@@ -55,7 +55,7 @@ from tests.fake_sane import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator, Iterator
     from pathlib import Path
     from types import FrameType, ModuleType
 
@@ -64,7 +64,7 @@ _BACKEND_LOGGER = "saneless.scanner.sane_backend"
 
 
 @contextlib.contextmanager
-def _signal_raises_scan_interrupted(signum: int) -> Iterator[None]:
+def _signal_raises_scan_interrupted(signum: int) -> Generator[None]:
     """
     Make ``signum`` raise ``ScanInterrupted`` for the block, then restore it.
 

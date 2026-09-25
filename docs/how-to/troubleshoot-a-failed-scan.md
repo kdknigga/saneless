@@ -20,7 +20,10 @@ In a shell, `echo $?` right after the command prints its exit code.
 | 5 | An error saneless did not anticipate: a bug | [Unexpected errors](#unexpected-errors-exit-5) |
 | 6 | The scan was saved to the consume folder, not uploaded: its title, tags and correspondent were not applied | [Saved to the consume folder](#saved-to-the-consume-folder-exit-6) |
 | 7 | The scan was uploaded, but with a warning | [Uploaded with a warning](#uploaded-with-a-warning-exit-7) |
+| 8 | Every page looked blank to empty-page detection, so nothing was uploaded | [Every page looked blank](#every-page-looked-blank-exit-8) |
+| 129 | A SIGHUP interrupted the command, for example a dropped SSH session | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
 | 130 | You cancelled the scan | [Cancelled scans](#cancelled-scans-exit-130) |
+| 143 | A SIGTERM interrupted the command | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
 
 [Use the CLI for Scripting](cli-scripting.md#exit-codes) shows how to branch on these codes in a
 script, and [CLI Commands](../reference/cli-commands.md#exit-codes) lists the codes each command
@@ -297,6 +300,41 @@ again. The warning is one of these:
 
 A run that was saved to the consume folder *and* carries a warning exits 6, not 7: the missing
 title, tags and correspondent are the larger problem.
+
+## Every page looked blank (exit 8)
+
+The line starts with `Empty-page detection:`. The scanner worked: it returned pages, and
+empty-page detection judged every one of them blank, so nothing was uploaded. The scanner is not
+the thing to check.
+
+The pages are not lost. saneless assembles every page it scanned, before detection removed any,
+into a PDF under `failed/` in its data directory, and the line names the path. Open it:
+
+- **If the pages really are blank**, there is nothing to do. Delete the file.
+- **If they are not blank** -- faint pencil, light print or a mostly empty form -- detection was too
+  eager for this document. Lower `empty_page_coverage_threshold` for the profile, or turn detection
+  off for it with `enable_empty_page_detection = false`, then scan again. Or keep the preserved
+  PDF and upload it yourself.
+
+[When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank)
+explains how detection decides.
+
+## Interrupted by a signal (exit 129 and 143)
+
+The line starts with `Interrupted:`. Something outside saneless stopped the command while it ran:
+
+- **129** is SIGHUP: the terminal or SSH session running the command went away.
+- **143** is SIGTERM: `kill`, a service manager or a container runtime stopped the command.
+
+Each code is 128 plus the signal number, the shell's convention. Nobody chose to stop the scan, so
+it is not treated as a cancel: the pages already scanned are kept as a PDF under `failed/` in the
+data directory, and the line names the path. Nothing is uploaded. Scan the rest of the stack, or
+the whole stack again, and delete or upload the kept file yourself.
+
+Ctrl-C is different. It is a deliberate cancel, exits 130 and keeps nothing (see
+[Cancelled scans](#cancelled-scans-exit-130)). To run a long scan over SSH without a dropped
+connection interrupting it, start it under `tmux` or `screen`. `saneless serve` keeps the web
+server's own signal handling, where SIGTERM is a graceful stop.
 
 ## Cancelled scans (exit 130)
 

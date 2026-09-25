@@ -27,9 +27,12 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | 5 | Unexpected error only: a saneless bug. The line names the exception type and the traceback is in the log file -- or, under `saneless serve`, in the stream, because a service writes no file |
 | 6 | Saved to the consume folder without its title, tags or correspondent. The document was delivered, so do not scan it again |
 | 7 | Uploaded, with a warning on stderr: a sheet the scanner skipped, or manual-duplex front and back counts that differed. The document was delivered, so do not rescan the whole stack |
+| 8 | Every page looked blank to empty-page detection, so nothing was uploaded. The pages were kept as a PDF in `failed/` |
+| 129 | Interrupted by SIGHUP, for example a dropped SSH session. Pages already scanned were kept in `failed/` |
 | 130 | Cancelled by the operator |
+| 143 | Interrupted by SIGTERM. Pages already scanned were kept in `failed/` |
 
-Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
+Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had. `serve` keeps the web server's own handling, where SIGTERM is a graceful stop. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
 
 ---
 
@@ -58,7 +61,10 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 6 | Saved to the consume folder, not uploaded: the document is there but its title, tags and correspondent were not applied; stdout reads `Saved to folder: <title>` |
 | 7 | Uploaded with a warning (a sheet the scanner skipped, or manual-duplex front and back counts that differed, uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |
+| 8 | Every page looked blank to empty-page detection; nothing was uploaded, and the pages were kept as a PDF in `failed/` |
+| 129 | Interrupted by SIGHUP (for example a dropped SSH session); pages already scanned were kept in `failed/` |
 | 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt, or Ctrl-C during the scan) |
+| 143 | Interrupted by SIGTERM; pages already scanned were kept in `failed/` |
 
 With neither `--title` nor a profile `title`, the document title is the scan's start time rendered in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. Set `TZ` on the server (or in `docker-compose.yml`) if that zone is wrong; a container reports UTC unless you do.
 
@@ -89,7 +95,9 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | 1 | Scan error (SANE failed while listing devices, or at least one device's capabilities could not be read; the other devices are still reported) |
 | 2 | Configuration error (invalid config, or python-sane not installed) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 143 | Interrupted by SIGTERM |
 
 Only data goes to stdout. The `Discovering scanners...` and `No scanners found.` status lines, which the table mode prints, and any per-device capability error go to stderr, so `saneless devices | grep` and `saneless devices --json | jq` see the device list and nothing else. With no scanners, the table mode writes nothing to stdout and `--json` writes `[]`; both exit 0.
 
@@ -170,7 +178,9 @@ saneless [--config PATH] [-v] jobs [--json] [--limit N]
 | 0 | Success |
 | 2 | Configuration error (invalid config, or the job database is unreadable or has an unsupported schema) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 143 | Interrupted by SIGTERM |
 
 The table's `Timestamp` column renders each job's start time in the server's local timezone with the zone named, for example `2026-03-22 09:30 CDT`, and drops seconds. `--json` is a machine contract and is unaffected: its `created_at` stays a UTC ISO-8601 string carrying the `+00:00` offset. See [Use the CLI for Scripting](../how-to/cli-scripting.md#job-history-json).
 
@@ -237,7 +247,9 @@ When the table would have no lines at all -- settings built with no search behin
 | 0 | Every check came out OK or a warning |
 | 2 | At least one check failed (scanner support not installed, no scanner reachable, an unset or rejected API token, no scan profiles, a folder saneless cannot write to, or an old `config.toml` found where a `saneless.toml` was expected), or the configuration could not be loaded |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 143 | Interrupted by SIGTERM |
 
 **A warning does not fail the command.** An appliance that scans and files correctly is not broken because it could be tidier, and a health gate that goes red for tidiness is one people learn to ignore. Only a failure exits non-zero, so `if saneless doctor; then ...` means "everything that stops scanning or filing is fine".
 
@@ -298,7 +310,9 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 | 1 | Scan error (SANE failed while listing devices, or could not open or read the scanner's capabilities) |
 | 2 | Configuration or setup error: the config could not be loaded, no scanner found, python-sane is not installed, an old `config.toml` was the only config file the search found (see below), or the config file could not be rewritten (for example `saneless.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 143 | Interrupted by SIGTERM |
 
 Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, they are written to `./saneless.toml` in the current directory. In the Docker image, whose working directory is `/var/lib/saneless`, that is `/var/lib/saneless/saneless.toml` -- in the durable data volume rather than the mounted `./config` directory, where it outlives the container and keeps loading ahead of any `saneless.toml` you add later -- so create `config/saneless.toml` on the host first (see [Deploy with Docker Compose](../how-to/deploy-docker-compose.md)). A config file created from scratch gets mode `0600`; rewriting an existing file keeps its permission bits, owner and group, each when the process is permitted to set it and the filesystem supports it.
 

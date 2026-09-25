@@ -146,7 +146,16 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 | 5 | Unexpected error (a saneless bug) | Prints one line; the traceback is in the log file -- attach it to a bug report |
 | 6 | Saved to the consume folder | paperless-ngx could not be reached, so the PDF went to the consume folder without its title, tags or correspondent; stdout reads `Saved to folder: <title>`. The document was delivered: do not rescan |
 | 7 | Uploaded with a warning | A sheet the scanner skipped, or manual-duplex front and back counts that differed (uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr. The document was delivered: do not rescan the whole stack |
+| 8 | Every page looked blank | Empty-page detection judged every page blank, so nothing was uploaded; the pages were kept as a PDF in `failed/`. The scanner worked: lower `empty_page_coverage_threshold` or turn detection off if the pages are not blank |
+| 129 | Interrupted by SIGHUP | The terminal or SSH session running the command went away. Pages already scanned were kept in `failed/` |
 | 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; Ctrl-C during a one-shot command |
+| 143 | Interrupted by SIGTERM | `kill`, a service manager or a container runtime stopped the command. Pages already scanned were kept in `failed/` |
+
+130 means someone chose to stop, so nothing was kept. 129 and 143 (128 plus the signal number)
+mean the command was stopped from outside without anyone choosing to discard the scan, so the pages
+already scanned were kept in `failed/`: a script can tell the two apart and look for the kept file
+only after 129 or 143. `saneless serve` is the exception: it keeps the web server's own signal
+handling, where SIGTERM is a graceful stop.
 
 Every failure prints one line to stderr (a configuration error prints a header naming the file,
 then one line per problem). [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) explains
@@ -163,7 +172,7 @@ what each code means and what to check.
 - **2** — at least one check failed: scanner support is not installed, no scanner is reachable,
   the paperless-ngx API token is unset or rejected, no scan profiles are configured, or a folder
   saneless needs is not writable.
-- **5** and **130** behave as they do for every other command.
+- **5**, **129**, **130** and **143** behave as they do for every other command.
 
 `doctor` prints a human-readable table and has no `--json` mode, so a script should gate on the
 exit code rather than parse the output. Do not wire it to a container `HEALTHCHECK`: it probes

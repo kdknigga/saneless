@@ -59,6 +59,7 @@ from .exceptions import (
     SanelessError,
     ScanCancelledError,
     ScanError,
+    ScanInterrupted,
     StorageError,
     describe,
     failure_text,
@@ -90,6 +91,7 @@ from .vocabulary import (
     error_next_step,
     exit_code_for,
     exit_code_for_outcome,
+    exit_code_for_signal,
     job_label,
     job_state_for,
     local_time,
@@ -379,6 +381,8 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
             line = f"Paperless error: {failure_text(exc)}"
         case ErrorCategory.ASSEMBLY:
             line = f"PDF error: {failure_text(exc)}"
+        case ErrorCategory.ALL_BLANK:
+            line = f"Empty-page detection: {failure_text(exc)}"
         case ErrorCategory.UNKNOWN | ErrorCategory.REJECTED:
             line = _unexpected_line(exc)
         case _:
@@ -463,18 +467,23 @@ class _GuardedGroup(click.Group):
     1. click's ``Exit``, ``Abort`` and ``ClickException`` are re-raised first.
        ``Exit`` and ``Abort`` subclass ``RuntimeError``, so a later
        ``except Exception`` would turn ``--help`` into exit 5.
-    2. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
+    2. ``ScanInterrupted`` -- a SIGHUP or SIGTERM to the command -- is an
+       interruption, not a cancel: nobody chose to stop, so the pages already
+       scanned were kept. One ``Interrupted:`` line and 128 plus the signal
+       number, 129 or 143. It is a ``BaseException``, so no later clause
+       would catch it.
+    3. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
        failure: one line and exit 130.
-    3. ``StorageError`` -- a job database saneless cannot use -- is a setup
+    4. ``StorageError`` -- a job database saneless cannot use -- is a setup
        problem and exits 2. It is mapped here by type and sits before the
        ``SanelessError`` clause because ``ErrorCategory`` is persisted on job
        records, and ``classify_error`` deliberately keeps ``StorageError``
        ``UNKNOWN`` rather than growing a category for it. Its message already
        names the database path and the reason.
-    4. Any other ``SanelessError`` is classified once, by the same
+    5. Any other ``SanelessError`` is classified once, by the same
        ``classify_error`` the web worker uses, so the CLI's exit code and the
        job's category cannot disagree.
-    5. Anything else is not a saneless type: ``Unexpected error (<Type>)``,
+    6. Anything else is not a saneless type: ``Unexpected error (<Type>)``,
        exit 5, the traceback in the log.
     """
 
@@ -493,6 +502,12 @@ class _GuardedGroup(click.Group):
             return super().invoke(ctx)
         except _CLICK_CONTROL_FLOW:
             raise
+        except ScanInterrupted as exc:
+            logger.info("Command interrupted by a signal: %r", failure_text(exc))
+            click.echo(
+                neutralise_controls(f"Interrupted: {failure_text(exc)}"), err=True
+            )
+            ctx.exit(exit_code_for_signal(exc.signum))
         except KeyboardInterrupt:
             logger.info("Command interrupted")
             click.echo("Cancelled (interrupted)", err=True)

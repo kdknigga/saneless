@@ -9,11 +9,13 @@ permitted is ``saneless.exceptions``, which is itself a leaf.
 
 from __future__ import annotations
 
+import signal
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from typing import TYPE_CHECKING, Final, Literal, Protocol, assert_never
 
 from saneless.exceptions import (
+    AllPagesBlankError,
     ConfigError,
     FeederEmptyError,
     PaperlessError,
@@ -69,6 +71,7 @@ __all__ = [
     "error_next_step",
     "exit_code_for",
     "exit_code_for_outcome",
+    "exit_code_for_signal",
     "flip_answer_label",
     "job_label",
     "job_state_for",
@@ -122,6 +125,11 @@ class ErrorCategory(StrEnum):
     img2pdf or Pillow refused the images, or the output directory could not be
     written.  It is its own category so a full disk is never reported as a
     scanner failure.
+
+    ``ALL_BLANK`` means empty-page detection judged every scanned page blank,
+    so nothing was uploaded.  The scanner did its job, so this is its own
+    category and is never reported as a scanner fault: the advice is to tune
+    detection, not to check the scanner.
     """
 
     FEEDER = "FEEDER"
@@ -131,6 +139,7 @@ class ErrorCategory(StrEnum):
     UNKNOWN = "UNKNOWN"
     REJECTED = "REJECTED"
     ASSEMBLY = "ASSEMBLY"
+    ALL_BLANK = "ALL_BLANK"
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +271,20 @@ class ExitCode(IntEnum):
     wins, since the lost metadata is the larger problem.  They are chosen in
     ``exit_code_for_outcome``, not in ``exit_code_for``, because no error
     category leads to either.
+
+    ``ALL_BLANK`` (8) means empty-page detection judged every page blank.
+    Nothing was uploaded, and the pages were kept as a PDF in ``failed/``.  It
+    is kept apart from ``SCAN`` because the scanner worked, and a script that
+    checks the scanner on exit 1 would be sent the wrong way.
+
+    ``HANGUP`` (129) and ``TERMINATED`` (143) follow the shell's convention of
+    128 plus the signal number, for a SIGHUP or a SIGTERM to a one-shot
+    command.  They are an interruption rather than a cancel: nobody chose to
+    stop, so the pages already scanned are kept in ``failed/``, unlike 130,
+    which keeps nothing.  ``exit_code_for_signal`` chooses them.
+
+    Members are declared in value order, the order every table pinned to
+    this enum lists them in.
     """
 
     SUCCESS = 0
@@ -272,7 +295,10 @@ class ExitCode(IntEnum):
     UNEXPECTED = 5
     SAVED_TO_FOLDER = 6
     UPLOADED_WITH_WARNING = 7
+    ALL_BLANK = 8
+    HANGUP = 129
     CANCELLED = 130
+    TERMINATED = 143
 
 
 class ScanOutcome(StrEnum):
@@ -989,6 +1015,18 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
                     "server's free disk space."
                 ),
             )
+        case ErrorCategory.ALL_BLANK:
+            advice = ErrorAdvice(
+                message=(
+                    "Every page looked blank, so nothing was uploaded; the "
+                    "pages were kept as a PDF."
+                ),
+                next_step=(
+                    "If the pages are not blank, lower "
+                    "empty_page_coverage_threshold for this profile or turn "
+                    "empty-page detection off, then scan again."
+                ),
+            )
         case ErrorCategory.REJECTED:
             advice = ErrorAdvice(
                 # Neutral on purpose: REJECTED also covers down and degraded
@@ -1348,11 +1386,13 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
     """
     Return the CLI exit code for an error category.
 
-    Two outcomes are resolved by exception type before a caller classifies at
+    Three outcomes are resolved by exception type before a caller classifies at
     all, and so never reach this function:
 
     * A cancel is not a category.  ``ScanCancelledError`` and
       ``KeyboardInterrupt`` map to ``ExitCode.CANCELLED``.
+    * Nor is an interruption.  ``ScanInterrupted`` maps through
+      ``exit_code_for_signal`` to 128 plus the signal number.
     * ``StorageError`` classifies as ``UNKNOWN``, but it is a setup problem, so
       the CLI guard maps it to ``ExitCode.CONFIG`` (exit 2) by type.  The
       mapping is by type rather than by making ``classify_error`` return
@@ -1387,6 +1427,8 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
             exit_code = ExitCode.PAPERLESS
         case ErrorCategory.ASSEMBLY:
             exit_code = ExitCode.PDF
+        case ErrorCategory.ALL_BLANK:
+            exit_code = ExitCode.ALL_BLANK
         case ErrorCategory.UNKNOWN | ErrorCategory.REJECTED:
             exit_code = ExitCode.UNEXPECTED
         case _:
@@ -1429,6 +1471,34 @@ def exit_code_for_outcome(outcome: ScanOutcome, warning: str | None) -> ExitCode
     return exit_code
 
 
+def exit_code_for_signal(signum: int | None) -> ExitCode:
+    """
+    Return the CLI exit code for a command a signal interrupted.
+
+    SIGHUP and SIGTERM exit 128 plus the signal number, the shell's
+    convention: 129 and 143.  They are the only signals a one-shot command
+    installs a handler for.  Ctrl-C's SIGINT never reaches here: it is a
+    ``KeyboardInterrupt``, a cancel, and exits ``CANCELLED``.
+
+    Anything else -- ``None``, which is a server stop the CLI never sees, or a
+    signal saneless installs no handler for -- cannot arrive here
+    legitimately, so it is reported as the bug it would be.
+
+    Args:
+        signum: The signal that interrupted the command, or ``None``.
+
+    Returns:
+        ``ExitCode.HANGUP`` for SIGHUP, ``ExitCode.TERMINATED`` for SIGTERM,
+        otherwise ``ExitCode.UNEXPECTED``.
+
+    """
+    if signum == signal.SIGHUP:
+        return ExitCode.HANGUP
+    if signum == signal.SIGTERM:
+        return ExitCode.TERMINATED
+    return ExitCode.UNEXPECTED
+
+
 def classify_error(exc: Exception) -> ErrorCategory:
     """
     Map an exception to its error category.
@@ -1462,4 +1532,6 @@ def classify_error(exc: Exception) -> ErrorCategory:
         category = ErrorCategory.UPLOAD
     elif isinstance(exc, PdfError):
         category = ErrorCategory.ASSEMBLY
+    elif isinstance(exc, AllPagesBlankError):
+        category = ErrorCategory.ALL_BLANK
     return category
