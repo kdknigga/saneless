@@ -53,10 +53,11 @@ __all__ = ["JobView", "build_job_view", "owns_detail"]
 # every one is replaced.
 _URL = re.compile(r"https?://\S+")
 
-# Punctuation that ends the sentence around a URL rather than the URL itself.
-# ``\S+`` swallows it, and it is put back after the replacement so
-# "Paperless at <url>: refused" keeps its colon.
-_URL_TRAILING = ").,:;"
+# Punctuation that ends the sentence around a URL rather than the URL itself,
+# and the quotes and brackets that close around one.  ``\S+`` swallows them,
+# and they are put back after the replacement so "Paperless at <url>: refused"
+# keeps its colon and "see '<url>' now" its closing quote.
+_URL_TRAILING = ").,:;'\"]>"
 
 # A host path counts only where it starts and ends as a whole path, so the
 # ``tmp`` directory does not also match ``tmp2`` beside it.  The lookahead
@@ -195,20 +196,25 @@ def _spellings(path: Path) -> set[str]:
 
     Text written by the pipeline may carry the path as configured or as the
     file system resolved it, which differ when the configured path runs
-    through a symlink.  The file system root is never returned: replacing
-    ``/`` would rewrite every separator in the text.
+    through a symlink.  Only absolute spellings are returned: a directory
+    configured as ``data`` or ``tmp`` would otherwise match those words in
+    an ordinary sentence, and a relative path names no place on the host
+    anyway.  Text that spells a relative directory as configured is left
+    as it is.  The file system root is never returned: replacing ``/`` would
+    rewrite every separator in the text.
 
     Args:
         path: The configured directory.
 
     Returns:
-        The configured spelling and the resolved one, without the root.
+        The absolute spelling and the resolved one, without the root.
 
     """
+    absolute = path.absolute()
     return {
         spelling
-        for spelling in (str(path), str(path.resolve()))
-        if spelling != path.anchor
+        for spelling in (str(absolute), str(path.resolve()))
+        if spelling != absolute.anchor
     }
 
 
@@ -225,7 +231,7 @@ def _relativise(text: str, settings: Settings) -> str:
     * ``tmp_dir`` becomes ``<output.tmp_dir>``;
     * ``consume_dir``, when one is set, becomes ``<paperless.consume_dir>``.
 
-    Each is matched in its configured and its resolved spelling.  Then every
+    Each is matched in its absolute and its resolved spelling.  Then every
     ``http://`` or ``https://`` address becomes ``<paperless.url>``, with the
     punctuation after it kept.  A path from a row written under an older
     configuration stays as it is: only its owner sees it.

@@ -287,6 +287,100 @@ def test_owner_url_scrub_keeps_the_sentence(
     assert owner.error == expected
 
 
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        pytest.param(
+            "see '{url}/api/x' now",
+            "see '<paperless.url>' now",
+            id="single-quoted",
+        ),
+        pytest.param(
+            'see "{url}/api/x" now',
+            'see "<paperless.url>" now',
+            id="double-quoted",
+        ),
+        pytest.param(
+            "[{url}/api/x]",
+            "[<paperless.url>]",
+            id="bracketed",
+        ),
+        pytest.param(
+            "<{url}/api/x>",
+            "<<paperless.url>>",
+            id="angle-bracketed",
+        ),
+    ],
+)
+def test_owner_url_scrub_keeps_closing_quotes_and_brackets(
+    settings: Settings, tmp_path: Path, template: str, expected: str
+) -> None:
+    """A quote or bracket that closes around an address is not swallowed with it."""
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=template.format(url=_PAPERLESS_URL),
+    )
+
+    owner = _view(job, presented=_OWNER, settings=settings, tmp_path=tmp_path)
+
+    assert owner.error == expected
+
+
+def test_relative_directories_leave_ordinary_words_alone(
+    make_settings: Callable[..., Settings], tmp_path: Path
+) -> None:
+    """
+    A directory configured as a relative path is not matched as a bare word.
+
+    ``data`` and ``tmp`` are valid settings, and the same words occur in
+    ordinary sentences; only an absolute spelling is a host path.
+    """
+    settings = make_settings(
+        output=OutputConfig(
+            tmp_dir="tmp",
+            data_dir="data",
+            log_file=tmp_path / "saneless.log",
+        ),
+    )
+    text = "Paperless returned invalid data; tmp space low"
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=text,
+    )
+
+    owner = _view(job, presented=_OWNER, settings=settings, tmp_path=tmp_path)
+
+    assert owner.error == text
+
+
+def test_a_relative_directory_that_resolves_to_the_root_matches_nothing(
+    make_settings: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``data_dir = "."`` run from ``/`` must not rewrite every separator."""
+    monkeypatch.chdir("/")
+    settings = make_settings(
+        output=OutputConfig(
+            tmp_dir=tmp_path / "scratch",
+            data_dir=".",
+            log_file=tmp_path / "saneless.log",
+        ),
+    )
+    text = "Upload failed: pages sent / pages scanned was 3 / 4"
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=text,
+    )
+
+    owner = _view(job, presented=_OWNER, settings=settings, tmp_path=tmp_path)
+
+    assert owner.error == text
+
+
 def test_owner_sees_bare_data_dir_by_setting_name(
     settings: Settings, tmp_path: Path
 ) -> None:
