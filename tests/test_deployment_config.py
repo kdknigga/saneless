@@ -73,6 +73,7 @@ membership are not things to re-implement with a regular expression.
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import re
 import subprocess
@@ -102,6 +103,15 @@ from saneless.config import (
     WebConfig,
     is_placeholder_token,
 )
+from saneless.pages import (
+    EDGE_TRIM,
+    INK_DELTA,
+    PAPER_PERCENTILE,
+    PAPER_WHITE_FLOOR,
+    filter_blank_pages,
+    is_blank,
+)
+from saneless.scanner.base import PageRecord
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
     ExitCode,
@@ -3396,19 +3406,42 @@ def test_no_planning_artifact_is_published_under_docs() -> None:
 # The heading whose body carries the threshold-tuning advice and its example.
 PROFILE_TUNING_HEADING = "## Empty page detection tuning"
 
-# An ``empty_page_*_threshold`` assignment inside a TOML example.
+# An ``empty_page_coverage_threshold`` assignment inside a TOML example.
 EMPTY_PAGE_THRESHOLD = re.compile(
-    r"^empty_page_(?P<key>mean|stddev)_threshold = (?P<value>[0-9.]+)$",
+    r"^empty_page_coverage_threshold = (?P<value>[0-9.]+)$",
     re.MULTILINE,
 )
 
-# The phrasings that get the dual-threshold rule backwards. ``is_empty_page``
-# is ``mean > mean_threshold and stddev < stddev_threshold``, so lowering the
-# mean threshold admits MORE pages to the blank set, never fewer.
+# The phrasings that get the coverage rule backwards. ``pages.is_blank`` is
+# ``coverage <= threshold`` (on light paper), so raising the threshold admits
+# MORE pages to the blank set, never fewer.
 INVERTED_TUNING_PHRASES = (
-    "lower the thresholds to detect",
-    "lower the thresholds to keep",
+    "raise the threshold to keep",
+    "raising it keeps",
+    "lower the threshold to remove",
 )
+
+# The explanation page the blank-page rule is described on.
+EMPTY_PAGE_EXPLANATION = DOCS_DIR / "explanation" / "empty-page-detection.md"
+
+# The headings the explanation must keep: other pages link to their anchors,
+# and each is one of the things the page exists to say.
+EMPTY_PAGE_HEADINGS = (
+    "## Tuning the threshold",
+    "## Removed pages",
+    "## When every page is blank",
+)
+
+# The profile keys the coverage rule replaced, with no alias: a config that
+# still sets either fails to load, so no page may still tell a reader to.
+REMOVED_THRESHOLD_KEYS = ("empty_page_mean_threshold", "empty_page_stddev_threshold")
+
+# The per-page log line the explanation quotes, rebuilt from these facts by
+# the real filter, so the quoted line cannot drift from what the log says.
+EXAMPLE_LOG_POSITION = 3
+EXAMPLE_LOG_PAGES = 12
+EXAMPLE_LOG_COVERAGE = 0.00034
+EXAMPLE_LOG_PAPER_WHITE = 249
 
 # The bullet that lists the words the history table's Status column shows.
 HISTORY_STATUS_WORDS = re.compile(r"Current state of the job \((?P<words>[^)]*)\)")
@@ -3419,50 +3452,143 @@ HISTORY_STATUS_HEDGE = "and so on"
 
 def test_profile_howto_tuning_advice_matches_the_empty_page_rule() -> None:
     """
-    The how-to's threshold example moves each threshold the way that keeps pages.
+    The how-to's threshold example moves the threshold the way that keeps pages.
 
-    ``pages.is_empty_page`` is ``mean > mean_threshold and stddev <
-    stddev_threshold``.  Keeping a faint page therefore means **raising** the
-    mean threshold and **lowering** the stddev threshold; lowering the mean
-    threshold does the opposite of what the page promises, and the review
-    caught that inversion as row 10.  The numbers are checked against
-    ``ProfileConfig``'s own defaults, so a default change cannot leave a stale
-    literal here passing.
+    ``pages.is_blank`` removes a page whose coverage is at or below the
+    threshold.  Keeping a faint page therefore means **lowering** the
+    threshold; raising it does the opposite of what the page promises, which
+    is the inversion the review caught as row 10 under the old rule.  The
+    direction is asserted three ways: the prose says to lower it, the example
+    sets a value below ``ProfileConfig``'s own default (so a default change
+    cannot leave a stale literal passing), and the real rule keeps a page
+    measured between the two at the example's value while removing it at
+    the default.
     """
     text, name = _read(PROFILE_HOWTO)
     body = _section(text, PROFILE_TUNING_HEADING, name)
     lowered = body.lower()
     for phrase in INVERTED_TUNING_PHRASES:
         assert phrase not in lowered, (
-            f"{name}'s tuning advice says {phrase!r}. Lowering the mean "
+            f"{name}'s tuning advice says {phrase!r}. Raising the coverage "
             "threshold makes MORE pages count as empty, so this tells the "
             "reader to do the opposite of what the sentence promises (row 10)"
         )
-    assert "raise the mean threshold" in lowered, (
-        f"{name} does not tell the reader to raise the mean threshold to keep "
-        "faint pages, which is the direction is_empty_page actually rewards"
+    assert "lower the threshold" in lowered, (
+        f"{name} does not tell the reader to lower the threshold to keep "
+        "faint pages, which is the direction is_blank actually rewards"
+    )
+    assert "raising it removes more pages" in lowered, (
+        f"{name} does not say that raising the threshold removes more pages"
     )
 
-    defaults = ProfileConfig(source="Flatbed")
-    found = {
-        match.group("key"): float(match.group("value"))
-        for match in EMPTY_PAGE_THRESHOLD.finditer(body)
-    }
-    assert set(found) == {"mean", "stddev"}, (
-        f"{name}'s tuning section no longer sets both thresholds in its "
-        f"example; found {sorted(found)}"
+    default = ProfileConfig(source="Flatbed").empty_page_coverage_threshold
+    found = [
+        float(match.group("value")) for match in EMPTY_PAGE_THRESHOLD.finditer(body)
+    ]
+    assert len(found) == 1, (
+        f"{name}'s tuning section should set empty_page_coverage_threshold "
+        f"once in its example; found {found}"
     )
-    assert found["mean"] > defaults.empty_page_mean_threshold, (
-        f"{name}'s example sets empty_page_mean_threshold to {found['mean']}, "
-        f"at or below the default {defaults.empty_page_mean_threshold}. That "
-        "discards more pages, not fewer"
+    (example,) = found
+    assert example < default, (
+        f"{name}'s example sets empty_page_coverage_threshold to {example}, "
+        f"at or above the default {default}. That removes more pages, not fewer"
     )
-    assert found["stddev"] < defaults.empty_page_stddev_threshold, (
-        f"{name}'s example sets empty_page_stddev_threshold to "
-        f"{found['stddev']}, at or above the default "
-        f"{defaults.empty_page_stddev_threshold}. That discards more pages, "
-        "not fewer"
+    between = (example + default) / 2
+    assert is_blank(between, PAPER_WHITE_FLOOR, coverage_threshold=default)
+    assert not is_blank(between, PAPER_WHITE_FLOOR, coverage_threshold=example)
+
+
+def _example_log_line(caplog: pytest.LogCaptureFixture) -> str:
+    """
+    Run the real blank-page filter over made-up records and return one log line.
+
+    Args:
+        caplog: pytest's log capture.
+
+    Returns:
+        The line the filter logged for the page the explanation quotes.
+
+    """
+    threshold = ProfileConfig().empty_page_coverage_threshold
+    records = [
+        PageRecord(
+            sequence=position,
+            path=Path(f"a-{position:04d}.png"),
+            size=(2480, 3508),
+            mode="L",
+            dpi=300,
+            ink_coverage=(
+                EXAMPLE_LOG_COVERAGE if position == EXAMPLE_LOG_POSITION else 1.0
+            ),
+            paper_white=EXAMPLE_LOG_PAPER_WHITE,
+        )
+        for position in range(1, EXAMPLE_LOG_PAGES + 1)
+    ]
+    caplog.set_level(logging.INFO, logger="saneless.pages")
+    filter_blank_pages(records, coverage_threshold=threshold)
+    lines = [
+        entry.getMessage()
+        for entry in caplog.records
+        if entry.name == "saneless.pages"
+        and f"page {EXAMPLE_LOG_POSITION} of " in entry.getMessage()
+    ]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def test_empty_page_explanation_matches_the_detector(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The explanation states the rule, the knob and the outcomes the code has.
+
+    Every number the page gives about the rule is derived from the code here:
+    the key and its default from ``ProfileConfig``, the margin, the
+    paper-white percentile, the ink margin and the paper floor from
+    ``saneless.pages``, and the quoted log line from the real filter.  A change
+    to any of them fails this test until the page is rewritten to match.
+    """
+    text, name = _read(EMPTY_PAGE_EXPLANATION)
+    default = ProfileConfig().empty_page_coverage_threshold
+
+    assert "`empty_page_coverage_threshold`" in text, name
+    assert f"`{default!r}`" in text, (
+        f"{name} does not give the default threshold {default!r}"
     )
+    assert f"{round(EDGE_TRIM * 100)}%" in text, (
+        f"{name} does not give the {EDGE_TRIM:.0%} margin"
+    )
+    assert f"brightest {round((1 - PAPER_PERCENTILE) * 100)}%" in text, name
+    assert f"more than {INK_DELTA} levels darker" in text, name
+    assert f"at least {PAPER_WHITE_FLOOR}" in text, name
+    for heading in EMPTY_PAGE_HEADINGS:
+        assert re.search(rf"^{re.escape(heading)}$", text, re.MULTILINE), (
+            f"{name} has no {heading!r} section"
+        )
+    assert "exits 8" in text, f"{name} does not say the all-blank scan exits 8"
+    for key in REMOVED_THRESHOLD_KEYS:
+        assert key not in text, f"{name} still names the removed key {key}"
+    assert _example_log_line(caplog) in text, (
+        f"{name}'s example log line is not the line the filter writes"
+    )
+
+
+def test_no_doc_page_names_a_removed_threshold_key() -> None:
+    """
+    No page tells a reader to set a key that now fails the config load.
+
+    The mean and stddev thresholds were removed with no alias, so a profile
+    that still sets either is refused by name.  A page still showing one
+    would hand the reader a config that cannot load.
+    """
+    offenders = [
+        f"{page.relative_to(REPO_ROOT)}: {key}"
+        for page in _doc_pages()
+        for key in REMOVED_THRESHOLD_KEYS
+        if key in page.read_text(encoding="utf-8")
+    ]
+    assert not offenders, "\n".join(offenders)
 
 
 def test_first_web_ui_scan_names_real_history_labels() -> None:

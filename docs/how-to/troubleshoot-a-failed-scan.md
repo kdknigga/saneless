@@ -46,9 +46,9 @@ What the common cases mean:
   the profile's source matches where the paper is. In a manual duplex scan, an empty second pass
   says so and names how many front pages the first pass scanned; reload the flipped stack and
   scan both sides again.
-- **All pages were blank.** Pages were scanned, but empty-page detection removed every one of
-  them. If the pages were not blank, make detection more conservative or turn it off; see
-  [When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank).
+- **Every page looked blank.** This is not a scanner error and does not exit 1: the scanner
+  returned pages and empty-page detection removed all of them. It exits 8; see
+  [Every page looked blank](#every-page-looked-blank-exit-8).
 - **The flip wait timed out.** A manual duplex scan waited `flip_timeout_seconds` for someone to
   flip the stack and nobody answered. A timeout is a failure, not a cancel. The front sides the
   first pass already scanned are kept: saneless assembles them into a PDF under `failed/` in its
@@ -298,6 +298,14 @@ again. The warning is one of these:
   saneless could not interleave them. It uploaded the fronts and the backs as two separate
   documents, with `(fronts)` and `(backs)` after the title. In paperless-ngx, check both documents
   and look for a sheet that fed twice or not at all.
+- **The scanner could not read N sheet(s), so the fronts and backs could not be paired
+  reliably.** In a manual duplex scan, one of the passes skipped a sheet it could not read. A
+  skipped sheet moves every later page of that pass by one, so saneless does not interleave the
+  passes even when the two counts agree. It uploaded the fronts and the backs as two separate
+  documents, with `(fronts)` and `(backs)` after the title, and the warning gives the number of
+  sheets. The `(backs)` document is in sheet order, the same order as `(fronts)`, not the reversed
+  order the second pass fed them in. In paperless-ngx, find the sheets missing from either
+  document and scan them again, or scan the whole stack again and delete both documents.
 
 A run that was saved to the consume folder *and* carries a warning exits 6, not 7: the missing
 title, tags and correspondent are the larger problem.

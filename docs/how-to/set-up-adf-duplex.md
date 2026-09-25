@@ -143,7 +143,7 @@ Manual duplex needs a feeder source, and this device exposes no source option to
 
 ## Empty page detection
 
-When scanning duplex documents, blank back sides are common. saneless detects and removes empty pages by default using luminance analysis. This is controlled per profile:
+When scanning duplex documents, blank back sides are common. saneless detects and removes empty pages by default, by measuring how much of each page is ink. This is controlled per profile:
 
 ```toml
 [profiles.duplex]
@@ -151,11 +151,10 @@ source = "ADF Duplex"
 resolution = 300
 mode = "Color"
 enable_empty_page_detection = true
-empty_page_mean_threshold = 250.0
-empty_page_stddev_threshold = 5.0
+empty_page_coverage_threshold = 0.001
 ```
 
-To tune the thresholds or disable empty page detection, see [Configure Scan Profiles](configure-scan-profiles.md).
+The default keeps a page that carries only a page number or a few faint pencil lines, and may keep a dusty blank back. Removed pages are not kept; the scan names them instead, by page number in the interleaved document, for example `Removed as blank: pages 2, 4 of 4 scanned.` To tune the threshold or disable empty page detection, see [Configure Scan Profiles](configure-scan-profiles.md#empty-page-detection-tuning) and [How Empty Page Detection Works](../explanation/empty-page-detection.md).
 
 ## When a manual duplex scan does not come out whole
 

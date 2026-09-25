@@ -199,9 +199,8 @@ Scan profiles define scanner settings and default metadata. At least one profile
 | `default_tags` | int[] | `[]` | Paperless-ngx tag IDs to apply automatically |
 | `default_correspondent` | int or null | `null` | Paperless-ngx correspondent ID |
 | `title` | string | `""` | Default document title, used as written when the title is left blank (typed title first, then this, then `Scan <date time>`) |
-| `empty_page_mean_threshold` | float | `250.0` | Mean pixel value threshold for empty page detection |
-| `empty_page_stddev_threshold` | float | `5.0` | Standard deviation threshold for empty page detection |
 | `enable_empty_page_detection` | bool | `true` | Enable automatic empty page removal |
+| `empty_page_coverage_threshold` | float | `0.001` | The most ink a page may carry and still be removed as blank, as a percentage of the page inside a 3% margin on every edge. From `0` (remove only pages with no ink at all) to `100`; any other value is rejected when the config loads. Lower keeps more pages. See [How Empty Page Detection Works](../explanation/empty-page-detection.md#tuning-the-threshold) |
 | `auto_generated` | bool | `false` | Whether this profile was auto-generated from scanner capabilities |
 
 `auto_generated = true` marks a profile as tool-owned: `saneless auto-profiles --force` rewrites its generated keys, `label` and `description` among them, so anything you write there is replaced the next time you run it. **To take a profile over, delete its `auto_generated` line.** saneless then leaves the whole profile alone, and your own `label` and `description` are what the dropdown shows. See [Configure Scan Profiles](../how-to/configure-scan-profiles.md) for the full ownership rules.

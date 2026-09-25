@@ -63,8 +63,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | `default_tags` | list of int | `[]` | Paperless-ngx tag IDs to apply automatically |
 | `default_correspondent` | int or null | `null` | Paperless-ngx correspondent ID |
 | `enable_empty_page_detection` | bool | `true` | Remove blank pages from scans |
-| `empty_page_mean_threshold` | float | `250.0` | Mean luminance threshold for blank detection (higher = stricter) |
-| `empty_page_stddev_threshold` | float | `5.0` | Standard deviation threshold for blank detection |
+| `empty_page_coverage_threshold` | float | `0.001` | The most ink a page may carry and still be removed as blank, as a percentage (0 to 100) of the page inside a 3% margin. Lower keeps more pages; `0` removes only pages with no ink at all |
 | `auto_source_mode` | string | `"flatbed"` | When source is `"Auto"`: `"flatbed"` for single-page or `"adf"` for multi-page feeder |
 | `paper_size` | string | `"full"` | Constrain scan area: `"full"`, `"a3"`, `"a4"`, `"a5"`, `"letter"`, `"legal"` |
 | `auto_generated` | bool | `false` | Set by `auto-profiles`; marks machine-generated profiles |
@@ -180,7 +179,7 @@ saneless auto-profiles --force
 `--force` merges; it does not replace whole profiles:
 
 - It refreshes only profiles that carry `auto_generated = true`. In those, only the generated keys (`label`, `description`, `source`, `resolution`, `mode`, `auto_source_mode`, `duplex`, `auto_generated`) are rewritten in place, and a generated key the new run no longer writes is removed.
-- Everything else in the profile is kept: `default_tags`, `default_correspondent`, `title`, `paper_size`, the empty-page thresholds, and your comments.
+- Everything else in the profile is kept: `default_tags`, `default_correspondent`, `title`, `paper_size`, the empty-page settings, and your comments.
 - A hand edit to a generated key, such as `resolution = 600`, is overwritten. To keep your edits, delete the `auto_generated` line from that profile.
 - A profile without `auto_generated = true` is never changed, even with `--force`. It is listed as `Skipped (not auto-generated)`; rename or delete it to let `auto-profiles` regenerate it.
 
@@ -247,15 +246,14 @@ mode = "Color"
 enable_empty_page_detection = false
 ```
 
-A page counts as empty only when its mean luminance is **above** `empty_page_mean_threshold` *and* its standard deviation is **below** `empty_page_stddev_threshold`. So to keep pages with faint content -- pencil, a light stamp, a pale carbon copy -- raise the mean threshold and lower the stddev threshold. Moving either one the other way discards more pages, not fewer:
+A page counts as empty only when its ink covers **no more than** `empty_page_coverage_threshold` percent of the page inside a narrow margin. So to keep pages with faint or sparse content -- pencil, a light stamp, a nearly empty form -- lower the threshold. Raising it removes more pages, not fewer. At `0`, only a page with no ink at all is removed:
 
 ```toml
 [profiles.pencil-notes]
 source = "ADF"
 resolution = 300
 mode = "Gray"
-empty_page_mean_threshold = 253.0
-empty_page_stddev_threshold = 3.0
+empty_page_coverage_threshold = 0.0005
 ```
 
-See [How Empty Page Detection Works](../explanation/empty-page-detection.md#tuning-the-thresholds) for both directions written out.
+See [How Empty Page Detection Works](../explanation/empty-page-detection.md#tuning-the-threshold) for what is measured and both directions written out.

@@ -1,61 +1,75 @@
 # How Empty Page Detection Works
 
-## The Problem
+## The problem
 
 ADF (Automatic Document Feeder) scanners with duplex capability scan both sides of every sheet. When scanning single-sided documents, the back of each page is blank -- but the scanner produces an image for it anyway. Without filtering, these blank pages end up in the final PDF, doubling the page count with useless white pages.
 
 Even non-duplex ADF scanning can produce occasional blank pages if an empty sheet is mixed into the stack.
 
-## The Algorithm
+## What is measured
 
-For each scanned page, saneless converts the image to grayscale and computes two statistics:
+saneless asks one question of each page: how much of it is ink? It measures that once, when the page is written to the scan's working directory, in five steps:
 
-**Mean luminance**
-:   The average pixel brightness across the entire image, on a scale from 0 (pure black) to 255 (pure white). A blank white page has a mean very close to 255.
+1. **Only the inside of the page is read.** 3% of the width is ignored at the left and right edges, and 3% of the height at the top and bottom. A dark frame, the scanner lid or a backing sheet around a smaller page usually falls in that margin, so it is not counted as ink. The margin is narrow on purpose: a page number printed 10 mm from the bottom edge, where word processors put footers, is still inside it.
+2. **Each pixel is read in its darkest colour channel.** On a colour scan that is the lowest of red, green and blue. It sees a yellow highlighter or a light-blue pen that a greyscale conversion would render almost as light as the paper.
+3. **Paper white is measured, not assumed.** It is the brightness of the page with its brightest 1% set aside, so tinted or recycled paper is judged against its own colour, and a few stray bright pixels cannot raise it.
+4. **A pixel is ink when it is more than 40 levels darker than paper white**, on the 0-255 brightness scale. Scanner noise stays inside that margin. Faint marks do not: on paper measuring 247, anything darker than 207, light pencil included, counts as ink.
+5. **Coverage is the ink pixels as a percentage of the inside of the page.**
 
-**Standard deviation**
-:   How much individual pixel values vary from the mean. A truly blank page has very low standard deviation because nearly every pixel is the same shade of white.
+The measurement is not a verdict. The verdict is made later, against the profile's threshold, so each profile can set its own.
 
-## The Detection Rule
+### The area arithmetic
 
-A page is considered empty if **both** conditions are true:
+An A4 page scanned at 300 dpi is 2480 × 3508 pixels. The margin takes 74 pixels off each side and 105 off the top and the bottom -- about 6 mm and 9 mm -- which leaves 2332 × 3298 = 7,690,936 pixels. At the default threshold of 0.001%, a page is blank when no more than about 77 of those pixels are ink: one dot about 0.75 mm across. The threshold is a share of the page, so it means the same at any resolution.
 
-- Mean luminance > `empty_page_mean_threshold` (default: **250.0**)
-- Standard deviation < `empty_page_stddev_threshold` (default: **5.0**)
+A lone page number such as `- 7 -` in 11-point type covers several times that, so it is kept. A single line of typing covers far more.
 
-Both thresholds must be met simultaneously. This dual-threshold approach guards against two common false-positive scenarios:
+## The detection rule
 
-**Why not mean alone?**
-:   A page with a small mark, stamp, or scanner dust on an otherwise white background still has a high mean luminance. Mean alone would incorrectly discard it. But the mark creates enough pixel variation to push the standard deviation above the threshold, saving the page.
+A page is blank, and is removed, when both of these are true:
 
-**Why not standard deviation alone?**
-:   A uniformly gray page (from paper bleed-through or a tinted sheet) has very low standard deviation -- the pixels are uniform, just not white. Standard deviation alone would incorrectly discard it. But the gray tone keeps the mean luminance well below the threshold, saving the page.
+- its paper white is at least 128, halfway up the brightness scale; and
+- its ink coverage is at or below `empty_page_coverage_threshold`.
 
-Together, the two thresholds reliably identify pages that are both very white on average *and* very uniform -- the signature of a truly blank page.
+A page whose paper is darker than mid-grey is not blank-looking paper at all -- a dark cover with white type, a photograph, a coloured sheet -- so it is kept whatever its coverage.
 
-## Tuning the Thresholds
+The rule asks whether a page carries marks, not how bright it is on average. So a tinted or slightly noisy blank sheet is still blank, and a white page with one small mark on it is not.
 
-The defaults work well for typical office scanners and white paper. If you find that pages are being incorrectly kept or discarded, adjust the thresholds in your scan profile configuration:
+### Keep when unsure
+
+The default is set to keep pages, not to tidy them. A blank page that is kept costs one extra page in paperless-ngx. A page with something on it that is removed is gone, because removed pages are not kept anywhere. So the default keeps a lone page number and a few faint pencil lines, and in exchange it does not promise to remove every blank sheet.
+
+Dust is the usual reason a blank sheet survives. A blank back with a few specks on it is removed, but one with more than about ten small specks can carry enough ink to be kept. That is by design.
+
+## Tuning the threshold
+
+There is one setting, per profile: `empty_page_coverage_threshold`, the most ink a blank page may carry, as a percentage of the inside of the page. The default is `0.001`. Any value from 0 to 100 is accepted, and a value outside that range is refused when the config loads.
+
+- **To keep more pages** -- faint pencil, a light stamp, a nearly empty form that detection removed -- lower it. At `0`, only a page with no ink pixel at all is removed.
+- **To remove more pages** -- dusty blank backs that keep getting through -- raise it, with care and in small steps. A lone page number measures only a few thousandths of a percent, so a value such as `0.01` removes pages like that too.
 
 ```toml
-[profiles.duplex]
-source = "ADF Duplex"
+[profiles.pencil-notes]
+source = "ADF"
 resolution = 300
-mode = "color"
-empty_page_mean_threshold = 245.0
-empty_page_stddev_threshold = 8.0
+mode = "Gray"
+empty_page_coverage_threshold = 0
 ```
 
-**To be more aggressive** (discard more pages): lower the mean threshold or raise the stddev threshold.
-
-**To be more conservative** (keep more pages): raise the mean threshold or lower the stddev threshold.
+The margin, the paper-white measurement and the 40-level ink margin are fixed; the threshold is the only thing to tune.
 
 !!! tip
-    If you are unsure whether detection is working correctly, run the scan with `saneless -v scan ...` (or set `log_level = "DEBUG"` under `[output]`). The log will show the exact mean and stddev values for each page along with the keep/discard decision.
+    Every page gets one line in the saneless log at the default `INFO` level, whether it was kept or removed:
 
-## Disabling Empty Page Detection
+    ```
+    Blank-page check: page 3 of 12 (a-0003.png): ink 0.00034% of the inset, paper white 249, threshold 0.001% -> REMOVE
+    ```
 
-If you want to keep all scanned pages regardless of content, disable detection in the profile:
+    The coverage is written at full precision, so you can see how far each page was from the threshold and pick a value between the pages you want kept and the ones you want removed. `saneless scan` writes these lines to its log file (`log_file` under `[output]`); `saneless serve` writes them to its stderr, which `docker logs` or `journalctl` shows.
+
+### Turning detection off
+
+If you want to keep every scanned page regardless of content, disable detection in the profile:
 
 ```toml
 [profiles.keep-all]
@@ -65,12 +79,34 @@ mode = "color"
 enable_empty_page_detection = false
 ```
 
-This is useful when scanning documents where blank pages are intentional (such as forms with designated blank backs).
+This is useful when scanning documents where blank pages are intentional, such as forms with designated blank backs.
 
-## When Every Page Is Blank
+## Removed pages
 
-If detection removes every page of a scan, the scan fails with "All pages were blank" and nothing is uploaded. If the document really is blank, or its pages are faint enough to look blank, make detection more conservative as described under [Tuning the Thresholds](#tuning-the-thresholds) or disable it for that profile.
+Removed pages are not kept anywhere. They are deleted with the scan's working directory when the scan ends, like every other page of a finished scan. Instead, saneless names them, by where they were in the scanned document:
 
-A scanner that returns no pages at all is reported separately, as "No pages were scanned", and an empty feeder still reports that no paper was detected. The all-blank failure therefore always means the scanner did return pages and detection judged all of them empty, so the two situations are never confused.
+```
+Removed as blank: pages 2, 4 of 4 scanned.
+```
+
+You see this note:
+
+- in the web UI, under the page counts in the status area and in the job history;
+- in `saneless jobs --json`, as the `pages_removed_positions` list;
+- on stdout after the `Done:` line, for `saneless scan`.
+
+The numbers are page numbers in the document as it was scanned, before anything was removed. For a manual duplex scan that is the interleaved document, so page 2 is the back of the first sheet. The numbering is the same for every source, and it is the numbering the log lines above use.
+
+The note is information, not a warning. A scan that removed blank pages is a plain success: **Done** in the web UI, exit 0 from `saneless scan`, and `"warning": null` in `saneless jobs --json`. If a page with something on it was taken for a blank one, rescan that sheet, and lower the threshold for the profile.
+
+Detection does not run on the two PDFs a manual duplex mismatch produces, or on the pages kept after a failed scan. Those exist so you can see exactly what the scanner picked up.
+
+## When every page is blank
+
+If detection removes every page of a scan, nothing is uploaded and the scan fails: `saneless scan` exits 8, and the web UI shows the error on the job. The pages are not lost. saneless assembles every page it scanned, before detection removed any, into one PDF under `failed/` in its data directory, and the error names the file.
+
+If the document really is blank, delete the file. If it is not, lower `empty_page_coverage_threshold` for the profile as described under [Tuning the threshold](#tuning-the-threshold), or turn detection off for it, then scan again. Or upload the kept PDF yourself. [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#every-page-looked-blank-exit-8) covers the same failure from its exit code.
+
+A scanner that returns no pages at all is reported separately, as "No pages were scanned", and an empty feeder still reports that no paper was detected. The all-blank failure therefore always means the scanner did return pages and detection judged all of them blank, so the two situations are never confused.
 
 Empty page detection is the only place saneless judges what is on a page. The scanner backend never discards a page for its content: with detection disabled, a page that is uniformly white or uniformly black is kept and assembled like any other. The only pages the backend skips are the ones it could not read at all -- an image with zero width or height, or a buffer far too small to be a real page -- and each of those is logged individually with its page number. Those are integrity checks rather than blank-page detection: they ask whether the scanner returned a decodable image, never whether the page was worth keeping.
