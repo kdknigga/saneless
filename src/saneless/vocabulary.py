@@ -295,7 +295,8 @@ class ExitCode(IntEnum):
     category leads to either.
 
     ``ALL_BLANK`` (8) means empty-page detection judged every page blank.
-    Nothing was uploaded, and the pages were kept as a PDF in ``failed/``.  It
+    Nothing was uploaded, and the pages were kept in ``failed/``, normally as
+    one PDF (the page files, if it could not be built).  It
     is kept apart from ``SCAN`` because the scanner worked, and a script that
     checks the scanner on exit 1 would be sent the wrong way.
 
@@ -1099,9 +1100,12 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
             )
         case ErrorCategory.ALL_BLANK:
             advice = ErrorAdvice(
+                # Path-free and hedged: the error beside it says what was
+                # really kept, which is one PDF unless building it failed.
                 message=(
                     "Every page looked blank, so nothing was uploaded; the "
-                    "pages were kept as a PDF."
+                    "pages are normally kept as one PDF, and the error says "
+                    "what was kept."
                 ),
                 next_step=(
                     "If the pages are not blank, lower "

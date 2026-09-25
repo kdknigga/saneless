@@ -166,7 +166,7 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 | 5 | Unexpected error (a saneless bug) | Prints one line; the traceback is in the log file -- attach it to a bug report |
 | 6 | Saved to the consume folder | paperless-ngx could not be reached, so the PDF went to the consume folder without its title, tags or correspondent; stdout reads `Saved to folder: <title>`. The document was delivered: do not rescan |
 | 7 | Uploaded with a warning | A sheet the scanner skipped, or manual-duplex front and back counts that differed (uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr. The document was delivered: do not rescan the whole stack |
-| 8 | Every page looked blank | Empty-page detection judged every page blank, so nothing was uploaded; the pages were kept as a PDF in `failed/`. The scanner worked: lower `empty_page_coverage_threshold` or turn detection off if the pages are not blank |
+| 8 | Every page looked blank | Empty-page detection judged every page blank, so nothing was uploaded; the pages were kept in `failed/`, normally as one PDF, and stderr names what was kept. The scanner worked: lower `empty_page_coverage_threshold` or turn detection off if the pages are not blank |
 | 129 | Interrupted by SIGHUP | The terminal or SSH session running the command went away. Pages already scanned were kept in `failed/` |
 | 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; Ctrl-C during a one-shot command |
 | 143 | Interrupted by SIGTERM | `kill`, a service manager or a container runtime stopped the command. Pages already scanned were kept in `failed/` |

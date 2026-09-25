@@ -103,7 +103,7 @@ Detection does not run on the two PDFs a manual duplex mismatch produces, or on 
 
 ## When every page is blank
 
-If detection removes every page of a scan, nothing is uploaded and the scan fails: `saneless scan` exits 8, and the web UI shows the error on the job. The pages are not lost. saneless assembles every page it scanned, before detection removed any, into one PDF under `failed/` in its data directory, and the error names the file.
+If detection removes every page of a scan, nothing is uploaded and the scan fails: `saneless scan` exits 8, and the web UI shows the error on the job. The pages are not lost. saneless assembles every page it scanned, before detection removed any, into one PDF under `failed/` in its data directory, and the error names the file. If that PDF cannot be built -- the disk is short of room, say -- the page files are kept there instead, and the error names their directory.
 
 If the document really is blank, delete the file. If it is not, lower `empty_page_coverage_threshold` for the profile as described under [Tuning the threshold](#tuning-the-threshold), or turn detection off for it, then scan again. Or upload the kept PDF yourself. [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#every-page-looked-blank-exit-8) covers the same failure from its exit code.
 

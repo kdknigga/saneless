@@ -321,7 +321,9 @@ empty-page detection judged every one of them blank, so nothing was uploaded. Th
 the thing to check.
 
 The pages are not lost. saneless assembles every page it scanned, before detection removed any,
-into a PDF under `failed/` in its data directory, and the line names the path. Open it:
+into a PDF under `failed/` in its data directory, and the line names the path. If that PDF cannot
+be built -- the disk is short of room, say -- the page files are kept there instead, and the line
+names their directory. Open what was kept:
 
 - **If the pages really are blank**, there is nothing to do. Delete the file.
 - **If they are not blank** -- faint pencil, light print or a mostly empty form -- detection was too

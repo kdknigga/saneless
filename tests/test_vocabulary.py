@@ -504,6 +504,20 @@ class TestErrorAdvice:
         assert "scanner" not in advice.message.lower()
         assert "scanner" not in advice.next_step.lower()
 
+    def test_all_blank_advice_does_not_promise_a_pdf(self) -> None:
+        """
+        The fixed advice cannot know what was kept, so it does not say.
+
+        The unfiltered pages are normally kept as one PDF, but when that PDF
+        cannot be built the page files are kept instead, or nothing reaches
+        the failed folder at all.  The job's own error says which; the advice
+        shown beside every such job must not contradict it.
+        """
+        advice = error_advice(ErrorCategory.ALL_BLANK)
+        assert "were kept as a PDF" not in advice.message
+        assert "normally" in advice.message
+        assert "error says what was kept" in advice.message
+
     def test_rejected_error_message(self) -> None:
         """REJECTED explains that the scan never started (D-05, D-06)."""
         assert error_message(ErrorCategory.REJECTED) == (
