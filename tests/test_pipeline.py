@@ -73,7 +73,7 @@ from saneless.vocabulary import (
     ScanOutcome,
     classify_error,
 )
-from saneless.workspace import find_orphans
+from saneless.workspace import SPOOL_DIR_NAME, find_orphans, sweep_orphans
 from tests.blank_fixtures import (
     footer_page_number,
     framed_blank,
@@ -2896,8 +2896,8 @@ class TestDiskSpaceCheck:
         request = PipelineRequest(profile_name="default", title="t")
         old = os.umask(0o002)
         try:
-            with _open_workspace(tmp_dir, 0, request) as path:
-                assert path.parent == tmp_dir
+            with _open_workspace(tmp_dir, 0, request) as workspace:
+                assert workspace.path.parent == tmp_dir
         finally:
             os.umask(old)
         assert stat.S_IMODE(tmp_dir.stat().st_mode) == 0o700
@@ -4650,6 +4650,51 @@ class TestPreservationNamesWhatItDidKeep:
         assert f"The scan could NOT be preserved to {failed_dir}" in message
         assert "fully preserved" not in message
         assert "was kept" not in message
+
+    def test_pages_that_could_not_be_kept_stay_for_the_next_sweep(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A failed/ that cannot be written must not cost the only copy.
+
+        Nothing reached failed/, so the workspace is the last copy of the
+        pages: it is left in place, unlocked, and the next sweep recovers it
+        once failed/ can be written again.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+        original = ScanError("Scanner error on page 3: Paper jam")
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(2, original),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Left For Later",
+                    job_id="job-left-1",
+                ),
+            )
+
+        tmp_dir = default_settings.output.tmp_dir
+        (workspace,) = tmp_dir.glob("job-*")
+        spool = workspace / SPOOL_DIR_NAME
+        assert len(list(spool.glob("*.png"))) == 2
+        message = failure_text(excinfo.value)
+        assert f"The scan could NOT be preserved to {failed_dir}" in message
+        assert f"left in {spool}" in message
+
+        # The lock is gone with the run, so the sweep can take it once
+        # failed/ is a directory again.
+        failed_dir.unlink()
+        (recovered,) = sweep_orphans(tmp_dir, failed_dir, 0)
+        assert recovered.pages == 2
+        assert list(tmp_dir.glob("job-*")) == []
+        assert len(list(failed_dir.glob("*.pdf"))) == 1
 
 
 class TestAssemblyFailureKeepsThePageFiles:

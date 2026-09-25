@@ -313,6 +313,22 @@ class TestJobWorkspaceCleanup:
         assert _lock_is_free(path)
         assert [r.levelno for r in caplog.records] == [logging.WARNING]
 
+    def test_a_kept_workspace_stays_with_its_lock_released(
+        self, scratch: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``keep`` leaves the pages for the next sweep, which can claim them."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        workspace = JobWorkspace(
+            scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE
+        )
+        with workspace as path:
+            (path / SPOOL_DIR_NAME / "a-0001.png").write_bytes(b"page")
+            workspace.keep()
+        assert (path / SPOOL_DIR_NAME / "a-0001.png").read_bytes() == b"page"
+        assert _lock_is_free(path)
+        assert [r.levelno for r in caplog.records] == [logging.WARNING]
+        assert str(path) in caplog.records[0].getMessage()
+
 
 class TestSigkillOrphan:
     """A workspace outlives a SIGKILL, and is found as a dead job's."""

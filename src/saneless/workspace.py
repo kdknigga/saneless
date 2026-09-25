@@ -76,6 +76,7 @@ __all__ = [
     "OrphanWorkspace",
     "RecoveredWorkspace",
     "find_orphans",
+    "has_pages_left",
     "sweep_orphans",
 ]
 
@@ -199,8 +200,9 @@ class JobWorkspace:
 
     Use it as a context manager: entering creates the directory (with its
     ``spool`` subdirectory, lock and metadata) and returns its path; leaving
-    removes it, however the block ends. A removal failure is logged at WARNING
-    and never replaces the exception the block raised.
+    removes it, however the block ends -- unless :meth:`keep` was called. A
+    removal failure is logged at WARNING and never replaces the exception the
+    block raised.
 
     The caller is responsible for ``tmp_dir`` itself: it must exist and be
     private (``private_dirs.ensure_private_dir``).
@@ -223,6 +225,7 @@ class JobWorkspace:
         self._profile = profile
         self._path: Path | None = None
         self._fd: int | None = None
+        self._keep = False
 
     @property
     def path(self) -> Path:
@@ -296,13 +299,26 @@ class JobWorkspace:
         self._path = final
         return final
 
+    def keep(self) -> None:
+        """
+        Leave the workspace in place when the block ends, for the next sweep.
+
+        For a failed run whose pages could not all be kept in ``failed/``: the
+        pages still in the spool are then the only copy, and removing them
+        would lose them.  The lock is still released on the way out, so the
+        next sweep -- when ``serve`` starts, or before a ``saneless scan`` --
+        finds the workspace's owner gone and recovers it.
+        """
+        self._keep = True
+
     def __exit__(self, *exc_info: object) -> None:
         """
         Remove the workspace, then release its lock.
 
         The lock is held until the directory is gone, so no sweeper can claim
-        a workspace while it is being removed. Returns None, so an exception
-        raised in the block always propagates unchanged.
+        a workspace while it is being removed. A workspace :meth:`keep` was
+        called for is left in place, and only its lock is released. Returns
+        None, so an exception raised in the block always propagates unchanged.
 
         Args:
             *exc_info: The exception type, value and traceback, if any.
@@ -311,7 +327,13 @@ class JobWorkspace:
         path = self._path
         self._path = None
         try:
-            if path is not None:
+            if path is not None and self._keep:
+                logger.warning(
+                    "Leaving the job workspace %s in place: some of its pages "
+                    "could not be kept, and the next sweep will recover them",
+                    path,
+                )
+            elif path is not None:
                 _remove_quietly(path, "the job workspace")
         finally:
             self._close_lock()
@@ -752,7 +774,7 @@ def _rebuild_pass(paths: list[Path]) -> tuple[PageRecord, ...] | None:
     return tuple(records)
 
 
-def _has_pages_left(spool: Path) -> bool:
+def has_pages_left(spool: Path) -> bool:
     """
     Say whether any spooled page is still in ``spool``.
 
@@ -821,7 +843,7 @@ def _recover_orphan(
             )
         )
         sentence = report.sentence()
-        kept_everything = not (report.problems and _has_pages_left(spool))
+        kept_everything = not (report.problems and has_pages_left(spool))
     logger.warning(
         "Recovered an interrupted scan's workspace for job %s (%r): %s",
         orphan.job_id,

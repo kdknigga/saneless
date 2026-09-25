@@ -33,7 +33,7 @@ from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
-from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace
+from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace, has_pages_left
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
@@ -522,14 +522,15 @@ def _check_disk_space(tmp_dir: Path, min_free_mb: int) -> None:
 @contextlib.contextmanager
 def _open_workspace(
     tmp_dir: Path, min_free_mb: int, request: PipelineRequest
-) -> Generator[Path]:
+) -> Generator[JobWorkspace]:
     """
     Create this run's job workspace under ``tmp_dir``, checking for room.
 
     The workspace is a ``JobWorkspace``: named ``job-<id>-...`` after the job
     and locked for as long as the run holds it, so a sweep of ``tmp_dir``
     can tell a live run's workspace from one a killed process left behind.
-    It is removed when the ``with`` block ends, however it ends.
+    It is removed when the ``with`` block ends, however it ends, unless the
+    run called its ``keep`` because pages in it could not be kept elsewhere.
 
     ``tmp_dir`` is created 0700 when missing and refused when it is not
     private (see ``saneless.private_dirs``); both failures are a
@@ -547,7 +548,8 @@ def _open_workspace(
             workspace records.
 
     Yields:
-        The workspace directory, with its ``spool`` subdirectory created.
+        The entered workspace, whose ``path`` is the directory, with its
+        ``spool`` subdirectory created.
 
     Raises:
         ConfigError: If ``tmp_dir`` cannot be created or measured, or the
@@ -564,18 +566,17 @@ def _open_workspace(
             # below unwrapped.
             ensure_private_dir(tmp_dir, key="output.tmp_dir")
             _check_disk_space(tmp_dir, min_free_mb)
-            workspace_path = stack.enter_context(
-                JobWorkspace(
-                    tmp_dir,
-                    job_id=request.job_id,
-                    title=request.title,
-                    profile=request.profile_name,
-                )
+            workspace = JobWorkspace(
+                tmp_dir,
+                job_id=request.job_id,
+                title=request.title,
+                profile=request.profile_name,
             )
+            stack.enter_context(workspace)
         except OSError as exc:
             msg = f"Could not prepare the working directory {tmp_dir}: {describe(exc)}"
             raise ConfigError(msg) from exc
-        yield workspace_path
+        yield workspace
 
 
 def _require_pages(batch: ScanBatch) -> None:
@@ -1067,6 +1068,9 @@ class _PipelineRun:
             None for every other run.
         workspace: The job's locked workspace directory, which holds the
             spool and the assembled PDFs and is removed when the run ends.
+        keep_workspace: Leaves the workspace in place when the run ends, for
+            the next sweep to recover; called when a failure's pages could
+            not all be kept in ``failed/``.
         ledger: What each acquisition pass has spooled; built here.
         artefacts: What the run has produced and how far it got; built here.
 
@@ -1081,6 +1085,7 @@ class _PipelineRun:
     scan_settings: ScanSettings
     flip: _FlipContext | None
     workspace: Path
+    keep_workspace: Callable[[], None]
     ledger: _SpoolLedger = field(init=False)
     artefacts: preservation.RunArtefacts = field(init=False)
 
@@ -1164,6 +1169,16 @@ class _PipelineRun:
             sentence = report.sentence()
             if sentence is not None:
                 exc.add_note(sentence)
+            if report.problems and has_pages_left(self.spool_dir):
+                # Removing the workspace now would delete the only copy of
+                # the pages the preservation could not move, so it stays for
+                # the next sweep, which retries into failed/.
+                self.keep_workspace()
+                exc.add_note(
+                    f"The pages that could not be kept are left in "
+                    f"{self.spool_dir}, and are moved into failed/ the next "
+                    f"time saneless serve starts or saneless scan runs"
+                )
             # A bare raise, never a rebuilt exception: the original object,
             # its type, attributes and traceback all survive, and
             # classify_error sees what really happened.
@@ -1871,7 +1886,7 @@ def run_pipeline(
     # block would run when the pages were already gone.
     with _open_workspace(
         settings.output.tmp_dir, settings.output.min_free_space_mb, request
-    ) as workspace_path:
+    ) as workspace:
         run = _PipelineRun(
             scanner=scanner,
             paperless=paperless,
@@ -1881,6 +1896,7 @@ def run_pipeline(
             device_id=device_id,
             scan_settings=scan_settings,
             flip=flip,
-            workspace=workspace_path,
+            workspace=workspace.path,
+            keep_workspace=workspace.keep,
         )
         return run.execute()
