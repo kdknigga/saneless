@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import inspect
 import logging
+import os
 import re
 import shutil
+import stat
 import time
 import traceback
 from collections import Counter
@@ -28,6 +31,7 @@ from saneless.paperless import (
     _RetryDecision,
     _without_userinfo,
 )
+from saneless.text_safety import has_control_characters
 from saneless.vocabulary import ConnectionStatus
 from tests.golden_support import (
     DOCUMENTS_PATH,
@@ -3569,3 +3573,290 @@ class TestUploadResultContract:
                 client.upload_document(sample_pdf, "Null Task")
         finally:
             client.close()
+
+
+def _deliver_to_consume_dir(sample_pdf: Path, consume_dir: Path) -> UploadResult:
+    """
+    Force the consume-directory fallback and return its result.
+
+    Args:
+        sample_pdf: The PDF to hand over.
+        consume_dir: The consume directory, which already exists.
+
+    Returns:
+        What ``upload_document`` reported.
+
+    """
+    client = PaperlessClient(
+        url="http://paperless:8000",
+        token=_MOCK_AUTH,
+        consume_dir=consume_dir,
+        transport=_make_transport(_always_refused),
+        max_retries=1,
+    )
+    try:
+        return client.upload_document(sample_pdf, title="Mode test")
+    finally:
+        client.close()
+
+
+_REFUSING_ERRNOS = [
+    pytest.param(errno.EPERM, id="EPERM"),
+    pytest.param(errno.EINVAL, id="EINVAL"),
+    pytest.param(errno.EOPNOTSUPP, id="EOPNOTSUPP"),
+    pytest.param(errno.ENOTSUP, id="ENOTSUP"),
+]
+
+
+class TestConsumeCopyMode:
+    """
+    The consume copy is 0644 whatever the umask.
+
+    paperless-ngx often runs as another user, so a copy left to a umask of 077
+    would be unreadable to it and the fallback would save nothing. The consume
+    folder's own mode decides who can reach the file.
+    """
+
+    def test_consume_mode_is_0644_under_umask_077(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """A umask that would give 0600 still yields a 0644 copy."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+
+        old = os.umask(0o077)
+        try:
+            result = _deliver_to_consume_dir(sample_pdf, consume_dir)
+        finally:
+            os.umask(old)
+
+        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert stat.S_IMODE((consume_dir / "test.pdf").stat().st_mode) == 0o644
+        _assert_no_staging_files(consume_dir)
+
+    @pytest.mark.parametrize("code", _REFUSING_ERRNOS)
+    def test_consume_mode_refusal_still_delivers_the_file(
+        self,
+        sample_pdf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        code: int,
+    ) -> None:
+        """
+        A filesystem that refuses the mode change still gets the document.
+
+        CIFS, vfat and some FUSE mounts have no Unix modes. Refusing to hand
+        the scan over because its mode could not be set would lose it.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        calls: list[int] = []
+
+        def refuse(_fd: int, mode: int) -> None:
+            calls.append(mode)
+            raise OSError(code, "refused")
+
+        monkeypatch.setattr(os, "fchmod", refuse)
+        with caplog.at_level(logging.DEBUG, logger="saneless.paperless"):
+            result = _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        assert calls == [0o644]
+        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
+        _assert_no_staging_files(consume_dir)
+        assert any(
+            record.levelno == logging.DEBUG and "mode" in record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.paperless"
+        )
+
+    def test_consume_mode_io_error_fails_and_removes_the_staging_file(
+        self,
+        sample_pdf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A real failure of the mode change fails the handoff and cleans up."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+
+        def broken(_fd: int, _mode: int) -> None:
+            raise OSError(errno.EIO, "input/output error")
+
+        monkeypatch.setattr(os, "fchmod", broken)
+        with pytest.raises(
+            PaperlessError, match="Could not copy the PDF to the consume directory"
+        ) as exc_info:
+            _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        assert isinstance(exc_info.value.__cause__, OSError)
+        assert sorted(entry.name for entry in consume_dir.iterdir()) == []
+
+
+_TASK_ID_LIMIT = 64
+"""The most characters of a paperless task id a log line or message carries."""
+
+_HOSTILE_TASK_ID = "\x1b[31m" + "x" * 295
+"""A 300-character task id that opens with a terminal colour escape."""
+
+
+def _assert_task_id_is_tame(text: str) -> None:
+    """
+    Assert ``text`` carries the hostile task id only in its bounded form.
+
+    Args:
+        text: A log line or an exception message.
+
+    """
+    assert not has_control_characters(text)
+    assert "x" * _TASK_ID_LIMIT not in text
+
+
+def _task_id_part(message: str, after: str) -> str:
+    """
+    Return the task id a ``Paperless task <id> <after>`` message names.
+
+    Args:
+        message: The exception text.
+        after: The words that follow the id.
+
+    Returns:
+        The text between ``Paperless task`` and ``after``.
+
+    """
+    match = re.match(rf"Paperless task (.*) {re.escape(after)}", message, re.DOTALL)
+    assert match is not None, message
+    return match.group(1)
+
+
+def _paperless_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return every formatted line ``saneless.paperless`` logged."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "saneless.paperless"
+    ]
+
+
+class TestTaskIdIsBoundedInLogs:
+    """
+    Paperless's task id is third-party text, so it is bounded and neutralised.
+
+    It is still sent back to paperless unchanged: only what saneless prints is
+    tamed.
+    """
+
+    def test_task_id_in_the_upload_log_is_bounded(
+        self, sample_pdf: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The upload's INFO line shows a short, escaped id; the result keeps it."""
+
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=_HOSTILE_TASK_ID)
+
+        client = _poll_client(handler)
+        try:
+            with caplog.at_level(logging.INFO, logger="saneless.paperless"):
+                result = client.upload_document(sample_pdf, title="Hostile id")
+        finally:
+            client.close()
+
+        assert result.task_uuid == _HOSTILE_TASK_ID
+        lines = [line for line in _paperless_lines(caplog) if "task" in line.lower()]
+        assert lines
+        for line in lines:
+            _assert_task_id_is_tame(line)
+        # The escape is shown, not dropped, so the operator can see it was there.
+        assert any("x1b[31m" in line for line in lines)
+
+    @pytest.mark.parametrize(
+        "respond",
+        [
+            pytest.param(
+                _task_answer({"task_id": _HOSTILE_TASK_ID, "status": "PENDING"}),
+                id="pending",
+            ),
+            pytest.param(
+                _raising(httpx2.ConnectError("connection refused")),
+                id="transport-error",
+            ),
+        ],
+    )
+    def test_task_id_in_the_timeout_message_is_bounded(
+        self,
+        sleeps: list[float],
+        caplog: pytest.LogCaptureFixture,
+        respond: Callable[[int], httpx2.Response],
+    ) -> None:
+        """A poll timeout names a bounded id, and so does every log line."""
+        sent: list[str] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request.url.params["task_id"])
+            return respond(len(sent))
+
+        client = _poll_client(handler)
+        try:
+            with (
+                caplog.at_level(logging.INFO, logger="saneless.paperless"),
+                pytest.raises(PaperlessTimeoutError) as exc_info,
+            ):
+                client.poll_task(_HOSTILE_TASK_ID, timeout=0.05)
+        finally:
+            client.close()
+
+        assert sleeps
+        # What goes back to paperless is the id it issued, untouched.
+        assert set(sent) == {_HOSTILE_TASK_ID}
+        message = str(exc_info.value)
+        _assert_task_id_is_tame(message)
+        task_id = _task_id_part(message, "did not finish within")
+        assert len(task_id) <= _TASK_ID_LIMIT
+        lines = _paperless_lines(caplog)
+        assert lines
+        for line in lines:
+            _assert_task_id_is_tame(line)
+
+    def test_task_id_in_the_failure_message_is_bounded(self) -> None:
+        """A FAILURE names a bounded id in the message that becomes job.error."""
+        client = _poll_client(
+            _CountingHandler(
+                _task_answer(
+                    {
+                        "task_id": _HOSTILE_TASK_ID,
+                        "status": "FAILURE",
+                        "result": "disk on fire",
+                    }
+                )
+            )
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.poll_task(_HOSTILE_TASK_ID, timeout=10)
+        finally:
+            client.close()
+
+        message = str(exc_info.value)
+        _assert_task_id_is_tame(message)
+        assert len(_task_id_part(message, "ended FAILURE")) <= _TASK_ID_LIMIT
+        assert "disk on fire" in message
+
+    def test_task_id_in_the_success_log_is_bounded(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The completion INFO line shows a short, escaped id."""
+        client = _poll_client(
+            _CountingHandler(
+                _task_answer({"task_id": _HOSTILE_TASK_ID, "status": "SUCCESS"})
+            )
+        )
+        try:
+            with caplog.at_level(logging.INFO, logger="saneless.paperless"):
+                client.poll_task(_HOSTILE_TASK_ID, timeout=10)
+        finally:
+            client.close()
+
+        lines = [line for line in _paperless_lines(caplog) if "completed" in line]
+        assert len(lines) == 1
+        _assert_task_id_is_tame(lines[0])

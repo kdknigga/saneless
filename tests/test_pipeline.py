@@ -5028,3 +5028,186 @@ class TestTitleLogEscaping:
         source = inspect.getsource(pipeline_module)
 
         assert "'%s'" not in source
+
+
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+
+
+@pytest.fixture
+def umask_022() -> Iterator[None]:
+    """
+    Run the test under umask 022, the common default.
+
+    Under it a plain ``mkdir`` gives 0755 and a new file 0644, readable by
+    every local user, which is exactly what a preserved scan must not be.
+    """
+    old = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+def _mode(path: Path) -> int:
+    """Return the permission bits of ``path``."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _fail_the_upload(settings: Settings, job_id: str) -> None:
+    """
+    Run one single-page scan whose upload fails, so its PDF is preserved.
+
+    Args:
+        settings: Settings already pointed at an isolated ``data_dir``.
+        job_id: The job id the preserved PDF is named from.
+
+    """
+    paperless = MagicMock()
+    paperless.upload_document.side_effect = PaperlessError("Upload failed")
+    with pytest.raises(PaperlessError):
+        run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=settings,
+            request=PipelineRequest(
+                profile_name="default", title="Private Scan", job_id=job_id
+            ),
+        )
+
+
+@pytest.mark.usefixtures("umask_022")
+class TestPreservedFilesArePrivate:
+    """
+    A failed scan leaves only owner-only files and directories behind.
+
+    Preserved scans are whole documents. On a fresh ``data_dir`` every
+    directory saneless creates for them is 0700 and every file it moves there
+    is 0600, whatever the umask. Directories that already exist keep the mode
+    an earlier release gave them.
+    """
+
+    def test_preserved_pdf_mode_is_private_on_a_fresh_data_dir(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """``data_dir`` and ``failed/`` are 0700 and the PDF is 0600."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+
+        _fail_the_upload(default_settings, "job-mode-1")
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert _mode(failed_dir.parent) == _PRIVATE_DIR_MODE
+        assert _mode(failed_dir) == _PRIVATE_DIR_MODE
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+    def test_preserved_pdf_mode_survives_a_cross_filesystem_move(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A move between filesystems copies the file and still keeps it 0600.
+
+        ``tmp_dir`` and ``data_dir`` may be different volumes, where a rename
+        fails with EXDEV and ``shutil`` falls back to a copy.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        real_rename = os.rename
+        crossed: list[str] = []
+
+        def cross_device(src: str | Path, dst: str | Path) -> None:
+            if Path(dst).parent == failed_dir:
+                crossed.append(str(dst))
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+            real_rename(src, dst)
+
+        monkeypatch.setattr(os, "rename", cross_device)
+
+        _fail_the_upload(default_settings, "job-mode-2")
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert crossed == [str(preserved[0])]
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+    def test_partial_pdf_mode_is_private(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A mid-batch jam's partial PDF is 0600 in a 0700 ``failed/``."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=_jamming_scanner(
+                    2, ScanError("Scanner error on page 3: Document feeder jammed")
+                ),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Jammed", job_id="job-mode-3"
+                ),
+            )
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "partial" in preserved[0].name
+        assert _mode(failed_dir.parent) == _PRIVATE_DIR_MODE
+        assert _mode(failed_dir) == _PRIVATE_DIR_MODE
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+    def test_preserved_page_files_mode_is_private(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Pages kept after an assembly failure are 0600 in a 0700 directory."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [distinct_page(index) for index in range(2)]
+        )
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(PdfError),
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Pages", job_id="job-mode-4"
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        pages = sorted(kept[0].iterdir())
+        assert len(pages) == 2
+        assert _mode(failed_dir.parent) == _PRIVATE_DIR_MODE
+        assert _mode(failed_dir) == _PRIVATE_DIR_MODE
+        assert _mode(kept[0]) == _PRIVATE_DIR_MODE
+        assert [_mode(page) for page in pages] == [_PRIVATE_FILE_MODE] * 2
+
+    def test_existing_failed_dir_mode_is_kept(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """
+        A ``failed/`` an earlier release made 0755 stays 0755.
+
+        Files and directories left by earlier releases are not re-moded; the
+        upgrade notes give the commands to tighten them. The new PDF inside is
+        still private.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.mkdir(parents=True)
+        failed_dir.parent.chmod(0o755)
+        failed_dir.chmod(0o755)
+
+        _fail_the_upload(default_settings, "job-mode-5")
+
+        assert _mode(failed_dir.parent) == 0o755
+        assert _mode(failed_dir) == 0o755
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert _mode(preserved[0]) == _PRIVATE_FILE_MODE

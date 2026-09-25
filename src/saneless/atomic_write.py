@@ -26,7 +26,7 @@ from typing import Final
 
 from .exceptions import ConfigError
 
-__all__ = ["replace_file_atomically"]
+__all__ = ["refused_mode_change", "replace_file_atomically"]
 
 logger = logging.getLogger(__name__)
 
@@ -128,12 +128,16 @@ _REFUSED: Final = frozenset(
 )
 
 
-def _refused(exc: OSError) -> bool:
+def refused_mode_change(exc: OSError) -> bool:
     """
     Report whether an ownership or mode change was refused, not broken.
 
+    Serves every ``chown`` or ``chmod`` whose refusal must not fail an
+    otherwise-good write: the config rewrite here, and the consume-directory
+    copy, whose mode a filesystem without Unix modes cannot take.
+
     Args:
-        exc: The error ``fchown`` or ``fchmod`` raised.
+        exc: The error ``fchown``, ``fchmod`` or ``chmod`` raised.
 
     Returns:
         True when the errno is one of ``_REFUSED``.
@@ -167,20 +171,20 @@ def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
     try:
         os.fchown(fd, original.st_uid, original.st_gid)
     except OSError as exc:
-        if not _refused(exc):
+        if not refused_mode_change(exc):
             raise
         logger.debug("Not copying the config file's owner: %s", exc.strerror)
         try:
             os.fchown(fd, -1, original.st_gid)
         except OSError as group_exc:
-            if not _refused(group_exc):
+            if not refused_mode_change(group_exc):
                 raise
             logger.debug("Not copying the config file's group: %s", group_exc.strerror)
     try:
         os.fchmod(fd, stat.S_IMODE(original.st_mode))
     except OSError as exc:
         # The temp file then keeps mkstemp's 0600: narrower, never wider.
-        if not _refused(exc):
+        if not refused_mode_change(exc):
             raise
         logger.debug("Not copying the config file's mode: %s", exc.strerror)
 

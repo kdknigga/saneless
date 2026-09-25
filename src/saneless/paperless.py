@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx2
 
+from .atomic_write import refused_mode_change
 from .exceptions import ConfigError, PaperlessError, PaperlessTimeoutError, describe
+from .text_safety import neutralise_bounded
 from .vocabulary import ConnectionStatus
 
 if TYPE_CHECKING:
@@ -68,6 +70,12 @@ _METADATA_PAGE_SIZE: Final = 1000
 # proxy that ignores ``?page=`` but varies its answer would otherwise keep the
 # fetch, and the metadata cache lock it runs under, busy forever.
 _METADATA_MAX_PAGES: Final = 1000
+
+# The most characters of a paperless task id that reach a log line or an error
+# message. The id is third-party text: paperless-ngx issues UUIDs, but nothing
+# stops a misbehaving server or proxy from answering with megabytes or with
+# terminal escape sequences, and the message becomes job.error.
+_TASK_ID_LOG_LIMIT: Final = 64
 
 _DUPLICATE_HINT = (
     "the document may already be in Paperless; check before scanning again"
@@ -535,6 +543,24 @@ def _bounded_line(text: str) -> str:
     return line
 
 
+def _loggable_task_id(task_id: str) -> str:
+    """
+    Tame a paperless task id for a log line or an error message.
+
+    Only what saneless prints is changed: the raw id is still what the poll
+    sends back to paperless.
+
+    Args:
+        task_id: The id paperless answered the upload with.
+
+    Returns:
+        The id with control characters shown as escapes, cut to
+        ``_TASK_ID_LOG_LIMIT`` characters.
+
+    """
+    return neutralise_bounded(task_id, _TASK_ID_LOG_LIMIT)
+
+
 def _not_accepted_message(response: httpx2.Response, token: str) -> str:
     """
     Say why a non-2xx upload response that is not a server error is final.
@@ -867,7 +893,7 @@ class PaperlessClient:
                     case unreachable:
                         assert_never(unreachable)
             else:
-                logger.info("Upload succeeded, task ID: %s", task_id)
+                logger.info("Upload succeeded, task ID: %r", _loggable_task_id(task_id))
                 return UploadResult(delivered_to_api=True, task_uuid=task_id)
 
         if self._consume_dir is not None:
@@ -1134,6 +1160,21 @@ class PaperlessClient:
         try:
             with staged.open("wb") as staged_file, pdf_path.open("rb") as source:
                 shutil.copyfileobj(source, staged_file)
+                # 0644 so paperless-ngx can read the copy whatever UID it runs
+                # as; the consume folder's own mode decides who can reach it.
+                # A chmod is not subject to the umask, and it is applied
+                # before the rename so the final name never exists with any
+                # other mode. A filesystem without Unix modes refuses it, and
+                # that must not fail a handoff that would otherwise save the
+                # scan.
+                try:
+                    os.fchmod(staged_file.fileno(), 0o644)
+                except OSError as exc:
+                    if not refused_mode_change(exc):
+                        raise
+                    logger.debug(
+                        "Not setting the consume copy's mode: %s", exc.strerror
+                    )
                 staged_file.flush()
                 os.fsync(staged_file.fileno())
             staged.replace(dest)
@@ -1215,8 +1256,8 @@ class PaperlessClient:
             except httpx2.RequestError as exc:
                 last_transport_error = exc
                 logger.warning(
-                    "Polling task %s failed, retrying until the deadline: %s",
-                    task_id,
+                    "Polling task %r failed, retrying until the deadline: %s",
+                    _loggable_task_id(task_id),
                     self._reason(exc),
                 )
             else:
@@ -1232,8 +1273,9 @@ class PaperlessClient:
             # deadline.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                logger.warning("Task %s did not finish within %ss", task_id, timeout)
-                msg = f"Paperless task {task_id} did not finish within {timeout}s"
+                shown = _loggable_task_id(task_id)
+                logger.warning("Task %r did not finish within %ss", shown, timeout)
+                msg = f"Paperless task {shown} did not finish within {timeout}s"
                 if last_transport_error is None:
                     raise PaperlessTimeoutError(msg)
                 msg = f"{msg}; last error: {self._reason(last_transport_error)}"
@@ -1288,7 +1330,7 @@ class PaperlessClient:
             return None
         status = _task_status(task)
         if status == "SUCCESS":
-            logger.info("Task %s completed: %s", task_id, status)
+            logger.info("Task %r completed: %s", _loggable_task_id(task_id), status)
             return task
         if status in _TERMINAL_STATUSES:
             full_failure = " ".join(
@@ -1299,7 +1341,9 @@ class PaperlessClient:
             # the CLI line.  The duplicate check reads the
             # whole text, so a hint past the cut is not lost.
             failure = _bounded_line(full_failure) or _NO_FAILURE_MESSAGE
-            msg = f"Paperless task {task_id} ended {status}: {failure}"
+            msg = (
+                f"Paperless task {_loggable_task_id(task_id)} ended {status}: {failure}"
+            )
             if _is_duplicate_failure(task, full_failure):
                 msg = f"{msg}; {_DUPLICATE_HINT}"
             raise PaperlessError(msg)

@@ -76,6 +76,22 @@ See [Configure Scan Profiles](configure-scan-profiles.md) for more profile optio
 
 Scans in progress are written under `tmp_dir`, by default `$TMPDIR/saneless-<uid>` (for example `/tmp/saneless-1000`), which saneless creates so that only your user can enter it; see [`[output]`](../reference/configuration.md#output) for what it refuses at startup. Upgrading from an earlier release? The old `/tmp/saneless` directory is no longer used and may be deleted, once any `saneless.db` a release older than `data_dir` left in it has been moved to `data_dir`.
 
+### Upgrading from an earlier release
+
+saneless now keeps what it writes under `data_dir` (by default `~/.local/state/saneless`) to your user. When it creates `data_dir`, `failed/` or a preserved page directory, it creates it `0700`. A new job database (`saneless.db`, with its `-wal` and `-shm` files) and each preserved PDF and page file are `0600`.
+
+Files and directories an earlier release created keep their modes: saneless does not change them at startup. To tighten them, run this once, with `DATA_DIR` set to your `data_dir`:
+
+```bash
+DATA_DIR=~/.local/state/saneless
+chmod 700 "$DATA_DIR" "$DATA_DIR/failed"
+chmod 600 "$DATA_DIR"/saneless.db*
+find "$DATA_DIR/failed" -mindepth 1 -type d -exec chmod 700 {} +
+find "$DATA_DIR/failed" -type f -exec chmod 600 {} +
+```
+
+`chmod` reports an error for a path that does not exist yet, such as `failed/` before any scan has been preserved; that path needs nothing.
+
 ## Troubleshooting
 
 **`python-sane` fails to compile**

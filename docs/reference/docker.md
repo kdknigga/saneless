@@ -200,6 +200,29 @@ is an operator task.
 Upgrading from a release where the job database lived under `/tmp/saneless`?
 See [Upgrading from a pre-`data_dir` release](../how-to/deploy-docker-compose.md#upgrading-from-a-pre-data_dir-release).
 
+### Upgrading from an earlier release
+
+saneless now keeps what it writes under `/var/lib/saneless` to its own user.
+A new job database (`saneless.db`, with its `-wal` and `-shm` files) is created
+`0600`. `failed/` and each preserved page directory are created `0700`, and
+each preserved PDF and page file is `0600`.
+
+Files and directories an earlier release created keep their modes: saneless
+does not change them at startup. To tighten them, run this once:
+
+```bash
+docker compose exec saneless sh -c '
+  chmod 700 /var/lib/saneless /var/lib/saneless/failed
+  chmod 600 /var/lib/saneless/saneless.db*
+  find /var/lib/saneless/failed -mindepth 1 -type d -exec chmod 700 {} +
+  find /var/lib/saneless/failed -type f -exec chmod 600 {} +
+'
+```
+
+`chmod` reports an error for a path that does not exist yet, such as `failed/`
+before any scan has been preserved; that path needs nothing. These commands
+change only the modes, not the owner, so the container keeps full access.
+
 ## Environment Variables
 
 All `SANELESS_*` environment variables are supported inside the container. Common ones for Docker deployments:
