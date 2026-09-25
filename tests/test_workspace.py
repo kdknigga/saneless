@@ -767,6 +767,49 @@ class TestSweepOrphans:
         assert repr(_TITLE) in named[0]
         assert str(pdfs[0]) in named[0]
 
+    def test_the_work_ahead_is_announced_before_it_starts(
+        self,
+        scratch: Path,
+        failed_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        One INFO line counts the orphans and their pages before any is touched.
+
+        At serve startup the sweep runs before the web server answers, so a
+        large orphan would otherwise be minutes of silence.
+        """
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        leave_killed_workspace(scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE)
+
+        sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        messages = [record.getMessage() for record in caplog.records]
+        announced = [m for m in messages if m.startswith("Recovering ")]
+        assert announced == [
+            "Recovering 1 orphaned workspace(s) holding 2 spooled page(s) "
+            "before going on; many pages take a while"
+        ]
+        first_recovery = next(
+            index
+            for index, message in enumerate(messages)
+            if message.startswith("Recovered an interrupted scan")
+        )
+        assert messages.index(announced[0]) < first_recovery
+
+    def test_nothing_to_recover_announces_nothing(
+        self,
+        scratch: Path,
+        failed_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An empty scratch directory is swept in silence."""
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+
+        sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert [r for r in caplog.records if "Recovering" in r.getMessage()] == []
+
     def test_a_live_workspace_is_left_alone(
         self, scratch: Path, failed_dir: Path
     ) -> None:

@@ -1006,6 +1006,22 @@ def sweep_orphans(
     if not tmp_dir.is_dir():
         return []
     orphans = find_orphans(tmp_dir)
+    if orphans:
+        # Said up front, because every page is decoded and a PDF assembled
+        # and copied before this returns -- and at serve startup, before the
+        # web server answers anything, so a long silence has an explanation.
+        pages = sum(
+            len(_page_files(orphan.spool, pattern))
+            for orphan in orphans
+            if _is_own_directory(orphan.spool)
+            for pattern in (_FRONT_PAGES, _BACK_PAGES)
+        )
+        logger.info(
+            "Recovering %d orphaned workspace(s) holding %d spooled page(s) "
+            "before going on; many pages take a while",
+            len(orphans),
+            pages,
+        )
     recovered: list[RecoveredWorkspace] = []
     try:
         for orphan in orphans:
