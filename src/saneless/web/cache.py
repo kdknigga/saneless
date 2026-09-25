@@ -114,14 +114,14 @@ class MetadataCache:
         When ``fetch`` raises and the key has a last good copy, that copy is
         returned and kept for one more TTL, and one warning names the key and
         the cause, without a traceback: the message of a Paperless client
-        error, or the class name of anything else.  The threads queued behind the failed fetch find the
-        re-armed entry, so an outage costs one failed fetch and one log line
-        per TTL rather than one per page load.  The re-arm obeys the same
-        invalidate check as a successful fetch; when an invalidate stops it,
-        the copy is still returned but the warning says the next request
-        fetches again rather than promising another TTL.  When there is no
-        last good copy, the exception propagates, nothing is cached, and the
-        next call fetches again.
+        error, or the class name of anything else.  The threads queued behind
+        the failed fetch find the re-armed entry, so an outage costs one
+        failed fetch and one log line per TTL rather than one per page load.
+        The re-arm obeys the same invalidate check as a successful fetch;
+        when an invalidate stops it, the copy is still returned but the
+        warning says the next request fetches again rather than promising
+        another TTL.  When there is no last good copy, the exception
+        propagates, nothing is cached, and the next call fetches again.
 
         Known limitation: while Paperless is unreachable and there is no last
         good copy, the waiting threads retry the fetch one after another, each
