@@ -6324,3 +6324,342 @@ class TestProfileStorage:
         assert row.state is CheckState.OK
         assert "in memory" not in row.message.lower()
         assert not row.next_step
+
+
+# What the simulated locked job database says.  The progress-write tests use
+# the text SQLite really gives a writer that lost the lock.
+_LOCKED = "database is locked"
+
+# A flip timeout short enough for a test to sit through, and still a whole
+# second longer than the minimum the setting allows.
+_SHORT_FLIP_TIMEOUT = 2
+
+
+class _FailingStateWrite:
+    """
+    ``JobStore.update_state`` that raises on its first calls for one state.
+
+    Every call records the state it was asked to write.  The first
+    ``failures`` calls for ``state`` raise ``sqlite3.OperationalError`` as a
+    locked database would; every other call delegates to the real method, so
+    the row the worker writes is the row the test reads back.
+
+    Args:
+        original: The bound ``update_state`` being replaced.
+        state: The state whose writes fail.
+        failures: How many of that state's writes fail before one lands.
+
+    """
+
+    def __init__(
+        self,
+        original: Callable[..., None],
+        state: JobState,
+        failures: int,
+    ) -> None:
+        """Wrap ``original``, failing ``failures`` writes of ``state``."""
+        self._original = original
+        self._state = state
+        self._failures = failures
+        self._lock = threading.Lock()
+        self._seen: list[JobState] = []
+        self._failed = 0
+
+    @property
+    def seen(self) -> list[JobState]:
+        """Every state the worker asked to write so far, in order."""
+        with self._lock:
+            return list(self._seen)
+
+    @property
+    def failed(self) -> int:
+        """How many writes have raised so far."""
+        with self._lock:
+            return self._failed
+
+    def __call__(
+        self,
+        job_id: str,
+        state: JobState,
+        error: str | None = None,
+        error_category: ErrorCategory | None = None,
+    ) -> None:
+        """Record the state, then raise or delegate."""
+        with self._lock:
+            self._seen.append(state)
+            failing = state is self._state and self._failed < self._failures
+            if failing:
+                self._failed += 1
+        if failing:
+            raise sqlite3.OperationalError(_LOCKED)
+        self._original(job_id, state, error=error, error_category=error_category)
+
+
+def _loop_failures_at_finish(
+    worker: ScanWorker, store: JobStore, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[int, bool]]:
+    """
+    Record the loop-failure count and degraded flag at each terminal write.
+
+    The loop resets the count after every job whose writes all land, so reading
+    it once the job is over proves nothing.  Reading it as the terminal write
+    starts does: anything the job's progress writes counted is still there.
+
+    Args:
+        worker: The unstarted worker under test.
+        store: The store it writes to.
+        monkeypatch: Replaces ``store.finish_job``.
+
+    Returns:
+        A list that gains ``(count, degraded)`` at every ``finish_job`` call.
+
+    """
+    snapshots: list[tuple[int, bool]] = []
+    original = store.finish_job
+
+    def watching_finish(
+        job_id: str,
+        state: JobState,
+        result: JobResult | None = None,
+        error: str | None = None,
+        error_category: ErrorCategory | None = None,
+    ) -> None:
+        snapshots.append((worker._consecutive_loop_failures, worker._degraded.is_set()))
+        original(
+            job_id, state, result=result, error=error, error_category=error_category
+        )
+
+    monkeypatch.setattr(store, "finish_job", watching_finish)
+    return snapshots
+
+
+def _progress_write_warnings(
+    caplog: pytest.LogCaptureFixture, job_id: str
+) -> list[logging.LogRecord]:
+    """
+    Return the worker's WARNINGs about ``job_id`` that carry a store error.
+
+    Args:
+        caplog: The test's log capture.
+        job_id: The job the warning must name.
+
+    Returns:
+        The matching records, in order.
+
+    """
+    return [
+        record
+        for record in caplog.records
+        if record.name == "saneless.worker"
+        and record.levelno == logging.WARNING
+        and job_id in record.getMessage()
+        and record.exc_info is not None
+        and isinstance(record.exc_info[1], sqlite3.OperationalError)
+    ]
+
+
+class TestProgressWriteFailures:
+    """
+    A failed progress write to the job store never changes how a scan ends.
+
+    The thumbnail and the active-state writes only tell observers how far a
+    scan has got.  A locked or failing job database during one of them used to
+    abort the run, file the store's error as a scanner fault and, outside the
+    pipeline's guard windows, delete the spooled pages.  Each test here runs
+    the real pipeline over a manual-duplex job, so the spool, the flip wait and
+    the assembly are all real; only the scanner and Paperless are fakes.
+    """
+
+    @pytest.mark.parametrize(
+        "state",
+        [JobState.ASSEMBLING, JobState.UPLOADING, JobState.SCANNING_REVERSE],
+        ids=lambda state: state.value.lower(),
+    )
+    def test_a_progress_write_failing_once_leaves_the_scan_to_finish(
+        self,
+        state: JobState,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """The document is uploaded, the job is DONE and the failure is a WARNING."""
+        caplog.set_level(logging.WARNING, logger="saneless.worker")
+        scanner = _CountedPassScanner(fronts=1, backs=1)
+        scanner.release_pass_b.set()
+        store = JobStore()
+        updates = _FailingStateWrite(store.update_state, state, failures=1)
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        # A MonkeyPatch context rather than the fixture keeps this parametrised
+        # test inside the lint's argument limit.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(store, "update_state", updates)
+            at_finish = _loop_failures_at_finish(worker, store, patch)
+            try:
+                worker.start()
+                job = _run_duplex_job(worker, store, f"Locked At {state.value}")
+                wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+                claimed = worker.continue_flip(job.id)
+                finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            finally:
+                worker.stop()
+                store.close()
+
+        assert claimed
+        assert updates.failed == 1
+        assert finished.state is JobState.DONE
+        assert finished.error is None
+        assert finished.error_category is None
+        assert mock_paperless.upload_document.call_count == 1
+        warnings = _progress_write_warnings(caplog, job.id)
+        assert len(warnings) == 1
+        assert state.value in warnings[0].getMessage()
+        assert at_finish == [(0, False)]
+        # Nothing was filed as a failure: the pages went to Paperless.
+        assert not list(isolated_duplex_settings.output.failed_dir.glob("*"))
+
+    def test_a_progress_write_failing_at_the_thumbnail_leaves_the_scan_to_finish(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """The job is DONE without a thumbnail, and the failure is a WARNING."""
+        caplog.set_level(logging.WARNING, logger="saneless.worker")
+        scanner = _CountedPassScanner(fronts=1, backs=1)
+        scanner.release_pass_b.set()
+        store = JobStore()
+        thumbnails = _StoreFault(store.update_thumbnail, frozenset({1}))
+        monkeypatch.setattr(store, "update_thumbnail", thumbnails)
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        at_finish = _loop_failures_at_finish(worker, store, monkeypatch)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Locked At The Thumbnail")
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            claimed = worker.continue_flip(job.id)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert claimed
+        assert len(thumbnails.calls) == 1
+        assert finished.state is JobState.DONE
+        assert finished.error is None
+        assert finished.error_category is None
+        assert finished.thumbnail is None
+        assert mock_paperless.upload_document.call_count == 1
+        warnings = _progress_write_warnings(caplog, job.id)
+        assert len(warnings) == 1
+        assert "thumbnail" in warnings[0].getMessage()
+        assert at_finish == [(0, False)]
+        assert not list(isolated_duplex_settings.output.failed_dir.glob("*"))
+
+    def test_a_progress_write_failing_once_at_the_flip_prompt_is_retried(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The prompt renders from the row, so its write is tried a second time.
+
+        Reaching AWAITING_FLIP at all is the proof the retry landed: the first
+        write of it raised.  The operator's Continue is then accepted and the
+        scan finishes as if nothing had happened.
+        """
+        caplog.set_level(logging.WARNING, logger="saneless.worker")
+        scanner = _CountedPassScanner(fronts=1, backs=1)
+        scanner.release_pass_b.set()
+        store = JobStore()
+        updates = _FailingStateWrite(
+            store.update_state, JobState.AWAITING_FLIP, failures=1
+        )
+        monkeypatch.setattr(store, "update_state", updates)
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        at_finish = _loop_failures_at_finish(worker, store, monkeypatch)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Locked At The Prompt Once")
+            waiting = wait_for_state(
+                store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET
+            )
+            claimed = worker.continue_flip(job.id)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert waiting.state is JobState.AWAITING_FLIP
+        assert claimed
+        assert updates.seen.count(JobState.AWAITING_FLIP) == 2
+        assert finished.state is JobState.DONE
+        assert finished.error is None
+        assert mock_paperless.upload_document.call_count == 1
+        assert scanner.scan_calls == 2
+        warnings = _progress_write_warnings(caplog, job.id)
+        assert len(warnings) == 1
+        assert JobState.AWAITING_FLIP.value in warnings[0].getMessage()
+        assert at_finish == [(0, False)]
+
+    def test_a_progress_write_failing_twice_at_the_flip_prompt_waits_for_the_timeout(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        With the prompt's row unwritable, the flip timeout still keeps the fronts.
+
+        One retry, then the worker logs and keeps waiting rather than ending
+        the scan itself.  Nobody can see a prompt to answer, so the bounded
+        flip wait runs out and ends the job the way any unanswered flip ends:
+        ERROR with the timeout's own text, pass A's fronts filed in
+        ``failed/``, and the store's error never recorded as a scanner fault.
+        """
+        caplog.set_level(logging.WARNING, logger="saneless.worker")
+        settings = isolated_duplex_settings
+        settings.output.flip_timeout_seconds = _SHORT_FLIP_TIMEOUT
+        scanner = _CountedPassScanner(fronts=2, backs=2)
+        store = JobStore()
+        updates = _FailingStateWrite(
+            store.update_state, JobState.AWAITING_FLIP, failures=2
+        )
+        monkeypatch.setattr(store, "update_state", updates)
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        at_finish = _loop_failures_at_finish(worker, store, monkeypatch)
+        try:
+            worker.start()
+            submitted = time.monotonic()
+            job = _run_duplex_job(worker, store, "Locked At The Prompt Twice")
+            finished = wait_for_state(
+                store, job.id, TERMINAL_STATES, _SHORT_FLIP_TIMEOUT + _STATE_BUDGET
+            )
+            elapsed = time.monotonic() - submitted
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        # Exactly one retry: two attempts, and no third.
+        assert updates.seen.count(JobState.AWAITING_FLIP) == 2
+        assert len(_progress_write_warnings(caplog, job.id)) == 2
+        # It waited out the flip timeout rather than ending at the failed write.
+        assert elapsed >= _SHORT_FLIP_TIMEOUT
+        assert finished.state is JobState.ERROR
+        assert finished.error is not None
+        assert "flip wait timed out" in finished.error
+        assert _LOCKED not in finished.error
+        assert scanner.scan_calls == 1
+        assert mock_paperless.upload_document.call_count == 0
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "fronts" in preserved[0].name
+        assert at_finish == [(0, False)]
