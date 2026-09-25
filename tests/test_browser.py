@@ -696,16 +696,17 @@ class TestTheEgressGateRefuses:
         browser: Browser,
         browser_server: _BrowserServer,
         egress_allowlist: list[str],
-        poll_until: Callable[..., bool],
     ) -> None:
         """
-        A fetch aimed off the allowlist is recorded and never leaves (ROBU-09).
+        A navigation aimed off the allowlist is recorded and never leaves (ROBU-09).
 
         The page is served by the test server first, so the probe is issued by
         a live document through the same gate every other browser test relies
-        on. The rejection is swallowed inside the page because an aborted fetch
-        rejects, and that rejection is a consequence of the block rather than
-        the thing being proved.
+        on. It is a navigation rather than a ``fetch``: the page's own
+        Content-Security-Policy refuses a ``fetch`` to another origin before
+        any request is made, so a ``fetch`` would never reach the gate. A
+        top-level navigation is the one way out that policy does not govern,
+        which is why the gate is still needed.
         """
         # Not the module ``context`` fixture: its teardown asserts ``blocked``
         # is empty, and refusing something on purpose is this test's subject.
@@ -720,21 +721,20 @@ class TestTheEgressGateRefuses:
             _make_csp_gate(ctx, violations)
             page = ctx.new_page()
             page.goto(browser_server.url)
-            page.evaluate(
-                "(url) => { fetch(url).catch(() => {}); }", _OFF_ALLOWLIST_URL
-            )
-
-            def refusal_recorded() -> bool:
-                # The round-trip is what makes the poll work at all: the sync
-                # API only dispatches route handlers while the caller is
-                # inside a Playwright call, so a predicate that merely read
-                # the list would hold this thread and never let the gate run.
-                page.evaluate("0")
-                return bool(blocked)
-
-            assert poll_until(refusal_recorded, budget=_EGRESS_PROBE_BUDGET), (
-                f"the gate recorded no refusal within the budget: {blocked}"
-            )
+            # Waiting for the failed request is what lets the gate run at all:
+            # the sync API only dispatches route handlers while the caller is
+            # inside a Playwright call.  The navigation is started from a
+            # timer so that the evaluate call has returned before the page
+            # starts to leave.
+            with page.expect_event(
+                "requestfailed",
+                lambda request: request.url == _OFF_ALLOWLIST_URL,
+                timeout=_EGRESS_PROBE_BUDGET * 1000,
+            ):
+                page.evaluate(
+                    "(url) => { setTimeout(() => window.location.assign(url), 0); }",
+                    _OFF_ALLOWLIST_URL,
+                )
             assert blocked == [_OFF_ALLOWLIST_URL], (
                 f"the probe, and only the probe, should have been refused: {blocked}"
             )
@@ -1094,7 +1094,9 @@ def _refresh_both_lists(page: Page) -> None:
         ) as refreshed:
             page.click(f'button[aria-label="Refresh {resource}"]')
         assert refreshed.value.status == 200, resource
-    page.wait_for_function("window.__controlSwapsFinished >= 2")
+    # A function, not a bare expression: Playwright evals a bare expression
+    # inside the page, and the page's Content-Security-Policy refuses eval.
+    page.wait_for_function("() => window.__controlSwapsFinished >= 2")
 
 
 @pytest.mark.browser
@@ -2328,8 +2330,10 @@ class TestRequestErrorSlot:
 
         page.locator("#scan-btn").click()
 
+        # A function, not a bare expression, which Playwright would eval under
+        # the page's Content-Security-Policy (see _refresh_both_lists).
         page.wait_for_function(
-            "document.getElementById('status-message').childNodes.length === 0"
+            "() => document.getElementById('status-message').childNodes.length === 0"
         )
         assert slot.evaluate("(el) => el.getBoundingClientRect().height") == 0
         assert slot.get_attribute("role") == "alert"

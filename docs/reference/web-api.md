@@ -375,6 +375,24 @@ That protection holds only while `[web] allowed_hosts` names only hosts you cont
 - Put saneless behind a reverse proxy that answers only requests for its own hostname, and make saneless itself reachable only by the proxy (for example, set `web_host` to an address only the proxy can reach). See [Answering only your own hostname](../how-to/deploy-docker-compose.md#answering-only-your-own-hostname).
 - Use a DNS resolver with rebind protection, which refuses to return private addresses for public hostnames. Many home routers offer this, as do dnsmasq (`--stop-dns-rebind`) and Pi-hole.
 
+### Security headers
+
+Every response carries these three headers, whatever its status: pages, partials, static files, and every error, a `500` included.
+
+| Header | Value |
+|--------|-------|
+| `Content-Security-Policy` | `default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'` |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+
+- **No page may be framed.** `frame-ancestors 'none'` stops a page on another site from showing saneless inside a frame and tricking you into clicking Scan or a flip answer. Such a click would really be yours, so the cross-site check above could not tell it apart. `X-Frame-Options: DENY` says the same to browsers too old to read `frame-ancestors`.
+- **No inline script or style runs anywhere.** Scripts, stylesheets and connections must come from saneless itself. saneless's pages contain no inline script, `<style>` element or `style` attribute. The htmx configuration in every page also turns off htmx's own injected style, its `eval` and its handling of swapped-in `<script>` elements. If markup were ever injected into a response, htmx could not be used to run it.
+- **Images may be `data:` URIs.** The icons in Pico's form controls and the scan preview thumbnail are both sent as `data:` images.
+- `base-uri 'none'` and `form-action 'self'` stop injected markup from changing where relative links resolve or where a form is sent.
+- `nosniff` stops a browser from guessing a content type the server did not send.
+
+A reverse proxy may add a policy of its own. It cannot loosen this one, because a browser enforces every `Content-Security-Policy` it receives.
+
 ### No API schema or interactive documentation
 
 **saneless serves no generated API schema and no interactive API documentation.** `GET /openapi.json`, `GET /docs` and `GET /redoc` answer `404` exactly like any unknown path, with the error body described under [Errors](#errors).

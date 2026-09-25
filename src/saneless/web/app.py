@@ -45,6 +45,7 @@ from .errors import install_error_handlers
 from .host_guard import HostGuard
 from .refresher import CheckRefresher
 from .routes import router
+from .security_headers import SecurityHeaders
 from .throttle import (
     MIN_MANUAL_REFRESH_SECONDS,
     PAPERLESS_TEST_WAIT_SECONDS,
@@ -262,6 +263,34 @@ def _open_job_store(settings: Settings) -> JobStore:
     return job_store
 
 
+def _install_middleware(app: FastAPI, settings: Settings) -> None:
+    """
+    Add the application's own middleware, in the order that decides who runs first.
+
+    ``add_middleware`` is LIFO: the last one added is outermost and runs first
+    on the way in and last on the way out.
+
+    Args:
+        app: The application being built.
+        settings: Application settings; ``[web] allowed_hosts`` is read.
+
+    """
+    # App-wide, on every method except GET, HEAD and OPTIONS, so a POST route
+    # added later cannot forget the cross-site check.  web_host still
+    # defaults to 0.0.0.0; the LAN exposure that implies is documented.
+    app.add_middleware(CrossOriginGuard)
+    # Added after the cross-site check, so the Host check wraps it and runs
+    # before it.  It applies to every method, GET and /health included,
+    # because a DNS-rebinding page can read as easily as it can start a scan.
+    app.add_middleware(HostGuard, allowed_hosts=settings.web.allowed_hosts)
+    # Added last, so it is the outermost of the app's own middleware: every
+    # route and static file, the router's 404 and 405, and the Host check's
+    # 421 and 400 and the cross-site check's 403 all pass through it on the
+    # way out.  Only the 500 for an unhandled exception is sent outside it,
+    # and render_error gives that one the same headers.
+    app.add_middleware(SecurityHeaders)
+
+
 def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -399,15 +428,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     app = FastAPI(lifespan=lifespan, openapi_url=None, docs_url=None, redoc_url=None)
     # Every error response the app sends is rendered there.
     install_error_handlers(app)
-    # App-wide, on every method except GET, HEAD and OPTIONS, so a POST route
-    # added later cannot forget the cross-site check.  web_host still
-    # defaults to 0.0.0.0; the LAN exposure that implies is documented.
-    app.add_middleware(CrossOriginGuard)
-    # add_middleware is LIFO: the last one added is outermost, so the Host
-    # check wraps the cross-site check and runs before it.  It applies to every
-    # method, GET and /health included, because a DNS-rebinding page can read
-    # as easily as it can start a scan.
-    app.add_middleware(HostGuard, allowed_hosts=settings.web.allowed_hosts)
+    _install_middleware(app, settings)
 
     app.state.worker = worker
     app.state.job_store = job_store

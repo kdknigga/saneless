@@ -48,6 +48,8 @@ from saneless.vocabulary import (
     rejection_status_code,
 )
 
+from .security_headers import SECURITY_HEADERS
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -249,6 +251,11 @@ def render_error(
     (ASVS V7), and a uniform affordance that sometimes lied about having
     detail would be worse than one that says what it has.
 
+    Every response built here carries ``SECURITY_HEADERS``.  Most would get
+    them from the ``SecurityHeaders`` middleware anyway, but the catch-all 500
+    is sent by Starlette's ``ServerErrorMiddleware``, outside all of the
+    application's middleware, so this is the only place that can give it them.
+
     Whether Job History reloads is decided here rather than in the template, so
     the partial keeps no rule of its own: it reloads exactly when a row was
     written, which is exactly when there is an id to name.
@@ -284,7 +291,12 @@ def render_error(
         to be swapped by the target's own rule; otherwise the JSON error shape.
 
     """
-    headers: dict[str, str] = dict(extra_headers or {})
+    # The security headers first, because the 500 for an unhandled exception
+    # is sent past every middleware the application adds, the one that sets
+    # them included.  That middleware sets rather than appends, so any other
+    # error still carries each header once.
+    headers: dict[str, str] = dict(SECURITY_HEADERS)
+    headers.update(extra_headers or {})
     if status_code == _TOO_MANY_REQUESTS:
         headers["Retry-After"] = str(RETRY_AFTER_SECONDS)
     message = rejection_message(rejection)
