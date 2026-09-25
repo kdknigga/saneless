@@ -127,7 +127,7 @@ Docker's restart policies act only when a container exits, so an unhealthy conta
 |-------------|---------|----------|
 | `/etc/saneless` | Configuration directory holding `saneless.toml` (mount read-write; a missing `saneless.toml` means defaults plus environment variables). A `config.toml` left here from an earlier release is **not** read -- the Configuration row on the status page names it and gives the rename to `saneless.toml` | Recommended |
 | `/var/lib/saneless` | **Durable state:** the job database (`saneless.db`) and preserved scans (`failed/`) | **Yes -- do not treat as disposable** |
-| `/tmp/saneless` | Scratch space for the scan in progress; every file in it is deleted as the scan finishes | No (ephemeral OK) |
+| `/tmp/saneless-1000` | Scratch space for the scan in progress; every file in it is deleted as the scan finishes. The default `tmp_dir` is `$TMPDIR/saneless-<uid>`, and the image runs as uid 1000 | No (ephemeral OK) |
 | `/consume` | Consume directory fallback for file-based ingestion | No (only if using fallback) |
 
 `/consume` is the path the shipped `docker-compose.yml` uses, as a commented
@@ -142,7 +142,7 @@ and what it costs.
 Mount the configuration *directory* (`./config:/etc/saneless`), not `saneless.toml` itself. saneless rewrites `saneless.toml` by writing a temp file beside it and renaming it over the original; over a single-file bind mount that rename fails with EBUSY, and over a read-only mount the write is refused. See [Moving from a single-file config mount](../how-to/deploy-docker-compose.md#moving-from-a-single-file-config-mount).
 
 `/var/lib/saneless` is not optional, and it is not the same kind of directory
-`/tmp/saneless` is. When a scan cannot be delivered to paperless-ngx at all --
+`/tmp/saneless-1000` is. When a scan cannot be delivered to paperless-ngx at all --
 the upload fails and no consume directory is configured, paperless-ngx rejects
 the upload outright, the consumption task reports a failure, or the task has not
 finished when `paperless_task_timeout` expires -- saneless moves the assembled
@@ -156,7 +156,7 @@ commands such as `docker compose exec saneless saneless jobs` log to
 `/var/lib/saneless/saneless.log`. It is only a default: `[output] data_dir` in
 `saneless.toml`, or `SANELESS_OUTPUT__DATA_DIR`, still overrides it. A plain
 `docker run -v saneless-data:/var/lib/saneless` is therefore correct without
-setting anything else. `/tmp/saneless` is not mounted by the compose files
+setting anything else. `/tmp/saneless-1000` is not mounted by the compose files
 below: it holds nothing worth keeping between runs.
 
 ### Preserved scans in `failed/`

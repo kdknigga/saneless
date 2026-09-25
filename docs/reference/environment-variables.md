@@ -41,7 +41,7 @@ Settings are resolved in this order (highest to lowest priority):
 
 | Variable | Config Path | Type | Example |
 |----------|-------------|------|---------|
-| `SANELESS_OUTPUT__TMP_DIR` | `output.tmp_dir` | string | `/tmp/saneless` |
+| `SANELESS_OUTPUT__TMP_DIR` | `output.tmp_dir` | string | `/tmp/saneless-1000` |
 | `SANELESS_OUTPUT__DATA_DIR` | `output.data_dir` | string | `/var/lib/saneless` |
 | `SANELESS_OUTPUT__LOG_FILE` | `output.log_file` | string | `/var/log/saneless.log` |
 | `SANELESS_OUTPUT__LOG_LEVEL` | `output.log_level` | string | `DEBUG` |

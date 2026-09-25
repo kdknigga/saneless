@@ -74,6 +74,8 @@ mode = "Color"
 
 See [Configure Scan Profiles](configure-scan-profiles.md) for more profile options.
 
+Scans in progress are written under `tmp_dir`, by default `$TMPDIR/saneless-<uid>` (for example `/tmp/saneless-1000`), which saneless creates so that only your user can enter it; see [`[output]`](../reference/configuration.md#output) for what it refuses at startup. Upgrading from an earlier release? The old `/tmp/saneless` directory is no longer used and may be deleted, once any `saneless.db` a release older than `data_dir` left in it has been moved to `data_dir`.
+
 ## Troubleshooting
 
 **`python-sane` fails to compile**

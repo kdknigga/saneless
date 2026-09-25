@@ -37,8 +37,9 @@ services:
       # environment variables and does not create the file.
       # See: https://github.com/kdknigga/saneless#configuration
       - ./config:/etc/saneless
-      # Durable state: job database and preserved scans. /tmp/saneless is
-      # deliberately NOT mounted -- it is disposable scratch space.
+      # Durable state: job database and preserved scans. /tmp/saneless-1000
+      # (the default tmp_dir, $TMPDIR/saneless-<uid>) is deliberately NOT
+      # mounted -- it is disposable scratch space.
       - saneless-data:/var/lib/saneless
       # Consume-directory fallback, optional. When the paperless-ngx API cannot
       # be reached at all, saneless drops the assembled PDF here instead of

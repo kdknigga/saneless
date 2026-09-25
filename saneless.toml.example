@@ -9,7 +9,7 @@ consume_dir = "/path/to/paperless/consume"
 
 [output]
 # web_port = 8080       # bare metal only; in Docker remap with -p
-# tmp_dir = "/tmp/saneless"
+# tmp_dir = "/tmp/saneless-1000"  # default: $TMPDIR/saneless-<uid>, created 0700
 # log_level = "INFO"     # DEBUG, INFO, WARNING, ERROR or CRITICAL
 
 [profiles.default]

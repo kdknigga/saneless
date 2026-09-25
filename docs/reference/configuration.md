@@ -127,8 +127,8 @@ In the path settings (`tmp_dir`, `data_dir`, `log_file`, and `consume_dir` under
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `tmp_dir` | string | `"/tmp/saneless"` | Scratch space for the scan in progress; its contents are deleted as each scan finishes and nothing durable is kept here. A leading `~` is expanded |
-| `data_dir` | string | `$XDG_STATE_HOME/saneless` (`~/.local/state/saneless` when `XDG_STATE_HOME` is unset) | Durable state: the job database (`saneless.db`) and `failed/`, where scans that could not be delivered to paperless-ngx are preserved. Must survive restarts. The container image sets this to `/var/lib/saneless`. A leading `~` is expanded |
+| `tmp_dir` | string | `$TMPDIR/saneless-<uid>`, for example `/tmp/saneless-1000` (`/tmp` when `TMPDIR` is unset; `<uid>` is your numeric user id) | Scratch space for the scan in progress; its contents are deleted as each scan finishes and nothing durable is kept here. When it is missing, saneless creates it with mode `0700`, so only your user can enter it. An existing directory is refused at startup, and again before each scan, if it is a symlink, is owned by another user, or is group- or world-writable; the message names `output.tmp_dir` and the path, and tells you to run `chmod 700` on it, remove it, or choose another directory. Group or world *read* is accepted. A leading `~` is expanded |
+| `data_dir` | string | `$XDG_STATE_HOME/saneless` (`~/.local/state/saneless` when `XDG_STATE_HOME` is unset) | Durable state: the job database (`saneless.db`) and `failed/`, where scans that could not be delivered to paperless-ngx are preserved. Must survive restarts. The container image sets this to `/var/lib/saneless`. When saneless creates it, it is created with mode `0700`; a directory that already exists keeps its mode. A leading `~` is expanded |
 | `log_file` | string | `$XDG_STATE_HOME/saneless/saneless.log` (`~/.local/state/saneless/saneless.log` when `XDG_STATE_HOME` is unset) | Log file path, **for one-shot CLI commands only**. `saneless serve` streams its records to stderr and writes no file at all, so under Docker or systemd the platform (`docker logs`, journald) holds them and owns retention. A leading `~` is expanded |
 | `log_level` | string | `"INFO"` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, case-insensitive (`warn` means `WARNING`); any other value is rejected when the config loads. Applies in **both** modes, unlike the three keys around it. `saneless -v` shows saneless's own debug detail without changing this setting |
 | `log_max_bytes` | int | `10485760` | Max log file size before rotation (10 MB). **One-shot CLI commands only**, like `log_file`: `saneless serve` writes no file, so there is nothing to rotate |
@@ -202,7 +202,7 @@ token = "abc123def456ghi789"
 consume_dir = ""
 
 [output]
-tmp_dir = "/tmp/saneless"
+tmp_dir = "/tmp/saneless-1000"
 data_dir = "/var/lib/saneless"
 log_file = "/var/log/saneless/saneless.log"
 log_level = "INFO"
