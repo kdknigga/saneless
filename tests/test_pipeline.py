@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import errno
 import inspect
+import io
 import logging
 import os
 import shutil
@@ -17,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pikepdf
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw
 
 import saneless.pipeline as pipeline_module
 import saneless.scanner.sane_backend as sane_backend_mod
@@ -360,6 +361,7 @@ def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[...,
         *,
         filename: str,
         dpi: int,
+        title: str,
     ) -> Path:
         """Open every spooled page, then report the PDF path."""
         for record in records:
@@ -409,6 +411,7 @@ class _AssemblingSomewhereDurable:
         *,
         filename: str,
         dpi: int,
+        title: str,
     ) -> Path:
         """
         Copy the spooled pages out, then assemble them for real.
@@ -420,6 +423,7 @@ class _AssemblingSomewhereDurable:
                 is exactly what this stand-in exists to override.
             filename: The PDF's file name, used unchanged.
             dpi: The resolution the device reported, used unchanged.
+            title: The document title, used unchanged.
 
         Returns:
             The assembled PDF's path, outside the workspace.
@@ -428,7 +432,7 @@ class _AssemblingSomewhereDurable:
         self.records = list(records)
         self.page_bytes = [record.path.read_bytes() for record in records]
         self.pdf_path = assemble_pdf(
-            records, self._output_dir, filename=filename, dpi=dpi
+            records, self._output_dir, filename=filename, dpi=dpi, title=title
         )
         return self.pdf_path
 
@@ -2008,6 +2012,136 @@ class TestDuplexStrategy:
         assert result.pages_scanned == 2
 
 
+# A sheet the real backend refuses: 10x10 RGB is 300 raw bytes, far under its
+# 10 KB integrity floor, so the pass counts it as rejected and spools nothing.
+_UNREADABLE = "unreadable"
+
+
+def _rgb(colour: str) -> tuple[int, int, int]:
+    """
+    Name the RGB value a ``_make_content_image`` page carries at its centre.
+
+    Args:
+        colour: The colour name the page was drawn with.
+
+    Returns:
+        That colour as an RGB triple.
+
+    """
+    red, green, blue = ImageColor.getrgb(colour)[:3]
+    return (red, green, blue)
+
+
+def _sheet(colour: str) -> Image.Image:
+    """
+    Build one fed sheet: a content page, or one the backend cannot read.
+
+    Args:
+        colour: The page's colour, or ``_UNREADABLE``.
+
+    Returns:
+        The image to load into the fake feeder.
+
+    """
+    if colour == _UNREADABLE:
+        return Image.new("RGB", (10, 10), "white")
+    return _make_content_image(colour)
+
+
+def _page_colours(pdf: bytes) -> list[tuple[int, int, int]]:
+    """
+    Read the colour at the centre of each page of a PDF, in page order.
+
+    Decoded from the embedded image itself, so the answer is what the page
+    shows rather than anything about how it was named or spooled.
+
+    Args:
+        pdf: The whole PDF.
+
+    Returns:
+        One RGB triple per page.
+
+    """
+    colours: list[tuple[int, int, int]] = []
+    with pikepdf.open(io.BytesIO(pdf)) as document:
+        for page in document.pages:
+            (image,) = pikepdf.Page(page).get_images().values()
+            assert isinstance(image, pikepdf.Stream)
+            decoded = pikepdf.PdfImage(image).as_pil_image().convert("RGB")
+            pixel = decoded.getpixel((decoded.width // 2, decoded.height // 2))
+            assert isinstance(pixel, tuple)
+            red, green, blue = pixel
+            colours.append((red, green, blue))
+    return colours
+
+
+def _manual_duplex_over_the_fake(
+    fronts: Sequence[str],
+    backs: Sequence[str],
+    paperless: MagicMock,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ScanResult, list[tuple[str, bytes]]]:
+    """
+    Run a manual duplex job through the real backend, assembly and all.
+
+    Args:
+        fronts: The colour of each sheet pass A is fed, in feed order.
+        backs: The colour of each sheet pass B is fed, in feed order.
+        paperless: The paperless mock, whose uploads are captured.
+        settings: Application settings; the default profile becomes a
+            manual-duplex feeder profile.
+        monkeypatch: Swaps the backend's ``sane`` module for the shared fake.
+
+    Returns:
+        The run's result and, per upload, its title and the PDF's bytes --
+        read during the upload, because the workspace is gone afterwards.
+
+    """
+    profile = settings.profiles["default"]
+    profile.source = "ADF"
+    profile.duplex = "manual"
+    profile.mode = "Color"
+
+    dev = FakeSaneDev()
+    dev.report_sources(["Flatbed", "Automatic Document Feeder"])
+    dev.load_feeder([_sheet(colour) for colour in fronts])
+    monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+
+    def _reload_the_stack(event: PipelineEvent) -> None:
+        """Put the flipped stack back when the pipeline asks for it."""
+        if event is PipelineEvent.AWAITING_FLIP:
+            dev.load_feeder([_sheet(colour) for colour in backs])
+
+    uploads: list[tuple[str, bytes]] = []
+
+    def _capture(
+        pdf_path: Path,
+        title: str,
+        tags: list[int] | None = None,
+        correspondent: int | None = None,
+    ) -> UploadResult:
+        """Keep the PDF as uploaded, and accept it."""
+        del tags, correspondent
+        uploads.append((title, pdf_path.read_bytes()))
+        return UploadResult(delivered_to_api=True, task_uuid=f"task-{len(uploads)}")
+
+    paperless.upload_document.side_effect = _capture
+
+    result = run_pipeline(
+        scanner=SaneBackend(),
+        paperless=paperless,
+        settings=settings,
+        request=PipelineRequest(
+            profile_name="default",
+            title="Duplex over the shared fake",
+            status_callback=_reload_the_stack,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
+        ),
+    )
+    return result, uploads
+
+
 class TestManualDuplexOverTheSharedFake:
     """
     A manual duplex run driven through a real SaneBackend (SCNR-07, M-32).
@@ -2091,6 +2225,82 @@ class TestManualDuplexOverTheSharedFake:
         assert dev.assignments.count("source") == 2
         assert dev.calls.count("snap") == 6
         assert dev.source == "Automatic Document Feeder"
+
+    def test_two_skip_manual_duplex_is_delivered_as_two_pdfs(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Each pass loses a different sheet: the halves are never interleaved.
+
+        Four sheets. Pass A cannot read sheet 2's front; pass B, fed the flipped
+        stack last sheet first, cannot read sheet 4's back. Both passes then
+        read three pages, so the counts agree -- and interleaving them would
+        pair sheet 3's front with sheet 2's back and sheet 4's front with
+        sheet 3's back, delivered as one successful document. Nothing in the
+        run can prove which back belongs to which front, so both halves go to
+        paperless-ngx separately with the reason stated.
+
+        The real backend rejects each 10x10 sheet under its byte floor, and
+        the real assembly builds both PDFs.
+        """
+        fronts = ["red", _UNREADABLE, "blue", "green"]
+        # Fed as the flipped stack comes out of the feeder: sheet 4's back
+        # first, sheet 1's back last.
+        backs = [_UNREADABLE, "yellow", "magenta", "cyan"]
+
+        result, uploads = _manual_duplex_over_the_fake(
+            fronts, backs, mock_paperless, default_settings, monkeypatch
+        )
+
+        assert [title for title, _ in uploads] == [
+            "Duplex over the shared fake (fronts)",
+            "Duplex over the shared fake (backs)",
+        ]
+        (_, fronts_pdf), (_, backs_pdf) = uploads
+        assert _page_colours(fronts_pdf) == [_rgb("red"), _rgb("blue"), _rgb("green")]
+        # Sheet order: the reverse of the order pass B produced them.
+        assert _page_colours(backs_pdf) == [
+            _rgb("cyan"),
+            _rgb("magenta"),
+            _rgb("yellow"),
+        ]
+        assert result.warning is not None
+        assert "could not read 2 sheet" in result.warning
+        assert "paired" in result.warning
+        # Said once, in the mismatch sentence, not again in the generic one.
+        assert "were skipped" not in result.warning
+        assert "Page count mismatch" not in result.warning
+
+    def test_one_rejected_sheet_with_equal_counts_still_splits(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        One sheet lost on pass A alone is enough to stop the interleave.
+
+        Pass A reads two of three fronts; pass B reads two backs. The counts
+        agree, but a sheet went missing on one pass, so position no longer
+        proves which back belongs to which front.
+        """
+        fronts = ["red", _UNREADABLE, "blue"]
+        backs = ["yellow", "cyan"]
+
+        result, uploads = _manual_duplex_over_the_fake(
+            fronts, backs, mock_paperless, default_settings, monkeypatch
+        )
+
+        assert [title for title, _ in uploads] == [
+            "Duplex over the shared fake (fronts)",
+            "Duplex over the shared fake (backs)",
+        ]
+        assert result.warning is not None
+        assert "could not read 1 sheet," in result.warning
+        assert "paired" in result.warning
 
     def test_a_device_with_no_feeder_refuses_before_pass_a(
         self,
@@ -3941,12 +4151,14 @@ class TestPreservationNamesWhatItDidKeep:
             output_dir: Path,
             filename: str,
             dpi: int,
+            *,
+            title: str,
         ) -> Path:
             """Assemble the fronts for real, then refuse the backs."""
             nonlocal calls
             calls += 1
             if calls == 1:
-                return assemble_pdf(records, output_dir, filename, dpi)
+                return assemble_pdf(records, output_dir, filename, dpi, title=title)
             msg = "qpdf refused the backs"
             raise PdfError(msg)
 
