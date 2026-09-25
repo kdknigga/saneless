@@ -84,6 +84,9 @@ services:
       # Uncomment for network scanners:
       # - SANELESS_SCANNER__HOST=192.168.1.50
     restart: unless-stopped
+    # Time for a stopped scan's pages to be copied into failed/ before Docker
+    # kills saneless. See "Stopping and restarting" below.
+    stop_grace_period: 90s
 
 volumes:
   saneless-data:
@@ -206,6 +209,30 @@ server {
 ```
 
 A Caddy site block named after a hostname and a Traefik router with a `Host()` rule match only that hostname in the same way. This layer protects saneless only if browsers cannot reach it directly: do not publish its port on the host (drop `ports:` and put the proxy on the same Docker network), or bind it to an address only the proxy can reach.
+
+## Stopping and restarting
+
+`docker compose stop`, `docker compose down`, `docker compose restart` and
+`docker compose up -d` after an upgrade all stop saneless the same way: Docker
+sends SIGTERM, waits for the container's grace period, and then kills it.
+
+A scan that the stop interrupts keeps the pages it already scanned. A manual
+duplex job waiting at the flip prompt, for example, keeps its front sides as a
+`(fronts)` PDF in `failed/`, and the job records that the server restarted and
+names the file. saneless waits up to 5 seconds for the scan worker to finish,
+and up to 60 seconds more while it is still writing those pages into `failed/`.
+
+That copy can be slow. saneless spools pages under `/tmp` inside the
+container, and `failed/` is on the data volume: they are different
+filesystems, so keeping the pages means copying every one of them. Docker's
+default grace period is 10 seconds, which a large scan can outlast, and a copy
+that is killed half way is lost for good. `docker compose up -d` recreates the
+container and discards its `/tmp`, so the next start has nothing left to
+recover.
+
+The compose file above sets `stop_grace_period: 90s` for this reason. Keep it,
+or something at least as long, in your own compose file. If you run the image
+with `docker run` instead, pass the same budget as `--stop-timeout 90`.
 
 ## Updating
 
