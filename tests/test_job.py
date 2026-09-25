@@ -44,10 +44,10 @@ from saneless.vocabulary import RESTART_REASON as SERVER_RESTART_REASON
 if TYPE_CHECKING:
     from pathlib import Path
 
-HEAD_VERSION = 2
+HEAD_VERSION = 3
 """The schema version a fully migrated job database reports."""
 
-HEAD_COLUMN_COUNT = 16
+HEAD_COLUMN_COUNT = 17
 """The number of columns the jobs table carries at HEAD_VERSION."""
 
 S2_COLUMNS = (
@@ -72,6 +72,19 @@ V2_COLUMNS = (
     "owner_token",
 )
 """The six columns migration step 2 adds, spelled out independently of job.py."""
+
+V2_COLUMN_TYPES = (
+    ("outcome", "TEXT"),
+    ("pages_scanned", "INTEGER"),
+    ("pages_removed", "INTEGER"),
+    ("pages_uploaded", "INTEGER"),
+    ("warning", "TEXT"),
+    ("owner_token", "TEXT"),
+)
+"""The version 2 columns with their SQL types, for building a v2 database."""
+
+V3_COLUMNS = (("pages_removed_at", "TEXT"),)
+"""The one column migration step 3 adds, spelled out independently of job.py."""
 
 PUBLIC_METHOD_FLOOR = 7
 """The number of public JobStore methods that exist today.
@@ -313,6 +326,31 @@ def _build_s3_schema(db_path: str) -> None:
                 datetime.now(tz=UTC).isoformat(),
             ),
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_v2_schema(db_path: str) -> None:
+    """
+    Write a database at schema version 2 holding one finished, counted row.
+
+    Built from the S3 shape the way the real ladder built it -- the six
+    version 2 columns added by ``ALTER`` -- and stamped ``user_version = 2``,
+    so opening it runs only the steps after version 2.
+    """
+    _build_s3_schema(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        for name, sqltype in V2_COLUMN_TYPES:
+            # Both values come from the module-level literal above.
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sqltype}")
+        conn.execute(
+            "UPDATE jobs SET outcome = ?, pages_scanned = ?, pages_removed = ?, "
+            "pages_uploaded = ?, warning = ?, owner_token = ? WHERE id = ?",
+            (ScanOutcome.SUCCESS.value, 4, 1, 3, None, "tok-v2", "legacy-1"),
+        )
+        conn.execute("PRAGMA user_version = 2")
         conn.commit()
     finally:
         conn.close()
@@ -1169,9 +1207,11 @@ class TestResultColumns:
 
     def test_single_mapping_ladder_reconciles_with_the_column_list(self) -> None:
         """The ladder and the live column list cannot drift apart (STOR-04)."""
-        ladder = job_module._S3_COLUMNS | {
-            name for name, _sqltype in job_module._V2_COLUMNS
-        }
+        ladder = (
+            job_module._S3_COLUMNS
+            | {name for name, _sqltype in job_module._V2_COLUMNS}
+            | {name for name, _sqltype in job_module._V3_COLUMNS}
+        )
         assert ladder == set(job_module._COLUMNS)
 
     def test_single_mapping_has_no_handwritten_select_list(self) -> None:
@@ -2661,3 +2701,155 @@ class TestTitleLogging:
         assert len(created) == 1
         assert repr(CONTROL_TITLE) in created[0]
         assert "\n" not in created[0]
+
+
+class TestRemovedPositions:
+    """Migration step 3 and the positions of the pages removed as blank."""
+
+    def test_step_three_adds_exactly_the_positions_column(self) -> None:
+        """The ladder's third step adds the one nullable TEXT column, and no other."""
+        assert job_module._V3_COLUMNS == V3_COLUMNS
+        assert len(job_module._MIGRATIONS) == HEAD_VERSION
+        assert job_module._COLUMNS[-1] == "pages_removed_at"
+
+    def test_a_version_two_database_migrates_and_keeps_its_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """A v2 database opens at v3; its old row reads back unchanged, positions None."""
+        db_path = str(tmp_path / "v2.db")
+        _build_v2_schema(db_path)
+
+        store = JobStore(db_path=db_path)
+        try:
+            version, columns = _read_schema(store._conn)
+            assert version == HEAD_VERSION
+            assert len(columns) == HEAD_COLUMN_COUNT
+            assert "pages_removed_at" in columns
+
+            legacy = store.get_job("legacy-1")
+            assert legacy is not None
+            assert legacy.title == "Legacy Doc"
+            assert legacy.state is JobState.DONE
+            assert legacy.outcome is ScanOutcome.SUCCESS
+            assert legacy.pages_scanned == 4
+            assert legacy.pages_removed == 1
+            assert legacy.pages_uploaded == 3
+            assert legacy.owner_token == "tok-v2"
+            assert legacy.removed_positions is None
+        finally:
+            store.close()
+
+    def test_finish_job_records_the_positions(self) -> None:
+        """Positions given in the result read back as the same tuple of ints."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Blank backs")
+            store.finish_job(
+                created.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=4,
+                    pages_removed=2,
+                    pages_uploaded=2,
+                    removed_positions=(2, 4),
+                ),
+            )
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.removed_positions == (2, 4)
+            assert isinstance(fetched.removed_positions, tuple)
+            assert all(isinstance(p, int) for p in fetched.removed_positions)
+            # Information, not a warning: the positions never reach it.
+            assert fetched.warning is None
+        finally:
+            store.close()
+
+    def test_finish_job_without_positions_leaves_the_column_null(self) -> None:
+        """A result with no positions, and no result at all, both record NULL."""
+        store = JobStore()
+        try:
+            counted = store.create_job("default", "Counted")
+            store.finish_job(
+                counted.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=2,
+                    pages_removed=0,
+                    pages_uploaded=2,
+                ),
+            )
+            failed = store.create_job("default", "Failed")
+            store.finish_job(failed.id, JobState.ERROR, error="boom")
+
+            for job_id in (counted.id, failed.id):
+                raw = store._conn.execute(
+                    "SELECT pages_removed_at FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()[0]
+                assert raw is None
+                fetched = store.get_job(job_id)
+                assert fetched is not None
+                assert fetched.removed_positions is None
+        finally:
+            store.close()
+
+    def test_new_and_rejected_rows_leave_the_positions_null(self) -> None:
+        """create_job and create_rejected_job record no positions."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "New")
+            rejected = store.create_rejected_job(
+                "default", "Refused", error=QUEUE_FULL_JOB_ERROR
+            )
+            assert created.removed_positions is None
+            assert rejected.removed_positions is None
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        "stored",
+        ["not json", '[1, "x"]', "[0]", "[-3]", '{"a": 1}', "[true]", "[2.5]"],
+    )
+    def test_a_corrupt_positions_column_reads_back_none_and_warns(
+        self, stored: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Anything but a JSON list of ints >= 1 reads back None with a WARNING."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Tampered")
+            store._conn.execute(
+                "UPDATE jobs SET pages_removed_at = ? WHERE id = ?",
+                (stored, created.id),
+            )
+            store._conn.commit()
+
+            with caplog.at_level(logging.WARNING, logger=job_module.__name__):
+                fetched = store.get_job(created.id)
+
+            assert fetched is not None
+            assert fetched.removed_positions is None
+            warnings = [
+                record
+                for record in caplog.records
+                if record.levelno == logging.WARNING
+                and created.id in record.getMessage()
+            ]
+            assert len(warnings) == 1
+        finally:
+            store.close()
+
+    def test_a_bare_job_and_result_have_no_positions(self) -> None:
+        """The new field defaults to None, so existing constructions stay valid."""
+        assert Job(id="t", profile="default", title="T").removed_positions is None
+        result = JobResult(
+            outcome=None,
+            warning=None,
+            pages_scanned=None,
+            pages_removed=None,
+            pages_uploaded=None,
+        )
+        assert result.removed_positions is None

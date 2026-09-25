@@ -93,6 +93,7 @@ from saneless.paperless import UploadResult
 from saneless.scanner.base import DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
+    HIDDEN_PRESERVED_ERROR,
     TERMINAL_STATES,
     ErrorCategory,
     FlipOutcome,
@@ -5235,3 +5236,182 @@ class TestTheGuardBehindTheBlockedButton:
         written = recent[0]
         assert written.error == _TOKEN_UNSET_ROW_ERROR, written.error
         assert written.error_category is ErrorCategory.REJECTED
+
+
+# ---------------------------------------------------------------------------
+# Pages removed as blank, and a scan in which every page looked blank.
+# ---------------------------------------------------------------------------
+
+_REMOVED_NOTE = "Removed as blank: pages 2, 4 of 4 scanned."
+"""The note a DONE job with blank backs at scanned positions 2 and 4 carries."""
+
+_ALL_BLANK_FILE = "blank-scan.pdf"
+"""The name of the PDF the all-blank job's error says was kept in failed/."""
+
+
+@pytest.mark.browser
+class TestRemovedBlankPagesRendering:
+    """
+    The removed-page note and the all-blank failure, proven in a browser.
+
+    The note is information, not a warning, so the green tick has to survive
+    it once the cascade has resolved -- which only a browser can see.  The
+    all-blank failure has its own advice, and its kept PDF must reach the
+    owner as a path under ``failed/`` and nobody else at all.
+    """
+
+    @pytest.fixture
+    def removed_blank_page(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> Iterator[Page]:
+        """Drive the live app's current job to a DONE that removed two blank pages."""
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        job = job_store.create_job(
+            profile="default",
+            title="Blank Backs Doc",
+            owner_token=_as_owner(page, browser_server.url),
+        )
+        job_store.finish_job(
+            job.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=None,
+                pages_scanned=4,
+                pages_removed=2,
+                pages_uploaded=2,
+                removed_positions=(2, 4),
+            ),
+        )
+        app.state.worker._current_job_id = job.id
+        try:
+            yield page
+        finally:
+            # Both halves, for the reason fallback_page gives: clearing only
+            # the pointer leaves this job as list_recent's most recent row, and
+            # every later "idle" page would render it.
+            app.state.worker._current_job_id = None
+            job_store.delete_job(job.id)
+
+    @pytest.fixture
+    def all_blank_error_page(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> Iterator[tuple[Page, str]]:
+        """Drive the live app's current job to an all-blank ERROR, then clear it."""
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        settings: Settings = app.state.settings
+        kept = settings.output.failed_dir / _ALL_BLANK_FILE
+        job = job_store.create_job(
+            profile="default",
+            title="All Blank Doc",
+            owner_token=_as_owner(page, browser_server.url),
+        )
+        job_store.finish_job(
+            job.id,
+            JobState.ERROR,
+            error=(
+                "All 4 page(s) looked blank, so nothing was uploaded. "
+                f"The 4 scanned page(s) were preserved at {kept}"
+            ),
+            error_category=ErrorCategory.ALL_BLANK,
+        )
+        app.state.worker._current_job_id = job.id
+        try:
+            yield page, str(kept)
+        finally:
+            app.state.worker._current_job_id = None
+            job_store.delete_job(job.id)
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_removed_positions_note_is_shown_and_done_stays_green(
+        self,
+        removed_blank_page: Page,
+        browser_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        The note sits beside the counts, and the headline keeps the plain green.
+
+        Removing blank backs is not a warning, so the DONE headline must
+        resolve to the done colour and never to the warned amber.
+        """
+        removed_blank_page.emulate_media(color_scheme=scheme)
+        removed_blank_page.goto(browser_server.url)
+        removed_blank_page.wait_for_selector("#status-area .status-done")
+
+        status = removed_blank_page.locator("#status-area")
+        expect(status.locator("p.page-counts", has_text=_REMOVED_NOTE)).to_be_visible()
+        expect(status).to_contain_text("Done: Blank Backs Doc")
+        expect(status.locator(".status-fallback")).to_have_count(0)
+
+        row = removed_blank_page.locator("#history-body tr", has_text="Blank Backs Doc")
+        expect(row.locator("span.page-counts", has_text=_REMOVED_NOTE)).to_be_visible()
+        expect(row.locator("td.status-done")).to_have_count(1)
+
+        colours = removed_blank_page.evaluate(_PROBE_STATUS_COLOURS)
+        headline = removed_blank_page.evaluate(
+            "() => getComputedStyle("
+            "document.querySelector('#status-area p.status-done')).color"
+        )
+        assert headline == colours["status-done"], colours
+        assert headline != colours["status-fallback"], colours
+
+    def test_all_blank_error_shows_tuning_advice(
+        self,
+        all_blank_error_page: tuple[Page, str],
+        browser: Browser,
+        browser_server: _BrowserServer,
+        egress_allowlist: list[str],
+    ) -> None:
+        """
+        The owner reads the advice and the kept file under failed/; others no path.
+
+        The second context is built by hand, so it installs ``_make_gate`` and
+        the policy recorder itself and is checked after it closes, as the
+        two-browser ownership test does.
+        """
+        page, kept = all_blank_error_page
+        message = error_message(ErrorCategory.ALL_BLANK)
+        next_step = error_next_step(ErrorCategory.ALL_BLANK)
+        assert "empty_page_coverage_threshold" in next_step
+
+        page.goto(browser_server.url)
+        status = page.locator("#status-area")
+        expect(status.locator("p.status-error")).to_contain_text(message)
+        expect(status).to_contain_text(next_step)
+        status.locator("details.tech-details summary").click()
+        expect(status.locator("details.tech-details")).to_contain_text(
+            f"preserved at failed/{_ALL_BLANK_FILE}"
+        )
+        assert kept not in page.content()
+
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        viewer_ctx = browser.new_context()
+        try:
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(viewer_ctx, violations)
+            viewer_page = viewer_ctx.new_page()
+            viewer_page.goto(browser_server.url)
+
+            viewer_status = viewer_page.locator("#status-area")
+            expect(viewer_status.locator("p.status-error")).to_contain_text(message)
+            expect(viewer_status).to_contain_text(next_step)
+            viewer_status.locator("details.tech-details summary").click()
+            expect(viewer_status.locator("details.tech-details")).to_contain_text(
+                HIDDEN_PRESERVED_ERROR
+            )
+            content = viewer_page.content()
+            assert "failed/" not in content
+            assert _ALL_BLANK_FILE not in content
+            assert kept not in content
+        finally:
+            viewer_ctx.close()
+            assert seen, "the hand-built context's gate handled no request"
+            assert blocked == [], f"a page tried to reach the network: {blocked}"
+            assert violations == [], (
+                f"a page violated its Content-Security-Policy: {violations}"
+            )
