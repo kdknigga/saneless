@@ -18,11 +18,10 @@ from unittest.mock import MagicMock, patch
 
 import pikepdf
 import pytest
-import saneless.preservation as preservation_module
 from PIL import Image, ImageColor, ImageDraw
-from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
 
 import saneless.pipeline as pipeline_module
+import saneless.preservation as preservation_module
 import saneless.scanner.sane_backend as sane_backend_mod
 from saneless.config import ProfileConfig
 from saneless.exceptions import (
@@ -55,6 +54,7 @@ from saneless.pipeline import (
     _resolve_device,
     run_pipeline,
 )
+from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
 from saneless.scanner.base import DeviceInfo, ScannerBackend
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.spool import SpooledPageSink

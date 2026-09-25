@@ -1321,7 +1321,8 @@ def isolated_duplex_settings(default_settings: Settings) -> Settings:
     ``default_settings`` already puts ``tmp_dir`` and ``data_dir`` on separate
     subtrees of the test's own ``tmp_path``, so whatever a job preserves into
     ``failed/`` disappears with the test instead of accumulating where
-    ``_warn_if_failed_dir_growing`` would start warning inside unrelated tests.
+    ``preservation.warn_if_failed_dir_growing`` would start warning inside
+    unrelated tests.
 
     Args:
         default_settings: The shared fixture settings, mutated in place.

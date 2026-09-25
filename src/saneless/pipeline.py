@@ -8,9 +8,7 @@ is automatically cleaned up on success or failure.
 from __future__ import annotations
 
 import contextlib
-import errno
 import logging
-import os
 import shutil
 import tempfile
 import threading
@@ -20,7 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, assert_never
 
-from saneless.atomic_write import refused_mode_change
+from saneless import preservation
 from saneless.exceptions import (
     ConfigError,
     PaperlessError,
@@ -32,7 +30,7 @@ from saneless.exceptions import (
 )
 from saneless.pages import filter_empty_pages
 from saneless.pdf import assemble_pdf, build_pdf_filename
-from saneless.private_dirs import ensure_private_dir, make_private_dir
+from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
@@ -140,31 +138,6 @@ _SPOOL_LABEL_B: Final = "b"
 # raises S105 under this configuration.
 SCAN_LABEL_FRONT: Final = "front"
 SCAN_LABEL_BACK: Final = "back"
-
-# The workspace subdirectory a preserved partial scan is assembled into, kept
-# apart from the finished PDF's own directory so a preservation can never be
-# mistaken for, or collide with, the document the run was trying to deliver.
-_PARTIAL_DIR_NAME: Final = "partial"
-
-# What a preserved artefact's title says it is, appended to the operator's own
-# title before ``build_pdf_filename`` sanitises the whole thing.  The bracketed
-# spelling is the one ``_handle_duplex_mismatch`` already delivers, and the two
-# paths have to agree: an operator looking in ``failed/`` should not have to
-# learn that a pass-B failure and a page-count mismatch name their halves
-# differently.  ``(partial)`` is the simplex and single-pass form.
-_PARTIAL_SUFFIX: Final = "(partial)"
-_FRONTS_SUFFIX: Final = "(fronts)"
-_BACKS_SUFFIX: Final = "(backs)"
-
-FAILED_DIR_WARN_THRESHOLD = 20
-"""
-How many preserved PDFs make ``<data_dir>/failed/`` worth mentioning in the log.
-
-This is an *attention* threshold, not a retention policy. Reaching it changes
-nothing except that a WARNING is emitted: saneless never deletes, moves,
-truncates or rotates a file it preserved, because the whole point of preserving
-one was that it is the only remaining copy of a scanned document.
-"""
 
 
 class FlipCoordinator(ABC):
@@ -573,10 +546,11 @@ def _spool_dir_of(tmp_path: Path) -> Path:
     """
     Name the one directory inside a job workspace that holds page files.
 
-    Three places need it and only one of them creates it: ``run_pipeline``,
-    and then the two preservation paths that have to reach the pages after a
-    failure. Composing the name once means a later rename cannot leave one of
-    them quietly looking in the wrong place.
+    Two places need it and only one of them creates it: ``run_pipeline``,
+    which also hands it to the partial-scan guard, and the duplex-mismatch
+    assembly, which has to reach the pages after a failure. Composing the name
+    once means a later rename cannot leave one of them quietly looking in the
+    wrong place.
 
     Args:
         tmp_path: The job workspace.
@@ -587,157 +561,6 @@ def _spool_dir_of(tmp_path: Path) -> Path:
 
     """
     return tmp_path / _SPOOL_DIR_NAME
-
-
-def _make_failed_dir(failed_dir: Path) -> None:
-    """
-    Create ``failed_dir`` and the ``data_dir`` it sits in, each owner-only.
-
-    Preserved scans are whole documents, so neither directory may be
-    readable by other local users. Each level gets its own call because a
-    ``mkdir`` with ``parents=True`` creates a missing parent with the default
-    permissions, ignoring the mode it was given. A directory that already
-    exists keeps its mode: one an earlier release created is left alone.
-
-    Args:
-        failed_dir: The durable directory preserved scans go in, directly
-            inside ``data_dir``.
-
-    Raises:
-        OSError: If either directory cannot be created.
-
-    """
-    make_private_dir(failed_dir.parent)
-    make_private_dir(failed_dir)
-
-
-def _best_effort_chmod(path: Path, mode: int) -> None:
-    """
-    Set ``path``'s permission bits, tolerating a filesystem without them.
-
-    A refused change (for example on a vfat or CIFS ``tmp_dir``) is logged at
-    DEBUG and skipped: failing here would lose the very scan being preserved.
-
-    Args:
-        path: The file to change.
-        mode: The permission bits to give it.
-
-    Raises:
-        OSError: If the change failed for a reason other than a refusal.
-
-    """
-    try:
-        path.chmod(mode)
-    except OSError as exc:
-        if not refused_mode_change(exc):
-            raise
-        logger.debug("Not setting the mode of %s: %s", path, exc.strerror)
-
-
-def _move_private(source: Path, destination: Path) -> None:
-    """
-    Move one file to ``destination`` so that nobody else can read it on the way.
-
-    A rename keeps the mode the caller already gave the source.  Across
-    filesystems a rename fails with ``EXDEV``, and ``shutil.move`` would then
-    copy through ``copy2``, which creates the destination with the umask's
-    mode and applies the source's only once the whole document is written:
-    inside a ``failed/`` an earlier release left at 0755, the scan would be
-    readable by every local user for the length of the copy.  So the copy is
-    made here instead, into a file created 0600, and the source is removed
-    only once the copy is complete.  A copy that fails is removed, so no
-    truncated document is left behind.  Like ``rename``, an existing
-    destination is replaced; every name is keyed on the job id.
-
-    Args:
-        source: The file to move, inside the job workspace.
-        destination: Its full path in the durable directory, never the bare
-            directory.
-
-    Raises:
-        OSError: If the file could be neither renamed nor copied.
-
-    """
-    try:
-        source.rename(destination)
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-    else:
-        return
-    destination.unlink(missing_ok=True)
-    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as copy, source.open("rb") as original:
-            shutil.copyfileobj(original, copy)
-            copy.flush()
-            os.fsync(copy.fileno())
-    except BaseException:
-        destination.unlink(missing_ok=True)
-        raise
-    source.unlink()
-
-
-def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
-    """
-    Log one WARNING when preserved scans have piled up in ``failed_dir``.
-
-    Warn only. Nothing in saneless prunes, sweeps, caps, rotates or deletes
-    anything in that directory: every file in it is a document that reached
-    paper and never reached paperless-ngx, and automatically deleting one
-    would be precisely the data loss the preservation guard exists to prevent.
-    The control here is operator visibility, not enforcement. A
-    retention policy would need a config key and a user story that do not
-    exist yet.
-
-    **This function must never raise.** It is called from inside the
-    preservation guard's exception handler, while a delivery exception is
-    already in flight; a raise here would replace the real failure with a
-    bookkeeping error and lose the failure message the job has to carry.
-    Any filesystem trouble -- a permission change, a race, the directory
-    disappearing underneath us -- ends the check silently instead.
-
-    ``failed_dir`` holds two kinds of artefact, and both count. A preserved
-    scan is usually a PDF, but an assembly failure has no PDF to keep and
-    preserves the spooled page files themselves, as a job-keyed *directory*.
-    Counting only ``*.pdf`` would let a directory fill up with those
-    and report nothing, which is precisely the silence this warning exists to
-    break -- so a directory counts as one preserved scan and contributes its
-    whole recursive size to the total.
-
-    Args:
-        failed_dir: The directory preserved scans are moved into. Every scan
-            this guard preserved has already been moved in by the time this
-            runs, so all of them are included in the count.
-
-    """
-    try:
-        preserved = list(failed_dir.glob("*.pdf"))
-        # The walk lives inside this try on purpose: a page directory removed
-        # underneath it -- by an operator draining failed/ while a job fails --
-        # raises OSError and must leave through the same silent return.
-        page_dirs = [entry for entry in failed_dir.iterdir() if entry.is_dir()]
-        if len(preserved) + len(page_dirs) < FAILED_DIR_WARN_THRESHOLD:
-            return
-        total_bytes = sum(pdf.stat().st_size for pdf in preserved)
-        total_bytes += sum(
-            page.stat().st_size
-            for page_dir in page_dirs
-            for page in page_dir.rglob("*")
-            if page.is_file()
-        )
-    except OSError:
-        # Deliberately silent, per the docstring: a bookkeeping failure must
-        # not displace the delivery failure the guard is about to re-raise.
-        return
-    logger.warning(
-        "%d preserved scans (%.1f MiB) have accumulated in %s -- saneless "
-        "never deletes these files itself, so draining the directory is yours "
-        "to do once those documents are safely in paperless-ngx",
-        len(preserved) + len(page_dirs),
-        total_bytes / (1024 * 1024),
-        failed_dir,
-    )
 
 
 def _preservation_failure_message(
@@ -802,10 +625,10 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
     weighed and rejected for exactly that reason; narrowing it later would be a
     change of behaviour, not a tidy-up, so please do not relitigate it here.
 
-    The relocation goes through ``_move_private`` rather than a bare rename:
+    The relocation goes through ``preservation.move_private``, not a rename:
     ``data_dir`` and ``tmp_dir`` are independent settings and may sit on
     different filesystems, where ``Path.rename`` raises ``EXDEV``, while
-    ``_move_private`` falls back to an owner-only copy plus a drop of the
+    ``move_private`` falls back to an owner-only copy plus a drop of the
     source. The destination is always a full explicit path, never the bare
     directory, and every failure is an ``OSError`` the handler below catches.
     Replacing an existing file of the same name is a non-event because
@@ -839,7 +662,7 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
     except Exception as exc:
         destinations: list[Path] = []
         try:
-            _make_failed_dir(failed_dir)
+            preservation.make_failed_dir(failed_dir)
             for pdf_path in pdf_paths:
                 if not pdf_path.exists():
                     continue
@@ -848,10 +671,10 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
                 # 0700 workspace, so nobody else can open it in the meantime; a
                 # same-filesystem move is a rename, which keeps the mode, and a
                 # cross-filesystem one copies into a file created 0600 (see
-                # ``_move_private``). The other preservation sites rely on the
-                # same reasoning.
-                _best_effort_chmod(pdf_path, 0o600)
-                _move_private(pdf_path, destination)
+                # ``preservation.move_private``). The other preservation sites
+                # rely on the same reasoning.
+                preservation.best_effort_chmod(pdf_path, 0o600)
+                preservation.move_private(pdf_path, destination)
                 destinations.append(destination)
             # Once, after the loop, so the count reflects the finished state.
             # The duplex-mismatch recovery passes two PDFs under a single
@@ -860,7 +683,7 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
             # log noise on the one path already flagged as an anomaly, and a
             # contradiction of this helper's own "one WARNING" docstring.
             if destinations:
-                _warn_if_failed_dir_growing(failed_dir)
+                preservation.warn_if_failed_dir_growing(failed_dir)
         except OSError as move_exc:
             msg = _preservation_failure_message(exc, move_exc, failed_dir, destinations)
             raise PaperlessError(msg) from exc
@@ -952,10 +775,7 @@ class _SpoolLedger:
 
 
 def _preserve_partial_passes(
-    ledger: _SpoolLedger,
-    tmp_path: Path,
-    request: PipelineRequest,
-    failed_dir: Path,
+    artefacts: preservation.RunArtefacts,
     destinations: list[Path],
 ) -> None:
     """
@@ -966,18 +786,19 @@ def _preserve_partial_passes(
     and ``_drop_empty_pages`` would additionally raise "All pages were blank"
     on an all-faint batch and destroy the very evidence being preserved.
 
-    Every move goes through ``_move_private`` to an explicit destination
-    path, for the reasons ``_preserving``'s docstring sets out: ``tmp_dir``
-    and ``data_dir`` are independent settings that may sit on different
-    filesystems, and the copy made across them must never be readable by
-    anyone else.
+    Each pass is built by ``preservation.build_pass_pdf``, which checks the
+    twice-the-spool disk rule first and puts a ``(backs)`` pass in sheet order.
+    Every move goes through ``preservation.move_private`` to an explicit
+    destination path, for the reasons ``_preserving``'s docstring sets out:
+    ``tmp_dir`` and ``data_dir`` are independent settings that may sit on
+    different filesystems, and the copy made across them must never be
+    readable by anyone else.
 
     Args:
-        ledger: The passes to preserve, and the resolution to assemble at.
-        tmp_path: The job workspace. The partials are built in a subdirectory
-            of it and must leave it before it is unwound.
-        request: The job id and title the preserved names are composed from.
-        failed_dir: The durable directory to move them into, created here
+        artefacts: The run: its passes, the resolution to assemble at, the
+            workspace the partials are built in (they must leave it before it
+            is unwound), the job id and title their names are composed from,
+            and the durable directory to move them into -- created here,
             because ``data_dir`` may have gone since it was validated.
         destinations: Appended to as each pass lands, in pass order. An
             out-parameter rather than a return value on purpose: when this
@@ -987,32 +808,23 @@ def _preserve_partial_passes(
 
     Raises:
         OSError: If the directory cannot be created or a move fails.
-        PdfError: If a partial cannot be assembled.
+        PdfError: If a partial cannot be assembled, or the disk rule refuses.
 
     """
-    _make_failed_dir(failed_dir)
-    for suffix, records in ledger.spooled():
-        partial_title = f"{request.title} {suffix}"
-        partial_pdf = assemble_pdf(
-            records,
-            tmp_path / _PARTIAL_DIR_NAME,
-            filename=build_pdf_filename(request.job_id, partial_title),
-            dpi=ledger.dpi,
-            title=partial_title,
-        )
-        destination = failed_dir / partial_pdf.name
+    preservation.make_failed_dir(artefacts.failed_dir)
+    for suffix, records in artefacts.passes:
+        partial_pdf = preservation.build_pass_pdf(artefacts, suffix, records)
+        destination = artefacts.failed_dir / partial_pdf.name
         # Owner-only before the move, for the reason ``_preserving`` gives.
-        _best_effort_chmod(partial_pdf, 0o600)
-        _move_private(partial_pdf, destination)
+        preservation.best_effort_chmod(partial_pdf, 0o600)
+        preservation.move_private(partial_pdf, destination)
         destinations.append(destination)
 
 
 @contextlib.contextmanager
 def _preserving_partial_scan(
     ledger: _SpoolLedger,
-    tmp_path: Path,
-    request: PipelineRequest,
-    failed_dir: Path,
+    artefacts: preservation.RunArtefacts,
 ) -> Generator[None]:
     """
     Keep the pages an interrupted scan already spooled, then re-raise.
@@ -1042,10 +854,11 @@ def _preserving_partial_scan(
 
     Args:
         ledger: The passes this job has spooled, registered as they started.
-        tmp_path: The job workspace, which deletes the spool when it unwinds --
-            so this guard has to sit inside it.
-        request: The job id and title the preserved names are composed from.
-        failed_dir: Where the partials are moved to.
+        artefacts: The job id and title the preserved names are composed
+            from, the reserve the disk rule keeps, where the partials are
+            moved to, and the job workspace, which deletes the spool when it
+            unwinds -- so this guard has to sit inside it.  Its passes and
+            resolution are refreshed from ``ledger`` when the guard fires.
 
     Yields:
         Nothing. The block it wraps is the acquisition itself.
@@ -1086,11 +899,14 @@ def _preserving_partial_scan(
             # today's messages -- FeederEmptyError, "No pages were scanned" --
             # stand exactly as they are.
             raise
+        # The ledger knows what the passes spooled and the resolution the
+        # device reported; the artefacts are what the preservation reads.
+        artefacts.passes = ledger.spooled()
+        artefacts.dpi = ledger.dpi
+        failed_dir = artefacts.failed_dir
         destinations: list[Path] = []
         try:
-            _preserve_partial_passes(
-                ledger, tmp_path, request, failed_dir, destinations
-            )
+            _preserve_partial_passes(artefacts, destinations)
         except (OSError, PdfError) as keep_exc:
             msg = _preservation_failure_message(exc, keep_exc, failed_dir, destinations)
             # The page-file fallback, which until now was wired only around
@@ -1099,9 +915,7 @@ def _preserving_partial_scan(
             # check refuses a page because the disk is full, this guard fires,
             # and the partial PDF cannot be written either.  Without this, the
             # N pages the guard exists to keep went out with the workspace.
-            kept_pages = _preserve_page_files_after_partial_failure(
-                _spool_dir_of(tmp_path), failed_dir, request
-            )
+            kept_pages = _preserve_page_files_after_partial_failure(artefacts)
             if kept_pages is not None:
                 msg = f"{msg}. {kept_pages}"
             if isinstance(exc, SanelessError):
@@ -1109,7 +923,7 @@ def _preserving_partial_scan(
             raise ScanError(msg) from exc
         # Once, after every move, so the count reflects the finished state --
         # the same reason _preserving calls it after its own loop.
-        _warn_if_failed_dir_growing(failed_dir)
+        preservation.warn_if_failed_dir_growing(failed_dir)
         preserved = ", ".join(str(destination) for destination in destinations)
         msg = (
             f"{exc}. The {pages} page(s) scanned before the error "
@@ -1120,55 +934,8 @@ def _preserving_partial_scan(
         raise ScanError(msg) from exc
 
 
-def _move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> None:
-    """
-    Move every spooled page file into ``destination``.
-
-    A plain function and not only a guard, because two failure windows want
-    it: the assembly ``_preserving_page_files`` wraps, and the *partial*
-    assembly ``_preserving_partial_scan`` falls back to it from.
-
-    Each page moves to its own **explicit** destination path through
-    ``_move_private``, for the reasons ``_preserving``'s docstring sets out:
-    ``tmp_dir`` and ``data_dir`` may be on different filesystems, and the copy
-    made across them must never be readable by anyone else.
-
-    Args:
-        spool_dir: The job's spool, inside the workspace that is about to be
-            unwound -- which is why every caller has to run inside it.
-        destination: The job-keyed directory to move the pages into. Created
-            here, and only if there is at least one page to put in it, so a
-            failure with an empty spool leaves no empty directory behind.
-        moved: Appended to as each page lands, in name order. An out-parameter
-            for the same reason ``_preserve_partial_passes`` has one: when this
-            raises on page 7 of 12, the caller still has to be able to say
-            which six it kept.
-
-    Raises:
-        OSError: If the directory cannot be created or a move fails. Whatever
-            had already moved stays moved, and stays named in ``moved``.
-
-    """
-    page_files = sorted(entry for entry in spool_dir.iterdir() if entry.is_file())
-    if not page_files:
-        return
-    _make_failed_dir(destination.parent)
-    make_private_dir(destination)
-    for page_file in page_files:
-        target = destination / page_file.name
-        # Owner-only before the move, for the reason ``_preserving`` gives.
-        _best_effort_chmod(page_file, 0o600)
-        _move_private(page_file, target)
-        moved.append(target)
-    # Once, after the loop, so the count reflects the finished state -- the
-    # same reason _preserving calls it there.
-    _warn_if_failed_dir_growing(destination.parent)
-
-
 def _preserve_page_files_after_partial_failure(
-    spool_dir: Path,
-    failed_dir: Path,
-    request: PipelineRequest,
+    artefacts: preservation.RunArtefacts,
 ) -> str | None:
     """
     Keep the page files when the *partial* PDF could not be built either.
@@ -1192,9 +959,9 @@ def _preserve_page_files_after_partial_failure(
     extra survived" rather than replacing the error the operator needs to see.
 
     Args:
-        spool_dir: The job's spool, still inside the workspace.
-        failed_dir: The durable directory the job-keyed page directory goes in.
-        request: The job id and title that directory is named from.
+        artefacts: The job's spool, still inside the workspace; the durable
+            directory the job-keyed page directory goes in; and the job id and
+            title that directory is named from.
 
     Returns:
         A sentence naming the count and the directory, or None when the spool
@@ -1202,11 +969,12 @@ def _preserve_page_files_after_partial_failure(
 
     """
     destination = (
-        failed_dir / Path(build_pdf_filename(request.job_id, request.title)).stem
+        artefacts.failed_dir
+        / Path(build_pdf_filename(artefacts.job_id, artefacts.title)).stem
     )
     moved: list[Path] = []
     try:
-        _move_page_files(spool_dir, destination, moved)
+        preservation.move_page_files(artefacts.spool_dir, destination, moved)
     except OSError:
         logger.warning(
             "The spooled page files could not be preserved either", exc_info=True
@@ -1225,7 +993,7 @@ def _preserving_page_files(spool_dir: Path, destination: Path) -> Generator[None
     so the pages themselves move out of the workspace instead -- into a
     job-keyed directory under
     ``failed/``, which is a second *kind* of artefact that directory has never
-    held before. ``_warn_if_failed_dir_growing`` counts it.
+    held before. ``preservation.warn_if_failed_dir_growing`` counts it.
 
     The destination's name is derived from ``build_pdf_filename``'s output, so
     the directory inherits that function's uniqueness argument unchanged: a UTC
@@ -1257,7 +1025,7 @@ def _preserving_page_files(spool_dir: Path, destination: Path) -> Generator[None
     except Exception as exc:
         moved: list[Path] = []
         try:
-            _move_page_files(spool_dir, destination, moved)
+            preservation.move_page_files(spool_dir, destination, moved)
         except OSError as move_exc:
             msg = _preservation_failure_message(exc, move_exc, destination, moved)
             if isinstance(exc, SanelessError):
@@ -1357,10 +1125,10 @@ class _DeliveryContext:
     """
     The settings-derived values the duplex-mismatch recovery needs.
 
-    Bundled into one record rather than passed as three more parameters
+    Bundled into one record rather than passed as four more parameters
     because ``_handle_duplex_mismatch`` already sits exactly on ruff's
     ``PLR0913`` argument limit, and CLAUDE.md forbids both raising the limit
-    and suppressing the rule. A three-field frozen record still names every
+    and suppressing the rule. A four-field frozen record still names every
     dependency -- which threading the whole ``Settings`` object in would not --
     and stays cheap to construct in a test.
 
@@ -1370,12 +1138,15 @@ class _DeliveryContext:
         failed_dir: Where the preservation guard moves partial PDFs when
             delivery fails.
         task_timeout: Seconds to wait for each paperless-ngx consume task.
+        min_free_space_mb: The reserve the twice-the-spool disk rule keeps
+            free on top of the room both halves need.
 
     """
 
     dpi: int
     failed_dir: Path
     task_timeout: float
+    min_free_space_mb: int
 
 
 @dataclass(frozen=True)
@@ -1558,9 +1329,10 @@ def _handle_duplex_mismatch(
         paperless: Paperless-ngx client for upload.
         request: Pipeline request with title, tags, correspondent, job id and
             status callback.
-        delivery: The DPI, the preservation directory and the task timeout.
-            Bundled because this function has no profile and no settings in
-            scope, and because three more parameters would break PLR0913.
+        delivery: The DPI, the preservation directory, the task timeout and
+            the disk reserve. Bundled because this function has no profile
+            and no settings in scope, and because four more parameters would
+            break PLR0913.
 
     Returns:
         A (warning, delivered_to_api) pair. The warning gives the reason the
@@ -1575,10 +1347,11 @@ def _handle_duplex_mismatch(
         the user actually needs.
 
     Raises:
-        PdfError: If either half cannot be assembled. The spooled page files of
-            both passes are moved into a job-keyed directory under
-            ``delivery.failed_dir`` first, and the message names the count and
-            that directory.
+        PdfError: If either half cannot be assembled, or the free space is
+            under twice both halves' spooled pages plus the reserve. The
+            spooled page files of both passes are moved into a job-keyed
+            directory under ``delivery.failed_dir`` first, and the message
+            names the count and that directory.
         PaperlessError: If either upload or either poll fails. Both partial
             PDFs are moved to ``delivery.failed_dir`` first, and the message
             names them.
@@ -1591,8 +1364,8 @@ def _handle_duplex_mismatch(
     backs = list(reversed(mismatch.backs))
     # One composition per half, used for the file name, the PDF's own /Title
     # and the upload, so the three cannot drift apart.
-    fronts_title = f"{request.title} {_FRONTS_SUFFIX}"
-    backs_title = f"{request.title} {_BACKS_SUFFIX}"
+    fronts_title = f"{request.title} {preservation.FRONTS_SUFFIX}"
+    backs_title = f"{request.title} {preservation.BACKS_SUFFIX}"
     # Derived rather than passed: it is exactly what the caller would hand us,
     # and the caller is already handing us the request it comes from.
     notify = request.status_callback or _noop_callback
@@ -1617,6 +1390,11 @@ def _handle_duplex_mismatch(
         delivery.failed_dir
         / Path(build_pdf_filename(request.job_id, request.title)).stem,
     ):
+        # Summed: the fronts PDF is still in the workspace while the backs are
+        # assembled, so the two halves together have to fit the rule.
+        preservation.ensure_room_to_assemble(
+            [*fronts, *backs], tmp_path, delivery.min_free_space_mb
+        )
         fronts_pdf = assemble_pdf(
             fronts,
             tmp_path / "fronts",
@@ -1696,7 +1474,7 @@ def _duplex_mismatch_warning(mismatch: _DuplexMismatch) -> str:
         return (
             f"The scanner could not read {sheets}, so the fronts and backs "
             f"could not be paired reliably; they were uploaded as two PDFs, "
-            f"{_FRONTS_SUFFIX} and {_BACKS_SUFFIX}, for manual review."
+            f"{preservation.FRONTS_SUFFIX} and {preservation.BACKS_SUFFIX}, for manual review."
         )
     return (
         f"Page count mismatch: {len(mismatch.fronts)} fronts, "
@@ -1745,6 +1523,7 @@ def _finish_duplex_mismatch(
             dpi=mismatch.dpi,
             failed_dir=settings.output.failed_dir,
             task_timeout=settings.output.paperless_task_timeout,
+            min_free_space_mb=settings.output.min_free_space_mb,
         ),
     )
     notify = request.status_callback or _noop_callback
@@ -1888,7 +1667,7 @@ def _scan_manual_duplex(
     # mismatch recovery gives this half, so every way pass A's sheets can be
     # lost from here on keeps them.  Registering afterwards would miss
     # the case the registration exists for: a fault part-way through pass A.
-    acquisition.ledger.register(_FRONTS_SUFFIX, front_sink)
+    acquisition.ledger.register(preservation.FRONTS_SUFFIX, front_sink)
     front_batch = scanner.scan_pages(
         acquisition.device_id, acquisition.settings, front_sink
     )
@@ -1955,7 +1734,7 @@ def _scan_manual_duplex(
     # are a single document between them, so a failure on either has to keep
     # both -- the same rule, and the same two names, that the mismatch recovery
     # already applies under its one shared guard.
-    acquisition.ledger.register(_BACKS_SUFFIX, back_sink)
+    acquisition.ledger.register(preservation.BACKS_SUFFIX, back_sink)
     back_batch = scanner.scan_pages(
         acquisition.device_id, acquisition.settings, back_sink
     )
@@ -2083,7 +1862,7 @@ def _scan_simplex(
     # Registered before the pass runs, not after it returns: the whole point is
     # the case where it never returns, and a fault part-way through has to find
     # the sink that has been collecting pages all along.
-    acquisition.ledger.register(_PARTIAL_SUFFIX, sink)
+    acquisition.ledger.register(preservation.PARTIAL_SUFFIX, sink)
     batch = scanner.scan_pages(acquisition.device_id, acquisition.settings, sink)
     _require_pages(batch)
     acquisition.ledger.note_resolution(batch.actual_resolution)
@@ -2253,7 +2032,9 @@ def run_pipeline(
             removed every page; or if a manual duplex flip prompt fails or its
             wait times out. When pages had already reached the spool, the
             message additionally names how many were kept and where.
-        PdfError: If the PDF cannot be assembled. The spooled page files are
+        PdfError: If the PDF cannot be assembled, or the free space is under
+            twice the spooled pages plus ``min_free_space_mb``, which is
+            checked before assembly starts. The spooled page files are
             moved into a job-keyed directory under
             ``settings.output.failed_dir`` first, and the message names the
             count and that directory.
@@ -2342,7 +2123,16 @@ def run_pipeline(
         # one would file the halves as (fronts)/(backs) partials as well.
         acquired: ScanBatch | _DuplexMismatch
         with _preserving_partial_scan(
-            acquisition.ledger, tmp_path, request, settings.output.failed_dir
+            acquisition.ledger,
+            preservation.RunArtefacts(
+                job_id=request.job_id,
+                title=request.title,
+                workspace=tmp_path,
+                spool_dir=spool_dir,
+                failed_dir=settings.output.failed_dir,
+                reserve_mb=settings.output.min_free_space_mb,
+                dpi=profile.resolution,
+            ),
         ):
             if flip is None:
                 acquired = _scan_simplex(scanner, acquisition, request)
@@ -2403,6 +2193,12 @@ def run_pipeline(
         with _preserving_page_files(
             spool_dir, settings.output.failed_dir / Path(pdf_filename).stem
         ):
+            # Refused before a byte is written when the disk cannot hold the
+            # singles and the output beside the spool; inside the guard, so a
+            # refusal keeps the page files like any other assembly failure.
+            preservation.ensure_room_to_assemble(
+                filtered, tmp_path, settings.output.min_free_space_mb
+            )
             pdf_path = assemble_pdf(
                 filtered,
                 tmp_path,

@@ -10,7 +10,9 @@ from unittest.mock import MagicMock
 
 import pikepdf
 import pytest
+
 import saneless.preservation as preservation_module
+from saneless.exceptions import PdfError, ScanInterrupted
 from saneless.preservation import (
     BACKS_SUFFIX,
     FAILED_DIR_WARN_THRESHOLD,
@@ -24,8 +26,6 @@ from saneless.preservation import (
     preserve_most_finished,
     warn_if_failed_dir_growing,
 )
-
-from saneless.exceptions import PdfError, ScanInterrupted
 from saneless.spool import SpooledPageSink
 from tests.golden_support import distinct_page, embedded_streams, png_idat
 
