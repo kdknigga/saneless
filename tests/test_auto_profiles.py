@@ -2509,10 +2509,11 @@ class TestDevicePin:
     ) -> None:
         """The id is untrusted, so the log line quotes it with ``%r``."""
         config_file = tmp_path / "saneless.toml"
-        device = "net:h:1\x1b[2J"
 
         with caplog.at_level(logging.INFO, logger="saneless.auto_profiles"):
-            write_profiles_to_config(config_file, self._generated(), device=device)
+            write_profiles_to_config(
+                config_file, self._generated(), device=self._DEVICE
+            )
 
         messages = [
             record.getMessage()
@@ -2520,7 +2521,39 @@ class TestDevicePin:
             if record.name == "saneless.auto_profiles"
             and "Pinned [scanner] device" in record.getMessage()
         ]
-        assert messages == [f"Pinned [scanner] device to {device!r}"]
+        assert messages == ["Pinned [scanner] device to 'net:h:1'"]
+
+    def test_pin_skips_an_id_holding_control_characters(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r"""
+        An id with control characters is not pinned; the profiles still are.
+
+        tomlkit writes ESC as ``\e``, which Python's TOML 1.0 reader rejects,
+        so the round-trip guard would refuse the whole run.  Skipping the pin
+        keeps the profiles and says why, with the id quoted by ``%r``.
+        """
+        config_file = tmp_path / "saneless.toml"
+        device = "net:h:1\x1b[2J"
+
+        with caplog.at_level(logging.INFO, logger="saneless.auto_profiles"):
+            result = write_profiles_to_config(
+                config_file, self._generated(), device=device
+            )
+
+        data = tomllib.loads(config_file.read_text())
+        assert "scanner" not in data
+        assert "default" in data["profiles"]
+        assert result.pinned_device is None
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.auto_profiles"
+            and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert repr(device) in warnings[0]
+        assert "\x1b" not in warnings[0]
 
     def test_pin_describe_names_the_device(self, tmp_path: Path) -> None:
         """The pin is its own line, after the profile groups, quoted with repr."""

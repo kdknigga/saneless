@@ -1,6 +1,9 @@
 [scanner]
 host = ""       # SANE network host, leave empty for local
-device = ""     # SANE device string, leave empty for auto-detect
+# SANE device string. Empty auto-detects the first device listed, so a scanner
+# that appears on your network later could take your scans: pin one.
+# `saneless devices` lists the ids; `saneless auto-profiles` writes it for you.
+device = ""
 
 [paperless]
 url = "http://your-paperless-host:8000"

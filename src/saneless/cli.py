@@ -1449,7 +1449,11 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         )
         raise ConfigError(msg)
 
-    # Use configured device or first discovered device
+    # Use configured device or first discovered device.  A discovered one is
+    # also pinned below, so later scans do not follow whichever scanner SANE
+    # lists first; a configured one, from the file or the environment, is
+    # already a choice and is not written again.
+    pin = None if settings.scanner.device else device_list[0].name
     device_id = settings.scanner.device or device_list[0].name
     caps = scanner.get_capabilities(device_id)
     profiles = generate_profiles(caps, device_type_of(device_list, device_id))
@@ -1464,7 +1468,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     # merged text that would not parse) names the file and the fix; the group
     # guard prints it as-is and exits 2, with no traceback.
     try:
-        result = write_profiles_to_config(config_path, profiles, force=force)
+        result = write_profiles_to_config(
+            config_path, profiles, force=force, device=pin
+        )
     except OSError as exc:
         click.echo(f"Cannot write {config_path}: {exc.strerror or exc}", err=True)
         ctx.exit(ExitCode.CONFIG)
