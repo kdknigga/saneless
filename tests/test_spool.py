@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 from PIL import Image, ImageDraw
-from PIL.ImageStat import Stat
 
+import saneless.spool as spool_module
 from saneless.exceptions import ScanError
+from saneless.pages import InkMeasurement, measure_ink
 from saneless.scanner.base import PageRecord, PageSink
 from saneless.spool import SpooledPageSink
 
@@ -26,12 +27,12 @@ _IMPOSSIBLE_RESERVE_MB = 1_000_000_000
 
 
 def _white_page(size: tuple[int, int] = (200, 300)) -> Image.Image:
-    """Return a pure-white page: greyscale mean 255.0, stddev 0.0."""
+    """Return a pure-white page: no ink anywhere on it."""
     return Image.new("RGB", size, "white")
 
 
 def _inked_page(size: tuple[int, int] = (200, 300)) -> Image.Image:
-    """Return a page with dark content, so its stddev is far from zero."""
+    """Return a page with dark content, so most of its inset is ink."""
     image = Image.new("RGB", size, "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((10, 10, size[0] - 10, size[1] - 10), fill="black")
@@ -44,7 +45,15 @@ class TestPageRecordContract:
     def test_fields_are_exactly_the_contract(self) -> None:
         """PageRecord carries the seven agreed fields, in the agreed order."""
         names = [field.name for field in dataclasses.fields(PageRecord)]
-        assert names == ["sequence", "path", "size", "mode", "dpi", "mean", "stddev"]
+        assert names == [
+            "sequence",
+            "path",
+            "size",
+            "mode",
+            "dpi",
+            "ink_coverage",
+            "paper_white",
+        ]
 
     def test_carries_no_verdict_field(self) -> None:
         """No is_blank/is_empty flag: verdicts belong to the pipeline (D-02)."""
@@ -60,8 +69,8 @@ class TestPageRecordContract:
             size=(200, 300),
             mode="RGB",
             dpi=300,
-            mean=255.0,
-            stddev=0.0,
+            ink_coverage=0.0,
+            paper_white=255,
         )
         # Through setattr with the name in a variable, because a plain
         # ``record.sequence = 2`` is a static error both type checkers report,
@@ -78,8 +87,8 @@ class TestPageRecordContract:
             size=(200, 300),
             mode="RGB",
             dpi=300,
-            mean=255.0,
-            stddev=0.0,
+            ink_coverage=0.0,
+            paper_white=255,
         )
         assert record.sequence == 1
 
@@ -112,8 +121,8 @@ class TestPageSinkContract:
                     size=image.size,
                     mode=image.mode,
                     dpi=dpi,
-                    mean=255.0,
-                    stddev=0.0,
+                    ink_coverage=0.0,
+                    paper_white=255,
                 )
 
         sink = _RecordingSink()
@@ -189,25 +198,57 @@ class TestSpooledPageSinkWrite:
         assert record.mode == "RGB"
 
 
-class TestSpooledPageSinkStatistics:
-    """Greyscale statistics, measured once at spool time (D-02, D-06)."""
+class TestSpooledPageSinkMeasurement:
+    """The ink measurement, made once at spool time by ``pages.measure_ink``."""
 
-    def test_white_page_statistics(self, tmp_path: Path) -> None:
-        """A pure-white page has mean 255.0 and stddev 0.0."""
+    def test_white_page_measures_no_ink(self, tmp_path: Path) -> None:
+        """A pure-white page records ``measure_ink``'s answer: no ink at all."""
+        page = _white_page()
         sink = SpooledPageSink(tmp_path, "a", 10)
-        record = sink.add(_white_page(), dpi=300)
-        assert record.mean == 255.0
-        assert record.stddev == 0.0
+        record = sink.add(page, dpi=300)
+        assert (record.ink_coverage, record.paper_white) == tuple(measure_ink(page))
+        assert record.ink_coverage == 0.0
 
-    def test_inked_page_statistics_match_pillow(self, tmp_path: Path) -> None:
-        """mean/stddev equal Stat(image.convert("L")) for an inked page."""
+    def test_inked_page_measurement_matches_measure_ink(self, tmp_path: Path) -> None:
+        """The coverage and paper white equal ``measure_ink`` of the same page."""
         image = _inked_page()
-        expected = Stat(image.convert("L"))
+        expected = measure_ink(image)
         sink = SpooledPageSink(tmp_path, "a", 10)
         record = sink.add(image, dpi=300)
-        assert record.mean == pytest.approx(expected.mean[0])
-        assert record.stddev == pytest.approx(expected.stddev[0])
-        assert record.stddev > 0.0
+        assert record.ink_coverage == expected.coverage
+        assert record.paper_white == expected.paper_white
+        assert record.ink_coverage > 0.0
+
+    def test_the_record_carries_no_greyscale_statistics(self, tmp_path: Path) -> None:
+        """The mean and stddev the old rule judged are gone from the record."""
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(_inked_page(), dpi=300)
+        assert not hasattr(record, "mean")
+        assert not hasattr(record, "stddev")
+
+    def test_each_page_is_measured_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One ``measure_ink`` call per page, on the page as it was spooled."""
+        measured: list[str] = []
+
+        def counting(image: Image.Image) -> InkMeasurement:
+            measured.append(image.mode)
+            return measure_ink(image)
+
+        monkeypatch.setattr(spool_module, "measure_ink", counting)
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        sink.add(_inked_page(), dpi=300)
+        sink.add(_white_page().convert("RGBA"), dpi=300)
+
+        assert measured == ["RGB", "RGB"]
+
+    def test_a_converted_page_is_measured_as_written(self, tmp_path: Path) -> None:
+        """An RGBA page is measured after its conversion, as the RGB page it became."""
+        image = _inked_page()
+        sink = SpooledPageSink(tmp_path, "a", 10)
+        record = sink.add(image.convert("RGBA"), dpi=300)
+        assert (record.ink_coverage, record.paper_white) == tuple(measure_ink(image))
 
 
 class TestSpooledPageSinkThumbnail:

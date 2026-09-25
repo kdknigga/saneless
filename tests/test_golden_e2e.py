@@ -30,6 +30,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn
 
+import pikepdf
 import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
@@ -480,6 +481,7 @@ def _run_cli(
     scenario: _Scenario,
     *,
     refuse_uploads: bool = False,
+    coverage_threshold: float | None = None,
 ) -> _CliRun:
     """
     Run ``saneless scan --title "Quarterly Report"`` against the golden fakes.
@@ -494,6 +496,8 @@ def _run_cli(
         scenario: What the scanner feeds.
         refuse_uploads: Answer every upload with a 500 and give the run a
             consume folder, so it falls back to it.
+        coverage_threshold: The scenario profile's blank-page threshold, when
+            the run is not to use the shipped default.
 
     Returns:
         What the run left behind.
@@ -503,6 +507,9 @@ def _run_cli(
     if consume_dir is not None:
         consume_dir.mkdir()
     settings = _settings(tmp_path, profile_metadata=True, consume_dir=consume_dir)
+    if coverage_threshold is not None:
+        profile = settings.profiles[scenario.profile]
+        profile.empty_page_coverage_threshold = coverage_threshold
     recorder = RecordingPaperless(refuse_uploads=refuse_uploads)
     scanner = DistinctPageScanner(passes=scenario.passes, rejected=scenario.rejected)
 
@@ -720,6 +727,30 @@ def test_cli_all_blank_scan_keeps_a_pdf_and_exits_8(
     assert f"preserved at {kept[0]}" in lines[0]
     assert lines[1].startswith("Try: ")
     assert "empty_page_coverage_threshold" in lines[1]
+    assert run.recorder.uploads() == []
+    assert run.scratch == []
+
+
+def test_cli_the_coverage_knob_decides_the_all_blank_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The profile's threshold is what judges the pages, end to end.
+
+    The scanner feeds its ordinary inked pages, which the shipped default
+    keeps.  With ``empty_page_coverage_threshold`` at the top of its range
+    every page light enough to be paper is judged blank, so the same run
+    fails as all-blank: nothing uploaded, the unfiltered pages kept as one
+    PDF, and exit 8.
+    """
+    run = _run_cli(tmp_path, monkeypatch, _SIMPLEX_RUN, coverage_threshold=100.0)
+
+    assert run.result.exit_code == 8, run.result.output
+    kept = sorted((tmp_path / "data" / "failed").glob("*.pdf"))
+    assert len(kept) == 1
+    with pikepdf.open(kept[0]) as pdf:
+        assert len(pdf.pages) == len(_SIMPLEX_RUN.document_order)
+    assert "empty_page_coverage_threshold" in run.result.stderr
     assert run.recorder.uploads() == []
     assert run.scratch == []
 

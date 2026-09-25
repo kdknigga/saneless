@@ -526,6 +526,46 @@ class TestScanCommand:
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 0
         assert "Done: Test" in result.output
+        assert "Removed as blank" not in result.output
+
+    def test_scan_names_the_pages_removed_as_blank(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Pages 2 and 4 of four are blank: named on stdout after Done, and exit 0.
+
+        Removed pages are not kept anywhere, so this line is how the operator
+        learns which sheets to rescan if a real page was taken for a blank.
+        It is information, not a warning: nothing reaches stderr and the
+        command still exits 0.
+        """
+
+        class BlankBacksScanner(StubScannerBackend):
+            """A feeder whose second and fourth sheets have nothing on them."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
+            def scan_pages(
+                self, device_id: str, settings: ScanSettings, sink: PageSink
+            ) -> ScanBatch:
+                """Spool inked, blank, inked, blank."""
+                blank = Image.new("RGB", (100, 100), "white")
+                records = [
+                    sink.add(page, dpi=settings.resolution)
+                    for page in (_inked_page(), blank, _inked_page(), blank)
+                ]
+                return scan_batch(records, resolution=settings.resolution)
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=BlankBacksScanner)
+
+        result = runner.invoke(cli, ["scan", "--title", "Test"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.stdout.splitlines()
+        done = lines.index("Done: Test")
+        assert lines[done + 1] == "Removed as blank: pages 2, 4 of 4 scanned."
+        assert "Removed as blank" not in result.stderr
 
     def test_scan_status_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan shows its progress messages in pipeline order."""

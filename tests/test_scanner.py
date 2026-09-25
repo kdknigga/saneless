@@ -1381,12 +1381,11 @@ class TestSaneBackendPageValidation:
         A uniformly white page reaches the caller instead of being discarded.
 
         python-sane expands 1-bit lineart to 0 and 255 bytes, so a clean blank
-        page is exactly mean 255.0 / stddev 0.0 -- which is precisely what the
-        deleted scanner-level check keyed on.  Those statistics are still how a
-        blank page is recognised; what changed is *where*.  The decision now
-        belongs to ``pipeline._drop_empty_pages``, under the profile's
-        ``enable_empty_page_detection`` toggle, where the user can see it and
-        turn it off (M-14, D-05).
+        page is uniformly 255 -- which is precisely what the deleted
+        scanner-level check keyed on.  Whether such a page is dropped is still
+        decided, but not here: it belongs to the pipeline's blank-page filter,
+        under the profile's ``enable_empty_page_detection`` toggle, where the
+        user can see it and turn it off (M-14, D-05).
         """
         mock_dev = fake_sane_module.open(_TEST_DEVICE)
         white_img = Image.new("RGB", (200, 300), (255, 255, 255))
@@ -1398,12 +1397,10 @@ class TestSaneBackendPageValidation:
         pages = backend.scan_pages("test:device:001", settings, page_sink).pages
         assert len(pages) == 2
         # The blank itself survived, rather than the content page arriving
-        # twice.  Asserted from the record's own statistics, which are the
-        # exact two numbers named above and are measured once, at spool time:
-        # a stddev of 0 means every greyscale pixel is equal, and a mean of 255
-        # says which value they all are.
-        assert pages[0].mean == 255.0
-        assert pages[0].stddev == 0.0
+        # twice.  Asserted from the record's own measurement, made once at
+        # spool time: no ink anywhere, on paper measuring 255.
+        assert pages[0].ink_coverage == 0.0
+        assert pages[0].paper_white == 255
 
     def test_pure_black_page_survives(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
@@ -1425,10 +1422,9 @@ class TestSaneBackendPageValidation:
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings, page_sink).pages
         assert len(pages) == 2
-        # Mean 0.0 with stddev 0.0 is solid black, which is precisely the
-        # statistic the deleted content policy keyed on.
-        assert pages[0].mean == 0.0
-        assert pages[0].stddev == 0.0
+        # Paper measuring 0 is solid black, which is precisely the page the
+        # deleted content policy keyed on.
+        assert pages[0].paper_white == 0
 
     def test_normal_content_page_passes(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink

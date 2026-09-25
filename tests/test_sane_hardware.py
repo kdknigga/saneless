@@ -210,17 +210,18 @@ class TestRealSaneTestBackend:
         All ten pages come back, and every one of them is uniformly black.
 
         SCNR-03 proven against real hardware instead of against a double.  The
-        ``test`` backend hands back solid black at mean 0.0 / stddev 0.0 --
-        exactly the statistics the deleted content policy keyed on -- so this
+        ``test`` backend hands back solid black -- exactly the page the deleted
+        content policy keyed on -- so this
         is the strongest evidence available that the scanner layer no longer
         judges a page by what is printed on it.  Whether a blank page is worth
         keeping is decided one layer up, under the profile's
         ``enable_empty_page_detection`` toggle, where the user can see it.
 
-        Asserted twice over, because the two say different things.  The record
-        statistics are what ``pipeline._drop_empty_pages`` will actually judge,
-        measured once at spool time; the read-back through ``images_of`` proves
-        the spooled PNG -- the file the PDF embeds -- really holds those pixels.
+        Asserted twice over, because the two say different things.  The record's
+        measurement is what the pipeline's blank-page filter will actually
+        judge, made once at spool time; the read-back through ``images_of``
+        proves the spooled PNG -- the file the PDF embeds -- really holds those
+        pixels.
 
         Args:
             tmp_path: Where the ten pages are spooled.
@@ -231,8 +232,7 @@ class TestRealSaneTestBackend:
         )
         batch = SaneBackend().scan_pages("test:0", settings, _page_sink_for(tmp_path))
         assert len(batch.pages) == 10
-        assert all(record.mean == 0.0 for record in batch.pages)
-        assert all(record.stddev == 0.0 for record in batch.pages)
+        assert all(record.paper_white == 0 for record in batch.pages)
         assert all(
             image.convert("L").getextrema() == (0, 0) for image in images_of(batch)
         )

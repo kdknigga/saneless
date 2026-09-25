@@ -2695,22 +2695,65 @@ class TestResolveJobTitle:
 
 
 class TestProfileConfigThresholds:
-    """ProfileConfig empty page threshold fields."""
+    """ProfileConfig's one blank-page knob: the ink-coverage threshold."""
 
     def test_custom_threshold_values(self, tmp_config_dir: Path) -> None:
-        """ProfileConfig accepts custom threshold values from TOML."""
+        """ProfileConfig accepts a custom coverage threshold from TOML."""
         toml_content = """\
 [profiles.default]
 source = "ADF"
-empty_page_mean_threshold = 240.0
-empty_page_stddev_threshold = 10.0
+empty_page_coverage_threshold = 0.01
 """
         config_file = tmp_config_dir / "thresholds.toml"
         config_file.write_text(toml_content)
         settings = load_settings(config_path=str(config_file))
         profile = settings.profiles["default"]
-        assert profile.empty_page_mean_threshold == 240.0
-        assert profile.empty_page_stddev_threshold == 10.0
+        assert profile.empty_page_coverage_threshold == 0.01
+
+    def test_the_default_keeps_sparse_pages(self) -> None:
+        """The shipped default is a thousandth of a per cent of the inset."""
+        assert ProfileConfig().empty_page_coverage_threshold == 0.001
+
+    @pytest.mark.parametrize(
+        "key", ["empty_page_mean_threshold", "empty_page_stddev_threshold"]
+    )
+    def test_the_removed_thresholds_fail_to_load(
+        self, tmp_config_dir: Path, key: str
+    ) -> None:
+        """A profile still setting a removed key is refused by name, with no alias."""
+        err = _load_error(
+            tmp_config_dir / "removed.toml",
+            f"[profiles.default]\n{key} = 250.0\n",
+        )
+        assert any(
+            line.startswith(f"  [profiles.default] unknown key '{key}'")
+            for line in _error_lines(err)
+        ), str(err)
+
+    @pytest.mark.parametrize(
+        ("value", "bound"),
+        [(-0.1, "greater_than_equal"), (100.1, "less_than_equal")],
+    )
+    def test_a_threshold_outside_a_percentage_is_refused(
+        self, value: float, bound: str
+    ) -> None:
+        """
+        Below zero or above a hundred per cent is not a coverage.
+
+        Asserted by the error's type, not only its field name: an unknown key
+        is refused under the same name, and that is not the refusal meant.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            ProfileConfig(empty_page_coverage_threshold=value)
+        (error,) = exc_info.value.errors()
+        assert error["loc"] == ("empty_page_coverage_threshold",)
+        assert error["type"] == bound
+
+    @pytest.mark.parametrize("value", [0.0, 100.0])
+    def test_the_bounds_are_inclusive(self, value: float) -> None:
+        """Zero (remove only inkless pages) and a hundred are both accepted."""
+        profile = ProfileConfig(empty_page_coverage_threshold=value)
+        assert profile.empty_page_coverage_threshold == value
 
 
 class TestDefaultResolution:

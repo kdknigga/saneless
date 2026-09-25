@@ -5032,6 +5032,74 @@ class TestWorkerFinish:
         finally:
             store.close()
 
+    def test_finish_records_the_removed_positions_on_a_plain_done(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Pages 2 and 4 removed as blank: named on the job, and the job stays DONE.
+
+        The positions are information beside the counts, never a warning, so a
+        run that dropped blank backs does not become a warned success.
+        """
+        store = JobStore()
+        try:
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: ScanResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    pages_scanned=4,
+                    pages_removed=2,
+                    pages_uploaded=2,
+                    removed_positions=(2, 4),
+                ),
+            )
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Blank Backs")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            assert finished.state is JobState.DONE
+            assert finished.removed_positions == (2, 4)
+            assert finished.pages_removed == 2
+            assert finished.warning is None
+        finally:
+            store.close()
+
+    def test_finish_records_that_nothing_was_removed(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A run that removed nothing records an empty list, not "never recorded"."""
+        store = JobStore()
+        try:
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: _success_result(),
+            )
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Nothing Removed")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            assert finished.removed_positions == ()
+        finally:
+            store.close()
+
     def test_finish_persists_a_duplex_mismatch_warning(
         self,
         mock_scanner: MagicMock,

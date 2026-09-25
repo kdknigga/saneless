@@ -41,6 +41,7 @@ from saneless.exceptions import (
     ScanInterrupted,
     failure_text,
 )
+from saneless.pages import BlankFilterResult
 from saneless.paperless import PaperlessClient, UploadResult
 from saneless.pdf import assemble_pdf
 from saneless.pipeline import (
@@ -73,6 +74,12 @@ from saneless.vocabulary import (
     classify_error,
 )
 from saneless.workspace import find_orphans
+from tests.blank_fixtures import (
+    footer_page_number,
+    framed_blank,
+    tinted_blank,
+    typed_line,
+)
 from tests.conftest import (
     AlwaysContinueFlipCoordinator,
     spooling,
@@ -331,9 +338,9 @@ def _duplex_spool(
 
 def _keep_everything(
     pages: Sequence[PageRecord], **_thresholds: float
-) -> list[PageRecord]:
+) -> BlankFilterResult:
     """
-    Stand in for ``filter_empty_pages``, keeping every record it is given.
+    Stand in for ``filter_blank_pages``, keeping every record it is given.
 
     A ``return_value`` cannot be used for this any more: the records the
     pipeline goes on to assemble have to be the ones its own sink produced, and
@@ -341,14 +348,14 @@ def _keep_everything(
 
     Args:
         pages: Whatever the pipeline passed.
-        _thresholds: The profile thresholds, ignored here and asserted on
+        _thresholds: The profile threshold, ignored here and asserted on
             through the mock's call args.
 
     Returns:
-        The same records, in the same order.
+        The same records, in the same order, and no removed positions.
 
     """
-    return list(pages)
+    return BlankFilterResult(kept=list(pages), removed_positions=())
 
 
 def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[..., Path]:
@@ -746,16 +753,15 @@ class TestPipelineEmptyPageFilter:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """Custom thresholds from ProfileConfig are passed to filter_empty_pages."""
-        default_settings.profiles["default"].empty_page_mean_threshold = 200.0
-        default_settings.profiles["default"].empty_page_stddev_threshold = 10.0
+        """The profile's coverage threshold is what reaches filter_blank_pages."""
+        default_settings.profiles["default"].empty_page_coverage_threshold = 0.5
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         request = PipelineRequest(profile_name="default", title="Threshold Test")
 
-        with patch("saneless.pipeline.filter_empty_pages", wraps=None) as mock_filter:
+        with patch("saneless.pipeline.filter_blank_pages", wraps=None) as mock_filter:
             # A side_effect, not a return_value: what comes back has to be the
             # records the pipeline's own sink produced, because assembly reads
             # their files.
@@ -768,8 +774,7 @@ class TestPipelineEmptyPageFilter:
             )
             mock_filter.assert_called_once()
             _, kwargs = mock_filter.call_args
-            assert kwargs["mean_threshold"] == 200.0
-            assert kwargs["stddev_threshold"] == 10.0
+            assert kwargs == {"coverage_threshold": 0.5}
 
     def test_all_pages_empty_raises(
         self,
@@ -811,6 +816,222 @@ class TestPipelineEmptyPageFilter:
         with pikepdf.open(kept[0]) as pdf:
             assert len(pdf.pages) == 2
         mock_paperless.upload_document.assert_not_called()
+
+
+# The resolution the synthetic pages below are drawn at.  A third of a real
+# scan's, so each page is small enough to spool quickly, and every verdict the
+# pages get at full size still holds at it.
+_SMALL_DPI = 100
+
+
+def _typed() -> Image.Image:
+    """
+    Return one typed line on tinted, noisy paper: content under any sane rule.
+
+    Returns:
+        A small A4 page.
+
+    """
+    return typed_line(dpi=_SMALL_DPI)
+
+
+def _blank() -> Image.Image:
+    """
+    Return tinted, noisy paper with nothing on it.
+
+    The old mean/stddev rule kept this page, because tinted paper is darker
+    than its mean threshold; the ink-coverage rule removes it.
+
+    Returns:
+        A small A4 page.
+
+    """
+    return tinted_blank(dpi=_SMALL_DPI)
+
+
+def _run_through_assembly(
+    scanner: MagicMock, paperless: MagicMock, settings: Settings, title: str
+) -> tuple[ScanResult, int]:
+    """
+    Run the pipeline with the real assembly, counting the pages it assembled.
+
+    Args:
+        scanner: The stubbed scanner, already spooling its pages.
+        paperless: The stubbed paperless-ngx client.
+        settings: The run's settings.
+        title: The document title.
+
+    Returns:
+        The run's result, and how many pages the assembled PDF was given.
+
+    """
+    request = PipelineRequest(
+        profile_name="default",
+        title=title,
+        flip_coordinator=AlwaysContinueFlipCoordinator(),
+    )
+    with patch("saneless.pipeline.assemble_pdf", wraps=assemble_pdf) as assemble:
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=paperless,
+            settings=settings,
+            request=request,
+        )
+    return result, sum(len(call.args[0]) for call in assemble.call_args_list)
+
+
+class TestBlankPagesByInkCoverage:
+    """
+    The pipeline judges pages by ink coverage and names the ones it removed.
+
+    The removed pages are named by their 1-based place in the scanned
+    document -- the interleaved document, for manual duplex -- because that
+    is the number the operator rescans by.  The names are information, not a
+    warning: a run that dropped blank backs is a plain success.
+    """
+
+    def test_simplex_names_the_removed_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """Pages 2 and 4 of four are blank: both removed, both named, no warning."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_typed(), _blank(), _typed(), _blank()]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Positions"
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.removed_positions == (2, 4)
+        assert result.pages_scanned == 4
+        assert result.pages_removed == 2
+        assert result.pages_uploaded == 2
+        assert result.warning is None
+        assert assembled == 2
+        mock_paperless.upload_document.assert_called_once()
+
+    def test_manual_duplex_names_the_interleaved_position(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """
+        A blank back is named by its page in the interleaved document.
+
+        Pass B runs over the flipped stack, so its first page is the back of
+        the last sheet.  With two sheets that is page 4 of the document,
+        whatever number the spool gave it.
+        """
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_typed(), _typed()], [_blank(), _typed()]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Duplex Positions"
+        )
+
+        assert result.removed_positions == (4,)
+        assert result.pages_removed == 1
+        assert result.warning is None
+        assert assembled == 3
+
+    def test_detection_off_names_no_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """With detection off nothing is removed, so nothing is named."""
+        default_settings.profiles["default"].enable_empty_page_detection = False
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_typed(), _blank()])
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Detection Off"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_removed == 0
+        assert assembled == 2
+
+    def test_nothing_removed_names_no_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """A run with no blank page reports an empty set of positions."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_typed(), _typed()])
+
+        result, _ = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Nothing Removed"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_removed == 0
+
+    def test_the_default_profile_keeps_a_page_number_page(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """
+        A page carrying only a footer page number is uploaded, not dropped.
+
+        On bright paper the old mean/stddev rule removed this page, which is
+        how a real page of a document disappeared.
+        """
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_typed(), footer_page_number(tint=255, dpi=_SMALL_DPI)]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Page Number"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_uploaded == 2
+        assert assembled == 2
+
+    def test_every_page_blank_by_coverage_fails_and_keeps_the_pdf(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """Tinted and framed blanks are all removed: nothing uploaded, PDF kept."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_blank(), framed_blank(3, dpi=_SMALL_DPI)]
+        )
+
+        request = PipelineRequest(profile_name="default", title="All Tinted Blank")
+        with pytest.raises(AllPagesBlankError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        kept = list(default_settings.output.failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        with pikepdf.open(kept[0]) as pdf:
+            assert len(pdf.pages) == 2
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_a_duplex_mismatch_names_no_positions(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """The mismatch route skips detection, so it names nothing, blank or not."""
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_typed(), _typed(), _typed()], [_blank(), _typed()]
+        )
+
+        result, assembled = _run_through_assembly(
+            scanner, mock_paperless, default_settings, "Mismatch"
+        )
+
+        assert result.removed_positions == ()
+        assert result.pages_removed == 0
+        assert assembled == 5
 
 
 class TestFlipAnswerSlot:
