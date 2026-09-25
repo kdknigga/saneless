@@ -15,14 +15,14 @@ import stat
 from typing import TYPE_CHECKING
 
 import pytest
+
 import saneless.private_dirs as private_dirs_module
+from saneless.exceptions import ConfigError
 from saneless.private_dirs import (
     check_private_dir,
     ensure_private_dir,
     make_private_dir,
 )
-
-from saneless.exceptions import ConfigError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator

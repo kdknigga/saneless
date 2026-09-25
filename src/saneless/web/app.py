@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import sqlite3
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,7 @@ from saneless.checks import (
 from saneless.config import validate_settings_dirs
 from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
+from saneless.private_dirs import ensure_private_dir, make_private_dir
 from saneless.vocabulary import (
     RESTART_REASON,
     JobState,
@@ -224,6 +226,41 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
     return worker_stopped, refresher_stopped
 
 
+def _open_job_store(settings: Settings) -> JobStore:
+    """
+    Open the server's job store, creating ``data_dir`` and converting old files.
+
+    ``sqlite3.connect`` does not create parent directories, so ``data_dir``
+    must exist first.  It is created 0700; one that already exists keeps its
+    mode.
+
+    A database an earlier release created is converted to incremental
+    auto-vacuum here, once, on the server path only: a CLI command opening the
+    same file would race the running server's connection.  The conversion is
+    best effort -- its ``VACUUM`` needs free space about the size of the
+    database, and a database that needs shrinking may sit on a full disk -- so
+    a failure is a WARNING and the server starts with the file as it is.
+
+    Args:
+        settings: Application settings naming ``data_dir`` and the database.
+
+    Returns:
+        The open job store.
+
+    """
+    make_private_dir(settings.output.data_dir)
+    job_store = JobStore(db_path=settings.output.db_path)
+    try:
+        job_store.enable_incremental_auto_vacuum()
+    except sqlite3.Error:
+        logger.warning(
+            "Could not convert the job database to incremental auto-vacuum; "
+            "it will not shrink after deletes",
+            exc_info=True,
+        )
+    return job_store
+
+
 def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -239,16 +276,17 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         Configured FastAPI application ready to serve.
 
     """
+    # Before anything that holds a resource, so a refused directory leaves
+    # nothing open.  Scratch space is created 0700 and refused if another
+    # user got to the name first; the lifespan's validate_settings_dirs then
+    # sees the directory this made.
+    ensure_private_dir(settings.output.tmp_dir, key="output.tmp_dir")
+    job_store = _open_job_store(settings)
     paperless = PaperlessClient(
         url=settings.paperless.url,
         token=settings.paperless.token.get_secret_value(),
         consume_dir=settings.paperless.consume_dir,
     )
-    settings.output.tmp_dir.mkdir(parents=True, exist_ok=True)
-    # sqlite3.connect does not create parent directories, so data_dir must
-    # exist before JobStore opens the database.
-    settings.output.data_dir.mkdir(parents=True, exist_ok=True)
-    job_store = JobStore(db_path=settings.output.db_path)
     cache = MetadataCache(ttl=settings.output.paperless_cache_ttl_seconds)
     worker = ScanWorker(scanner, paperless, settings, job_store)
     checks_cache, refresher = _build_check_machinery(

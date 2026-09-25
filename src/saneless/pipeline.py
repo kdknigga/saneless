@@ -29,6 +29,7 @@ from saneless.exceptions import (
 )
 from saneless.pages import filter_empty_pages
 from saneless.pdf import assemble_pdf, build_pdf_filename
+from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
@@ -475,8 +476,10 @@ def _open_workspace(
     """
     Create this run's temporary workspace under ``tmp_dir``, checking for room.
 
-    Each of the three steps can raise a raw ``OSError`` -- a full disk, or a
-    ``tmp_dir`` removed since start-up.  That is the setup problem
+    ``tmp_dir`` is created 0700 when missing and refused when it is not
+    private (see ``saneless.private_dirs``); both failures are a
+    ``ConfigError`` naming ``output.tmp_dir``.  The other two steps can raise a
+    raw ``OSError`` -- a full disk, say.  That is the setup problem
     ``validate_settings_dirs`` reports at start-up, so it is a ``ConfigError``
     here too, not an UNKNOWN error the CLI would call a saneless bug.
     Only the workspace's creation is guarded: an ``OSError`` from the scan run
@@ -496,7 +499,11 @@ def _open_workspace(
 
     """
     try:
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+        # Re-checked before every scan, not only at startup: a temp-directory
+        # sweep can remove tmp_dir while the server runs, and another local
+        # user can then create the name.  A refusal is a ConfigError, which is
+        # not an OSError, so it passes the handler below unwrapped.
+        ensure_private_dir(tmp_dir, key="output.tmp_dir")
         _check_disk_space(tmp_dir, min_free_mb)
         return tempfile.TemporaryDirectory(dir=tmp_dir)
     except OSError as exc:

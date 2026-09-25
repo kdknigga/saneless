@@ -40,6 +40,7 @@ from pydantic_settings import (
 from pydantic_settings.exceptions import SettingsError
 
 from saneless.exceptions import ConfigError
+from saneless.private_dirs import check_private_dir
 from saneless.vocabulary import (
     TITLE_MAX_LENGTH,
     ConfigFileState,
@@ -294,6 +295,24 @@ def _default_data_dir() -> Path:
 
     """
     return xdg_state_home() / "saneless"
+
+
+def _default_tmp_dir() -> Path:
+    """
+    Compute the default ``output.tmp_dir``: ``<temp dir>/saneless-<uid>``.
+
+    Computed when settings are built, never at import: ``gettempdir()``
+    probes the file system on its first call, and importing saneless touches
+    nothing. The name is per user, so two users on one host do not share
+    scratch space, and stable, so leftover workspaces can be found later.
+    Another local user can still create the name first; the directory
+    checks refuse it then, with a message saying what to do.
+
+    Returns:
+        The default scratch directory.
+
+    """
+    return Path(tempfile.gettempdir()) / f"saneless-{os.getuid()}"
 
 
 def _default_log_file() -> Path:
@@ -722,7 +741,9 @@ class OutputConfig(BaseModel):
     # An unknown key is an error, not silently dropped.
     model_config = ConfigDict(extra="forbid")
 
-    tmp_dir: Path = Path(tempfile.gettempdir()) / "saneless"
+    # Scratch space: per user, created 0700, refused if squatted (see
+    # _default_tmp_dir and saneless.private_dirs).
+    tmp_dir: Path = Field(default_factory=_default_tmp_dir)
     # Durable state: the job database and preserved scans. Deliberately NOT
     # under tmp_dir, which is disposable scratch space. The data_dir and
     # log_file defaults move together: both follow $XDG_STATE_HOME, computed
@@ -1812,7 +1833,7 @@ def _require_writable(label: str, directory: Path) -> None:
 
 def validate_settings_dirs(settings: Settings) -> None:
     """
-    Fail fast with ConfigError if tmp_dir, data_dir or consume_dir are unwritable.
+    Fail fast with ConfigError if a configured directory is unwritable or unsafe.
 
     Validates directory writability at startup so permission errors surface
     immediately rather than mid-scan, or - for data_dir - at the moment a
@@ -1820,14 +1841,23 @@ def validate_settings_dirs(settings: Settings) -> None:
     writability failures. A missing directory is checked against its nearest
     existing ancestor, so ``<unwritable>/a/b/c`` fails here too.
 
+    An existing ``tmp_dir`` must also be private: a symlink, a directory
+    owned by another user, or one with group- or world-write is refused, as
+    ``check_private_dir`` describes. A missing one is not created here; the
+    server and each scan create it 0700 when they first need it.
+
     Args:
         settings: Application settings to validate.
 
     Raises:
-        ConfigError: If any configured directory is not writable.
+        ConfigError: If any configured directory is not writable, or an
+            existing ``tmp_dir`` is not safe to use.
 
     """
-    _require_writable("tmp_dir", settings.output.tmp_dir)
+    tmp_dir = settings.output.tmp_dir
+    if os.path.lexists(tmp_dir):
+        check_private_dir(tmp_dir, key="output.tmp_dir")
+    _require_writable("tmp_dir", tmp_dir)
     _require_writable("data_dir", settings.output.data_dir)
     if settings.paperless.consume_dir is not None:
         _require_writable("consume_dir", settings.paperless.consume_dir)
