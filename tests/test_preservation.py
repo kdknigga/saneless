@@ -323,6 +323,43 @@ class TestTheMostFinishedArtefactIsKept:
         assert earlier.read_bytes() == b"an earlier scan"
         assert embedded_streams(kept) == _streams_of(records)
 
+    def test_an_accepted_pdf_kept_as_page_files_still_carries_its_caution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        paperless-ngx took the PDF, the PDF could not be kept, its pages were.
+
+        Whoever re-assembles and uploads those pages would make a duplicate,
+        so the report still says the document had already been accepted.
+        """
+        artefacts = _artefacts(tmp_path, RunStage.DELIVERING)
+        records = _spool(artefacts.spool_dir, "a", 2)
+        pdf = preservation_module.assemble_pdf(
+            records,
+            artefacts.workspace / "out",
+            filename="20260925-120000-job-pres-accepted.pdf",
+            title=_TITLE,
+        )
+        artefacts.pdfs = [pdf]
+        artefacts.accepted[pdf] = (
+            "had already been accepted by paperless-ngx as task t-1, which had "
+            "not confirmed it was consumed"
+        )
+
+        def refused(_pdf: Path, _failed_dir: Path) -> Path:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+
+        monkeypatch.setattr(preservation_module, "_keep_file", refused)
+
+        report = preserve_most_finished(artefacts)
+
+        (group,) = report.groups
+        assert group.kind is KeptKind.PAGE_FILES
+        sentence = report.sentence()
+        assert sentence is not None
+        assert f"{pdf.name} had already been accepted by paperless-ngx" in sentence
+        assert "check paperless-ngx before uploading its pages again" in sentence
+
     def test_a_part_way_pass_b_says_which_sheets_its_backs_are(
         self, tmp_path: Path
     ) -> None:

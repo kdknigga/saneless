@@ -410,6 +410,34 @@ def test_sigterm_during_upload_keeps_the_pdf_and_exits_143(
     assert recorder.polls() == []
 
 
+def test_a_signal_during_the_upload_says_the_pdf_may_have_arrived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    SIGTERM while the PDF is being sent: the kept copy says to check first.
+
+    The request was on its way, and paperless-ngx may already have created
+    the document before the answer was cut off, so uploading the kept file
+    unchecked could make a duplicate.
+    """
+    signaller = _Signaller()
+    recorder = _SignallingPaperless(signaller, signal.SIGTERM)
+    scanner = DistinctPageScanner(passes=((0, 1),))
+
+    run = _run_cli(
+        tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner, recorder=recorder
+    )
+
+    assert signaller.refusals == []
+    assert run.result.exit_code == ExitCode.TERMINATED, run.result.output
+    (kept,) = run.failed
+    (line,) = run.interrupted_lines
+    assert f"{kept.name} was being sent to paperless-ngx" in line
+    assert "may have arrived, so check paperless-ngx before uploading it again" in (
+        line
+    )
+
+
 def test_sighup_at_the_flip_prompt_keeps_the_fronts_and_exits_129(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

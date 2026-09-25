@@ -442,10 +442,11 @@ class RunArtefacts:
             has finished; None before that.
         pdfs: Assembled PDFs not yet delivered, still in the workspace.
         accepted: Of those PDFs, each one paperless-ngx had already taken --
-            accepted by its API, or saved to its consume folder -- before the
-            run failed, with the words that say how.  Such a PDF is still
-            kept, because paperless-ngx may yet fail to consume it, but the
-            sentence says it got there, so nobody uploads it again unchecked.
+            accepted by its API, or saved to its consume folder -- or may
+            have, because the run was interrupted while it was being sent,
+            with the words that say which.  Such a PDF is still kept, because
+            paperless-ngx may yet fail to consume it, but the sentence says it
+            got there, or may have, so nobody uploads it again unchecked.
         unreadable_sheets: How many sheets the passes that finished reported
             they could not read.  A pass that stopped part way never reports
             its own, so zero means none is known, not that none was skipped.
@@ -771,6 +772,16 @@ def _keep_assembled(artefacts: RunArtefacts, report: PreservationReport) -> bool
                 )
     except Exception as exc:
         _record_problem(report, "moving the assembled PDF(s)", exc)
+    # A PDF paperless-ngx took that could not be kept here is kept as its page
+    # files instead, and whoever assembles and uploads those would make the
+    # same duplicate, so the caution goes with them.
+    for pdf in pdfs[len(kept) :]:
+        how = artefacts.accepted.get(pdf)
+        if how is not None:
+            report.cautions.append(
+                f"{pdf.name} {how}, so check paperless-ngx before uploading its "
+                f"pages again"
+            )
     if kept:
         out_of = len(pdfs) if len(kept) < len(pdfs) else None
         report.groups.append(

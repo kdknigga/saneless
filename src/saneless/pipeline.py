@@ -606,6 +606,32 @@ def _require_pages(batch: ScanBatch) -> None:
         raise ScanError(msg)
 
 
+# How a kept PDF reached paperless-ngx when the run was interrupted while it
+# was being sent: the request left, and no answer said whether it landed.
+_MAY_HAVE_ARRIVED: Final = (
+    "was being sent to paperless-ngx when the scan was interrupted and may have arrived"
+)
+
+
+def _accepted_how(upload: UploadResult) -> str:
+    """
+    Say how paperless-ngx took an uploaded PDF, for the kept copy's caution.
+
+    Args:
+        upload: What the upload did.
+
+    Returns:
+        The words that follow the kept file's name.
+
+    """
+    if upload.task_uuid is not None:
+        return (
+            f"had already been accepted by paperless-ngx as task "
+            f"{upload.task_uuid}, which had not confirmed it was consumed"
+        )
+    return "had already been saved to the paperless-ngx consume folder"
+
+
 @dataclass
 class _SpoolLedger:
     """
@@ -1683,21 +1709,22 @@ class _PipelineRun:
             What the upload did.
 
         """
-        upload = self.paperless.upload_document(
-            pdf_path, title, self.request.tags, self.request.correspondent
-        )
-        # From here paperless-ngx has the document, or will from its consume
-        # folder: if the run fails later -- the poll, the other half of a
-        # mismatch, a signal -- the kept copy must say so, or following the
-        # usual advice to upload it would make a duplicate.
-        if upload.task_uuid is not None:
-            how = (
-                f"had already been accepted by paperless-ngx as task "
-                f"{upload.task_uuid}, which had not confirmed it was consumed"
+        # From the moment the upload returns paperless-ngx has the document,
+        # or will from its consume folder: if the run fails later -- the
+        # poll, the other half of a mismatch, a signal -- the kept copy must
+        # say so, or following the usual advice to upload it would make a
+        # duplicate.  An interruption while the request is on its way is the
+        # same risk unconfirmed: paperless-ngx may have created the document
+        # before the answer was cut off.  The record is made inside the try,
+        # so a signal landing between the two is still caught.
+        try:
+            upload = self.paperless.upload_document(
+                pdf_path, title, self.request.tags, self.request.correspondent
             )
-        else:
-            how = "had already been saved to the paperless-ngx consume folder"
-        self.artefacts.accepted[pdf_path] = how
+            self.artefacts.accepted[pdf_path] = _accepted_how(upload)
+        except ScanInterrupted:
+            self.artefacts.accepted.setdefault(pdf_path, _MAY_HAVE_ARRIVED)
+            raise
         return upload
 
     def _poll(self, upload: UploadResult) -> None:

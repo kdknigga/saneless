@@ -246,7 +246,8 @@ When the upload fails, the assembled PDF is kept and its path is added to the er
 paperless-ngx had already taken is named as such: the failure came while saneless waited for the
 document to be consumed, or it was the other half of a manual-duplex pair that failed. The line
 then says the file had already been accepted as a task, or saved to the consume folder, so check
-paperless-ngx before uploading it, or it will be there twice.
+paperless-ngx before uploading it, or it will be there twice. If that PDF could not be kept either
+and its page files were kept instead, the line says the same of them.
 [How Consume Directory Fallback Works](../explanation/consume-directory-fallback.md) explains
 which failures retry, when the consume directory is used, and where a kept PDF goes.
 
@@ -346,10 +347,11 @@ it is not treated as a cancel: the pages already scanned are kept, normally as a
 `failed/` in the data directory, and the line names the path. A line that names no path kept
 nothing, because there was nothing to keep: the command was not a scan, or the scan was stopped
 before its first page. Scan the rest of the stack, or the whole stack again,
-and delete or upload the kept file yourself. The one exception is a signal that arrives while
-saneless waits for paperless-ngx to consume a document it has already accepted: the line then says
-the kept file had already been accepted, and names the task, so check paperless-ngx before
-uploading it, or it will be there twice.
+and delete or upload the kept file yourself. The exceptions are a signal that arrives while
+saneless waits for paperless-ngx to consume a document it has already accepted, and one that
+arrives while the document is being sent: the line then says the kept file had already been
+accepted, and names the task, or that it was being sent and may have arrived. Either way, check
+paperless-ngx before uploading it, or it will be there twice.
 
 A signal that arrives once the scan's outcome is settled -- the document already delivered, or a
 failure's pages already being kept -- does not interrupt it. The command finishes what it was doing
