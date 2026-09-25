@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -574,6 +575,50 @@ class TestFindOrphans:
         finally:
             for orphan in orphans:
                 orphan.close()
+
+    def test_a_workspace_removed_while_checked_is_not_claimed(
+        self,
+        scratch: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        The owner finished removing it between the open and the lock: skip it.
+
+        The lock then sits on an unlinked file and proves nothing, and
+        claiming it would log a recovery for a directory that is gone.
+        """
+        path = _plant_orphan(scratch, "job-deadbeef-abc123", b"{}")
+        real_try_lock = workspace_mod._try_lock
+
+        def removed_first(fd: int, candidate: Path) -> bool:
+            """Let the owner finish its removal, then take the lock."""
+            shutil.rmtree(candidate)
+            return real_try_lock(fd, candidate)
+
+        monkeypatch.setattr(workspace_mod, "_try_lock", removed_first)
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+
+        assert find_orphans(scratch) == []
+        assert not path.exists()
+        assert caplog.records == []
+
+    def test_a_workspace_renamed_while_checked_is_not_claimed(
+        self, scratch: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lock whose directory moved away is not the lock at ``path``."""
+        path = _plant_orphan(scratch, "job-deadbeef-abc124", b"{}")
+        real_try_lock = workspace_mod._try_lock
+
+        def moved_first(fd: int, candidate: Path) -> bool:
+            """Move the directory out of the sweep's names, then take the lock."""
+            candidate.rename(scratch / f"leftover-{candidate.name}")
+            return real_try_lock(fd, candidate)
+
+        monkeypatch.setattr(workspace_mod, "_try_lock", moved_first)
+
+        assert find_orphans(scratch) == []
+        assert not path.exists()
 
     def test_unsupported_flock_treats_the_entry_as_live(
         self, scratch: Path, monkeypatch: pytest.MonkeyPatch

@@ -622,6 +622,34 @@ def _is_own_directory(path: Path) -> bool:
     return True
 
 
+def _still_in_place(fd: int, path: Path) -> bool:
+    """
+    Say whether the lock just taken is still the lock of a workspace at ``path``.
+
+    The lock file is opened before it is locked.  If its owner -- or another
+    sweeper -- finishes removing the workspace in between, and then lets go of
+    the lock, the lock taken here is on a file that no longer exists, and
+    proves nothing about anything still in ``tmp_dir``.
+
+    Args:
+        fd: The candidate's open, now locked, lock file.
+        path: The candidate directory.
+
+    Returns:
+        True if the file is still linked, as ``path``'s lock file.
+
+    """
+    try:
+        opened = os.fstat(fd)
+        current = os.lstat(path / LOCK_FILE_NAME)
+    except OSError:
+        return False
+    return opened.st_nlink > 0 and (current.st_dev, current.st_ino) == (
+        opened.st_dev,
+        opened.st_ino,
+    )
+
+
 def _claim(path: Path) -> OrphanWorkspace | None:
     """
     Return ``path`` as a locked orphan if it is a dead job's workspace.
@@ -642,6 +670,9 @@ def _claim(path: Path) -> OrphanWorkspace | None:
     claimed = False
     try:
         if not _try_lock(fd, path):
+            return None
+        if not _still_in_place(fd, path):
+            logger.debug("Skipping %s: it was removed while being checked", path)
             return None
         metadata = _read_metadata(path)
         if metadata is None:
