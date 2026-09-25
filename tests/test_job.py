@@ -10,7 +10,10 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import logging
+import os
 import sqlite3
+import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -20,7 +23,14 @@ import pytest
 
 from saneless import job as job_module
 from saneless.exceptions import StorageError
-from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
+from saneless.job import (
+    REJECTED_HISTORY_ROWS,
+    ErrorCategory,
+    Job,
+    JobResult,
+    JobState,
+    JobStore,
+)
 from saneless.vocabulary import (
     ACTIVE_STATES,
     QUEUE_FULL_JOB_ERROR,
@@ -150,6 +160,64 @@ TRANSACTION_VERBS = frozenset(
 ``with conn:`` issues alongside the statements the method itself runs.  These
 are what the single-statement assertion filters out.
 """
+
+PAGE_MAINTENANCE_VERBS = frozenset({"PRAGMA"})
+"""Leading SQL verbs that maintain the file's pages rather than touch a row.
+
+A delete that removed rows is followed by ``PRAGMA incremental_vacuum``, which
+hands the freed pages back to the file system.  It reads and writes pages, not
+jobs, so it is filtered out alongside transaction control: the single-statement
+assertions are about rows a concurrent writer could observe half-changed.
+"""
+
+PRIVATE_MODE = 0o600
+"""The mode a job database this release creates is given, with its -wal/-shm."""
+
+LEGACY_MODE = 0o644
+"""The mode an earlier release left on its job database under umask 022."""
+
+TEST_UMASK = 0o022
+"""The common default umask, under which an unforced create lands at 0644."""
+
+SIDECAR_SUFFIXES = ("", "-wal", "-shm")
+"""The database file and the two WAL-mode sidecars SQLite creates beside it."""
+
+AUTO_VACUUM_NONE = 0
+"""``PRAGMA auto_vacuum``'s answer for a database that never shrinks."""
+
+AUTO_VACUUM_INCREMENTAL = 2
+"""``PRAGMA auto_vacuum``'s answer for INCREMENTAL, the mode a new database gets."""
+
+REJECTED_FLOOD = 30
+"""Refused submits the cap case records -- more than REJECTED_HISTORY_ROWS."""
+
+REJECTED_FINISH_FLOOD = 25
+"""Jobs the finish_job case marks REJECTED -- more than REJECTED_HISTORY_ROWS."""
+
+SPLIT_RUN_CAP = 5
+"""The ``max_rows`` the split-prune cases pass: far below the refused rows kept."""
+
+SPLIT_RUN_ROWS = 8
+"""Run rows the over-cap split-prune case creates -- more than SPLIT_RUN_CAP."""
+
+VACUUM_ROWS = 200
+"""Rows the shrink case inserts before pruning all but VACUUM_KEEP of them."""
+
+VACUUM_KEEP = 5
+"""Rows the shrink case keeps."""
+
+VACUUM_THUMBNAIL = "T" * 8192
+"""A thumbnail large enough that each row spills onto overflow pages of its own.
+
+Two 4 KiB pages or more per row, so deleting rows frees whole pages and the
+freelist a non-shrinking database would keep is far from empty.
+"""
+
+VACUUM_ERROR = "E" * 8192
+"""A refused row's error text, sized like VACUUM_THUMBNAIL for the trim case."""
+
+CONTROL_TITLE = "a\nb"
+"""A title carrying a newline, which a ``%s`` log line would split in two."""
 
 RESTART_REASON = "Interrupted by restart"
 """The reason ``fail_active_jobs()`` records when the caller names none.
@@ -462,13 +530,15 @@ def _row_touching(traced: list[str]) -> list[str]:
         traced: Every statement the connection's trace callback reported.
 
     Returns:
-        Those whose leading verb is not transaction control.
+        Those whose leading verb is neither transaction control nor page
+        maintenance.
 
     """
     return [
         text
         for text in traced
-        if (words := text.split()) and words[0].upper() not in TRANSACTION_VERBS
+        if (words := text.split())
+        and words[0].upper() not in TRANSACTION_VERBS | PAGE_MAINTENANCE_VERBS
     ]
 
 
@@ -1966,6 +2036,12 @@ class TestCreateRejectedJob:
             assert "UPDATE" not in verbs, (
                 f"create_rejected_job ran an UPDATE: {'; '.join(statements)}"
             )
+            # The refused-row trim is a DELETE in the same transaction, which
+            # is allowed: it cannot strand a PENDING row.  Anything else is not.
+            assert set(verbs) <= {"INSERT", "DELETE", "SELECT"}, (
+                f"create_rejected_job ran an unexpected statement: "
+                f"{'; '.join(statements)}"
+            )
         finally:
             store._conn.set_trace_callback(None)
             store.close()
@@ -2198,3 +2274,323 @@ class TestQueuePosition:
             assert store.queue_position("not-a-job-id") is None
         finally:
             store.close()
+
+
+def _raw_scalar(db_path: Path, statement: str) -> int:
+    """
+    Read one integer through a raw connection that bypasses JobStore.
+
+    Used after the store is closed, so the WAL has been checkpointed into the
+    main file and the answer reflects what is on disk.
+
+    Args:
+        db_path: The job database to read.
+        statement: A fixed PRAGMA statement written by the calling test.
+
+    Returns:
+        The first column of the first row the statement answers.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        value: int = conn.execute(statement).fetchone()[0]
+    finally:
+        conn.close()
+    return value
+
+
+def _mode(path: Path) -> int:
+    """Return a file's permission bits alone."""
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def _sidecars(db_path: Path) -> list[Path]:
+    """Return the database file and its -wal and -shm files, in that order."""
+    return [db_path.with_name(db_path.name + suffix) for suffix in SIDECAR_SUFFIXES]
+
+
+def _rejected_titles(store: JobStore) -> set[str]:
+    """Return the titles of every refused row the store still holds."""
+    return {
+        job.title
+        for job in store.list_recent(limit=VACUUM_ROWS)
+        if job.error_category is ErrorCategory.REJECTED
+    }
+
+
+def _run_titles(store: JobStore) -> set[str]:
+    """Return the titles of every row the store holds that was not refused."""
+    return {
+        job.title
+        for job in store.list_recent(limit=VACUUM_ROWS)
+        if job.error_category is not ErrorCategory.REJECTED
+    }
+
+
+class TestPrivateDatabaseMode:
+    """A database this release creates is owner-only; an older one keeps its mode."""
+
+    def test_fresh_database_mode_is_owner_only_with_its_sidecars(
+        self, tmp_path: Path
+    ) -> None:
+        """The db, -wal and -shm files are 0600 under umask 022 (D-10)."""
+        db_path = tmp_path / "fresh.db"
+        previous = os.umask(TEST_UMASK)
+        try:
+            store = JobStore(db_path=str(db_path))
+            try:
+                store.create_job(profile="default", title="Private")
+
+                # Read while the store is open: a clean close checkpoints and
+                # removes both sidecars.
+                modes = {path.name: _mode(path) for path in _sidecars(db_path)}
+            finally:
+                store.close()
+        finally:
+            os.umask(previous)
+
+        assert modes == {path.name: PRIVATE_MODE for path in _sidecars(db_path)}
+
+    def test_existing_database_mode_is_left_as_it_was(self, tmp_path: Path) -> None:
+        """A 0644 database from an earlier release is not re-moded (D-10)."""
+        db_path = tmp_path / "legacy.db"
+        sqlite3.connect(db_path).close()
+        db_path.chmod(LEGACY_MODE)
+        previous = os.umask(TEST_UMASK)
+        try:
+            store = JobStore(db_path=str(db_path))
+            try:
+                store.create_job(profile="default", title="Legacy")
+
+                modes = {path.name: _mode(path) for path in _sidecars(db_path)}
+            finally:
+                store.close()
+        finally:
+            os.umask(previous)
+
+        assert modes == {path.name: LEGACY_MODE for path in _sidecars(db_path)}
+
+
+class TestRejectedRowCap:
+    """Refused rows keep their own small cap and never count against history."""
+
+    def test_create_rejected_job_rejected_cap_keeps_the_newest(self) -> None:
+        """30 refused submits leave the newest 20 and touch no run row (D-12)."""
+        store = JobStore()
+        try:
+            done = store.create_job(profile="default", title="Real scan")
+            store.finish_job(done.id, JobState.DONE)
+            titles = [f"Refused {index:02d}" for index in range(REJECTED_FLOOD)]
+            for title in titles:
+                store.create_rejected_job("default", title, error=QUEUE_FULL_JOB_ERROR)
+
+            assert _rejected_titles(store) == set(titles[-REJECTED_HISTORY_ROWS:])
+            assert _run_titles(store) == {"Real scan"}
+            for job in store.list_recent(limit=VACUUM_ROWS):
+                if job.error_category is ErrorCategory.REJECTED:
+                    # D-14: the refused row stays unowned.
+                    assert job.owner_token is None
+        finally:
+            store.close()
+
+    def test_rejected_cap_is_smaller_than_the_visible_history(self) -> None:
+        """A flood can never fill the web history table on its own (D-12)."""
+        assert REJECTED_HISTORY_ROWS == 20
+        assert job_module.WEB_HISTORY_LIMIT > REJECTED_HISTORY_ROWS
+
+    def test_finish_job_rejected_cap_trims_refused_rows(self) -> None:
+        """finish_job recording REJECTED trims to the newest 20 as well (D-12)."""
+        store = JobStore()
+        try:
+            ids = _create_in_order(store, REJECTED_FINISH_FLOOD)
+            for job_id in ids:
+                _reject(store, job_id)
+
+            survivors = {
+                job.id
+                for job in store.list_recent(limit=VACUUM_ROWS)
+                if job.error_category is ErrorCategory.REJECTED
+            }
+            assert survivors == set(ids[-REJECTED_HISTORY_ROWS:])
+        finally:
+            store.close()
+
+
+class TestPruneCountsRunRowsOnly:
+    """history_max_rows counts runs; refused rows sit under their own cap."""
+
+    def test_prune_ignores_refused_rows_for_the_row_cap(self) -> None:
+        """Five runs and twenty refused rows all survive max_rows=5 (D-12)."""
+        store = JobStore()
+        try:
+            ids = _create_in_order(store, SPLIT_RUN_CAP)
+            for job_id in ids:
+                store.finish_job(job_id, JobState.DONE)
+            for index in range(REJECTED_HISTORY_ROWS):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=QUEUE_FULL_JOB_ERROR
+                )
+
+            deleted = store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=SPLIT_RUN_CAP)
+
+            assert deleted == 0
+            assert len(_run_titles(store)) == SPLIT_RUN_CAP
+            assert len(_rejected_titles(store)) == REJECTED_HISTORY_ROWS
+        finally:
+            store.close()
+
+    def test_prune_trims_run_rows_to_the_cap_null_category_included(self) -> None:
+        """Only the newest 5 runs survive, NULL category counted as a run (D-12)."""
+        # finish_job(DONE) records no category, so most run rows here are NULL
+        # in error_category.  A `!=` predicate would never match NULL and would
+        # keep them all; `IS NOT` is what makes them count.
+        store = JobStore()
+        try:
+            ids = _create_in_order(store, SPLIT_RUN_ROWS)
+            for job_id in ids:
+                store.finish_job(job_id, JobState.DONE)
+            # One run row with a real, non-REJECTED category, and the oldest,
+            # so it is among the rows the cap removes.
+            store.finish_job(
+                ids[0],
+                JobState.ERROR,
+                error="scanner jammed",
+                error_category=ErrorCategory.SCANNER,
+            )
+            for index in range(REJECTED_HISTORY_ROWS):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=QUEUE_FULL_JOB_ERROR
+                )
+
+            deleted = store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=SPLIT_RUN_CAP)
+
+            assert deleted == SPLIT_RUN_ROWS - SPLIT_RUN_CAP
+            kept = {
+                job.id
+                for job in store.list_recent(limit=VACUUM_ROWS)
+                if job.error_category is not ErrorCategory.REJECTED
+            }
+            assert kept == set(ids[-SPLIT_RUN_CAP:])
+            assert len(_rejected_titles(store)) == REJECTED_HISTORY_ROWS
+        finally:
+            store.close()
+
+
+class TestIncrementalVacuum:
+    """A new database shrinks after deletes; an old one converts once."""
+
+    def test_fresh_database_auto_vacuum_is_incremental(self, tmp_path: Path) -> None:
+        """A database this release creates reports auto_vacuum = 2 (D-12)."""
+        db_path = tmp_path / "fresh.db"
+        JobStore(db_path=str(db_path)).close()
+
+        assert _raw_scalar(db_path, "PRAGMA auto_vacuum") == AUTO_VACUUM_INCREMENTAL
+
+    def test_enable_incremental_auto_vacuum_converts_once(self, tmp_path: Path) -> None:
+        """An auto_vacuum NONE database converts once, then is a no-op (D-12)."""
+        db_path = tmp_path / "old.db"
+        JobStore(db_path=str(db_path)).close()
+        raw = sqlite3.connect(db_path)
+        try:
+            raw.execute("PRAGMA auto_vacuum = NONE")
+            raw.execute("VACUUM")
+        finally:
+            raw.close()
+        assert _raw_scalar(db_path, "PRAGMA auto_vacuum") == AUTO_VACUUM_NONE
+
+        store = JobStore(db_path=str(db_path))
+        try:
+            assert store.enable_incremental_auto_vacuum() is True
+            assert store.enable_incremental_auto_vacuum() is False
+            # The store still writes afterwards: the conversion restored
+            # explicit transaction control rather than leaving autocommit on.
+            job = store.create_job(profile="default", title="After vacuum")
+        finally:
+            store.close()
+
+        assert _raw_scalar(db_path, "PRAGMA auto_vacuum") == AUTO_VACUUM_INCREMENTAL
+        reopened = JobStore(db_path=str(db_path))
+        try:
+            assert reopened.get_job(job.id) is not None
+        finally:
+            reopened.close()
+
+    def test_prune_vacuum_leaves_no_free_pages(self, tmp_path: Path) -> None:
+        """Pruning 195 thumbnail-heavy rows leaves an empty freelist (D-12)."""
+        db_path = tmp_path / "bloated.db"
+        store = JobStore(db_path=str(db_path))
+        try:
+            for index in range(VACUUM_ROWS):
+                job = store.create_job(profile="default", title=f"Row {index:03d}")
+                store.update_thumbnail(job.id, VACUUM_THUMBNAIL)
+
+            deleted = store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=VACUUM_KEEP)
+        finally:
+            store.close()
+
+        assert deleted == VACUUM_ROWS - VACUUM_KEEP
+        assert _raw_scalar(db_path, "PRAGMA freelist_count") == 0
+
+    def test_rejected_cap_trim_vacuum_leaves_no_free_pages(
+        self, tmp_path: Path
+    ) -> None:
+        """Trimming large refused rows leaves an empty freelist too (D-12)."""
+        db_path = tmp_path / "flooded.db"
+        store = JobStore(db_path=str(db_path))
+        try:
+            for index in range(REJECTED_FLOOD):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=VACUUM_ERROR
+                )
+            kept = len(_rejected_titles(store))
+        finally:
+            store.close()
+
+        assert kept == REJECTED_HISTORY_ROWS
+        assert _raw_scalar(db_path, "PRAGMA freelist_count") == 0
+
+
+class TestTitleLogging:
+    """Titles reach the debug log as a repr, so a newline cannot forge a line."""
+
+    def test_create_job_logs_the_title_repr(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Created job ... logs the title with %r."""
+        store = JobStore()
+        try:
+            with caplog.at_level(logging.DEBUG, logger=job_module.__name__):
+                store.create_job(profile="default", title=CONTROL_TITLE)
+        finally:
+            store.close()
+
+        created = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Created job ")
+        ]
+        assert len(created) == 1
+        assert repr(CONTROL_TITLE) in created[0]
+        assert "\n" not in created[0]
+
+    def test_create_rejected_job_logs_the_title_repr(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Created rejected job ... logs the title with %r."""
+        store = JobStore()
+        try:
+            with caplog.at_level(logging.DEBUG, logger=job_module.__name__):
+                store.create_rejected_job(
+                    "default", CONTROL_TITLE, error=QUEUE_FULL_JOB_ERROR
+                )
+        finally:
+            store.close()
+
+        created = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Created rejected job ")
+        ]
+        assert len(created) == 1
+        assert repr(CONTROL_TITLE) in created[0]
+        assert "\n" not in created[0]

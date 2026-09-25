@@ -134,7 +134,7 @@ In the path settings (`tmp_dir`, `data_dir`, `log_file`, and `consume_dir` under
 | `log_max_bytes` | int | `10485760` | Max log file size before rotation (10 MB). **One-shot CLI commands only**, like `log_file`: `saneless serve` writes no file, so there is nothing to rotate |
 | `log_backup_count` | int | `5` | Number of rotated log files to keep. **One-shot CLI commands only**, like `log_file`: `saneless serve` writes no file, so there is nothing to keep |
 | `history_retention_days` | int | `7` | Days to keep job history, by creation time and regardless of whether the job finished |
-| `history_max_rows` | int | `500` | Maximum job history entries retained in SQLite; the newest are kept |
+| `history_max_rows` | int | `500` | Maximum job history entries retained in SQLite; the newest are kept. Refused submits are kept separately, only the newest 20, and do not count toward this limit, so a burst of refusals never pushes a real scan out of history |
 | `paperless_task_timeout` | int | `300` | Seconds to wait for paperless-ngx task completion |
 | `paperless_cache_ttl_seconds` | int | `60` | Cache TTL for paperless tag/correspondent lists (seconds) |
 | `flip_timeout_seconds` | int | `600` | Seconds a manual duplex scan waits for the operator to flip the stack between passes, in the web UI and the CLI. If nobody confirms in time, the job fails and nothing is uploaded. Must be a whole number of seconds from 1 to 86400 (one day); 0 and negative values are rejected when the config is loaded, so there is no "wait forever" setting |

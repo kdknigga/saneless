@@ -39,7 +39,14 @@ from saneless.exceptions import (
     ScanCancelledError,
     ScanError,
 )
-from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
+from saneless.job import (
+    REJECTED_HISTORY_ROWS,
+    ErrorCategory,
+    Job,
+    JobResult,
+    JobState,
+    JobStore,
+)
 from saneless.paperless import UploadResult
 from saneless.pipeline import PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
@@ -2779,20 +2786,28 @@ class TestOwedRejections:
                 raise raised[0]
 
             def all_recorded() -> bool:
-                # The flush drops an entry just after its write lands.
+                # The flush drops an entry just after its write lands.  A row
+                # that is gone was trimmed under the refused-row cap, which
+                # deletes only rows already marked REJECTED, so its rejection
+                # was written too; a lost one would leave its row PENDING.
                 written = all(
-                    _get(store, job_id).state is JobState.ERROR for job_id in ids
+                    (job := store.get_job(job_id)) is None
+                    or job.state is JobState.ERROR
+                    for job_id in ids
                 )
                 return written and not worker._unrecorded_failures
 
             recorded = poll_until(all_recorded, _MANY_OWED_BUDGET)
-            rows = [_get(store, job_id) for job_id in ids]
+            rows = [job for job_id in ids if (job := store.get_job(job_id))]
             owed_after = dict(worker._unrecorded_failures)
         finally:
             worker.stop()
             store.close()
 
         assert recorded
+        # Every one of the hundred was written, and the cap then kept the
+        # newest REJECTED_HISTORY_ROWS of them.
+        assert len(rows) == REJECTED_HISTORY_ROWS
         assert all(row.error_category is ErrorCategory.REJECTED for row in rows)
         assert all(row.error == "queue full" for row in rows)
         assert owed_after == {}
