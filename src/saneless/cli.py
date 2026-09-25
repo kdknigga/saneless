@@ -568,13 +568,14 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
 
 def _echo_err(text: str, *, nl: bool = True) -> None:
     """
-    Write one line of the guard's report to stderr, surviving a dead terminal.
+    Write one line of a command's report to stderr, surviving a dead terminal.
 
-    The guard reports how a command ended, and the exit code is the report a
-    script reads.  A terminal that has gone away -- the dropped SSH session
-    behind a SIGHUP -- answers every write with EIO, and an ``OSError`` raised
-    here would escape the guard as a traceback and exit 1 instead of the code
-    it chose.  So a failed write is logged and the exit code still stands.
+    The guard, and a scan's closing lines, report how a command ended, and the
+    exit code is the report a script reads.  A terminal that has gone away --
+    the dropped SSH session behind a SIGHUP -- answers every write with EIO,
+    and an ``OSError`` raised here would escape as a traceback, or reach the
+    guard as an unexpected error, instead of the code the command chose.  So a
+    failed write is logged and the exit code still stands.
 
     Args:
         text: The line to write.
@@ -585,6 +586,25 @@ def _echo_err(text: str, *, nl: bool = True) -> None:
         click.echo(text, err=True, nl=nl)
     except OSError:
         logger.info("Could not write to stderr: %r", text, exc_info=True)
+
+
+def _echo_out(text: str) -> None:
+    """
+    Write one line of a scan's report to stdout, surviving a dead terminal.
+
+    The stdout twin of ``_echo_err``.  A hangup after delivery is deferred, so
+    the scan goes on to print its outcome to a terminal that is already gone;
+    the document is in paperless-ngx by then, and the exit code chosen from
+    the result must stand rather than become exit 5.
+
+    Args:
+        text: The line to write.
+
+    """
+    try:
+        click.echo(text)
+    except OSError:
+        logger.info("Could not write to stdout: %r", text, exc_info=True)
 
 
 def _log_failure(ctx: click.Context, exc: Exception) -> None:
@@ -1093,7 +1113,11 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # delivered but degraded -- saved to the consume folder, or uploaded with a
     # warning -- exits 6 or 7, so a script can tell it from a clean success and
     # from a paperless failure (3), which it might retry by scanning again.
-    click.echo(
+    #
+    # Every closing line goes through a helper that survives a dead terminal:
+    # a hangup after delivery is deferred, and the lines it leaves nowhere to
+    # write must not replace that exit code with a crash.
+    _echo_out(
         outcome_line(job_state_for(result.outcome), result.warning, resolved_title)
     )
     # Removed pages are not kept anywhere, so naming them is how the operator
@@ -1102,11 +1126,11 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # information about a success, not a warning.
     removed_note = removed_pages_note(result.removed_positions, result.pages_scanned)
     if removed_note is not None:
-        click.echo(removed_note)
+        _echo_out(removed_note)
     if result.outcome is ScanOutcome.FALLBACK:
-        click.echo(FALLBACK_NOT_UPLOADED_LINE, err=True)
+        _echo_err(FALLBACK_NOT_UPLOADED_LINE)
     if result.warning:
-        click.echo(f"Warning: {result.warning}", err=True)
+        _echo_err(f"Warning: {result.warning}")
     code = exit_code_for_outcome(result.outcome, result.warning)
     if code is not ExitCode.SUCCESS:
         ctx.exit(code)

@@ -745,6 +745,49 @@ def test_a_signal_landing_as_a_delivery_settles_leaves_the_success_alone(
     assert list((tmp_path / "scratch").glob("job-*")) == []
 
 
+def test_a_hangup_after_delivery_still_exits_0_on_a_dead_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    SIGHUP after delivery, every write then failing with EIO: still exit 0.
+
+    A hangup means the terminal is gone, so the scan's closing lines cannot
+    be written.  The document is already in paperless-ngx, and the exit code
+    is what a script reads, so a line that cannot be written must not turn
+    the success into an unexpected error.
+    """
+    signaller = _Signaller()
+    scanner = DistinctPageScanner(passes=((0, 1),))
+    real_remove = workspace_module._remove_quietly
+    real_echo = click.echo
+    hung_up: list[str] = []
+
+    def remove_quietly(path: Path, what: str) -> None:
+        """Hang up as the delivered scan's workspace starts to go."""
+        signaller.send(signal.SIGHUP)
+        hung_up.append(what)
+        real_remove(path, what)
+
+    def dead_terminal(
+        message: object = None, *, nl: bool = True, err: bool = False
+    ) -> None:
+        """Once hung up, refuse every write the way a closed terminal does."""
+        if hung_up:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        real_echo(message, nl=nl, err=err)
+
+    monkeypatch.setattr(workspace_module, "_remove_quietly", remove_quietly)
+    monkeypatch.setattr("saneless.cli.click.echo", dead_terminal)
+
+    run = _run_cli(tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGHUP]
+    assert run.result.exit_code == ExitCode.SUCCESS, run.result.output
+    assert len(run.recorder.uploads()) == 1
+    assert run.failed == []
+
+
 class _HangupAtUpload(RecordingPaperless):
     """The in-memory paperless-ngx, sending SIGHUP as an upload arrives."""
 
