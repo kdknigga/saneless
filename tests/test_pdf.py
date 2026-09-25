@@ -1238,7 +1238,7 @@ class TestMediaBox:
         self, spool_dir: Path, output_dir: Path
     ) -> None:
         """
-        An A4 raster read back at 150 dpi is an A4 page, 595.2 x 841.92 (N-33).
+        An A4 raster read back at 150 dpi is an A4 page, 595.2 x 841.92.
 
         The dpi comes from the record and from nowhere else: nothing passes
         one to ``assemble_pdf``.

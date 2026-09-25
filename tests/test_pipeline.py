@@ -5193,7 +5193,7 @@ class TestTheDpiTheDeviceActuallyChose:
         tmp_path: Path,
     ) -> None:
         """
-        A partial kept after a jam is laid out at the device's dpi (N-33).
+        A partial kept after a jam is laid out at the device's dpi.
 
         The profile asks for 300 and the device reads back 150; two A4 rasters
         at 150 dpi go through, then the third sheet jams.  The scan never

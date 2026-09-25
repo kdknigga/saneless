@@ -394,7 +394,7 @@ def _no_free_space(_path: object) -> SimpleNamespace:
 
 
 class TestSpooledPageSinkDpi:
-    """Each page carries the resolution the device read back (N-33)."""
+    """Each page carries the resolution the device read back."""
 
     @pytest.mark.parametrize("dpi", [150, 300, 600])
     def test_the_record_carries_the_dpi_it_was_given(
@@ -422,7 +422,7 @@ class TestSpooledPageSinkDpi:
 
 
 class TestSpooledPageSinkModes:
-    """Every page mode is kept, converted or refused, never mishandled (N-33)."""
+    """Every page mode is kept, converted or refused, never mishandled."""
 
     @pytest.mark.parametrize("mode", _KEPT_MODES)
     def test_a_sane_mode_is_stored_unchanged(self, tmp_path: Path, mode: str) -> None:
@@ -518,7 +518,7 @@ class TestSpooledPageSinkModes:
 
 
 class TestSpooledPageSinkAtomicWrite:
-    """A page is whole on disk or absent, never truncated (N-20)."""
+    """A page is whole on disk or absent, never truncated."""
 
     def test_the_png_does_not_exist_while_it_is_being_written(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
