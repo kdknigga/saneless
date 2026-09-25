@@ -116,7 +116,8 @@
          here is already path-free.  The job is a view built on the server:
          for the browser that started the scan, its text names every host
          directory and web address by the setting that holds it, so a kept
-         file reads failed/<file>.pdf; for everyone else it is a fixed
+         file reads failed/<file>.pdf, and any other absolute path reads
+         <path>; for everyone else it is a fixed
          sentence saying where the full text is.
 
          A NULL error_category is a row written before categories were

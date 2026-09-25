@@ -421,6 +421,68 @@ def test_owner_url_scrub_keeps_the_sentence(
 
 
 @pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            "Could not open /dev/bus/usb/001/004: busy",
+            "Could not open <path>: busy",
+            id="device-node",
+        ),
+        pytest.param(
+            "Check the host list (see /etc/sane.d/net.conf).",
+            "Check the host list (see <path>).",
+            id="closing-bracket-and-full-stop-kept",
+        ),
+        pytest.param(
+            "The scan was preserved at /srv/old-state/failed/tax.pdf",
+            "The scan was preserved at <path>",
+            id="earlier-data-dir",
+        ),
+        pytest.param(
+            "No space left on device: '/var/tmp/x.pnm'",
+            "No space left on device: '<path>'",
+            id="quoted-os-error-path",
+        ),
+        pytest.param(
+            "3/4 pages scanned; tags and/or correspondent unset",
+            "3/4 pages scanned; tags and/or correspondent unset",
+            id="slashes-inside-words-kept",
+        ),
+    ],
+)
+def test_owner_text_carries_no_other_absolute_path(
+    settings: Settings, tmp_path: Path, text: str, expected: str
+) -> None:
+    """A host path outside every configured directory is replaced as well."""
+    job = _job(state=JobState.ERROR, error_category=ErrorCategory.SCANNER, error=text)
+
+    owner = _view(job, presented=_OWNER, settings=settings, tmp_path=tmp_path)
+
+    assert owner.error == expected
+
+
+def test_owner_text_keeps_the_kept_file_and_setting_names(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The replacements the configured directories get survive the path pass."""
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=(
+            f"Kept {settings.output.failed_dir}/x.pdf; scratch "
+            f"{settings.output.tmp_dir}/job-1; Paperless at {_PAPERLESS_URL}/api/"
+        ),
+    )
+
+    owner = _view(job, presented=_OWNER, settings=settings, tmp_path=tmp_path)
+
+    assert owner.error == (
+        "Kept failed/x.pdf; scratch <output.tmp_dir>/job-1; "
+        "Paperless at <paperless.url>"
+    )
+
+
+@pytest.mark.parametrize(
     ("template", "expected"),
     [
         pytest.param(

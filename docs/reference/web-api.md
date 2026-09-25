@@ -361,7 +361,7 @@ Anything that can reach the port can read, without logging in:
 
 Only the browser that started a scan sees its title, its preview and the name of a kept PDF. saneless recognises that browser by its `saneless_owner` cookie. The cookie is set when the browser submits a scan and lasts a year. The kept PDF is named relative to the data directory, as `failed/<file>.pdf`. A job that recorded no owner is nobody's: every browser sees its generic title, although anyone may still answer its flip prompt. Jobs written before saneless recorded owners are like this, and so are most refused submits.
 
-Error and warning text on the web never carries a host path or the paperless-ngx URL. The owner sees the text with each directory and web address replaced by the name of its setting, such as `<output.tmp_dir>` or `<paperless.url>`. Every other browser sees a fixed sentence instead, which says where the full text is. On the server, the log and `saneless jobs --json` keep the full text.
+Error and warning text on the web never carries a host path or the paperless-ngx URL. The owner sees the text with each directory and web address replaced by the name of its setting, such as `<output.tmp_dir>` or `<paperless.url>`, and any other absolute path, such as a device node, replaced by `<path>`. Every other browser sees a fixed sentence instead, which says where the full text is. On the server, the log and `saneless jobs --json` keep the full text.
 
 The cookie is not a password. A client that sends a guessed or copied cookie is treated as its owner. saneless assumes a trusted LAN, and a reverse proxy with authentication is the answer where that is not enough.
 

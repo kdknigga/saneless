@@ -11,7 +11,7 @@ therefore handed a :class:`JobView`, never a :class:`~saneless.job.Job`, and
 The browser that submitted the job -- the one presenting the owner token the
 job recorded -- sees its title and thumbnail, and its error and warning text
 with every host path and web address replaced by the name of the setting that
-holds it.  Every other browser sees that a scan happened and how it ended:
+holds it, or by ``<path>`` when no setting does.  Every other browser sees that a scan happened and how it ended:
 profile, state, time, error category and page counts, a generic title, no
 thumbnail, and fixed sentences from ``vocabulary.py`` in place of the stored
 text.  The gated fields are absent from such a view, not hidden with CSS, so
@@ -55,10 +55,11 @@ __all__ = ["JobView", "build_job_view", "owns_detail"]
 # ``HTTPS://`` is a working setting that reaches the stored text as written.
 _URL = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# Punctuation that ends the sentence around a URL rather than the URL itself,
-# and the quotes and brackets that close around one.  ``\S+`` swallows them,
-# and they are put back after the replacement so "Paperless at <url>: refused"
-# keeps its colon and "see '<url>' now" its closing quote.
+# Punctuation that ends the sentence around a URL or a path rather than the
+# URL or path itself, and the quotes and brackets that close around one.
+# ``\S+`` swallows them, and they are put back after the replacement so
+# "Paperless at <url>: refused" keeps its colon and "see '<url>' now" its
+# closing quote.
 _URL_TRAILING = ").,:;'\"]>"
 
 # A host path counts only where it starts and ends as a whole path, so the
@@ -67,6 +68,14 @@ _URL_TRAILING = ").,:;'\"]>"
 # character follows it.
 _PATH_BEFORE = r"(?<![\w.-])"
 _PATH_AFTER = r"(?![\w-]|\.\w)"
+
+# Any absolute path still in the text once the configured directories and web
+# addresses are named: a device node, a path under an earlier configuration,
+# one a library put in its own message.  It starts at a "/" that does not
+# directly follow a name character, dot, "<", ">" or "-", so "failed/x.pdf",
+# "<output.tmp_dir>/x", "3/4" and "and/or" are left alone; the punctuation
+# after it is kept, as for a web address.
+_OTHER_PATH = re.compile(r"(?<![\w.<>-])/[^\s'\"<>]+")
 
 # What the pipeline writes directly before the path of something it kept in
 # the failed folder: "The scan was preserved at <path>", "The 3 page(s) ...
@@ -241,9 +250,10 @@ def _relativise(text: str, settings: Settings) -> str:
     * ``consume_dir``, when one is set, becomes ``<paperless.consume_dir>``.
 
     Each is matched in its absolute and its resolved spelling.  Then every
-    ``http://`` or ``https://`` address becomes ``<paperless.url>``, with the
-    punctuation after it kept.  A path from a row written under an older
-    configuration stays as it is: only its owner sees it.
+    ``http://`` or ``https://`` address becomes ``<paperless.url>``, and last
+    every other absolute path becomes ``<path>``, each with the punctuation
+    after it kept.  That covers a path from a row written under an older
+    configuration, a device node and a path a library named.
 
     Args:
         text: The stored error or warning text.
@@ -270,23 +280,25 @@ def _relativise(text: str, settings: Settings) -> str:
     )
     paths = re.compile(f"{_PATH_BEFORE}(?:{alternatives})")
     text = paths.sub(lambda match: names[match.group()], text)
-    return _URL.sub(_name_url, text)
+    text = _URL.sub(lambda match: _name(match, "<paperless.url>"), text)
+    return _OTHER_PATH.sub(lambda match: _name(match, "<path>"), text)
 
 
-def _name_url(match: re.Match[str]) -> str:
+def _name(match: re.Match[str], name: str) -> str:
     """
-    Replace one matched web address, keeping the punctuation after it.
+    Replace one matched address or path, keeping the punctuation after it.
 
     Args:
-        match: A match of ``_URL``.
+        match: A match of ``_URL`` or ``_OTHER_PATH``.
+        name: What the matched text is replaced with.
 
     Returns:
-        ``<paperless.url>`` followed by any trailing sentence punctuation.
+        ``name`` followed by any trailing sentence punctuation.
 
     """
-    url = match.group()
-    address = url.rstrip(_URL_TRAILING)
-    return f"<paperless.url>{url[len(address) :]}"
+    matched = match.group()
+    kept = matched.rstrip(_URL_TRAILING)
+    return f"{name}{matched[len(kept) :]}"
 
 
 def _hidden_error(text: str, settings: Settings) -> str:
