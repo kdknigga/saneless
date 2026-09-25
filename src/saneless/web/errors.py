@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CHECKS_POLL_TARGET_ID",
     "RETRY_AFTER_SECONDS",
+    "TITLE_CONTROL_TYPE",
     "RequestRejected",
     "TechnicalDetails",
     "install_error_handlers",
@@ -109,8 +110,9 @@ _SERVER_ERROR_FLOOR = 500
 _TITLE_LOC = ("body", "title")
 _TOO_LONG_TYPE = "string_too_long"
 # The error type the scan route's title validator raises for a control
-# character.  Matched by value here, so the two spellings must stay equal.
-_TITLE_CONTROL_TYPE = "title_control_character"
+# character, which the validation handler here maps to its own rejection.
+# Defined once, here, and imported by the route that raises it.
+TITLE_CONTROL_TYPE: Final = "title_control_character"
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,7 +368,7 @@ async def _validation_error(request: Request, exc: Exception) -> Response:
         failures,
     )
     title_has_control = any(
-        loc == _TITLE_LOC and error_type == _TITLE_CONTROL_TYPE
+        loc == _TITLE_LOC and error_type == TITLE_CONTROL_TYPE
         for loc, error_type in failures
     )
     title_too_long = any(

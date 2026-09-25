@@ -55,7 +55,7 @@ from saneless.vocabulary import (
     local_time,
     worker_health_detail,
 )
-from saneless.web.errors import RequestRejected
+from saneless.web.errors import TITLE_CONTROL_TYPE, RequestRejected
 from saneless.web.job_view import build_job_view, owns_detail
 
 if TYPE_CHECKING:
@@ -1345,12 +1345,10 @@ def _reject_created_job(
     return job_id
 
 
-# The error type the title validator raises, which the validation error
-# handler maps to TITLE_HAS_CONTROL by value, and the error's own message.  The
-# handler never reads that message and nothing renders it; the page shows the
-# rejection's fixed sentence instead.  The title tests fail if the two
-# spellings of the type ever drift apart.
-_TITLE_CONTROL_TYPE: Final = "title_control_character"
+# The title validator's error message.  It goes with ``TITLE_CONTROL_TYPE``,
+# which the validation error handler maps to TITLE_HAS_CONTROL.  The handler
+# never reads this message and nothing renders it; the page shows the
+# rejection's fixed sentence instead.
 _TITLE_CONTROL_MESSAGE: Final = "the title contains a control character"
 
 
@@ -1377,7 +1375,7 @@ def _refuse_control_characters(value: str) -> str:
 
     """
     if has_control_characters(value):
-        raise PydanticCustomError(_TITLE_CONTROL_TYPE, _TITLE_CONTROL_MESSAGE)
+        raise PydanticCustomError(TITLE_CONTROL_TYPE, _TITLE_CONTROL_MESSAGE)
     return value
 
 
