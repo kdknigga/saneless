@@ -6,24 +6,18 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
+
+from saneless.web.throttle import MIN_MANUAL_REFRESH_SECONDS, MinimumInterval
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from saneless.checks import CheckResult
 
+# MIN_MANUAL_REFRESH_SECONDS lives in saneless.web.throttle with the floor it
+# sizes, and is re-exported here because this is where callers first met it.
 __all__ = ["MIN_MANUAL_REFRESH_SECONDS", "CachedChecks", "CheckCache"]
-
-# The shortest gap between two honoured Refresh clicks.  Two seconds is below
-# the interval a human clicks at -- nobody presses Check again twice in the
-# same two seconds and expects two different answers -- and far above the rate
-# at which a scripted loop is a problem, which is the only case this exists
-# for.  It does not break the Refresh button's promise either: that promise is
-# "do not make somebody wait out a 30 s TTL after plugging the scanner back
-# in", and a 2 s floor leaves it intact.  Deliberately not configurable, and
-# read at call time, so a test can shorten it.
-MIN_MANUAL_REFRESH_SECONDS: Final = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,22 +110,30 @@ class CheckCache:
         """Initialize an empty cache with the given TTL and clock."""
         self._ttl = ttl
         self._clock = clock
-        # Guards every read and every rebind of self._entry and of
-        # self._last_manual_claim, and nothing else; never a probe.  The entry
-        # is a frozen _Entry rebound as a whole, so holding this for the rebind
-        # is what makes "results, stamp and checked_at always belong to the
-        # same store" true for a concurrent reader.  The claim stamp shares it
-        # because its read-and-rebind has to be one step for two request
-        # threads arriving together to get one grant between them; the two
-        # pieces of state are otherwise unrelated.
+        # Guards every read and every rebind of self._entry, and nothing else;
+        # never a probe.  The entry is a frozen _Entry rebound as a whole, so
+        # holding this for the rebind is what makes "results, stamp and
+        # checked_at always belong to the same store" true for a concurrent
+        # reader.
         self._lock = threading.Lock()
         self._entry: _Entry | None = None
-        # When a manual refresh was last granted, or None for "never".  None
-        # rather than 0.0 for the reason CheckRefresher._last_watched is None:
-        # time.monotonic() on Linux counts from boot, so 0.0 would sit inside
-        # the interval and refuse the first click on a freshly booted
-        # appliance -- the one click that certainly deserves a probe.
-        self._last_manual_claim: float | None = None
+        # The manual-refresh floor, on this cache's clock.  It has its own lock:
+        # its read-and-rebind has to be one step for two request threads
+        # arriving together to get one grant between them, and that state is
+        # otherwise unrelated to the entry.  It reads the clock through
+        # _now rather than holding ``clock`` itself, so the cache and its
+        # floor can never be on two different clocks.
+        self._manual_floor = MinimumInterval(clock=self._now)
+
+    def _now(self) -> float:
+        """
+        Read this cache's clock at call time.
+
+        Returns:
+            The current monotonic reading of whichever clock the cache holds.
+
+        """
+        return self._clock()
 
     def current(self) -> CachedChecks:
         """
@@ -220,8 +222,9 @@ class CheckCache:
         floor shut for ever and the household member standing at the appliance
         would never get their probe.
 
-        The clock is read before the lock is taken, so this never calls out
-        while holding it -- the same discipline the lock's comment states.
+        The floor itself is a :class:`~saneless.web.throttle.MinimumInterval`,
+        shared with every other paperless-bound endpoint; this method keeps the
+        name and contract the refresh route was written against.
 
         Args:
             min_interval: The shortest gap between two grants, in seconds.
@@ -236,17 +239,11 @@ class CheckCache:
             on Linux that counts from boot, so 0.0 is a reading a grant can
             really record and it is falsey.  A caller branching on truthiness
             would read the first click after a boot as a refusal -- the one
-            click that certainly deserves a probe, for the same reason
-            ``_last_manual_claim`` starts at ``None`` rather than at 0.0.
+            click that certainly deserves a probe, for the same reason the
+            floor's recorded claim starts at ``None`` rather than at 0.0.
 
         """
-        now = self._clock()
-        with self._lock:
-            last = self._last_manual_claim
-            if last is not None and now - last < min_interval:
-                return None
-            self._last_manual_claim = now
-            return now
+        return self._manual_floor.claim(min_interval)
 
     def release_manual_claim(self, stamp: float) -> bool:
         """
@@ -291,8 +288,4 @@ class CheckCache:
             is not the recorded one and when no claim is recorded at all.
 
         """
-        with self._lock:
-            if self._last_manual_claim != stamp:
-                return False
-            self._last_manual_claim = None
-            return True
+        return self._manual_floor.release(stamp)

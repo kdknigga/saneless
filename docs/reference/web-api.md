@@ -71,6 +71,15 @@ The five 200 values are the complete set, and each is a stable wire contract: `c
 is returned for a 2xx and nothing else, so a 404 or a 500 is now reported as its own
 outcome rather than as a working connection.
 
+The result is shared and reused for 2 seconds; concurrent calls do not each contact
+paperless-ngx. A call inside that window gets the same status code and body as the call
+that ran the test, the `502` included, so calling the endpoint in a loop sends at most one
+request to paperless-ngx every 2 seconds. While a test is running, a caller that has a
+previous result to fall back on gets that result at once instead of waiting -- against an
+unreachable paperless-ngx a test can take the client's full 30-second timeout. Only the
+first callers after start-up, before any result exists, wait for the running test; one
+that waits longer than 35 seconds is answered `502` with `"detail": "TimeoutError"`.
+
 ---
 
 ### `POST /api/scan`
@@ -226,6 +235,12 @@ If paperless-ngx cannot be reached, the response is built from the last list tha
 | `resource` | string | Resource to invalidate: `tags` or `correspondents` |
 
 **Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched.
+
+At most one refetch per resource every 2 seconds; a sooner call returns the cached list. It
+is answered with the same status code and the same partial as a call that refetched,
+because an early click is not an error, and the list it gets is at most a couple of seconds
+older than the one a refetch would have fetched. The two resources have separate floors, so
+refreshing the tags does not delay a refresh of the correspondents.
 
 ---
 

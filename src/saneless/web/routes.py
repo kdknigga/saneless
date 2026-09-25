@@ -1010,24 +1010,66 @@ def health(request: Request) -> dict[str, str] | JSONResponse:
     )
 
 
-@router.get("/api/paperless/test", response_model=None)
-def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
+@dataclass(frozen=True, slots=True)
+class _PaperlessTestAnswer:
+    """One connection-test response, as the shared result stores it."""
+
+    status_code: int
+    body: dict[str, str]
+
+
+def _paperless_test_error(exc: BaseException) -> _PaperlessTestAnswer:
+    """
+    Build the connection test's 502 answer, logging the class name only.
+
+    Class name only, by the client-exception rule above _get_cached_or_fetch.
+
+    Args:
+        exc: What stopped the test from producing a status.
+
+    Returns:
+        The 502 answer naming the exception class.
+
+    """
+    detail = type(exc).__name__
+    logger.warning("Paperless connection test failed: %s", detail)
+    return _PaperlessTestAnswer(
+        status_code=502, body={"status": "error", "detail": detail}
+    )
+
+
+@router.get("/api/paperless/test")
+def paperless_test(request: Request) -> JSONResponse:
     """
     Test paperless-ngx connection status.
 
     Returns JSON with status: connected, token_rejected, unreachable,
     or error with detail on unexpected failures.
+
+    The answer is shared and reused for ``MIN_MANUAL_REFRESH_SECONDS``, error
+    included, so a loop against this unauthenticated endpoint costs one
+    token-bearing request to paperless-ngx per window rather than one per
+    call.  Concurrent callers do not each probe either, and while a probe is
+    in flight a caller with a previous answer gets that answer at once rather
+    than holding a worker thread behind it -- against an unreachable
+    paperless-ngx the probe takes the client's full timeout.  Only the very
+    first callers, before any answer exists, wait for the probe, and a wait
+    that outlasts its bound answers the usual 502 naming ``TimeoutError``.
     """
+    state = request.app.state
+
+    def probe() -> _PaperlessTestAnswer:
+        try:
+            status = state.paperless.test_connection()
+        except Exception as exc:
+            return _paperless_test_error(exc)
+        return _PaperlessTestAnswer(status_code=200, body={"status": str(status)})
+
     try:
-        status = request.app.state.paperless.test_connection()
-        return {"status": status}
-    except Exception as exc:
-        # Class name only, by the client-exception rule above _get_cached_or_fetch.
-        logger.warning("Paperless connection test failed: %s", type(exc).__name__)
-        return JSONResponse(
-            status_code=502,
-            content={"status": "error", "detail": type(exc).__name__},
-        )
+        answer: _PaperlessTestAnswer = state.paperless_test_result.get(probe)
+    except TimeoutError as exc:
+        answer = _paperless_test_error(exc)
+    return JSONResponse(answer.body, status_code=answer.status_code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1750,6 +1792,15 @@ def invalidate_cache(
     because htmx sends an ``hx-include``'s values that way on a POST; they are
     ignored for the correspondent resource, which includes nothing.
 
+    Each resource has a floor under it: at most one refetch every
+    ``MIN_MANUAL_REFRESH_SECONDS``.  The endpoint is unauthenticated on a LAN
+    and every refetch is a token-bearing request to paperless-ngx, so without
+    one a loop is unbounded upstream traffic.  A too-soon call skips the
+    invalidation and renders the cached list instead of erroring, because the
+    click is not wrong, only early: the list it would fetch is at most two
+    seconds newer than the one it gets.  The floors are per resource, so a
+    tag refresh never spends the correspondent list's.
+
     Args:
         request: The incoming HTTP request.
         resource: Resource name to invalidate ('tags' or 'correspondents').
@@ -1758,7 +1809,8 @@ def invalidate_cache(
 
     """
     state = request.app.state
-    state.cache.invalidate(resource)
+    if state.invalidate_floors[resource].claim() is not None:
+        state.cache.invalidate(resource)
 
     if resource == "tags":
         return state.templates.TemplateResponse(
