@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CLI_JOBS_DEFAULT_LIMIT",
+    "REJECTED_HISTORY_ROWS",
     "WEB_HISTORY_LIMIT",
     "ErrorCategory",
     "Job",
@@ -68,6 +69,13 @@ function has no such attribute, and a string literal in ``setattr`` trips
 # terminal -- so they are two constants, not one.  Neither is configurable.
 WEB_HISTORY_LIMIT: Final = 50
 CLI_JOBS_DEFAULT_LIMIT: Final = 20
+
+# How many refused submits -- ERROR rows with ``ErrorCategory.REJECTED`` -- the
+# store keeps, newest first.  They sit under this cap of their own rather than
+# under ``history_max_rows``, so a flood of refusals can never evict a real scan.
+# Smaller than WEB_HISTORY_LIMIT, so such a flood can never fill the visible
+# history table on its own either.  Not configurable.
+REJECTED_HISTORY_ROWS: Final = 20
 
 _COLUMNS: tuple[str, ...] = (
     "id",
@@ -246,8 +254,17 @@ One bound parameter, the job id.  Its safety argument is ``_SELECT_JOBS``'s: the
 only interpolated value is the module-level ``_DELETE_JOBS`` literal.
 """
 
-_NEWEST_IDS = f"{_SELECT_JOBS} id FROM jobs ORDER BY created_at DESC LIMIT ?"
-"""The ids of the newest jobs, up to a bound limit -- ``_PRUNE``'s subquery.
+_NEWEST_RUN_IDS = (
+    f"{_SELECT_JOBS} id FROM jobs WHERE error_category IS NOT ? "
+    "ORDER BY created_at DESC LIMIT ?"
+)
+"""The ids of the newest jobs that were not refused at submit, up to a limit.
+
+``_PRUNE``'s run-row subquery.  Two bound parameters, in this order:
+``ErrorCategory.REJECTED.value`` and the row cap.  ``IS NOT`` rather than
+``!=`` for the reason ``_SELECT_LATEST_RUN`` gives: ``NULL != 'X'`` is NULL, so
+``!=`` would leave out every job with no category -- nearly every run -- and
+those jobs would then never count toward the cap.
 
 Held apart from ``_PRUNE`` for the same reason ``_SELECT_JOBS`` holds the verb:
 ``S608`` matches ``select ... from`` anywhere in an interpolated string's
@@ -256,30 +273,71 @@ trip it -- and a lint suppression is not available to silence it.  Behind a
 name, both halves are ordinary constants and the rule has nothing to flag.
 """
 
-_PRUNE = f"{_DELETE_JOBS} WHERE created_at < ? OR id NOT IN ({_NEWEST_IDS})"
-"""Delete every job past the age cutoff or outside the newest ``max_rows``.
+_NEWEST_REJECTED_IDS = (
+    f"{_SELECT_JOBS} id FROM jobs WHERE error_category = ? "
+    "ORDER BY created_at DESC LIMIT ?"
+)
+"""The ids of the newest refused submits, up to a limit.
 
-Two bound parameters, in this order: the ISO-8601 cutoff, then the row cap.  Its
-safety argument is ``_SELECT_JOBS``'s -- the only interpolated value is the
-module-level ``_DELETE_JOBS`` literal, and both runtime values are bound ``?``.
+The subquery ``_PRUNE`` and ``_TRIM_REJECTED`` share.  Two bound parameters, in
+this order: ``ErrorCategory.REJECTED.value`` and ``REJECTED_HISTORY_ROWS``.
+Plain ``=`` is right here, because it is meant to leave out every NULL
+category.  Named apart for the ``S608`` reason ``_NEWEST_RUN_IDS`` gives.
+"""
 
-**Both comparisons are lexicographic over strings.**  ``created_at`` is written
+_TRIM_REJECTED = (
+    f"{_DELETE_JOBS} WHERE error_category = ? AND id NOT IN ({_NEWEST_REJECTED_IDS})"
+)
+"""Delete every refused submit outside the newest ``REJECTED_HISTORY_ROWS``.
+
+Three bound parameters, in this order: ``ErrorCategory.REJECTED.value``, then
+``ErrorCategory.REJECTED.value`` and ``REJECTED_HISTORY_ROWS`` for the
+subquery.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated
+values are the module-level ``_DELETE_JOBS`` literal and the module-level
+subquery, and every runtime value is bound.  It runs in the same transaction
+as the write that recorded a refusal, so once that write commits the table
+never holds more refused rows than the cap.
+"""
+
+_PRUNE = (
+    f"{_DELETE_JOBS} WHERE created_at < ? "
+    f"OR (error_category IS NOT ? AND id NOT IN ({_NEWEST_RUN_IDS})) "
+    f"OR (error_category = ? AND id NOT IN ({_NEWEST_REJECTED_IDS}))"
+)
+"""Delete every job past the age cutoff or outside its partition's row cap.
+
+The table has two partitions.  Runs -- every job not refused at submit,
+including every job with no category -- are capped at the caller's
+``max_rows``.  Refused submits are capped at ``REJECTED_HISTORY_ROWS`` and do
+not count toward ``max_rows``, so a flood of refusals can never push a real
+scan out of history.  ``IS NOT`` and ``=`` split the table exactly in two, for
+the NULL-safety reason ``_NEWEST_RUN_IDS`` gives.
+
+Seven bound parameters, in this order: the ISO-8601 cutoff; for the run half,
+``ErrorCategory.REJECTED.value`` twice and the run-row cap; for the refused
+half, ``ErrorCategory.REJECTED.value`` twice and ``REJECTED_HISTORY_ROWS``.
+Its safety argument is ``_SELECT_JOBS``'s -- the only interpolated values are
+the module-level ``_DELETE_JOBS`` literal and the two module-level subqueries,
+and every runtime value is a bound ``?``.
+
+**Every comparison is lexicographic over strings.**  ``created_at`` is written
 as ``datetime.now(tz=UTC).isoformat()``, so every value ends ``+00:00``, and the
 ``<`` cutoff and the ``ORDER BY`` are correct *only* because of that uniformity.
 A single non-UTC timestamp reaching this column -- a ``-05:00`` offset, say --
 would make both the cutoff and the ordering silently wrong, and nothing here
 would raise.  Anyone adding a writer to this column meets this note first.
 
-The two predicates are a *union*, not a sequence, and that is equivalent to
-deleting by age and then trimming to a row cap: both order by ``created_at``, so
-the age-expired rows are always a prefix of the oldest and the union of the two
-sets is exactly what the sequential form produced.  The equivalence rests in
-turn on SQLite evaluating the ``IN (SELECT ... ORDER BY ... LIMIT ?)`` right-hand
-side into a ``LIST SUBQUERY`` before the outer scan begins, so it never observes
-its own partial deletions.  SQLite does not document that as a guarantee, so it
-is pinned by the shuffled-insert-order tests in ``tests/test_job.py`` rather than
-by contract: if a future libsqlite changes the plan, those go red instead of
-this statement quietly under-deleting.
+The predicates are a *union*, not a sequence, and within each partition that is
+equivalent to deleting by age and then trimming to a row cap: both order by
+``created_at``, so a partition's age-expired rows are always a prefix of its
+oldest and the union of the two sets is exactly what the sequential form
+produced.  The equivalence rests in turn on SQLite evaluating each
+``IN (SELECT ... ORDER BY ... LIMIT ?)`` right-hand side into a ``LIST
+SUBQUERY`` before the outer scan begins, so it never observes its own partial
+deletions.  SQLite does not document that as a guarantee, so it is pinned by the
+shuffled-insert-order tests in ``tests/test_job.py`` rather than by contract: if
+a future libsqlite changes the plan, those go red instead of this statement
+quietly under-deleting.
 """
 
 _S3_COLUMNS: frozenset[str] = frozenset(
@@ -417,13 +475,14 @@ def _migrate(conn: sqlite3.Connection, db_path: str) -> None:
         conn.commit()
 
 
-def _open_failure(db_path: str, exc: sqlite3.Error) -> StorageError:
+def _open_failure(db_path: str, exc: sqlite3.Error | OSError) -> StorageError:
     """
     Build the StorageError for a job database that cannot be used at open time.
 
     Args:
         db_path: Path the connection was opened on, named in the message.
-        exc: The sqlite3 error that stopped the open.
+        exc: The sqlite3 error that stopped the open, or the OS error that
+            stopped the private pre-create of a new database file.
 
     Returns:
         A one-line StorageError naming the path and sqlite's reason.
@@ -435,12 +494,61 @@ def _open_failure(db_path: str, exc: sqlite3.Error) -> StorageError:
     )
 
 
+_AUTO_VACUUM_INCREMENTAL = 2
+"""``PRAGMA auto_vacuum``'s answer for INCREMENTAL (0 is NONE, 1 is FULL)."""
+
+_MEMORY_DB = ":memory:"
+"""The path SQLite reads as a private in-memory database rather than a file.
+
+Such a database is always new, and there is no file for a mode to apply to.
+"""
+
+
+def _create_private(db_path: str) -> bool:
+    """
+    Create a new job database file readable by its owner alone.
+
+    SQLite would create a missing file itself, with a mode the umask decides --
+    0644 under the usual 022 -- and the database holds every job title and
+    thumbnail.  Creating the empty file first, exclusively and with mode 0600,
+    closes that: SQLite accepts a zero-byte file as an empty database, and it
+    gives the ``-wal`` and ``-shm`` files it later creates the database file's
+    own mode.  A mode passed to ``open`` is only ever narrowed by the umask, so
+    0600 holds under any of them.
+
+    A file that already exists keeps the mode it has, including a 0644 one an
+    earlier release created: this is the create path only, never a chmod.  The
+    same answer covers another opener winning a race to create it.
+
+    Args:
+        db_path: Path of the database file to create.
+
+    Returns:
+        True if this call created the file, False if it already existed.
+
+    Raises:
+        StorageError: If the file could not be created for any other reason,
+            such as a missing parent directory or a permission refusal.
+
+    """
+    try:
+        os.close(os.open(db_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        raise _open_failure(db_path, exc) from exc
+    return True
+
+
 def _open_connection(db_path: str) -> sqlite3.Connection:
     """
     Open a job database connection with WAL and explicit transaction control.
 
-    A path that cannot be opened (a directory, a missing parent) fails at
-    ``connect``; a file that is not SQLite fails at the ``user_version`` read,
+    A missing database file is first created owner-only by
+    :func:`_create_private`, and a database this call created gets
+    ``auto_vacuum = INCREMENTAL`` before anything is written to it.  A missing
+    parent fails at that pre-create; a directory fails at ``connect``; a file
+    that is not SQLite fails at the ``user_version`` read,
     the first statement that reads it.  A database stamped with a schema
     version newer than this release's migration ladder, or negative, is
     refused before any statement that could write to it.  Only this open
@@ -460,6 +568,7 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
             found.  The connection, when one was opened, is closed first.
 
     """
+    created = db_path == _MEMORY_DB or _create_private(db_path)
     try:
         conn = sqlite3.connect(db_path, check_same_thread=False)
     except sqlite3.Error as exc:
@@ -489,6 +598,14 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
                 "restore a backup"
             )
             raise StorageError(msg)
+        if created:
+            # auto_vacuum can only be switched on for free while the file
+            # holds no table yet, so it runs before the WAL header rewrite and
+            # before any migration creates one.  INCREMENTAL lets a delete hand
+            # its freed pages back to the file system; an existing database is
+            # converted separately by enable_incremental_auto_vacuum, since
+            # that takes a VACUUM.
+            conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
         # WAL has to be enabled before the connection switches to explicit
         # transaction control: that switch opens a transaction immediately,
         # and SQLite refuses a journal-mode change inside a transaction on a
@@ -798,7 +915,9 @@ class JobStore:
             # mapping in exactly one place.
             row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
         job = self._row_to_job(row)
-        logger.debug("Created job %s: %s", job.id, job.title)
+        # %r, not %s: the title is untrusted text, and a newline in it would
+        # otherwise start what reads as a second log line.
+        logger.debug("Created job %s: %r", job.id, job.title)
         return job
 
     @_locked
@@ -826,6 +945,12 @@ class JobStore:
         saw that id and restart recovery never runs again, so the row would stay
         active for good, showing "Starting scan..." and disabling the Scan
         button.  With a single statement a failure leaves no row at all.
+
+        The same transaction then trims refused rows to the newest
+        ``REJECTED_HISTORY_ROWS``, so a flood of refused submits holds the
+        table at a fixed size instead of growing it.  That trim deletes only
+        refused rows, so it cannot strand a ``PENDING`` one either.  The row
+        stays unowned: ``owner_token`` is NULL.
 
         Args:
             profile: Scan profile name the refused submit named.
@@ -864,10 +989,13 @@ class JobStore:
                 ),
             )
             # Read back inside the same transaction, as create_job does, so the
-            # row mapping stays in _row_to_job alone.
+            # row mapping stays in _row_to_job alone.  Before the trim, so the
+            # read can never miss the row it just wrote.
             row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
+            self._trim_rejected()
         job = self._row_to_job(row)
-        logger.debug("Created rejected job %s: %s", job.id, job.title)
+        # %r for the same reason as create_job's: the title is untrusted text.
+        logger.debug("Created rejected job %s: %r", job.id, job.title)
         return job
 
     @_locked
@@ -936,7 +1064,8 @@ class JobStore:
         method rather than an extra argument.
 
         State, outcome, warning, the three counts and the error all land in one
-        ``UPDATE``.  The web request thread reads this row while the worker
+        ``UPDATE``.  Recording ``ErrorCategory.REJECTED`` also trims the refused
+        rows to their cap, in the same transaction.  The web request thread reads this row while the worker
         thread writes it, and a two-statement version would let it observe a
         job that had finished but had not yet recorded how.
 
@@ -971,6 +1100,12 @@ class JobStore:
                     job_id,
                 ),
             )
+            if error_category is ErrorCategory.REJECTED:
+                # A job refused after its row existed -- the queue was full, or
+                # the worker replays a rejection it owed -- joins the refused
+                # rows, so it is trimmed under their cap in this transaction
+                # just as create_rejected_job's rows are.
+                self._trim_rejected()
         logger.debug("Job %s finished as %s", job_id, state.value)
 
     @_locked
@@ -1004,6 +1139,25 @@ class JobStore:
         with self._conn:
             rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
         return [self._row_to_job(row) for row in rows]
+
+    def _trim_rejected(self) -> None:
+        """
+        Delete refused rows past ``REJECTED_HISTORY_ROWS``, in the open transaction.
+
+        Private, unlocked and without a ``with self._conn:`` of its own for the
+        reason :meth:`_pending_jobs` gives: its callers, ``create_rejected_job``
+        and ``finish_job``, already hold the lock and a transaction, and the
+        trim must commit with the write that recorded the refusal.  It deletes
+        only rows marked ``ErrorCategory.REJECTED``, so a flood of refused
+        submits can never remove a run.
+        """
+        rejected = ErrorCategory.REJECTED.value
+        trimmed = self._conn.execute(
+            _TRIM_REJECTED, (rejected, rejected, REJECTED_HISTORY_ROWS)
+        ).rowcount
+        if trimmed > 0:
+            # fetchall() steps the pragma to completion; see prune.
+            self._conn.execute("PRAGMA incremental_vacuum").fetchall()
 
     def _pending_jobs(self) -> list[Job]:
         """
@@ -1219,11 +1373,13 @@ class JobStore:
         Remove old jobs by age and count limits.
 
         One ``DELETE`` removes every job older than ``max_age_days`` together
-        with every job outside the newest ``max_rows``, and reports how many
-        rows it removed.  The two predicates are a union rather than a sequence;
-        ``_PRUNE`` carries the argument for why that is the same set the old
-        delete-by-age-then-trim composition produced, and the UTC assumption
-        both halves rest on.
+        with every run outside the newest ``max_rows`` and every refused submit
+        outside the newest ``REJECTED_HISTORY_ROWS``, and reports how many rows
+        it removed.  Refused submits do not count toward ``max_rows``, so they
+        can never push a real scan out of history.  The predicates are a union
+        rather than a sequence; ``_PRUNE`` carries the argument for why that is
+        the same set the old delete-by-age-then-trim composition produced, and
+        the UTC assumption every half rests on.
 
         The count comes from the statement itself.  The two ``SELECT COUNT(*)``
         reads this used to subtract straddled the deletes, so an insert landing
@@ -1232,17 +1388,42 @@ class JobStore:
         stronger guarantee than serialising the method behind the store's lock:
         it holds against writers on other connections too.
 
+        When rows went, an incremental vacuum in the same transaction returns
+        their pages to the file system, so the file shrinks back.  That only
+        happens on a database with ``auto_vacuum = INCREMENTAL``; on an older
+        one the pragma is a no-op until
+        :meth:`enable_incremental_auto_vacuum` has converted it.
+
         Args:
             max_age_days: Maximum age in days before a job is pruned.
-            max_rows: Maximum number of jobs to retain.
+            max_rows: Maximum number of runs to retain.  Refused submits are
+                kept under ``REJECTED_HISTORY_ROWS`` instead.
 
         Returns:
             Total number of jobs deleted.
 
         """
         cutoff = (datetime.now(tz=UTC) - timedelta(days=max_age_days)).isoformat()
+        rejected = ErrorCategory.REJECTED.value
         with self._conn:
-            deleted = self._conn.execute(_PRUNE, (cutoff, max_rows)).rowcount
+            deleted = self._conn.execute(
+                _PRUNE,
+                (
+                    cutoff,
+                    rejected,
+                    rejected,
+                    max_rows,
+                    rejected,
+                    rejected,
+                    REJECTED_HISTORY_ROWS,
+                ),
+            ).rowcount
+            if deleted > 0:
+                # The fetchall() is load-bearing.  incremental_vacuum frees one
+                # page per step of the statement, and execute() alone takes
+                # only the first step, so without it a prune of thousands of
+                # pages would hand back exactly one.
+                self._conn.execute("PRAGMA incremental_vacuum").fetchall()
 
         if deleted > 0:
             logger.debug("Pruned %d old jobs", deleted)
@@ -1272,6 +1453,49 @@ class JobStore:
         if deleted > 0:
             logger.debug("Deleted job %s", job_id)
         return deleted > 0
+
+    @_locked
+    def enable_incremental_auto_vacuum(self) -> bool:
+        """
+        Convert an older job database to ``auto_vacuum = INCREMENTAL``, once.
+
+        A database this release creates already has it, set before its first
+        table.  One an earlier release created has ``NONE``, so the pages its
+        deletes free stay inside the file for good; switching an existing file
+        over takes a full ``VACUUM``, which rewrites it.  After that, the
+        incremental vacuums :meth:`prune` and the refused-row trim run can
+        shrink it.
+
+        ``VACUUM`` cannot run inside a transaction, and this connection always
+        has one open, so the method commits it and runs both statements with
+        ``autocommit`` on, restoring explicit transaction control afterwards
+        whatever happens.  ``VACUUM`` also needs free disk space of roughly the
+        database's size for its copy -- and a database bloated by a flood may
+        sit on a nearly full disk -- so callers on the server path catch
+        ``sqlite3.Error``, log it and carry on with the database as it is.
+
+        This is not a migration step and bumps no schema version:
+        ``auto_vacuum`` is a header setting that older releases open without
+        complaint, so a version bump would only make them refuse the file.
+        No ``with self._conn:`` here, for the ``VACUUM`` reason above.
+
+        Returns:
+            True if the database was converted, False if it already was
+            INCREMENTAL and nothing was done.
+
+        """
+        mode: int = self._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if mode == _AUTO_VACUUM_INCREMENTAL:
+            return False
+        self._conn.commit()
+        self._conn.autocommit = True
+        try:
+            self._conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            self._conn.execute("VACUUM")
+        finally:
+            self._conn.autocommit = False
+        logger.info("Converted the job database to incremental auto-vacuum")
+        return True
 
     @_locked
     def close(self) -> None:

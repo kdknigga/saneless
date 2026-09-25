@@ -2556,7 +2556,7 @@ class TestTitleLogging:
     def test_create_job_logs_the_title_repr(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Created job ... logs the title with %r (T-25)."""
+        """Created job ... logs the title with %r."""
         store = JobStore()
         try:
             with caplog.at_level(logging.DEBUG, logger=job_module.__name__):
@@ -2576,7 +2576,7 @@ class TestTitleLogging:
     def test_create_rejected_job_logs_the_title_repr(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Created rejected job ... logs the title with %r (T-25)."""
+        """Created rejected job ... logs the title with %r."""
         store = JobStore()
         try:
             with caplog.at_level(logging.DEBUG, logger=job_module.__name__):
