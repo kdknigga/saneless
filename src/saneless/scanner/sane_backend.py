@@ -45,6 +45,7 @@ from saneless.scanner.base import (
     SourceKind,
     classify_source,
 )
+from saneless.text_safety import neutralise_controls
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -1170,8 +1171,12 @@ def _refuse_if_wedged(device_id: str, operation: str) -> None:
             return
         wedged_id = _WEDGE.device_id or "the scanner"
         label = _WEDGE.page_label or "an earlier page"
+    # Both ids can come from discovery, which is LAN-supplied text, and this
+    # message reaches the terminal, the log and a traceback as it is built.
+    shown = neutralise_controls(device_id)
     wedged_msg = (
-        f"Could not {operation} {device_id}: a read on {wedged_id} ({label}) "
+        f"Could not {operation} {shown}: a read on "
+        f"{neutralise_controls(wedged_id)} ({label}) "
         f"has not returned, and SANE allows no other operation on a device "
         f"while one is outstanding. The scan will be possible again as soon "
         f"as the scanner releases it. Restart saneless if it does not."
@@ -1716,14 +1721,18 @@ def _configure_device(
             setattr(dev, name, value)
         except Exception as exc:
             set_msg = (
-                f"Could not set {name} to {value!r} on {device_id}: {describe(exc)}"
+                f"Could not set {name} to {value!r} on "
+                f"{neutralise_controls(device_id)}: {describe(exc)}"
             )
             raise ScanError(set_msg) from exc
 
     try:
         actual_resolution = int(dev.resolution)
     except Exception as exc:
-        read_msg = f"Could not read back resolution from {device_id}: {describe(exc)}"
+        read_msg = (
+            f"Could not read back resolution from "
+            f"{neutralise_controls(device_id)}: {describe(exc)}"
+        )
         raise ScanError(read_msg) from exc
     if actual_resolution != settings.resolution:
         logger.warning(
@@ -1756,7 +1765,10 @@ def _read_options(dev: SaneDevice, device_id: str) -> list:
     try:
         return dev.get_options()
     except Exception as exc:
-        options_msg = f"Could not read options from {device_id}: {describe(exc)}"
+        options_msg = (
+            f"Could not read options from {neutralise_controls(device_id)}: "
+            f"{describe(exc)}"
+        )
         raise ScanError(options_msg) from exc
 
 
@@ -1862,7 +1874,7 @@ def _snap_flatbed(
     except Exception as exc:
         if str(exc) == "Document feeder out of documents":
             raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
-        snap_msg = f"Scanner error on {device_id}: {describe(exc)}"
+        snap_msg = f"Scanner error on {neutralise_controls(device_id)}: {describe(exc)}"
         raise ScanError(snap_msg) from exc
 
     # The same two integrity checks the feeder path runs.  The reason once
@@ -1995,7 +2007,13 @@ class SaneBackend(ScannerBackend):
         try:
             dev: SaneDevice = _ensure_sane().open(device_id)
         except Exception as exc:
-            open_msg = f"Could not open scanner {device_id}: {describe(exc)}"
+            # The id may come from discovery, which is LAN-supplied text, so
+            # it is defused here, where the message is built: every sink it
+            # reaches, a traceback included, then gets the safe spelling.
+            open_msg = (
+                f"Could not open scanner {neutralise_controls(device_id)}: "
+                f"{describe(exc)}"
+            )
             raise ScanError(open_msg) from exc
         try:
             yield dev

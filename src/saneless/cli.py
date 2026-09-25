@@ -347,7 +347,10 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
     The prefixes are documented (``docs/how-to/set-up-adf-duplex.md`` quotes
     them), so they are kept as they were before the guard existed. A
     configuration error is printed as-is: the loader's renderer already wrote
-    its own ``Configuration error in <file>:`` header.
+    its own ``Configuration error in <file>:`` header, and escapes the names
+    in its own lines.  Every other line has its control characters shown as
+    escapes, because its text can carry something from outside saneless,
+    such as a device name that LAN discovery reported.
 
     Args:
         exc: The failure.
@@ -361,7 +364,7 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
         case ErrorCategory.FEEDER | ErrorCategory.SCANNER:
             line = f"Scan error: {exc}"
         case ErrorCategory.CONFIG:
-            line = str(exc)
+            return str(exc)
         case ErrorCategory.UPLOAD:
             line = f"Paperless error: {exc}"
         case ErrorCategory.ASSEMBLY:
@@ -370,7 +373,7 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
             line = _unexpected_line(exc)
         case _:
             assert_never(category)
-    return line
+    return neutralise_controls(line)
 
 
 def _log_failure(ctx: click.Context, exc: Exception) -> None:
@@ -379,7 +382,8 @@ def _log_failure(ctx: click.Context, exc: Exception) -> None:
 
     The message names the failure too: when the log fell back to stderr the
     traceback is not rendered there, and the record must still say what went
-    wrong.
+    wrong.  It is quoted with ``%r``, because it can carry text from outside
+    saneless and repr shows a control character in it as its escape.
 
     Args:
         ctx: The group's context.
@@ -388,7 +392,7 @@ def _log_failure(ctx: click.Context, exc: Exception) -> None:
     """
     if _logging_ready(ctx):
         logger.error(
-            "saneless %s failed: %s",
+            "saneless %s failed: %r",
             ctx.invoked_subcommand,
             describe(exc),
             exc_info=exc,
@@ -919,7 +923,7 @@ def _probe_capabilities(scanner: ScannerBackend, name: str) -> DeviceCapabilitie
         return scanner.get_capabilities(name)
     except ScanError as exc:
         reason = describe(exc)
-        logger.warning("Could not read capabilities for %r: %s", name, reason)
+        logger.warning("Could not read capabilities for %r: %r", name, reason)
         click.echo(
             f"Capabilities for {neutralise_controls(name)}: "
             f"{neutralise_controls(reason)}",

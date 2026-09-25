@@ -38,6 +38,7 @@ from saneless.scanner.base import (
 )
 from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from saneless.spool import SpooledPageSink
+from saneless.text_safety import has_control_characters
 from tests.conftest import images_of, reset_sane_process_state
 from tests.fake_sane import (
     FakeSaneDev,
@@ -4915,3 +4916,104 @@ class TestSaneBoundary:
             backend.scan_pages("test:0", _feeder_settings(), page_sink)
 
         assert str(exc_info.value) == "Scanner error on page 2: FakeSaneError"
+
+
+# A device name as LAN discovery could report it: an OSC that retitles the
+# terminal window, then a CSI that turns the text red.
+_HOSTILE_DEVICE = "net:evil\x1b]0;owned\x07\x1b[31m:0"
+_SHOWN_DEVICE = "net:evil\\x1b]0;owned\\x07\\x1b[31m:0"
+
+
+class TestDeviceIdsInScanErrorsAreNeutralised:
+    """A device id from discovery reaches every ScanError message defused."""
+
+    @staticmethod
+    def _assert_defused(exc: ScanError) -> None:
+        """Assert the message names the device with its controls escaped."""
+        message = str(exc)
+        assert _SHOWN_DEVICE in message, message
+        assert not has_control_characters(message)
+
+    def test_open_failure(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """The open failure names the device with its controls escaped."""
+        monkeypatch.setattr(
+            sane_backend_mod,
+            "sane",
+            FakeSaneModule(open_error=FakeSaneError("Invalid argument")),
+        )
+        backend = SaneBackend()
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages(_HOSTILE_DEVICE, _flatbed_settings(), page_sink)
+
+        self._assert_defused(exc_info.value)
+
+    def test_scanner_error(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """A flatbed scan failure names the device with its controls escaped."""
+        dev = FakeSaneDev(start_error=FakeSaneError("scan failed"))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages(_HOSTILE_DEVICE, _flatbed_settings(), page_sink)
+
+        self._assert_defused(exc_info.value)
+
+    def test_option_set_failure(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """A refused option names the device with its controls escaped."""
+        dev = FakeSaneDev()
+        dev.fail_assignment("resolution", FakeSaneError("Invalid argument"))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages(_HOSTILE_DEVICE, _flatbed_settings(), page_sink)
+
+        self._assert_defused(exc_info.value)
+
+    def test_resolution_read_back_failure(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """A failed read-back names the device with its controls escaped."""
+        dev = FakeSaneDev()
+        dev.fail_read("resolution", FakeSaneError("I/O error"))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages(_HOSTILE_DEVICE, _flatbed_settings(), page_sink)
+
+        self._assert_defused(exc_info.value)
+
+    def test_options_read_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed option listing names the device with its controls escaped."""
+        dev = FakeSaneDev()
+        dev.fail_call("get_options", FakeSaneError("I/O error"))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_capabilities(_HOSTILE_DEVICE)
+
+        self._assert_defused(exc_info.value)
+
+    def test_wedged_refusal(
+        self, fake_sane_module: FakeSaneModule, fake_device: FakeSaneDev
+    ) -> None:
+        """The wedge refusal names both devices with their controls escaped."""
+        backend = SaneBackend()
+        _ = fake_sane_module
+        record = sane_backend_mod._WEDGE
+        record.stuck = True
+        record.done = threading.Event()
+        record.device = fake_device
+        record.device_id = _HOSTILE_DEVICE
+        record.page_label = "Page 1"
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_capabilities(_HOSTILE_DEVICE)
+
+        self._assert_defused(exc_info.value)
+        assert str(exc_info.value).count(_SHOWN_DEVICE) == 2

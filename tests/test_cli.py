@@ -1507,7 +1507,7 @@ class TestDevicesCommand:
         ]
         assert [
             r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-        ] == [f"Could not read capabilities for 'hp:002': {_HALF_BROKEN_REASON}"]
+        ] == [f"Could not read capabilities for 'hp:002': {_HALF_BROKEN_REASON!r}"]
 
     def test_devices_text_capabilities_reports_a_failed_probe_and_lists_the_rest(
         self, monkeypatch: pytest.MonkeyPatch
@@ -6160,3 +6160,63 @@ class TestControlCharactersAtCliSinks:
         data = json.loads(result.stdout)
         assert data[0]["title"] == "t\x1b[31m"
         assert data[0]["profile"] == "p\x1b"
+
+
+# A scanner failure naming a device as LAN discovery could report it.
+_HOSTILE_SCAN_FAILURE = "Could not open scanner net:evil\x1b]0;owned\x07:0: busy"
+
+
+class _HostileProbeScanner(StubScannerBackend):
+    """A device whose capability probe fails naming it with a terminal escape."""
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """Fail the way a device named with an escape would."""
+        raise ScanError(_HOSTILE_SCAN_FAILURE)
+
+
+class TestControlCharactersInFailureSinks:
+    """A failure's text reaches the terminal and the log with its controls escaped."""
+
+    @pytest.mark.parametrize(
+        ("category", "exc_type"),
+        [pair for pair in _ADVISED_CATEGORIES if pair[0] is not ErrorCategory.CONFIG],
+    )
+    def test_failure_line_escapes_controls(
+        self, category: ErrorCategory, exc_type: type[SanelessError]
+    ) -> None:
+        """The one stderr line for a failure carries no live control character."""
+        line = _failure_line(exc_type(_HOSTILE_SCAN_FAILURE), category)
+
+        assert _control_free(line), repr(line)
+        assert "net:evil\\x1b]0;owned\\x07:0" in line
+
+    def test_failure_line_keeps_a_configuration_error_as_written(self) -> None:
+        """The loader's multi-line configuration report is printed unchanged."""
+        report = "Configuration error in saneless.toml:\n  web.port: bad"
+
+        assert _failure_line(ConfigError(report), ErrorCategory.CONFIG) == report
+
+    def test_failure_log_line_escapes_controls(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The ERROR record for a failure quotes its text with controls escaped."""
+        ctx = click.Context(cli, obj={"logging_configured": True})
+        ctx.invoked_subcommand = "scan"
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        cli_module._log_failure(ctx, ScanError(_HOSTILE_SCAN_FAILURE))
+
+        [record] = [r for r in caplog.records if r.name == "saneless.cli"]
+        assert _control_free(record.getMessage()), record.getMessage()
+
+    def test_capability_probe_log_line_escapes_controls(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The WARNING for a failed capability probe quotes the reason escaped."""
+        caplog.set_level(logging.WARNING, logger="saneless.cli")
+
+        reason = cli_module._probe_capabilities(_HostileProbeScanner(), "net:0")
+
+        assert reason == _HOSTILE_SCAN_FAILURE
+        [record] = [r for r in caplog.records if r.name == "saneless.cli"]
+        assert _control_free(record.getMessage()), record.getMessage()
