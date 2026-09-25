@@ -195,7 +195,6 @@ class SpooledPageSink(PageSink):
         self._pass_label = pass_label
         self._min_free_space_mb = min_free_space_mb
         self._thumbnail_callback = thumbnail_callback
-        self._sequence = 0
         self._records: list[PageRecord] = []
 
     @property
@@ -225,11 +224,20 @@ class SpooledPageSink(PageSink):
         be appended the moment the page is on disk: a page file the records do
         not name is a sheet the run's guard would not keep.
 
-        A signal that interrupts the write (``ScanInterrupted``) does not lose
-        the page either.  The sheet has already left the feeder and this image
-        is its only copy, so the write is finished and recorded before the
-        interruption goes on.  The signal handler has ignored both signals by
-        then, so nothing interrupts the second attempt.
+        A signal that lands anywhere in that sequence (``ScanInterrupted``)
+        does not lose the page either: while it is normalised, checked for
+        room, measured or written.  The sheet has already left the feeder and
+        this image is its only copy, so the whole sequence is run again from
+        the image as it arrived, the page is recorded, and only then does the
+        interruption go on.  The signal handler has ignored both signals by
+        then, so nothing interrupts the second attempt, and the page keeps the
+        number the first attempt gave it.  A second attempt that fails on its
+        own account -- a refused mode, a full disk -- raises that ``ScanError``
+        as the first attempt would have.  What this cannot cover is a signal
+        that lands before this method starts: in the moments between the
+        device handing the page back and the backend calling ``add`` -- its
+        integrity check and the crop to paper size -- the page is not yet the
+        sink's to finish.
 
         The page is measured exactly once, here, while it is already decoded,
         by ``pages.measure_ink``: its ink coverage and paper white go on the
@@ -259,33 +267,23 @@ class SpooledPageSink(PageSink):
                 failed.  No raw OSError escapes this method.
 
         """
-        self._sequence += 1
-        sequence = self._sequence
-        png_path = self._directory / f"{self._pass_label}-{sequence:04d}.png"
-
-        image = _normalise_mode(image, sequence)
-        self._check_room_for(image, sequence, png_path)
-
-        measurement = measure_ink(image)
-        record = PageRecord(
-            sequence=sequence,
-            path=png_path,
-            size=image.size,
-            mode=image.mode,
-            dpi=dpi,
-            ink_coverage=measurement.coverage,
-            paper_white=measurement.paper_white,
-        )
-
+        # The record is appended inside the try, with no call between the
+        # page reaching disk and the append that a signal could land in.  A
+        # signal that lands after the append finds the page already recorded;
+        # one that lands before it runs the whole sequence again.  _spool
+        # changes nothing on the sink, and the page's number is the count of
+        # pages recorded, so a second attempt writes the same file.
+        recorded = len(self._records)
         try:
-            self._write(image, sequence, png_path, dpi)
-        except ScanInterrupted:
-            self._write(image, sequence, png_path, dpi)
+            record, spooled = self._spool(image, dpi)
             self._records.append(record)
+        except ScanInterrupted:
+            if len(self._records) == recorded:
+                record, spooled = self._spool(image, dpi)
+                self._records.append(record)
             raise
-        self._records.append(record)
 
-        if sequence == 1 and self._thumbnail_callback is not None:
+        if record.sequence == 1 and self._thumbnail_callback is not None:
             # Best-effort: the thumbnail is something to look at while the
             # scan runs, not part of the scan.  It can fail for reasons that
             # have nothing to do with the page -- the web worker's callback is
@@ -301,18 +299,18 @@ class SpooledPageSink(PageSink):
             # so the run's guard keeps it rather than let the workspace delete
             # a sheet that had really been fed.
             try:
-                self._thumbnail_callback(generate_thumbnail(image))
+                self._thumbnail_callback(generate_thumbnail(spooled))
             except Exception:
                 logger.warning(
                     "Could not make or hand on the thumbnail of %s; the scan continues",
-                    png_path,
+                    record.path,
                     exc_info=True,
                 )
 
         logger.debug(
             "Spooled page %d to %s (%dx%d %s at %d dpi, ink %r%%, paper white %d)",
-            sequence,
-            png_path,
+            record.sequence,
+            record.path,
             record.size[0],
             record.size[1],
             record.mode,
@@ -321,6 +319,40 @@ class SpooledPageSink(PageSink):
             record.paper_white,
         )
         return record
+
+    def _spool(self, image: Image.Image, dpi: int) -> tuple[PageRecord, Image.Image]:
+        """
+        Normalise, check, measure and write the next page, recording nothing.
+
+        Args:
+            image: The page as the backend handed it over.
+            dpi: The resolution the device read back.
+
+        Returns:
+            The page's record, and the page as it was written.
+
+        Raises:
+            ScanError: As ``add`` documents.
+
+        """
+        sequence = len(self._records) + 1
+        png_path = self._directory / f"{self._pass_label}-{sequence:04d}.png"
+
+        page = _normalise_mode(image, sequence)
+        self._check_room_for(page, sequence, png_path)
+
+        measurement = measure_ink(page)
+        record = PageRecord(
+            sequence=sequence,
+            path=png_path,
+            size=page.size,
+            mode=page.mode,
+            dpi=dpi,
+            ink_coverage=measurement.coverage,
+            paper_white=measurement.paper_white,
+        )
+        self._write(page, sequence, png_path, dpi)
+        return record, page
 
     def _check_room_for(
         self, image: Image.Image, sequence: int, png_path: Path

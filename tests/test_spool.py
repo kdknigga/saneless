@@ -653,20 +653,79 @@ class TestSpooledPageSinkInterruption:
         assert record.path == tmp_path / "a-0001.png"
         assert record.path.is_file()
 
-    def test_an_interruption_while_measuring_leaves_no_unrecorded_page(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("step", ["normalising", "checking for room", "measuring"])
+    def test_an_interruption_before_the_write_still_spools_the_page(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: str
     ) -> None:
-        """Measured before it is written, so no page file is left unrecorded."""
+        """
+        A signal while the page is prepared still leaves it written and recorded.
 
-        def interrupted(_image: Image.Image) -> InkMeasurement:
-            msg = "Interrupted by SIGHUP"
-            raise ScanInterrupted(msg, signum=1)
+        The sheet has left the feeder by the time the page reaches the sink,
+        so every step before the write is as much a part of keeping its only
+        copy as the write itself.
+        """
+        calls: list[str] = []
 
-        monkeypatch.setattr(spool_module, "measure_ink", interrupted)
+        def interrupt_once() -> None:
+            calls.append(step)
+            if len(calls) == 1:
+                msg = "Interrupted by SIGHUP"
+                raise ScanInterrupted(msg, signum=1)
+
+        real_normalise = spool_module._normalise_mode
+        real_check = SpooledPageSink._check_room_for
+
+        def normalise(image: Image.Image, sequence: int) -> Image.Image:
+            interrupt_once()
+            return real_normalise(image, sequence)
+
+        def check_room_for(
+            sink: SpooledPageSink, image: Image.Image, sequence: int, png_path: Path
+        ) -> None:
+            interrupt_once()
+            real_check(sink, image, sequence, png_path)
+
+        def measure(image: Image.Image) -> InkMeasurement:
+            interrupt_once()
+            return measure_ink(image)
+
+        if step == "normalising":
+            monkeypatch.setattr(spool_module, "_normalise_mode", normalise)
+        elif step == "checking for room":
+            monkeypatch.setattr(SpooledPageSink, "_check_room_for", check_room_for)
+        else:
+            monkeypatch.setattr(spool_module, "measure_ink", measure)
         sink = SpooledPageSink(tmp_path, "a", 0)
 
         with pytest.raises(ScanInterrupted):
             sink.add(_inked_page(), dpi=300)
 
-        assert sink.records == ()
-        assert list(tmp_path.iterdir()) == []
+        assert calls == [step, step]
+        (record,) = sink.records
+        assert record.sequence == 1
+        assert record.path == tmp_path / "a-0001.png"
+        assert record.path.is_file()
+        assert sorted(tmp_path.iterdir()) == [record.path]
+
+    def test_the_page_after_an_interrupted_one_takes_the_next_number(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finishing an interrupted page does not skip or repeat a number."""
+        calls: list[int] = []
+
+        def measure(image: Image.Image) -> InkMeasurement:
+            calls.append(1)
+            if len(calls) == 1:
+                msg = "Interrupted by SIGTERM"
+                raise ScanInterrupted(msg, signum=15)
+            return measure_ink(image)
+
+        monkeypatch.setattr(spool_module, "measure_ink", measure)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(ScanInterrupted):
+            sink.add(_inked_page(), dpi=300)
+
+        second = sink.add(_inked_page(), dpi=300)
+
+        assert [record.sequence for record in sink.records] == [1, 2]
+        assert second.path == tmp_path / "a-0002.png"
