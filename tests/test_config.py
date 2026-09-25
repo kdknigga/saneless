@@ -3716,7 +3716,7 @@ class TestWebConfig:
         )
         assert (
             "  [web] unknown key 'show_tag' (did you mean 'show_tags'?); "
-            "valid keys: show_tags, show_correspondent"
+            "valid keys: show_tags, show_correspondent, allowed_hosts"
         ) in _error_lines(err)
 
     def test_web_config_key_under_wrong_section_says_where_it_belongs(
@@ -3745,6 +3745,111 @@ class TestWebConfig:
         """
         field = Settings.model_fields["web"]
         assert field.default_factory is WebConfig
+
+
+_ALLOWED_HOSTS_RULE = "must be a host name or a .suffix"
+"""The start of the refusal every bad ``allowed_hosts`` entry gets."""
+
+
+class TestWebAllowedHosts:
+    """
+    ``[web] allowed_hosts`` adds names saneless answers to, and nothing else.
+
+    Every entry is an exact name or a leading-dot suffix.  There is no ``*``:
+    one line would reopen DNS rebinding for every name at once.  A port, a
+    scheme or a path is a sign the operator pasted a URL, and is refused at load
+    with a message that names the key and never the value.
+    """
+
+    def test_allowed_hosts_defaults_to_empty(self) -> None:
+        """No extra names are trusted until the operator adds some."""
+        assert WebConfig().allowed_hosts == ()
+
+    def test_allowed_hosts_entries_are_stripped_and_lower_cased(self) -> None:
+        """Entries are compared the way Host is: without case or padding."""
+        web = WebConfig.model_validate(
+            {"allowed_hosts": [" Scan.Example.COM ", ".Home.Example", "nas.lan."]}
+        )
+        assert web.allowed_hosts == ("scan.example.com", ".home.example", "nas.lan")
+
+    def test_allowed_hosts_loads_from_toml(self, tmp_config_dir: Path) -> None:
+        """The TOML form is a list of strings under ``[web]``."""
+        config_file = tmp_config_dir / "allowed.toml"
+        config_file.write_text('[web]\nallowed_hosts = ["scan.example.com"]\n')
+        settings = load_settings(config_path=str(config_file))
+        assert settings.web.allowed_hosts == ("scan.example.com",)
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_allowed_hosts_loads_from_the_environment_as_json(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The environment form is a JSON list."""
+        monkeypatch.setenv(
+            "SANELESS_WEB__ALLOWED_HOSTS", '["scan.example.com", ".home.example"]'
+        )
+        settings = load_settings()
+        assert settings.web.allowed_hosts == ("scan.example.com", ".home.example")
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_a_bare_string_in_the_environment_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare name is not a JSON list, and loads as an error, not a guess."""
+        monkeypatch.setenv("SANELESS_WEB__ALLOWED_HOSTS", "scan.example.com")
+        with pytest.raises(ConfigError):
+            load_settings()
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="blank"),
+            pytest.param("*", id="star"),
+            pytest.param("*.zqmarker.example", id="wildcard"),
+            pytest.param("zqmarker.example:8080", id="port"),
+            pytest.param("http://zqmarker.example", id="scheme"),
+            pytest.param("zqmarker.example/scan", id="path"),
+            pytest.param("user@zqmarker.example", id="userinfo"),
+            pytest.param(".zqmarkercom", id="suffix-of-a-top-level-name"),
+            pytest.param("zqmarker..example", id="empty-label"),
+            pytest.param("zqmarker example", id="inner-space"),
+            pytest.param("zqmärker.example", id="non-ascii"),
+            pytest.param("[::1]", id="bracketed-ipv6"),
+        ],
+    )
+    def test_a_bad_entry_is_refused_without_echoing_it(
+        self, tmp_config_dir: Path, entry: str
+    ) -> None:
+        """A bad entry is a ConfigError naming the key and never the value."""
+        err = _load_error(
+            tmp_config_dir / "bad_allowed.toml",
+            f"[web]\nallowed_hosts = [{_toml_string(entry)}]\n",
+        )
+        line = _only_body_line(err)
+        assert line.startswith("  [web] allowed_hosts: ")
+        assert _ALLOWED_HOSTS_RULE in line
+        assert "zqmarker" not in str(err)
+        assert "zqmärker" not in str(err)
+
+    def test_one_bad_entry_refuses_the_whole_list(self) -> None:
+        """A good entry beside a bad one does not let the list load."""
+        with pytest.raises(ValidationError, match="allowed_hosts"):
+            WebConfig.model_validate({"allowed_hosts": ["scan.example.com", "*"]})
+
+
+def _toml_string(value: str) -> str:
+    """
+    Quote ``value`` as a TOML basic string, escaping what TOML requires.
+
+    Args:
+        value: The raw string.
+
+    Returns:
+        A TOML basic-string literal that parses back to ``value``.
+
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 class TestEverySectionRendersUnknownKeys:

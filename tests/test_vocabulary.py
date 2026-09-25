@@ -977,6 +977,12 @@ _REJECTION_MESSAGES: list[tuple[RequestRejection, str]] = [
         RequestRejection.CLIENT_ERROR,
         "The request could not be completed. Reload the page, then try again.",
     ),
+    (
+        RequestRejection.HOST_NOT_ALLOWED,
+        "saneless does not answer to this address. Add the host name you used "
+        "to [web] allowed_hosts in the saneless config file, then restart "
+        "saneless.",
+    ),
 ]
 
 _REJECTION_STATUS_CODES: list[tuple[RequestRejection, int]] = [
@@ -994,6 +1000,7 @@ _REJECTION_STATUS_CODES: list[tuple[RequestRejection, int]] = [
     (RequestRejection.METHOD_NOT_ALLOWED, 405),
     (RequestRejection.INTERNAL, 500),
     (RequestRejection.CLIENT_ERROR, 400),
+    (RequestRejection.HOST_NOT_ALLOWED, 421),
 ]
 
 _JOB_ROW_TEXTS: list[str] = [
@@ -1026,6 +1033,7 @@ class TestRequestRejection:
             "METHOD_NOT_ALLOWED",
             "INTERNAL",
             "CLIENT_ERROR",
+            "HOST_NOT_ALLOWED",
         }
 
     @pytest.mark.parametrize("rejection", list(RequestRejection))
