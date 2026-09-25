@@ -50,8 +50,10 @@ __all__ = ["JobView", "build_job_view", "owns_detail"]
 # Any web address.  Stored text names paperless-ngx by its configured URL, and
 # a URL from an earlier configuration, or from a library's own message, would
 # slip past a match on the current one; the owner never needs the address, so
-# every one is replaced.
-_URL = re.compile(r"https?://\S+")
+# every one is replaced.  The scheme is matched in any case: it is
+# case-insensitive, and ``paperless.url`` is kept as it was typed, so
+# ``HTTPS://`` is a working setting that reaches the stored text as written.
+_URL = re.compile(r"https?://\S+", re.IGNORECASE)
 
 # Punctuation that ends the sentence around a URL rather than the URL itself,
 # and the quotes and brackets that close around one.  ``\S+`` swallows them,

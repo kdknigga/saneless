@@ -393,6 +393,16 @@ def test_tmp_dir_error_relativised_for_owner_hidden_for_others(
             "Could not reach <paperless.url>.",
             id="https-full-stop",
         ),
+        pytest.param(
+            "Could not reach Paperless at HTTP://{host}:8000: refused",
+            "Could not reach Paperless at <paperless.url>: refused",
+            id="upper-case-scheme",
+        ),
+        pytest.param(
+            "Could not reach Https://{host}.",
+            "Could not reach <paperless.url>.",
+            id="mixed-case-scheme",
+        ),
     ],
 )
 def test_owner_url_scrub_keeps_the_sentence(
