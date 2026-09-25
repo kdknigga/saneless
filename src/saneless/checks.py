@@ -399,8 +399,10 @@ class CheckContext:
     the thing an operator most needs a diagnostic for is the
     machine where the diagnostic would otherwise not run.
 
-    ``paperless=None`` means no usable client could be built at all, which
-    ``PaperlessClient.__init__`` only refuses for a URL httpx2 will not parse.
+    ``paperless=None`` means no usable client could be built at all:
+    ``PaperlessClient.__init__`` refused, for a URL httpx2 will not parse or
+    that carries a user name or password, a token an HTTP header cannot
+    carry, or a TLS trust store it could not read.
 
     ``profile_storage`` is the outcome the worker recorded when it wrote the
     generated profiles, not something re-derived here.  ``doctor`` derives its
@@ -1679,9 +1681,13 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     setting.  ``ConnectionStatus`` is a public JSON contract, so the unset URL
     gets its own row here rather than a sixth status.
 
-    A ``None`` client means one could not be constructed, and the only way
-    ``PaperlessClient.__init__`` refuses is a URL httpx2 will not parse -- which
-    is the "not found at that URL" row, not a sixth sentence.
+    A ``None`` client means one could not be constructed.
+    ``PaperlessClient.__init__`` refuses a URL httpx2 will not parse or that
+    carries a user name or password, a token an HTTP header cannot carry, and
+    a TLS trust store it cannot read; every one of them is shown as the "not
+    found at that URL" row, not a sixth sentence.  Load-time validation of
+    ``paperless.url`` and ``paperless.token`` rejects the first three before a
+    client is ever built, so in practice the row is reached by the last.
 
     Args:
         context: The injected dependencies and configuration.
