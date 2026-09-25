@@ -25,8 +25,9 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
-import saneless.workspace as workspace_mod
 from PIL import Image
+
+import saneless.workspace as workspace_mod
 from saneless.workspace import (
     LOCK_FILE_NAME,
     METADATA_FILE_NAME,
