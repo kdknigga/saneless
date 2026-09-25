@@ -128,6 +128,28 @@ def client(app: FastAPI, mock_paperless: object) -> Iterator[TestClient]:
         yield tc
 
 
+# The owner token a test hands its client when the rows it stages should render
+# as their owner sees them.  A job's title, preview and detail text reach only
+# the browser that started it; every other browser, and every browser for a row
+# that recorded no owner, sees the generic title instead.
+_VIEWER_TOKEN = "tok-owner"
+
+
+def _as_owner(client: TestClient) -> str:
+    """
+    Make the client present ``_VIEWER_TOKEN``, and return it to record on rows.
+
+    Args:
+        client: The browser that should see its rows in full.
+
+    Returns:
+        The token, for ``create_job(owner_token=...)``.
+
+    """
+    client.cookies.set(routes_module.OWNER_COOKIE, _VIEWER_TOKEN)
+    return _VIEWER_TOKEN
+
+
 def test_page_loads(client: TestClient) -> None:
     """GET / returns 200 with form elements (UI-01)."""
     response = client.get("/")
@@ -390,9 +412,11 @@ def test_flip_prompt(client: TestClient) -> None:
 
 
 def test_thumbnail_display(client: TestClient) -> None:
-    """Job with thumbnail shows base64 img tag (UI-04)."""
+    """The owner's job with a thumbnail shows the base64 img tag (UI-04)."""
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title="Thumb Test")
+    job = job_store.create_job(
+        profile="default", title="Thumb Test", owner_token=_as_owner(client)
+    )
     job_store.update_thumbnail(job.id, "dGVzdA==")
     job_store.update_state(job.id, JobState.SCANNING)
     _app(client).state.worker._current_job_id = job.id
@@ -402,11 +426,12 @@ def test_thumbnail_display(client: TestClient) -> None:
 
 
 def test_job_history(client: TestClient) -> None:
-    """GET /api/jobs/history returns job list (UI-05)."""
+    """GET /api/jobs/history returns the owner's jobs by title (UI-05)."""
     job_store: JobStore = _app(client).state.job_store
     titles = ["Job Alpha", "Job Beta", "Job Gamma"]
+    owner = _as_owner(client)
     for title in titles:
-        job_store.create_job(profile="default", title=title)
+        job_store.create_job(profile="default", title=title, owner_token=owner)
 
     response = client.get("/api/jobs/history")
     assert response.status_code == 200
@@ -415,9 +440,11 @@ def test_job_history(client: TestClient) -> None:
 
 
 def test_error_display(client: TestClient) -> None:
-    """Error state shows error message in status area (LOG-03)."""
+    """Error state shows the owner its error message in status area (LOG-03)."""
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title="Error Test")
+    job = job_store.create_job(
+        profile="default", title="Error Test", owner_token=_as_owner(client)
+    )
     job_store.update_state(job.id, JobState.ERROR, error="Scanner disconnected")
     _app(client).state.worker._current_job_id = job.id
 
@@ -479,7 +506,9 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     app = _app(client)
     job_store: JobStore = app.state.job_store
     worker = app.state.worker
-    job = job_store.create_job(profile="default", title="Running Job")
+    job = job_store.create_job(
+        profile="default", title="Running Job", owner_token=_as_owner(client)
+    )
     job_store.update_state(job.id, JobState.SCANNING)
     worker._current_job_id = job.id
     monkeypatch.setattr(worker, "submit", lambda _job: SubmitResult.QUEUE_FULL)
@@ -502,7 +531,9 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     page = client.get("/").text
     assert "Done: Running Job" in _status_area(page)
     assert QUEUE_FULL_JOB_ERROR not in _status_area(page)
-    # History still lists the rejected attempt (D-05).
+    # History still lists the rejected attempt (D-05).  A submit refused after
+    # its row was written keeps the token it was written with, so the browser
+    # that sent it still sees its title.
     assert "Refused Scan" in page
 
 
@@ -547,7 +578,9 @@ def test_flip_continue(client: TestClient) -> None:
     the idle copy for a job that plainly exists.
     """
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="duplex", title="Flip Just Finished")
+    job = job_store.create_job(
+        profile="duplex", title="Flip Just Finished", owner_token=_as_owner(client)
+    )
     job_store.finish_job(job.id, JobState.DONE)
     assert _app(client).state.worker.current_job_id is None
 
@@ -566,7 +599,9 @@ def test_flip_abort(client: TestClient) -> None:
     would say "Ready to scan." while the job that timed out sits in history.
     """
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="duplex", title="Flip Timed Out")
+    job = job_store.create_job(
+        profile="duplex", title="Flip Timed Out", owner_token=_as_owner(client)
+    )
     job_store.finish_job(
         job.id,
         JobState.ERROR,
@@ -1443,20 +1478,23 @@ def _displayed(markup: str) -> str:
     return html.unescape(markup)
 
 
-def _running_job(client: TestClient, title: str) -> str:
+def _running_job(
+    client: TestClient, title: str, *, owner_token: str | None = None
+) -> str:
     """
     Create a SCANNING job and make it the worker's current job.
 
     Args:
         client: The client whose app owns the store and worker.
         title: The document title to give it.
+        owner_token: The token to record, or None for a row nobody owns.
 
     Returns:
         The job's id.
 
     """
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title=title)
+    job = job_store.create_job(profile="default", title=title, owner_token=owner_token)
     job_store.update_state(job.id, JobState.SCANNING)
     _app(client).state.worker._current_job_id = job.id
     return job.id
@@ -1490,9 +1528,12 @@ class TestFollowedJob:
         self, client: TestClient
     ) -> None:
         """The named job is rendered whatever the worker happens to be running."""
-        _running_job(client, "Someone Elses Scan")
+        owner = _as_owner(client)
+        _running_job(client, "Someone Elses Scan", owner_token=owner)
         job_store: JobStore = _app(client).state.job_store
-        mine = job_store.create_job(profile="default", title="My Scan")
+        mine = job_store.create_job(
+            profile="default", title="My Scan", owner_token=owner
+        )
         job_store.finish_job(mine.id, JobState.DONE)
 
         response = client.get(f"/api/jobs/{mine.id}/status")
@@ -1577,8 +1618,8 @@ class TestQueueLine:
     def test_queue_line_names_the_running_job_and_the_count(
         self, client: TestClient
     ) -> None:
-        """One job ahead reads as APPL-08 writes it."""
-        _running_job(client, "Tax return")
+        """One job ahead reads as APPL-08 writes it, to the running job's owner."""
+        _running_job(client, "Tax return", owner_token=_as_owner(client))
         _queued_job(client, "Ahead Of Me")
         mine = _queued_job(client, "Mine")
 
@@ -1592,7 +1633,7 @@ class TestQueueLine:
         self, client: TestClient
     ) -> None:
         """The last job in the queue is told it is next, not that zero wait."""
-        _running_job(client, "Tax return")
+        _running_job(client, "Tax return", owner_token=_as_owner(client))
         mine = _queued_job(client, "Mine")
 
         response = client.get(f"/api/jobs/{mine}/status")
@@ -1628,7 +1669,7 @@ class TestQueueLine:
 
     def test_queue_line_escapes_the_running_title(self, client: TestClient) -> None:
         """The title is user data and is autoescaped, never injected (T-30-62)."""
-        _running_job(client, "<script>alert(1)</script>")
+        _running_job(client, "<script>alert(1)</script>", owner_token=_as_owner(client))
         mine = _queued_job(client, "Mine")
 
         response = client.get(f"/api/jobs/{mine}/status")

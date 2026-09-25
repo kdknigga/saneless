@@ -103,6 +103,13 @@ _LOG_FILE_NAME = "render-test-do-not-render-me.log"
 # main path renders. REJECTED is avoided because D-06 gives it its own routing.
 _DEFAULT_ERROR_CATEGORY = ErrorCategory.SCANNER
 
+# The browser the rendering tests look through, and the owner every row they
+# stage records.  A job's title, preview and detail text reach only the
+# browser that started it, so a rendering test that means to see them has to
+# be that browser; the tests about what anyone else sees name their own
+# tokens below.
+_RENDERING_BROWSER = "the-browser-these-rows-were-rendered-for"
+
 # The templates and the stylesheet, located the way the app locates them, so a
 # moved package cannot make a source assertion pass on an empty file.
 _PACKAGE_DIR = Path(app_module.__file__).parent
@@ -177,8 +184,14 @@ def _make_app(
 
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[TestClient]:
-    """TestClient over a real app with a stub scanner and no network calls."""
+    """
+    TestClient over a real app with a stub scanner and no network calls.
+
+    It presents the owner token every row this module stages records, so the
+    status area and history render each row as its owner sees it.
+    """
     with TestClient(_make_app(tmp_path)) as tc:
+        tc.cookies.set(_OWNER_COOKIE, _RENDERING_BROWSER)
         yield tc
 
 
@@ -264,7 +277,9 @@ def _job_in_state(
 
     """
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title="Render Test")
+    job = job_store.create_job(
+        profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
+    )
     job_store.update_state(
         job.id, state, error="disk on fire", error_category=error_category
     )
@@ -528,7 +543,9 @@ class TestStatusAreaError:
         so the property is pinned here as it already is for ``job.warning``.
         """
         job_store: JobStore = _app(client).state.job_store
-        job = job_store.create_job(profile="default", title="Render Test")
+        job = job_store.create_job(
+            profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
+        )
         job_store.update_state(
             job.id,
             JobState.ERROR,
@@ -1008,7 +1025,9 @@ def _finished_job(
 
     """
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title="Render Test")
+    job = job_store.create_job(
+        profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
+    )
     job_store.finish_job(
         job.id,
         state,
@@ -1099,7 +1118,9 @@ class TestPageCounts:
     ) -> None:
         """Under FALLBACK the counts read after the warning, not between it and the outcome."""
         job_store: JobStore = _app(client).state.job_store
-        job = job_store.create_job(profile="default", title="Render Test")
+        job = job_store.create_job(
+            profile="default", title="Render Test", owner_token=_RENDERING_BROWSER
+        )
         job_store.finish_job(
             job.id,
             JobState.FALLBACK,
@@ -1395,8 +1416,7 @@ _OWNER_COOKIE = "saneless_owner"
 _OWNING_BROWSER = "the-browser-that-submitted-this-stack"
 
 # A base64 payload that is not a real JPEG.  Nothing decodes it: it exists so
-# both renderings carry an identical `<img>` for the identical-content
-# assertion to have something after the flip block to compare.
+# the owner's rendering carries an `<img>` that every other browser's lacks.
 _THUMBNAIL = "c3RhbmQtaW4="
 
 # The exact confirmation D-27 locks: one question, one consequence, and no
@@ -1448,7 +1468,8 @@ def _as_browser(client: TestClient, token: str | None) -> str:
 
     The cookie is set as a header rather than through the client's jar so one
     client can stand in for two browsers without the jar carrying state from
-    one request into the next.
+    one request into the next.  The jar is emptied first, so the module's
+    rendering token is not sent alongside and "no token" means none.
 
     Args:
         client: The client to request through.
@@ -1458,6 +1479,7 @@ def _as_browser(client: TestClient, token: str | None) -> str:
         The rendered response body.
 
     """
+    client.cookies.clear()
     headers = {} if token is None else {"Cookie": f"{_OWNER_COOKIE}={token}"}
     response = client.get("/api/jobs/current/status", headers=headers)
     assert response.status_code == 200
@@ -1466,33 +1488,36 @@ def _as_browser(client: TestClient, token: str | None) -> str:
 
 def _around_the_flip_block(markup: str) -> tuple[str, str]:
     """
-    Split the markup into what precedes and what follows the flip branch.
+    Return the parts of the markup the owner gate must not change.
 
-    The branch's output is the only thing the owner gate may change, so
-    everything on either side of it -- the status area's opening tag with its
-    poll attributes, the thumbnail, and the out-of-band Scan button -- must be
-    identical for both viewers.
+    The token gates the flip branch's controls, and through the job view the
+    title, preview and detail text.  What is left -- the status area's opening
+    tag with its poll attributes, and the out-of-band Scan button -- is the
+    same for every viewer, so the appliance reads as equally busy to all.
 
     Args:
         markup: The rendered response body.
 
     Returns:
-        The status area's opening tag, and everything from the thumbnail on.
+        The status area's opening tag, and the Scan button.
 
     """
     opening = _STATUS_OPEN.search(markup)
     assert opening is not None
-    thumbnail_at = markup.index(_THUMBNAIL_START)
-    return opening.group(0), markup[thumbnail_at:]
+    button = _SCAN_BUTTON.search(markup)
+    assert button is not None
+    return opening.group(0), button.group(0)
 
 
 class TestOwnerGatedFlipPrompt:
     """
     Who sees the Continue and Abort buttons, and what everyone else sees.
 
-    APPL-09 and D-24: the token gates those two buttons and nothing else.  The
-    gate is server-side -- the buttons are not rendered for a non-owner, never
-    hidden with CSS, which would be an ASVS V4 failure.
+    APPL-09 and D-24: the token gates those two buttons.  The gate is
+    server-side -- the buttons are not rendered for a non-owner, never hidden
+    with CSS, which would be an ASVS V4 failure.  The same token also gates the
+    job's preview, through the job view, while the poll and the Scan button
+    stay the same for everyone.
     """
 
     def test_owner_sees_the_flip_prompt_with_both_buttons(
@@ -1538,16 +1563,18 @@ class TestOwnerGatedFlipPrompt:
         assert f'<p aria-busy="true">{_NON_OWNER_LINE}</p>' in markup
         assert markup.count('hx-post="/api/flip/') == 0
 
-    def test_owner_and_non_owner_see_identical_markup_around_the_flip_block(
+    def test_owner_and_non_owner_share_the_poll_and_button_but_not_the_preview(
         self, client: TestClient
     ) -> None:
-        """Only the flip block differs: state, poll, thumbnail and button match."""
+        """The poll and the Scan button match; the controls and preview are the owner's."""
         _flip_job(client, _OWNING_BROWSER)
 
         owner = _as_browser(client, _OWNING_BROWSER)
         other = _as_browser(client, None)
 
         assert _around_the_flip_block(owner) == _around_the_flip_block(other)
+        assert f"{_THUMBNAIL_START}{_THUMBNAIL}" in owner
+        assert _THUMBNAIL_START not in other
 
     def test_unowned_flip_job_renders_the_prompt_for_everyone(
         self, client: TestClient
@@ -1729,7 +1756,9 @@ def _done_job_that_is_not_current(client: TestClient, title: str) -> str:
 
     """
     job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title=title)
+    job = job_store.create_job(
+        profile="default", title=title, owner_token=_RENDERING_BROWSER
+    )
     job_store.update_state(job.id, JobState.DONE)
     return job.id
 

@@ -26,11 +26,14 @@
          The second arm is the owner gate.  The decision is made
          on the server and the two buttons are simply not emitted for anybody
          else; hiding them with CSS would be an ASVS V4 failure and is
-         forbidden.  Everything else about the two renderings is identical --
-         state, title, counts, thumbnail, errors -- because the token gates the
-         controls and nothing else.  A NULL owner token means unowned, and the
-         prompt then renders for everyone, so a manual-duplex job in flight
-         across an upgrade is still answerable.
+         forbidden.  The owner token gates two things, by two rules.  It gates
+         these controls through is_owner, where a NULL owner token means
+         unowned and the prompt renders for everyone, so a manual-duplex job in
+         flight across an upgrade is still answerable.  And, through the job
+         view this template is handed, it gates the title, thumbnail and
+         detail text, where a NULL owner token means nobody's: every browser
+         sees the generic title and no preview for such a job, even while it
+         may press Continue.  State and counts are the same for everyone.
 
          There is deliberately no third control here and no second timer.
          Somebody who closed the tab is the same case as somebody who walked away,
@@ -107,9 +110,14 @@
          sentence would be a regression, so job.error is still rendered -- inside
          the disclosure.  The category sentence and the next step are *added*.
 
-         The log file path is deliberately absent.  It is a host filesystem
-         path and this page is visible to the whole LAN, so the disclosure carries
-         only job.error, the category and the job id and nothing else.
+         No host path reaches this page, and the log file path is deliberately
+         absent.  This page is visible to the whole LAN, so the disclosure
+         carries only job.error, the category and the job id -- and job.error
+         here is already path-free.  The job is a view built on the server:
+         for the browser that started the scan, its text names every host
+         directory and web address by the setting that holds it, so a kept
+         file reads failed/<file>.pdf; for everyone else it is a fixed
+         sentence saying where the full text is.
 
          A NULL error_category is a row written before categories were
          recorded.  It renders today's shape verbatim: substituting UNKNOWN would

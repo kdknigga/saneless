@@ -428,9 +428,16 @@ def test_web_consume_folder_fallback_is_reported(
     assert run.recorder.issued == []
     assert run.recorder.polls() == []
     assert len(list((tmp_path / "consume").glob("*.pdf"))) == 1
+    # The browser that submitted the scan is shown its warning with the host
+    # folder named by the setting that holds it: no web page carries a host
+    # path, and the full text stays in the log and in `saneless jobs`.
+    consume = str(tmp_path / "consume")
+    shown = run.job.warning.replace(consume, "<paperless.consume_dir>")
+    assert shown != run.job.warning
     for page in (run.status_html, run.index_html):
         assert _FALLBACK_LINE in page
-        assert run.job.warning in page
+        assert shown in page
+        assert consume not in page
         assert _DONE_LINE not in page
         assert _WARNED_LINE not in page
     assert re.search(

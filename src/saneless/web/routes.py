@@ -36,6 +36,7 @@ from saneless.job import WEB_HISTORY_LIMIT
 from saneless.scanner.base import SourceKind, classify_source
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
+    HIDDEN_JOB_TITLE,
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
     SCAN_BLOCKED_URL_REASON,
@@ -55,6 +56,7 @@ from saneless.vocabulary import (
     worker_health_detail,
 )
 from saneless.web.errors import RequestRejected
+from saneless.web.job_view import build_job_view, owns_detail
 
 if TYPE_CHECKING:
     from starlette.datastructures import State
@@ -64,6 +66,7 @@ if TYPE_CHECKING:
     from saneless.paperless import PaperlessClient
     from saneless.web.cache import MetadataCache
     from saneless.web.checks_cache import CachedChecks
+    from saneless.web.job_view import JobView
     from saneless.worker import ScanWorker
 
 __all__ = ["router"]
@@ -661,7 +664,13 @@ def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | Non
     return job
 
 
-def _busy_line(worker: ScanWorker, job_store: JobStore, job: Job | None) -> str | None:
+def _busy_line(
+    worker: ScanWorker,
+    job_store: JobStore,
+    job: Job | None,
+    *,
+    presented: str | None,
+) -> str | None:
     """
     Compose the one line the status area shows while the rendered job works.
 
@@ -681,10 +690,16 @@ def _busy_line(worker: ScanWorker, job_store: JobStore, job: Job | None) -> str 
     bug.  That rule lives in ``vocabulary.busy_line``, so this
     function passes the count through and does not restate it.
 
+    The queued line names a job other than the one being rendered, so it is
+    gated on its own: the running job's title reaches only the browser that
+    started the running job, by the same rule ``build_job_view`` applies, and
+    everyone else waits for the generic title.
+
     Args:
         worker: The scan worker, for the job in flight and its front count.
         job_store: The job store, for the running job's title and the position.
         job: The job being rendered, or None when nothing has ever run.
+        presented: The owner token this request carries, or None.
 
     Returns:
         One line of plain text, or None when there is no job to describe.
@@ -697,7 +712,12 @@ def _busy_line(worker: ScanWorker, job_store: JobStore, job: Job | None) -> str 
         running = job_store.get_job(running_id) if running_id else None
         ahead = job_store.queue_position(job.id)
         if running is not None and ahead is not None:
-            return busy_line(job.state, queue_title=running.title, queue_ahead=ahead)
+            title = (
+                running.title
+                if owns_detail(presented, running.owner_token)
+                else HIDDEN_JOB_TITLE
+            )
+            return busy_line(job.state, queue_title=title, queue_ahead=ahead)
     if job.id == running_id and job.state is JobState.SCANNING_REVERSE:
         return busy_line(job.state, front_pages=worker.front_pages)
     return busy_line(job.state)
@@ -718,8 +738,13 @@ class _StatusFacts:
     which is what stops a route added later from acquiring or losing a fact by
     forgetting about it -- the same discipline ``refresh_checks`` and
     ``is_owner`` already follow.
+
+    ``settings`` is the running configuration, carried so ``_status_context``
+    can build the job's view: which host paths the owner's text names by
+    setting is read from it.
     """
 
+    settings: Settings
     claimed: tuple[str, FlipOutcome] | None = None
     followed_job_id: str | None = None
     owner_token: str | None = None
@@ -763,6 +788,7 @@ def _status_facts(
     """
     settings = request.app.state.settings
     return _StatusFacts(
+        settings=settings,
         claimed=claimed,
         followed_job_id=followed_job_id,
         owner_token=_presented_owner(request),
@@ -780,7 +806,14 @@ def _status_context(
 
     The job comes from ``_current_or_recent_job``, and the store's recorded
     state still selects the branch the partial renders, so no route asserts a
-    state the store has not recorded.  What this adds is ``flip_answer``: for a
+    state the store has not recorded.  It reaches the partial as a
+    ``JobView``, never the stored row: whether this browser sees the title,
+    the preview and the error and warning text, and in what form, is decided
+    in ``build_job_view``, once, from the token the request presents.  Every
+    status response -- the page, both polls, both flip answers and the scan
+    submit -- goes through here, so none can render more than the view holds.
+
+    What this adds is ``flip_answer``: for a
     job the store still reads as ``AWAITING_FLIP``, whether its flip wait has
     already been answered, and with what.  That is a fact the worker genuinely
     holds, and it lets the partial acknowledge the answer instead of
@@ -817,7 +850,9 @@ def _status_context(
     same reason ``refresh_checks`` is: a route added later must not be able to
     acquire or lose the gate by forgetting about it.  The partial reads the
     flag and never the token, so the value itself has no path into the
-    markup.
+    markup.  It is computed from the stored row with ``_is_owner``, not from
+    the view's rule: a job that recorded no owner may be answered by anyone,
+    while its title and preview are nobody's.
 
     ``scan_blocked`` rides along for the same reason again, and it is why every
     out-of-band ``#scan-btn`` -- the scan submit's own response, both status
@@ -830,9 +865,10 @@ def _status_context(
     fed from one builder, not that each caller remembered.
 
     Returns:
-        The job, its flip answer, the followed job's id, the one busy line,
-        whether this viewer owns the job, whether the Scan button is blocked
-        and a false strip-refresh flag.  ``flip_answer`` is None unless the
+        This viewer's view of the job, its flip answer, the followed job's id,
+        the one busy line, whether this viewer may answer the job's flip
+        prompt, whether the Scan button is blocked and a false strip-refresh
+        flag.  ``flip_answer`` is None unless the
         rendered job is ``AWAITING_FLIP`` and has been answered.
 
     """
@@ -848,12 +884,17 @@ def _status_context(
             answer = facts.claimed[1]
         else:
             answer = worker.flip_answer(job.id)
+    view = (
+        build_job_view(job, presented=facts.owner_token, settings=facts.settings)
+        if job is not None
+        else None
+    )
     return {
-        "job": job,
+        "job": view,
         "flip_answer": answer,
         "refresh_checks": False,
         "followed_job_id": followed.id if followed is not None else None,
-        "busy_line": _busy_line(worker, job_store, job),
+        "busy_line": _busy_line(worker, job_store, job, presented=facts.owner_token),
         "is_owner": job is not None and _is_owner(facts.owner_token, job.owner_token),
         "scan_blocked": facts.scan_blocked,
     }
@@ -939,6 +980,33 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
     return tuple(option for option, _ in entries)
 
 
+def _history_views(request: Request) -> list[JobView]:
+    """
+    Return the Job History rows as the browser making this request may see them.
+
+    One view per row, each decided by ``build_job_view`` from the token this
+    request presents: a row this browser started keeps its real title, and
+    every other row -- another browser's, or one that recorded no owner --
+    shows the generic title.  Time, profile, outcome and page counts are the
+    same for every viewer, so the table still shows the appliance is in use.
+    The full page and ``GET /api/jobs/history`` both read the rows here, so
+    the two cannot disagree about what a browser is shown.
+
+    Args:
+        request: The incoming request, for its owner token and the settings.
+
+    Returns:
+        The most recent jobs, newest first, as this browser's views.
+
+    """
+    state = request.app.state
+    presented = _presented_owner(request)
+    return [
+        build_job_view(job, presented=presented, settings=state.settings)
+        for job in state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
+    ]
+
+
 @router.get("/")
 def index(request: Request) -> Response:
     """
@@ -974,7 +1042,7 @@ def index(request: Request) -> Response:
     status = _status_context(state.worker, state.job_store, _status_facts(request))
     block = _scan_block(state.settings)
 
-    jobs = state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
+    jobs = _history_views(request)
 
     return state.templates.TemplateResponse(
         request,
@@ -1903,14 +1971,13 @@ def job_history(request: Request) -> Response:
     Fetch the job history table body.
 
     Returns the history partial with the most recent jobs for
-    HTMX swap into the history table.
+    HTMX swap into the history table, each one as this browser may see it.
     """
     state = request.app.state
-    jobs = state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
     return state.templates.TemplateResponse(
         request,
         "partials/history.html",
-        {"jobs": jobs},
+        {"jobs": _history_views(request)},
     )
 
 

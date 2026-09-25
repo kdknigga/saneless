@@ -40,6 +40,7 @@ from saneless.config import (
 )
 from saneless.job import REJECTED_HISTORY_ROWS
 from saneless.vocabulary import (
+    HIDDEN_JOB_TITLE,
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
@@ -1528,7 +1529,10 @@ class TestPlaceholderTokenRefusal:
 
         Asserted through the history route rather than the store alone,
         because "history shows the attempt" is a claim about the page a
-        household member actually looks at.
+        household member actually looks at.  A submit refused before its row
+        existed records no owner, so the row is nobody's and even the browser
+        that sent it sees the generic title; the refusal itself was shown to
+        that browser in the submit response.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER
@@ -1539,7 +1543,8 @@ class TestPlaceholderTokenRefusal:
                 headers=HTMX_HEADERS,
             )
             history = client.get("/api/jobs/history").text
-            assert "Refused In History" in history
+            assert HIDDEN_JOB_TITLE in history
+            assert "Refused In History" not in history
             assert '<td class="status-error">' in history
             _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
 

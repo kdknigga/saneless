@@ -64,6 +64,10 @@ _INCREMENTAL = 2
 # elsewhere on the page cannot satisfy or break the assertion.
 _STATUS_AREA = re.compile(r'<div id="status-area"(?P<attrs>[^>]*)>')
 
+# The owner token the crashed process's rows record, so a browser presenting it
+# is shown their text: a job's detail reaches only the browser that started it.
+_SEEDING_BROWSER = "the-browser-that-started-the-crashed-jobs"
+
 
 @dataclass(frozen=True)
 class _Seeded:
@@ -108,12 +112,20 @@ def _seed_crashed_store(settings: Settings) -> _Seeded:
     """
     store = JobStore(db_path=settings.output.db_path)
     try:
-        done = store.create_job("default", "finished before the crash")
+        done = store.create_job(
+            "default", "finished before the crash", owner_token=_SEEDING_BROWSER
+        )
         store.finish_job(done.id, JobState.DONE)
-        pending = store.create_job("default", "queued when the process died")
-        flip = store.create_job("default", "waiting at the flip prompt")
+        pending = store.create_job(
+            "default", "queued when the process died", owner_token=_SEEDING_BROWSER
+        )
+        flip = store.create_job(
+            "default", "waiting at the flip prompt", owner_token=_SEEDING_BROWSER
+        )
         store.update_state(flip.id, JobState.AWAITING_FLIP)
-        scanning = store.create_job("default", "mid-scan when the process died")
+        scanning = store.create_job(
+            "default", "mid-scan when the process died", owner_token=_SEEDING_BROWSER
+        )
         store.update_state(scanning.id, JobState.SCANNING)
     finally:
         store.close()
@@ -163,6 +175,7 @@ def test_recovered_row_is_what_the_status_area_shows(settings: Settings) -> None
     _seed_crashed_store(settings)
     app = _build_app(settings)
     with TestClient(app) as client:
+        client.cookies.set("saneless_owner", _SEEDING_BROWSER)
         response = client.get("/")
     assert response.status_code == 200
     assert f"&#10007; Error: {RESTART_REASON}" in response.text
