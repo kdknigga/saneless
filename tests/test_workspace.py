@@ -314,9 +314,9 @@ class TestJobWorkspaceCleanup:
         with pytest.raises(RuntimeError) as caught:
             _raise_inside(scratch, error, seen)
         assert caught.value is error
-        assert seen[0].exists()
+        assert (scratch / f"leftover-{seen[0].name}").is_dir()
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1
+        assert len(warnings) == 2
 
     def test_removal_failure_after_success_is_only_logged(
         self,
@@ -336,9 +336,60 @@ class TestJobWorkspaceCleanup:
         ) as path:
             pass
         monkeypatch.undo()
-        assert path.exists()
-        assert _lock_is_free(path)
-        assert [r.levelno for r in caplog.records] == [logging.WARNING]
+        leftover = scratch / f"leftover-{path.name}"
+        assert leftover.is_dir()
+        assert _lock_is_free(leftover)
+        assert [r.levelno for r in caplog.records] == [logging.WARNING] * 2
+
+    def test_what_a_delivered_run_left_is_never_recovered(
+        self, scratch: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A workspace that could not be removed is not a killed scan.
+
+        Its document was delivered, so a sweep that took it for an
+        interrupted scan would file the same pages in failed/ and invite the
+        operator to upload them a second time.
+        """
+
+        def failing_rmtree(path: object, *args: object, **kwargs: object) -> None:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+        monkeypatch.setattr(workspace_mod.shutil, "rmtree", failing_rmtree)
+        with JobWorkspace(
+            scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE
+        ) as path:
+            (path / SPOOL_DIR_NAME / "a-0001.png").write_bytes(b"page")
+        monkeypatch.undo()
+        failed_dir = scratch.parent / "failed"
+
+        assert find_orphans(scratch) == []
+        assert sweep_orphans(scratch, failed_dir, 0) == []
+        assert not failed_dir.exists()
+
+    def test_a_workspace_that_cannot_be_renamed_loses_its_lock_file(
+        self, scratch: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failing the rename too, the lock file goes, and a sweep skips it."""
+
+        def failing_rmtree(path: object, *args: object, **kwargs: object) -> None:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+        def failing_rename(self: Path, target: object) -> Path:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+        monkeypatch.setattr(workspace_mod.shutil, "rmtree", failing_rmtree)
+        with JobWorkspace(
+            scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE
+        ) as path:
+            (path / SPOOL_DIR_NAME / "a-0001.png").write_bytes(b"page")
+            # Only now: entering the workspace renames it into place.
+            monkeypatch.setattr(workspace_mod.Path, "rename", failing_rename)
+        monkeypatch.undo()
+
+        assert path.is_dir()
+        assert not (path / LOCK_FILE_NAME).exists()
+        assert find_orphans(scratch) == []
 
     def test_a_kept_workspace_stays_with_its_lock_released(
         self, scratch: Path, caplog: pytest.LogCaptureFixture

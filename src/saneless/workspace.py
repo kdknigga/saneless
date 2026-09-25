@@ -99,6 +99,10 @@ RECOVERED_TITLE: Final = "Recovered scan"
 
 _STAGING_PREFIX: Final = ".new-"
 
+# The name prefix a finished workspace is given when it cannot be removed, so
+# that no sweep mistakes what is left of it for a killed scan.
+_LEFTOVER_PREFIX: Final = "leftover-"
+
 # The name prefix of a workspace whose lock could not be taken.  Never
 # ``job-``: nothing would prove its owner alive, so a sweeper whose own lock
 # attempt succeeded -- a lock manager that recovered, another mount of the same
@@ -185,7 +189,7 @@ def _write_metadata(directory: Path, metadata: dict[str, str]) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def _remove_quietly(path: Path, what: str) -> None:
+def _remove_quietly(path: Path, what: str) -> bool:
     """
     Remove the directory tree ``path``, logging a failure instead of raising.
 
@@ -193,11 +197,58 @@ def _remove_quietly(path: Path, what: str) -> None:
         path: The directory to remove.
         what: How to describe it in the log line.
 
+    Returns:
+        Whether the tree is gone.
+
     """
     try:
         shutil.rmtree(path)
     except OSError:
         logger.warning("Could not remove %s %s", what, path, exc_info=True)
+        return False
+    return True
+
+
+def _remove_or_retire(path: Path, what: str) -> None:
+    """
+    Remove a workspace nothing in which still needs keeping, or hide it.
+
+    The run that owned it is over: its document was delivered, its pages were
+    kept in ``failed/``, or it was cancelled.  If the removal fails, what is
+    left must not look like a killed scan, or the next sweep would file the
+    delivered document's pages in ``failed/`` as an interrupted scan.  So,
+    while the caller still holds its lock, it is renamed out of the ``job-``
+    names every sweep looks at; failing that, its lock file is removed, and
+    a sweep skips a workspace with no lock file.
+
+    Args:
+        path: The workspace directory.
+        what: How to describe it in the log line.
+
+    """
+    if _remove_quietly(path, what):
+        return
+    retired = path.with_name(f"{_LEFTOVER_PREFIX}{path.name}")
+    try:
+        path.rename(retired)
+    except FileNotFoundError:
+        return
+    except OSError:
+        try:
+            (path / LOCK_FILE_NAME).unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Could not stop the next sweep taking %s for an interrupted scan",
+                path,
+                exc_info=True,
+            )
+            return
+        retired = path
+    logger.warning(
+        "%s holds nothing that still needs keeping, and no sweep will take it "
+        "for an interrupted scan; delete it by hand",
+        retired,
+    )
 
 
 class JobWorkspace:
@@ -208,7 +259,8 @@ class JobWorkspace:
     ``spool`` subdirectory, lock and metadata) and returns its path; leaving
     removes it, however the block ends -- unless :meth:`keep` was called. A
     removal failure is logged at WARNING and never replaces the exception the
-    block raised.
+    block raised; what is left is renamed ``leftover-*``, out of every sweep's
+    sight, because nothing in it still needs keeping.
 
     The caller is responsible for ``tmp_dir`` itself: it must exist and be
     private (``private_dirs.ensure_private_dir``).
@@ -354,7 +406,7 @@ class JobWorkspace:
                     else "no sweep recovers an unlocked workspace",
                 )
             elif path is not None:
-                _remove_quietly(path, "the job workspace")
+                _remove_or_retire(path, "the job workspace")
         finally:
             self._close_lock()
 
@@ -876,7 +928,7 @@ def _recover_orphan(
         sentence or "it held no page that could be kept",
     )
     if kept_everything:
-        _remove_quietly(orphan.path, "the recovered job workspace")
+        _remove_or_retire(orphan.path, "the recovered job workspace")
     else:
         logger.warning(
             "Leaving %s in place: some of its pages could not be kept, and the "
