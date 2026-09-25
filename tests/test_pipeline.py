@@ -1225,12 +1225,18 @@ class TestFlipCoordinatorContract:
         assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
 
-    def test_abort_cause_adds_no_fourth_flip_outcome(self) -> None:
-        """The cause travels beside the outcome, never as a new member (D-09)."""
+    def test_abort_cause_adds_no_flip_outcome_of_its_own(self) -> None:
+        """
+        The cause travels beside the outcome, never as a new member (D-09).
+
+        The fourth member is a server stop, which is a different ending, not a
+        broken prompt: this used to pin exactly three members.
+        """
         assert set(FlipOutcome) == {
             FlipOutcome.CONTINUED,
             FlipOutcome.ABORTED,
             FlipOutcome.TIMED_OUT,
+            FlipOutcome.INTERRUPTED,
         }
 
 
@@ -1846,6 +1852,95 @@ class TestManualDuplex:
         assert "17" in failure_text(excinfo.value)
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
+
+    def test_a_server_stop_at_the_flip_keeps_the_fronts(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        INTERRUPTED is an interruption: the run raises ScanInterrupted and keeps.
+
+        A server stop is nobody's decision to throw the scan away, so unlike
+        an Abort it keeps pass A's fronts.  ``signum`` is ``None`` because no
+        signal was involved, and the failure text names the kept PDF.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Stopped At The Flip",
+            job_id="job-server-stop",
+            flip_coordinator=_FixedFlipCoordinator(FlipOutcome.INTERRUPTED),
+        )
+
+        with pytest.raises(ScanInterrupted) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert excinfo.value.signum is None
+        preserved = sorted(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "fronts" in preserved[0].name
+        text = failure_text(excinfo.value)
+        assert "preserved at " in text
+        assert preserved[0].name in text
+        assert scanner.scan_pages.call_count == 1
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_the_preserving_event_is_set_only_while_pages_are_kept(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A stopping server can tell that a failed run's pages are still moving.
+
+        ``PipelineRequest.preserving`` is set before the guard starts keeping
+        the pages and cleared once it is done, so ``ScanWorker.stop`` knows
+        when waiting a little longer saves the fronts.
+        """
+        _duplex_settings(default_settings, tmp_path)
+        preserving = threading.Event()
+        seen_during_move: list[bool] = []
+        real_move = preservation_module.move_private
+
+        def observing_move(source: Path, destination: Path) -> None:
+            seen_during_move.append(preserving.is_set())
+            real_move(source, destination)
+
+        monkeypatch.setattr(preservation_module, "move_private", observing_move)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+        request = PipelineRequest(
+            profile_name="default",
+            title="Watched While Kept",
+            job_id="job-preserving",
+            flip_coordinator=_FixedFlipCoordinator(FlipOutcome.INTERRUPTED),
+            preserving=preserving,
+        )
+
+        assert not preserving.is_set()
+        with pytest.raises(ScanInterrupted):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert seen_during_move == [True]
+        assert not preserving.is_set()
 
 
 class TestManualDuplexPassCounts:

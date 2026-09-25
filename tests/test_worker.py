@@ -16,6 +16,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from saneless import auto_profiles as auto_profiles_module
+from saneless import preservation as preservation_module
 from saneless import worker as worker_module
 from saneless.auto_profiles import (
     ProfileWriteResult,
@@ -39,6 +40,7 @@ from saneless.exceptions import (
     PdfError,
     ScanCancelledError,
     ScanError,
+    ScanInterrupted,
 )
 from saneless.job import (
     REJECTED_HISTORY_ROWS,
@@ -53,6 +55,7 @@ from saneless.pipeline import DeviceMemory, PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
+    HIDDEN_PRESERVED_ERROR,
     RESTART_REASON,
     TERMINAL_STATES,
     FlipOutcome,
@@ -62,6 +65,7 @@ from saneless.vocabulary import (
     WorkerHealth,
     classify_error,
 )
+from saneless.web.job_view import build_job_view
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, poll_until, quiet_window, scan_batch
 
@@ -896,6 +900,33 @@ class TestWorkerFlipCoordinator:
         monkeypatch.setattr(coordinator._slot, "wait", _continue_then_expire)
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
+    def test_shutdown_answers_even_an_unarmed_wait_with_interrupted(self) -> None:
+        """
+        A stop claimed during pass A is the answer once the prompt opens.
+
+        Shutdown arms the coordinator itself, so its answer lands whether the
+        job is at the prompt or still scanning pass A, and it is its own
+        outcome rather than an operator's Abort.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        assert coordinator.interrupt_for_shutdown() is True
+        assert coordinator.armed is True
+        assert coordinator.answer is FlipOutcome.INTERRUPTED
+        assert coordinator.wait_for_flip(0) is FlipOutcome.INTERRUPTED
+
+    def test_an_operator_answer_already_claimed_outlasts_shutdown(self) -> None:
+        """
+        Shutdown never overwrites an answer the operator already gave.
+
+        An Abort claimed first stays an Abort, so the job is recorded as the
+        operator's cancel and keeps nothing, as the operator chose.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_abort() is True
+        assert coordinator.interrupt_for_shutdown() is False
+        assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
+
 
 class TestWorkerIntermediateStates:
     """Worker emits ASSEMBLING and UPLOADING intermediate states (UI-02)."""
@@ -1217,6 +1248,9 @@ _PASS_B_GATE_CEILING = 4.0
 # The wait_for_state budget for the tests below: generous against a worker that
 # only has to write a row, and far below pytest-timeout's 60 s ceiling.
 _STATE_BUDGET = 2.0
+
+# The owner token of the job a stop interrupts, for the owner-gated view.
+_OWNER = "owner-of-the-stopped-scan"
 
 
 def _inked_page() -> Image.Image:
@@ -1926,26 +1960,36 @@ class TestWorkerStopAndSubmit:
         assert exited
         assert scanner.scan_calls == 1
 
-    def test_stop_aborts_an_open_flip_wait_with_the_restart_reason(
+    def test_stop_at_the_flip_wait_keeps_the_fronts_and_records_the_restart(
         self,
         mock_paperless: MagicMock,
-        default_settings: Settings,
+        isolated_duplex_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        D-07: a job waiting at the flip prompt does not hold shutdown.
+        D-07: a stop at the flip prompt is an interruption, not a cancel.
 
-        stop() answers the open wait with Abort, so the thread exits at once
-        rather than after ``flip_timeout_seconds``.  The row records that the
-        server stopped the scan, not that the operator aborted it.
+        stop() answers the open wait with ``INTERRUPTED``, so the thread exits
+        at once rather than after ``flip_timeout_seconds``.  Nobody chose to
+        throw the scan away, so pass A's fronts are kept as a ``(fronts)`` PDF
+        in ``failed/``.  The row says the server stopped the scan and where
+        the fronts went, with no category, and it is not logged as a failure.
+
+        This used to pin ``error == RESTART_REASON`` exactly, when a stop
+        answered the wait with Abort and the fronts were deleted.  The error
+        still starts with the restart reason; it now goes on to name the file.
+        The owner sees that file relative to the data directory, and anyone
+        else sees only the fixed sentence saying something was kept.
         """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
-        settings = _manual_duplex_settings(default_settings)
+        settings = isolated_duplex_settings
         store = JobStore()
         worker = ScanWorker(scanner, mock_paperless, settings, store)
         try:
             worker.start()
-            job = store.create_job("duplex", "Stopped At Prompt")
+            job = store.create_job("duplex", "Stopped At Prompt", owner_token=_OWNER)
             worker.submit(job)
             wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
 
@@ -1959,29 +2003,210 @@ class TestWorkerStopAndSubmit:
             store.close()
 
         assert stopped is True
-        assert elapsed < 1.0
+        assert elapsed < _STATE_BUDGET
         assert finished.state is JobState.ERROR
-        assert finished.error == RESTART_REASON
+        assert finished.error is not None
+        assert finished.error.startswith(f"{RESTART_REASON}. ")
+        assert "preserved at " in finished.error
         assert finished.error_category is None
         assert scanner.scan_calls == 1
+        mock_paperless.upload_document.assert_not_called()
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "fronts" in preserved[0].name
+        assert preserved[0].name in finished.error
+        # Ended by the server, not by a fault: one INFO line, no ERROR line.
+        ended = f"Job {finished.id} ended by shutdown"
+        assert len(_worker_records(caplog, logging.INFO, ended)) == 1
+        assert _worker_records(caplog, logging.ERROR, finished.id) == []
 
-    def test_a_job_reaching_the_prompt_while_stopping_aborts_at_once(
+        owner = build_job_view(finished, presented=_OWNER, settings=settings)
+        assert owner.error is not None
+        assert owner.error.startswith(RESTART_REASON)
+        assert f"failed/{preserved[0].name}" in owner.error
+        assert str(settings.output.data_dir) not in owner.error
+        other = build_job_view(finished, presented="someone-else", settings=settings)
+        assert other.error == HIDDEN_PRESERVED_ERROR
+
+    def test_a_stop_during_pass_a_keeps_the_fronts_once_they_reach_the_flip(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A stop claimed while pass A still scans is answered at the flip.
+
+        stop() finds the job inside pass A's read, pre-answers the flip with
+        ``INTERRUPTED`` and gives up its (shortened) join.  Once pass A
+        finishes, the flip wait returns that answer at once, the fronts are
+        kept and the row records the restart, exactly as for a stop at the
+        prompt itself.
+        """
+        monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
+        scanner = _GatedScanner(frozenset({1}))
+        settings = isolated_duplex_settings
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Stopped In Pass A")
+            worker.submit(job)
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+            stopped = worker.stop()
+            coordinator = worker._flip_coordinator
+            assert coordinator is not None
+            assert coordinator.answer is FlipOutcome.INTERRUPTED
+            scanner.gates[1].set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_all()
+            # Joined here, not through stop(), whose join is shortened: the
+            # store must not close under a thread still finishing the job.
+            worker._thread.join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+            exited = not worker.is_alive
+            store.close()
+
+        assert stopped is False
+        assert exited
+        assert finished.state is JobState.ERROR
+        assert finished.error is not None
+        assert finished.error.startswith(f"{RESTART_REASON}. ")
+        assert "preserved at " in finished.error
+        assert finished.error_category is None
+        assert scanner.scan_calls == 1
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "fronts" in preserved[0].name
+
+    def test_stop_waits_longer_while_a_stopped_scan_is_being_preserved(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The join is extended, within a bound, while the fronts are copied.
+
+        Under Docker the preservation is a copy across filesystems, and it can
+        outlast the ordinary join.  The race is staged rather than timed: the
+        move into ``failed/`` is held on a gate until stop() starts a second
+        join, so the ordinary (shortened) join always runs out with the copy
+        still in flight.  stop() must see that a preservation is in flight,
+        join again for ``PRESERVATION_JOIN_SECONDS``, and report the thread
+        stopped with the fronts in place.
+        """
+        monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
+        monkeypatch.setattr("saneless.worker.PRESERVATION_JOIN_SECONDS", 10.0)
+        real_move = preservation_module.move_private
+        copy_started = threading.Event()
+        copy_released = threading.Event()
+
+        def held_move(source: Path, destination: Path) -> None:
+            copy_started.set()
+            copy_released.wait(_PASS_B_GATE_CEILING)
+            real_move(source, destination)
+
+        monkeypatch.setattr("saneless.preservation.move_private", held_move)
+        scanner = _PassBGatedScanner()
+        settings = isolated_duplex_settings
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        real_join = worker._thread.join
+        joins: list[float | None] = []
+
+        def recording_join(timeout: float | None = None) -> None:
+            # The second join is the extension: the copy is released only
+            # then, so the first one cannot have outlasted it.
+            joins.append(timeout)
+            if len(joins) >= 2:
+                copy_released.set()
+            real_join(timeout=timeout)
+
+        monkeypatch.setattr(worker._thread, "join", recording_join)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Slow To Preserve")
+            worker.submit(job)
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            stopped = worker.stop()
+            finished = _get(store, job.id)
+        finally:
+            copy_released.set()
+            scanner.release_pass_b.set()
+            real_join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+            store.close()
+
+        assert stopped is True
+        # The ordinary join, then the extension; the finally block's join
+        # bypasses the recorder.
+        assert joins == [0.2, 10.0]
+        assert copy_started.is_set()
+        assert finished.state is JobState.ERROR
+        assert finished.error is not None
+        assert finished.error.startswith(f"{RESTART_REASON}. ")
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "fronts" in preserved[0].name
+
+    def test_stop_does_not_wait_longer_when_nothing_is_being_preserved(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The stop extension applies only while pages are being preserved.
+
+        A scan parked inside a SANE read is preserving nothing, so stop()
+        gives up after the ordinary (shortened) join and reports the thread
+        still running, however long the preservation bound is.
+        """
+        monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
+        monkeypatch.setattr("saneless.worker.PRESERVATION_JOIN_SECONDS", 10.0)
+        scanner = _GatedScanner(frozenset({1}))
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            worker.submit(store.create_job("default", "Parked In A Read"))
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+
+            started = time.monotonic()
+            stopped = worker.stop()
+            elapsed = time.monotonic() - started
+        finally:
+            scanner.release_all()
+            worker._thread.join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+            exited = not worker.is_alive
+            store.close()
+
+        assert stopped is False
+        assert elapsed < _STATE_BUDGET
+        assert exited
+
+    def test_a_job_reaching_the_prompt_while_stopping_is_interrupted_at_once(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         wait_for_state: Callable[..., Job],
     ) -> None:
         """
         D-07, research Pitfall 5: stopping during pass A still ends the flip wait.
 
-        stop() can find no coordinator to abort because the job is still in
+        stop() can find no coordinator to answer because the job is still in
         pass A.  The stop flag is set while pass A is held, then pass A is
-        released: the job must announce AWAITING_FLIP and abort immediately,
-        well inside the state budget and nowhere near the flip timeout.
+        released: the job must announce AWAITING_FLIP and be interrupted
+        immediately, well inside the state budget and nowhere near the flip
+        timeout.  Like any stop at the flip, it keeps the fronts, so
+        the error starts with the restart reason and names the kept file;
+        it used to pin the bare restart reason.
         """
         scanner = _GatedScanner(frozenset({1}))
-        settings = _manual_duplex_settings(default_settings)
+        settings = isolated_duplex_settings
         assert settings.output.flip_timeout_seconds > _STATE_BUDGET * 10
         states_seen: list[JobState] = []
         store = JobStore()
@@ -2018,7 +2243,10 @@ class TestWorkerStopAndSubmit:
         assert JobState.AWAITING_FLIP in states_seen
         assert elapsed < _STATE_BUDGET
         assert finished.state is JobState.ERROR
-        assert finished.error == RESTART_REASON
+        assert finished.error is not None
+        assert finished.error.startswith(f"{RESTART_REASON}. ")
+        assert "preserved at " in finished.error
+        assert finished.error_category is None
         assert scanner.scan_calls == 1
 
     def test_a_pipeline_failure_while_stopping_keeps_its_own_cause(
@@ -2068,9 +2296,9 @@ class TestWorkerStopAndSubmit:
         """
         WR-02, EXC-05: shutdown claiming the flip does not relabel a real failure.
 
-        stop() pre-answers the flip wait while pass A is still scanning, so the
-        coordinator is marked as aborted by shutdown before the pipeline ever
-        reaches the prompt.  Pass A then jams.  The job did not end at the flip,
+        stop() pre-answers the flip wait with ``INTERRUPTED`` while pass A is
+        still scanning, before the pipeline ever reaches the prompt.  Pass A
+        then jams.  The job did not end at the flip,
         so the row keeps the scanner's text and category, and the failure is
         logged with its traceback rather than as a restart at INFO.
 
@@ -2091,7 +2319,7 @@ class TestWorkerStopAndSubmit:
             worker.stop()
             coordinator = worker._flip_coordinator
             assert coordinator is not None
-            assert coordinator.aborted_by_shutdown
+            assert coordinator.answer is FlipOutcome.INTERRUPTED
             scanner.gates[1].set()
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
@@ -2102,7 +2330,7 @@ class TestWorkerStopAndSubmit:
         assert finished.state is JobState.ERROR
         assert finished.error is not None
         assert _JAM_MESSAGE in finished.error
-        assert finished.error != RESTART_REASON
+        assert not finished.error.startswith(RESTART_REASON)
         assert finished.error_category == classify_error(ScanError(_JAM_MESSAGE))
         failures = [
             record.exc_info
@@ -5293,9 +5521,10 @@ class TestWorkerJobEndings:
     and no category.  N-08: a cancel is not a failure, so it is logged once at
     INFO with no traceback.  EXC-05: every other failure is recorded ERROR with
     its category and logged at ERROR with ``exc_info``, so the operator can
-    find the cause.  D-02, Phase 26 WR-06: a flip answer claimed by shutdown is
-    still a restart even though it reaches the worker as a cancel.  Phase 26
-    D-10: job endings never count toward degraded health.
+    find the cause.  A server stop reaches the worker as
+    ``ScanInterrupted``, its own ending, and is recorded as a restart followed
+    by whatever the pipeline kept.  Phase 26 D-10: job endings never count
+    toward degraded health.
     """
 
     def test_a_cancel_is_recorded_cancelled_without_a_category(
@@ -5397,7 +5626,106 @@ class TestWorkerJobEndings:
         assert records[0].exc_info is not None
         assert records[0].exc_info[1] is error
 
-    def test_a_shutdown_claimed_cancel_is_still_recorded_as_a_restart(
+    def test_an_interruption_is_recorded_as_a_restart_naming_what_was_kept(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A server stop ends the job as a restart, followed by the kept file.
+
+        The pipeline raises ``ScanInterrupted`` for a stop, carrying the
+        preservation's sentence as a note.  It is not an ``Exception``, so the
+        worker catches it by name: ERROR with the restart reason and the note,
+        no category, one INFO line and no traceback, because nothing failed.
+
+        This replaces a test that pinned the old path, where the stop answered
+        the flip with Abort and the worker had to tell that Abort from the
+        operator's by a marker on the coordinator.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        note = "The 1 page(s) scanned before the error were preserved at /x.pdf"
+        interruption = ScanInterrupted("The server is stopping")
+        interruption.add_note(note)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline", _raising_pipeline(interruption)
+        )
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == f"{RESTART_REASON}. {note}"
+        assert finished.error_category is None
+        shutdown = f"Job {finished.id} ended by shutdown"
+        assert len(_worker_records(caplog, logging.INFO, shutdown)) == 1
+        assert _worker_records(caplog, logging.ERROR, finished.id) == []
+
+    def test_an_interruption_that_kept_nothing_records_the_bare_restart(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """With no page to keep there is no note, and the row says only why."""
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _raising_pipeline(ScanInterrupted("The server is stopping")),
+        )
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == RESTART_REASON
+        assert finished.error_category is None
+
+    def test_the_worker_thread_survives_an_interruption(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        ``ScanInterrupted`` is a ``BaseException``, and it must not kill the thread.
+
+        Escaping ``_scan_job`` would end the worker thread with the row left
+        active.  The first job is interrupted, the second succeeds on the same
+        thread, and the worker stays healthy: an interruption is a job
+        ending, not a loop failure.
+        """
+        calls: list[str] = []
+        interruption = ScanInterrupted("The server is stopping")
+
+        def interrupted_once(*_args: object, **_kwargs: object) -> ScanResult:
+            calls.append("run")
+            if len(calls) == 1:
+                raise interruption
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", interrupted_once)
+        store = JobStore()
+        worker = worker_for(store)
+        try:
+            worker.start()
+            first, second = _submit_jobs(worker, store, 2)
+            first_row = wait_for_state(store, first.id, TERMINAL_STATES, _STATE_BUDGET)
+            second_row = wait_for_state(
+                store, second.id, TERMINAL_STATES, _STATE_BUDGET
+            )
+            alive = worker.is_alive
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert first_row.state is JobState.ERROR
+        assert first_row.error == RESTART_REASON
+        assert second_row.state is JobState.DONE
+        assert alive
+        assert health is WorkerHealth.HEALTHY
+
+    def test_a_cancel_after_shutdown_claimed_the_flip_is_still_a_cancel(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         default_settings: Settings,
@@ -5406,11 +5734,11 @@ class TestWorkerJobEndings:
         wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        D-02, Phase 26 WR-06: the shutdown check runs before the cancel check.
+        The outcome carries the meaning; nothing on the coordinator relabels it.
 
-        Shutdown's Abort reaches the pipeline exactly as an operator's does and
-        comes back as a ScanCancelledError.  The row must still say the server
-        stopped the scan, not that the operator cancelled it.
+        A ``ScanCancelledError`` is the operator's cancel however the flip was
+        answered, so the row is CANCELLED and never a restart.  A stop reaches
+        the worker as ``ScanInterrupted`` instead.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
 
@@ -5422,7 +5750,7 @@ class TestWorkerJobEndings:
         ) -> ScanResult:
             coordinator = request.flip_coordinator
             assert isinstance(coordinator, WorkerFlipCoordinator)
-            assert coordinator.abort_for_shutdown()
+            assert coordinator.interrupt_for_shutdown()
             raise ScanCancelledError(_CANCEL_MESSAGE)
 
         monkeypatch.setattr("saneless.worker.run_pipeline", shutdown_then_cancel)
@@ -5433,15 +5761,11 @@ class TestWorkerJobEndings:
         worker = worker_for(store)
         finished = _finish_one_job(worker, store, wait_for_state, profile="duplex")
 
-        assert finished.state is JobState.ERROR
-        assert finished.error == RESTART_REASON
+        assert finished.state is JobState.CANCELLED
+        assert finished.error == _CANCEL_MESSAGE
         assert finished.error_category is None
-        # Matched from the job id on: the shutdown line quotes the cancel's own
-        # message, which says "cancelled" too.
         shutdown = f"Job {finished.id} ended by shutdown"
-        cancelled = f"Job {finished.id} cancelled"
-        assert len(_worker_records(caplog, logging.INFO, shutdown)) == 1
-        assert _worker_records(caplog, logging.INFO, cancelled) == []
+        assert _worker_records(caplog, logging.INFO, shutdown) == []
 
     def test_cancelled_jobs_never_degrade_the_worker(
         self,

@@ -96,6 +96,7 @@ import pytest
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
+from saneless import worker as worker_module
 from saneless.checks import CheckKey, check_name
 from saneless.config import (
     OutputConfig,
@@ -1051,6 +1052,161 @@ def test_compose_sets_the_timezone_with_an_explanation() -> None:
     assert "utc" in COMPOSE.read_text(encoding="utf-8").lower(), (
         f"{COMPOSE.name} does not mention UTC, so the TZ line reads as noise"
     )
+
+
+# A compose duration saneless ships: whole minutes and seconds, such as "90s".
+_COMPOSE_DURATION = re.compile(r"^(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+)s)?$")
+
+# Room above the two join bounds for uvicorn to stop serving and for the
+# lifespan's own closes, before Docker's SIGKILL.
+_GRACE_MARGIN_SECONDS = 10.0
+
+# The container's scratch directory named as a path, not as part of a longer
+# word or path.  A pattern rather than a plain needle, which would read as a
+# hard-coded temporary directory.
+_TMP_PATH = re.compile(r"(?<![\w./])/tmp\b")
+
+# The heading of the deploy guide's section on stopping the container.
+_STOPPING_HEADING = "## Stopping and restarting"
+
+
+def _grace_period_lines(path: Path) -> list[tuple[int, str]]:
+    """Return every live ``stop_grace_period:`` line in ``path``, numbered."""
+    return [
+        (number, line)
+        for number, line in _numbered(path)
+        if line.strip().startswith("stop_grace_period:")
+    ]
+
+
+def _grace_seconds(line: str, name: str) -> float:
+    """
+    Parse one ``stop_grace_period:`` line's value into seconds.
+
+    Args:
+        line: The whole line.
+        name: The file it came from, for the failure message.
+
+    Returns:
+        The grace period, in seconds.
+
+    """
+    value = line.split(":", 1)[1].strip().strip("\"'")
+    assert value, f"{name}: stop_grace_period has no value"
+    match = _COMPOSE_DURATION.match(value)
+    assert match is not None, (
+        f"{name}: stop_grace_period {value!r} is not a duration like '90s'"
+    )
+    minutes = int(match.group("minutes") or 0)
+    seconds = int(match.group("seconds") or 0)
+    return float(minutes * 60 + seconds)
+
+
+def _preservation_budget() -> float:
+    """Return the longest a stopping server may need: both joins and a margin."""
+    return (
+        worker_module.STOP_JOIN_SECONDS
+        + worker_module.PRESERVATION_JOIN_SECONDS
+        + _GRACE_MARGIN_SECONDS
+    )
+
+
+def test_compose_gives_a_stopping_scan_time_to_keep_its_pages() -> None:
+    """
+    ``stop_grace_period`` covers the worker's join and its preservation extension.
+
+    Docker's default grace is 10 s, then SIGKILL.  A scan stopped at the flip
+    prompt keeps its fronts by copying them from ``/tmp`` to the data volume,
+    a different filesystem, and ``docker compose up -d`` recreates the
+    container and discards ``/tmp``, so a copy cut short is lost for good.
+    The setting must sit on the saneless service, be at least both join
+    bounds plus a margin, and carry a comment saying why.
+    """
+    lines = _numbered(COMPOSE)
+    graces = [
+        index
+        for index, (_, line) in enumerate(lines)
+        if line.strip().startswith("stop_grace_period:")
+    ]
+    assert len(graces) == 1, (
+        f"{COMPOSE.name}: expected exactly one live stop_grace_period line, "
+        f"found {len(graces)}"
+    )
+    index = graces[0]
+    line = lines[index][1]
+    assert line.startswith("    stop_grace_period:"), (
+        f"{COMPOSE.name}:{lines[index][0]}: stop_grace_period is not indented "
+        "as a key of services.saneless"
+    )
+    service = next(
+        position for position, (_, text) in enumerate(lines) if text == "  saneless:"
+    )
+    service_end = next(
+        (
+            position
+            for position, (_, text) in enumerate(lines)
+            if position > service and text and not text.startswith((" ", "#"))
+        ),
+        len(lines),
+    )
+    assert service < index < service_end, (
+        f"{COMPOSE.name}:{lines[index][0]}: stop_grace_period is outside "
+        "services.saneless"
+    )
+    seconds = _grace_seconds(line, COMPOSE.name)
+    assert seconds >= _preservation_budget(), (
+        f"{COMPOSE.name}: stop_grace_period is {seconds:g} s, less than the "
+        f"worker's {_preservation_budget():g} s worst case"
+    )
+    above = _comment_lines_above(lines, index)
+    assert above >= 1, f"{COMPOSE.name}: stop_grace_period has no comment above it"
+    comment = " ".join(text for _, text in lines[index - above : index])
+    assert _TMP_PATH.search(comment), (
+        f"{COMPOSE.name}: the comment above stop_grace_period does not name "
+        "the container's /tmp, so it does not say why the grace is needed"
+    )
+    assert "failed/" in comment, (
+        f"{COMPOSE.name}: the comment above stop_grace_period does not name "
+        "failed/, so it does not say what the grace protects"
+    )
+
+
+def test_the_deploy_guide_explains_the_stop_grace_period() -> None:
+    """
+    The guide says why a stop needs time, and its compose example sets it.
+
+    Operators copy the guide's compose block as well as the shipped file, so
+    the example carries the same grace period.  The explanation names the two
+    facts that make a cut-short copy unrecoverable: ``/tmp`` and the data
+    volume are different filesystems, and ``docker compose up -d`` recreates
+    the container.  It also covers ``docker run``, whose flag has another name.
+    """
+    text = DEPLOY_HOWTO.read_text(encoding="utf-8")
+    shipped = _grace_period_lines(COMPOSE)
+    assert len(shipped) == 1
+    example = _grace_period_lines(DEPLOY_HOWTO)
+    assert len(example) == 1, (
+        f"{DEPLOY_HOWTO.name}: expected the compose example to set "
+        f"stop_grace_period once, found {len(example)}"
+    )
+    assert _grace_seconds(example[0][1], DEPLOY_HOWTO.name) == _grace_seconds(
+        shipped[0][1], COMPOSE.name
+    )
+    section = _section(text, _STOPPING_HEADING, DEPLOY_HOWTO)
+    assert _TMP_PATH.search(section), (
+        f"{DEPLOY_HOWTO.name}: the {_STOPPING_HEADING!r} section does not "
+        "name the container's /tmp"
+    )
+    for needle in (
+        "stop_grace_period",
+        "failed/",
+        "docker compose up -d",
+        "--stop-timeout",
+    ):
+        assert needle in section, (
+            f"{DEPLOY_HOWTO.name}: the {_STOPPING_HEADING!r} section does not "
+            f"mention {needle!r}"
+        )
 
 
 def test_no_shipped_example_token_is_a_detected_placeholder() -> None:

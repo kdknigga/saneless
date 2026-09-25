@@ -319,6 +319,11 @@ class TestFlipAnswerLabel:
             (FlipOutcome.CONTINUED, "Flip confirmed. Scanning reverse sides next..."),
             (FlipOutcome.ABORTED, "Aborting scan..."),
             (FlipOutcome.TIMED_OUT, "Flip wait timed out..."),
+            (
+                FlipOutcome.INTERRUPTED,
+                "Stopping: saneless is shutting down and keeping the pages "
+                "already scanned...",
+            ),
         ],
     )
     def test_flip_answer_label_strings(
@@ -326,6 +331,20 @@ class TestFlipAnswerLabel:
     ) -> None:
         """flip_answer_label returns the acknowledgment copy (DPLX-06, CR-01)."""
         assert flip_answer_label(outcome) == expected
+
+    def test_a_flip_wait_ends_in_one_of_four_ways(self) -> None:
+        """
+        Flipped, gave up, ran out of time, or saneless is stopping.
+
+        The fourth is not the operator's decision, which is why it is its own
+        member rather than an Abort: the pages already scanned are kept.
+        """
+        assert [outcome.value for outcome in FlipOutcome] == [
+            "CONTINUED",
+            "ABORTED",
+            "TIMED_OUT",
+            "INTERRUPTED",
+        ]
 
     @pytest.mark.parametrize("outcome", list(FlipOutcome))
     def test_flip_answer_label_is_complete(self, outcome: FlipOutcome) -> None:

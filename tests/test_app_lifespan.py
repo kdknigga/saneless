@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
 
 import saneless.scanner.sane_backend as sane_backend_mod
+from saneless import worker as worker_module
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -859,6 +860,47 @@ def test_shutdown_leaves_the_scanner_open_when_the_worker_does_not_stop(
         assert real_stop()
         paperless.close()
         store.close()
+
+
+def test_the_stuck_worker_warning_names_the_preservation_extension(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The warning says the worker's join may have run past the ordinary bound.
+
+    A worker keeping a stopped scan's pages waits up to
+    ``PRESERVATION_JOIN_SECONDS`` longer than ``STOP_JOIN_SECONDS``, so a
+    warning naming only the ordinary bound would understate how long the
+    shutdown took and send the operator looking for the wrong cause.
+    """
+    app = _build_app(settings)
+    worker = app.state.worker
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    real_stop = worker.stop
+
+    monkeypatch.setattr(worker, "stop", lambda: False)
+    caplog.set_level(logging.WARNING, logger=_APP_LOGGER)
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        assert real_stop()
+        paperless.close()
+        store.close()
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _APP_LOGGER
+        and record.levelno == logging.WARNING
+        and "did not stop within" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert f"up to {worker_module.PRESERVATION_JOIN_SECONDS:g} s" in warnings[0]
+    assert "preserv" in warnings[0]
 
 
 def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
