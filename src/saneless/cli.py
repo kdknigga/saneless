@@ -14,13 +14,14 @@ import contextlib
 import json
 import logging
 import shutil
+import signal
 import socket
 import sys
 import threading
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, assert_never
+from typing import TYPE_CHECKING, Final, NoReturn, assert_never
 from uuid import uuid4
 
 import click
@@ -102,6 +103,9 @@ from .vocabulary import (
 from .web.app import create_app
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import FrameType
+
     from fastapi import FastAPI
 
     from .auto_profiles import ProfileWriteResult
@@ -178,6 +182,130 @@ def _stdin_is_interactive() -> bool:
     return sys.stdin.isatty()
 
 
+# The signals a one-shot command turns into an interruption: a supervisor
+# stopping it, or its terminal going away. Nobody at the keyboard chose to
+# stop, so the pages already scanned are kept, not thrown away. SIGINT is not
+# here: Ctrl-C is the operator's own cancel, which Python already raises as
+# KeyboardInterrupt, and it keeps nothing.
+_INTERRUPT_SIGNALS: Final = (signal.SIGTERM, signal.SIGHUP)
+
+# A dropped SSH session delivers SIGHUP to the main thread and end of input to
+# the flip prompt's thread at nearly the same moment, in no promised order. End
+# of input on its own is a cancel, which keeps nothing, so the prompt thread
+# waits this long for the signal before it treats end of input as one: the
+# signal wins, and the hangup keeps the fronts.
+_HANGUP_GRACE_SECONDS: Final = 0.25
+
+
+class _Interruption:
+    """
+    Whether a SIGTERM or SIGHUP has reached the running command, and which.
+
+    Set by the signal handler on the main thread and read by the flip prompt's
+    thread, which is why it is an ``Event`` and not a bare flag.
+    """
+
+    def __init__(self) -> None:
+        """Start with no signal received."""
+        self._received = threading.Event()
+        self.signum: int | None = None
+
+    def record(self, signum: int) -> None:
+        """
+        Note that ``signum`` arrived.
+
+        Args:
+            signum: The signal's number.
+
+        """
+        self.signum = signum
+        self._received.set()
+
+    def wait(self, timeout: float) -> bool:
+        """
+        Wait up to ``timeout`` seconds for a signal to arrive.
+
+        Args:
+            timeout: The longest to wait, in seconds.
+
+        Returns:
+            Whether a signal has arrived.
+
+        """
+        return self._received.wait(timeout)
+
+    def clear(self) -> None:
+        """Forget any signal, once the command that received it is over."""
+        self.signum = None
+        self._received.clear()
+
+
+_INTERRUPTION = _Interruption()
+
+
+def _interrupt_handler(signum: int, _frame: FrameType | None) -> NoReturn:
+    """
+    Turn SIGTERM or SIGHUP into ``ScanInterrupted`` on the main thread.
+
+    Both signals are ignored from here on, first of all, so a second one -- an
+    impatient supervisor, or a hangup following a stop -- cannot abandon the
+    preservation this one starts. The command's context puts the original
+    handlers back when it closes.
+
+    Args:
+        signum: The signal that arrived.
+        _frame: The interrupted frame; unused.
+
+    Raises:
+        ScanInterrupted: Always, carrying ``signum``.
+
+    """
+    for each in _INTERRUPT_SIGNALS:
+        signal.signal(each, signal.SIG_IGN)
+    _INTERRUPTION.record(signum)
+    msg = f"Interrupted by {signal.Signals(signum).name}"
+    raise ScanInterrupted(msg, signum=signum)
+
+
+def _keep_handlers() -> None:
+    """Restore nothing: no handler was installed."""
+
+
+def _install_interrupt_handlers() -> Callable[[], None]:
+    """
+    Install the SIGTERM and SIGHUP handlers, returning what puts them back.
+
+    Only the main thread can install a signal handler, so anywhere else this
+    installs nothing. A signal whose current handler was installed from
+    outside Python (``getsignal`` returns ``None``) is left alone, because
+    that handler could not be put back afterwards.
+
+    Returns:
+        A function that restores the handlers found here and forgets any
+        signal received, for the command's context to call as it closes.
+
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return _keep_handlers
+    previous = {
+        signum: handler
+        for signum in _INTERRUPT_SIGNALS
+        if (handler := signal.getsignal(signum)) is not None
+    }
+    for signum in previous:
+        signal.signal(signum, _interrupt_handler)
+
+    def restore() -> None:
+        """Put the original handlers back, then forget any signal received."""
+        # In this order: once the handlers are back, no late signal can reach
+        # _interrupt_handler and set the flag after it was cleared.
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        _INTERRUPTION.clear()
+
+    return restore
+
+
 class ClickFlipCoordinator(FlipCoordinator):
     """
     The CLI flip coordinator: a terminal prompt with a bounded wait.
@@ -193,9 +321,13 @@ class ClickFlipCoordinator(FlipCoordinator):
     (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
     the calling thread, where Python delivers SIGINT).  Those three are an
     operator's abort -- a cancel -- so giving up at the terminal and clicking
-    Abort in the web UI end the job the same way.  End of input counts as a
-    cancel however it arrives, including a terminal that closes, since
-    ``click.confirm`` reports it as ``click.Abort``.  A prompt that fails with a
+    Abort in the web UI end the job the same way.  The exception is end of
+    input caused by a hangup: a terminal that closes also sends SIGHUP, which
+    is an interruption, not a cancel, and keeps the fronts.  The two arrive at
+    nearly the same moment on different threads, so on end of input the prompt
+    thread waits ``_HANGUP_GRACE_SECONDS`` for a signal and, if one came,
+    claims nothing and leaves the calling thread to the ``ScanInterrupted``
+    the signal raised there.  A prompt that fails with a
     read error instead -- an I/O error from the terminal, undecodable input --
     also answers ``ABORTED`` at once, logged with its traceback, but it records
     the exception as ``abort_cause``: nobody chose to stop, so the scan is
@@ -264,6 +396,17 @@ class ClickFlipCoordinator(FlipCoordinator):
         try:
             flipped = click.confirm(_FLIP_PROMPT, default=True)
         except click.Abort:
+            # End of input.  If the terminal hung up, SIGHUP is on its way to
+            # (or already at) the calling thread as ScanInterrupted, and
+            # settling ABORTED here first would turn that interruption into a
+            # cancel that keeps nothing.  So the signal gets a moment to win.
+            if _INTERRUPTION.wait(_HANGUP_GRACE_SECONDS):
+                logger.info(
+                    "Flip prompt reached end of input after a signal (%s); "
+                    "leaving the answer to the interruption",
+                    _INTERRUPTION.signum,
+                )
+                return
             self._slot.settle(FlipOutcome.ABORTED)
             return
         except Exception as exc:
@@ -575,6 +718,15 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
     ctx.obj["verbose"] = verbose
+    # SIGTERM and SIGHUP become ScanInterrupted, which keeps the pages already
+    # scanned and exits 143 or 129 through the guard. Installing a handler
+    # loads nothing, so `--help` stays free of side effects; this group's
+    # context closes after the guard has chosen the exit code, which is when
+    # the original handlers go back, so none leaks into a caller that invoked
+    # the CLI in-process. serve is left to uvicorn, which installs its own
+    # handlers for a graceful shutdown.
+    if ctx.invoked_subcommand != "serve":
+        ctx.call_on_close(_install_interrupt_handlers())
 
 
 # The two situations in which a file under the superseded name is sitting in a

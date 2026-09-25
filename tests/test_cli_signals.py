@@ -40,7 +40,7 @@ from click.testing import CliRunner
 from fastapi import FastAPI
 
 from saneless import preservation
-from saneless.cli import cli
+from saneless.cli import _INTERRUPTION, cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -49,7 +49,6 @@ from saneless.config import (
     Settings,
 )
 from saneless.exceptions import ScanError
-from saneless.preservation import FRONTS_SUFFIX, PARTIAL_SUFFIX
 from saneless.vocabulary import ExitCode
 from tests.golden_support import (
     DOCUMENTS_PATH,
@@ -396,7 +395,9 @@ def test_sigterm_during_upload_keeps_the_pdf_and_exits_143(
     assert signaller.sent == [signal.SIGTERM]
     assert run.result.exit_code == ExitCode.TERMINATED, run.result.output
     (kept,) = run.failed
-    assert PARTIAL_SUFFIX not in kept.name
+    # The finished document itself, named as it would have been uploaded: not
+    # a "(partial)" rebuilt from the spooled pages.
+    assert kept.stem.endswith("-quarterly-report"), kept.name
     assert run.interrupted_lines == [run.interrupted_lines[0]]
     assert str(kept) in run.interrupted_lines[0]
     assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1, 2))
@@ -432,12 +433,58 @@ def test_sighup_at_the_flip_prompt_keeps_the_fronts_and_exits_129(
     assert signaller.sent == [signal.SIGHUP]
     assert run.result.exit_code == ExitCode.HANGUP, run.result.output
     (kept,) = run.failed
-    assert FRONTS_SUFFIX in kept.name
+    # build_pdf_filename sanitises "(fronts)" to "-fronts".
+    assert kept.stem.endswith("-quarterly-report-fronts"), kept.name
     assert run.interrupted_lines == [run.interrupted_lines[0]]
     assert str(kept) in run.interrupted_lines[0]
     assert _kept_pages(kept) == _spooled_idat(scanner, (0, 2, 4))
     assert scanner.calls == 1
     assert run.recorder.uploads() == []
+
+
+def test_a_hangup_whose_end_of_input_lands_first_still_keeps_the_fronts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    End of input first, SIGHUP a moment later: still an interruption, not a cancel.
+
+    The other order of the same race.  The prompt thread sees end of input
+    before the main thread sees SIGHUP; the signal is sent from inside the
+    prompt thread's wait for it, so it lands after end of input by
+    construction, with no timed pause.  Settling ABORTED without that wait
+    would end the run as a cancel that keeps nothing.
+    """
+    signaller = _Signaller()
+    real_wait = _INTERRUPTION.wait
+
+    def end_of_input(*_args: object, **_kwargs: object) -> bool:
+        """
+        Be the closed terminal's end of input, arriving ahead of its signal.
+
+        Raises:
+            click.Abort: Always.
+
+        """
+        raise click.Abort
+
+    def signal_arrives(timeout: float) -> bool:
+        """Deliver the hangup's SIGHUP now, then wait for it as the code does."""
+        signaller.send(signal.SIGHUP)
+        return real_wait(timeout)
+
+    monkeypatch.setattr("saneless.cli.click.confirm", end_of_input)
+    monkeypatch.setattr(_INTERRUPTION, "wait", signal_arrives)
+    scanner = DistinctPageScanner(passes=((0, 2, 4), (5, 3, 1)))
+
+    run = _run_cli(tmp_path, monkeypatch, profile=_DUPLEX, scanner=scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGHUP]
+    assert run.result.exit_code == ExitCode.HANGUP, run.result.output
+    (kept,) = run.failed
+    assert kept.stem.endswith("-quarterly-report-fronts"), kept.name
+    assert _kept_pages(kept) == _spooled_idat(scanner, (0, 2, 4))
+    assert scanner.calls == 1
 
 
 def test_ctrl_c_is_still_a_cancel(
