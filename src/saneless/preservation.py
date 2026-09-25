@@ -175,7 +175,10 @@ def move_private(source: Path, destination: Path) -> None:
     made here instead -- also where the filesystem has no hard links -- into a
     file created 0600 with ``O_EXCL``, and the source is removed only once the
     copy is complete.  A copy that fails is removed, so no truncated document
-    is left behind.
+    is left behind.  Once the file is whole at ``destination`` the move has
+    succeeded, and a source that cannot then be removed is logged and left.
+    The two steps are not one: a process killed between them leaves the file
+    in both places, which loses nothing.
 
     Args:
         source: The file to move, inside the job workspace.
@@ -197,7 +200,7 @@ def move_private(source: Path, destination: Path) -> None:
         if exc.errno not in _COPY_INSTEAD_OF_LINK:
             raise
     else:
-        source.unlink()
+        _remove_moved_source(source, destination)
         return
     descriptor = os.open(
         destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _PRIVATE_FILE_MODE
@@ -210,7 +213,33 @@ def move_private(source: Path, destination: Path) -> None:
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
-    source.unlink()
+    _remove_moved_source(source, destination)
+
+
+def _remove_moved_source(source: Path, destination: Path) -> None:
+    """
+    Remove a moved file's source, once the file is whole at its destination.
+
+    The move has succeeded by then: the file is in ``failed/``.  A source
+    that cannot be removed loses nothing, so it is logged and left, rather
+    than raised as a move that failed -- which would have the report say
+    that a file already kept could not be kept.
+
+    Args:
+        source: The file just linked or copied.
+        destination: Where it now is.
+
+    """
+    try:
+        source.unlink()
+    except OSError:
+        logger.warning(
+            "%s is kept at %s, but the original could not be removed; it is "
+            "a spare copy",
+            source,
+            destination,
+            exc_info=True,
+        )
 
 
 def warn_if_failed_dir_growing(failed_dir: Path) -> None:

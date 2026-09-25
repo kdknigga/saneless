@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import stat
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -32,8 +33,6 @@ from saneless.spool import SpooledPageSink
 from tests.golden_support import distinct_page, embedded_streams, png_idat
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from saneless.scanner.base import PageRecord
 
 _JOB_ID = "job-pres-1"
@@ -823,3 +822,44 @@ class TestMovePrivateNeverReplaces:
 
         assert destination.read_bytes() == b"the scan"
         assert not source.exists()
+
+    @pytest.mark.parametrize("crossing", [False, True], ids=["link", "copy"])
+    def test_a_source_that_cannot_be_removed_still_counts_as_moved(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        *,
+        crossing: bool,
+    ) -> None:
+        """
+        The file reached the destination, so the move succeeded.
+
+        Only the leftover source could not be removed, which loses nothing:
+        reporting the move as failed would say a file already in ``failed/``
+        could not be kept.
+        """
+        if crossing:
+
+            def cross_device(_src: object, _dst: object) -> None:
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+            monkeypatch.setattr(os, "link", cross_device)
+        source = tmp_path / "scan.pdf"
+        source.write_bytes(b"the scan")
+        destination = tmp_path / "failed-scan.pdf"
+        real_unlink = Path.unlink
+
+        def stuck(path: Path, *, missing_ok: bool = False) -> None:
+            if path == source:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+            real_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", stuck)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
+            preservation_module.move_private(source, destination)
+
+        assert destination.read_bytes() == b"the scan"
+        assert source.exists()
+        assert str(source) in caplog.text
