@@ -18,6 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, assert_never
 
+from saneless.atomic_write import refused_mode_change
 from saneless.exceptions import (
     ConfigError,
     PaperlessError,
@@ -29,7 +30,7 @@ from saneless.exceptions import (
 )
 from saneless.pages import filter_empty_pages
 from saneless.pdf import assemble_pdf, build_pdf_filename
-from saneless.private_dirs import ensure_private_dir
+from saneless.private_dirs import ensure_private_dir, make_private_dir
 from saneless.scanner.base import ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
@@ -558,6 +559,51 @@ def _spool_dir_of(tmp_path: Path) -> Path:
     return tmp_path / _SPOOL_DIR_NAME
 
 
+def _make_failed_dir(failed_dir: Path) -> None:
+    """
+    Create ``failed_dir`` and the ``data_dir`` it sits in, each owner-only.
+
+    Preserved scans are whole documents, so neither directory may be
+    readable by other local users. Each level gets its own call because a
+    ``mkdir`` with ``parents=True`` creates a missing parent with the default
+    permissions, ignoring the mode it was given. A directory that already
+    exists keeps its mode: one an earlier release created is left alone.
+
+    Args:
+        failed_dir: The durable directory preserved scans go in, directly
+            inside ``data_dir``.
+
+    Raises:
+        OSError: If either directory cannot be created.
+
+    """
+    make_private_dir(failed_dir.parent)
+    make_private_dir(failed_dir)
+
+
+def _best_effort_chmod(path: Path, mode: int) -> None:
+    """
+    Set ``path``'s permission bits, tolerating a filesystem without them.
+
+    A refused change (for example on a vfat or CIFS ``tmp_dir``) is logged at
+    DEBUG and skipped: failing here would lose the very scan being preserved.
+
+    Args:
+        path: The file to change.
+        mode: The permission bits to give it.
+
+    Raises:
+        OSError: If the change failed for a reason other than a refusal.
+
+    """
+    try:
+        path.chmod(mode)
+    except OSError as exc:
+        if not refused_mode_change(exc):
+            raise
+        logger.debug("Not setting the mode of %s: %s", path, exc.strerror)
+
+
 def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     """
     Log one WARNING when preserved scans have piled up in ``failed_dir``.
@@ -722,11 +768,17 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
     except Exception as exc:
         destinations: list[Path] = []
         try:
-            failed_dir.mkdir(parents=True, exist_ok=True)
+            _make_failed_dir(failed_dir)
             for pdf_path in pdf_paths:
                 if not pdf_path.exists():
                     continue
                 destination = failed_dir / pdf_path.name
+                # Owner-only before the move, not after. The source sits in the
+                # 0700 workspace, so nobody else can open it in the meantime; a
+                # same-filesystem move is a rename, which keeps the mode, and a
+                # cross-filesystem one copies it through ``shutil.copy2``. The
+                # other preservation sites rely on the same reasoning.
+                _best_effort_chmod(pdf_path, 0o600)
                 shutil.move(pdf_path, destination)
                 destinations.append(destination)
             # Once, after the loop, so the count reflects the finished state.
@@ -868,7 +920,7 @@ def _preserve_partial_passes(
         PdfError: If a partial cannot be assembled.
 
     """
-    failed_dir.mkdir(parents=True, exist_ok=True)
+    _make_failed_dir(failed_dir)
     for suffix, records in ledger.spooled():
         partial_pdf = assemble_pdf(
             records,
@@ -877,6 +929,8 @@ def _preserve_partial_passes(
             dpi=ledger.dpi,
         )
         destination = failed_dir / partial_pdf.name
+        # Owner-only before the move, for the reason ``_preserving`` gives.
+        _best_effort_chmod(partial_pdf, 0o600)
         shutil.move(partial_pdf, destination)
         destinations.append(destination)
 
@@ -1027,9 +1081,12 @@ def _move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> N
     page_files = sorted(entry for entry in spool_dir.iterdir() if entry.is_file())
     if not page_files:
         return
-    destination.mkdir(parents=True, exist_ok=True)
+    _make_failed_dir(destination.parent)
+    make_private_dir(destination)
     for page_file in page_files:
         target = destination / page_file.name
+        # Owner-only before the move, for the reason ``_preserving`` gives.
+        _best_effort_chmod(page_file, 0o600)
         shutil.move(page_file, target)
         moved.append(target)
     # Once, after the loop, so the count reflects the finished state -- the
