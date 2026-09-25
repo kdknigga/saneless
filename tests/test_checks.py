@@ -2288,6 +2288,96 @@ def _without_url(settings: Settings) -> Settings:
     return settings.model_copy(update={"paperless": paperless})
 
 
+def _with_device(settings: Settings, device: str) -> Settings:
+    """
+    Copy settings with ``scanner.device`` set to ``device``.
+
+    Args:
+        settings: Settings from ``_settings``, which pins a device.
+        device: The device id to configure, ``""`` for auto-detection.
+
+    Returns:
+        A copy differing only in ``scanner.device``.
+
+    """
+    scanner = settings.scanner.model_copy(update={"device": device})
+    return settings.model_copy(update={"scanner": scanner})
+
+
+def _rogue_device() -> DeviceInfo:
+    """
+    Build a second device whose SANE id names a different LAN host.
+
+    Returns:
+        A DeviceInfo distinct from ``_device()`` in id, vendor and model.
+
+    """
+    return DeviceInfo(
+        name="net:rogue.lan:escl:bus1;dev2",
+        vendor="Canon",
+        model="MF740C",
+        device_type="scanner",
+    )
+
+
+class TestScannerCheckMultipleDevices:
+    """
+    Several visible scanners and none chosen is a WARN, never a FAIL.
+
+    With ``scanner.device`` empty every scan goes to the first device SANE
+    lists, and a newly visible scanner on the LAN can take that place.  The
+    row says so by count only: device ids are LAN addresses and the strip is
+    LAN-visible.
+    """
+
+    def test_multiple_devices_without_a_pin_warn(self, tmp_path: Path) -> None:
+        """
+        Two devices and an empty ``scanner.device`` give a count-only WARN.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_device(_settings(tmp_path), "")
+        backend = _CountingBackend([_device(), _rogue_device()])
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert row.state is CheckState.WARN
+        assert row.message == "2 scanners are visible and none is chosen."
+        assert "[scanner] device" in row.next_step
+        rendered = f"{row.message} {row.next_step}"
+        for leaked in ("net:", "scanbox.lan", "rogue.lan", "Brother", "Canon"):
+            assert leaked not in rendered
+
+    def test_multiple_devices_with_a_pin_stay_ok(self, tmp_path: Path) -> None:
+        """
+        A configured device settles the choice, however many are visible.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_device(_settings(tmp_path), "net:scanbox.lan:x")
+        backend = _CountingBackend([_device(), _rogue_device()])
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert row.state is CheckState.OK
+
+    def test_one_device_without_a_pin_multiple_devices_absent_stays_ok(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        One visible device leaves nothing ambiguous to warn about.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_device(_settings(tmp_path), "")
+        backend = _CountingBackend([_device()])
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert row.state is CheckState.OK
+        assert row.message == "Brother ADS-2700W is ready."
+
+
 _PROBE_OUTCOMES = [
     pytest.param(200, CheckState.OK, ConnectionStatus.CONNECTED, id="connected"),
     pytest.param(

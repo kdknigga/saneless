@@ -39,6 +39,7 @@ from saneless.pipeline import (
     FAILED_DIR_WARN_THRESHOLD,
     SCAN_LABEL_BACK,
     SCAN_LABEL_FRONT,
+    DeviceMemory,
     FlipAnswerSlot,
     FlipCoordinator,
     PipelineEvent,
@@ -49,6 +50,7 @@ from saneless.pipeline import (
     _note_pass_count,
     _open_workspace,
     _preserving,
+    _resolve_device,
     _warn_if_failed_dir_growing,
     run_pipeline,
 )
@@ -1761,6 +1763,159 @@ def _two_pass_scanner() -> MagicMock:
         [_make_content_image("red")], [_make_content_image("blue")]
     )
     return scanner
+
+
+def _scanner_listing(*names: str) -> MagicMock:
+    """
+    Build a scanner mock whose ``get_devices`` lists ``names`` in order.
+
+    Args:
+        *names: The SANE ids to report, first one first.
+
+    Returns:
+        A mock backend.
+
+    """
+    scanner = MagicMock(spec=ScannerBackend)
+    scanner.get_devices.return_value = [
+        DeviceInfo(name=name, vendor="V", model="M", device_type="t") for name in names
+    ]
+    return scanner
+
+
+def _pipeline_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """
+    Pick the pipeline logger's records out of everything captured.
+
+    Args:
+        caplog: pytest's log capture.
+
+    Returns:
+        The records ``saneless.pipeline`` emitted.
+
+    """
+    return [record for record in caplog.records if record.name == "saneless.pipeline"]
+
+
+class TestResolveDeviceChange:
+    """
+    A worker remembers the device it auto-detected, and says when it changes.
+
+    With ``scanner.device`` empty every scan goes to the first listed device,
+    so a scanner that appears on the LAN between two jobs silently takes the
+    second one.  The change is logged at WARNING, and nothing refuses to scan.
+    """
+
+    def test_device_change_between_jobs_logs_one_warning(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A different first device than last time is one WARNING naming both."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory(last_id="dev:a")
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            chosen = _resolve_device(
+                _scanner_listing("dev:b", "dev:a"), default_settings, memory
+            )
+
+        assert chosen == "dev:b"
+        assert memory.last_id == "dev:b"
+        warnings = [
+            record.getMessage()
+            for record in _pipeline_records(caplog)
+            if record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "'dev:a'" in warnings[0]
+        assert "'dev:b'" in warnings[0]
+
+    def test_device_change_first_detection_logs_info_only(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The first detection has nothing to differ from: INFO, as before."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory()
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            chosen = _resolve_device(
+                _scanner_listing("dev:a"), default_settings, memory
+            )
+
+        assert chosen == "dev:a"
+        assert memory.last_id == "dev:a"
+        levels = [record.levelno for record in _pipeline_records(caplog)]
+        assert levels == [logging.INFO]
+
+    def test_device_change_same_device_logs_info_only(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The same device again is no change."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory(last_id="dev:a")
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            _resolve_device(_scanner_listing("dev:a"), default_settings, memory)
+
+        levels = [record.levelno for record in _pipeline_records(caplog)]
+        assert levels == [logging.INFO]
+
+    def test_device_change_without_memory_is_todays_behaviour(
+        self, default_settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The CLI passes no memory: one INFO naming the device with repr."""
+        default_settings.scanner.device = ""
+
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            chosen = _resolve_device(_scanner_listing("dev:b"), default_settings)
+
+        assert chosen == "dev:b"
+        messages = [
+            (record.levelno, record.getMessage())
+            for record in _pipeline_records(caplog)
+        ]
+        assert messages == [(logging.INFO, "Auto-detected scanner: 'dev:b'")]
+
+    def test_device_change_is_not_checked_for_a_pinned_device(
+        self, default_settings: Settings
+    ) -> None:
+        """A configured device is used as is; discovery never runs."""
+        memory = DeviceMemory(last_id="dev:a")
+        scanner = _scanner_listing("dev:b")
+
+        chosen = _resolve_device(scanner, default_settings, memory)
+
+        assert chosen == default_settings.scanner.device
+        scanner.get_devices.assert_not_called()
+        assert memory.last_id == "dev:a"
+
+    def test_device_change_memory_travels_on_the_request(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """``run_pipeline`` hands ``request.device_memory`` to the resolution."""
+        default_settings.scanner.device = ""
+        memory = DeviceMemory(last_id="dev:a")
+        scanner = _two_pass_scanner()
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Memory", device_memory=memory
+                ),
+            )
+
+        assert memory.last_id == "test:auto:001"
+        assert any(
+            "'dev:a'" in record.getMessage()
+            and "'test:auto:001'" in record.getMessage()
+            for record in _pipeline_records(caplog)
+            if record.levelno == logging.WARNING
+        )
 
 
 class TestDuplexStrategy:
