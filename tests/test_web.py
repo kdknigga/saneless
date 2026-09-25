@@ -2877,13 +2877,15 @@ _MARKER = "tok-MARKER-9b1e5c"
 _MARKED_TEXT = f"refused: Token {_MARKER} user:pass@paperless.invalid"
 
 
-def _marked_client(error: Exception) -> PaperlessClient:
+def _marked_client(error: Exception, token: str = _MARKER) -> PaperlessClient:
     """
     Build a real Paperless client whose token is the marker and whose requests fail.
 
     Args:
         error: What every request raises, from inside the transport, so the
             client's own handling decides what reaches the log.
+        token: The configured token: the marker, or the marker with the
+            trailing space h11 refuses to send.
 
     Returns:
         The client, ready to replace ``app.state.paperless``.
@@ -2896,7 +2898,7 @@ def _marked_client(error: Exception) -> PaperlessClient:
 
     return PaperlessClient(
         url="http://paperless.invalid:8000",
-        token=_MARKER,
+        token=token,
         transport=httpx2.MockTransport(refuse),
     )
 
@@ -2909,7 +2911,8 @@ def _client_refuses_the_connection(app: FastAPI) -> None:
 def _client_cannot_send_the_request(app: FastAPI) -> None:
     """Make the tag fetch fail the way h11 refuses a token it cannot send."""
     app.state.paperless = _marked_client(
-        httpx2.LocalProtocolError(f"Illegal header value b'Token {_MARKER} '")
+        httpx2.LocalProtocolError(f"Illegal header value b'Token {_MARKER} '"),
+        token=f"{_MARKER} ",
     )
 
 

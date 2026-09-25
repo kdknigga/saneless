@@ -2216,6 +2216,69 @@ class TestLoopbackClientSideProtocolErrors:
         assert LOOPBACK_SESSION_COOKIE not in caplog.text
 
 
+# What h11 says when a request body does not match its declared length: a
+# LocalProtocolError that has nothing to do with the configured URL or token.
+_LENGTH_MISMATCH = "Too much data for declared Content-Length"
+
+# The fixed reason for a request the HTTP library refused for another cause.
+_REQUEST_REFUSED_REASON = (
+    "the request could not be sent: the HTTP library refused it (LocalProtocolError)"
+)
+
+
+class TestUnsendableRequestWithASendableConfiguration:
+    """
+    A request refused for a reason that is not the configuration says so.
+
+    Load validation makes a URL or token h11 would refuse impossible, so a
+    ``LocalProtocolError`` from a client built with sendable values has
+    another cause.  Blaming ``paperless.url`` and ``paperless.token`` would send
+    the operator to edit a configuration file that is fine.
+    """
+
+    def test_upload_is_a_paperless_error_without_retry_or_copy(
+        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """No retry, no consume-folder copy, and no configuration named."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        handler = _CountingHandler(
+            _raising(httpx2.LocalProtocolError(_LENGTH_MISMATCH))
+        )
+        client = _upload_client(handler, consume_dir=consume_dir)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Length")
+        finally:
+            client.close()
+        assert not isinstance(exc_info.value, ConfigError)
+        assert str(exc_info.value) == (
+            f"Uploading to Paperless: {_REQUEST_REFUSED_REASON}"
+        )
+        assert "paperless.url" not in str(exc_info.value)
+        assert handler.calls == 1
+        assert sleeps == []
+        assert list(consume_dir.iterdir()) == []
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_metadata_fetch_is_a_paperless_error(self, method: str, noun: str) -> None:
+        """Tag and correspondent fetches give the same verdict."""
+        handler = _CountingHandler(
+            _raising(httpx2.LocalProtocolError(_LENGTH_MISMATCH))
+        )
+        client = _metadata_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                getattr(client, method)()
+        finally:
+            client.close()
+        assert not isinstance(exc_info.value, ConfigError)
+        assert str(exc_info.value) == (
+            f"Could not fetch {noun} from Paperless at http://paperless.test:8000: "
+            f"{_REQUEST_REFUSED_REASON}"
+        )
+
+
 _REDACTED_TOKENS = [
     pytest.param("tok-9e41d2", id="plain"),
     pytest.param("\ttok-5c7b20 ", id="padded"),

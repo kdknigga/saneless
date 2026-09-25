@@ -309,9 +309,11 @@ class _RetryDecision(Enum):
         REFUSED: The server answered with a non-2xx that is not a 5xx.  It
             would answer the same way again, so this is final: no retry and no
             fallback.
-        MISCONFIGURED: The request could not be built or sent from the
-            configured ``paperless.url`` and ``paperless.token``.  No retry can
-            succeed and no copy is made; it is a configuration error.
+        MISCONFIGURED: The request could not be sent at all.  No retry can
+            succeed and no copy is made.  ``PaperlessClient._unsendable_error``
+            reports it as a configuration error when the configured
+            ``paperless.url`` or ``paperless.token`` is what the transport
+            refused, and as a request the HTTP library refused otherwise.
         UNEXPECTED: Any other httpx2 error.  Final.
 
     """
@@ -376,22 +378,21 @@ _REQUEST_UNSENDABLE: Final = (
 )
 
 
-def _misconfigured_message(exc: httpx2.HTTPError, action: str) -> str:
+def _is_visible_ascii(text: str) -> bool:
     """
-    Build the fixed message for a MISCONFIGURED error.
+    Say whether ``text`` is visible ASCII only, the rule the config load applies.
+
+    ``paperless.url`` and ``paperless.token`` must pass it to load at all, and
+    a header value or URL made only of these characters is one h11 sends.
 
     Args:
-        exc: The error, used only to tell an unusable URL from an unsendable
-            request.  Its text is never included.
-        action: What saneless was doing, e.g. ``Uploading to Paperless``.
+        text: A configured value.
 
     Returns:
-        ``<action>: <fixed problem>``, one line, with no configured value in it.
+        True when every character is in ``!`` to ``~``.
 
     """
-    if isinstance(exc, httpx2.UnsupportedProtocol):
-        return f"{action}: {_URL_UNUSABLE}"
-    return f"{action}: {_REQUEST_UNSENDABLE}"
+    return all("!" <= char <= "~" for char in text)
 
 
 def _first_message(value: object) -> str | None:
@@ -624,9 +625,10 @@ class PaperlessClient:
     ``PaperlessError`` naming the configured base URL and the original text
     with the token struck out, chained to its cause unless some link of that
     cause's chain quotes the token (see ``_cause``) -- or, for a request that
-    could not be sent at all, as a ``ConfigError`` with fixed text and no
-    cause.  A URL or token the constructor refuses is a ``PaperlessError``
-    with fixed text and no cause.
+    could not be sent at all, with fixed text and no cause: a ``ConfigError``
+    when the configuration is at fault, else a ``PaperlessError``.  A URL or
+    token the constructor refuses is a ``PaperlessError`` with fixed text and
+    no cause.
 
     ``_retry_decision`` sorts every httpx2 error, and upload failures fall
     into three groups:
@@ -640,13 +642,16 @@ class PaperlessClient:
       non-2xx that is not a server error (a redirect, which names its target
       so ``paperless.url`` can be corrected), any other ``httpx2.HTTPError``,
       and a 200 whose body is not JSON.
-    * **Misconfigured**, a ``ConfigError`` with no further attempt: a
-      ``paperless.url`` that is unset or has no usable scheme
-      (``httpx2.UnsupportedProtocol``), and a request the transport refused
-      to put on the wire (``httpx2.LocalProtocolError``, which is what h11
-      raises for a token with edge whitespace or a control character).  Both
-      are TransportErrors that no retry can fix, and the second quotes the
-      token in its text, so the message is fixed and never chained.
+    * **Not sendable**, with no further attempt: a ``paperless.url`` that is
+      unset or has no usable scheme (``httpx2.UnsupportedProtocol``), and a
+      request the transport refused to put on the wire
+      (``httpx2.LocalProtocolError``, which is what h11 raises for a token
+      with edge whitespace or a control character).  Both are TransportErrors
+      that no retry can fix, and the second quotes the token in its text, so
+      the message is fixed and never chained.  It is a ``ConfigError`` when
+      the configured URL or token is at fault, and a ``PaperlessError``
+      naming only the exception's class when they pass the load rules and so
+      cannot be (see ``_unsendable_error``).
 
     When a consume directory is configured it is the fallback only for
     exhausted retries: a scan must never be lost to an outage.  A 4xx, a
@@ -702,6 +707,12 @@ class PaperlessClient:
         # " at <url>" for a message, or nothing when no address is set: an
         # unset paperless.url would otherwise read "Paperless at : ...".
         self._at_url = f" at {self._display_url}" if self._display_url else ""
+        # Whether the transport could be refusing the configured values at
+        # all.  A set token and URL that pass the load rules are ones h11
+        # sends, so a request refused while this is True has another cause.
+        self._configuration_sendable = (
+            bool(token) and _is_visible_ascii(token) and _is_visible_ascii(base_url)
+        )
         try:
             parsed = httpx2.URL(base_url)
             if parsed.userinfo:
@@ -798,18 +809,21 @@ class PaperlessClient:
         Raises:
             ConfigError: If the request cannot be sent from the configured
                 ``paperless.url`` and ``paperless.token``: the URL is unset or
-                has no usable scheme, or the transport refused the token.  The
-                message is fixed text starting ``Uploading to Paperless:`` and
-                naming the setting, and the error carries no cause, so no
-                traceback can print the refused header value.  Nothing is
-                retried or copied.
+                has no usable scheme, or the transport refused a token or URL
+                outside the load rules.  The message is fixed text starting
+                ``Uploading to Paperless:`` and naming the setting, and the
+                error carries no cause, so no traceback can print the refused
+                header value.  Nothing is retried or copied.
             PaperlessError: If the server rejects the upload with a 4xx
                 (``Paperless rejected the upload (<status> <reason>): <line>``)
                 or answers with a redirect (``Paperless redirected the upload
                 (<status> <reason>) to <location>; check paperless.url``);
                 if the retries are exhausted and no consume directory is
-                configured (``failed after N attempts``); if any other httpx2
-                error occurs; if the PDF cannot be opened; if a 200 body is
+                configured (``failed after N attempts``); if the transport
+                refuses to send a request built from a sendable URL and token
+                (fixed text, no cause, nothing retried or copied); if any
+                other httpx2 error occurs; if the PDF cannot be opened; if a
+                200 body is
                 not JSON or carries no task id; or if copying into the consume
                 directory fails.  Any library or server text it quotes has the
                 token struck out, and it is chained to its cause only when no
@@ -836,11 +850,11 @@ class PaperlessClient:
                         last_error = exc
                         self._back_off(attempt, exc)
                     case _RetryDecision.MISCONFIGURED:
-                        msg = _misconfigured_message(exc, "Uploading to Paperless")
+                        error = self._unsendable_error(exc, "Uploading to Paperless")
                         # from None, not from exc: the worker logs a failed job
                         # with its traceback, and a chained h11 error would
                         # print the refused header value -- the token -- there.
-                        raise ConfigError(msg) from None
+                        raise error from None
                     case _RetryDecision.UNEXPECTED | _RetryDecision.REFUSED:
                         # REFUSED lands here only for a non-status error, which
                         # _retry_decision never gives it; it is reported as
@@ -985,6 +999,40 @@ class PaperlessClient:
         """
         rendered = "".join(traceback.format_exception(exc))
         return exc if _strike(rendered, self._token) == rendered else None
+
+    def _unsendable_error(
+        self, exc: httpx2.HTTPError, action: str
+    ) -> ConfigError | PaperlessError:
+        """
+        Build the error for a request that could not be sent at all.
+
+        The configuration is blamed only when it can be at fault: a URL with
+        no usable scheme, or a token or URL outside the load rules, which a
+        client built from loaded settings never has.  Any other refusal --
+        h11 finding a body longer than its declared length, say -- is not
+        something ``paperless.url`` or ``paperless.token`` can fix, so it is a
+        ``PaperlessError`` that names only the exception's class.  Either way
+        the text is fixed: h11's own text for a refused header value quotes
+        it, and for the Authorization header that is the token.
+
+        Args:
+            exc: The error, used only for its type.  Its text is never
+                included.
+            action: What saneless was doing, e.g. ``Uploading to Paperless``.
+
+        Returns:
+            ``<action>: <fixed problem>``, one line, as a ``ConfigError`` when
+            the configuration is at fault and a ``PaperlessError`` otherwise.
+
+        """
+        if isinstance(exc, httpx2.UnsupportedProtocol):
+            return ConfigError(f"{action}: {_URL_UNUSABLE}")
+        if not self._configuration_sendable:
+            return ConfigError(f"{action}: {_REQUEST_UNSENDABLE}")
+        return PaperlessError(
+            f"{action}: the request could not be sent: the HTTP library refused "
+            f"it ({type(exc).__name__})"
+        )
 
     def _back_off(self, attempt: int, exc: httpx2.HTTPError) -> None:
         """
@@ -1338,7 +1386,8 @@ class PaperlessClient:
         Raises:
             ConfigError: If the request cannot be sent from the configured
                 ``paperless.url`` and ``paperless.token``, with fixed text and
-                no cause.
+                no cause.  A request refused for another reason is a
+                ``PaperlessError`` with fixed text and no cause.
             PaperlessError: If any page request fails for any other
                 ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
                 naming the endpoint and base URL and chained to the cause
@@ -1357,7 +1406,8 @@ class PaperlessClient:
         Raises:
             ConfigError: If the request cannot be sent from the configured
                 ``paperless.url`` and ``paperless.token``, with fixed text and
-                no cause.
+                no cause.  A request refused for another reason is a
+                ``PaperlessError`` with fixed text and no cause.
             PaperlessError: If any page request fails for any other
                 ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
                 naming the endpoint and base URL and chained to the cause
@@ -1406,7 +1456,8 @@ class PaperlessClient:
             ConfigError: ``Could not fetch <noun> from Paperless at <url>:
                 <fixed problem>``, with no cause, when the request cannot be
                 sent from the configured URL and token.  With no URL set the
-                `` at <url>`` is left out.
+                `` at <url>`` is left out.  A request refused for any other
+                reason is a ``PaperlessError`` of the same shape.
             PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
                 <reason>``, chained to the httpx2 error or the ValueError
                 unless its chain quotes the token, or
@@ -1471,9 +1522,11 @@ class PaperlessClient:
 
         Raises:
             ConfigError: ``<prefix>: <fixed problem>``, with no cause, when
-                ``_retry_decision`` finds the request could not be sent from
-                the configured URL and token; the library's text, which can
-                quote the token, is left out.
+                ``_retry_decision`` finds the request could not be sent and
+                ``_unsendable_error`` finds the configured URL or token at
+                fault; the library's text, which can quote the token, is left
+                out.  Otherwise the same fixed-text error is a
+                ``PaperlessError``.
             PaperlessError: ``<prefix>: <reason>``, with the token struck out
                 of the reason, chained to any other httpx2 error or the
                 ValueError unless that cause's chain quotes the token.
@@ -1486,10 +1539,9 @@ class PaperlessClient:
             response.raise_for_status()
         except httpx2.HTTPError as exc:
             if _retry_decision(exc) is _RetryDecision.MISCONFIGURED:
-                msg = _misconfigured_message(exc, prefix)
                 # from None for the reason upload_document gives: a chained
                 # h11 error would print the refused token in a traceback.
-                raise ConfigError(msg) from None
+                raise self._unsendable_error(exc, prefix) from None
             msg = f"{prefix}: {self._reason(exc)}"
             raise PaperlessError(msg) from self._cause(exc)
         try:
