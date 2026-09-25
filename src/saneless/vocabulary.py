@@ -342,15 +342,19 @@ class FlipOutcome(StrEnum):
     """
     How a manual-duplex flip wait resolved.
 
-    The three members are exhaustive over the ways that wait can end: the
-    operator turned the stack and said so, the operator gave up, or the clock
-    ran out first.  ``FlipCoordinator.wait_for_flip`` returns exactly one of
-    them, as one atomic answer -- which is the point, because the two events it
+    The four members are exhaustive over the ways that wait can end: the
+    operator turned the stack and said so, the operator gave up, the clock
+    ran out first, or saneless is stopping.  The last is not the operator's
+    decision, so unlike giving up it keeps the pages already scanned: the
+    pipeline answers it by raising ``ScanInterrupted``, the same
+    "interrupted, not cancelled" ending a SIGTERM or SIGHUP gives a one-shot
+    command.  ``FlipCoordinator.wait_for_flip`` returns exactly one of them,
+    as one atomic answer -- which is the point, because the two events it
     replaced let a waiter wake up and then have to ask a second question to
     learn why.
 
     There is deliberately no "still waiting" member.  The method only returns
-    once the wait has resolved, so a fourth value could never be observed, and
+    once the wait has resolved, so such a value could never be observed, and
     a member no caller can receive is an arm every ``match`` would have to
     carry for nothing.
     """
@@ -358,6 +362,7 @@ class FlipOutcome(StrEnum):
     CONTINUED = "CONTINUED"
     ABORTED = "ABORTED"
     TIMED_OUT = "TIMED_OUT"
+    INTERRUPTED = "INTERRUPTED"
 
 
 # The wire string for a rejected API token, named rather than written inline
@@ -520,8 +525,8 @@ SCAN_BLOCKED_URL_REASON: Final = (
 )
 
 # What startup recovery passes to ``JobStore.fail_active_jobs`` for a job the
-# previous process left in flight, and what a flip wait aborted by shutdown
-# records.
+# previous process left in flight, and how a job a server stop interrupted
+# begins its error, before the sentence naming what was kept.
 RESTART_REASON: Final = "The server restarted before this scan finished"
 
 # The words for a delivered scan that did not go cleanly.  A DONE job carrying
@@ -951,7 +956,8 @@ def flip_answer_label(outcome: FlipOutcome) -> str:
 
     ``TIMED_OUT`` has an arm for totality: a timed-out job moves to ``ERROR``
     within the same worker step, so the status area is not expected to show
-    it.
+    it.  ``INTERRUPTED`` is what a stopping server answers; a poll that lands
+    before the job's row moves on says the pages already scanned are kept.
 
     Args:
         outcome: The answer the job's flip wait received.
@@ -970,6 +976,11 @@ def flip_answer_label(outcome: FlipOutcome) -> str:
             label = "Aborting scan..."
         case FlipOutcome.TIMED_OUT:
             label = "Flip wait timed out..."
+        case FlipOutcome.INTERRUPTED:
+            label = (
+                "Stopping: saneless is shutting down and keeping the pages "
+                "already scanned..."
+            )
         case _:
             assert_never(outcome)
     return label

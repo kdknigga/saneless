@@ -386,6 +386,11 @@ class PipelineRequest:
     # change between jobs is logged.  Defaulted, like every field here, so the
     # CLI -- one scan per process, nothing to compare with -- passes none.
     device_memory: DeviceMemory | None = None
+    # Set while a failed run's pages are being preserved, and cleared once
+    # that is done, so a stopping server can wait for the pages to land in
+    # failed/ rather than exit half way through copying them.  The worker
+    # passes one; the CLI, which has no stop join to extend, passes none.
+    preserving: threading.Event | None = None
 
 
 @dataclass
@@ -1145,7 +1150,7 @@ class _PipelineRun:
             # dpi it was read back at; the artefacts are what the
             # preservation reads.
             self.artefacts.passes = self.ledger.spooled()
-            report = preservation.preserve_most_finished(self.artefacts)
+            report = self._preserve()
             sentence = report.sentence()
             if sentence is not None:
                 exc.add_note(sentence)
@@ -1153,6 +1158,27 @@ class _PipelineRun:
             # its type, attributes and traceback all survive, and
             # classify_error sees what really happened.
             raise
+
+    def _preserve(self) -> preservation.PreservationReport:
+        """
+        Keep the most finished artefact, flagging the request while it runs.
+
+        ``request.preserving`` is set for exactly as long as the pages are
+        being kept, and cleared however that ends, so a stopping server
+        waits for them only while there is something to wait for.
+
+        Returns:
+            What was kept and what went wrong.
+
+        """
+        preserving = self.request.preserving
+        if preserving is not None:
+            preserving.set()
+        try:
+            return preservation.preserve_most_finished(self.artefacts)
+        finally:
+            if preserving is not None:
+                preserving.clear()
 
     def _run(self) -> ScanResult:
         """
@@ -1327,6 +1353,9 @@ class _PipelineRun:
                 naming pass A's count, if pass B returns none, before the count
                 comparison. Otherwise, if the flip prompt itself failed, or if the
                 flip wait times out.  Both raise before pass B starts.
+            ScanInterrupted: If the server is stopping and answered the flip
+                wait with ``INTERRUPTED``.  Raised before pass B starts, and
+                pass A's fronts are kept.
             AssertionError: If the coordinator returns a value that is not a
                 FlipOutcome member.
 
@@ -1360,9 +1389,9 @@ class _PipelineRun:
         # into pass B.  An explicit abort -- web Abort, n, Ctrl-D, Ctrl-C -- is a
         # cancellation, not a scanner failure.  A broken prompt (an ABORTED that
         # carries an abort_cause) and a timeout are failures, because nobody chose
-        # to stop.  A shutdown-claimed abort also arrives here as
-        # ScanCancelledError; the worker records it as a restart by checking
-        # aborted_by_shutdown before anything else.
+        # to stop.  A server stop is its own answer, INTERRUPTED, and never
+        # arrives as a cancel: it raises ScanInterrupted, which the guard in
+        # ``execute`` answers by keeping the fronts.
         match outcome:
             case FlipOutcome.CONTINUED:
                 pass
@@ -1388,6 +1417,12 @@ class _PipelineRun:
                     "seconds: nobody confirmed the stack was flipped"
                 )
                 raise ScanError(msg)
+            case FlipOutcome.INTERRUPTED:
+                # The server is stopping.  That is nobody's decision to throw
+                # the scan away, so it is an interruption rather than a
+                # cancel, with no signal behind it.
+                msg = "The server is stopping"
+                raise ScanInterrupted(msg)
             case _:
                 assert_never(outcome)
 

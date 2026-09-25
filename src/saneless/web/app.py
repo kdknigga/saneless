@@ -37,7 +37,7 @@ from saneless.vocabulary import (
     progress_label,
     removed_pages,
 )
-from saneless.worker import STOP_JOIN_SECONDS, ScanWorker
+from saneless.worker import PRESERVATION_JOIN_SECONDS, STOP_JOIN_SECONDS, ScanWorker
 
 from .cache import MetadataCache
 from .checks_cache import CheckCache
@@ -204,7 +204,10 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
     between them, so whatever the worker's join used is gone from the
     refresher's share and the worst case stays one ``STOP_JOIN_SECONDS``
     rather than one per thread (the joins are sequential, so signalling both
-    events first does not make them overlap).
+    events first does not make them overlap).  The one exception is the
+    worker keeping a stopped scan's pages: its join is then extended by up to
+    ``PRESERVATION_JOIN_SECONDS``, so the worst case is the sum of the two,
+    and the refresher, whose share is long spent by then, gets a poll.
     The total is what matters because a refresher parked in an unbounded
     ``getaddrinfo`` or inside ``sane_get_devices`` is exactly the case the
     bound exists for, and exactly the case a per-thread bound would double --
@@ -215,7 +218,8 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
     exits for free, so its own join is skipped entirely.  The worker goes
     first because it is the thread that must be confirmed stopped before any
     resource closes, and its own stop blocks the event loop for at most
-    ``STOP_JOIN_SECONDS``, during lifespan shutdown, after uvicorn has stopped
+    ``STOP_JOIN_SECONDS`` -- plus ``PRESERVATION_JOIN_SECONDS`` while pages
+    are being kept -- during lifespan shutdown, after uvicorn has stopped
     serving.
 
     Args:
@@ -410,10 +414,13 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
                 if not stopped
             )
             logger.warning(
-                "%s did not stop within %s s; leaving the job store, Paperless "
-                "client and scanner open for process exit (current job: %s)",
+                "%s did not stop within %s s (the scan worker's join is "
+                "extended by up to %g s while a stopped scan's pages are being "
+                "preserved); leaving the job store, Paperless client and scanner "
+                "open for process exit (current job: %s)",
                 stuck,
                 STOP_JOIN_SECONDS,
+                PRESERVATION_JOIN_SECONDS,
                 worker.current_job_id,
             )
             return

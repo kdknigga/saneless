@@ -5468,7 +5468,7 @@ class TestWorkerFinish:
             store.close()
 
 
-def _raising_pipeline(error: Exception) -> Callable[..., ScanResult]:
+def _raising_pipeline(error: BaseException) -> Callable[..., ScanResult]:
     """
     Build a ``run_pipeline`` stand-in that raises ``error`` itself.
 

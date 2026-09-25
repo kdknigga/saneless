@@ -27,7 +27,13 @@ from .config import (
     config_search_paths,
     profile_storage_for_loaded,
 )
-from .exceptions import ConfigError, ScanCancelledError, failure_text
+from .exceptions import (
+    ConfigError,
+    ScanCancelledError,
+    ScanInterrupted,
+    failure_text,
+    note_text,
+)
 from .job import JobResult
 from .pipeline import (
     SCAN_LABEL_FRONT,
@@ -61,14 +67,30 @@ if TYPE_CHECKING:
     from .paperless import PaperlessClient
     from .scanner.base import ScannerBackend
 
-__all__ = ["STOP_JOIN_SECONDS", "ScanWorker", "WorkerFlipCoordinator"]
+__all__ = [
+    "PRESERVATION_JOIN_SECONDS",
+    "STOP_JOIN_SECONDS",
+    "ScanWorker",
+    "WorkerFlipCoordinator",
+]
 
 logger = logging.getLogger(__name__)
 
 # How long stop() waits for the worker thread before reporting it still alive.
-# Five seconds leaves room for uvicorn inside Docker's 10 s SIGKILL grace.
+# Five seconds leaves room for uvicorn inside Docker's default 10 s SIGKILL
+# grace whenever no scan is being preserved (see PRESERVATION_JOIN_SECONDS).
 # Deliberately not configurable.  Read at call time, so tests can shorten it.
 STOP_JOIN_SECONDS: Final = 5.0
+
+# How much longer stop() waits, past STOP_JOIN_SECONDS, while the current job
+# is still keeping its pages in failed/.  Under Docker the tmp_dir
+# and the data volume are different filesystems, so that is a copy, and a large
+# pass can take longer than the ordinary join; a process that exits half way
+# loses the pages, because a recreated container discards /tmp.  Bounded, and
+# only spent while a preservation is in flight.  The shipped compose file's
+# stop_grace_period covers it and STOP_JOIN_SECONDS together.  Deliberately not
+# configurable.  Read at call time, so tests can shorten it.
+PRESERVATION_JOIN_SECONDS: Final = 60.0
 
 # The idle loop's queue.get() timeout.  stop() does not rely on it -- the queue
 # shutdown wakes a blocked get() at once -- so it only sets how often an idle
@@ -174,8 +196,10 @@ class WorkerFlipCoordinator(FlipCoordinator):
     The web flip coordinator: one answer, for one job, claimed once, and final.
 
     The Continue and Abort routes signal it from request threads while the
-    worker thread waits on it.  Whichever of Continue, Abort or the timeout
-    claims the answer first is the answer; anything arriving later is dropped.
+    worker thread waits on it, and a stopping server answers it through
+    :meth:`interrupt_for_shutdown`.  Whichever of Continue, Abort, a stop or
+    the timeout claims the answer first is the answer; anything arriving later
+    is dropped.
 
     It is also bound to one job and accepts a signal only once armed.  The
     worker arms it when the job announces ``AWAITING_FLIP``, which is after
@@ -203,10 +227,6 @@ class WorkerFlipCoordinator(FlipCoordinator):
         self._job_id = job_id
         self._slot = FlipAnswerSlot()
         self._armed = threading.Event()
-        # Held across a shutdown's claim and its marker, so the worker thread,
-        # woken by that claim, cannot read the marker before it is set.
-        self._shutdown_lock = threading.Lock()
-        self._aborted_by_shutdown = False
 
     @property
     def job_id(self) -> str:
@@ -249,31 +269,23 @@ class WorkerFlipCoordinator(FlipCoordinator):
         """
         return self._signal(FlipOutcome.ABORTED)
 
-    def abort_for_shutdown(self) -> bool:
+    def interrupt_for_shutdown(self) -> bool:
         """
-        Answer the wait with Abort because the server is stopping.
+        Answer the wait with ``INTERRUPTED`` because the server is stopping.
 
         Arms first, so the answer lands whether the job is at the prompt or
-        still in pass A.  Only a claim made here marks the job as ended by
-        shutdown: an operator's Abort, a Continue, or a timeout that claimed
-        first keeps its own meaning.
+        still in pass A: a job in pass A meets the answer the moment it
+        reaches the prompt.  An answer the operator or the timeout already
+        claimed keeps its own meaning, because the slot keeps the first
+        answer.  The outcome itself says the server stopped the scan, so no
+        marker is needed to tell it from an operator's Abort.
 
         Returns:
             Whether this shutdown claimed the answer.
 
         """
         self.arm()
-        with self._shutdown_lock:
-            claimed = self._slot.offer(FlipOutcome.ABORTED)
-            if claimed:
-                self._aborted_by_shutdown = True
-        return claimed
-
-    @property
-    def aborted_by_shutdown(self) -> bool:
-        """Whether :meth:`abort_for_shutdown` claimed this coordinator's answer."""
-        with self._shutdown_lock:
-            return self._aborted_by_shutdown
+        return self._slot.offer(FlipOutcome.INTERRUPTED)
 
     def wait_for_flip(self, timeout: float) -> FlipOutcome:
         """
@@ -320,34 +332,6 @@ class WorkerFlipCoordinator(FlipCoordinator):
         if not self._armed.is_set():
             return False
         return self._slot.offer(outcome)
-
-
-def _ended_by_shutdown(
-    exc: Exception, coordinator: WorkerFlipCoordinator | None
-) -> bool:
-    """
-    Say whether a job ended because shutdown answered its flip wait with Abort.
-
-    ``stop()`` claims the answer as soon as a manual-duplex job is current,
-    including while pass A is still scanning, so the coordinator's marker alone
-    does not mean the job ended there.  Only a ``ScanCancelledError`` -- the
-    pipeline coming back through that aborted flip -- is a shutdown ending.  A
-    jam, an empty feeder or any other pass-A failure raised after the claim
-    stays a failure, with its own text, category and traceback.
-
-    Args:
-        exc: What ended the job.
-        coordinator: The job's flip coordinator, if it has one.
-
-    Returns:
-        True only for a cancel whose flip answer shutdown claimed.
-
-    """
-    return (
-        isinstance(exc, ScanCancelledError)
-        and coordinator is not None
-        and coordinator.aborted_by_shutdown
-    )
 
 
 class ScanWorker:
@@ -453,6 +437,11 @@ class ScanWorker:
         # every job's pipeline so a change between jobs is logged.  Touched
         # only by the worker thread, one job at a time.
         self._device_memory = DeviceMemory()
+        # Set by the pipeline, on the worker thread, while a failed job's
+        # pages are being kept, and read by stop() on the lifespan's thread
+        # to decide whether to wait longer, so an Event.  One per worker,
+        # cleared as each job starts.
+        self._preserving = threading.Event()
 
     def start(self) -> None:
         """Start the worker thread."""
@@ -553,13 +542,23 @@ class ScanWorker:
         anything, so a full queue cannot hold it.  Jobs still queued are
         abandoned on purpose, and so is a scan inside a SANE read: their rows
         stay active and the next startup's recovery fails them.  An open flip
-        wait is answered with Abort, so a job parked at the flip prompt lets
-        the thread go at once.
+        wait is answered with ``INTERRUPTED``, and one not yet reached is
+        pre-answered, so a manual-duplex job lets the thread go as soon as it
+        is at the prompt.  That is nobody's decision to discard the scan, so
+        the job keeps pass A's fronts in ``failed/`` and records the restart.
 
-        The join is bounded by ``STOP_JOIN_SECONDS``.  When this returns
-        ``False`` the thread is still running and may still write to the job
-        store, so the caller must leave the store and the Paperless client
-        open.  Calling it again, or on a worker never started, is safe.
+        The join is bounded by ``STOP_JOIN_SECONDS``.  If the thread is still
+        running then because the job is keeping its pages -- under Docker a
+        copy from ``/tmp`` to the data volume, which a large pass can make
+        slow -- the join is extended once, by up to
+        ``PRESERVATION_JOIN_SECONDS``, so the process does not exit half way
+        through the copy.  A thread busy with anything else, such as a scan
+        inside a SANE read, gets no extension.
+
+        When this returns ``False`` the thread is still running and may still
+        write to the job store, so the caller must leave the store and the
+        Paperless client open.  Calling it again, or on a worker never
+        started, is safe.
 
         Returns:
             Whether the worker thread has stopped.
@@ -571,12 +570,18 @@ class ScanWorker:
         self._queue.shutdown(immediate=True)
         coordinator = self._flip_coordinator
         if coordinator is not None:
-            # Pre-answering Abort is exactly the shutdown intent: a job waiting
-            # at the prompt aborts now, and one still in pass A aborts the
-            # moment it asks.  Only this claim records the restart reason.
-            coordinator.abort_for_shutdown()
+            # A job waiting at the prompt is interrupted now, and one still
+            # in pass A the moment it asks.  An answer the operator already
+            # gave keeps its own meaning.
+            coordinator.interrupt_for_shutdown()
         if self._thread.is_alive():
             self._thread.join(timeout=STOP_JOIN_SECONDS)
+        if self._thread.is_alive() and self._preserving.is_set():
+            logger.info(
+                "Waiting up to %s s more while a stopped scan's pages are kept",
+                PRESERVATION_JOIN_SECONDS,
+            )
+            self._thread.join(timeout=PRESERVATION_JOIN_SECONDS)
         stopped = not self._thread.is_alive()
         if stopped:
             logger.info("ScanWorker stopped")
@@ -1161,16 +1166,15 @@ class ScanWorker:
             )
 
     @staticmethod
-    def _failure_record(
-        exc: Exception, coordinator: WorkerFlipCoordinator | None = None
-    ) -> tuple[str, ErrorCategory | None]:
+    def _failure_record(exc: Exception) -> tuple[str, ErrorCategory]:
         """
         Choose the error text and category a failed job is recorded with.
 
         Stopping alone is not a cause: a Paperless error, a jam or an
         operator's Abort that happens inside the shutdown join window keeps
-        its own text and category.  Only a job that came back through a flip
-        answer the shutdown itself claimed is recorded as a restart.
+        its own text and category.  A job the stop itself ended arrives as
+        ``ScanInterrupted``, never as an ``Exception``, so it cannot reach
+        here.
 
         ``_best_effort_fail`` records a loop-level failure through this.  A
         pipeline exception in ``_scan_job`` does not: that path tells its three
@@ -1179,17 +1183,13 @@ class ScanWorker:
 
         Args:
             exc: What ended the job.
-            coordinator: The job's flip coordinator, if it has one.
 
         Returns:
-            ``RESTART_REASON`` with no category when the job ended at a flip
-            answer shutdown claimed, otherwise the exception's own text and its classified
-            category.  The text is ``failure_text``'s, so a note attached with
-            ``add_note`` is recorded with it.
+            The exception's own text and its classified category.  The text
+            is ``failure_text``'s, so a note attached with ``add_note`` is
+            recorded with it.
 
         """
-        if _ended_by_shutdown(exc, coordinator):
-            return RESTART_REASON, None
         return failure_text(exc), classify_error(exc)
 
     def _record_loop_failure(self) -> None:
@@ -1498,9 +1498,11 @@ class ScanWorker:
         this returns normally.  A store write inside a pipeline callback -- the
         thumbnail or an active state -- is not one: it is logged and the scan
         carries on, so a locked job database cannot change how a scan ends
-        (see :meth:`_store_progress_state`).  A cancel is
-        recorded as CANCELLED, and a flip answer claimed by shutdown as ERROR
-        with ``RESTART_REASON``; neither is a failure.  The loop's own store
+        (see :meth:`_store_progress_state`).  A cancel is recorded as
+        CANCELLED, and a server stop -- ``ScanInterrupted``, which is not an
+        ``Exception`` and would otherwise end the worker thread -- as ERROR
+        with ``RESTART_REASON`` followed by whatever the pipeline kept;
+        neither is a failure.  The loop's own store
         writes -- SCANNING before the pipeline, and the terminal write of
         either outcome -- are never swallowed, so their failure escapes to
         ``_run`` as a loop-level failure.  A failed terminal write is owed
@@ -1511,6 +1513,9 @@ class ScanWorker:
 
         """
         self._job_store.update_state(job.id, JobState.SCANNING)
+        # A previous job's preservation always clears it on the way out; this
+        # is the belt to that brace, so a stop never waits on a stale flag.
+        self._preserving.clear()
 
         # Flip machinery follows profile.duplex alone, the same field
         # run_pipeline reads to choose the strategy.  source is a pure SANE
@@ -1582,11 +1587,11 @@ class ScanWorker:
                 # cannot accept a click sent during pass A.
                 coordinator.arm()
                 if self._stopping.is_set():
-                    # stop() may have run while this job was still in pass A,
-                    # found no prompt to answer, and returned to its join.
-                    # Abort now, or the wait would hold the thread for
+                    # stop() may have run before this job had a coordinator,
+                    # found nothing to answer, and returned to its join.
+                    # Interrupt now, or the wait would hold the thread for
                     # flip_timeout_seconds after shutdown began.
-                    coordinator.abort_for_shutdown()
+                    coordinator.interrupt_for_shutdown()
             # Only a write that landed advances persisted_state, so a state
             # whose write failed is tried again at the next event instead of
             # being taken as already on the row.
@@ -1607,6 +1612,7 @@ class ScanWorker:
             pass_count_callback=_pass_count_cb,
             flip_coordinator=coordinator,
             device_memory=self._device_memory,
+            preserving=self._preserving,
         )
         try:
             # The gate covers the whole pipeline call, which is the whole of
@@ -1626,31 +1632,35 @@ class ScanWorker:
                     self._settings,
                     request,
                 )
+        except ScanInterrupted as exc:
+            # The server is stopping, and the pipeline has already kept what
+            # it had; its note says where.  Caught by name because it is a
+            # BaseException: escaping here would end the worker thread with
+            # the row still active.  Not a failure, so no category, no ERROR
+            # line and no traceback, and not a cancel either: nobody chose to
+            # throw the scan away.  Like every ending below, this is the
+            # worker thread's own final write, so the rule against a
+            # shutdown-time write -- about the lifespan writing over a running
+            # thread -- holds.
+            kept = note_text(exc)
+            error = f"{RESTART_REASON}. {kept}" if kept else RESTART_REASON
+            self._finish_or_owe(job.id, _OwedWrite(JobState.ERROR, error=error))
+            logger.info("Job %s ended by shutdown: %r", job.id, error)
+            return
         except Exception as exc:
             # No result argument: outcome, warning and all three page counts
             # stay NULL.  NULL means "never recorded"; 0 would claim a
             # measurement a job that never reached the scanner did not make.
             # If this write raises, the job ending could not be recorded, and
             # that is the loop's failure; the write is owed first, so the
-            # pipeline's own ending is what lands later.  While stopping this
-            # is the worker thread's own final write, so the rule against a
-            # shutdown-time write -- which is about the lifespan writing over
-            # a running thread -- holds.
+            # pipeline's own ending is what lands later.
             #
-            # Three endings, three branches.  The shutdown check stays first:
-            # stop() answers the flip wait with Abort, and that Abort reaches
-            # the pipeline exactly as an operator's does, so it comes back as
-            # ScanCancelledError too.  It is a shutdown only when the job
-            # really came back through that aborted flip: stop() claims the
-            # answer while pass A is still scanning, and a jam or an empty
-            # feeder there is a failure with its own text, category and
-            # traceback, not a restart.
-            if _ended_by_shutdown(exc, coordinator):
-                self._finish_or_owe(
-                    job.id, _OwedWrite(JobState.ERROR, error=RESTART_REASON)
-                )
-                logger.info("Job %s ended by shutdown: %s", job.id, exc)
-            elif isinstance(exc, ScanCancelledError):
+            # Two endings, two branches.  A stop is not among them: it
+            # arrives as ScanInterrupted above, so a ScanCancelledError is
+            # always the operator's cancel, and a jam or an empty feeder
+            # raised after stop() claimed the flip is a failure with its own
+            # text, category and traceback.
+            if isinstance(exc, ScanCancelledError):
                 # The operator ended the scan.  Not a failure, so no category,
                 # no ERROR line and no traceback.
                 self._finish_or_owe(

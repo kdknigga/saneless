@@ -347,8 +347,7 @@ class ClickFlipCoordinator(FlipCoordinator):
         """Start unanswered, with no abort cause."""
         self._slot = FlipAnswerSlot()
         # Held across a broken prompt's claim and its cause, so the calling
-        # thread, woken by that claim, cannot read the cause before it is set
-        # (as WorkerFlipCoordinator.abort_for_shutdown does).
+        # thread, woken by that claim, cannot read the cause before it is set.
         self._cause_lock = threading.Lock()
         self._abort_cause: Exception | None = None
 
