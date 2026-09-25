@@ -19,7 +19,7 @@ import logging
 import re
 import tempfile
 from datetime import UTC, datetime
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -52,6 +52,28 @@ _MAX_PART_LENGTH = 16
 __all__ = ["assemble_pdf", "build_pdf_filename", "sanitise_title_for_filename"]
 
 logger = logging.getLogger(__name__)
+
+
+def _producer() -> str:
+    """
+    Name saneless and its installed version, for every PDF's ``/Producer``.
+
+    Resolved once, when the module loads, and outside assembly's catch-all:
+    run from a source tree with no installed distribution, the lookup raises
+    ``PackageNotFoundError``, and inside that catch-all it would have failed
+    every scan as an assembly error.  A bare ``saneless`` is still true.
+
+    Returns:
+        ``saneless <version>``, or ``saneless`` when no version is installed.
+
+    """
+    try:
+        return f"saneless {version('saneless')}"
+    except PackageNotFoundError:
+        return "saneless"
+
+
+_PRODUCER = _producer()
 
 
 def sanitise_title_for_filename(title: str) -> str:
@@ -312,7 +334,7 @@ def assemble_pdf(
             # the merge's primary input, and qpdf keeps the primary's /Info.
             metadata = {
                 "title": title,
-                "producer": f"saneless {version('saneless')}",
+                "producer": _PRODUCER,
                 "creator": "saneless",
             }
             singles: list[str] = []

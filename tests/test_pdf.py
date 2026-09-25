@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import sys
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -659,6 +659,31 @@ class TestDocumentInfo:
             producer = str(docinfo["/Producer"])
         assert producer.startswith("saneless ")
         assert producer == f"saneless {version('saneless')}"
+
+    def test_a_missing_distribution_never_fails_an_assembly(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Run from a source tree, the version is unknown and the scan still works.
+
+        The lookup used to run inside assembly's catch-all, where a missing
+        distribution became a PdfError on every scan.  It is resolved once at
+        import instead, falling back to a bare ``saneless``.
+        """
+
+        def not_installed(_name: str) -> str:
+            raise PackageNotFoundError(_name)
+
+        monkeypatch.setattr(pdf_mod, "version", not_installed)
+        records = spool_pages([Image.new("RGB", (100, 100), "white")])
+
+        pdf_path = assemble_pdf(records, output_dir, filename="x.pdf", title="t")
+
+        assert pdf_path.is_file()
+        assert pdf_mod._producer() == "saneless"
 
     def test_a_merged_document_keeps_its_info_and_no_extra_page(
         self,
