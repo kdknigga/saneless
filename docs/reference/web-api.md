@@ -295,7 +295,7 @@ Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt.
 
 ## Errors
 
-Every error response saneless renders -- a refused scan, a validation failure, a blocked cross-site request, an unknown path, an unexpected server error -- has one of two body forms, chosen by the `HX-Request` request header. The status code is the same either way.
+Every error response saneless renders -- a refused scan, a validation failure, a refused Host, a blocked cross-site request, an unknown path, an unexpected server error -- has one of two body forms, chosen by the `HX-Request` request header. The status code is the same either way.
 
 | Request | Body | Extra headers |
 |---------|------|---------------|
@@ -304,7 +304,7 @@ Every error response saneless renders -- a refused scan, a validation failure, a
 
 A `429` carries `Retry-After: 30` in both forms.
 
-The message is a fixed sentence chosen by saneless for the kind of error. It never echoes request input or internal exception text. The error from [`GET /api/paperless/test`](#get-apipaperlesstest) and the `503` bodies from [`GET /health`](#get-health) keep their own shapes, documented above.
+The message is a fixed sentence chosen by saneless for the kind of error. It never echoes request input or internal exception text. One refusal repeats one value beside the sentence: a `421` names the `Host` it refused, so you know which name to add to `[web] allowed_hosts`. The value is shown under Technical details in the HTML fragment and as a separate `"host"` field in the JSON form (`{"status": "error", "detail": "<message>", "host": "<host>"}`). Control characters in it are shown as visible escapes, and it is cut to at most 255 characters. The error from [`GET /api/paperless/test`](#get-apipaperlesstest) and the `503` bodies from [`GET /health`](#get-health) keep their own shapes, documented above.
 
 ### Every rejection
 
@@ -326,6 +326,7 @@ One sentence per kind of refusal, and every sentence is a fixed developer consta
 | `METHOD_NOT_ALLOWED` | 405 | That action is not allowed. Reload the page, then try again. |
 | `INTERNAL` | 500 | Something went wrong on the server. Check the server log for details, then try again. |
 | `CLIENT_ERROR` | 400 | The request could not be completed. Reload the page, then try again. |
+| `HOST_NOT_ALLOWED` | 421 | saneless does not answer to this address. Add the host name you used to [web] allowed_hosts in the saneless config file, then restart saneless. |
 
 **`TOKEN_UNSET` is new, and it is deliberately not `WORKER_DEGRADED`.** The scan service is working perfectly well; nobody set the paperless-ngx API token. Saying "the scan service was unavailable" would send a household member looking for a broken server, so the refusal says what is actually wrong and which file fixes it. A placeholder token counts as unset: saneless keeps a small fixed list of literals such as `changeme` and `your-api-token-here`, and an empty or whitespace-only token is the same case. See [Docker: placeholder tokens are detected](docker.md#placeholder-tokens-are-detected).
 
@@ -341,6 +342,20 @@ While the token is unset the Scan button also renders disabled with the reason b
 - There is no authentication on the API. saneless assumes a trusted LAN; use a reverse proxy for auth if needed. The web server binds to `web_host`, which defaults to `0.0.0.0` -- all network interfaces -- so every host that can reach the port can use the API.
 - `POST /api/scan` returns once the job is queued or refused; it does not wait for the scan. Poll `/api/jobs/current/status` for progress.
 
+### Host check
+
+saneless answers a request only when its `Host` header names saneless. The check covers every request, of any method, including `GET /health` and the static files, and it runs before any other check. Without configuration, saneless answers to:
+
+- IP addresses: dotted IPv4 such as `192.168.1.5`, and IPv6 in brackets such as `[::1]`;
+- `localhost`, and any other name without a dot, such as a Docker Compose service name;
+- names ending in `.local`, `.home.arpa`, `.internal` or `.lan`.
+
+The port is ignored, case does not matter, and one trailing dot is dropped. To reach saneless by any other name, such as a reverse proxy's public name, add it to [`[web] allowed_hosts`](configuration.md#web). The list adds to the names above and never replaces them, so `http://<lan-ip>:8080` always keeps working.
+
+Only `Host` is read. `X-Forwarded-Host` is never consulted, so a trusted value there does not rescue a request whose `Host` is refused.
+
+A request whose `Host` is a well-formed name that saneless does not answer to gets `421` with the `HOST_NOT_ALLOWED` sentence and the refused `Host` beside it (see [Errors](#errors)). The server logs one warning per refusal naming the `Host`, the method and the path. A request with no `Host`, an empty one, two of them, or one that is not a valid host name gets `400` with the `CLIENT_ERROR` sentence.
+
 ### Cross-site requests
 
 saneless rejects state-changing requests that did not come from a saneless page, so a web page on another site cannot start a scan or answer a flip prompt in your browser. `GET`, `HEAD` and `OPTIONS` requests are never checked; every other request is checked as follows:
@@ -353,9 +368,11 @@ A rejected request gets `403` with the message "This request was blocked because
 
 Browsers do not send `Sec-Fetch-Site` to a plain-HTTP address such as `http://<lan-ip>:8080`, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it at all, so those requests are checked by `Origin` against `Host`. A reverse proxy in front of saneless should therefore preserve the original `Host` header (nginx: `proxy_set_header Host $host;`) or set `X-Forwarded-Host`, over HTTPS as well as plain HTTP; otherwise every scan from such a browser is rejected. See [Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy).
 
-**This check does not stop DNS rebinding.** It compares the page's origin with the address the browser sent the request to, and it cannot tell whether that address really is saneless. A hostile site can make its own hostname resolve first to its server and then to saneless's LAN address. The browser then treats the hostile page and saneless as the same origin, the `Origin` and `Host` headers agree, and the page's requests pass the check. Because the API has no authentication, such a page can start scans. To close this gap, do one of the following:
+**The Host check is what stops DNS rebinding.** A hostile site can make its own hostname resolve first to its server and then to saneless's LAN address. The browser then treats the hostile page and saneless as the same origin, so the `Origin` and `Host` headers agree and the cross-site check above passes. Before the Host check existed, such a page could read job titles, scan previews and your paperless-ngx tag and correspondent names, as well as start scans. Its requests still carry the hostile hostname in `Host`, though, and the Host check refuses them with `421` before they reach anything else.
 
-- Put saneless behind a reverse proxy that answers only requests for its own hostname, and make saneless itself reachable only by the proxy (for example, set `web_host` to an address only the proxy can reach). A rebinding page's requests carry the hostile hostname in `Host`, so the proxy refuses them. See [Answering only your own hostname](../how-to/deploy-docker-compose.md#answering-only-your-own-hostname).
+That protection holds only while `[web] allowed_hosts` names only hosts you control. Adding a name tells saneless to answer to it; there is no wildcard, so a single entry cannot turn the check off. Two further measures remain useful as defence in depth:
+
+- Put saneless behind a reverse proxy that answers only requests for its own hostname, and make saneless itself reachable only by the proxy (for example, set `web_host` to an address only the proxy can reach). See [Answering only your own hostname](../how-to/deploy-docker-compose.md#answering-only-your-own-hostname).
 - Use a DNS resolver with rebind protection, which refuses to return private addresses for public hostnames. Many home routers offer this, as do dnsmasq (`--stop-dns-rebind`) and Pi-hole.
 
 ### No API schema or interactive documentation

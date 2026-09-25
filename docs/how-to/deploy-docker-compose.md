@@ -155,7 +155,16 @@ See [Environment Variables](../reference/environment-variables.md) for the full 
 
 ## Running behind a reverse proxy
 
-saneless rejects state-changing requests that did not come from a saneless page (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A reverse proxy in front of saneless has to leave the browser's view of the site intact, or saneless mistakes your own scans for cross-site requests.
+saneless answers only requests whose `Host` names it (see [Host check](../reference/web-api.md#host-check)), and it rejects state-changing requests that did not come from a saneless page (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A reverse proxy in front of saneless has to leave the browser's view of the site intact, or saneless mistakes your own scans for cross-site requests.
+
+**Add the proxy's public name to `[web] allowed_hosts`.** A proxy that passes the original `Host` header, as described next, sends saneless the name the browser used, such as `scan.example.com`. saneless answers to IP addresses, names without a dot, and names under `.local`, `.home.arpa`, `.internal` and `.lan` without configuration; any other name gets `421` with "saneless does not answer to this address." until you list it:
+
+```toml
+[web]
+allowed_hosts = ["scan.example.com"]
+```
+
+or `SANELESS_WEB__ALLOWED_HOSTS='["scan.example.com"]'` in the environment. A leading-dot entry such as `.example.com` covers that domain and every name under it. See [Allowed host names](../reference/configuration.md#allowed-host-names).
 
 **Have the proxy pass the original `Host` header, or set `X-Forwarded-Host`, whatever the scheme.** When the browser sends no `Sec-Fetch-Site`, saneless compares the browser's `Origin` with `Host` and `X-Forwarded-Host`. Browsers never send `Sec-Fetch-Site` over plain HTTP, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it over HTTPS either. Behind an HTTPS proxy, current browsers do send it and saneless decides from that header alone, so HTTPS usually works without this step, but an older browser is then rejected. nginx replaces `Host` with the upstream address by default, so tell it to pass the original:
 
@@ -177,7 +186,7 @@ Other proxies:
 
 ### Answering only your own hostname
 
-The cross-site check cannot stop a DNS rebinding attack, in which a hostile site makes its own hostname resolve to saneless's address (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A proxy that answers only saneless's hostname closes that gap, because a rebinding page's requests carry the hostile hostname in `Host`. With nginx, add a default server that drops every other hostname:
+saneless itself refuses a DNS rebinding attack, in which a hostile site makes its own hostname resolve to saneless's address: the rebinding page's requests carry the hostile hostname in `Host`, and saneless answers them with `421` (see [Host check](../reference/web-api.md#host-check)). A proxy that answers only saneless's hostname adds a second layer in front of that check, as defence in depth. Its hostname still has to be in `[web] allowed_hosts`, as described above. With nginx, add a default server that drops every other hostname:
 
 ```nginx
 server {
@@ -196,7 +205,7 @@ server {
 }
 ```
 
-A Caddy site block named after a hostname and a Traefik router with a `Host()` rule match only that hostname in the same way. This protects saneless only if browsers cannot reach it directly: do not publish its port on the host (drop `ports:` and put the proxy on the same Docker network), or bind it to an address only the proxy can reach.
+A Caddy site block named after a hostname and a Traefik router with a `Host()` rule match only that hostname in the same way. This layer protects saneless only if browsers cannot reach it directly: do not publish its port on the host (drop `ports:` and put the proxy on the same Docker network), or bind it to an address only the proxy can reach.
 
 ## Updating
 

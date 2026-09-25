@@ -12,6 +12,13 @@ consume_dir = "/path/to/paperless/consume"
 # tmp_dir = "/tmp/saneless-1000"  # default: $TMPDIR/saneless-<uid>, created 0700
 # log_level = "INFO"     # DEBUG, INFO, WARNING, ERROR or CRITICAL
 
+[web]
+# Extra host names the web UI answers to. IP addresses, localhost, names
+# without a dot and names under .local, .home.arpa, .internal and .lan always
+# work; add a reverse proxy's public name here. ".example.com" covers that
+# domain and every name under it. No "*", port, scheme or path.
+# allowed_hosts = ["scan.example.com"]
+
 [profiles.default]
 source = "Flatbed"
 resolution = 300

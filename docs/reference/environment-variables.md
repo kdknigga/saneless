@@ -64,8 +64,13 @@ Settings are resolved in this order (highest to lowest priority):
 |----------|-------------|------|---------|
 | `SANELESS_WEB__SHOW_TAGS` | `web.show_tags` | bool | `false` |
 | `SANELESS_WEB__SHOW_CORRESPONDENT` | `web.show_correspondent` | bool | `false` |
+| `SANELESS_WEB__ALLOWED_HOSTS` | `web.allowed_hosts` | JSON list of strings | `'["scan.example.com", ".home.example"]'` |
 
-Both default to `true`. Setting one to `false` hides that control on the scan form; the profile's `default_tags` and `default_correspondent` still apply, so hiding a control changes the form and never the scan. The web server's bind address is **not** in this section: it is `SANELESS_OUTPUT__WEB_HOST` and `SANELESS_OUTPUT__WEB_PORT` above. See [`[web]`](configuration.md#web).
+The two `SHOW_*` variables default to `true`. Setting one to `false` hides that control on the scan form; the profile's `default_tags` and `default_correspondent` still apply, so hiding a control changes the form and never the scan.
+
+The allowed-hosts variable must be a JSON list, even for one name: `'["scan.example.com"]'`. A bare `scan.example.com` is not valid JSON and stops saneless starting. The names it lists are added to the ones saneless always answers to; see [Allowed host names](configuration.md#allowed-host-names).
+
+The web server's bind address is **not** in this section: it is `SANELESS_OUTPUT__WEB_HOST` and `SANELESS_OUTPUT__WEB_PORT` above. See [`[web]`](configuration.md#web).
 
 ### Not a saneless variable: `TZ`
 

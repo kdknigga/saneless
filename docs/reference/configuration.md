@@ -144,24 +144,41 @@ In the path settings (`tmp_dir`, `data_dir`, `log_file`, and `consume_dir` under
 
 ## `[web]`
 
-Which optional controls the scan form shows. Both default to `true`, so an existing deployment's form is unchanged by upgrading.
+Which optional controls the scan form shows, and which extra host names saneless answers to. Both form keys default to `true`, so an existing deployment's form is unchanged by upgrading.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `show_tags` | bool | `true` | Show the Tags checkbox list on the scan form. `false` hides the whole Tags block, filter included |
 | `show_correspondent` | bool | `true` | Show the Correspondent dropdown on the scan form. `false` hides it |
+| `allowed_hosts` | list of strings | `[]` | Extra host names saneless answers to, on top of the ones it always answers to. See [Allowed host names](#allowed-host-names) |
 
 This is one appliance with one configured form shape, not a per-browser preference: everyone who opens the page sees the same form, and there is no control in the UI to turn either back on. Edit the file and restart saneless.
 
 **Hiding a control changes the form, never the scan.** The profile's `default_tags` and `default_correspondent` still apply to every scan it runs, exactly as they do when the controls are visible and left untouched -- the same way a blank title still falls back to the profile's `title`. So `show_tags = false` with `default_tags = [3, 7]` means every scan from that profile is tagged 3 and 7, and nobody has to think about it. Use this to hand a household member a form with a Profile, a Title and a Scan button.
 
-**The bind address is not here.** `web_host` and `web_port` stayed under [`[output]`](#output), where they have always been, because moving them would break every deployment that already sets them or their `SANELESS_OUTPUT__WEB_*` variables. `[web]` holds only the form-shape keys.
+**The bind address is not here.** `web_host` and `web_port` stayed under [`[output]`](#output), where they have always been, because moving them would break every deployment that already sets them or their `SANELESS_OUTPUT__WEB_*` variables. `[web]` holds the form-shape keys and `allowed_hosts`, the names saneless answers to; `[output]` holds the address it listens on.
 
 ```toml
 [web]
 show_tags = true
 show_correspondent = false
+allowed_hosts = ["scan.example.com", ".home.example"]
 ```
+
+### Allowed host names
+
+saneless refuses every request whose `Host` header does not name it, with `421 Misdirected Request`. This is what stops a web page on another site from reaching saneless through DNS rebinding; see [Host check](web-api.md#host-check). Without configuration, saneless answers to IP addresses (IPv4, and IPv6 in brackets), `localhost` and every other name without a dot, and names ending in `.local`, `.home.arpa`, `.internal` or `.lan`.
+
+`allowed_hosts` adds names to that set. It never replaces it, so adding a name cannot lock you out of `http://<lan-ip>:8080`. Each entry is one of:
+
+- **An exact name**, such as `scan.example.com`. It matches that name only, not `www.scan.example.com`.
+- **A suffix with a leading dot**, such as `.example.com`. It matches `example.com` itself and every name under it, such as `scan.example.com` and `a.b.example.com`.
+
+Entries are compared without case, and the port a request uses does not matter, so write the name alone. A suffix must contain a dot after its leading one: `.com` is refused, because it would trust a whole top-level domain.
+
+There is no `*`. A single wildcard would turn the check off for every name at once, which is exactly what DNS rebinding needs. An empty entry, a `*` anywhere, a port (`scan.example.com:8080`), a scheme (`https://scan.example.com`), a path, a user name, whitespace or a non-ASCII character is a configuration error, and saneless does not start. Write an international name in its `xn--` form. An IP address needs no entry: every IP address is already answered.
+
+A reverse proxy that keeps the original `Host` header -- as it should -- sends its public name to saneless, so put that name here. See [Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy).
 
 ## `[profiles.NAME]`
 
