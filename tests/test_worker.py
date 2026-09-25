@@ -3927,6 +3927,78 @@ class TestWorkerDegradedHealth:
         assert row.state is JobState.ERROR
         assert row.error == RESTART_REASON
 
+    def test_recovered_workspace_texts_are_written_before_the_restart_reason(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A row whose pages startup recovered is told where they went.
+
+        The texts handed to ``mark_recovery_pending`` are written first, so
+        the blanket ``RESTART_REASON`` reaches only the rows with no text.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        recovered_job = store.create_job("default", "Pages Recovered")
+        store.update_state(recovered_job.id, JobState.SCANNING)
+        plain_job = store.create_job("default", "Nothing Recovered")
+        store.update_state(plain_job.id, JobState.SCANNING)
+        text = f"{RESTART_REASON}. The scan was preserved at /data/failed/a.pdf"
+        probes = _StoreFault(store.probe)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.mark_recovery_pending({recovered_job.id: text})
+            worker.start()
+            at_start = worker.health
+            probes.heal()
+            recovered = poll_until(
+                lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
+            )
+            with_text = _get(store, recovered_job.id)
+            without_text = _get(store, plain_job.id)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert at_start is WorkerHealth.DEGRADED
+        assert recovered
+        assert (with_text.state, with_text.error) == (JobState.ERROR, text)
+        assert (without_text.state, without_text.error) == (
+            JobState.ERROR,
+            RESTART_REASON,
+        )
+
+    def test_recovered_workspace_texts_survive_a_failed_write(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A first write of the texts that fails is retried, not dropped."""
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        job = store.create_job("default", "Pages Recovered")
+        store.update_state(job.id, JobState.SCANNING)
+        text = f"{RESTART_REASON}. The scan was preserved at /data/failed/b.pdf"
+        writes = _StoreFault(store.fail_recovered_jobs, frozenset({1}))
+        monkeypatch.setattr(store, "fail_recovered_jobs", writes)
+        worker = worker_for(store)
+        try:
+            worker.mark_recovery_pending({job.id: text})
+            worker.start()
+            recovered = poll_until(
+                lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
+            )
+            row = _get(store, job.id)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert recovered
+        assert len(writes.calls) == 2
+        assert (row.state, row.error) == (JobState.ERROR, text)
+
     def test_probe_is_not_called_while_not_degraded(
         self,
         worker_for: Callable[[JobStore], ScanWorker],

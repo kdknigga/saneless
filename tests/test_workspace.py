@@ -7,7 +7,9 @@ all that is left of the scan, so it has to be recognisable as a dead job's and
 findable without ever touching a live scan that shares ``tmp_dir``. These tests
 pin the naming, the privacy of what is inside, the lock that proves liveness,
 the cleanup on every exit path, and the discovery of workspaces whose owner is
-gone, including one left behind by a real SIGKILL in a child process.
+gone, including one left behind by a real SIGKILL in a child process, and the
+sweep that turns such a workspace's pages into a PDF (or keeps the raw pages)
+in ``failed/``.
 """
 
 from __future__ import annotations
@@ -19,26 +21,35 @@ import logging
 import os
 import re
 import stat
-import subprocess
-import sys
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+import pikepdf
 import pytest
 from PIL import Image
 
+import saneless.preservation as preservation_module
 import saneless.workspace as workspace_mod
+from saneless.exceptions import PdfError
+from saneless.spool import SpooledPageSink
 from saneless.workspace import (
     LOCK_FILE_NAME,
     METADATA_FILE_NAME,
     SPOOL_DIR_NAME,
     JobWorkspace,
     OrphanWorkspace,
+    RecoveredWorkspace,
     find_orphans,
+    sweep_orphans,
 )
+from tests.conftest import leave_killed_workspace
+from tests.golden_support import distinct_page, embedded_streams, png_idat
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
+
+    from saneless.scanner.base import PageRecord
 
 _LOGGER = "saneless.workspace"
 _JOB_ID = "3f9c2a71-aaaa"
@@ -46,34 +57,6 @@ _TITLE = "Tax 2026"
 _PROFILE = "default"
 _PRIVATE_DIR = 0o700
 _PRIVATE_FILE = 0o600
-_CHILD_TIMEOUT_SECONDS = 30
-_SIGKILL_RETURNCODE = -9
-
-# The child enters a real workspace, spools two pages the way the scanner
-# does (PNG with a 300 dpi pHYs chunk), says where it is, and dies without
-# running a single ``finally`` or ``__exit__``.
-_SIGKILL_CHILD = """\
-import os
-import signal
-from pathlib import Path
-
-from PIL import Image
-
-from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace
-
-tmp_dir = Path(os.environ["SANELESS_TEST_TMP_DIR"])
-with JobWorkspace(
-    tmp_dir,
-    job_id=os.environ["SANELESS_TEST_JOB_ID"],
-    title=os.environ["SANELESS_TEST_TITLE"],
-    profile=os.environ["SANELESS_TEST_PROFILE"],
-) as path:
-    spool = path / SPOOL_DIR_NAME
-    for name in ("a-0001.png", "a-0002.png"):
-        Image.new("L", (64, 64), 255).save(spool / name, dpi=(300, 300))
-    print(path, flush=True)
-    os.kill(os.getpid(), signal.SIGKILL)
-"""
 
 
 @pytest.fixture
@@ -159,42 +142,6 @@ def _raise_inside(scratch: Path, error: Exception, seen: list[Path]) -> None:
     with JobWorkspace(scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE) as path:
         seen.append(path)
         raise error
-
-
-def _run_sigkill_child(script: Path, scratch: Path) -> subprocess.CompletedProcess[str]:
-    """
-    Run ``script`` in a child that enters a workspace and SIGKILLs itself.
-
-    Every argv element is a literal and the per-run values travel in the
-    environment, as ``test_pdf._measure_assembly`` does: ``sys.executable`` in
-    the argv would take the call off ruff's S603 allow-list, and this project
-    adds no suppressions.
-
-    Args:
-        script: The child source, already written to disk.
-        scratch: The shared scratch directory the child creates its workspace in.
-
-    Returns:
-        The completed child, its output captured as text.
-
-    """
-    env = {
-        **os.environ,
-        "SANELESS_TEST_PYTHON": sys.executable,
-        "SANELESS_TEST_SCRIPT": str(script),
-        "SANELESS_TEST_TMP_DIR": str(scratch),
-        "SANELESS_TEST_JOB_ID": _JOB_ID,
-        "SANELESS_TEST_TITLE": _TITLE,
-        "SANELESS_TEST_PROFILE": _PROFILE,
-    }
-    return subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" "$SANELESS_TEST_SCRIPT"'],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_CHILD_TIMEOUT_SECONDS,
-    )
 
 
 class TestJobWorkspaceLayout:
@@ -371,17 +318,12 @@ class TestSigkillOrphan:
     """A workspace outlives a SIGKILL, and is found as a dead job's."""
 
     def test_sigkilled_workspace_is_found_with_pages_and_metadata(
-        self, tmp_path: Path, scratch: Path
+        self, scratch: Path
     ) -> None:
         """No finalizer runs: the pages and the job's identity survive the kill."""
-        script = tmp_path / "sigkill_child.py"
-        script.write_text(_SIGKILL_CHILD, encoding="utf-8")
-
-        completed = _run_sigkill_child(script, scratch)
-
-        assert completed.returncode == _SIGKILL_RETURNCODE, completed.stderr
-        workspace = scratch / completed.stdout.strip().rsplit("/", 1)[-1]
-        assert str(workspace) == completed.stdout.strip()
+        workspace = leave_killed_workspace(
+            scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE
+        )
         assert workspace.is_dir()
 
         orphans = find_orphans(scratch)
@@ -559,3 +501,333 @@ class TestFindOrphans:
         caplog.set_level(logging.WARNING, logger=_LOGGER)
         assert find_orphans(tmp_path / "missing") == []
         assert [r.levelno for r in caplog.records] == [logging.WARNING]
+
+
+# --- The sweep: an orphan's pages end up in failed/ --------------------------
+
+# How many bytes of a whole PNG a "truncated" page keeps: its signature and
+# the start of its header, and none of its pixel data.
+_TRUNCATED_BYTES = 100
+
+
+@pytest.fixture
+def failed_dir(tmp_path: Path) -> Path:
+    """Return where preserved scans go; it does not exist until one is kept."""
+    return tmp_path / "data" / "failed"
+
+
+def _plant_dead_workspace(
+    scratch: Path, *, job_id: str = _JOB_ID, title: str = _TITLE, suffix: str = "x1"
+) -> Path:
+    """
+    Build the workspace a dead job leaves behind: free lock, metadata, spool.
+
+    Args:
+        scratch: The shared scratch directory.
+        job_id: The job id the metadata records.
+        title: The title the metadata records.
+        suffix: The random part of the directory name.
+
+    Returns:
+        The planted workspace.
+
+    """
+    metadata = json.dumps({"job_id": job_id, "title": title, "profile": _PROFILE})
+    return _plant_orphan(
+        scratch, f"job-{job_id[:8]}-{suffix}", metadata.encode("utf-8")
+    )
+
+
+def _spool_pages(
+    spool: Path, label: str, count: int, *, first: int = 0
+) -> tuple[PageRecord, ...]:
+    """
+    Spool ``count`` distinct pages into ``spool`` through the real sink.
+
+    The sink writes each page as the scanner's pages are written: through a
+    ``.part`` file, with the dpi in the PNG's pHYs chunk.
+
+    Args:
+        spool: The spool directory, which must exist.
+        label: The pass label, ``a`` or ``b``.
+        count: How many pages to spool.
+        first: The ``distinct_page`` index of the first page.
+
+    Returns:
+        The records the sink made, in acquisition order.
+
+    """
+    sink = SpooledPageSink(spool, label, 0)
+    for index in range(count):
+        sink.add(distinct_page(first + index), dpi=300)
+    return sink.records
+
+
+def _streams(records: Sequence[PageRecord]) -> list[bytes]:
+    """Return the image data each record's file would embed, in order."""
+    return [png_idat(record.path.read_bytes()) for record in records]
+
+
+def _pdfs(failed_dir: Path) -> list[Path]:
+    """Return the PDFs in ``failed_dir``, by name; none if it does not exist."""
+    return sorted(failed_dir.glob("*.pdf")) if failed_dir.exists() else []
+
+
+def _page_dirs(failed_dir: Path) -> list[Path]:
+    """Return the page-file directories in ``failed_dir``, by name."""
+    if not failed_dir.exists():
+        return []
+    return sorted(entry for entry in failed_dir.iterdir() if entry.is_dir())
+
+
+def _sweep_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return the workspace module's WARNING records."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == _LOGGER and record.levelno == logging.WARNING
+    ]
+
+
+class TestSweepOrphans:
+    """An orphan's pages become a PDF in ``failed/``, or stay as page files."""
+
+    def test_a_sigkilled_scan_becomes_a_partial_pdf(
+        self,
+        scratch: Path,
+        failed_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A real SIGKILL: two spooled pages, one two-page (partial) PDF."""
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        workspace = leave_killed_workspace(
+            scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE
+        )
+
+        recovered = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert len(recovered) == 1
+        only = recovered[0]
+        assert isinstance(only, RecoveredWorkspace)
+        assert (only.job_id, only.title, only.pages) == (_JOB_ID, _TITLE, 2)
+        pdfs = _pdfs(failed_dir)
+        assert len(pdfs) == 1
+        assert pdfs[0].name.endswith("-partial.pdf")
+        with pikepdf.open(pdfs[0]) as pdf:
+            assert len(pdf.pages) == 2
+        assert only.sentence is not None
+        assert f"preserved at {pdfs[0]}" in only.sentence
+        assert not workspace.exists()
+        assert _page_dirs(failed_dir) == []
+        named = [
+            record.getMessage()
+            for record in _sweep_warnings(caplog)
+            if _JOB_ID in record.getMessage()
+        ]
+        assert len(named) == 1
+        assert repr(_TITLE) in named[0]
+        assert str(pdfs[0]) in named[0]
+
+    def test_a_live_workspace_is_left_alone(
+        self, scratch: Path, failed_dir: Path
+    ) -> None:
+        """A workspace whose lock is held belongs to a running scan."""
+        with JobWorkspace(
+            scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE
+        ) as live:
+            _spool_pages(live / SPOOL_DIR_NAME, "a", 2)
+            before = _snapshot(live)
+
+            recovered = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+            assert recovered == []
+            assert _snapshot(live) == before
+            assert not _lock_is_free(live)
+        assert not failed_dir.exists()
+
+    def test_part_files_and_a_truncated_last_page_are_skipped(
+        self, scratch: Path, failed_dir: Path
+    ) -> None:
+        """Only the readable pages reach the PDF; the rest go with the workspace."""
+        workspace = _plant_dead_workspace(scratch)
+        spool = workspace / SPOOL_DIR_NAME
+        records = _spool_pages(spool, "a", 2)
+        whole = records[0].path.read_bytes()
+        (spool / "a-0003.png").write_bytes(whole[:_TRUNCATED_BYTES])
+        (spool / "a-0004.png.part").write_bytes(whole[: 2 * _TRUNCATED_BYTES])
+
+        recovered = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert [entry.pages for entry in recovered] == [2]
+        pdfs = _pdfs(failed_dir)
+        assert len(pdfs) == 1
+        assert embedded_streams(pdfs[0]) == _streams(records)
+        assert _page_dirs(failed_dir) == []
+        assert not workspace.exists()
+
+    def test_an_unreadable_page_before_the_last_keeps_the_raw_pages(
+        self, scratch: Path, failed_dir: Path
+    ) -> None:
+        """A damaged page mid-pass is not skipped over: every page file is kept."""
+        workspace = _plant_dead_workspace(scratch)
+        spool = workspace / SPOOL_DIR_NAME
+        records = _spool_pages(spool, "a", 3)
+        records[1].path.write_bytes(records[1].path.read_bytes()[:_TRUNCATED_BYTES])
+
+        recovered = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert len(recovered) == 1
+        assert _pdfs(failed_dir) == []
+        (kept,) = _page_dirs(failed_dir)
+        assert sorted(page.name for page in kept.iterdir()) == [
+            "a-0001.png",
+            "a-0002.png",
+            "a-0003.png",
+        ]
+        assert not workspace.exists()
+
+    def test_an_assembly_failure_moves_the_raw_pages(
+        self, scratch: Path, failed_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No PDF can be built, so the page files themselves are kept."""
+
+        def failing_assembly(*_args: object, **_kwargs: object) -> Path:
+            msg = "img2pdf refused the page"
+            raise PdfError(msg)
+
+        monkeypatch.setattr(preservation_module, "assemble_pdf", failing_assembly)
+        workspace = _plant_dead_workspace(scratch)
+        records = _spool_pages(workspace / SPOOL_DIR_NAME, "a", 2)
+        expected = {record.path.name: record.path.read_bytes() for record in records}
+
+        recovered = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert _pdfs(failed_dir) == []
+        (kept,) = _page_dirs(failed_dir)
+        assert {page.name: page.read_bytes() for page in kept.iterdir()} == expected
+        (only,) = recovered
+        assert only.sentence is not None
+        assert f"spooled page file(s) were preserved at {kept}" in only.sentence
+        assert not workspace.exists()
+
+    def test_two_passes_become_fronts_and_backs_in_sheet_order(
+        self, scratch: Path, failed_dir: Path
+    ) -> None:
+        """Pass B scanned the flipped stack, so the (backs) PDF is reversed."""
+        workspace = _plant_dead_workspace(scratch)
+        spool = workspace / SPOOL_DIR_NAME
+        fronts = _spool_pages(spool, "a", 3)
+        backs = _spool_pages(spool, "b", 3, first=3)
+
+        (only,) = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert only.pages == 6
+        pdfs = _pdfs(failed_dir)
+        assert len(pdfs) == 2
+        (fronts_pdf,) = [pdf for pdf in pdfs if pdf.name.endswith("-fronts.pdf")]
+        (backs_pdf,) = [pdf for pdf in pdfs if pdf.name.endswith("-backs.pdf")]
+        assert embedded_streams(fronts_pdf) == _streams(fronts)
+        assert embedded_streams(backs_pdf) == _streams(list(reversed(backs)))
+        assert not workspace.exists()
+
+    def test_the_free_space_rule_keeps_the_raw_pages_instead(
+        self, scratch: Path, failed_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under twice the spool free, no PDF is built: the pages are moved."""
+        monkeypatch.setattr(preservation_module, "_free_bytes", lambda _path: 0)
+        workspace = _plant_dead_workspace(scratch)
+        records = _spool_pages(workspace / SPOOL_DIR_NAME, "a", 2)
+
+        (only,) = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert _pdfs(failed_dir) == []
+        (kept,) = _page_dirs(failed_dir)
+        assert sorted(page.name for page in kept.iterdir()) == [
+            record.path.name for record in records
+        ]
+        assert only.sentence is not None
+        assert "Not enough free disk space" in only.sentence
+        assert not workspace.exists()
+
+    def test_a_symlinked_workspace_is_never_followed(
+        self, tmp_path: Path, scratch: Path, failed_dir: Path
+    ) -> None:
+        """A ``job-*`` link to a directory full of pages moves nothing."""
+        metadata = json.dumps({"job_id": _JOB_ID, "title": _TITLE, "profile": ""})
+        target = _plant_orphan(tmp_path, "elsewhere", metadata.encode("utf-8"))
+        _spool_pages(target / SPOOL_DIR_NAME, "a", 2)
+        link = scratch / "job-3f9c2a71-link"
+        link.symlink_to(target)
+        before = _snapshot(target)
+
+        assert sweep_orphans(scratch, failed_dir, reserve_mb=0) == []
+
+        assert _snapshot(target) == before
+        assert link.is_symlink()
+        assert not failed_dir.exists()
+
+    def test_one_failed_recovery_does_not_stop_the_next(
+        self,
+        scratch: Path,
+        failed_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A bug recovering one orphan is logged; the next is still recovered."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        first = _plant_dead_workspace(scratch, job_id="11111111-first", suffix="a")
+        second = _plant_dead_workspace(scratch, job_id="22222222-second", suffix="b")
+        _spool_pages(first / SPOOL_DIR_NAME, "a", 1)
+        _spool_pages(second / SPOOL_DIR_NAME, "a", 1)
+        original = workspace_mod._recover_orphan
+        seen: list[Path] = []
+
+        def failing_first(
+            orphan: OrphanWorkspace, failed: Path, reserve_mb: int
+        ) -> RecoveredWorkspace:
+            seen.append(orphan.path)
+            if len(seen) == 1:
+                msg = "a bug in the recovery"
+                raise RuntimeError(msg)
+            return original(orphan, failed, reserve_mb)
+
+        monkeypatch.setattr(workspace_mod, "_recover_orphan", failing_first)
+
+        recovered = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert seen == [first, second]
+        assert [entry.job_id for entry in recovered] == ["22222222-second"]
+        assert not second.exists()
+        assert first.is_dir()
+        assert _lock_is_free(first)
+        assert any(
+            record.exc_info is not None and str(first) in record.getMessage()
+            for record in _sweep_warnings(caplog)
+        )
+
+    def test_an_orphan_with_no_pages_is_removed_and_reported(
+        self,
+        scratch: Path,
+        failed_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Nothing to keep: the workspace goes, and the WARNING says so."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        workspace = _plant_dead_workspace(scratch)
+
+        (only,) = sweep_orphans(scratch, failed_dir, reserve_mb=0)
+
+        assert (only.pages, only.sentence) == (0, None)
+        assert not workspace.exists()
+        assert not failed_dir.exists()
+        assert any(_JOB_ID in r.getMessage() for r in _sweep_warnings(caplog))
+
+    def test_a_missing_tmp_dir_is_nothing_to_sweep(
+        self, tmp_path: Path, failed_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A first run has no scratch directory yet; that is not a problem."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+
+        assert sweep_orphans(tmp_path / "missing", failed_dir, reserve_mb=0) == []
+
+        assert _sweep_warnings(caplog) == []

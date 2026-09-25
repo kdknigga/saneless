@@ -1782,6 +1782,54 @@ class TestQueryMethods:
         finally:
             store.close()
 
+    def test_fail_recovered_jobs_fails_only_the_named_active_rows(self) -> None:
+        """Each named active row gets its own text; nothing else is touched."""
+        store = JobStore()
+        try:
+            seeded = _seed_one_per_state(store)
+            active = next(i for i, s in seeded.items() if s is JobState.SCANNING)
+            terminal = next(i for i, s in seeded.items() if s is JobState.DONE)
+
+            failed = store.fail_recovered_jobs(
+                {
+                    active: "The scan was preserved at /data/failed/one.pdf",
+                    terminal: "must not land on a finished job",
+                    "no-such-job": "must not land anywhere",
+                }
+            )
+
+            assert failed == 1
+            for job_id, original in seeded.items():
+                job = store.get_job(job_id)
+                assert job is not None
+                if job_id == active:
+                    assert job.state == JobState.ERROR
+                    assert job.error == "The scan was preserved at /data/failed/one.pdf"
+                    assert job.error_category is None
+                else:
+                    # The unnamed active row is left for fail_active_jobs, and
+                    # the terminal row keeps its recorded history.
+                    assert job.state == original
+                    assert job.error == f"before {original.value}"
+            assert store.get_job("no-such-job") is None
+        finally:
+            store.close()
+
+    def test_fail_recovered_jobs_with_no_texts_changes_nothing(self) -> None:
+        """An empty mapping writes nothing and reports zero."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="In flight")
+            store.update_state(job.id, JobState.SCANNING)
+
+            assert store.fail_recovered_jobs({}) == 0
+
+            still = store.get_job(job.id)
+            assert still is not None
+            assert still.state == JobState.SCANNING
+        finally:
+            store.close()
+
     def test_job_state_has_no_failed_member(self) -> None:
         """FAILED in the STOR-05 prose means the existing JobState.ERROR (STOR-05)."""
         # D-19, pinned as a test because a future reader taking the requirement

@@ -79,7 +79,12 @@ from saneless.vocabulary import (
     local_time,
     state_label,
 )
-from tests.conftest import StubScannerBackend, build_settings, scan_batch
+from tests.conftest import (
+    StubScannerBackend,
+    build_settings,
+    leave_killed_workspace,
+    scan_batch,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Generator
@@ -88,6 +93,7 @@ if TYPE_CHECKING:
 
     from saneless.config import LogLevel
     from saneless.scanner.base import PageSink, ScanSettings
+    from saneless.workspace import RecoveredWorkspace
 
 
 def _inked_page() -> Image.Image:
@@ -421,6 +427,84 @@ class TestVersionOption:
         assert result.exit_code == 0, result.output
         assert captured.get("verbose") is True, "-v no longer reaches configure_logging"
         assert "saneless, version" not in result.output
+
+
+class TestScanRecoversOrphanedWorkspaces:
+    """
+    ``saneless scan`` first recovers what a killed scan left in ``tmp_dir``.
+
+    A CLI-only install has no server whose startup would do it, so each scan
+    sweeps before it opens the scanner. The sweep is housekeeping: it never
+    decides whether the scan the operator asked for runs.
+    """
+
+    def test_an_orphan_is_recovered_into_failed_before_the_scan(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The killed scan's pages become a PDF, then the new scan runs."""
+        runner, settings = _patch_cli(monkeypatch)
+        settings.output.tmp_dir.mkdir(mode=0o700)
+        workspace = leave_killed_workspace(
+            settings.output.tmp_dir, job_id="deadbeef-cli", title="Killed CLI scan"
+        )
+        order: list[str] = []
+        original_sweep = cli_module.sweep_orphans
+        original_backend = cli_module.SaneBackend
+
+        def recording_sweep(
+            tmp_dir: Path, failed_dir: Path, reserve_mb: int
+        ) -> list[RecoveredWorkspace]:
+            order.append("sweep")
+            return original_sweep(tmp_dir, failed_dir, reserve_mb)
+
+        def recording_backend(host: str = "") -> ScannerBackend:
+            order.append("scanner")
+            return original_backend(host=host)
+
+        monkeypatch.setattr(cli_module, "sweep_orphans", recording_sweep)
+        monkeypatch.setattr(cli_module, "SaneBackend", recording_backend)
+        caplog.set_level(logging.WARNING, logger="saneless.workspace")
+
+        result = runner.invoke(cli, ["scan", "--title", "Test"])
+
+        assert result.exit_code == 0, result.output
+        assert "Done: Test" in result.output
+        assert order == ["sweep", "scanner"]
+        assert not workspace.exists()
+        (pdf,) = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert pdf.name.endswith("-partial.pdf")
+        assert any(
+            "deadbeef-cli" in record.getMessage() and str(pdf) in record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.workspace"
+        )
+
+    def test_a_failing_sweep_never_fails_the_scan(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A sweep that raises is logged with its traceback; the scan exits 0."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        def failing_sweep(
+            tmp_dir: Path, failed_dir: Path, reserve_mb: int
+        ) -> list[RecoveredWorkspace]:
+            msg = f"could not read {tmp_dir} ({failed_dir}, {reserve_mb} MB)"
+            raise OSError(msg)
+
+        monkeypatch.setattr(cli_module, "sweep_orphans", failing_sweep)
+        caplog.set_level(logging.WARNING, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["scan", "--title", "Test"])
+
+        assert result.exit_code == 0, result.output
+        assert "Done: Test" in result.output
+        assert any(
+            record.name == "saneless.cli"
+            and record.levelno == logging.WARNING
+            and record.exc_info is not None
+            and "orphaned" in record.getMessage()
+            for record in caplog.records
+        )
 
 
 class TestScanCommand:

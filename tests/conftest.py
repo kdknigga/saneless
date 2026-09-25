@@ -5,6 +5,9 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -867,6 +870,90 @@ def quiet_window(seconds: float) -> None:
     """
     never_set = threading.Event()
     never_set.wait(seconds)
+
+
+# The child enters a real JobWorkspace, spools blank pages the way the scanner
+# does (a PNG with a 300 dpi pHYs chunk), says where it is, and dies without
+# running a single ``finally`` or ``__exit__``: what a SIGKILL, the OOM killer
+# or a power cut leaves behind.
+_KILLED_WORKSPACE_CHILD = """\
+import os
+import signal
+from pathlib import Path
+
+from PIL import Image
+
+from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace
+
+with JobWorkspace(
+    Path(os.environ["SANELESS_TEST_TMP_DIR"]),
+    job_id=os.environ["SANELESS_TEST_JOB_ID"],
+    title=os.environ["SANELESS_TEST_TITLE"],
+    profile=os.environ["SANELESS_TEST_PROFILE"],
+) as path:
+    spool = path / SPOOL_DIR_NAME
+    for name in os.environ["SANELESS_TEST_PAGES"].split(","):
+        Image.new("L", (64, 64), 255).save(spool / name, dpi=(300, 300))
+    print(path, flush=True)
+    os.kill(os.getpid(), signal.SIGKILL)
+"""
+
+_KILLED_CHILD_TIMEOUT_SECONDS = 30
+
+
+def leave_killed_workspace(
+    tmp_dir: Path,
+    *,
+    job_id: str,
+    title: str,
+    profile: str = "default",
+    pages: Sequence[str] = ("a-0001.png", "a-0002.png"),
+) -> Path:
+    """
+    Leave behind the workspace of a scan whose process was SIGKILLed.
+
+    A child process enters a real ``JobWorkspace`` in ``tmp_dir``, spools
+    ``pages`` into it, and SIGKILLs itself, so the kernel -- not saneless --
+    releases the workspace's lock. Every argv element is a literal and the
+    per-run values travel in the environment, as ``test_pdf._measure_assembly``
+    does: ``sys.executable`` in the argv would take the call off ruff's S603
+    allow-list, and this project adds no suppressions.
+
+    Import it as ``from tests.conftest import leave_killed_workspace``.
+
+    Args:
+        tmp_dir: The existing scratch directory to create the workspace in.
+        job_id: The job id the workspace records.
+        title: The title the workspace records.
+        profile: The profile name the workspace records.
+        pages: The spool file names to write, each a blank 64x64 page.
+
+    Returns:
+        The orphaned workspace directory.
+
+    """
+    env = {
+        **os.environ,
+        "SANELESS_TEST_PYTHON": sys.executable,
+        "SANELESS_TEST_SOURCE": _KILLED_WORKSPACE_CHILD,
+        "SANELESS_TEST_TMP_DIR": str(tmp_dir),
+        "SANELESS_TEST_JOB_ID": job_id,
+        "SANELESS_TEST_TITLE": title,
+        "SANELESS_TEST_PROFILE": profile,
+        "SANELESS_TEST_PAGES": ",".join(pages),
+    }
+    completed = subprocess.run(
+        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE"'],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_KILLED_CHILD_TIMEOUT_SECONDS,
+    )
+    assert completed.returncode == -signal.SIGKILL, completed.stderr
+    workspace = Path(completed.stdout.strip())
+    assert workspace.parent == tmp_dir, completed.stdout
+    return workspace
 
 
 def leaf_routes(app: FastAPI) -> list[BaseRoute]:

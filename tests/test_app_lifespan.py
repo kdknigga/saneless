@@ -50,13 +50,25 @@ from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web.app import create_app
 from saneless.worker import STOP_JOIN_SECONDS
-from tests.conftest import StubScannerBackend, leaf_routes, wait_for_state
+from tests.conftest import (
+    StubScannerBackend,
+    leaf_routes,
+    leave_killed_workspace,
+    poll_until,
+    wait_for_state,
+)
 from tests.fake_sane import FakeSaneModule
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 _APP_LOGGER = "saneless.web.app"
+
+# The worker's idle tick while a test waits for it to heal, and how long the
+# test waits: a degraded worker retries startup recovery on every tick.
+_FAST_TICK = 0.02
+_HEAL_BUDGET = 5.0
 
 # ``PRAGMA auto_vacuum`` reads 2 for INCREMENTAL.
 _INCREMENTAL = 2
@@ -313,6 +325,144 @@ def test_recovery_failure_starts_the_worker_degraded(
         record.name == _APP_LOGGER
         and record.levelno == logging.ERROR
         and record.exc_info is not None
+        and "Crash recovery" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+# --- Orphaned workspaces at startup -------------------------------------------
+
+# The title the crashed SCANNING row carries, which its workspace records too.
+_SCANNING_TITLE = "mid-scan when the process died"
+
+
+def _orphan_the_scanning_job(settings: Settings, seeded: _Seeded) -> Path:
+    """
+    Leave the workspace a SIGKILLed scan of the SCANNING row would leave.
+
+    Returns:
+        The orphaned workspace, holding two spooled pages.
+
+    """
+    return leave_killed_workspace(
+        settings.output.tmp_dir, job_id=seeded.scanning, title=_SCANNING_TITLE
+    )
+
+
+def _preserved_pdfs(settings: Settings) -> list[Path]:
+    """Return the PDFs in ``failed/``, by name; none if it does not exist."""
+    failed_dir = settings.output.failed_dir
+    return sorted(failed_dir.glob("*.pdf")) if failed_dir.exists() else []
+
+
+def test_an_orphaned_workspace_is_named_in_its_jobs_restart_error(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A killed scan's pages reach failed/, and its row says where."""
+    seeded = _seed_crashed_store(settings)
+    workspace = _orphan_the_scanning_job(settings, seeded)
+    app = _build_app(settings)
+    caplog.set_level(logging.INFO, logger=_APP_LOGGER)
+    with TestClient(app) as client:
+        store: JobStore = app.state.job_store
+        scanning = store.get_job(seeded.scanning)
+        others = [store.get_job(job_id) for job_id in seeded.active[:2]]
+        client.cookies.set("saneless_owner", _SEEDING_BROWSER)
+        page = client.get("/").text
+
+    (pdf,) = _preserved_pdfs(settings)
+    assert pdf.name.endswith("-partial.pdf")
+    assert not workspace.exists()
+    assert scanning is not None
+    assert scanning.state is JobState.ERROR
+    assert scanning.error is not None
+    assert scanning.error.startswith(f"{RESTART_REASON}. ")
+    assert f"preserved at {pdf}" in scanning.error
+    assert scanning.error_category is None
+    for other in others:
+        assert other is not None
+        assert (other.state, other.error) == (JobState.ERROR, RESTART_REASON)
+    # The owner's page names the kept file relative to the data directory.
+    assert f"failed/{pdf.name}" in page
+    warnings = _interrupted_warnings(caplog)
+    assert len(warnings) == 1
+    assert "3" in warnings[0]
+
+
+def test_a_failing_orphan_sweep_never_stops_startup(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A sweep that raises is logged; recovery and the app carry on."""
+    seeded = _seed_crashed_store(settings)
+
+    def failing_sweep(*_args: object, **_kwargs: object) -> list[object]:
+        msg = "tmp_dir went away while the orphan sweep read it"
+        raise OSError(msg)
+
+    monkeypatch.setattr(app_module, "sweep_orphans", failing_sweep)
+    app = _build_app(settings)
+    caplog.set_level(logging.INFO, logger=_APP_LOGGER)
+    with TestClient(app) as client:
+        response = client.get("/health")
+        store: JobStore = app.state.job_store
+        rows = [store.get_job(job_id) for job_id in seeded.active]
+
+    assert response.status_code == 200
+    for row in rows:
+        assert row is not None
+        assert (row.state, row.error) == (JobState.ERROR, RESTART_REASON)
+    assert any(
+        record.name == _APP_LOGGER
+        and record.levelno == logging.WARNING
+        and record.exc_info is not None
+        and "workspace recovery" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_an_orphan_text_the_store_refused_is_written_once_it_recovers(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The worker starts degraded and later writes where the pages went."""
+    monkeypatch.setattr(worker_module, "_IDLE_TICK_SECONDS", _FAST_TICK)
+    seeded = _seed_crashed_store(settings)
+    _orphan_the_scanning_job(settings, seeded)
+    app = _build_app(settings)
+    store: JobStore = app.state.job_store
+    original = store.fail_recovered_jobs
+    calls: list[dict[str, str]] = []
+
+    def failing_once(texts: Mapping[str, str]) -> int:
+        calls.append(dict(texts))
+        if len(calls) == 1:
+            msg = "attempt to write a readonly database"
+            raise sqlite3.OperationalError(msg)
+        return original(texts)
+
+    monkeypatch.setattr(store, "fail_recovered_jobs", failing_once)
+    caplog.set_level(logging.INFO, logger=_APP_LOGGER)
+    with TestClient(app):
+        healed = poll_until(
+            lambda: app.state.worker.health is WorkerHealth.HEALTHY, _HEAL_BUDGET
+        )
+        scanning = store.get_job(seeded.scanning)
+
+    (pdf,) = _preserved_pdfs(settings)
+    assert healed
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert scanning is not None
+    assert scanning.state is JobState.ERROR
+    assert scanning.error is not None
+    assert scanning.error.startswith(f"{RESTART_REASON}. ")
+    assert f"preserved at {pdf}" in scanning.error
+    assert any(
+        record.name == _APP_LOGGER
+        and record.levelno == logging.ERROR
         and "Crash recovery" in record.getMessage()
         for record in caplog.records
     )
