@@ -39,7 +39,6 @@ from __future__ import annotations
 import contextlib
 import ipaddress
 import logging
-import os
 import socket
 import struct
 import tempfile
@@ -57,6 +56,7 @@ from saneless.config import (
     config_file_state,
     is_placeholder_token,
 )
+from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
     ConfigFileState,
     ConnectionStatus,
@@ -720,21 +720,17 @@ def _saned_host_setting(settings: Settings) -> str:
     """
     Return the host list SANE will actually use, not merely the configured one.
 
-    ``_ensure_initialised`` (``sane_backend.py:876-883``) writes
-    ``scanner.host`` into ``SANE_NET_HOSTS`` only when the variable is not
-    already set, and logs "already set externally … ignoring scanner.host
-    config" when it is.  A probe that read the setting alone could therefore
-    dial a host SANE is not using: a configured host that is switched off
-    would produce a row while the live environment host quietly served
-    devices.  Reading the environment first makes the probe's subject and
-    SANE's subject the same machine.
+    The probe must dial the hosts SANE's net backend will read, or it
+    describes a machine nothing is dialling: a configured host that is
+    switched off would produce a row while a host exported in
+    ``SANE_NET_HOSTS`` quietly served devices.  The rule for which list that
+    is lives in one helper, which the scanner backend calls before it hands
+    the list to SANE and this module calls here, so the two cannot drift.  In
+    particular both count an exported but empty variable as unset: it names
+    no host, so the configured host is what SANE is given.
 
     This places no new trust in the variable.  It is already the value libsane
     reads; the alternative is describing a host nothing is dialling.
-
-    The ``or`` rather than a two-argument ``get`` is deliberate: an exported
-    but empty variable names no host, and ``sane_backend.py`` only treats a
-    non-empty host as a host list, so the setting is what remains.
 
     Args:
         settings: The injected configuration.
@@ -743,7 +739,7 @@ def _saned_host_setting(settings: Settings) -> str:
         The colon-separated host list to parse, possibly empty.
 
     """
-    return os.environ.get("SANE_NET_HOSTS") or settings.scanner.host
+    return effective_sane_net_hosts(settings.scanner.host)
 
 
 def _part_is_a_number_to_glibc(part: str) -> bool:
@@ -1843,24 +1839,6 @@ def configuration_check(
             assert_never(state)
 
 
-def _scanner_unreachable() -> CheckResult:
-    """
-    Build the "the scanner is not answering" row.
-
-    Returns:
-        The red not-reachable Scanner row.
-
-    """
-    return CheckResult(
-        key=CheckKey.SCANNER,
-        state=CheckState.FAIL,
-        message="Not reachable.",
-        next_step=(
-            "Check the scanner is switched on and connected, then press Check again."
-        ),
-    )
-
-
 def _scanner_host_unanswered(probes: tuple[_HostProbe, ...]) -> CheckResult:
     """
     Build the row for a scanner host the check must not enumerate.
@@ -1961,7 +1939,7 @@ def _scanner_busy() -> CheckResult:
     scan, and a row that says one is running is simply false.  Today there is
     one known contender, and it is not hypothetical --
     ``ScanWorker._read_generated_profiles`` takes the gate around
-    ``get_devices()`` and ``get_capabilities()`` as the worker thread's first
+    ``get_devices`` and ``get_capabilities`` as the worker thread's first
     act at startup (``worker.py:947``), while ``_current_job_id`` is still
     ``None`` (it is set at ``worker.py:1394``).  The lifespan starts the worker
     and then the refresher, so that window coincides exactly with the
@@ -2390,64 +2368,62 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     return _ScannerPreflight(scanner=scanner, probes=probes)
 
 
-def _scanner_enumeration(context: CheckContext) -> CheckResult:
+def _scanner_enumeration(
+    scanner: ScannerBackend, configured_device: str
+) -> _Enumeration:
     """
     Ask the backend what it can see, which is the part that enters SANE.
 
-    This is the region the scanner gate exists to make exclusive, and the only
-    region: whatever the enumeration reports stands, red included, because an
-    enumeration that actually ran has earned its verdict.  It is also the
-    branch that cannot produce a false row, because a host setting this module
-    cannot parse into an entry leaves the check behaving exactly as it did
-    before the pre-probe existed.
+    This is the only region of the Scanner check that enters libsane, and it
+    runs under the scanner gate on the status strip; it decides nothing.  It
+    lists the devices, and then, only when ``scanner.device`` is set and no
+    listed device has exactly that id, opens and closes that id once.
+
+    The open exists because SANE opens ids it never lists.  An ``escl:`` URL
+    with no ``escl.conf`` entry is one, and a ``net:`` device on a host that
+    is not in ``SANE_NET_HOSTS`` is another: libsane's net backend adds that
+    host when the device is opened.  Opening the id is what a scan does first,
+    so an unlisted device that opens is one a scan can use, and reporting it
+    red would break the rule that a working appliance never goes red.  It is
+    attempted only in that absent case, never on every check, and also when
+    the listing itself raised, because a scan opens a configured id without
+    listing anything.
+
+    It is never reached when the preflight stopped the check, so no host that
+    timed out, refused the connection or accepted it and then said nothing is
+    ever listed or opened here: libsane would hang on the first, and entering
+    it after a lost connection to the second can crash the process.
 
     Args:
-        context: The injected dependencies and configuration.
+        scanner: The backend to ask.
+        configured_device: The configured ``scanner.device``, possibly empty.
 
     Returns:
-        Exactly one result for ``CheckKey.SCANNER``: WARN when several devices
-        are visible and ``scanner.device`` chooses none of them.
+        What was listed, and whether an unlisted configured device opened.
 
     """
-    scanner = context.scanner
-    if scanner is None:
-        # Unreachable through both real callers: each runs the preflight
-        # first, and the preflight answers this case itself.  Re-narrowing it
-        # here is how the type checkers learn that, without a cast and without
-        # a suppression, and it returns the one shared row rather than a
-        # second copy of it.
-        return _scanner_support_missing()
     try:
-        devices = scanner.get_devices()
+        devices = tuple(scanner.get_devices())
     except Exception as exc:
         # The backend raises ScanError, but python-sane underneath it raises
         # _sane.error, RuntimeError or AttributeError with no shared base, so
         # the boundary catches Exception.  The type name is logged; nothing
         # from the exception reaches the row.
         logger.warning("Scanner enumeration failed: %s", type(exc).__name__)
-        return _scanner_unreachable()
-    if not devices:
-        return _scanner_unreachable()
-    if not context.settings.scanner.device and len(devices) > 1:
-        # With no device configured, every scan goes to whichever device SANE
-        # lists first, and a scanner that appears on the LAN can take that
-        # place.  A warning, not a failure: scanning still works.  Count-only,
-        # because device ids are LAN addresses and this row is LAN-visible.
-        return CheckResult(
-            key=CheckKey.SCANNER,
-            state=CheckState.WARN,
-            message=f"{len(devices)} scanners are visible and none is chosen.",
-            next_step=(
-                "Set [scanner] device to the one you use; saneless devices "
-                "lists them, and saneless auto-profiles writes it for you."
-            ),
-        )
-    label = _device_label(devices[0])
-    return CheckResult(
-        key=CheckKey.SCANNER,
-        state=CheckState.OK,
-        message=f"{label} is ready." if label else "Ready.",
-    )
+        devices = ()
+    if not configured_device or any(
+        device.name == configured_device for device in devices
+    ):
+        return _Enumeration(devices=devices)
+    try:
+        scanner.get_capabilities(configured_device)
+    except Exception as exc:
+        # The same boundary, for the same reason.  Neither the id nor the
+        # exception text is logged: the id is a LAN address, and the text of
+        # a failed open usually repeats it.
+        logger.warning("Configured scanner could not be opened: %s", type(exc).__name__)
+        return _Enumeration(devices=devices, configured_opened=False)
+    return _Enumeration(devices=devices, configured_opened=True)
 
 
 def _check_scanner(context: CheckContext) -> CheckResult:
@@ -2455,9 +2431,11 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     Report whether a scanner is there to scan with.
 
     The ungated path: this is what ``_dispatch`` calls, and therefore what
-    ``saneless doctor`` runs.  It is the preflight followed by the
-    enumeration, in that order, which is the order this check has always had
-    -- the split changed where the gate sits, not what any caller sees.
+    ``saneless doctor`` runs.  It is three steps, in the same order the gated
+    ``_scanner_result`` runs them: the preflight, which may settle the row
+    before SANE is entered; the enumeration, which is the only step that
+    enters SANE; and the verdict, which decides the row from plain values.
+    Only the placement of the gate differs between the two functions.
 
     An ``isinstance`` test against ``CheckResult`` rather than a truthiness
     shortcut: the preflight returns either a finished row or what enumeration
@@ -2475,7 +2453,9 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     pre = _scanner_preflight(context)
     if isinstance(pre, CheckResult):
         return pre
-    return _scanner_enumeration(context)
+    configured_device = context.settings.scanner.device
+    enumeration = _scanner_enumeration(pre.scanner, configured_device)
+    return _scanner_verdict(pre.probes, enumeration, configured_device)
 
 
 def _paperless_next_step(status: ConnectionStatus) -> str:
@@ -2787,15 +2767,18 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     Run the scanner check, holding the worker's gate for the part that needs it.
 
     This is the only place in the registry that takes the gate, because the
-    enumeration is the only thing any check does inside libsane.  What matters
-    is the size of the gated region: the pre-probe runs *first*,
-    with the gate free, and only ``_scanner_enumeration`` is held.  The
-    pre-probe is name resolution and the opening of the SANE network
-    handshake, and resolution is outside every budget this module states, so
-    holding the gate across it could park a ``ScanWorker._scan_job`` whose job
-    row already reads ``SCANNING`` for as long as a broken resolver takes.  A
-    pre-probe that settles the row -- no python-sane, or a configured host
+    enumeration is the only thing any check does inside libsane.  The check
+    is the same three steps ``_check_scanner`` runs, and what matters is which
+    of them holds the gate.  The preflight runs *first*, with the gate free:
+    it is name resolution and the opening of the SANE network handshake, and
+    resolution is outside every budget this module states, so holding the
+    gate across it could park a ``ScanWorker._scan_job`` whose job row
+    already reads ``SCANNING`` for as long as a broken resolver takes.  A
+    preflight that settles the row -- no python-sane, or a configured host
     that timed out or refused -- therefore never touches the gate at all.
+    Only ``_scanner_enumeration`` is held: the device listing, and the open of
+    an unlisted configured device, inside one hold.  The verdict runs after
+    the release, because it is pure and enters nothing.
 
     The attempt is non-blocking and a failure is reported rather than waited
     out, which is the single move ``ScanWorker.scanner_gate`` documents as
@@ -2818,13 +2801,13 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     agree.  A test guarantees it instead --
     ``test_a_gated_run_returns_what_an_ungated_run_returns`` in
     ``tests/test_checks.py`` -- and that is where anyone changing either half
-    should look.  It is parametrised over the four contexts whose rows differ:
-    no python-sane, a configured host that does not answer the pre-probe,
-    a host that answers and enumerates one device, and an enumeration that
-    raises.  The first two are decided before the gate is reached and the last
-    one leaves through ``run_checks``' handler with the gate released in a
-    ``finally``, so all four halves of this function are compared against
-    ``_check_scanner``.
+    should look.  It is parametrised over the contexts whose rows differ: no
+    python-sane, a configured host that does not answer the pre-probe, a host
+    that answers and enumerates one device, an enumeration that raises, a
+    host that refuses this machine, a host whose name does not resolve, a
+    configured device that is not listed and does not open, and one that is
+    not listed but opens.  Together they reach every branch of this function
+    and compare each against ``_check_scanner``.
 
     Args:
         context: The injected dependencies and configuration.
@@ -2837,12 +2820,14 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     pre = _scanner_preflight(context)
     if isinstance(pre, CheckResult):
         return pre
+    configured_device = context.settings.scanner.device
     if not scanner_gate.acquire(blocking=False):
         return _scanner_busy()
     try:
-        return _scanner_enumeration(context)
+        enumeration = _scanner_enumeration(pre.scanner, configured_device)
     finally:
         scanner_gate.release()
+    return _scanner_verdict(pre.probes, enumeration, configured_device)
 
 
 def run_checks(
