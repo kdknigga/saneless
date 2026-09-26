@@ -1054,9 +1054,11 @@ def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
     calls lazily), so a host configured while SANE is already initialised is
     not used for this process's own opens until the next initialisation, while
     the operator who configured it has every reason to believe it is in
-    effect.  Listings are not affected: each listing child is given its
-    backend's own host.  The warning names the host list that was in effect at
-    init, which is what SANE is using.  Only host names from the operator's
+    effect.  Listings are held to the same host list: a listing child's
+    ``SANE_NET_HOSTS`` comes from ``effective_sane_net_hosts``, which prefers
+    an exported value, and the host this function exported at init is one, so
+    the later backend's listings dial it too.  The warning names the host list
+    that was in effect at init, which is what SANE is using.  Only host names from the operator's
     own configuration or environment are named, which the existing INFO line
     already logs; no credential is in scope here (ASVS V7).
 
