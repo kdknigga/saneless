@@ -12,6 +12,12 @@ serves exactly one of those behaviours on an ephemeral 127.0.0.1 port and
 records every byte it was sent, so a test can assert both what the probe
 concluded and what it put on the wire.
 
+Two more behaviours go one procedure further and answer
+``SANE_NET_GET_DEVICES`` with one device.  One then drops the connection, the
+way a saned that restarts leaves a client's persistent control connection
+dead; the other keeps it.  Real libsane is their client, not the probe, and
+libsane dials only port 6566, so they are served on that fixed port.
+
 The wire format is the one ``sanei_codec_bin.c`` and ``sanei_net.c`` in
 sane-backends define: a word is four big-endian bytes, a string is a word
 holding its length (trailing NUL included) followed by that many bytes, the
@@ -40,11 +46,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
+import pytest
+
 if TYPE_CHECKING:
     from collections.abc import Generator
 
 __all__ = [
     "EXIT_REQUEST",
+    "GET_DEVICES_REPLY",
     "INIT_REQUEST",
     "FakeSaned",
     "SanedBehaviour",
@@ -58,8 +67,47 @@ _VERSION_CODE: Final = 0x01000003
 # word, and the user name "saneless" as a NUL-terminated string.
 INIT_REQUEST: Final = struct.pack(">iii", 0, _VERSION_CODE, 9) + b"saneless\0"
 
+# The two procedures after SANE_NET_INIT that the listing behaviours read:
+# SANE_NET_GET_DEVICES (1) and SANE_NET_EXIT (10).  Neither takes arguments,
+# so each request is the bare procedure word.
+_GET_DEVICES: Final = 1
+_EXIT: Final = 10
+
 # SANE_NET_EXIT: procedure 10, no arguments, and saned sends no reply.
-EXIT_REQUEST: Final = struct.pack(">i", 10)
+EXIT_REQUEST: Final = struct.pack(">i", _EXIT)
+
+
+def _string(text: str) -> bytes:
+    """
+    Encode ``text`` as a SANE wire string.
+
+    Args:
+        text: The string to encode.
+
+    Returns:
+        A word holding the length with the trailing NUL, then the bytes and
+        the NUL.
+
+    """
+    encoded = text.encode() + b"\0"
+    return struct.pack(">i", len(encoded)) + encoded
+
+
+# The SANE_NET_GET_DEVICES reply listing one device (sanei_w_get_devices_reply
+# in sanei_net.c): a status word, then an array of device pointers.  The array
+# is a length word counting the devices plus the NULL that terminates them;
+# each element is a pointer word, 0 for "not NULL" followed by the
+# SANE_Device's name, vendor, model and type strings, and 1 for the NULL.
+GET_DEVICES_REPLY: Final = (
+    struct.pack(">i", 0)  # status SANE_STATUS_GOOD
+    + struct.pack(">i", 2)  # array length: one device and the NULL terminator
+    + struct.pack(">i", 0)  # element 0: not NULL
+    + _string("fake0")
+    + _string("Fake")
+    + _string("Loopback")
+    + _string("flatbed scanner")
+    + struct.pack(">i", 1)  # element 1: NULL
+)
 
 # The INIT request header: procedure word, version word, string-length word.
 _HEADER_LENGTH: Final = 12
@@ -88,6 +136,12 @@ class SanedBehaviour(StrEnum):
     (``SANE_STATUS_ACCESS_DENIED``).  ``BAD_VERSION`` reads the request and
     replies success with a major version libsane does not speak.  ``FLOOD``
     reads the request and sends a valid reply followed by a mebibyte of junk.
+    ``LIST_THEN_DROP`` reads the INIT request, replies success, reads one
+    procedure word and, when it is ``SANE_NET_GET_DEVICES``, replies with one
+    device and closes the connection -- the way a saned that restarts leaves
+    the client's persistent control connection dead.  ``LIST_AND_KEEP`` does
+    the same but keeps the connection, answering every ``SANE_NET_GET_DEVICES``
+    until the client sends ``SANE_NET_EXIT`` or closes.
     """
 
     HEALTHY = "HEALTHY"
@@ -95,6 +149,14 @@ class SanedBehaviour(StrEnum):
     BAD_STATUS = "BAD_STATUS"
     BAD_VERSION = "BAD_VERSION"
     FLOOD = "FLOOD"
+    LIST_THEN_DROP = "LIST_THEN_DROP"
+    LIST_AND_KEEP = "LIST_AND_KEEP"
+
+
+# The behaviours that answer SANE_NET_GET_DEVICES after the INIT exchange.
+_LISTING_BEHAVIOURS: Final = frozenset(
+    {SanedBehaviour.LIST_THEN_DROP, SanedBehaviour.LIST_AND_KEEP}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,15 +165,20 @@ class FakeSaned:
     A running fake saned: where it listens and what it was sent.
 
     Attributes:
-        port: The ephemeral loopback port it listens on.
+        port: The loopback port it listens on: ephemeral unless the caller
+            fixed it.
         received: Every chunk of bytes read from any client, in arrival order.
             Complete once the context manager has exited, because teardown
             joins the serving thread.
+        listings: One entry per ``SANE_NET_GET_DEVICES`` reply served, holding
+            the number of the connection (counting from 1) it was served on.
+            Complete once the context manager has exited, like ``received``.
 
     """
 
     port: int
     received: list[bytes] = field(default_factory=list)
+    listings: list[int] = field(default_factory=list)
 
 
 def _read_exactly(conn: socket.socket, count: int, received: list[bytes]) -> bool:
@@ -196,8 +263,61 @@ def _reply_for(behaviour: SanedBehaviour) -> bytes:
             return struct.pack(">ii", 0, _VERSION_CODE)
 
 
+@dataclass(frozen=True, slots=True)
+class _Listing:
+    """
+    Where a listing behaviour records what it served.
+
+    Attributes:
+        connection: The number of the connection being served, from 1.
+        listings: The fake's ``listings`` list.
+
+    """
+
+    connection: int
+    listings: list[int]
+
+
+def _serve_listings(
+    conn: socket.socket,
+    behaviour: SanedBehaviour,
+    received: list[bytes],
+    listing: _Listing,
+) -> None:
+    """
+    Answer ``SANE_NET_GET_DEVICES`` requests after a successful INIT exchange.
+
+    Returning is the drop: the caller's ``finally`` closes the connection.
+
+    Args:
+        conn: The accepted connection, already past its INIT reply.
+        behaviour: ``LIST_THEN_DROP`` or ``LIST_AND_KEEP``.
+        received: Where every byte read is recorded.
+        listing: Which connection this is, and where each served listing is
+            counted.
+
+    """
+    while True:
+        word: list[bytes] = []
+        if not _read_exactly(conn, 4, word):
+            received.extend(word)
+            return
+        received.extend(word)
+        (procedure,) = struct.unpack(">i", b"".join(word))
+        if procedure != _GET_DEVICES:
+            # SANE_NET_EXIT, or a procedure this fake does not speak.
+            return
+        conn.sendall(GET_DEVICES_REPLY)
+        listing.listings.append(listing.connection)
+        if behaviour is SanedBehaviour.LIST_THEN_DROP:
+            return
+
+
 def _handle(
-    conn: socket.socket, behaviour: SanedBehaviour, received: list[bytes]
+    conn: socket.socket,
+    behaviour: SanedBehaviour,
+    received: list[bytes],
+    listing: _Listing,
 ) -> None:
     """
     Serve one accepted connection, then close it whatever happened.
@@ -206,6 +326,8 @@ def _handle(
         conn: The accepted connection, owned by this function.
         behaviour: What to do with it.
         received: Where every byte read is recorded.
+        listing: Which connection this is, and where each listing served on
+            it is counted.
 
     """
     try:
@@ -215,6 +337,9 @@ def _handle(
         if not _read_init_request(conn, received):
             return
         conn.sendall(_reply_for(behaviour))
+        if behaviour in _LISTING_BEHAVIOURS:
+            _serve_listings(conn, behaviour, received, listing)
+            return
         _drain(conn, received)
     except OSError:
         # The client closed or reset mid-exchange -- which the flooding
@@ -229,6 +354,7 @@ def _serve(
     listener: socket.socket,
     behaviour: SanedBehaviour,
     received: list[bytes],
+    listings: list[int],
     stopping: threading.Event,
 ) -> None:
     """
@@ -238,9 +364,11 @@ def _serve(
         listener: The bound, listening socket.
         behaviour: What to do with each connection.
         received: Where every byte read is recorded.
+        listings: Where every ``SANE_NET_GET_DEVICES`` reply served is counted.
         stopping: Set by teardown before it wakes ``accept()``.
 
     """
+    connection = 0
     while True:
         try:
             conn, _peer = listener.accept()
@@ -249,44 +377,83 @@ def _serve(
         if stopping.is_set():
             conn.close()
             return
-        _handle(conn, behaviour, received)
+        connection += 1
+        _handle(conn, behaviour, received, _Listing(connection, listings))
+
+
+def _bind(listener: socket.socket, port: int) -> None:
+    """
+    Bind ``listener`` to 127.0.0.1, failing the test if a fixed port is taken.
+
+    Args:
+        listener: The unbound socket.
+        port: The port to bind, or 0 for an ephemeral one.
+
+    """
+    if not port:
+        listener.bind(("127.0.0.1", 0))
+        return
+    # A previous test's connections to the same fixed port may still be in
+    # TIME_WAIT; without this the next bind would fail for no real reason.
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind(("127.0.0.1", port))
+    except OSError:
+        # A failure and never a skip: a skip would silently drop the
+        # regression test on every machine that happens to run saned.
+        pytest.fail(
+            f"127.0.0.1:{port} is already in use, so the fake saned cannot "
+            f"listen there. libsane's net backend dials only port {port}; stop "
+            "whatever is listening on it (usually a local saned or "
+            "saned.socket) and run the test again."
+        )
 
 
 @contextlib.contextmanager
-def fake_saned(behaviour: SanedBehaviour) -> Generator[FakeSaned]:
+def fake_saned(behaviour: SanedBehaviour, *, port: int = 0) -> Generator[FakeSaned]:
     """
-    Serve one saned behaviour on an ephemeral 127.0.0.1 port.
+    Serve one saned behaviour on a 127.0.0.1 port, ephemeral by default.
 
     Point the scanner check at it with ``scanner.host`` set to
     ``f"127.0.0.1:{fake.port}"``, or call the probe with the port directly.
 
+    Real libsane cannot be pointed at an ephemeral port.  Its net backend
+    resolves every host with ``getaddrinfo(name, "sane-port")`` and
+    ``SANE_NET_HOSTS`` has no port syntax (sane-backends ``backend/net.c``),
+    so a test whose client is libsane itself -- the reason ``LIST_THEN_DROP``
+    and ``LIST_AND_KEEP`` exist -- passes ``port=6566``.  A fixed port that is
+    already taken fails the test, naming the port.
+
     Args:
         behaviour: What every accepted connection gets.
+        port: The port to listen on, or 0 for an ephemeral one.
 
     Yields:
-        Where the fake listens, and every byte it was sent.
+        Where the fake listens, every byte it was sent, and every listing it
+        served.
 
     """
     received: list[bytes] = []
+    listings: list[int] = []
     stopping = threading.Event()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
+        _bind(listener, port)
         listener.listen(8)
-        port: int = listener.getsockname()[1]
+        bound: int = listener.getsockname()[1]
         thread = threading.Thread(
             target=_serve,
-            args=(listener, behaviour, received, stopping),
+            args=(listener, behaviour, received, listings, stopping),
             name="fake-saned",
             daemon=True,
         )
         thread.start()
         try:
-            yield FakeSaned(port=port, received=received)
+            yield FakeSaned(port=bound, received=received, listings=listings)
         finally:
             stopping.set()
             # Wake the blocked accept() deterministically: the loop takes this
             # connection, sees the flag and returns.  The listener is still
             # open, so the connect cannot be refused.
-            with socket.create_connection(("127.0.0.1", port)):
+            with socket.create_connection(("127.0.0.1", bound)):
                 pass
             thread.join()
