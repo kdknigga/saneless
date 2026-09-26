@@ -593,3 +593,19 @@ class ScannerBackend(ABC):
         shutdown log that nothing was skipped by accident.
         """
         logger.debug("close() is a no-op for %s", type(self).__name__)
+
+    def reinitialise(self) -> None:
+        """
+        Restart whatever process-wide library this backend drives, before a job.
+
+        Deliberately **not** an ``@abstractmethod``, for the reason ``close()``
+        gives: the default does nothing, because a backend holding no
+        process-global library has nothing to restart, and requiring the
+        method would force an empty override onto every test stub.
+        ``SaneBackend`` overrides it to restart SANE at the start of each scan
+        job, and refuses there while a read is stuck or a handle is open.
+
+        The DEBUG line is the body, as in ``close()``, so ruff's ``B027`` has
+        no empty method on an ABC to flag.
+        """
+        logger.debug("reinitialise() is a no-op for %s", type(self).__name__)

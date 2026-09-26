@@ -236,8 +236,13 @@ def reset_sane_process_state() -> None:
     so that one case is finished off by hand, and pointedly *without* calling
     ``sane_exit()``, which would be unsafe for the same reason ``shutdown()``
     declined to.
+
+    The open-handle count is zeroed on every path, because a test that wedged
+    a handle and did not release it leaves that handle counted, which would
+    refuse every later test's ``reinitialise()``.
     """
     sane_backend_mod.shutdown()
+    sane_backend_mod._OPEN_HANDLES.count = 0
     if not sane_backend_mod._INIT.done:
         return
     record = sane_backend_mod._WEDGE

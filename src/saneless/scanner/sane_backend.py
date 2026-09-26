@@ -4,11 +4,21 @@ SANE scanner backend implementation wrapping python-sane.
 This module provides the concrete SaneBackend that communicates with
 physical scanners through the SANE (Scanner Access Now Easy) library.
 Key safety measures:
-- sane.init() runs once per process, behind a module-level guard: the first
-  SaneBackend built initialises SANE and every later one does not, and after
-  shutdown() a later init is allowed again.  python-sane leaks file
-  descriptors on every init/exit cycle, so re-initialising per backend would
-  grow the process's fd count without bound.
+- sane.init() runs behind a module-level guard: the first SaneBackend built
+  initialises SANE and every later one reuses it, and after shutdown() a later
+  init is allowed again.  The long-running server also re-initialises SANE at
+  the start of each scan job (SaneBackend.reinitialise), because after a saned
+  restart the net backend's stale control connection fails every later open
+  until SANE is restarted.  Descriptor counts were measured flat over hundreds
+  of exit/init cycles on both supported libsane builds, so the restart costs
+  no descriptors.  It is refused while a read is stuck or any handle is open:
+  sane_exit closes open handles with a request that waits for a reply, and on
+  a host that has silently vanished that wait was measured to outlast 40
+  seconds.
+- Scanners are listed in a short-lived child process and never in this one,
+  because a listing on a lost net control connection kills the process that
+  makes it, and listing across repeated init/exit cycles corrupts memory in
+  some local backends.
 - Device handles managed via context manager with cancel+close, so an
   exception cannot skip the close and leave the scanner reporting "device
   busy" to the next scan; skipped entirely while a read is still inside SANE,
@@ -30,7 +40,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Protocol, assert_never
+from typing import TYPE_CHECKING, Any, Final, Protocol, assert_never
 
 from PIL import Image
 
@@ -881,7 +891,7 @@ _WEDGE = _Wedge()
 @dataclass
 class _Init:
     """
-    What the module remembers about the one ``sane_init`` of this process.
+    What the module remembers about the current ``sane_init``.
 
     Module-level and **mutated, never rebound**, for the reason ``_Wedge``
     gives: rebinding a module-level name needs a ``global`` statement, which
@@ -891,8 +901,9 @@ class _Init:
 
     ``host`` is the configured ``host`` argument the initialising construction
     passed, and it is what a later construction is compared against: what the
-    comparison has to catch is a second operator-configured host arriving too
-    late to be read.  ``effective`` is the host list SANE's net backend will
+    comparison has to catch is a second operator-configured host arriving
+    while SANE is already initialised with the first.  ``effective`` is the
+    host list SANE's net backend will
     actually read, which differs from ``host`` whenever a non-empty
     ``SANE_NET_HOSTS`` was exported, and it is what that comparison's warning
     names, so the operator is pointed at the host SANE is really using.
@@ -923,13 +934,82 @@ class _Init:
     version: object = None
 
 
-# Guards every read and write of _INIT.  Two threads reach it in production --
-# whichever builds the backend and whichever shuts it down -- and "look, then
-# initialise" is a check and a write that must not be split, or a racing pair
-# of constructions would each see an uninitialised SANE and call sane_init
-# twice.
+# Guards every read and write of _INIT.  Three threads reach it in production
+# -- whichever builds the backend, whichever shuts it down, and the worker that
+# re-initialises SANE at the start of a scan job -- and "look, then initialise"
+# is a check and a write that must not be split, or a racing pair of
+# constructions would each see an uninitialised SANE and call sane_init twice.
+# It is not reentrant, so shutdown() and _ensure_initialised() are called one
+# after the other and never one inside the other.
 _INIT_LOCK = threading.Lock()
 _INIT = _Init()
+
+
+@dataclass
+class _OpenHandles:
+    """
+    How many device handles this process has open right now.
+
+    ``sane_exit`` closes every handle that is still open, and on the net
+    backend each close is a request that waits for saned's reply
+    (``backend/net.c``: ``sane_exit`` calls ``sane_close`` on each one).  On a
+    host that has silently vanished that wait was measured to last longer than
+    40 seconds on both supported libsane builds.  So SANE is only restarted
+    when this count is zero, and the count is what makes "no handle is open"
+    something ``SaneBackend.reinitialise()`` can check rather than assume.
+
+    Module-level and **mutated, never rebound**, for the reason ``_Wedge``
+    gives.  A handle left open by a read that never returned stays counted
+    until the reader thread closes it, because until then it is exactly the
+    kind of open handle ``sane_exit`` would try to close.
+
+    Attributes:
+        count: Handles opened by ``_open_device`` and not yet closed.
+
+    """
+
+    count: int = 0
+
+
+# Guards every read and write of _OPEN_HANDLES.  It is taken inside
+# _WEDGE_LOCK by the reader that closes a stuck handle late, and never the
+# other way round, so the two cannot deadlock.
+_HANDLES_LOCK = threading.Lock()
+_OPEN_HANDLES = _OpenHandles()
+
+
+def _handle_opened() -> None:
+    """Count a handle ``sane_open`` has just returned."""
+    with _HANDLES_LOCK:
+        _OPEN_HANDLES.count += 1
+
+
+def _handle_closed() -> None:
+    """Count a handle as closed, whether or not its close succeeded."""
+    with _HANDLES_LOCK:
+        _OPEN_HANDLES.count = max(0, _OPEN_HANDLES.count - 1)
+
+
+def _handles_open() -> int:
+    """
+    Report how many device handles this process has open.
+
+    Returns:
+        The number of handles opened and not yet closed.
+
+    """
+    with _HANDLES_LOCK:
+        return _OPEN_HANDLES.count
+
+
+# What a scan job is told when SANE cannot be restarted because a handle is
+# open.  It names no device and no host: the count does not know which device
+# the handle belongs to, and a net: id is a LAN address (ASVS V7).
+_HANDLE_OPEN_REFUSAL: Final = (
+    "Could not start a scan: a scanner handle from an earlier operation is "
+    "still open, and SANE cannot be restarted safely while it is. Restart "
+    "saneless if this does not clear."
+)
 
 # The prefix every acquisition thread is named with, so a stuck reader is
 # identifiable in a ``faulthandler`` dump or a debugger without guessing.
@@ -954,28 +1034,35 @@ def _restore_sane_net_hosts() -> None:
     _INIT.previous = None
 
 
-def _ensure_initialised(host: str) -> object:
+def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
     """
-    Initialise SANE, once per process, whoever asks.
+    Initialise SANE unless it already is, whoever asks.
 
     ``sane_init`` is a process-global call, not a per-object one, so the
     guard is here rather than in ``SaneBackend.__init__``: three one-shot CLI
-    commands and the web server each build their own backend, and the second
-    ``sane_init`` in a process is at best wasted work.  It is a guard and not
-    a singleton deliberately -- every one of those callers keeps getting its
-    own ``SaneBackend``, which is what lets the tests and the CLI construct one
-    wherever they need it.
+    commands and the web server each build their own backend, and a second
+    ``sane_init`` without a ``sane_exit`` between them is at best wasted work.
+    It is a guard and not a singleton deliberately -- every one of those
+    callers keeps getting its own ``SaneBackend``, which is what lets the tests
+    and the CLI construct one wherever they need it.  The per-job restart,
+    ``SaneBackend.reinitialise()``, calls ``shutdown()`` first, so it passes
+    this guard with SANE uninitialised.
 
     A later construction naming a *different* host is the case worth a WARNING
-    rather than silence.  The sane-net backend reads ``SANE_NET_HOSTS`` once,
-    at the first device listing after ``sane_init`` (the dll backend
-    initialises it lazily), so a host configured later has no effect for the
-    life of the process.  The second host is not merely redundant: it does
-    nothing at all, while the operator who configured it has every reason to
-    believe it is in effect.  The warning names the host list that was in
-    effect at init, which is what SANE is using.  Only host names from the
-    operator's own configuration or environment are named, which the existing
-    INFO line already logs; no credential is in scope here (ASVS V7).
+    rather than silence.  The net backend reads ``SANE_NET_HOSTS`` when SANE
+    initialises it (``backend/net.c`` ``sane_init``, which the dll backend
+    calls lazily), so a host configured while SANE is already initialised is
+    not used for this process's own opens until the next initialisation, while
+    the operator who configured it has every reason to believe it is in
+    effect.  Listings are not affected: each listing child is given its
+    backend's own host.  The warning names the host list that was in effect at
+    init, which is what SANE is using.  Only host names from the operator's
+    own configuration or environment are named, which the existing INFO line
+    already logs; no credential is in scope here (ASVS V7).
+
+    ``log_level`` is the level of the success lines.  A construction logs them
+    at INFO; the per-job restart passes DEBUG and logs one line of its own, so
+    each scan job adds one INFO line rather than three.
 
     The failure translation is ``ScanError`` because a SANE that will not start
     is a scanning failure the caller reports, and it catches ``Exception``
@@ -988,9 +1075,10 @@ def _ensure_initialised(host: str) -> object:
     Args:
         host: Colon-separated sane-net hosts from the caller's configuration,
             or the empty string when none was configured.
+        log_level: The level of the success lines; the warnings keep theirs.
 
     Returns:
-        Whatever ``sane.init()`` returned for this process.
+        Whatever ``sane.init()`` returned for the current initialisation.
 
     Raises:
         ScanError: If ``sane.init()`` fails, chained to the SANE error.
@@ -1001,8 +1089,8 @@ def _ensure_initialised(host: str) -> object:
             if host and host != _INIT.host:
                 logger.warning(
                     "SANE is already initialised with scanner host %s, so the "
-                    "host %s configured here has no effect: SANE_NET_HOSTS is "
-                    "read once per process, at the first device listing. "
+                    "host %s configured here is not used for this process's "
+                    "own scanner opens until SANE is next initialised. "
                     "Run one saneless per scanner host, or list both hosts "
                     "colon-separated in one configuration",
                     _INIT.effective or "none",
@@ -1018,9 +1106,10 @@ def _ensure_initialised(host: str) -> object:
             _INIT.previous = os.environ.get(SANE_NET_HOSTS)
             os.environ[SANE_NET_HOSTS] = host
             _INIT.written = host
-            logger.info("SANE net host discovery configured: %s", host)
+            logger.log(log_level, "SANE net host discovery configured: %s", host)
         elif host:
-            logger.info(
+            logger.log(
+                log_level,
                 "SANE_NET_HOSTS already set externally (%s), ignoring scanner.host config",
                 exported,
             )
@@ -1036,7 +1125,7 @@ def _ensure_initialised(host: str) -> object:
         _INIT.host = host
         _INIT.effective = effective_sane_net_hosts(host)
         _INIT.version = version
-        logger.info("SANE initialized, version %s", version)
+        logger.log(log_level, "SANE initialized, version %s", version)
         return version
 
 
@@ -1055,15 +1144,20 @@ def _read_outstanding() -> bool:
         return _WEDGE.stuck
 
 
-def shutdown() -> None:
+def shutdown(*, log_level: int = logging.INFO) -> None:
     """
     Shut SANE down for this process, or explain why it was not.
 
-    Called at an entry point's shutdown and nowhere else: never from a request
-    path, and never from an interpreter-exit hook, which would run while a
-    daemon reader thread may still be inside ``sane_read``.  It is idempotent,
-    so an entry point that closes more than one backend calls ``sane_exit``
-    once.
+    Called at an entry point's shutdown, and by ``SaneBackend.reinitialise()``
+    at the start of a scan job, under the scanner gate and only once it has
+    checked that no handle is open.  Never from a request path, and never from
+    an interpreter-exit hook, which would run while a daemon reader thread may
+    still be inside ``sane_read``.  It is idempotent, so an entry point that
+    closes more than one backend calls ``sane_exit`` once.
+
+    ``log_level`` is the level of the "SANE shut down" line: INFO at an entry
+    point's shutdown, DEBUG on the per-job restart, which logs its own line.
+    The skip lines keep their levels.
 
     Two conditions skip the call rather than making it, and both are logged
     because a silently skipped shutdown is indistinguishable from one that
@@ -1075,12 +1169,16 @@ def shutdown() -> None:
       specification, and ``PySane_exit`` runs holding the GIL while
       ``sane_read`` has released it -- exactly the close-while-reading sequence
       ``_open_device`` already refuses on one handle, applied to
-      all of them at once.  The process is ending anyway, so an un-exited SANE
-      costs nothing next to a segfault on the way out.
+      all of them at once.  At an entry point's shutdown the process is ending
+      anyway, so an un-exited SANE costs nothing next to a segfault on the way
+      out.  The per-job restart refuses before it gets here, so on that path
+      this check is a second guard, not the first.
 
     Nothing escapes: a failing ``sane_exit`` is logged with its traceback and
-    swallowed, because this runs while the process is on its way out and an
-    exception here would replace whatever error the operator is being shown.
+    swallowed, because at an entry point's shutdown the process is on its way
+    out and an exception here would replace whatever error the operator is
+    being shown.  On the per-job restart the ``sane_init`` that follows is what
+    reports a SANE that a failed exit left broken.
     The guard is re-armed either way, so a later ``SaneBackend`` initialises
     rather than assuming a SANE that a failed exit may well have left broken.
 
@@ -1109,7 +1207,7 @@ def shutdown() -> None:
         _INIT.host = ""
         _INIT.effective = ""
         _INIT.version = None
-        logger.info("SANE shut down")
+        logger.log(log_level, "SANE shut down")
 
 
 def _page_label(page_num: int) -> str:
@@ -1230,6 +1328,10 @@ def _release_wedge(dev: SaneDevice, done: threading.Event) -> None:
             dev.close()
         except Exception:
             logger.warning("Could not close the released scanner", exc_info=True)
+        # Counted as closed either way, as _open_device does: the close was
+        # attempted, and counting the handle open forever would refuse every
+        # later scan job's SANE restart until saneless itself was restarted.
+        _handle_closed()
         _WEDGE.stuck = False
         _WEDGE.done = None
         _WEDGE.device = None
@@ -2087,7 +2189,9 @@ class SaneBackend(ScannerBackend):
 
     The first backend built in a process initialises SANE, behind a
     module-level guard; every later one reuses that initialisation, and after
-    ``shutdown()`` a later one initialises again.  A backend is otherwise an
+    ``shutdown()`` a later one initialises again.  The long-running server
+    also restarts SANE at the start of each scan job (``reinitialise``), so
+    every scan gets a fresh control connection.  A backend is otherwise an
     ordinary object -- there is no singleton and no factory, because the three
     one-shot CLI commands and the web server each construct their own.
 
@@ -2106,11 +2210,12 @@ class SaneBackend(ScannerBackend):
         Join this process's SANE, initialising it if nobody has yet.
 
         Args:
-            host: Colon-separated sane-net hosts, applied only at the first
-                initialisation in the process, and only when
-                ``SANE_NET_HOSTS`` is not already set to a non-empty value.  A
-                later, differing host
-                is reported as having no effect rather than applied.
+            host: Colon-separated sane-net hosts, applied at every
+                initialisation this backend makes (construction and each
+                ``reinitialise``) when ``SANE_NET_HOSTS`` is not already set to
+                a non-empty value, and handed to every listing child.  A
+                differing host arriving while SANE is already initialised is
+                reported as not used until the next initialisation.
 
         Raises:
             ConfigError: If python-sane cannot be imported (``require_sane``).
@@ -2128,8 +2233,8 @@ class SaneBackend(ScannerBackend):
         Shut this process's SANE down, through the backend abstraction.
 
         The work is ``shutdown()``'s, and it is process-level rather than
-        per-object: what is released is the one ``sane_init`` this process
-        made, not anything this instance owns.  The method exists so that an
+        per-object: what is released is this process's current ``sane_init``,
+        not anything this instance owns.  The method exists so that an
         entry point holding a ``ScannerBackend`` can end it without naming the
         concrete class -- and so that a backend holding nothing process-global
         can go on inheriting the base's no-op.
@@ -2141,6 +2246,53 @@ class SaneBackend(ScannerBackend):
         there is nothing left here to catch.
         """
         shutdown()
+
+    def reinitialise(self) -> None:
+        """
+        Restart this process's SANE before a scan job, or refuse to.
+
+        Called at the top of each scan job, under the scanner gate, before the
+        job's first open, and nowhere else.  After a saned restart the net
+        backend keeps its old control connection: ``sane_open`` in
+        ``backend/net.c`` checks the reply status but never drops or
+        reconnects a connection that has gone bad, so every later open in this
+        process fails with an I/O error until SANE is restarted.  Restarting
+        at each job gives every scan a fresh connection, which also covers a
+        saned restart between two jobs that no check would have seen.
+
+        Two states refuse the restart, and both refuse before any SANE call,
+        because the call itself is the hazard:
+
+        - **A read has not returned.** ``sane_exit`` would close the handle
+          the read is still inside, which SANE forbids.
+        - **A device handle is open.** ``sane_exit`` closes every open handle,
+          and on the net backend each close waits for saned's reply.  On a
+          host that has silently vanished that wait was measured to last
+          longer than 40 seconds on both supported libsane builds, with the
+          scanner gate held the whole time.
+
+        ``shutdown()`` keeps its own outstanding-read check as a second guard.
+        Descriptor counts were measured flat over hundreds of exit/init cycles
+        on both builds, with scans in between, so restarting per job does not
+        grow the process's descriptor count.
+
+        ``shutdown()`` and ``_ensure_initialised()`` each take the init lock,
+        which is not reentrant, so they are called one after the other.  Their
+        success lines are logged at DEBUG, and this logs one INFO line, so a
+        job adds one line to the log rather than three.
+
+        Raises:
+            ScanError: If a read has not returned, if a handle is open, or if
+                ``sane.init()`` fails (chained to the SANE error; SANE is then
+                left uninitialised, so the next job tries again).
+
+        """
+        _refuse_if_wedged("the scanner", "start a scan on")
+        if _handles_open():
+            raise ScanError(_HANDLE_OPEN_REFUSAL)
+        shutdown(log_level=logging.DEBUG)
+        _ensure_initialised(self._host, log_level=logging.DEBUG)
+        logger.info("SANE re-initialised before this scan")
 
     @contextlib.contextmanager
     def _open_device(
@@ -2158,6 +2310,11 @@ class SaneBackend(ScannerBackend):
         has released it, so a close racing a blocked read is the one sequence
         python-sane cannot survive.  The handle is released later by
         the reader thread itself, and until then the wedge record holds it.
+
+        Every handle is counted from a successful open until its close was
+        attempted (``_OpenHandles``), so ``reinitialise()`` can refuse to
+        restart SANE while one is open.  A handle left open by a stuck read
+        stays counted until the reader closes it.
 
         A failed close is logged, never raised.  For a scan the line names
         the device and carries the traceback, because that is what an
@@ -2193,10 +2350,13 @@ class SaneBackend(ScannerBackend):
                 f"{describe(exc)}"
             )
             raise ScanError(open_msg) from exc
+        _handle_opened()
         try:
             yield dev
         finally:
             if _name_wedged_device(dev, device_id):
+                # Still counted: the reader thread closes it, and counts it
+                # closed, when the late read returns (_release_wedge).
                 logger.critical(
                     "Leaving scanner %s open: a read has not returned, so "
                     "neither cancel() nor close() may be issued on it",
@@ -2220,6 +2380,11 @@ class SaneBackend(ScannerBackend):
                             "Could not close the scanner after checking it: %s",
                             type(exc).__name__,
                         )
+                finally:
+                    # Counted closed whether or not close() raised: the close
+                    # was attempted, and a handle counted open forever would
+                    # refuse every later scan job's SANE restart.
+                    _handle_closed()
 
     def get_devices(self) -> list[DeviceInfo]:
         """

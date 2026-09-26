@@ -3507,7 +3507,9 @@ class TestReinitialise:
         inits_before = fake_sane_module.init_call_count
         sane_backend.reinitialise()
         assert fake_sane_module.init_call_count == inits_before + 1
-        assert sane_backend_mod._INIT.done is True
+        # The version, not ``done``: a type checker still holds ``done`` at the
+        # False asserted above.  Only a successful init records a version.
+        assert sane_backend_mod._INIT.version == (1, 0, 3)
 
 
 # The child process the exit proof runs, and the bound it is given.

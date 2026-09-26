@@ -13,10 +13,13 @@ the configured host is what SANE is given.
 
 What libsane does with the value (sane-backends ``backend/net.c``,
 ``sane_init``): it splits the variable on ``:``, skips empty entries and has no
-port syntax. It reads the variable once, and not at ``sane_init`` itself: the
-dll backend initialises the net backend lazily, so the read happens at the
-first device listing after ``sane_init``. A value set after that listing has no
-effect for the life of the process.
+port syntax. It reads the variable when the net backend is initialised, which
+is not at ``sane_init`` itself: the dll backend initialises the net backend
+lazily, at the first device listing or open after ``sane_init``. saneless lists
+scanners in a short-lived child process, so each listing child reads the
+variable afresh when it starts, and the main process reads it again after
+every re-initialisation of SANE, which the server does at the start of each
+scan job.
 
 This is a leaf module. It imports only ``os`` and ``typing.Final`` and nothing
 from ``saneless``, so ``checks.py`` can import it at runtime and ``doctor``
