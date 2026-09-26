@@ -13,6 +13,9 @@ install it.  The device used throughout is ``test:0``.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -24,6 +27,7 @@ from saneless.scanner.base import ScanSettings
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.spool import SpooledPageSink
 from tests.conftest import images_of
+from tests.fake_saned import SanedBehaviour, fake_saned
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -59,6 +63,31 @@ _SLOW_READ_OPTIONS: tuple[tuple[str, object], ...] = (
 # the measured read was still blocked after three seconds with these options.
 _SLOW_READ_TIMEOUT_SECONDS = 0.5
 
+# The only port libsane's net backend dials: it resolves every host with
+# getaddrinfo(name, "sane-port"), and SANE_NET_HOSTS has no port syntax.
+_SANE_PORT = 6566
+
+# How long one lost-connection subprocess may run.  A bound, not a pause: the
+# measured runs finish in well under a second, and this only stops a hung
+# libsane from hanging the suite.
+_SUBPROCESS_TIMEOUT_SECONDS = 60
+
+# Raw python-sane listing twice in one process: the call sequence
+# SaneBackend.get_devices() made in-process before listing moved to a child.
+_RAW_LISTS_TWICE = (
+    "import sane; sane.init(); "
+    "print(len(sane.get_devices()), flush=True); "
+    "print(len(sane.get_devices()), flush=True)"
+)
+
+# saneless listing twice from one process, the way the web app does.
+_SANELESS_LISTS_TWICE = (
+    "from saneless.scanner.sane_backend import SaneBackend; "
+    'b = SaneBackend(host="127.0.0.1"); '
+    "print(len(b.get_devices()), flush=True); "
+    "print(len(b.get_devices()), flush=True)"
+)
+
 
 def _page_sink_for(tmp_path: Path) -> SpooledPageSink:
     """
@@ -80,6 +109,49 @@ def _page_sink_for(tmp_path: Path) -> SpooledPageSink:
     directory = tmp_path / "spool"
     directory.mkdir(exist_ok=True)
     return SpooledPageSink(directory, _SPOOL_LABEL_A, _NO_FREE_SPACE_RESERVE)
+
+
+def _run_against_loopback_saned(
+    code: str, tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """
+    Run ``code`` in a fresh interpreter whose SANE sees only the loopback saned.
+
+    The child gets its own config directory, with only the ``net`` backend and
+    an empty ``net.conf``, and ``SANE_NET_HOSTS=127.0.0.1``.  Both are set
+    explicitly: the session fixture's ``SANE_CONFIG_DIR`` (the ``test``
+    backend) is in ``os.environ`` and would otherwise be inherited.
+
+    Args:
+        code: The Python source the child runs.
+        tmp_path: The per-test temporary directory pytest removes afterwards.
+
+    Returns:
+        The finished child, with its stdout and stderr captured as text.
+
+    """
+    config_dir = tmp_path / "sane.d"
+    config_dir.mkdir()
+    (config_dir / "dll.conf").write_text("net\n")
+    (config_dir / "net.conf").write_text("")
+    env = {
+        **os.environ,
+        "SANE_CONFIG_DIR": str(config_dir),
+        "SANE_NET_HOSTS": "127.0.0.1",
+        "SANELESS_TEST_PYTHON": sys.executable,
+        "SANELESS_TEST_CODE": code,
+    }
+    # Every argv element is a literal and the interpreter and code travel in
+    # the environment, quoted so they are never re-split -- the shape the
+    # other child-process tests in this suite use.
+    return subprocess.run(
+        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -294,3 +366,77 @@ class TestRealSaneCancelSequence:
             # is one of the two things this test exists to establish, so a
             # failure here has to fail the test rather than be swallowed.
             device.close()
+
+
+@pytest.mark.sane_hardware
+class TestLostControlConnection:
+    """
+    ENUM-04: a saned that drops the control connection crashes raw libsane only.
+
+    libsane's net backend keeps one control connection per host open between
+    listings.  Once the saned at the other end restarts, the next listing
+    sends its request on the dead connection, ignores the failed status and
+    reads a reply that was never filled in, and the process dies.  The fake
+    saned here lists once and closes, which is exactly that.
+
+    All three tests run their client in a subprocess.  The control crashes by
+    design, and the fix path runs there too, so that a regression back to
+    listing in-process fails that one test rather than killing the whole
+    ``sane_hardware`` run.  They listen on port 6566, the only port libsane
+    dials; if something already listens there, they fail naming the port.
+    """
+
+    def test_raw_libsane_dies_when_the_control_connection_drops(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The control: raw python-sane listing twice dies by a signal.
+
+        This is what proves the fake reproduces the defect.  The crash reads
+        a reply that was never filled in, so which signal ends the process
+        depends on the libsane build -- SIGABRT, SIGBUS and SIGSEGV have all
+        been measured -- and any signal counts.
+        """
+        with fake_saned(SanedBehaviour.LIST_THEN_DROP, port=_SANE_PORT):
+            result = _run_against_loopback_saned(_RAW_LISTS_TWICE, tmp_path)
+
+        assert result.returncode < 0, (
+            "the fake saned did not reproduce the lost-connection crash: raw "
+            f"python-sane exited {result.returncode} instead of dying by a "
+            f"signal\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+    def test_raw_libsane_survives_when_the_connection_is_kept(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The negative control: the same code exits 0 when nothing drops.
+
+        This is what proves the control can fail: its signal comes from the
+        dropped connection, not from the fake's replies or from listing twice.
+        """
+        with fake_saned(SanedBehaviour.LIST_AND_KEEP, port=_SANE_PORT) as fake:
+            result = _run_against_loopback_saned(_RAW_LISTS_TWICE, tmp_path)
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == ["1", "1"]
+        assert fake.listings == [1, 1]
+
+    def test_saneless_survives_a_dropped_control_connection(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The fix path: ``SaneBackend.get_devices()`` twice returns both times.
+
+        Each listing runs in a fresh child with its own libsane, so the
+        second listing never meets the connection the first one's saned
+        dropped.  The fake serving exactly two listings proves each listing
+        dialled afresh and was dropped; without that, this test would also
+        pass against a fake that never drops.
+        """
+        with fake_saned(SanedBehaviour.LIST_THEN_DROP, port=_SANE_PORT) as fake:
+            result = _run_against_loopback_saned(_SANELESS_LISTS_TWICE, tmp_path)
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == ["1", "1"]
+        assert len(fake.listings) == 2
