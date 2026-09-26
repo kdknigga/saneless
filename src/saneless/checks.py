@@ -113,8 +113,9 @@ logger = logging.getLogger(__name__)
 # not inside it -- `getaddrinfo` takes no timeout, so an unreachable resolver
 # costs whatever `resolv.conf` says.  Once a connect succeeds, the handshake
 # has ``PROBE_HANDSHAKE_SECONDS`` of its own, so one host's worst case is
-# resolution plus this budget plus that one, and every configured host is
-# probed -- up to ``_MAX_PROBE_HOSTS`` of them.  The bound still
+# resolution plus this budget plus that one, and every host the pre-probe can
+# dial is probed -- up to ``_MAX_PROBE_HOSTS`` setting entries, and the
+# configured ``net:`` device's own host.  The bound still
 # matters for the reason it always did: what it
 # replaces is `get_devices()`, which has no timeout at any layer and costs
 # roughly 127 s for a silently unreachable host, because Linux retries a SYN
@@ -194,6 +195,12 @@ _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 # host onwards loses the pre-probe, not the check.
 _MAX_PROBE_HOSTS: Final = 4
 
+# How libsane's net backend starts every device id it names
+# (``sane_get_devices`` in ``backend/net.c``).  An id that starts this way is
+# opened by dialling a saned host, which is why the Scanner check probes that
+# host before it will open one.
+_NET_DEVICE_PREFIX: Final = "net:"
+
 # The cold-start row, before any check has run.  It lives here rather
 # than in the template for the same reason the state glyphs do: templates own
 # no vocabulary.  U+00B7 is neutral -- it says "not yet", not "bad" -- and
@@ -262,16 +269,23 @@ POLL_ATTEMPT_CAP: Final = 10
 
 # How many times a strip may ask while a probe is demonstrably in flight --
 # that is, while some checker holds the refresher's single-flight lock.
-# Ninety attempts at the real two-second interval is about 180 s.  The two
-# slow paths a first check can take are either/or, not both: with no host to
-# probe, ``get_devices()`` can cost the ~127 s this file documents; with
-# hosts, the saned pre-probe costs at most ``PROBE_CONNECT_SECONDS`` plus
-# ``PROBE_HANDSHAKE_SECONDS`` -- 7 s -- for each of up to ``_MAX_PROBE_HOSTS``,
-# so 28 s, and a host that could hang enumeration never reaches it.  Either
-# path plus ``PROBE_READ_SECONDS`` for Paperless leaves room for the
-# pre-probe's unbounded resolutions.  Below it, a cold start on a wedged scanner stopped
-# asking while its first probe was still running and told a household member to
-# press a button that starts the thing already running.
+# Ninety attempts at the real two-second interval is about 180 s.  The saned
+# pre-probe costs at most ``PROBE_CONNECT_SECONDS`` plus
+# ``PROBE_HANDSHAKE_SECONDS`` -- 7 s -- for each of up to ``_MAX_PROBE_HOSTS``
+# setting entries and the configured ``net:`` device's own host, so 35 s, and
+# a *probed* host that could hang enumeration never reaches it: a configured
+# device is opened only once its own host has been probed and did not time
+# out or refuse.  A host the pre-probe cannot dial is another matter --
+# ``_scanner_preflight`` lists which those are -- and ``get_devices()`` still
+# dials it, so a dead one costs the ~127 s this file documents, as a wedged
+# local backend can.  That is one uninterruptible ``get_devices()`` at most,
+# never two: the open of an unlisted device is refused when its host could
+# not be probed.  35 s of probing, one ~127 s listing and
+# ``PROBE_READ_SECONDS`` for Paperless is about 167 s, which leaves little
+# room for the pre-probe's unbounded resolutions, and that is stated rather
+# than hidden.  Below it, a cold start on a wedged scanner stopped asking while
+# its first probe was still running and told a household member to press a
+# button that starts the thing already running.
 #
 # It is a second cap and not an exemption, and that is deliberate.
 # ``Lock.locked()`` stays true forever if the holder dies, and a thread that
@@ -1387,13 +1401,20 @@ class _ScannerPreflight:
 
     Attributes:
         scanner: The scanner backend enumeration will ask.
-        probes: One entry per configured saned host, in configured order;
-            empty when no host is configured or none could be parsed.
+        probes: One entry per probed saned host: the setting's entries in
+            configured order, then the configured ``net:`` device's own host
+            when the setting did not already cover it.  Empty when there was
+            nothing to probe.
+        may_open: Whether enumeration may open a configured device it does
+            not find listed.  False only for a ``net:`` device whose host the
+            probe cannot dial, because opening it would make libsane dial
+            that host with no timeout and nothing has shown it is up.
 
     """
 
     scanner: ScannerBackend
     probes: tuple[_HostProbe, ...]
+    may_open: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1408,11 +1429,15 @@ class _Enumeration:
         configured_opened: ``None`` when no open was attempted; otherwise
             whether a configured device that the backend did not list could
             be opened and closed again, which is what a scan does with it.
+        open_withheld: True when the configured device was not listed and
+            was deliberately not opened, because it is a ``net:`` device
+            whose host the pre-probe could not dial.
 
     """
 
     devices: tuple[DeviceInfo, ...]
     configured_opened: bool | None = None
+    open_withheld: bool = False
 
 
 def _outcome_severity(outcome: _SanedOutcome) -> int:
@@ -1642,16 +1667,61 @@ def _net_device_entry(device_id: str) -> str | None:
         no entry.
 
     """
-    prefix = "net:"
-    if not device_id.startswith(prefix):
+    if not device_id.startswith(_NET_DEVICE_PREFIX):
         return None
-    remainder = device_id.removeprefix(prefix)
+    remainder = device_id.removeprefix(_NET_DEVICE_PREFIX)
     if remainder.startswith("["):
         closing = remainder.find("]")
         entry = remainder[: closing + 1] if closing >= 0 else ""
     else:
         entry = remainder.partition(":")[0]
     return entry or None
+
+
+def _configured_device_probes(
+    device_id: str, probes: tuple[_HostProbe, ...]
+) -> tuple[tuple[_HostProbe, ...], bool]:
+    """
+    Probe a configured ``net:`` device's own host, when nothing else did.
+
+    libsane's net backend dials a ``net:`` device's host when the device is
+    opened, whether or not that host is in ``SANE_NET_HOSTS``, and it dials
+    with no timeout.  The Scanner check opens a configured device it does not
+    find listed, so without this a switched-off host outside the setting --
+    none configured, one past ``_MAX_PROBE_HOSTS``, or one named only in
+    ``net.conf`` -- would cost the ~127 s uninterruptible connect the
+    pre-probe exists to prevent, and on the status strip it would be paid
+    holding the scanner gate.  Probing that host here, with the gate free and
+    on the same budgets as every other host, means a timed-out or refused one
+    ends the check before libsane is touched, exactly like a configured host.
+
+    A host the setting already probed is not probed twice.  A ``net:`` id
+    whose host this module cannot dial -- an IPv6 literal, a numeric
+    shorthand ``_saned_hosts`` drops, or an id that names no host -- is not
+    probed, and the caller must not open it: nothing has shown the host is
+    up, and libsane would find out with no timeout.  A device that is not a
+    ``net:`` device is left alone; opening it dials no saned host.
+
+    Args:
+        device_id: The configured ``scanner.device``, possibly empty.
+        probes: What the setting's own hosts' probes found.
+
+    Returns:
+        The probes, with the device's host appended when it was probed here,
+        and whether enumeration may open the device if it is not listed.
+
+    """
+    if not device_id.startswith(_NET_DEVICE_PREFIX):
+        return probes, True
+    entry = _net_device_entry(device_id)
+    if entry is not None and any(probe.host == entry for probe in probes):
+        return probes, True
+    dialable = _saned_hosts(entry or "")
+    if not dialable:
+        return probes, False
+    host, port = dialable[0]
+    outcome = _probe_saned(host, port, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS)
+    return (*probes, _HostProbe(host, outcome)), True
 
 
 def _directory_accepts_a_write(path: Path) -> bool:
@@ -2171,6 +2241,33 @@ def _scanner_configured_missing_row() -> CheckResult:
     )
 
 
+def _scanner_configured_unprobed_row() -> CheckResult:
+    """
+    Build the amber row for an unlisted ``net:`` device that was not opened.
+
+    The configured device is a ``net:`` device the backend did not list, and
+    its host is one the pre-probe cannot dial, so the check did not open it:
+    opening it would make libsane dial that host with no timeout.  Amber, not
+    red, because nothing was found wrong -- the device may well open for a
+    scan -- and the rule is that a working appliance never goes red.
+
+    The next step names both ways out.  A host in ``[scanner] host`` is one
+    SANE lists devices from, so the device becomes a listed one; a device
+    ``saneless devices`` lists is one the check can find.  Either is a config
+    edit, which needs a restart.  Neither names the host (ASVS V7).
+
+    Returns:
+        The amber Scanner row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.WARN,
+        message="The configured scanner is not listed, and its host cannot be checked in advance, so the scanner could not be checked.",
+        next_step="Add the configured scanner's host to [scanner] host, or set [scanner] device to one saneless devices lists, then restart saneless.",
+    )
+
+
 def _scanner_nothing_found_row(hosts: int) -> CheckResult:
     """
     Build the red row for no scanner at all, with every probed host healthy.
@@ -2312,6 +2409,8 @@ def _scanner_verdict(
     if any(_blocks_enumeration(probe.outcome) for probe in probes):
         return _scanner_host_unanswered(probes)
     subject = _scanner_ready_subject(enumeration, configured_device)
+    if subject is None and enumeration.open_withheld:
+        return _scanner_configured_unprobed_row()
     if subject is None:
         return _scanner_unusable_row(probes, configured_device)
     unchosen = 0 if configured_device else len(enumeration.devices)
@@ -2335,22 +2434,41 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
 
     The order inside it is the order ``_check_scanner`` always had.  A machine
     with no python-sane is its own row and is decided without touching
-    anything.  Then **every** configured host SANE will dial is probed with
-    ``_probe_saned``, with no short circuit: libsane dials every entry, so a
-    dead second host costs its full uninterruptible connect inside
-    ``get_devices()`` however well the first one answers.  If any host timed
-    out -- including one that accepted the connection and said nothing -- or
-    refused, the check ends right there with the amber
-    ``_scanner_host_unanswered`` row, and ``_blocks_enumeration`` says why
-    neither may be enumerated.  Rejected, unresolved and healthy hosts, and a
-    setting with no host to probe, go on to enumeration.
+    anything.  Then every entry ``_saned_hosts`` returns for the host list
+    SANE will use is probed with ``_probe_saned``, with no short circuit:
+    libsane dials every entry, so a dead second host costs its full
+    uninterruptible connect inside ``get_devices()`` however well the first
+    one answers.  When ``scanner.device`` is a ``net:`` id whose host none of
+    those entries covers, that host is probed too
+    (``_configured_device_probes``), because the check may open the device
+    and opening it dials its host.
+
+    What is *not* probed is stated rather than hidden, because libsane still
+    dials it inside ``get_devices()``.  ``_saned_hosts`` returns at most
+    ``_MAX_PROBE_HOSTS`` entries and drops the ones it will not guess at: an
+    IPv6 literal, a numeric shorthand, and the rest of a setting it refuses.
+    Hosts named only in ``net.conf`` are not read at all.  And a two-segment
+    ``host:port`` setting is probed as one host on that port, where libsane
+    dials ``host`` and the port number as two hosts.  Enumeration still runs
+    beside such an entry, as it did before the pre-probe existed, so a dead
+    host there can still cost ``get_devices()`` its uninterruptible connect;
+    refusing to enumerate instead would turn every working IPv6 or
+    five-host setup permanently amber.
+
+    If any probed host timed out -- including one that accepted the
+    connection and said nothing -- or refused, the check ends right there
+    with the amber ``_scanner_host_unanswered`` row, and
+    ``_blocks_enumeration`` says why neither may be enumerated.  Rejected,
+    unresolved and healthy hosts, and a setting with no host to probe, go on
+    to enumeration.
 
     Args:
         context: The injected dependencies and configuration.
 
     Returns:
         The row, when it can be decided here; otherwise what enumeration
-        needs, which is the backend and what each host's probe found.
+        needs, which is the backend, what each host's probe found, and
+        whether an unlisted configured device may be opened.
 
     """
     scanner = context.scanner
@@ -2363,13 +2481,16 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
         )
         for host, port in _saned_hosts(_saned_host_setting(context.settings))
     )
+    probes, may_open = _configured_device_probes(
+        context.settings.scanner.device, probes
+    )
     if any(_blocks_enumeration(probe.outcome) for probe in probes):
         return _scanner_host_unanswered(probes)
-    return _ScannerPreflight(scanner=scanner, probes=probes)
+    return _ScannerPreflight(scanner=scanner, probes=probes, may_open=may_open)
 
 
 def _scanner_enumeration(
-    scanner: ScannerBackend, configured_device: str
+    scanner: ScannerBackend, configured_device: str, *, may_open: bool
 ) -> _Enumeration:
     """
     Ask the backend what it can see, which is the part that enters SANE.
@@ -2389,17 +2510,25 @@ def _scanner_enumeration(
     the listing itself raised, because a scan opens a configured id without
     listing anything.
 
-    It is never reached when the preflight stopped the check, so no host that
-    timed out, refused the connection or accepted it and then said nothing is
-    ever listed or opened here: libsane would hang on the first, and entering
-    it after a lost connection to the second can crash the process.
+    It is never reached when the preflight stopped the check, and the
+    preflight probes a ``net:`` device's own host before this can open it, so
+    no *probed* host that timed out, refused the connection or accepted it
+    and then said nothing is listed or opened here: libsane would hang on the
+    first, and entering it after a lost connection to the second can crash
+    the process.  A ``net:`` device whose host could not be probed at all is
+    not opened either (``may_open``).  The listing itself still dials every
+    host libsane knows of, including any the preflight could not probe;
+    ``_scanner_preflight`` lists which those are.
 
     Args:
         scanner: The backend to ask.
         configured_device: The configured ``scanner.device``, possibly empty.
+        may_open: Whether an unlisted configured device may be opened; False
+            for a ``net:`` device whose host the preflight could not probe.
 
     Returns:
-        What was listed, and whether an unlisted configured device opened.
+        What was listed, and whether an unlisted configured device opened or
+        was deliberately left unopened.
 
     """
     try:
@@ -2415,6 +2544,8 @@ def _scanner_enumeration(
         device.name == configured_device for device in devices
     ):
         return _Enumeration(devices=devices)
+    if not may_open:
+        return _Enumeration(devices=devices, open_withheld=True)
     try:
         scanner.get_capabilities(configured_device)
     except Exception as exc:
@@ -2454,7 +2585,9 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     if isinstance(pre, CheckResult):
         return pre
     configured_device = context.settings.scanner.device
-    enumeration = _scanner_enumeration(pre.scanner, configured_device)
+    enumeration = _scanner_enumeration(
+        pre.scanner, configured_device, may_open=pre.may_open
+    )
     return _scanner_verdict(pre.probes, enumeration, configured_device)
 
 
@@ -2806,7 +2939,8 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     one that does not answer it, a host that answers and enumerates one
     device, an enumeration that raises, a host that refuses this machine, a
     host whose name does not resolve, a configured device that is not listed
-    and does not open, and one that is not listed but opens.  Together they
+    and does not open, one that is not listed but opens, and a ``net:`` device
+    that is not listed and whose host cannot be probed.  Together they
     reach every branch of this function and compare each against
     ``_check_scanner``.
 
@@ -2825,7 +2959,9 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     if not scanner_gate.acquire(blocking=False):
         return _scanner_busy()
     try:
-        enumeration = _scanner_enumeration(pre.scanner, configured_device)
+        enumeration = _scanner_enumeration(
+            pre.scanner, configured_device, may_open=pre.may_open
+        )
     finally:
         scanner_gate.release()
     return _scanner_verdict(pre.probes, enumeration, configured_device)

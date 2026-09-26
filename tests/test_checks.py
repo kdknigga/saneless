@@ -155,6 +155,42 @@ def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
 
 
+# The real saned probe, kept before any test replaces it, so the probe's own
+# tests can still reach it by name.
+_REAL_PROBE_SANED: Final = checks._probe_saned
+
+# The host the configured device ``_settings()`` writes lives on.
+_DEVICE_HOST: Final = "scanbox.lan"
+
+
+@pytest.fixture(autouse=True)
+def _the_configured_device_host_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Answer healthy for the default configured device's host, without a socket.
+
+    ``_settings()`` configures a ``net:`` device on ``_DEVICE_HOST``, and the
+    Scanner check's preflight probes a ``net:`` device's own host before it
+    may open that device.  A real probe of that name would ask this machine's
+    resolver: network traffic, and a verdict that depends on the machine the
+    suite runs on.  So that one host answers healthy with no socket, and
+    every other host still goes to the real probe.  A test that cares what
+    the host answers says so with ``_recording_dialler``, which replaces this.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+
+    """
+
+    def _probe(
+        host: str, port: int, connect_timeout: float, handshake_timeout: float
+    ) -> checks._SanedOutcome:
+        if host == _DEVICE_HOST:
+            return checks._SanedOutcome.HEALTHY
+        return _REAL_PROBE_SANED(host, port, connect_timeout, handshake_timeout)
+
+    monkeypatch.setattr(checks, "_probe_saned", _probe)
+
+
 @pytest.fixture
 def listening_port() -> Iterator[int]:
     """
@@ -951,7 +987,7 @@ def _probe(host: str = "scanbox.lan", port: int = SANED_PORT) -> checks._SanedOu
         What the probe concluded about the host.
 
     """
-    return checks._probe_saned(host, port, _PROBE_BUDGET, _PROBE_BUDGET)
+    return _REAL_PROBE_SANED(host, port, _PROBE_BUDGET, _PROBE_BUDGET)
 
 
 # A valid SANE_NET_INIT reply: status 0 (SANE_STATUS_GOOD), version 1.0.3.
@@ -2386,6 +2422,17 @@ _REFUSED_NEXT_STEP: Final = (
     "then press Check again."
 )
 
+# The amber row for an unlisted ``net:`` device whose host the pre-probe
+# cannot dial, so the check never opens it.
+_UNPROBED_DEVICE_MESSAGE: Final = (
+    "The configured scanner is not listed, and its host cannot be checked "
+    "in advance, so the scanner could not be checked."
+)
+_UNPROBED_DEVICE_NEXT: Final = (
+    "Add the configured scanner's host to [scanner] host, or set [scanner] "
+    "device to one saneless devices lists, then restart saneless."
+)
+
 # Two scanner hosts in one setting, so the count wording and the
 # probe-every-entry rule have something to count.
 _TWO_HOSTS: Final = "scanbox-a.lan:scanbox-b.lan"
@@ -2666,6 +2713,160 @@ class TestScannerCheck:
         assert row.state is CheckState.WARN
 
     @pytest.mark.parametrize("surface", _SURFACES)
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            pytest.param(
+                (checks._SanedOutcome.REFUSED, _REFUSED_MESSAGE), id="refused"
+            ),
+            pytest.param(
+                (checks._SanedOutcome.TIMED_OUT, _TIMED_OUT_MESSAGE), id="timed-out"
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "setting",
+        [
+            pytest.param(("", 1), id="no-host-configured"),
+            pytest.param(("a.lan:b.lan:c.lan:d.lan:scanbox.lan", 5), id="past-the-cap"),
+        ],
+    )
+    def test_a_configured_net_device_on_an_unprobed_dead_host_is_never_opened(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        answer: tuple[checks._SanedOutcome, str],
+        setting: tuple[str, int],
+        surface: str,
+    ) -> None:
+        """
+        A configured ``net:`` device's own host is probed before SANE is entered.
+
+        The device is not listed, which is the case that opens it.  libsane's
+        net backend dials the device's host when the device is opened, with no
+        timeout, so a switched-off host there is the ~127 s uninterruptible
+        connect the pre-probe exists to prevent -- and on the status strip it
+        would be paid holding the scanner gate.  The host is not among the
+        probed setting entries (none is configured, or it is past the cap), so
+        the preflight probes it on its own, and a host that must not be
+        enumerated ends the check before libsane is touched at all.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            answer: What the configured device's host answers, and the amber
+                row message that answer must produce.
+            setting: The configured ``scanner.host``, and how many hosts the
+                preflight must probe for it.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        outcome, message = answer
+        host, expected_dials = setting
+        dialled = _recording_dialler(monkeypatch, outcomes={"scanbox.lan": outcome})
+        backend = _CountingBackend()
+        settings = _settings(tmp_path, host=host)
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert ("scanbox.lan", SANED_PORT) in dialled
+        assert len(dialled) == expected_dials
+        assert backend.calls == 0
+        assert backend.opens == 0
+        assert row.state is CheckState.WARN
+        if host:
+            assert "1 of 5 scanner hosts" in row.message
+        else:
+            assert row.message == message
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_configured_net_device_on_a_probed_host_is_dialled_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        """
+        The configured device's host is not probed twice when the setting names it.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        dialled = _recording_dialler(monkeypatch)
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host="scanbox.lan")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert dialled == [("scanbox.lan", SANED_PORT)]
+        assert row.state is CheckState.OK
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    @pytest.mark.parametrize(
+        "device",
+        [
+            pytest.param("net:[fe80::1]:brother5:bus0;dev1", id="ipv6-literal"),
+            pytest.param("net:127.1:brother5:bus0;dev1", id="numeric-shorthand"),
+            pytest.param("net:[fe80::1", id="no-entry"),
+        ],
+    )
+    def test_a_configured_net_device_whose_host_cannot_be_probed_is_never_opened(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        device: str,
+        surface: str,
+    ) -> None:
+        """
+        An unlisted ``net:`` device on a host the probe cannot dial is not opened.
+
+        Opening it would dial that host from inside libsane with no timeout,
+        and nothing has shown the host is up.  The listing still runs, as it
+        did before this device was looked at, and the row is amber: nothing
+        was found wrong, but the configured scanner could not be checked.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            device: The configured ``scanner.device``.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        dialled = _recording_dialler(monkeypatch)
+        backend = _CountingBackend([_device()])
+        settings = _with_device(_settings(tmp_path), device)
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert dialled == []
+        assert backend.calls == 1
+        assert backend.opens == 0
+        assert row.state is CheckState.WARN
+        assert row.message == _UNPROBED_DEVICE_MESSAGE
+        assert row.next_step == _UNPROBED_DEVICE_NEXT
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_listed_net_device_whose_host_cannot_be_probed_is_ready(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        """
+        A device the backend lists needs no open, so an unprobeable host is moot.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        _recording_dialler(monkeypatch)
+        device = DeviceInfo(
+            name="net:[fe80::1]:brother5:bus0;dev1",
+            vendor="Brother",
+            model="ADS-2700W",
+            device_type="scanner",
+        )
+        backend = _CountingBackend([device])
+        settings = _with_device(_settings(tmp_path), device.name)
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.opens == 0
+        assert row.state is CheckState.OK
+        assert row.message == "Brother ADS-2700W is ready."
+
+    @pytest.mark.parametrize("surface", _SURFACES)
     def test_a_configured_device_that_is_not_listed_and_does_not_open_is_red(
         self, tmp_path: Path, surface: str, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -2813,7 +3014,9 @@ class TestScannerCheck:
 
         """
         backend = _CountingBackend([_device()])
-        settings = _settings(tmp_path, host=f"127.0.0.1:{_closed_port()}")
+        settings = _with_device(
+            _settings(tmp_path, host=f"127.0.0.1:{_closed_port()}"), ""
+        )
         results = run_checks(_context(settings, scanner=backend))
         row = _row(results, CheckKey.SCANNER)
         assert backend.calls == 0
@@ -2854,7 +3057,9 @@ class TestScannerCheck:
         monkeypatch.setattr(checks, "PROBE_CONNECT_SECONDS", _PROBE_BUDGET)
         monkeypatch.setattr(checks, "PROBE_HANDSHAKE_SECONDS", _PROBE_BUDGET)
         backend = _CountingBackend([_device()])
-        settings = _settings(tmp_path, host=f"127.0.0.1:{listening_port}")
+        settings = _with_device(
+            _settings(tmp_path, host=f"127.0.0.1:{listening_port}"), ""
+        )
         row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
         assert backend.calls == 0
         assert row.state is CheckState.WARN
@@ -2877,7 +3082,7 @@ class TestScannerCheck:
 
         """
         dialled = _recording_dialler(monkeypatch)
-        settings = _settings(tmp_path, host=_TWO_HOSTS)
+        settings = _with_device(_settings(tmp_path, host=_TWO_HOSTS), "")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("scanbox-a.lan", SANED_PORT), ("scanbox-b.lan", SANED_PORT)]
 
@@ -2979,7 +3184,7 @@ class TestScannerCheck:
 
         """
         dialled = _recording_dialler(monkeypatch)
-        settings = _settings(tmp_path, host="config-host")
+        settings = _with_device(_settings(tmp_path, host="config-host"), "")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("config-host", SANED_PORT)]
 
@@ -3002,7 +3207,7 @@ class TestScannerCheck:
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "env-host")
         dialled = _recording_dialler(monkeypatch)
-        settings = _settings(tmp_path, host="config-host")
+        settings = _with_device(_settings(tmp_path, host="config-host"), "")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("env-host", SANED_PORT)]
 
@@ -3024,7 +3229,7 @@ class TestScannerCheck:
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "")
         dialled = _recording_dialler(monkeypatch)
-        settings = _settings(tmp_path, host="cfg-host")
+        settings = _with_device(_settings(tmp_path, host="cfg-host"), "")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("cfg-host", SANED_PORT)]
 
@@ -3165,7 +3370,7 @@ class TestScannerCheck:
         """
         _recording_dialler(monkeypatch, outcomes=outcomes)
         backend = _CountingBackend([_device()])
-        settings = _healthy_settings(tmp_path, host=host)
+        settings = _with_device(_healthy_settings(tmp_path, host=host), "")
         row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
         assert backend.calls == 0
         assert row.state is CheckState.WARN
@@ -4357,6 +4562,41 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.row.next_step == _REFUSED_NEXT_STEP
         _assert_names_nothing(runs, caplog, port)
 
+    def test_a_configured_net_device_on_a_refusing_host_is_never_opened(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A configured device's own host is dialled for real, and it keeps SANE out.
+
+        No scanner host is configured, and the backend lists nothing, so the
+        check would otherwise open the configured ``net:`` id -- which makes
+        libsane dial that host with no timeout.  The default saned port is
+        pointed at a closed loopback port, so the host refuses.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Points the default saned port at the closed port.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        port = _closed_port()
+        monkeypatch.setattr(checks, "SANED_PORT", port)
+        settings = _with_device(
+            _healthy_settings(tmp_path, host=""), "net:127.0.0.1:brother5:bus0;dev1"
+        )
+        runs = _run_ungated_and_gated(settings, [])
+        for run in runs:
+            assert run.backend.calls == 0
+            assert run.backend.opens == 0
+            assert run.row.state is CheckState.WARN
+            assert run.row.message == _REFUSED_MESSAGE
+            assert run.row.next_step == _REFUSED_NEXT_STEP
+        _assert_names_nothing(runs, caplog, port)
+
     def test_a_silent_peer_is_amber_bounded_and_never_enumerated(
         self,
         tmp_path: Path,
@@ -5411,7 +5651,9 @@ def _gate_sampling_context(
 # - a host that refuses this machine, and a name that does not resolve, both
 #   enumerated and finding nothing;
 # - a configured device that is not listed and does not open, and one that is
-#   not listed but opens, both decided by the open held under the gate.
+#   not listed but opens, both decided by the open held under the gate;
+# - a configured ``net:`` device that is not listed and whose host cannot be
+#   probed, so it is deliberately never opened.
 #
 # ``_scanner_result``'s docstring lists the same contexts, and
 # ``test_every_gated_context_reaches_a_different_row`` keeps them distinct.
@@ -5425,6 +5667,7 @@ _GATED_CONTEXTS = (
     "unresolved",
     "wrong-device-open-fails",
     "wrong-device-open-succeeds",
+    "unprobed-net-device",
 )
 
 # What the stubbed dialler answers in each context; any context not named here
@@ -5491,6 +5734,9 @@ def _gated_context_builder(
         ),
         "wrong-device-open-succeeds": lambda: on_scanbox(
             _LOCAL_DEVICE_ID, _CountingBackend([_device()])
+        ),
+        "unprobed-net-device": lambda: on_scanbox(
+            "net:[fe80::1]:brother5:bus0;dev1", _CountingBackend([_device()])
         ),
     }
     return factories[scanner_context]
@@ -5763,8 +6009,9 @@ class TestRunChecksUnderTheScannerGate:
         """
 
         def boom(
-            _scanner: ScannerBackend, _configured_device: str
+            _scanner: ScannerBackend, _configured_device: str, *, may_open: bool
         ) -> checks._Enumeration:
+            del may_open
             msg = "the scanner check exploded"
             raise RuntimeError(msg)
 
@@ -5831,10 +6078,10 @@ class TestRunChecksUnderTheScannerGate:
         )
         backend = _GateSamplingBackend(probe, [_device()])
         results = run_checks(
-            _context(_settings(tmp_path, host="scanbox"), scanner=backend),
+            _context(_settings(tmp_path, host=_DEVICE_HOST), scanner=backend),
             scanner_gate=cast("threading.Lock", gate),
         )
-        assert dialled == [("scanbox", SANED_PORT)]
+        assert dialled == [(_DEVICE_HOST, SANED_PORT)]
         assert probe.free_during["pre-probe"] is True
         assert probe.free_during["scanner"] is False
         assert _row(results, CheckKey.SCANNER).state is CheckState.OK
@@ -5907,10 +6154,10 @@ class TestRunChecksUnderTheScannerGate:
         backend = _CountingBackend([_device()])
         dialled = _recording_dialler(monkeypatch, outcome=outcome)
         results = run_checks(
-            _context(_settings(tmp_path, host="scanbox"), scanner=backend),
+            _context(_settings(tmp_path, host=_DEVICE_HOST), scanner=backend),
             scanner_gate=cast("threading.Lock", gate),
         )
-        assert dialled == [("scanbox", SANED_PORT)]
+        assert dialled == [(_DEVICE_HOST, SANED_PORT)]
         assert gate.acquires == 0
         assert backend.calls == 0
         row = _row(results, CheckKey.SCANNER)
