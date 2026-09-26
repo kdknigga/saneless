@@ -25,6 +25,7 @@ from saneless.exceptions import (
     ScanError,
     ScanInterrupted,
     describe,
+    describe_text,
     failure_text,
     note_text,
 )
@@ -112,6 +113,33 @@ class TestDescribe:
     def test_describe_falls_back_to_the_class_name_for_whitespace_text(self) -> None:
         """Text that is only whitespace is as empty as no text at all (D-08)."""
         assert describe(OSError(" \n ")) == "OSError"
+
+
+class TestDescribeText:
+    """
+    describe_text() applies describe()'s rule to text with no exception object.
+
+    A scanner listing runs in a child process, which reports a failure as a
+    type name and a message rather than an exception, so the parent needs the
+    same normalisation without an object to call ``str`` on.
+    """
+
+    def test_whitespace_is_collapsed_to_one_line(self) -> None:
+        """Leading, trailing and internal whitespace runs become single spaces."""
+        assert describe_text("  two\n  lines ", "RuntimeError") == "two lines"
+
+    def test_empty_text_falls_back_to_the_type_name(self) -> None:
+        """A child failure with no message is named by its type."""
+        assert describe_text("", "RuntimeError") == "RuntimeError"
+
+    def test_whitespace_text_falls_back_to_the_type_name(self) -> None:
+        """Text that is only whitespace is as empty as no text at all."""
+        assert describe_text(" \n\t", "error") == "error"
+
+    def test_describe_still_collapses_through_the_shared_rule(self) -> None:
+        """``describe`` gives the same answer it gave before the rule moved."""
+        assert describe(RuntimeError("a\nb")) == "a b"
+        assert describe(RuntimeError("a\nb")) == describe_text("a\nb", "RuntimeError")
 
 
 class TestScanInterrupted:
