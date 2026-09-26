@@ -42,6 +42,7 @@ from saneless.scanner.base import (
     SourceKind,
     classify_source,
 )
+from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
@@ -573,6 +574,89 @@ class TestSaneBackendInit:
         SaneBackend(host="192.168.1.50:192.168.1.51")
         assert os.environ["SANE_NET_HOSTS"] == "192.168.1.50:192.168.1.51"
 
+    def test_sane_backend_treats_an_exported_empty_variable_as_unset(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        An exported but empty SANE_NET_HOSTS names no host, so the config wins.
+
+        libsane skips empty entries, so leaving the empty value in place would
+        give SANE no host at all while the operator configured one.
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "")
+        caplog.set_level(logging.INFO, logger=_BACKEND_LOGGER)
+        SaneBackend(host="scanbox.lan")
+
+        assert os.environ["SANE_NET_HOSTS"] == "scanbox.lan"
+        assert not any("set externally" in m for m in _backend_messages(caplog))
+
+    def test_sane_backend_logs_an_exported_value_as_external(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A non-empty exported value is kept and named once at INFO."""
+        monkeypatch.setenv("SANE_NET_HOSTS", "external-host")
+        caplog.set_level(logging.INFO, logger=_BACKEND_LOGGER)
+        SaneBackend(host="config-host")
+
+        assert os.environ["SANE_NET_HOSTS"] == "external-host"
+        external = [m for m in _backend_messages(caplog) if "set externally" in m]
+        assert len(external) == 1
+        assert "external-host" in external[0]
+
+    @pytest.mark.parametrize(
+        "environment",
+        [
+            pytest.param(None, id="unset"),
+            pytest.param("", id="exported-empty"),
+            pytest.param("ext-host", id="exported"),
+        ],
+    )
+    def test_sane_backend_writes_what_the_shared_helper_derives(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        environment: str | None,
+    ) -> None:
+        """
+        The backend and the helper agree on the host list in every state.
+
+        The scanner check probes the helper's answer, so any disagreement
+        would have it probe a host SANE never dials.
+        """
+        if environment is None:
+            monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        else:
+            monkeypatch.setenv("SANE_NET_HOSTS", environment)
+        expected = effective_sane_net_hosts("cfg-host")
+
+        SaneBackend(host="cfg-host")
+
+        assert os.environ.get("SANE_NET_HOSTS") == expected
+
+
+def _backend_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """
+    Collect every message the backend module logged, at any captured level.
+
+    Args:
+        caplog: The capturing fixture, already set to the level of interest.
+
+    Returns:
+        One string per record from the backend module's logger.
+
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _BACKEND_LOGGER
+    ]
+
 
 def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     """
@@ -671,6 +755,89 @@ class TestSaneInitGuard:
         sane_backend_mod.shutdown()
         SaneBackend()
         assert fake_sane_module.init_call_count == 2
+
+    def test_a_re_init_after_shutdown_writes_its_own_host(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        Saneless's own earlier value is not mistaken for an operator's.
+
+        Without the restore, the second init would find the first host still
+        exported, keep it, and log it as set externally.
+        """
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend(host="scanner-a")
+        sane_backend_mod.shutdown()
+        assert "SANE_NET_HOSTS" not in os.environ
+
+        caplog.set_level(logging.INFO, logger=_BACKEND_LOGGER)
+        SaneBackend(host="scanner-b")
+
+        assert os.environ["SANE_NET_HOSTS"] == "scanner-b"
+        assert not any("set externally" in m for m in _backend_messages(caplog))
+
+    def test_shutdown_restores_an_exported_empty_variable(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The previous state is put back exactly, empty rather than absent."""
+        monkeypatch.setenv("SANE_NET_HOSTS", "")
+        SaneBackend(host="scanner-a")
+        assert os.environ["SANE_NET_HOSTS"] == "scanner-a"
+
+        sane_backend_mod.shutdown()
+
+        assert os.environ["SANE_NET_HOSTS"] == ""
+
+    def test_shutdown_leaves_a_value_someone_else_wrote_alone(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only saneless's own value is restored; a later change is not undone."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend(host="scanner-a")
+        monkeypatch.setenv("SANE_NET_HOSTS", "operator-host")
+
+        sane_backend_mod.shutdown()
+
+        assert os.environ["SANE_NET_HOSTS"] == "operator-host"
+
+    def test_a_failed_init_puts_the_variable_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed init records nothing, the environment included."""
+        failing = FakeSaneModule(init_error=FakeSaneError("no SANE here"))
+        monkeypatch.setattr(sane_backend_mod, "sane", failing)
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+
+        with pytest.raises(ScanError, match="Could not initialise SANE"):
+            SaneBackend(host="scanner-a")
+
+        assert "SANE_NET_HOSTS" not in os.environ
+
+    def test_the_later_host_warning_names_the_effective_host_list(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        The warning names what SANE is using, not the ignored configured host.
+
+        With an exported value in effect, the first construction's host was
+        never used, so naming it would send the operator to the wrong place.
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "ext-host")
+        SaneBackend(host="scanner-a")
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+        SaneBackend(host="scanner-b")
+
+        warnings = _guard_warnings(caplog)
+        assert len(warnings) == 1
+        assert "ext-host" in warnings[0]
+        assert "scanner-b" in warnings[0]
+        assert "scanner-a" not in warnings[0]
 
     def test_init_once_under_concurrent_construction(
         self, fake_sane_module: FakeSaneModule
