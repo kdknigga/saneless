@@ -1509,7 +1509,7 @@ class _ListingFailure(StrEnum):
     tell apart from "listed nothing".  ``CRASHED``: the child died from a
     signal, which is the scanner library failing inside a C call.
     ``TIMED_OUT``: the child was still listing at the deadline and was
-    stopped, which is a peer that accepted a connection and then said
+    stopped, for example because a peer accepted a connection and then said
     nothing.  ``NO_ANSWER``: the child could not be started, or ended without
     a reply that could be read.
     """
