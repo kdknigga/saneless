@@ -57,6 +57,8 @@ from saneless.config import (
     config_file_state,
     is_placeholder_token,
 )
+from saneless.exceptions import ListingCrashedError, ListingTimedOutError
+from saneless.scanner.base import DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
     ConfigFileState,
@@ -117,11 +119,13 @@ logger = logging.getLogger(__name__)
 # resolution plus this budget plus that one, and every host the pre-probe can
 # dial is probed -- up to ``_MAX_PROBE_HOSTS`` setting entries, and the
 # configured ``net:`` device's own host.  The bound still
-# matters for the reason it always did: what it
-# replaces is `get_devices()`, which has no timeout at any layer and costs
-# roughly 127 s for a silently unreachable host, because Linux retries a SYN
-# six times by default, inside a blocking C call nothing can interrupt.  Read
-# at call time, so tests can shorten it.
+# matters, although a listing is no longer unbounded: libsane's own connect
+# takes no timeout and costs roughly 127 s for a silently unreachable host,
+# because Linux retries a SYN six times by default, inside a blocking C call
+# nothing can interrupt.  That call now runs in a listing child stopped at
+# ``LISTING_DEADLINE_SECONDS`` (see below), and this budget is what keeps a
+# host it can see is dead from costing a check even that.  Read at call time,
+# so tests can shorten it.
 PROBE_CONNECT_SECONDS: Final = 2.0
 
 # How long a saned pre-probe waits for saned's answer once a connection is
@@ -205,10 +209,22 @@ _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 # than four network scanners is not the machine this project is for.  The cost
 # of being wrong about that is stated rather than hidden: the fifth distinct
 # host onwards loses the pre-probe, not the check, and libsane still dials it
-# inside ``get_devices()``, so a dead one there can hang that call for the
-# ~127 s the pre-probe otherwise prevents.  The configured ``net:`` device's
-# own host is probed on top of the cap, because the check may open it.
+# inside the listing, so a dead one there holds the listing, and the scanner
+# gate, until ``LISTING_DEADLINE_SECONDS`` stops it.  The configured ``net:``
+# device's own host is probed on top of the cap, because the check may open
+# it.
 _MAX_PROBE_HOSTS: Final = 4
+
+# The listing has a bound of its own: ``LISTING_DEADLINE_SECONDS``, 30 s, in
+# ``saneless.scanner.listing``.  Every listing, the Scanner check's included,
+# runs in a short-lived child process that is killed and reaped at that
+# deadline, so the uninterruptible connect inside libsane costs a check at
+# most 30 s rather than the ~127 s a silent host costs the C call itself.  It
+# is defined in the scanner layer, beside the launcher that enforces it,
+# because the scan path lists through the same launcher and must not import
+# this module to do so.  The pre-probe still matters: a silent host it
+# catches never holds the scanner gate for the whole deadline, and the row
+# names the cause rather than saying only that the listing ran out of time.
 
 # How libsane's net backend starts every device id it names
 # (``sane_get_devices`` in ``backend/net.c``).  An id that starts this way is
@@ -270,8 +286,8 @@ SKIPPED_STATE_LABEL: Final = "Not checked"
 # host, up to ``_MAX_PROBE_HOSTS`` of them.  And the ordinary local-USB
 # deployment has no parseable host at all, so ``_scanner_preflight`` hands
 # over to enumeration without dialling anything and ``_scanner_enumeration``
-# enters ``get_devices()``, which this file costs at roughly 127 s for a silently
-# unreachable host, inside a blocking C call nothing can interrupt.
+# starts a listing child, which a silently unreachable host holds until
+# ``LISTING_DEADLINE_SECONDS`` stops it.
 #
 # So what this cap means is narrower than it used to claim: ten attempts is the
 # bound for a chain with **nothing in flight**, which is the case it was always
@@ -292,13 +308,15 @@ POLL_ATTEMPT_CAP: Final = 10
 # device is opened only once its own host has been probed, on the port libsane
 # opens it on, and did not time out.  A host the pre-probe cannot dial is
 # another matter -- ``_scanner_preflight`` lists which those are --
-# and ``get_devices()`` still dials it, so a dead one costs the ~127 s this
-# file documents, as a wedged local backend can.  That is one uninterruptible
-# ``get_devices()`` at most, never two: the open of an unlisted device is
-# refused when its host could not be probed on that port.  35 s of probing, one ~127 s listing and
-# ``PROBE_READ_SECONDS`` for Paperless is about 167 s, which leaves little
-# room for the pre-probe's unbounded resolutions, and that is stated rather
-# than hidden.  Below it, a cold start on a wedged scanner stopped asking while
+# and the listing still dials it, so a dead one holds the listing child until
+# ``LISTING_DEADLINE_SECONDS``, 30 s, stops it, as a wedged local backend can.
+# That is one listing at most, never two: the open of an unlisted device runs
+# in the same child, and is refused when its host could not be probed on that
+# port.  35 s of probing, one 30 s listing and ``PROBE_READ_SECONDS`` for
+# Paperless is about 70 s, which leaves the pre-probe's unbounded resolutions
+# the rest; the cap was sized when one listing could cost ~127 s on its own,
+# and is kept rather than shrunk because a tab asking a little longer loses
+# nothing.  Below it, a cold start on a wedged scanner stopped asking while
 # its first probe was still running and told a household member to press a
 # button that starts the thing already running.
 #
@@ -327,8 +345,10 @@ POLL_GAVE_UP_LINE: Final = "The checks have not run yet. Press Check again to tr
 # ``Check again`` button, and beside a running probe that is advice that cannot
 # help: the click collapses into the probe already running.  So this sentence
 # says what is true -- the first check has not finished -- and sets an
-# expectation for how long that can take, which is the ~127 s ``get_devices()``
-# figure rounded into words a household member reads.  Held to exactly
+# expectation for how long that can take, in words a household member reads.
+# It was written when one listing could cost ~127 s; a listing now stops at
+# ``LISTING_DEADLINE_SECONDS``, so the sentence errs long, which for an
+# expectation is the safe direction.  Held to exactly
 # ``POLL_GAVE_UP_LINE``'s rule: no host, no address, no port, no path, no URL
 # and no exception text, because it renders on a page the whole LAN can read
 # (ASVS V7).
@@ -824,9 +844,10 @@ def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
     On Linux a ``connect()`` to ``0.0.0.0`` reaches loopback, so one of those
     in the dial list lets any unrelated local process listening on 6566 make
     that entry HEALTHY or REJECTED instead of timed out or refused, and let
-    enumeration start -- reinstating the ~127 s uninterruptible hang the
-    pre-probe exists to avoid, on an appliance whose configured host is in
-    fact dead.
+    enumeration start -- a listing that then hangs on the dead host until
+    ``LISTING_DEADLINE_SECONDS`` stops it, holding the scanner gate, which is
+    what the pre-probe exists to avoid, on an appliance whose configured host
+    is in fact dead.
 
     The rule is in two steps.  If any dot-separated part is not a number glibc
     could read, the segment holds a letter outside a hex prefix and is a name,
@@ -881,7 +902,8 @@ def _looks_like_a_host_name(segment: str) -> bool:
 
     Being narrow is the safe direction.  A false "no" costs the pre-probe for
     that entry: ``_saned_hosts`` drops it and the scanner check falls through
-    to ``get_devices()``, which may still dial it with no timeout.  A false
+    to the listing, which may still dial it until ``LISTING_DEADLINE_SECONDS``
+    stops the child.  A false
     "yes" costs junk dials and, through the pre-probe, possibly a wrong
     verdict.
 
@@ -905,8 +927,9 @@ def _looks_like_a_host_name(segment: str) -> bool:
     A legal dotted-quad IPv4 literal is accepted, deliberately and by name.
     ``192.0.2.10`` is not a number glibc invented an address from -- it is the
     address the operator configured -- and dialling it is precisely the
-    pre-probe's job on a static-IP scanner, worth about 127 s of
-    uninterruptible ``get_devices()`` when the appliance is off.  The one
+    pre-probe's job on a static-IP scanner, which would otherwise cost a
+    listing its whole ``LISTING_DEADLINE_SECONDS`` when the appliance is off.
+    The one
     exception is ``0.0.0.0`` itself: a legal literal, but the very address the
     paragraph above names as the worst case, and one no scanner is ever at, so
     ``_segment_is_a_numeric_address_shorthand`` refuses it by name.
@@ -943,7 +966,7 @@ def _looks_like_an_ipv6_literal(host_setting: str) -> bool:
     hex -- instead of as a name with a stray ``]`` in it.  Mangling the input
     that way is safe here because the answer is only ever used to *refuse*: a
     false "yes" leaves the setting unprobed, so a dead host in it can still
-    cost ``get_devices()`` its uninterruptible connect, but there is no path
+    hold a listing until ``LISTING_DEADLINE_SECONDS``, but there is no path
     from this function to an address that gets dialled.
 
     A zone suffix needs no handling of its own.  ``ipaddress.ip_address`` has
@@ -1063,20 +1086,21 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     takes, so the length of this tuple is the only place the duration can be
     bounded.  A longer setting loses the pre-probe for its tail rather than
     losing the bound.  That is a real loss, not only a latency one: libsane
-    still dials every entry of the tail inside ``get_devices()``, so a dead
-    fifth host costs the ~127 s uninterruptible connect the pre-probe exists
-    to prevent.  It is accepted, and documented, because refusing to
+    still dials every entry of the tail inside the listing, so a dead fifth
+    host holds the listing child, and the scanner gate, until
+    ``LISTING_DEADLINE_SECONDS`` stops it, and the row can only say the
+    listing ran out of time.  It is accepted, and documented, because refusing to
     enumerate beside an unprobed entry would turn every working five-host
     setup permanently amber.
 
     Returning ``()`` is not a silent failure; it is the fallback this module
     documents everywhere else.  No entries means no probe, which means the
-    scanner check calls ``get_devices()`` and behaves exactly as it did before
-    the probe existed.  The same is true of a segment dropped from a list: it
-    is not probed, and libsane may still dial it.  An operator who typed an
-    IPv6 literal, or a name this module will not guess at, therefore loses
-    the pre-probe's protection for that host -- a dead one can hang
-    ``get_devices()`` -- but never gets a wrong verdict from a probe of
+    scanner check lists and behaves exactly as it did before the probe
+    existed.  The same is true of a segment dropped from a list: it is not
+    probed, and libsane may still dial it.  An operator who typed an IPv6
+    literal, or a name this module will not guess at, therefore loses the
+    pre-probe's protection for that host -- a dead one holds the listing until
+    ``LISTING_DEADLINE_SECONDS`` -- but never gets a wrong verdict from a probe of
     something nobody configured, which is the trade the whole module is built
     on.  ``_scanner_preflight`` lists every kind of entry that goes unprobed.
 
@@ -1283,14 +1307,17 @@ def _probe_saned(
     """
     Classify one configured saned host by the opening of the SANE handshake.
 
-    There is nowhere else to put a bound.  ``SaneBackend.get_devices()``
-    calls into libsane, which has no timeout parameter at any layer -- not in
-    python-sane, not in ``sane_get_devices(3)``, and not settable from Python.
-    With the ``net`` backend that call opens a TCP connection to each entry of
+    libsane's listing takes no timeout parameter -- not in python-sane, not
+    in ``sane_get_devices(3)``, and not settable from Python.  With the
+    ``net`` backend that call opens a TCP connection to each entry of
     ``SANE_NET_HOSTS``, so an unplugged host is a connect that hangs until the
     kernel gives up: on Linux ``tcp_syn_retries`` defaults to 6, roughly 127
-    seconds, inside a blocking C call nothing can interrupt.  Dialling the same
-    address first, with a timeout, is the only bound available.
+    seconds, inside a blocking C call nothing can interrupt.  The listing
+    child is stopped at ``LISTING_DEADLINE_SECONDS``, which bounds that, but
+    only by abandoning the listing: the check then knows nothing but that it
+    ran out of time, and it held the scanner gate for the whole deadline.
+    Dialling the same address first, with a short timeout, is what finds a
+    dead host quickly, with the gate free, and lets the row name it.
 
     **Why a connect is not enough.**  saned refuses a peer its ``saned.conf``
     does not allow by closing the socket before it reads anything
@@ -1565,7 +1592,10 @@ def _blocks_enumeration(outcome: _SanedOutcome) -> bool:
     layer -- its net backend's connect timeout is cleared once the connect
     succeeds (``connect_dev`` in ``backend/net.c``) -- so a listing would wait
     on that host for as long as it stays silent, inside a C call nothing can
-    interrupt.
+    interrupt.  The listing child would be stopped at
+    ``LISTING_DEADLINE_SECONDS``, but only after holding the scanner gate that
+    long, and its row could say no more than that the listing ran out of
+    time; keeping out gives a fast row that names the host problem.
 
     Refused, rejected and unresolved hosts return at once inside libsane: a
     refused connect fails straight away, a rejection is an answer, and a name
@@ -1772,9 +1802,9 @@ def _configured_device_probes(
     with no timeout.  The Scanner check opens a configured device it does not
     find listed, so without this a switched-off host outside the setting --
     none configured, one past ``_MAX_PROBE_HOSTS``, or one named only in
-    ``net.conf`` -- would cost the ~127 s uninterruptible connect the
-    pre-probe exists to prevent, and on the status strip it would be paid
-    holding the scanner gate.  Probing that host here, with the gate free and
+    ``net.conf`` -- would hold the listing child until
+    ``LISTING_DEADLINE_SECONDS`` stops it, and on the status strip that would
+    be paid holding the scanner gate.  Probing that host here, with the gate free and
     on the same budgets as every other host, means a timed-out one ends the
     check before libsane is touched, exactly like a configured host.
 
@@ -2607,15 +2637,15 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     with no python-sane is its own row and is decided without touching
     anything.  Then every entry ``_saned_hosts`` returns for the host list
     SANE will use is probed with ``_probe_saned``, with no short circuit:
-    libsane dials every entry, so a dead second host costs its full
-    uninterruptible connect inside ``get_devices()`` however well the first
-    one answers.  When ``scanner.device`` is a ``net:`` id whose host none of
-    those entries covers on ``SANED_PORT``, that host is probed on
+    libsane dials every entry, so a dead second host holds the listing until
+    ``LISTING_DEADLINE_SECONDS`` however well the first one answers.  When
+    ``scanner.device`` is a ``net:`` id whose host none of those entries
+    covers on ``SANED_PORT``, that host is probed on
     ``SANED_PORT`` too (``_configured_device_probes``), because the check may
     open the device and opening it dials its host there.
 
     What is *not* probed is stated rather than hidden, because libsane still
-    dials it inside ``get_devices()``.  ``_saned_hosts`` returns at most
+    dials it inside the listing.  ``_saned_hosts`` returns at most
     ``_MAX_PROBE_HOSTS`` entries and drops the ones it will not guess at: an
     IPv6 literal, a numeric shorthand, and the rest of a setting it refuses.
     Hosts named only in ``net.conf`` are not read at all.  And a two-segment
@@ -2623,8 +2653,8 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     dials ``host`` and the port number as two hosts, both on ``SANED_PORT``
     (a configured ``net:`` device on that host is the exception, as above).
     Enumeration still runs beside such an entry, as it did before the
-    pre-probe existed, so a dead host there can still cost ``get_devices()``
-    its uninterruptible connect; refusing to enumerate instead would turn
+    pre-probe existed, so a dead host there can still hold the listing until
+    ``LISTING_DEADLINE_SECONDS`` stops it; refusing to enumerate instead would turn
     every working IPv6 or five-host setup permanently amber.
 
     If any probed host timed out -- including one that accepted the
@@ -2669,8 +2699,13 @@ def _scanner_enumeration(
 
     This is the only region of the Scanner check that enters libsane, and it
     runs under the scanner gate on the status strip; it decides nothing.  It
-    lists the devices, and then, only when ``scanner.device`` is set and no
-    listed device has exactly that id, opens and closes that id once.
+    is one call, ``scanner.list_and_open``, which lists the devices and, only
+    when ``scanner.device`` is set and no listed device has exactly that id,
+    opens and closes that id once.  Both steps run inside the backend's
+    short-lived listing child, so a check never uses this process's libsane
+    and always sees a fresh control connection to every scanner host.  The
+    child is killed and reaped at ``LISTING_DEADLINE_SECONDS``, and the call
+    does not return, or raise, until it has been reaped.
 
     The open exists because SANE opens ids it never lists.  An ``escl:`` URL
     with no ``escl.conf`` entry is one, and a ``net:`` device on a host that
@@ -2679,18 +2714,26 @@ def _scanner_enumeration(
     so an unlisted device that opens is one a scan can use, and reporting it
     red would break the rule that a working appliance never goes red.  It is
     attempted only in that absent case, never on every check, and also when
-    the listing itself raised, because a scan opens a configured id without
+    the listing itself failed, because a scan opens a configured id without
     listing anything.
+
+    A child that crashed, or that was stopped at its deadline, is not a
+    listing that found nothing: each has its own row, so each is recorded as
+    what it was.  The launcher has already logged the crash or the timeout,
+    so nothing more is logged for them here.  Any other failure is logged by
+    its class name only and treated as an empty listing, with a configured id
+    counted as not opened.
 
     It is never reached when the preflight stopped the check, and the
     preflight probes a ``net:`` device's own host before this can open it, so
     no *probed* host that timed out, or accepted the connection and then said
-    nothing, is listed or opened here: libsane would hang on it.  A refused
+    nothing, is listed or opened here (``_blocks_enumeration``).  A refused
     host is listed, and a device on it opened, because a refused connect
     returns at once inside libsane.  A ``net:`` device whose host could not
-    be probed at all is not opened either (``may_open``).  The listing itself
-    still dials every host libsane knows of, including any the preflight
-    could not probe; ``_scanner_preflight`` lists which those are.
+    be probed at all is not opened either (``may_open``): the call is asked
+    to open nothing.  The listing itself still dials every host libsane
+    knows of, including any the preflight could not probe;
+    ``_scanner_preflight`` lists which those are.
 
     Args:
         scanner: The backend to ask.
@@ -2699,36 +2742,67 @@ def _scanner_enumeration(
             for a ``net:`` device whose host the preflight could not probe.
 
     Returns:
-        What was listed, and whether an unlisted configured device opened or
-        was deliberately left unopened.
+        What was listed, whether an unlisted configured device opened or was
+        deliberately left unopened, and whether the listing crashed or ran
+        out of time.
 
     """
+    open_target = configured_device if may_open else ""
     try:
-        devices = tuple(scanner.get_devices())
+        survey = scanner.list_and_open(open_target)
+    except ListingCrashedError:
+        return _Enumeration(devices=(), failure=_ListingFailure.CRASHED)
+    except ListingTimedOutError:
+        return _Enumeration(devices=(), failure=_ListingFailure.TIMED_OUT)
     except Exception as exc:
-        # The backend raises ScanError, but python-sane underneath it raises
-        # _sane.error, RuntimeError or AttributeError with no shared base, so
-        # the boundary catches Exception.  The type name is logged; nothing
-        # from the exception reaches the row.
-        logger.warning("Scanner enumeration failed: %s", type(exc).__name__)
-        devices = ()
+        # The backend raises ScanError, for instance while a read is stuck or
+        # when the child gave no usable answer, but a backend is free to raise
+        # anything, so the boundary catches Exception.  Only the type name
+        # goes any further.
+        survey = DeviceSurvey(
+            devices=(),
+            list_error=type(exc).__name__,
+            configured_opened=False if open_target else None,
+        )
+    # The survey carries class names only, never an id or exception text: a
+    # ``net:`` id is a LAN address, and the text of a SANE error usually
+    # repeats it.
+    if survey.list_error is not None:
+        logger.warning("Scanner enumeration failed: %s", survey.list_error)
+    if survey.open_error is not None:
+        logger.warning("Configured scanner could not be opened: %s", survey.open_error)
+    return _enumeration_from(survey, configured_device, may_open=may_open)
+
+
+def _enumeration_from(
+    survey: DeviceSurvey, configured_device: str, *, may_open: bool
+) -> _Enumeration:
+    """
+    Turn what the listing found into the verdict's plain record.
+
+    Args:
+        survey: What the backend's list-then-open found.
+        configured_device: The configured ``scanner.device``, possibly empty.
+        may_open: Whether an unlisted configured device could be opened.
+
+    Returns:
+        The listed devices, and for an unlisted configured device, whether it
+        opened or was deliberately left unopened.
+
+    """
+    devices = survey.devices
     if not configured_device or any(
         device.name == configured_device for device in devices
     ):
         return _Enumeration(devices=devices)
     if not may_open:
         return _Enumeration(devices=devices, open_withheld=True)
-    try:
-        scanner.open_and_close(configured_device)
-    except Exception as exc:
-        # The same boundary, for the same reason.  Neither the id nor the
-        # exception text is logged: the id is a LAN address, and the text of
-        # a failed open usually repeats it.  ``open_and_close`` holds the
-        # backend's own logging to the same rule, which ``get_capabilities``
-        # does not: a scan's close-failure line names the device.
-        logger.warning("Configured scanner could not be opened: %s", type(exc).__name__)
-        return _Enumeration(devices=devices, configured_opened=False)
-    return _Enumeration(devices=devices, configured_opened=True)
+    # ``None`` here would mean no open was attempted although the id is not
+    # listed, which the backend does only when its listing included it -- the
+    # branch above.  Anything but a confirmed open is therefore not opened.
+    return _Enumeration(
+        devices=devices, configured_opened=survey.configured_opened is True
+    )
 
 
 def _check_scanner(context: CheckContext) -> CheckResult:
@@ -3084,8 +3158,14 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     preflight that settles the row -- no python-sane, or a configured host
     that timed out -- therefore never touches the gate at all.
     Only ``_scanner_enumeration`` is held: the device listing, and the open of
-    an unlisted configured device, inside one hold.  The verdict runs after
-    the release, because it is pure and enters nothing.
+    an unlisted configured device, inside one hold.  Both run in the backend's
+    listing child, and the gate is held for that child's whole life: the
+    backend does not return, or raise, until the launcher has reaped the
+    child, whether it answered, crashed or was killed at
+    ``LISTING_DEADLINE_SECONDS``, so the release in ``finally`` always comes
+    after the reap.  A gate released while the child was still inside libsane
+    would let a scan in beside it.  The verdict runs after the release,
+    because it is pure and enters nothing.
 
     The attempt is non-blocking and a failure is reported rather than waited
     out, which is the single move ``ScanWorker.scanner_gate`` documents as
@@ -3114,7 +3194,8 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     enumerates one device, an enumeration that raises, a host that refuses
     this machine, a host whose name does not resolve, a configured device
     that is not listed and does not open, one that is not listed but opens,
-    and a ``net:`` device that is not listed and whose host cannot be probed.
+    a ``net:`` device that is not listed and whose host cannot be probed, a
+    listing whose child crashed, and one whose child ran out of time.
     Together they reach every branch of this function and compare each
     against ``_check_scanner``.
 

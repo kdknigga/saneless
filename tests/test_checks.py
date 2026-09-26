@@ -14,10 +14,11 @@ without forcing a decision here -- the discipline
 ``tests/test_web_state_rendering.py`` applies to the templates.
 
 The saned pre-probe is tested against real loopback sockets.  It has no analog
-anywhere in the tree: ``SaneBackend.get_devices()`` is a blocking C call with
-no timeout at any layer, so this socket probe is the only bound available and
-is therefore treated as new code rather than as a variation on something
-already proven.  No test here sleeps.
+anywhere in the tree: libsane's listing is a blocking C call with no timeout
+of its own, and the listing child's deadline bounds it only by abandoning it,
+so this socket probe is what finds a dead host quickly and is therefore
+treated as new code rather than as a variation on something already proven.
+No test here sleeps.
 """
 
 from __future__ import annotations
@@ -2028,9 +2029,11 @@ class _CountingBackend(StubScannerBackend):
     A backend that reports what it is told to and counts the times it is asked.
 
     Both ways the Scanner check can enter SANE are counted: ``calls`` for a
-    device listing and ``opens`` for opening a device.  The check opens
-    through ``open_and_close``, whose base-class default opens through
-    ``get_capabilities``, so counting there counts the check's opens.
+    device listing and ``opens`` for opening a device.  The check makes one
+    ``list_and_open`` call, whose base-class default lists through
+    ``get_devices`` and opens through ``open_and_close`` and then
+    ``get_capabilities``, so counting there counts the check's listings and
+    opens.
     """
 
     def __init__(self, devices: list[DeviceInfo] | None = None) -> None:
