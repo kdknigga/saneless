@@ -1630,10 +1630,12 @@ def test_no_shipped_file_references_the_old_owner() -> None:
 # leaves ordinary text alone: UTF-8, ISO-8601, SHA-384, A4, "N-1" and a bare
 # PLAN (SQLite's EXPLAIN QUERY PLAN) do not match. The no-planning-citations
 # hook in .pre-commit-config.yaml carries the same pattern, and the test after
-# the guard keeps the two identical.
+# the guard keeps the two identical. The architecture and enumeration
+# requirement IDs are covered too, because their prefixes appear in no other
+# identifier shape above.
 PLANNING_CITATION = re.compile(
     r"\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
-    r"API|APPL|CFG|CTR|DARK|DLVR|DOCS|DPLX|EXC|HARD|OUTC|ROBU|"
+    r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|OUTC|ROBU|"
     r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\bT-[0-9]+-[0-9]+\b|"
     r"\b[Pp]hase [0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
     r"\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|"
@@ -1747,6 +1749,13 @@ def test_the_citation_guard_reports_a_file_it_cannot_read(tmp_path: Path) -> Non
     ]
     assert "not UTF-8" in offenders[0]
     assert "unreadable" in offenders[1]
+
+
+def test_the_citation_guard_catches_architecture_and_enumeration_ids() -> None:
+    """Architecture and enumeration requirement IDs are citations; UTF-8 is not."""
+    assert PLANNING_CITATION.search("ENUM-03")
+    assert PLANNING_CITATION.search("ARCH-03")
+    assert not PLANNING_CITATION.search("UTF-8")
 
 
 def test_the_citation_hook_uses_the_guard_pattern() -> None:
