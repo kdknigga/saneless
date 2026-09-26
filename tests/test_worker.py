@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import errno
 import logging
 import os
@@ -6417,6 +6418,294 @@ class TestScannerGate:
 
         assert not during
         assert freed
+
+
+# The refusal a wedged read makes a restart of SANE raise, in the backend's
+# own words: a job refused this way fails exactly as a refused scan does.
+_WEDGED_REINIT_REFUSAL = (
+    "Could not start a scan on the scanner: a read on test:0 (page 1) has not "
+    "returned, and SANE allows no other operation on a device while one is "
+    "outstanding. The scan will be possible again as soon as the scanner "
+    "releases it. Restart saneless if it does not."
+)
+
+
+class _ReinitRecordingScanner(StubScannerBackend):
+    """
+    A scanner that logs, in order, every SANE entry the worker makes.
+
+    ``reinitialise``, ``get_devices``, ``get_capabilities`` and ``scan_pages``
+    all append their name to one list, so a test can read the order of a
+    job's calls.  ``reinitialise`` also records whether the scanner gate
+    was free at that moment, as a probe would see it, and can be told to
+    refuse the way a wedged read makes the real backend refuse.
+
+    It reports one flatbed, so startup generation builds a ``default``
+    profile and a job with no device configured picks this one.
+
+    Attributes:
+        calls: The name of each call made, in order.
+        gate_free_at_reinit: For each restart, whether the gate could be taken.
+        worker: The worker whose gate to test; set once the worker exists.
+
+    """
+
+    def __init__(self, *, refusal: str | None = None) -> None:
+        """
+        Start with no calls recorded.
+
+        Args:
+            refusal: When set, every restart raises a ``ScanError`` with this text.
+
+        """
+        self.calls: list[str] = []
+        self.gate_free_at_reinit: list[bool] = []
+        self.worker: ScanWorker | None = None
+        self._refusal = refusal
+
+    def reinitialise(self) -> None:
+        """
+        Record the restart and the gate's state, then refuse if told to.
+
+        Raises:
+            ScanError: When the scanner was built with a refusal.
+
+        """
+        self.calls.append("reinitialise")
+        if self.worker is not None:
+            self.gate_free_at_reinit.append(_gate_is_free(self.worker))
+        if self._refusal is not None:
+            raise ScanError(self._refusal)
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Record the listing and report one flatbed.
+
+        Returns:
+            A single device.
+
+        """
+        self.calls.append("get_devices")
+        return [
+            DeviceInfo(
+                name="test:0",
+                vendor="Test",
+                model="Flatbed",
+                device_type="flatbed scanner",
+            )
+        ]
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Record the open and report the stub's plain flatbed.
+
+        Args:
+            device_id: Passed through to the stub.
+
+        Returns:
+            The stub's capabilities.
+
+        """
+        self.calls.append("get_capabilities")
+        return super().get_capabilities(device_id)
+
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Record the scan and spool the stub's one page.
+
+        Args:
+            device_id: Passed through to the stub.
+            settings: Passed through to the stub.
+            sink: Passed through to the stub.
+
+        Returns:
+            The stub's one-page batch.
+
+        """
+        self.calls.append("scan_pages")
+        return super().scan_pages(device_id, settings, sink)
+
+
+def _reinit_call_sites() -> list[tuple[str, str]]:
+    """
+    Find every call to a method named ``reinitialise`` in the saneless package.
+
+    The walk is over the syntax tree rather than the text, so a docstring or
+    comment that names the method is not mistaken for a call.
+
+    Returns:
+        One ``(file name, enclosing function name)`` pair per call, with
+        ``""`` for a call outside any function.
+
+    """
+    package = Path(worker_module.__file__).parent
+    sites: list[tuple[str, str]] = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        owner: dict[int, str] = {}
+        # ast.walk visits an outer function before the ones nested in it, so
+        # the innermost enclosing function is the last one written here.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                for inner in ast.walk(node):
+                    owner[id(inner)] = node.name
+        sites.extend(
+            (path.relative_to(package).as_posix(), owner.get(id(node), ""))
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "reinitialise"
+        )
+    return sites
+
+
+class TestPerJobReinitialise:
+    """
+    Every scan job restarts SANE first, under the scanner gate.
+
+    After a saned restart, the net backend keeps using a control connection
+    the server has already dropped, so every later open in this process fails
+    until SANE is restarted.  Restarting at the top of each job, before its
+    first listing or open, means every scan starts on a fresh connection.
+    The gate is already held there and no handle of this process is open,
+    which is the one state in which a restart is known to be safe.
+    """
+
+    def test_a_job_reinitialises_once_under_the_gate_before_listing(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """The restart is the job's first SANE call, made with the gate held."""
+        default_settings.scanner.device = ""
+        scanner = _ReinitRecordingScanner()
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        scanner.worker = worker
+        try:
+            worker.start()
+            job = store.create_job("default", "Reinit Once")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert "reinitialise" in scanner.calls, "the job never restarted SANE"
+        job_calls = scanner.calls[scanner.calls.index("reinitialise") :]
+        assert job_calls[:2] == ["reinitialise", "get_devices"]
+        assert "scan_pages" in job_calls
+        assert scanner.calls.count("reinitialise") == 1
+        assert scanner.gate_free_at_reinit == [False]
+        assert finished.state is JobState.DONE
+
+    def test_each_of_two_jobs_reinitialises_once_at_its_start(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A saned restart between two jobs is met by the second job's restart."""
+        scanner = _ReinitRecordingScanner()
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        scanner.worker = worker
+        try:
+            worker.start()
+            first = store.create_job("default", "Reinit First")
+            worker.submit(first)
+            wait_for_state(store, first.id, TERMINAL_STATES, _STATE_BUDGET)
+            mark = len(scanner.calls)
+            second = store.create_job("default", "Reinit Second")
+            worker.submit(second)
+            wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert scanner.calls[:mark].count("reinitialise") == 1
+        assert scanner.calls[mark:].count("reinitialise") == 1
+        assert scanner.calls[mark : mark + 1] == ["reinitialise"]
+        assert scanner.gate_free_at_reinit == [False, False]
+
+    def test_startup_profile_read_does_not_reinitialise(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The startup read uses the SANE the backend just started; jobs restart it.
+
+        It runs once, before any job, so there is nothing stale to clear.
+        """
+        scanner = _ReinitRecordingScanner()
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        scanner.worker = worker
+        try:
+            worker.start()
+            generated = poll_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+            before_any_job = list(scanner.calls)
+            job = store.create_job("default", "Reinit After Startup")
+            worker.submit(job)
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert before_any_job == ["get_devices", "get_capabilities"]
+        assert scanner.calls.count("reinitialise") == 1
+
+    def test_a_refused_reinitialise_fails_the_job_as_a_scanner_error(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A restart refused over a wedged read fails the job and frees the gate.
+
+        Nothing else reaches SANE for that job: no listing and no scan.
+        """
+        default_settings.scanner.device = ""
+        scanner = _ReinitRecordingScanner(refusal=_WEDGED_REINIT_REFUSAL)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        scanner.worker = worker
+        try:
+            worker.start()
+            job = store.create_job("default", "Reinit Refused")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            freed = poll_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert "reinitialise" in scanner.calls, "the job never restarted SANE"
+        job_calls = scanner.calls[scanner.calls.index("reinitialise") :]
+        assert job_calls == ["reinitialise"]
+        assert finished.state is JobState.ERROR
+        assert finished.error_category is ErrorCategory.SCANNER
+        assert finished.error is not None
+        assert "Restart saneless" in finished.error
+        assert freed
+
+    def test_reinitialise_is_called_only_from_the_scan_job(self) -> None:
+        """
+        The job's gated block is the one place SANE is restarted.
+
+        A restart anywhere else could run while a handle is open or a listing
+        child holds the gate, which is exactly the state it must never see.
+        """
+        assert _reinit_call_sites() == [("worker.py", "_scan_job")]
 
 
 class TestProfileStorage:
