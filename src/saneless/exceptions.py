@@ -10,6 +10,7 @@ __all__ = [
     "ConfigError",
     "FeederEmptyError",
     "ListingCrashedError",
+    "ListingNoAnswerError",
     "ListingTimedOutError",
     "PaperlessError",
     "PaperlessTimeoutError",
@@ -48,6 +49,17 @@ class FeederEmptyError(ScanError):
 
 class ListingCrashedError(ScanError):
     """The scanner library died from a signal while listing scanners."""
+
+
+class ListingNoAnswerError(ScanError):
+    """
+    The listing process gave no answer that could be read, or never started.
+
+    It exited without a reply, its reply did not fit the schema, or it could
+    not be started at all.  Like a crash or a timeout, this says the listing
+    could not see, not that there was nothing to see.  A listing that ran
+    and in which the scanner library itself raised is a plain ``ScanError``.
+    """
 
 
 class ListingTimedOutError(ScanError):

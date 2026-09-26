@@ -2405,10 +2405,11 @@ class SaneBackend(ScannerBackend):
         Raises:
             ListingCrashedError: The listing child died from a signal.
             ListingTimedOutError: The listing child did not finish in time.
+            ListingNoAnswerError: The listing child gave no usable answer, or
+                could not be started.
             ScanError: If a previous read has not returned, in which case no
-                child is started; if SANE could not list the devices, with
-                its message normalised and its control characters escaped;
-                or if the child gave no usable answer.
+                child is started; or if SANE could not list the devices, with
+                its message normalised and its control characters escaped.
 
         """
         # No device to name, because enumeration is the call that finds out
@@ -2453,8 +2454,10 @@ class SaneBackend(ScannerBackend):
         Raises:
             ListingCrashedError: The listing child died from a signal.
             ListingTimedOutError: The listing child did not finish in time.
+            ListingNoAnswerError: The listing child gave no usable answer, or
+                could not be started.
             ScanError: If a previous read has not returned, in which case no
-                child is started; or if the child gave no usable answer.
+                child is started.
 
         """
         _refuse_if_wedged("the scanners", "list")
@@ -2487,9 +2490,11 @@ class SaneBackend(ScannerBackend):
         Raises:
             ListingCrashedError: The listing child died from a signal.
             ListingTimedOutError: The listing child did not finish in time.
+            ListingNoAnswerError: The listing child gave no usable answer, or
+                could not be started.
             ScanError: If a previous read has not returned, in which case no
-                child is started; if the child gave no usable answer; or if
-                the open failed, naming the failure's class only.
+                child is started; or if the open failed, naming the failure's
+                class only.
 
         """
         survey = self.list_and_open(device_id)

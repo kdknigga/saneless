@@ -7,8 +7,9 @@ child is dead and reaped before the launcher returns or raises: a child that
 overruns the deadline is killed, and so is one still running when the wait is
 interrupted.  A child that dies from a signal is a crashed listing, one that
 runs out of time is a timed-out listing.  Both are ``ScanError`` subclasses,
-and each logs one WARNING naming nothing but the signal or the deadline.  Anything else that
-is not exactly the child's reply schema is a plain ``ScanError``.
+and each logs one WARNING naming nothing but the signal or the deadline.  A
+child that cannot be started, or whose output is not exactly the reply
+schema, is a listing that gave no answer, a third ``ScanError`` subclass.
 
 The child's environment is the parent's minus every ``SANELESS_*`` variable,
 with ``SANE_NET_HOSTS`` taken from the one derivation the scanner check uses.
@@ -19,17 +20,20 @@ script written into ``tmp_path``, run exactly as the real child is run.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import subprocess
 import time
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
 from saneless.exceptions import (
     ListingCrashedError,
+    ListingNoAnswerError,
     ListingTimedOutError,
     ScanError,
     ScanInterrupted,
@@ -509,7 +513,7 @@ class TestDeadline:
 
 
 class TestNoAnswer:
-    """A child that exits without a usable reply is a plain ScanError."""
+    """A child that exits without a usable reply is a listing with no answer."""
 
     @pytest.mark.parametrize(
         "source",
@@ -522,13 +526,13 @@ class TestNoAnswer:
     def test_no_reply_is_no_answer(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
     ) -> None:
-        """Neither subclass: the child did not crash and did not overrun."""
+        """Not a crash or a timeout: the child did not die and did not overrun."""
         _use_child(monkeypatch, tmp_path, source)
 
         with pytest.raises(ScanError) as failed:
             run_listing_child(ListingRequest(), configured_host="")
 
-        assert type(failed.value) is ScanError
+        assert type(failed.value) is ListingNoAnswerError
         assert str(failed.value) == _NO_ANSWER
 
     def test_a_missing_child_file_is_no_answer(
@@ -540,8 +544,32 @@ class TestNoAnswer:
         with pytest.raises(ScanError) as failed:
             run_listing_child(ListingRequest(), configured_host="")
 
-        assert type(failed.value) is ScanError
+        assert type(failed.value) is ListingNoAnswerError
         assert str(failed.value) == _NO_ANSWER
+
+    def test_a_child_that_cannot_be_started_is_no_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A fork refused under a process or memory limit is not an ``OSError``.
+
+        Every caller catches ``ScanError``, so an ``OSError`` from starting
+        the child would escape them all.
+        """
+        refusal = BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+
+        def refuse(*_args: object, **_kwargs: object) -> NoReturn:
+            raise refusal
+
+        monkeypatch.setattr(subprocess, "Popen", refuse)
+
+        with pytest.raises(ListingNoAnswerError) as failed:
+            run_listing_child(ListingRequest(), configured_host="")
+
+        assert str(failed.value) == (
+            "The scanner library could not be started to list scanners"
+        )
+        assert failed.value.__cause__ is refusal
 
 
 class TestInterrupt:
@@ -625,12 +653,12 @@ class TestReplyDecoder:
             pytest.param(b'{"devices": []}\nnoise\n', id="reply-not-the-last-line"),
         ],
     )
-    def test_off_schema_output_is_a_plain_scan_error(self, out: bytes) -> None:
+    def test_off_schema_output_is_no_answer(self, out: bytes) -> None:
         """Nothing off-schema escapes as a json, Unicode or key error."""
         with pytest.raises(ScanError) as failed:
             ListingReply.from_stdout(out)
 
-        assert type(failed.value) is ScanError
+        assert type(failed.value) is ListingNoAnswerError
         assert str(failed.value) == _NO_ANSWER
         assert failed.value.__cause__ is None
 
@@ -818,9 +846,10 @@ def test_the_deadline_is_thirty_seconds() -> None:
     assert listing._ALARM_MARGIN_SECONDS == 5
 
 
-def test_the_crash_and_timeout_errors_are_scan_errors() -> None:
-    """Every existing ``except ScanError`` boundary still catches both."""
-    assert issubclass(ListingCrashedError, ScanError)
-    assert issubclass(ListingTimedOutError, ScanError)
-    assert not issubclass(ListingCrashedError, ListingTimedOutError)
-    assert not issubclass(ListingTimedOutError, ListingCrashedError)
+def test_the_listing_failure_errors_are_distinct_scan_errors() -> None:
+    """Every existing ``except ScanError`` boundary still catches all three."""
+    failures = (ListingCrashedError, ListingTimedOutError, ListingNoAnswerError)
+    for failure in failures:
+        assert issubclass(failure, ScanError)
+        for other in failures:
+            assert failure is other or not issubclass(failure, other)

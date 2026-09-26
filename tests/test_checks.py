@@ -72,7 +72,12 @@ from saneless.config import (
     Settings,
     discover_config,
 )
-from saneless.exceptions import ListingCrashedError, ListingTimedOutError, ScanError
+from saneless.exceptions import (
+    ListingCrashedError,
+    ListingNoAnswerError,
+    ListingTimedOutError,
+    ScanError,
+)
 from saneless.paperless import PaperlessClient
 from saneless.scanner import listing
 from saneless.scanner import sane_backend as sane_backend_mod
@@ -4103,19 +4108,22 @@ _NOTHING_FOUND_NEXT: Final = (
     "Check the scanner is switched on and connected, then press Check again."
 )
 
-# The two rows for a listing that could not see: the scanner library crashed
-# while listing, or did not finish before the deadline.
+# The three rows for a listing that could not see: the scanner library crashed
+# while listing, did not finish before the deadline, or gave no usable answer.
 _LISTING_CRASHED_MESSAGE: Final = "The scanner library failed while listing scanners, so the scanner could not be checked."
 _LISTING_CRASHED_NEXT: Final = "Press Check again."
 _LISTING_TIMED_OUT_MESSAGE: Final = "The scanner library did not finish listing scanners in time, so the scanner could not be checked."
 _LISTING_TIMED_OUT_NEXT: Final = "Check the scanner, and its scanner host if it has one, are switched on and reachable, then press Check again."
+_LISTING_NO_ANSWER_MESSAGE: Final = "The scanner library gave no usable answer while listing scanners, so the scanner could not be checked."
+_LISTING_NO_ANSWER_NEXT: Final = "Press Check again."
 
-# The texts the listing launcher gives its two failures, which the rows above
-# must never repeat.
+# The texts the listing launcher gives its three failures, which the rows
+# above must never repeat.
 _CRASH_TEXT: Final = "The scanner library failed while listing scanners (SIGSEGV)"
 _TIMEOUT_TEXT: Final = (
     "The scanner library did not finish listing scanners in time (30 s)"
 )
+_NO_ANSWER_TEXT: Final = "The scanner library returned no answer while listing scanners"
 
 # The longest message the Scanner row could carry before these two were added,
 # which is what the status strip's layout is already known to hold.
@@ -4123,6 +4131,7 @@ _LONGEST_SCANNER_MESSAGE: Final = _UNPROBED_DEVICE_MESSAGE
 
 _CRASHED: Final = checks._ListingFailure.CRASHED
 _LISTING_TIMED_OUT: Final = checks._ListingFailure.TIMED_OUT
+_LISTING_NO_ANSWER: Final = checks._ListingFailure.NO_ANSWER
 
 _UNPROBED_NET_ID: Final = "net:[fe80::1]:brother5:bus0;dev1"
 
@@ -4622,6 +4631,32 @@ _VERDICT_CASES: Final = [
         ),
         id="timeout-with-a-configured-device",
     ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message=_LISTING_NO_ANSWER_MESSAGE,
+            next_step=_LISTING_NO_ANSWER_NEXT,
+            failure=_LISTING_NO_ANSWER,
+        ),
+        id="no-answer",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(),
+            configured=_LOCAL_DEVICE_ID,
+            opened=False,
+            state=CheckState.WARN,
+            message=_LISTING_NO_ANSWER_MESSAGE,
+            next_step=_LISTING_NO_ANSWER_NEXT,
+            failure=_LISTING_NO_ANSWER,
+        ),
+        id="no-answer-with-a-configured-device",
+    ),
 ]
 
 
@@ -4676,6 +4711,7 @@ def _advice_kind(message: str) -> str:
             "scanner service is not running",
             "failed while listing scanners",
             "did not finish listing scanners",
+            "no usable answer while listing scanners",
             "no scanner was found",
         )
     ):
@@ -4901,8 +4937,12 @@ class TestScannerVerdict:
 
     @pytest.mark.parametrize(
         "message",
-        [_LISTING_CRASHED_MESSAGE, _LISTING_TIMED_OUT_MESSAGE],
-        ids=["crash", "timeout"],
+        [
+            _LISTING_CRASHED_MESSAGE,
+            _LISTING_TIMED_OUT_MESSAGE,
+            _LISTING_NO_ANSWER_MESSAGE,
+        ],
+        ids=["crash", "timeout", "no-answer"],
     )
     def test_a_listing_failure_message_fits_where_the_longest_one_does(
         self, message: str
@@ -6407,8 +6447,8 @@ def _gate_sampling_context(
 #   not listed but opens, both decided by the open held under the gate;
 # - a configured ``net:`` device that is not listed and whose host cannot be
 #   probed, so it is deliberately never opened;
-# - a listing whose child crashed, and one whose child ran past its deadline,
-#   each with its own row.
+# - a listing whose child crashed, one whose child ran past its deadline, and
+#   one whose child gave no usable answer, each with its own row.
 #
 # ``_scanner_result``'s docstring lists the same contexts, and
 # ``test_every_gated_context_reaches_a_different_row`` keeps them distinct.
@@ -6425,6 +6465,7 @@ _GATED_CONTEXTS = (
     "unprobed-net-device",
     "listing-crashed",
     "listing-timed-out",
+    "listing-no-answer",
 )
 
 # What the stubbed dialler answers in each context; any context not named here
@@ -6498,6 +6539,9 @@ def _gated_context_builder(
         ),
         "listing-timed-out": lambda: on_scanbox(
             "", _ListingFailureBackend(ListingTimedOutError(_TIMEOUT_TEXT))
+        ),
+        "listing-no-answer": lambda: on_scanbox(
+            "", _ListingFailureBackend(ListingNoAnswerError(_NO_ANSWER_TEXT))
         ),
     }
     return factories[scanner_context]
@@ -7320,7 +7364,12 @@ class TestIsolatedListingWiring:
                 id="timed-out",
             ),
             pytest.param(
-                ScanError("The scanner library returned no answer"),
+                ListingNoAnswerError(_NO_ANSWER_TEXT),
+                (CheckState.WARN, _LISTING_NO_ANSWER_MESSAGE, _LISTING_NO_ANSWER_NEXT),
+                id="no-answer",
+            ),
+            pytest.param(
+                ScanError("SANE is wedged"),
                 (CheckState.FAIL, "No scanner was found.", _NOTHING_FOUND_NEXT),
                 id="plain-failure",
             ),
@@ -7335,7 +7384,7 @@ class TestIsolatedListingWiring:
         surface: str,
     ) -> None:
         """
-        A crash and a timeout have their own rows; any other failure lists nothing.
+        A crash, a timeout and no answer have their own rows; else nothing listed.
 
         Args:
             tmp_path: The test's own directory.
@@ -7399,6 +7448,36 @@ class TestIsolatedListingWiring:
             if record.name == "saneless.checks" and record.levelno >= logging.WARNING
         ] == []
         assert runs.read_text().splitlines() == ["ran"]
+        assert fake.get_devices_call_count == 0
+
+    def test_a_listing_child_with_no_reply_is_the_no_answer_row(
+        self,
+        real_listing_launcher: None,
+        isolated_context: Callable[
+            [str], tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]
+        ],
+    ) -> None:
+        """
+        A child that exits without a reply is amber, not a missing scanner.
+
+        The configured device is not listed, because nothing was listed, and
+        it was not opened.  That is still the check not seeing, so the row
+        must not send the operator to the hardware.
+
+        Args:
+            real_listing_launcher: Runs a stand-in child that exits at once.
+            isolated_context: Builds a context around a real backend.
+
+        """
+        _ = real_listing_launcher  # the real launcher runs the stand-in
+        context, fake, _handle = isolated_context(_LOCAL_DEVICE_ID)
+        results = run_checks(context, scanner_gate=threading.Lock())
+        row = _row(results, CheckKey.SCANNER)
+        assert (row.state, row.message, row.next_step) == (
+            CheckState.WARN,
+            _LISTING_NO_ANSWER_MESSAGE,
+            _LISTING_NO_ANSWER_NEXT,
+        )
         assert fake.get_devices_call_count == 0
 
     def test_a_listing_child_past_its_deadline_is_reaped_before_the_gate_opens(

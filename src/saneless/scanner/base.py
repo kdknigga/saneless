@@ -14,7 +14,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
-from saneless.exceptions import ListingCrashedError, ListingTimedOutError
+from saneless.exceptions import (
+    ListingCrashedError,
+    ListingNoAnswerError,
+    ListingTimedOutError,
+)
 from saneless.text_safety import neutralise_controls
 
 if TYPE_CHECKING:
@@ -481,8 +485,9 @@ class ScannerBackend(ABC):
         unchanged.  A real backend overrides it to list and open in one
         isolated step.
 
-        A listing that crashed or was stopped at its deadline is not a failed
-        listing: it propagates, so the caller can report it as what it was.
+        A listing that crashed, was stopped at its deadline or gave no usable
+        answer is not a failed listing: it propagates, so the caller can
+        report it as what it was.
         Any other failure, of the listing or of the open, is recorded by
         class name.  Nothing is logged here; the caller logs type names.
 
@@ -496,13 +501,14 @@ class ScannerBackend(ABC):
         Raises:
             ListingCrashedError: The listing died from a signal.
             ListingTimedOutError: The listing did not finish in time.
+            ListingNoAnswerError: The listing gave no usable answer.
 
         """
         devices: tuple[DeviceInfo, ...] = ()
         list_error: str | None = None
         try:
             devices = tuple(self.get_devices())
-        except ListingCrashedError, ListingTimedOutError:
+        except ListingCrashedError, ListingTimedOutError, ListingNoAnswerError:
             raise
         except Exception as exc:
             list_error = type(exc).__name__

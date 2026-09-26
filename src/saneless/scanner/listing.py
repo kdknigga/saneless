@@ -55,7 +55,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from saneless.exceptions import ListingCrashedError, ListingTimedOutError, ScanError
+from saneless.exceptions import (
+    ListingCrashedError,
+    ListingNoAnswerError,
+    ListingTimedOutError,
+)
 from saneless.scanner.net_hosts import SANE_NET_HOSTS, effective_sane_net_hosts
 
 __all__ = [
@@ -107,6 +111,7 @@ _CHILD_VARIABLE: Final = "SANELESS_LISTING_CHILD"
 _OWN_PREFIX: Final = "saneless_"
 
 _NO_ANSWER: Final = "The scanner library returned no answer while listing scanners"
+_NOT_STARTED: Final = "The scanner library could not be started to list scanners"
 
 _REPLY_KEYS: Final = frozenset({"devices", "list_error", "opened", "open_error"})
 _ERROR_KEYS: Final = frozenset({"type", "message"})
@@ -192,19 +197,19 @@ class ListingReply:
             The validated reply.
 
         Raises:
-            ScanError: The output is over the size cap, not UTF-8, not JSON,
-                or not exactly the reply schema.
+            ListingNoAnswerError: The output is over the size cap, not UTF-8,
+                not JSON, or not exactly the reply schema.
 
         """
         if len(out) > _MAX_REPLY_BYTES:
-            raise ScanError(_NO_ANSWER)
+            raise ListingNoAnswerError(_NO_ANSWER)
         try:
             lines = [line for line in out.decode("utf-8").split("\n") if line.strip()]
             payload: object = json.loads(lines[-1]) if lines else None
         except ValueError, RecursionError:
             # UnicodeDecodeError and JSONDecodeError are both ValueErrors; a
             # deeply nested document exhausts the decoder's recursion.
-            raise ScanError(_NO_ANSWER) from None
+            raise ListingNoAnswerError(_NO_ANSWER) from None
         return cls._from_payload(payload)
 
     @classmethod
@@ -219,14 +224,14 @@ class ListingReply:
             The validated reply.
 
         Raises:
-            ScanError: ``payload`` is not exactly the reply schema.
+            ListingNoAnswerError: ``payload`` is not exactly the reply schema.
 
         """
         if not isinstance(payload, dict) or not payload.keys() <= _REPLY_KEYS:
-            raise ScanError(_NO_ANSWER)
+            raise ListingNoAnswerError(_NO_ANSWER)
         devices = payload.get("devices")
         if not isinstance(devices, list):
-            raise ScanError(_NO_ANSWER)
+            raise ListingNoAnswerError(_NO_ANSWER)
         list_error = (
             _child_error(payload["list_error"]) if "list_error" in payload else None
         )
@@ -234,12 +239,12 @@ class ListingReply:
         if "opened" in payload:
             value = payload["opened"]
             if not isinstance(value, bool):
-                raise ScanError(_NO_ANSWER)
+                raise ListingNoAnswerError(_NO_ANSWER)
             opened = value
         open_error: ChildError | None = None
         if "open_error" in payload:
             if opened is not False:
-                raise ScanError(_NO_ANSWER)
+                raise ListingNoAnswerError(_NO_ANSWER)
             open_error = _child_error(payload["open_error"])
         return cls(
             devices=tuple(_device(device) for device in devices),
@@ -260,14 +265,14 @@ def _device(value: object) -> tuple[str, str, str, str]:
         The entry as a ``(name, vendor, model, type)`` tuple.
 
     Raises:
-        ScanError: The entry is any other shape.
+        ListingNoAnswerError: The entry is any other shape.
 
     """
     if not isinstance(value, list):
-        raise ScanError(_NO_ANSWER)
+        raise ListingNoAnswerError(_NO_ANSWER)
     fields = [field for field in value if isinstance(field, str)]
     if len(value) != _DEVICE_FIELDS or len(fields) != _DEVICE_FIELDS:
-        raise ScanError(_NO_ANSWER)
+        raise ListingNoAnswerError(_NO_ANSWER)
     return (fields[0], fields[1], fields[2], fields[3])
 
 
@@ -282,15 +287,15 @@ def _child_error(value: object) -> ChildError:
         The reported error.
 
     Raises:
-        ScanError: The object is any other shape.
+        ListingNoAnswerError: The object is any other shape.
 
     """
     if not isinstance(value, dict) or value.keys() != _ERROR_KEYS:
-        raise ScanError(_NO_ANSWER)
+        raise ListingNoAnswerError(_NO_ANSWER)
     type_name = value["type"]
     message = value["message"]
     if not isinstance(type_name, str) or not isinstance(message, str):
-        raise ScanError(_NO_ANSWER)
+        raise ListingNoAnswerError(_NO_ANSWER)
     return ChildError(type_name=type_name, message=message)
 
 
@@ -359,7 +364,8 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
         ListingCrashedError: The child died from a signal.
         ListingTimedOutError: The child did not finish before the deadline,
             or its own alarm ended it.
-        ScanError: The child exited without a reply that fits the schema.
+        ListingNoAnswerError: The child exited without a reply that fits
+            the schema, or could not be started.
 
     """
     deadline = LISTING_DEADLINE_SECONDS
@@ -367,19 +373,25 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     env[_PYTHON_VARIABLE] = sys.executable
     env[_CHILD_VARIABLE] = str(_CHILD_FILE)
     line = request.to_line(math.ceil(deadline) + _ALARM_MARGIN_SECONDS)
-    with subprocess.Popen(
-        (
-            "/bin/sh",
-            "-c",
-            'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
-        ),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=None,
-        env=env,
-        close_fds=True,
-        start_new_session=True,
-    ) as proc:
+    try:
+        proc = subprocess.Popen(
+            (
+                "/bin/sh",
+                "-c",
+                'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
+            ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            env=env,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        # The fork or the exec failed, for instance under a process or memory
+        # limit: nothing ran, so nothing could be seen.
+        raise ListingNoAnswerError(_NOT_STARTED) from exc
+    with proc:
         try:
             out, _ = proc.communicate(line, timeout=deadline)
         except subprocess.TimeoutExpired:
@@ -396,7 +408,7 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     if returncode < 0:
         raise _crashed(-returncode)
     if returncode != 0:
-        raise ScanError(_NO_ANSWER)
+        raise ListingNoAnswerError(_NO_ANSWER)
     return ListingReply.from_stdout(out)
 
 

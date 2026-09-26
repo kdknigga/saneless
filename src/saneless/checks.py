@@ -57,7 +57,11 @@ from saneless.config import (
     config_file_state,
     is_placeholder_token,
 )
-from saneless.exceptions import ListingCrashedError, ListingTimedOutError
+from saneless.exceptions import (
+    ListingCrashedError,
+    ListingNoAnswerError,
+    ListingTimedOutError,
+)
 from saneless.scanner.base import DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
@@ -1501,15 +1505,18 @@ class _ListingFailure(StrEnum):
     Why a device listing could not see, when it could not.
 
     Each listing runs in a child process with its own scanner library, so a
-    listing that goes wrong there ends in one of two ways the check can tell
-    apart from "listed nothing".  ``CRASHED``: the child died from a signal,
-    which is the scanner library failing inside a C call.  ``TIMED_OUT``: the
-    child was still listing at the deadline and was stopped, which is a peer
-    that accepted a connection and then said nothing.
+    listing that goes wrong there ends in one of three ways the check can
+    tell apart from "listed nothing".  ``CRASHED``: the child died from a
+    signal, which is the scanner library failing inside a C call.
+    ``TIMED_OUT``: the child was still listing at the deadline and was
+    stopped, which is a peer that accepted a connection and then said
+    nothing.  ``NO_ANSWER``: the child could not be started, or ended without
+    a reply that could be read.
     """
 
     CRASHED = "crashed"
     TIMED_OUT = "timed_out"
+    NO_ANSWER = "no_answer"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1529,10 +1536,10 @@ class _Enumeration:
             was deliberately not opened, because it is a ``net:`` device
             whose host the pre-probe could not dial.
         failure: ``None`` when the listing ran to an end.  Otherwise the way
-            the listing child failed: it crashed, or it was stopped at the
-            deadline.  Those two are kept apart from "listed nothing" because
-            the row must say the check could not see, not that nothing is
-            there.
+            the listing child failed: it crashed, it was stopped at the
+            deadline, or it gave no usable answer.  Those are kept apart from
+            "listed nothing" because the row must say the check could not
+            see, not that nothing is there.
 
     """
 
@@ -2454,6 +2461,31 @@ def _scanner_listing_timed_out_row() -> CheckResult:
     )
 
 
+def _scanner_listing_no_answer_row() -> CheckResult:
+    """
+    Build the amber row for a listing child that gave no usable answer.
+
+    The child could not be started, or it ended without a reply the check
+    could read, so the check saw nothing at all.  Amber, not red, for the
+    same reason as the crash row: the check could not see, which is not proof
+    that scanning is impossible, and a working appliance never goes red.
+    Whatever the child printed is in the log, and the next listing starts
+    another child, so pressing Check again is the whole of the advice.
+
+    Nothing is interpolated, for the same reason as the crash row (ASVS V7).
+
+    Returns:
+        The amber Scanner row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.WARN,
+        message="The scanner library gave no usable answer while listing scanners, so the scanner could not be checked.",
+        next_step="Press Check again.",
+    )
+
+
 def _scanner_nothing_found_row(hosts: int) -> CheckResult:
     """
     Build the red row for no scanner at all, with every probed host healthy.
@@ -2537,6 +2569,31 @@ def _scanner_unusable_row(
     return _scanner_nothing_found_row(len(probes))
 
 
+def _scanner_listing_failure_row(failure: _ListingFailure) -> CheckResult:
+    """
+    Pick the amber row for the way a listing child failed.
+
+    A ``match`` ending in ``assert_never``, so a new way of failing stops
+    type-checking here until it has a row.
+
+    Args:
+        failure: How the listing child failed.
+
+    Returns:
+        The row for that failure.
+
+    """
+    match failure:
+        case _ListingFailure.CRASHED:
+            return _scanner_listing_crashed_row()
+        case _ListingFailure.TIMED_OUT:
+            return _scanner_listing_timed_out_row()
+        case _ListingFailure.NO_ANSWER:
+            return _scanner_listing_no_answer_row()
+        case _:
+            assert_never(failure)
+
+
 def _scanner_verdict(
     probes: tuple[_HostProbe, ...],
     enumeration: _Enumeration,
@@ -2580,9 +2637,10 @@ def _scanner_verdict(
 
     A host that must not be enumerated -- one that timed out -- gets the
     same row the preflight returns for it, so the two can never disagree.
-    A listing that crashed, or was stopped at its deadline, gets its own
-    amber row next, ahead of anything the devices would say, because the
-    check could not see and that is not the same as seeing nothing.
+    A listing that crashed, was stopped at its deadline or gave no usable
+    answer gets its own amber row next, ahead of anything the devices would
+    say, because the check could not see and that is not the same as seeing
+    nothing.
 
     Rows interpolate counts and ``_device_label`` output only.  The
     configured id and the listed device ids are compared, never rendered,
@@ -2600,15 +2658,8 @@ def _scanner_verdict(
     """
     if any(_blocks_enumeration(probe.outcome) for probe in probes):
         return _scanner_host_unanswered(probes)
-    match enumeration.failure:
-        case _ListingFailure.CRASHED:
-            return _scanner_listing_crashed_row()
-        case _ListingFailure.TIMED_OUT:
-            return _scanner_listing_timed_out_row()
-        case None:
-            pass
-        case _:
-            assert_never(enumeration.failure)
+    if enumeration.failure is not None:
+        return _scanner_listing_failure_row(enumeration.failure)
     subject = _scanner_ready_subject(enumeration, configured_device)
     if subject is None and enumeration.open_withheld:
         return _scanner_configured_unprobed_row()
@@ -2717,12 +2768,13 @@ def _scanner_enumeration(
     the listing itself failed, because a scan opens a configured id without
     listing anything.
 
-    A child that crashed, or that was stopped at its deadline, is not a
-    listing that found nothing: each has its own row, so each is recorded as
-    what it was.  The launcher has already logged the crash or the timeout,
-    so nothing more is logged for them here.  Any other failure is logged by
-    its class name only and treated as an empty listing, with a configured id
-    counted as not opened.
+    A child that crashed, that was stopped at its deadline, or that gave no
+    usable answer is not a listing that found nothing: each has its own row,
+    so each is recorded as what it was.  The launcher has already logged the
+    crash or the timeout, so nothing more is logged for them here; no answer
+    is logged by its class name.  Any other failure is logged by its class
+    name only and treated as an empty listing, with a configured id counted
+    as not opened.
 
     It is never reached when the preflight stopped the check, and the
     preflight probes a ``net:`` device's own host before this can open it, so
@@ -2743,8 +2795,8 @@ def _scanner_enumeration(
 
     Returns:
         What was listed, whether an unlisted configured device opened or was
-        deliberately left unopened, and whether the listing crashed or ran
-        out of time.
+        deliberately left unopened, and whether the listing crashed, ran out
+        of time or gave no usable answer.
 
     """
     open_target = configured_device if may_open else ""
@@ -2754,11 +2806,13 @@ def _scanner_enumeration(
         return _Enumeration(devices=(), failure=_ListingFailure.CRASHED)
     except ListingTimedOutError:
         return _Enumeration(devices=(), failure=_ListingFailure.TIMED_OUT)
+    except ListingNoAnswerError as exc:
+        logger.warning("Scanner enumeration failed: %s", type(exc).__name__)
+        return _Enumeration(devices=(), failure=_ListingFailure.NO_ANSWER)
     except Exception as exc:
-        # The backend raises ScanError, for instance while a read is stuck or
-        # when the child gave no usable answer, but a backend is free to raise
-        # anything, so the boundary catches Exception.  Only the type name
-        # goes any further.
+        # The backend raises ScanError, for instance while a read is stuck,
+        # but a backend is free to raise anything, so the boundary catches
+        # Exception.  Only the type name goes any further.
         survey = DeviceSurvey(
             devices=(),
             list_error=type(exc).__name__,
