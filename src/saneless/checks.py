@@ -36,10 +36,12 @@ message, and every other state stays under the rule above.
 
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import logging
 import os
 import socket
+import struct
 import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
@@ -81,6 +83,7 @@ __all__ = [
     "POLL_PROBE_ATTEMPT_CAP",
     "POLL_STILL_CHECKING_LINE",
     "PROBE_CONNECT_SECONDS",
+    "PROBE_HANDSHAKE_SECONDS",
     "PROBE_READ_SECONDS",
     "SANED_PORT",
     "SKIPPED_STATE_LABEL",
@@ -117,6 +120,16 @@ logger = logging.getLogger(__name__)
 # at call time, so tests can shorten it.
 PROBE_CONNECT_SECONDS: Final = 2.0
 
+# How long a saned pre-probe waits for saned's answer once a connection is
+# made.  It is started after the connect succeeds and is separate from
+# ``PROBE_CONNECT_SECONDS`` for one reason: saned does name lookups before it
+# replies -- a reverse lookup of the peer, a lookup of its own host name, and
+# one per name line in its ``saned.conf`` -- so on a scanner host with slow DNS
+# a perfectly working saned can take seconds to say hello.  One short budget
+# over connect and reply would call that host timed out and keep it away from
+# enumeration.  Read at call time, so tests can shorten it.
+PROBE_HANDSHAKE_SECONDS: Final = 5.0
+
 # How long the Paperless probe waits for a response body once connected.  The
 # client's own default is a flat 30 s, which is the right budget for an upload
 # and the wrong one for a health row.  Read at call time.
@@ -125,6 +138,25 @@ PROBE_READ_SECONDS: Final = 5.0
 # saned's registered port.  IANA names 6566 ``sane-port``, and this machine's
 # ``/etc/services`` agrees.  Read at call time.
 SANED_PORT: Final = 6566
+
+# The SANE network protocol, as far as the pre-probe speaks it.  Every word is
+# four big-endian bytes (``sanei_codec_bin.c`` in sane-backends).  Procedure 0
+# is ``SANE_NET_INIT`` and procedure 10 is ``SANE_NET_EXIT``, which saned
+# answers by ending the session without a reply.  The version sent is
+# ``SANE_VERSION_CODE(1, 0, 3)``, what libsane 1.0.32 sends; saned does not read
+# it.
+_SANE_NET_INIT: Final = 0
+_SANE_NET_EXIT: Final = 10
+_SANE_VERSION_CODE: Final = 0x01000003
+
+# The user name the probe introduces itself with.  Fixed rather than the local
+# login name, which saned would log on the scanner host and which is nobody
+# else's business; saned logs the session as ``saneless@<address>``.
+_PROBE_USER: Final = b"saneless"
+
+# A ``SANE_NET_INIT`` reply is a status word and a version word and nothing
+# else, so the probe never reads more than this from a peer.
+_INIT_REPLY_LENGTH: Final = 8
 
 # Every character a segment of ``scanner.host`` may contain and still be read
 # as a host name.  Deliberately narrower than any hostname RFC: this is not a
@@ -913,11 +945,18 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     """
     Parse ``scanner.host`` into the ``(host, port)`` pairs saned would be dialled on.
 
-    sane-net's own syntax is genuinely ambiguous.  The setting is
-    colon-separated when it names several hosts (``sane_backend.py:849``,
-    ``sane-net(5)``), *and* ``host:port`` is a legal single entry.  ``a:b`` is
-    therefore either two hosts or one host on a port named ``b``, and nothing
-    in the string settles it.
+    The setting is colon-separated when it names several hosts
+    (``sane-net(5)``), and ``SaneBackend`` hands it to libsane as
+    ``SANE_NET_HOSTS`` unchanged.  sane-net(5) documents no port syntax, and
+    libsane's net backend splits the variable on every ``:`` and always dials
+    saned's registered port, so to libsane ``host:6566`` is two hosts,
+    ``host`` and ``6566``.  The two-segment ``host:port`` reading below is this
+    module's own, not libsane's.  It is kept because it only ever changes the
+    port *this probe* dials -- which is how a test aims the probe at an
+    ephemeral loopback port -- and with the registered port it probes exactly
+    the host libsane will dial.  With any other port the probe and libsane
+    disagree about where saned is, and a setting like that is one an operator
+    is better off not using.
 
     The reading taken here is the narrow one: a trailing segment is a port only
     when the setting has exactly two segments and that segment is ASCII decimal
@@ -1150,6 +1189,273 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
             # put first has no listener and the IPv4 address does.
             logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
     return False
+
+
+class _SanedOutcome(StrEnum):
+    """
+    What the saned pre-probe learnt about one configured host.
+
+    Five outcomes, each a different thing an operator has to do, which is why
+    the probe tells them apart at all:
+
+    - ``UNRESOLVED``: the resolver raised, or answered with no address.
+    - ``TIMED_OUT``: nothing connected and at least one address did not
+      answer -- a connect timed out, the budget ran out before an address was
+      dialled, or the network said there was no route.  A peer that accepted
+      the connection and then sent nothing before the handshake deadline is
+      counted here too, because it is the peer libsane would wait on forever.
+    - ``REFUSED``: every address refused the connection.  The host is up and
+      nothing is listening on saned's port.
+    - ``REJECTED``: a connection was made and the handshake failed: the peer
+      closed or reset it, the reply ended early, or it carried a failure
+      status or a protocol version libsane does not speak.
+    - ``HEALTHY``: a valid ``SANE_NET_INIT`` reply.
+
+    Private, and every consumer is a total ``match`` ending in
+    ``assert_never``, so a sixth outcome stops type-checking until each of
+    them decides what it means.
+    """
+
+    UNRESOLVED = "UNRESOLVED"
+    TIMED_OUT = "TIMED_OUT"
+    REFUSED = "REFUSED"
+    REJECTED = "REJECTED"
+    HEALTHY = "HEALTHY"
+
+
+def _init_request() -> bytes:
+    """
+    Build the ``SANE_NET_INIT`` request the probe sends.
+
+    A procedure word, a version word and the user name as a SANE string: a
+    word holding the length *including* the trailing NUL, then the bytes.
+
+    Returns:
+        The 21-byte request.
+
+    """
+    user = _PROBE_USER + b"\0"
+    return struct.pack(">iii", _SANE_NET_INIT, _SANE_VERSION_CODE, len(user)) + user
+
+
+def _recv_exactly(sock: socket.socket, count: int, deadline: float) -> bytes | None:
+    """
+    Read exactly ``count`` bytes before ``deadline``, and never one more.
+
+    Every ``recv`` asks only for what is still missing, and the socket's
+    timeout is reset to what is left of the deadline before each one, so a
+    peer that trickles bytes cannot stretch the read past the deadline and a
+    peer that floods cannot make the probe take more than it asked for.
+
+    Args:
+        sock: The connected socket.
+        count: How many bytes to read.
+        deadline: The ``monotonic`` reading the read must finish by.
+
+    Returns:
+        The bytes, or ``None`` when the peer closed the connection first.
+
+    Raises:
+        TimeoutError: When the deadline passes before ``count`` bytes arrive.
+
+    """
+    buffer = bytearray()
+    while len(buffer) < count:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        sock.settimeout(remaining)
+        chunk = sock.recv(count - len(buffer))
+        if not chunk:
+            return None
+        buffer += chunk
+    return bytes(buffer)
+
+
+def _handshake(sock: socket.socket, deadline: float) -> _SanedOutcome:
+    """
+    Say hello to a connected saned and classify what comes back.
+
+    The request is ``SANE_NET_INIT``; the reply is exactly eight bytes, a
+    status word and a version word.  It is accepted on the terms libsane's
+    net backend accepts it (``connect_dev`` in ``backend/net.c``): status 0,
+    major version 1, build 2 or 3.  After a valid reply the probe sends
+    ``SANE_NET_EXIT``, best effort, so saned ends the session cleanly and logs
+    one ordinary session per probe rather than an error.
+
+    ``TimeoutError`` is caught before ``OSError``, which it subclasses: a peer
+    that accepted the connection and then said nothing is not answering, and
+    is not the same finding as one that hung up.  Nothing escapes this
+    function; only the outcome and the exception's type name are logged.
+
+    Args:
+        sock: A socket whose ``connect`` has just succeeded.
+        deadline: The ``monotonic`` reading the reply must arrive by.
+
+    Returns:
+        ``HEALTHY``, ``REJECTED`` or ``TIMED_OUT``.
+
+    """
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        return _SanedOutcome.TIMED_OUT
+    try:
+        sock.settimeout(remaining)
+        sock.sendall(_init_request())
+        reply = _recv_exactly(sock, _INIT_REPLY_LENGTH, deadline)
+    except TimeoutError:
+        logger.debug("saned pre-probe handshake: %s", _SanedOutcome.TIMED_OUT.value)
+        return _SanedOutcome.TIMED_OUT
+    except OSError as exc:
+        logger.debug(
+            "saned pre-probe handshake: %s (%s)",
+            _SanedOutcome.REJECTED.value,
+            type(exc).__name__,
+        )
+        return _SanedOutcome.REJECTED
+    if reply is None:
+        logger.debug(
+            "saned pre-probe handshake: %s (closed)", _SanedOutcome.REJECTED.value
+        )
+        return _SanedOutcome.REJECTED
+    status, version = struct.unpack(">ii", reply)
+    major = (version >> 24) & 0xFF
+    build = version & 0xFFFF
+    if status != 0 or major != 1 or build not in {2, 3}:
+        # The status and version stay out of the log line: they are the
+        # peer's words, and only the outcome is this module's.
+        logger.debug(
+            "saned pre-probe handshake: %s (reply)", _SanedOutcome.REJECTED.value
+        )
+        return _SanedOutcome.REJECTED
+    with contextlib.suppress(OSError):
+        sock.sendall(struct.pack(">i", _SANE_NET_EXIT))
+    return _SanedOutcome.HEALTHY
+
+
+def _probe_saned(
+    host: str, port: int, connect_timeout: float, handshake_timeout: float
+) -> _SanedOutcome:
+    """
+    Classify one configured saned host by the opening of the SANE handshake.
+
+    There is nowhere else to put a bound.  ``SaneBackend.get_devices()``
+    calls into libsane, which has no timeout parameter at any layer -- not in
+    python-sane, not in ``sane_get_devices(3)``, and not settable from Python.
+    With the ``net`` backend that call opens a TCP connection to each entry of
+    ``SANE_NET_HOSTS``, so an unplugged host is a connect that hangs until the
+    kernel gives up: on Linux ``tcp_syn_retries`` defaults to 6, roughly 127
+    seconds, inside a blocking C call nothing can interrupt.  Dialling the same
+    address first, with a timeout, is the only bound available.
+
+    **Why a connect is not enough.**  saned refuses a peer its ``saned.conf``
+    does not allow by closing the socket before it reads anything
+    (``check_host``, called from ``init`` in ``frontend/saned.c``).  The
+    client never gets a status: it gets a reset or an end of file where the
+    reply should be.  A probe that stopped at ``connect()`` counted that host
+    as reachable, and the row then blamed a scanner that was switched on and
+    answering.  Going as far as the ``SANE_NET_INIT`` reply is what tells a
+    refusal by the access list apart from a working saned.  It also changes
+    what saned logs: a bare connect that hung up made saned log an error for
+    every healthy check, while a handshake that ends with ``SANE_NET_EXIT``
+    leaves one ordinary session.
+
+    **What the budgets cover.**  The connect budget covers every address the
+    name resolved to, in resolver order, and all of them together.  It is a
+    *deadline*, read once before the walk rather than handed to each socket,
+    so every attempt gets only what the attempts before it left over and a
+    host with three addresses costs no more than a host with one.  The
+    handshake gets a deadline of its own, started when a connect succeeds,
+    because saned does name lookups before it replies
+    (``PROBE_HANDSHAKE_SECONDS``).
+
+    Every address is tried because of the resolver, not the handshake.
+    ``getaddrinfo`` is called with no ``AI_ADDRCONFIG``, so glibc returns
+    AAAA records even on a host with no IPv6 route, and RFC 6724 orders the
+    IPv6 address first -- measured on this machine, ``localhost`` resolves to
+    ``::1`` and then ``127.0.0.1``.  saned commonly binds v4-only, so a probe
+    that dialled only the first answer reported a host that is *on*,
+    answering over one family and not the other, as dead.  A refused address
+    therefore moves the walk on.  The first address that *connects* decides:
+    a rejected handshake there is not retried on the next address, which is
+    what libsane's ``connect_dev`` does too.
+
+    Resolution itself is outside both budgets, deliberately.  ``getaddrinfo``
+    takes no timeout, so bounding it means running it on a thread and
+    abandoning the thread when the deadline passes.  That is the same trade
+    the scanner check refuses for the enumeration: a thread parked in a C call
+    that nothing can interrupt is worse than a slow answer, because it is
+    still in there after the caller has moved on.  An unreachable resolver
+    therefore costs whatever ``resolv.conf`` says, and that is stated rather
+    than claimed away.
+
+    **Failure policy.**  This raises nothing.  Every ``OSError`` becomes an
+    outcome, and an empty resolver answer needs no guard of its own: the walk
+    holds no subscript, so nothing to dial is a loop body that never runs and
+    the answer is ``UNRESOLVED``.  Subscripting the resolver's first answer
+    once raised ``IndexError``, which is not an ``OSError`` and so escaped
+    into ``run_checks``' generic red row.  Log lines carry the outcome and
+    ``type(exc).__name__`` only -- no host, no address, no port and no
+    exception text (ASVS V7).
+
+    Args:
+        host: The host name or address to dial.
+        port: The TCP port to dial.
+        connect_timeout: The deadline for connecting, over every address.
+        handshake_timeout: The deadline for saned's reply, once connected.
+
+    Returns:
+        What the probe learnt about the host.
+
+    """
+    try:
+        candidates = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        # Logged at DEBUG, not WARNING: a name that does not resolve is the
+        # ordinary state of an appliance whose scanner host is switched off or
+        # misspelled, and the row the caller renders is where an operator is
+        # told about it.
+        logger.debug(
+            "saned pre-probe: %s (%s)",
+            _SanedOutcome.UNRESOLVED.value,
+            type(exc).__name__,
+        )
+        return _SanedOutcome.UNRESOLVED
+    deadline = monotonic() + connect_timeout
+    unanswered = False
+    for family, socket_type, protocol, _canonical_name, address in candidates:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            # The budget is spent, so the addresses left over do not get one.
+            unanswered = True
+            break
+        try:
+            with socket.socket(family, socket_type, protocol) as probe:
+                probe.settimeout(remaining)
+                probe.connect(address)
+                outcome = _handshake(probe, monotonic() + handshake_timeout)
+        except ConnectionRefusedError:
+            # One address refusing says nothing about the next one: this is
+            # exactly the dual-stack case where the IPv6 address the resolver
+            # put first has no listener and the IPv4 address does.
+            logger.debug("saned pre-probe: one address refused")
+            continue
+        except OSError as exc:
+            # A timeout, no route, or a socket this machine cannot open for
+            # that family.  None of them proves anything is up there.
+            unanswered = True
+            logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
+            continue
+        logger.debug("saned pre-probe: %s", outcome.value)
+        return outcome
+    if unanswered:
+        outcome = _SanedOutcome.TIMED_OUT
+    elif not candidates:
+        outcome = _SanedOutcome.UNRESOLVED
+    else:
+        outcome = _SanedOutcome.REFUSED
+    logger.debug("saned pre-probe: %s", outcome.value)
+    return outcome
 
 
 def _directory_accepts_a_write(path: Path) -> bool:

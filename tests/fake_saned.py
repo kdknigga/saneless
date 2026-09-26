@@ -41,7 +41,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 __all__ = [
     "EXIT_REQUEST",
@@ -253,7 +253,7 @@ def _serve(
 
 
 @contextlib.contextmanager
-def fake_saned(behaviour: SanedBehaviour) -> Iterator[FakeSaned]:
+def fake_saned(behaviour: SanedBehaviour) -> Generator[FakeSaned]:
     """
     Serve one saned behaviour on an ephemeral 127.0.0.1 port.
 

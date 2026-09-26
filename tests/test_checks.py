@@ -1369,7 +1369,7 @@ class _RecordingSocket:
         self.recorder.events.append("sendall")
         if self.recorder.peer.send_error is not None:
             raise self.recorder.peer.send_error
-        self.recorder.sent.append(bytes(data))
+        self.recorder.sent.append(data)
 
     def recv(self, size: int) -> bytes:
         """
