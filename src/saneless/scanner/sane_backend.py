@@ -2343,6 +2343,16 @@ class SaneBackend(ScannerBackend):
         here; the Scanner health check, whose log may name no device, opens
         in the listing child (``list_and_open``).
 
+        Every listing runs in a child, so this process's libsane never lists
+        before it opens: a scan job opens on a SANE that ``reinitialise()``
+        has just started, with no ``sane_get_devices`` before ``sane_open``.
+        That has been measured only for a ``net:`` device served by saned's
+        ``test`` backend.  A backend that finds its devices by network
+        discovery, such as ``escl`` or ``airscan``, has not been measured
+        opening an id it has not listed; if one cannot, the open fails here
+        with SANE's error, and listing in this process first would be the
+        fix.
+
         Args:
             device_id: SANE device identifier string.
 
