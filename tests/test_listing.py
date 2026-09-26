@@ -672,17 +672,34 @@ class TestNoAnswer:
     """A child that exits without a usable reply is a listing with no answer."""
 
     @pytest.mark.parametrize(
-        "source",
+        ("source", "logged"),
         [
-            pytest.param(_EXIT_THREE_CHILD, id="positive-exit-status"),
-            pytest.param(_SILENT_CHILD, id="exit-zero-empty-stdout"),
-            pytest.param(_NOISE_ONLY_CHILD, id="never-writes-a-reply"),
+            pytest.param(
+                _EXIT_THREE_CHILD,
+                "exited with status 3 and no answer",
+                id="positive-exit-status",
+            ),
+            pytest.param(_SILENT_CHILD, "wrote 0 bytes", id="exit-zero-empty-stdout"),
+            pytest.param(
+                _NOISE_ONLY_CHILD, "wrote 30 bytes", id="never-writes-a-reply"
+            ),
         ],
     )
     def test_no_reply_is_no_answer(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        source: str,
+        logged: str,
     ) -> None:
-        """Not a crash or a timeout: the child did not die and did not overrun."""
+        """
+        Not a crash or a timeout: the child did not die and did not overrun.
+
+        One WARNING says which kind of no answer it was, through the exit
+        status or the size of what the child wrote, never its text.
+        """
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
         _use_child(monkeypatch, tmp_path, source)
 
         with pytest.raises(ScanError) as failed:
@@ -690,6 +707,10 @@ class TestNoAnswer:
 
         assert type(failed.value) is ListingNoAnswerError
         assert str(failed.value) == _NO_ANSWER
+        records = _warnings(caplog)
+        assert len(records) == 1
+        assert logged in records[0].getMessage()
+        assert "starting up" not in records[0].getMessage()
 
     def test_a_missing_child_file_is_no_answer(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -704,14 +725,16 @@ class TestNoAnswer:
         assert str(failed.value) == _NO_ANSWER
 
     def test_a_child_that_cannot_be_started_is_no_answer(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
         A fork refused under a process or memory limit is not an ``OSError``.
 
         Every caller catches ``ScanError``, so an ``OSError`` from starting
-        the child would escape them all.
+        the child would escape them all.  The WARNING names the error number,
+        not the exception's text.
         """
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
         refusal = BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
 
         def refuse(*_args: object, **_kwargs: object) -> NoReturn:
@@ -726,6 +749,10 @@ class TestNoAnswer:
             "The scanner library could not be started to list scanners"
         )
         assert failed.value.__cause__ is refusal
+        messages = [record.getMessage() for record in _warnings(caplog)]
+        assert messages == [
+            "The scanner library could not be started to list scanners: EAGAIN"
+        ]
 
 
 class TestInterrupt:

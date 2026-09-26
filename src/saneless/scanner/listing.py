@@ -47,6 +47,7 @@ other way round.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
@@ -394,7 +395,7 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     except OSError as exc:
         # The fork or the exec failed, for instance under a process or memory
         # limit: nothing ran, so nothing could be seen.
-        raise ListingNoAnswerError(_NOT_STARTED) from exc
+        raise _not_started(exc) from exc
     with proc:
         try:
             out, _ = proc.communicate(line, timeout=deadline)
@@ -412,8 +413,43 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     if returncode < 0:
         raise _crashed(-returncode)
     if returncode != 0:
+        logger.warning(
+            "The scanner library's listing process exited with status %d and no answer",
+            returncode,
+        )
         raise ListingNoAnswerError(_NO_ANSWER)
-    return ListingReply.from_stdout(out)
+    try:
+        return ListingReply.from_stdout(out)
+    except ListingNoAnswerError:
+        logger.warning(
+            "The scanner library's listing process wrote %d bytes, none of "
+            "them an answer saneless could read",
+            len(out),
+        )
+        raise
+
+
+def _not_started(exc: OSError) -> ListingNoAnswerError:
+    """
+    Log a listing child that could not be started, and build its error.
+
+    Only the error number's name is logged: the exception's text can name
+    the interpreter's path.
+
+    Args:
+        exc: Why starting the child failed.
+
+    Returns:
+        The error for the caller to raise.
+
+    """
+    name = "unknown error"
+    if exc.errno is not None:
+        name = errno.errorcode.get(exc.errno, f"error {exc.errno}")
+    logger.warning(
+        "The scanner library could not be started to list scanners: %s", name
+    )
+    return ListingNoAnswerError(_NOT_STARTED)
 
 
 def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
