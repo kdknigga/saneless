@@ -3511,6 +3511,25 @@ class TestReinitialise:
         assert fake_device.close_calls == 1
         assert sane_backend_mod._handles_open() == 0
 
+    def test_closing_one_handle_twice_leaves_another_counted(self) -> None:
+        """
+        A second close of the same handle does not count a different one closed.
+
+        A bare count would drop to zero here and let SANE restart with the
+        other handle still open, which ``sane_exit`` would then try to close.
+        """
+        first = FakeSaneDev()
+        second = FakeSaneDev()
+        sane_backend_mod._handle_opened(first)
+        sane_backend_mod._handle_opened(second)
+
+        sane_backend_mod._handle_closed(first)
+        sane_backend_mod._handle_closed(first)
+
+        assert sane_backend_mod._handles_open() == 1
+        sane_backend_mod._handle_closed(second)
+        assert sane_backend_mod._handles_open() == 0
+
     def test_reinitialise_logs_one_info_line(
         self,
         fake_sane_module: FakeSaneModule,

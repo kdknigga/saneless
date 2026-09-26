@@ -38,7 +38,7 @@ import importlib
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final, Protocol, assert_never
 
@@ -955,20 +955,26 @@ class _OpenHandles:
     (``backend/net.c``: ``sane_exit`` calls ``sane_close`` on each one).  On a
     host that has silently vanished that wait was measured to last longer than
     40 seconds on both supported libsane builds.  So SANE is only restarted
-    when this count is zero, and the count is what makes "no handle is open"
+    when no handle is open, and this record is what makes "no handle is open"
     something ``SaneBackend.reinitialise()`` can check rather than assume.
 
+    Handles are kept by identity rather than as a bare count, so closing one
+    handle twice cannot also count a different, still-open handle as closed.
+    A handle's identity is stable while it is recorded, because whoever
+    closes it holds a reference to it until then.
+
     Module-level and **mutated, never rebound**, for the reason ``_Wedge``
-    gives.  A handle left open by a read that never returned stays counted
+    gives.  A handle left open by a read that never returned stays recorded
     until the reader thread closes it, because until then it is exactly the
     kind of open handle ``sane_exit`` would try to close.
 
     Attributes:
-        count: Handles opened by ``_open_device`` and not yet closed.
+        handles: The ``id()`` of each handle opened by ``_open_device`` and
+            not yet closed.
 
     """
 
-    count: int = 0
+    handles: set[int] = field(default_factory=set)
 
 
 # Guards every read and write of _OPEN_HANDLES.  It is taken inside
@@ -978,16 +984,28 @@ _HANDLES_LOCK = threading.Lock()
 _OPEN_HANDLES = _OpenHandles()
 
 
-def _handle_opened() -> None:
-    """Count a handle ``sane_open`` has just returned."""
+def _handle_opened(dev: SaneDevice) -> None:
+    """
+    Record a handle ``sane_open`` has just returned.
+
+    Args:
+        dev: The handle.
+
+    """
     with _HANDLES_LOCK:
-        _OPEN_HANDLES.count += 1
+        _OPEN_HANDLES.handles.add(id(dev))
 
 
-def _handle_closed() -> None:
-    """Count a handle as closed, whether or not its close succeeded."""
+def _handle_closed(dev: SaneDevice) -> None:
+    """
+    Record a handle as closed, whether or not its close succeeded.
+
+    Args:
+        dev: The handle.
+
+    """
     with _HANDLES_LOCK:
-        _OPEN_HANDLES.count = max(0, _OPEN_HANDLES.count - 1)
+        _OPEN_HANDLES.handles.discard(id(dev))
 
 
 def _handles_open() -> int:
@@ -999,7 +1017,7 @@ def _handles_open() -> int:
 
     """
     with _HANDLES_LOCK:
-        return _OPEN_HANDLES.count
+        return len(_OPEN_HANDLES.handles)
 
 
 # What a scan job is told when SANE cannot be restarted because a handle is
@@ -1333,7 +1351,7 @@ def _release_wedge(dev: SaneDevice, done: threading.Event) -> None:
         # Counted as closed either way, as _open_device does: the close was
         # attempted, and counting the handle open forever would refuse every
         # later scan job's SANE restart until saneless itself was restarted.
-        _handle_closed()
+        _handle_closed(dev)
         _WEDGE.stuck = False
         _WEDGE.done = None
         _WEDGE.device = None
@@ -2347,7 +2365,7 @@ class SaneBackend(ScannerBackend):
                 f"{describe(exc)}"
             )
             raise ScanError(open_msg) from exc
-        _handle_opened()
+        _handle_opened(dev)
         try:
             yield dev
         finally:
@@ -2375,7 +2393,7 @@ class SaneBackend(ScannerBackend):
                     # Counted closed whether or not close() raised: the close
                     # was attempted, and a handle counted open forever would
                     # refuse every later scan job's SANE restart.
-                    _handle_closed()
+                    _handle_closed(dev)
 
     def get_devices(self) -> list[DeviceInfo]:
         """
