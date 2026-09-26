@@ -1363,15 +1363,16 @@ class TestTheMainProcessNeverLists:
         assert str(exc_info.value) == expected
         assert not has_control_characters(str(exc_info.value))
 
-    def test_the_backend_keeps_its_own_open_and_close(self) -> None:
+    def test_the_backend_has_no_main_process_open_and_close(self) -> None:
         """
-        The Scanner check's main-process open is still the backend's own.
+        The real backend opens a device for the Scanner check only in its child.
 
-        The base default opens through ``get_capabilities``, which logs the
-        device id when a close fails, so the check must not fall through to it
-        while it still calls ``open_and_close``.
+        The check's open happens inside ``list_and_open``'s listing child, so
+        ``SaneBackend`` keeps no ``open_and_close`` of its own that would open
+        the device in this process.  The base default is left for test
+        doubles.
         """
-        assert "open_and_close" in SaneBackend.__dict__
+        assert "open_and_close" not in SaneBackend.__dict__
 
     def test_the_seam_refuses_to_start_real_libsane(self) -> None:
         """With no fake patched in, a listing fails the test instead of running."""
@@ -5695,11 +5696,14 @@ class TestSaneBoundary:
         The Scanner check's open of an unlisted device names nothing in the log.
 
         A ``net:`` device id is a LAN address, and the exception a failed
-        close raises is free text that can repeat it, so on the check's path
-        the close failure is logged by exception type alone -- unlike a scan's,
-        whose log names the device and carries the traceback.  The check's
-        own enumeration is what is run here, over a real ``SaneBackend``, so
-        every log line the check can cause through the backend is captured.
+        close raises is free text that can repeat it.  The check's open runs
+        in the listing child, which swallows a failed close, since the open
+        already showed the device can be reached, so the backend logs nothing
+        about it -- unlike a scan's close failure, whose log names the device
+        and carries the traceback.  The check's own enumeration is what is
+        run here, over a real ``SaneBackend`` whose listing the suite's seam
+        serves in this process, so every log line the check can cause through
+        the backend and the child's logic is captured.
         """
         device_id = "net:scanbox.lan:brother5:bus0;dev1"
         dev = FakeSaneDev()
@@ -5711,14 +5715,13 @@ class TestSaneBoundary:
 
         assert enumeration.configured_opened is True
         assert dev.close_calls == 1
-        close_warnings = [
+        backend_warnings = [
             r
             for r in caplog.records
             if r.name == "saneless.scanner.sane_backend"
-            and r.levelno == logging.WARNING
+            and r.levelno >= logging.WARNING
         ]
-        assert len(close_warnings) == 1
-        assert "FakeSaneError" in close_warnings[0].getMessage()
+        assert backend_warnings == []
         for record in caplog.records:
             message = record.getMessage()
             assert "scanbox" not in message
