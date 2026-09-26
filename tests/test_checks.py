@@ -2043,8 +2043,9 @@ class _CountingBackend(StubScannerBackend):
     A backend that reports what it is told to and counts the times it is asked.
 
     Both ways the Scanner check can enter SANE are counted: ``calls`` for a
-    device listing and ``opens`` for opening a device, which is what
-    ``get_capabilities`` does on the real backend.
+    device listing and ``opens`` for opening a device.  The check opens
+    through ``open_and_close``, whose base-class default opens through
+    ``get_capabilities``, so counting there counts the check's opens.
     """
 
     def __init__(self, devices: list[DeviceInfo] | None = None) -> None:

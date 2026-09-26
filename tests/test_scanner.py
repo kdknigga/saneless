@@ -24,6 +24,7 @@ import saneless.cli as cli_module
 import saneless.scanner as scanner_pkg
 import saneless.scanner.sane_backend as sane_backend_mod
 import saneless.web.app as app_module
+from saneless import checks
 from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
@@ -4968,6 +4969,44 @@ class TestSaneBoundary:
         ]
         assert len(records) == 1
         assert records[0].exc_info is not None
+
+    def test_the_check_open_logs_no_device_id_and_no_exception_text(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The Scanner check's open of an unlisted device names nothing in the log.
+
+        A ``net:`` device id is a LAN address, and the exception a failed
+        close raises is free text that can repeat it, so on the check's path
+        the close failure is logged by exception type alone -- unlike a scan's,
+        whose log names the device and carries the traceback.  The check's
+        own enumeration is what is run here, over a real ``SaneBackend``, so
+        every log line the check can cause through the backend is captured.
+        """
+        device_id = "net:scanbox.lan:brother5:bus0;dev1"
+        dev = FakeSaneDev()
+        dev.fail_call("close", FakeSaneError(f"close failed on {device_id}"))
+        backend = _backend_with(dev, monkeypatch)
+
+        with caplog.at_level(logging.DEBUG):
+            enumeration = checks._scanner_enumeration(backend, device_id, may_open=True)
+
+        assert enumeration.configured_opened is True
+        assert dev.close_calls == 1
+        close_warnings = [
+            r
+            for r in caplog.records
+            if r.name == "saneless.scanner.sane_backend"
+            and r.levelno == logging.WARNING
+        ]
+        assert len(close_warnings) == 1
+        assert "FakeSaneError" in close_warnings[0].getMessage()
+        for record in caplog.records:
+            message = record.getMessage()
+            assert "scanbox" not in message
+            assert "net:" not in message
+            assert "close failed" not in message
+            assert record.exc_info is None
 
     # -- option assignment and read-back (D-08) -----------------------------
 

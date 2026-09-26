@@ -2593,11 +2593,13 @@ def _scanner_enumeration(
     if not may_open:
         return _Enumeration(devices=devices, open_withheld=True)
     try:
-        scanner.get_capabilities(configured_device)
+        scanner.open_and_close(configured_device)
     except Exception as exc:
         # The same boundary, for the same reason.  Neither the id nor the
         # exception text is logged: the id is a LAN address, and the text of
-        # a failed open usually repeats it.
+        # a failed open usually repeats it.  ``open_and_close`` holds the
+        # backend's own logging to the same rule, which ``get_capabilities``
+        # does not: a scan's close-failure line names the device.
         logger.warning("Configured scanner could not be opened: %s", type(exc).__name__)
         return _Enumeration(devices=devices, configured_opened=False)
     return _Enumeration(devices=devices, configured_opened=True)

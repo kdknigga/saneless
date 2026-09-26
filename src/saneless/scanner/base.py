@@ -413,6 +413,29 @@ class ScannerBackend(ABC):
 
         """
 
+    def open_and_close(self, device_id: str) -> None:
+        """
+        Open a device and close it again, which is the first thing a scan does.
+
+        The Scanner health check calls this to learn whether a configured
+        device the backend did not list can be used, without scanning.  It is
+        its own method rather than a call to ``get_capabilities`` because the
+        check's log is held to a stricter rule than a scan's: nothing the
+        check causes to be logged may name a device id or carry an
+        exception's text, since a ``net:`` id is a LAN address.  A backend
+        whose own open or close logging could break that rule overrides this.
+
+        Deliberately not an ``@abstractmethod``.  The default opens the device
+        the only way this interface otherwise offers, through
+        ``get_capabilities``, which is right for a backend that logs nothing
+        of its own.
+
+        Args:
+            device_id: SANE device identifier string.
+
+        """
+        self.get_capabilities(device_id)
+
     @abstractmethod
     def scan_pages(
         self, device_id: str, settings: ScanSettings, sink: PageSink

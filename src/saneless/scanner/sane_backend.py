@@ -2096,7 +2096,9 @@ class SaneBackend(ScannerBackend):
         shutdown()
 
     @contextlib.contextmanager
-    def _open_device(self, device_id: str) -> Generator[SaneDevice]:
+    def _open_device(
+        self, device_id: str, *, name_in_log: bool = True
+    ) -> Generator[SaneDevice]:
         """
         Context manager for SANE device lifecycle.
 
@@ -2110,8 +2112,20 @@ class SaneBackend(ScannerBackend):
         python-sane cannot survive.  The handle is released later by
         the reader thread itself, and until then the wedge record holds it.
 
+        A failed close is logged, never raised.  For a scan the line names
+        the device and carries the traceback, because that is what an
+        operator debugging a scanner needs.  For the Scanner health check
+        (``name_in_log`` false) it carries the exception's type name only:
+        the check may not cause a device id or exception text to be logged,
+        because a ``net:`` id is a LAN address and the text of a SANE error
+        can repeat it (ASVS V7).  The wedged branch needs no such switch on
+        that path: a handle is wedged only by a read, and the check never
+        reads.
+
         Args:
             device_id: SANE device identifier string.
+            name_in_log: Whether a close failure may be logged with the
+                device id and the traceback; False on the health check's path.
 
         Yields:
             An open SANE device handle.
@@ -2146,13 +2160,19 @@ class SaneBackend(ScannerBackend):
                     dev.cancel()
                 try:
                     dev.close()
-                except Exception:
+                except Exception as exc:
                     # Logged, never raised: an exception from close() here
                     # would replace the one that ended the scan, which is the
                     # error the operator needs to see.
-                    logger.warning(
-                        "Could not close scanner %s", device_id, exc_info=True
-                    )
+                    if name_in_log:
+                        logger.warning(
+                            "Could not close scanner %s", device_id, exc_info=True
+                        )
+                    else:
+                        logger.warning(
+                            "Could not close the scanner after checking it: %s",
+                            type(exc).__name__,
+                        )
 
     def get_devices(self) -> list[DeviceInfo]:
         """
@@ -2233,6 +2253,30 @@ class SaneBackend(ScannerBackend):
                 raw_options=raw_options,
                 resolution_range=resolution.span,
             )
+
+    def open_and_close(self, device_id: str) -> None:
+        """
+        Open a device and close it again, logging nothing that names it.
+
+        This is the Scanner health check's open, and it does no more than a
+        scan's first step: no option is read, so the only SANE work is
+        ``sane_open``, ``sane_cancel`` and ``sane_close``.  It refuses while a
+        read is outstanding, exactly as ``get_capabilities`` does.  A failure
+        to open raises, as ``_open_device`` builds it; the caller logs its
+        type only.  A failure to close is logged by type only
+        (``_open_device``'s ``name_in_log``).
+
+        Args:
+            device_id: SANE device identifier string.
+
+        Raises:
+            ScanError: If a previous read has not returned, in which case no
+                SANE call is made at all; or if the device cannot be opened.
+
+        """
+        _refuse_if_wedged(device_id, "open")
+        with self._open_device(device_id, name_in_log=False):
+            pass
 
     def _scan_adf_pages(
         self,
