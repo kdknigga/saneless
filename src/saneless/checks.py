@@ -1912,14 +1912,11 @@ def _scanner_host_unanswered(probes: tuple[_HostProbe, ...]) -> CheckResult:
         and what it found is the row.
 
     """
-    worst = _worst_outcome(probes)
-    count = sum(1 for probe in probes if probe.outcome is worst)
-    subject, plural = _hosts_subject(count, len(probes))
-    clause = _host_problem_clause(worst, subject, plural=plural)
+    clause, worst = _worst_host_clause(probes)
     return CheckResult(
         key=CheckKey.SCANNER,
         state=CheckState.WARN,
-        message=f"{clause[:1].upper()}{clause[1:]}, so the scanner could not be checked.",
+        message=f"{_capitalised(clause)}, so the scanner could not be checked.",
         next_step=_host_problem_next_step(worst),
     )
 
