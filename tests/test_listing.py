@@ -20,14 +20,16 @@ script written into ``tmp_path``, run exactly as the real child is run.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 import pytest
 
@@ -46,6 +48,9 @@ from saneless.scanner.listing import (
     child_environment,
     run_listing_child,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _LOGGER = "saneless.scanner.listing"
 _NET_ID = "net:scanbox.lan:test:0"
@@ -109,6 +114,20 @@ import signal
 from pathlib import Path
 
 Path(os.environ["LISTING_TEST_PIDFILE"]).write_text(str(os.getpid()))
+signal.pause()
+"""
+
+# Starts a process of its own, as a backend that runs a helper program does,
+# records its PID, and then both sleep.
+_FORKING_SLEEPER_CHILD = """\
+import os
+import signal
+from pathlib import Path
+
+helper = os.fork()
+if helper == 0:
+    signal.pause()
+Path(os.environ["LISTING_TEST_PIDFILE"]).write_text(str(helper))
 signal.pause()
 """
 
@@ -336,6 +355,28 @@ def _assert_reaped(pid: int) -> None:
     with pytest.raises(ChildProcessError):
         os.waitpid(pid, os.WNOHANG)
     assert not Path(f"/proc/{pid}").exists()
+
+
+def _is_dead(pid: int) -> bool:
+    """
+    Tell whether a process that is not this process's child has ended.
+
+    Such a process is reaped by whichever process adopted it, so it can
+    still show briefly as a zombie after it died.
+
+    Args:
+        pid: The process id.
+
+    Returns:
+        Whether the process is gone or a zombie.
+
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except FileNotFoundError, ProcessLookupError:
+        # Reaped before the open, or between the open and the read.
+        return True
+    return stat.rpartition(")")[2].split()[0] in {"Z", "X"}
 
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
@@ -598,6 +639,33 @@ class TestDeadline:
         assert len(started) == 1
         assert started[0].returncode is not None
         _assert_reaped(started[0].pid)
+
+    def test_an_overrun_also_stops_what_the_child_started(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        A process the child started dies with it, rather than outliving it.
+
+        The child leads a process group of its own, and the whole group is
+        killed, so a helper program still holding a device or the reply's
+        pipe does not keep running after the listing was stopped.
+        """
+        monkeypatch.setattr(listing, "LISTING_DEADLINE_SECONDS", 1.0)
+        _use_child(monkeypatch, tmp_path, _FORKING_SLEEPER_CHILD)
+        pidfile = _pidfile(monkeypatch, tmp_path)
+
+        with pytest.raises(ListingTimedOutError):
+            run_listing_child(ListingRequest(), configured_host="")
+
+        helper = int(pidfile.read_text())
+        try:
+            assert poll_until(lambda: _is_dead(helper), _ELAPSED_CEILING_SECONDS)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(helper, signal.SIGKILL)
 
 
 class TestNoAnswer:

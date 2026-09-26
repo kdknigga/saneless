@@ -349,8 +349,9 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     thread, where no interruption is raised, would die from that signal and
     be reported as a crash of the scanner library.  A Ctrl-C or a stop that
     does reach this call interrupts the wait, and the child is killed and
-    reaped as above; a parent that dies outright leaves the child to its own
-    alarm.
+    reaped as above.  A parent that dies outright, or that exits while this
+    wait is still running on a thread it gave up waiting for, leaves the
+    child to its own alarm, which ends it a few seconds after the deadline.
 
     A crash is reported and not retried: a fresh child cannot hit the stale
     connection defect, so a crash here is a new defect that a retry would
@@ -417,13 +418,22 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
 
 def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
     """
-    Kill the child and wait for it, so it is neither running nor a zombie.
+    Kill the child and its process group, and wait for the child.
+
+    The child leads a process group of its own, so killing the group also
+    stops a helper program a backend started, or a fork of the child, that
+    would otherwise outlive it, still holding a device or the reply's pipe.
+    Only the child is waited for: the others are not this process's children.
 
     Args:
         proc: The child process.
 
     """
-    proc.kill()
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        # The group is already gone, or holds nothing this process may signal.
+        proc.kill()
     proc.wait()
 
 
