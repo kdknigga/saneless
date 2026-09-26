@@ -15,13 +15,13 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
+import saneless
 from saneless.scanner.net_hosts import (
     SANE_NET_HOSTS,
     effective_sane_net_hosts,
     exported_sane_net_hosts,
 )
-
-import saneless
 
 
 def test_constant_names_the_variable() -> None:
