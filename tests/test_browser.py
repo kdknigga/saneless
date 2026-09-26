@@ -3278,9 +3278,11 @@ def refused_scanner_strip_server(
     Serve a private app whose scanner host refuses the connection.
 
     The host is a loopback port that was bound and released, so the server's
-    own pre-probe is refused at once and the Scanner row is the amber refused
-    row, the longest message the strip carries.  Nothing leaves the machine:
-    the dial is the server's, to 127.0.0.1, and the browser never makes it.
+    own pre-probe is refused at once.  A refused host is still enumerated, the
+    browser test scanner is listed beside it, and the Scanner row is the amber
+    ready-but-refused row, one of the longest messages the strip carries.
+    Nothing leaves the machine: the dial is the server's, to 127.0.0.1, and
+    the browser never makes it.
 
     The refresher is stopped for the reason ``cold_strip_server`` stops it.
     """
@@ -3649,7 +3651,9 @@ class TestStatusStripInChromium:
         page.goto(server.url)
         expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
         scanner = _check_row(page, check_name(CheckKey.SCANNER))
-        expect(scanner).to_contain_text("is on, but its scanner service is not running")
+        expect(scanner).to_contain_text(
+            "is ready, but the scanner service is not running on the scanner host."
+        )
         expect(scanner.locator(".check-glyph")).to_have_class(
             re.compile(rf"\b{check_state_class(CheckState.WARN)}\b")
         )
