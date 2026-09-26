@@ -9,6 +9,8 @@ __all__ = [
     "AllPagesBlankError",
     "ConfigError",
     "FeederEmptyError",
+    "ListingCrashedError",
+    "ListingTimedOutError",
     "PaperlessError",
     "PaperlessTimeoutError",
     "PdfError",
@@ -18,6 +20,7 @@ __all__ = [
     "ScanInterrupted",
     "StorageError",
     "describe",
+    "describe_text",
     "failure_text",
     "note_text",
 ]
@@ -41,6 +44,19 @@ class ScanError(SanelessError):
 
 class FeederEmptyError(ScanError):
     """ADF feeder is empty -- no paper detected."""
+
+
+class ListingCrashedError(ScanError):
+    """The scanner library died from a signal while listing scanners."""
+
+
+class ListingTimedOutError(ScanError):
+    """
+    The scanner library did not finish listing scanners before the deadline.
+
+    The listing was stopped: the process running it was killed and reaped
+    before this was raised.
+    """
 
 
 class ScanCancelledError(SanelessError):
@@ -148,7 +164,28 @@ def describe(exc: BaseException) -> str:
         the exception's class name when that leaves nothing.
 
     """
-    return " ".join(str(exc).split()) or type(exc).__name__
+    return describe_text(str(exc), type(exc).__name__)
+
+
+def describe_text(message: str, type_name: str) -> str:
+    """
+    Apply ``describe``'s rule to a message that has no exception object.
+
+    A scanner listing runs in a separate process, which reports a failure as
+    its exception's type name and message rather than as an exception.  This
+    is the one place the rule lives, so that text and an exception object are
+    normalised the same way.
+
+    Args:
+        message: The failure's message, possibly empty or over several lines.
+        type_name: The failure's type name, used when the message is empty.
+
+    Returns:
+        ``message`` with every run of whitespace collapsed to one space, or
+        ``type_name`` when that leaves nothing.
+
+    """
+    return " ".join(message.split()) or type_name
 
 
 def note_text(exc: BaseException) -> str:
