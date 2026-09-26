@@ -83,7 +83,7 @@ from tests.conftest import StubScannerBackend
 from tests.fake_saned import EXIT_REQUEST, INIT_REQUEST, SanedBehaviour, fake_saned
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from saneless.config import ConfigDiscovery
 
@@ -2264,29 +2264,38 @@ def _without_allowed_spellings(text: str) -> str:
 
 
 def _recording_dialler(
-    monkeypatch: pytest.MonkeyPatch, *, reachable: bool
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    outcome: checks._SanedOutcome = checks._SanedOutcome.HEALTHY,
+    outcomes: Mapping[str, checks._SanedOutcome] | None = None,
 ) -> list[tuple[str, int]]:
     """
-    Replace the probe's dialler with one that records what it was asked for.
+    Replace the saned probe with one that records what it was asked for.
 
     Nothing connects: the point of these cases is *which address* the check
-    decided to dial, which is a decision made before any socket exists.
+    decided to dial, and what it made of each answer, which is decided without
+    any socket existing.
 
     Args:
         monkeypatch: pytest's attribute patcher.
-        reachable: What the stubbed dialler should answer.
+        outcome: What the stubbed probe answers for any host.
+        outcomes: A per-host answer, which wins over ``outcome`` for the
+            hosts it names.
 
     Returns:
         The list the stub appends each ``(host, port)`` pair to.
 
     """
     dialled: list[tuple[str, int]] = []
+    per_host = dict(outcomes or {})
 
-    def _dial(host: str, port: int, _timeout: float) -> bool:
+    def _probe_stub(
+        host: str, port: int, _connect_timeout: float, _handshake_timeout: float
+    ) -> checks._SanedOutcome:
         dialled.append((host, port))
-        return reachable
+        return per_host.get(host, outcome)
 
-    monkeypatch.setattr(checks, "_saned_reachable", _dial)
+    monkeypatch.setattr(checks, "_probe_saned", _probe_stub)
     return dialled
 
 
@@ -2306,6 +2315,29 @@ def _healthy_settings(tmp_path: Path, *, host: str) -> Settings:
     folder = tmp_path / "consume"
     folder.mkdir(exist_ok=True)
     return _settings(tmp_path, host=host, consume_dir=str(folder))
+
+
+# The two outcomes that end the scanner check before enumeration, and the
+# wording each one's amber row carries.  Pinned here, word for word, because
+# the next step is the part of the row a household member acts on.
+_TIMED_OUT_MESSAGE: Final = (
+    "The scanner host is not answering, so the scanner could not be checked."
+)
+_TIMED_OUT_NEXT_STEP: Final = (
+    "Check the scanner host is switched on and on the network, then press Check again."
+)
+_REFUSED_MESSAGE: Final = (
+    "The scanner host is on, but its scanner service is not running, "
+    "so the scanner could not be checked."
+)
+_REFUSED_NEXT_STEP: Final = (
+    "Start saned on the scanner host, or check it is listening on the network, "
+    "then press Check again."
+)
+
+# Two scanner hosts in one setting, so the count wording and the
+# probe-every-entry rule have something to count.
+_TWO_HOSTS: Final = "scanbox-a.lan:scanbox-b.lan"
 
 
 class TestScannerCheck:
@@ -2447,11 +2479,14 @@ class TestScannerCheck:
 
     def test_a_closed_saned_port_skips_the_backend(self, tmp_path: Path) -> None:
         """
-        An unplugged sane-net host answers in about two seconds, not two minutes.
+        A host with nothing listening is the refused row, and SANE is never entered.
 
         The pre-probe is the whole mitigation for T-30-22: ``get_devices()``
         has no timeout at any layer, so the only way not to hang is not to
-        call it.
+        call it.  A refused host is kept away from it for a second reason: a
+        refused scanner host is what one restarting its saned looks like, and
+        enumerating a host whose earlier connection was lost can crash the
+        process inside libsane.
 
         Args:
             tmp_path: The test's own directory.
@@ -2463,27 +2498,137 @@ class TestScannerCheck:
         row = _row(results, CheckKey.SCANNER)
         assert backend.calls == 0
         assert row.state is CheckState.WARN
-        assert row.message == (
-            "The configured scanner host is not answering, "
-            "so the scanner could not be checked."
-        )
+        assert row.message == _REFUSED_MESSAGE
+        assert row.next_step == _REFUSED_NEXT_STEP
 
-    def test_a_listening_saned_port_reaches_the_backend(
-        self, tmp_path: Path, listening_port: int
-    ) -> None:
+    def test_a_healthy_saned_reaches_the_backend(self, tmp_path: Path) -> None:
         """
-        A reachable host costs one extra handshake and then behaves as before.
+        A host whose saned answers the handshake then behaves as before.
 
         Args:
             tmp_path: The test's own directory.
-            listening_port: A loopback port the fixture is listening on.
 
         """
         backend = _CountingBackend([_device()])
-        settings = _settings(tmp_path, host=f"127.0.0.1:{listening_port}")
-        results = run_checks(_context(settings, scanner=backend))
+        with fake_saned(SanedBehaviour.HEALTHY) as fake:
+            settings = _settings(tmp_path, host=f"127.0.0.1:{fake.port}")
+            results = run_checks(_context(settings, scanner=backend))
         assert backend.calls == 1
         assert _row(results, CheckKey.SCANNER).state is CheckState.OK
+
+    def test_a_silent_saned_port_never_reaches_the_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listening_port: int
+    ) -> None:
+        """
+        A host that accepts and then says nothing is the timed-out row, unenumerated.
+
+        libsane bounds nothing after its connect, so enumerating this host
+        would wait on the INIT reply for as long as the peer keeps quiet.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Shortens both probe budgets.
+            listening_port: A loopback port that listens and never answers.
+
+        """
+        monkeypatch.setattr(checks, "PROBE_CONNECT_SECONDS", _PROBE_BUDGET)
+        monkeypatch.setattr(checks, "PROBE_HANDSHAKE_SECONDS", _PROBE_BUDGET)
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host=f"127.0.0.1:{listening_port}")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 0
+        assert row.state is CheckState.WARN
+        assert row.message == _TIMED_OUT_MESSAGE
+        assert row.next_step == _TIMED_OUT_NEXT_STEP
+
+    def test_every_configured_host_is_probed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A healthy first host does not excuse the second from its probe.
+
+        libsane dials every entry, so a dead second host costs its full
+        uninterruptible connect inside ``get_devices()`` however well the first
+        one answers.  Probing stops at nothing short of the last entry.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        dialled = _recording_dialler(monkeypatch)
+        settings = _settings(tmp_path, host=_TWO_HOSTS)
+        run_checks(_context(settings, scanner=_CountingBackend([_device()])))
+        assert dialled == [("scanbox-a.lan", SANED_PORT), ("scanbox-b.lan", SANED_PORT)]
+
+    @pytest.mark.parametrize(
+        "dead",
+        [
+            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
+            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
+        ],
+    )
+    def test_a_healthy_host_beside_a_dead_one_never_reaches_the_backend(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        dead: checks._SanedOutcome,
+    ) -> None:
+        """
+        One answering host is not enough to enter SANE when another is dead.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            dead: What the second host answers.
+
+        """
+        _recording_dialler(
+            monkeypatch,
+            outcomes={
+                "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
+                "scanbox-b.lan": dead,
+            },
+        )
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host=_TWO_HOSTS)
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 0
+        assert row.state is CheckState.WARN
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            pytest.param(checks._SanedOutcome.REJECTED, id="rejected"),
+            pytest.param(checks._SanedOutcome.UNRESOLVED, id="unresolved"),
+            pytest.param(checks._SanedOutcome.HEALTHY, id="healthy"),
+        ],
+    )
+    def test_hosts_that_cannot_hang_or_crash_libsane_are_enumerated(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: checks._SanedOutcome,
+    ) -> None:
+        """
+        Rejected, unresolved and healthy hosts go on to ``get_devices()``.
+
+        A rejection and a failed lookup both return at once inside libsane, so
+        the enumeration costs nothing and says whether a scanner is usable
+        anyway.  None of them gets the no-enumeration amber row.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            outcome: What the one configured host answers.
+
+        """
+        _recording_dialler(monkeypatch, outcome=outcome)
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host="scanbox.lan")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 1
+        assert "could not be checked" not in row.message
 
     def test_no_configured_host_is_never_pre_probed(self, tmp_path: Path) -> None:
         """
@@ -2513,7 +2658,7 @@ class TestScannerCheck:
             monkeypatch: pytest's patcher.
 
         """
-        dialled = _recording_dialler(monkeypatch, reachable=True)
+        dialled = _recording_dialler(monkeypatch)
         settings = _settings(tmp_path, host="config-host")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("config-host", SANED_PORT)]
@@ -2536,7 +2681,7 @@ class TestScannerCheck:
 
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "env-host")
-        dialled = _recording_dialler(monkeypatch, reachable=True)
+        dialled = _recording_dialler(monkeypatch)
         settings = _settings(tmp_path, host="config-host")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("env-host", SANED_PORT)]
@@ -2556,34 +2701,156 @@ class TestScannerCheck:
 
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "")
-        dialled = _recording_dialler(monkeypatch, reachable=True)
+        dialled = _recording_dialler(monkeypatch)
         settings = _settings(tmp_path, host="config-host")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("config-host", SANED_PORT)]
 
+    @pytest.mark.parametrize(
+        ("host", "outcomes", "expected"),
+        [
+            pytest.param(
+                "scanbox.lan",
+                {"scanbox.lan": checks._SanedOutcome.TIMED_OUT},
+                (_TIMED_OUT_MESSAGE, _TIMED_OUT_NEXT_STEP),
+                id="one-timed-out",
+            ),
+            pytest.param(
+                "scanbox.lan",
+                {"scanbox.lan": checks._SanedOutcome.REFUSED},
+                (_REFUSED_MESSAGE, _REFUSED_NEXT_STEP),
+                id="one-refused",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
+                    "scanbox-b.lan": checks._SanedOutcome.TIMED_OUT,
+                },
+                (
+                    "1 of 2 scanner hosts is not answering, "
+                    "so the scanner could not be checked.",
+                    _TIMED_OUT_NEXT_STEP,
+                ),
+                id="healthy-and-timed-out",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
+                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                },
+                (
+                    "1 of 2 scanner hosts is on, but its scanner service is not "
+                    "running, so the scanner could not be checked.",
+                    _REFUSED_NEXT_STEP,
+                ),
+                id="healthy-and-refused",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.REFUSED,
+                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                },
+                (
+                    "2 of 2 scanner hosts are on, but their scanner service is "
+                    "not running, so the scanner could not be checked.",
+                    _REFUSED_NEXT_STEP,
+                ),
+                id="both-refused",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.REFUSED,
+                    "scanbox-b.lan": checks._SanedOutcome.TIMED_OUT,
+                },
+                (
+                    "1 of 2 scanner hosts is not answering, "
+                    "so the scanner could not be checked.",
+                    _TIMED_OUT_NEXT_STEP,
+                ),
+                id="refused-and-timed-out",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.REJECTED,
+                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                },
+                (
+                    "1 of 2 scanner hosts is on, but its scanner service is not "
+                    "running, so the scanner could not be checked.",
+                    _REFUSED_NEXT_STEP,
+                ),
+                id="rejected-and-refused",
+            ),
+        ],
+    )
     def test_an_unanswered_host_is_amber_and_says_what_to_do(
-        self, tmp_path: Path
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        host: str,
+        outcomes: dict[str, checks._SanedOutcome],
+        expected: tuple[str, str],
     ) -> None:
         """
-        CR-02: a refused dial is a fact about the host, not about the appliance.
+        CR-02: a dead host is a fact about the host, not about the appliance.
 
         ``SANE_NET_HOSTS`` *adds* net devices; it does not replace local
-        backend enumeration, so "every configured host refused TCP" never
-        implied "there is no scanner".  D-01 calls a true statement about a
-        deployment that still works amber.
+        backend enumeration, so "a configured host did not answer" never
+        implied "there is no scanner".  A true statement about a deployment
+        that may still work is amber.  The row names the worst outcome among
+        the hosts, with a count once there is more than one, and each outcome
+        carries its own next step.
 
         Args:
             tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            host: The configured ``scanner.host``.
+            outcomes: What each configured host answers.
+            expected: The row's message and next step.
 
         """
+        _recording_dialler(monkeypatch, outcomes=outcomes)
         backend = _CountingBackend([_device()])
-        settings = _healthy_settings(tmp_path, host=f"127.0.0.1:{_closed_port()}")
+        settings = _healthy_settings(tmp_path, host=host)
         row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 0
         assert row.state is CheckState.WARN
         assert row.skipped is False
-        assert row.next_step == (
-            "Check the scanner is switched on and connected, then press Check again."
-        )
+        assert (row.message, row.next_step) == expected
+
+    def test_the_timed_out_and_refused_rows_advise_different_things(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A host that is off and a host whose saned is stopped need different fixes.
+
+        Both still end in pressing Check again: each state was measured to
+        clear on the next enumeration in the same process, with no restart.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        rows = []
+        for outcome in (checks._SanedOutcome.TIMED_OUT, checks._SanedOutcome.REFUSED):
+            _recording_dialler(monkeypatch, outcome=outcome)
+            settings = _settings(tmp_path, host="scanbox.lan")
+            rows.append(
+                _row(
+                    run_checks(_context(settings, scanner=_CountingBackend())),
+                    CheckKey.SCANNER,
+                )
+            )
+        timed_out, refused = rows
+        assert timed_out.next_step != refused.next_step
+        assert timed_out.next_step.endswith("press Check again.")
+        assert refused.next_step.endswith("press Check again.")
 
     def test_an_unanswered_host_does_not_turn_a_health_gate_red(
         self, tmp_path: Path
@@ -2617,8 +2884,8 @@ class TestScannerCheck:
         """
         R3-CR-01 end to end: a U+00B2 in the port leaves the run green.
 
-        The reachable half of this is stubbed -- ``_recording_dialler``
-        replaces ``checks._saned_reachable``, so the test resolves no name and
+        The probe half of this is stubbed -- ``_recording_dialler`` replaces
+        ``checks._probe_saned``, so the test resolves no name and
         opens no socket.  What is measured is the row the *parser* produces:
         before the fix the ``ValueError`` escaped into ``run_checks``' generic
         per-check handler, so the Scanner row carried
@@ -2634,7 +2901,7 @@ class TestScannerCheck:
 
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "scanbox:²")
-        _recording_dialler(monkeypatch, reachable=True)
+        _recording_dialler(monkeypatch)
         results = run_checks(
             _context(
                 _healthy_settings(tmp_path, host=""),
@@ -2646,36 +2913,48 @@ class TestScannerCheck:
         assert worst_state(results) is not CheckState.FAIL
 
     @pytest.mark.parametrize(
-        ("environment", "setting"),
+        "outcome",
         [
-            pytest.param(None, "scanbox.lan", id="setting-only"),
-            pytest.param("scanbox.lan:6566", "", id="environment-only"),
-            pytest.param("192.0.2.10", "scanbox.lan", id="both"),
+            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
+            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "hosts",
+        [
+            pytest.param((None, "scanbox.lan"), id="setting-only"),
+            pytest.param(("scanbox.lan:6566", ""), id="environment-only"),
+            pytest.param(("192.0.2.10", "scanbox.lan"), id="both"),
+            pytest.param((None, _TWO_HOSTS), id="two-hosts"),
         ],
     )
     def test_the_unanswered_row_names_no_host_address_or_port(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        environment: str | None,
-        setting: str,
+        hosts: tuple[str | None, str],
+        outcome: checks._SanedOutcome,
     ) -> None:
         """
         ASVS V7: a LAN address never reaches a LAN-visible page through this row.
 
         Same class of fact, and the same refusal, as ``_device_label``
-        declining to print a ``net:<host>`` identifier.
+        declining to print a ``net:<host>`` identifier.  It also never falls
+        back on the red row's "switched on and connected", which was the
+        wrong advice for a host whose saned refused the connection.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
-            environment: What ``SANE_NET_HOSTS`` is set to, or None for unset.
-            setting: What ``scanner.host`` is configured as.
+            hosts: What ``SANE_NET_HOSTS`` is set to (None for unset), and
+                what ``scanner.host`` is configured as.
+            outcome: What every configured host answers.
 
         """
+        environment, setting = hosts
         if environment is not None:
             monkeypatch.setenv("SANE_NET_HOSTS", environment)
-        _recording_dialler(monkeypatch, reachable=False)
+        _recording_dialler(monkeypatch, outcome=outcome)
         settings = _settings(tmp_path, host=setting)
         row = _row(
             run_checks(_context(settings, scanner=_CountingBackend([_device()]))),
@@ -2684,9 +2963,11 @@ class TestScannerCheck:
         assert row.state is CheckState.WARN
         for text in (row.message, row.next_step):
             assert ":" not in text
+            assert "/" not in text
             assert "scanbox" not in text
             assert "192.0.2.10" not in text
             assert "6566" not in text
+            assert "switched on and connected" not in text
 
     def test_an_enumeration_that_found_nothing_is_still_red(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2702,7 +2983,7 @@ class TestScannerCheck:
             monkeypatch: pytest's patcher.
 
         """
-        _recording_dialler(monkeypatch, reachable=True)
+        _recording_dialler(monkeypatch)
         backend = _CountingBackend()
         settings = _settings(tmp_path, host="scanbox.lan")
         row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
@@ -2721,7 +3002,7 @@ class TestScannerCheck:
             monkeypatch: pytest's patcher.
 
         """
-        _recording_dialler(monkeypatch, reachable=True)
+        _recording_dialler(monkeypatch)
         settings = _settings(tmp_path, host="scanbox.lan")
         row = _row(
             run_checks(_context(settings, scanner=_RaisingBackend())), CheckKey.SCANNER
@@ -3638,7 +3919,7 @@ class _GateSamplingBackend(StubScannerBackend):
 
 
 def _gate_sampling_dialler(
-    monkeypatch: pytest.MonkeyPatch, probe: _GateProbe, *, reachable: bool
+    monkeypatch: pytest.MonkeyPatch, probe: _GateProbe, *, outcome: checks._SanedOutcome
 ) -> list[tuple[str, int]]:
     """
     Replace the saned dialler with one that samples the gate before answering.
@@ -3650,7 +3931,7 @@ def _gate_sampling_dialler(
     Args:
         monkeypatch: pytest's attribute patcher.
         probe: The recorder the gate sample goes to.
-        reachable: What the stubbed dialler should answer.
+        outcome: What the stubbed probe should answer.
 
     Returns:
         The list the stub appends each ``(host, port)`` pair to.
@@ -3658,12 +3939,14 @@ def _gate_sampling_dialler(
     """
     dialled: list[tuple[str, int]] = []
 
-    def _dial(host: str, port: int, _timeout: float) -> bool:
+    def _probe_stub(
+        host: str, port: int, _connect_timeout: float, _handshake_timeout: float
+    ) -> checks._SanedOutcome:
         dialled.append((host, port))
         probe.sample("pre-probe")
-        return reachable
+        return outcome
 
-    monkeypatch.setattr(checks, "_saned_reachable", _dial)
+    monkeypatch.setattr(checks, "_probe_saned", _probe_stub)
     return dialled
 
 
@@ -3748,22 +4031,22 @@ def _gated_context_builder(
 
     """
     if scanner_context == "no-python-sane":
-        _recording_dialler(monkeypatch, reachable=False)
+        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT)
         return lambda: _context(_settings(tmp_path), scanner=None)
     if scanner_context == "host-unanswered":
-        _recording_dialler(monkeypatch, reachable=False)
+        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT)
         return lambda: _context(
             _settings(tmp_path, host="scanbox.lan"),
             scanner=_CountingBackend([_device()]),
         )
     if scanner_context == "one-device":
-        _recording_dialler(monkeypatch, reachable=True)
+        _recording_dialler(monkeypatch)
         return lambda: _context(
             _settings(tmp_path, host="scanbox.lan"),
             scanner=_CountingBackend([_device()]),
         )
     if scanner_context == "enumeration-raises":
-        _recording_dialler(monkeypatch, reachable=True)
+        _recording_dialler(monkeypatch)
         return lambda: _context(
             _settings(tmp_path, host="scanbox.lan"), scanner=_RaisingBackend()
         )
@@ -3989,7 +4272,9 @@ class TestRunChecksUnderTheScannerGate:
         """
         gate = _RecordingLock()
         probe = _GateProbe(gate)
-        dialled = _gate_sampling_dialler(monkeypatch, probe, reachable=True)
+        dialled = _gate_sampling_dialler(
+            monkeypatch, probe, outcome=checks._SanedOutcome.HEALTHY
+        )
         backend = _GateSamplingBackend(probe, [_device()])
         results = run_checks(
             _context(_settings(tmp_path, host="scanbox"), scanner=backend),
@@ -4001,20 +4286,37 @@ class TestRunChecksUnderTheScannerGate:
         assert _row(results, CheckKey.SCANNER).state is CheckState.OK
         assert gate.is_free() is True
 
+    @pytest.mark.parametrize(
+        "expected",
+        [
+            pytest.param(
+                (checks._SanedOutcome.TIMED_OUT, _TIMED_OUT_MESSAGE), id="timed-out"
+            ),
+            pytest.param(
+                (checks._SanedOutcome.REFUSED, _REFUSED_MESSAGE), id="refused"
+            ),
+        ],
+    )
     def test_a_refused_pre_probe_never_touches_the_gate(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        expected: tuple[checks._SanedOutcome, str],
     ) -> None:
         """
         A check that decides before SANE has no business taking SANE's lock.
 
         Args:
             tmp_path: The test's own directory.
-            monkeypatch: Used to make every configured host refuse.
+            monkeypatch: Used to make every configured host fail its probe.
+            expected: What the configured host answers, and the amber row
+                message that answer produces.
 
         """
+        outcome, message = expected
         gate = _RecordingLock()
         backend = _CountingBackend([_device()])
-        dialled = _recording_dialler(monkeypatch, reachable=False)
+        dialled = _recording_dialler(monkeypatch, outcome=outcome)
         results = run_checks(
             _context(_settings(tmp_path, host="scanbox"), scanner=backend),
             scanner_gate=cast("threading.Lock", gate),
@@ -4024,10 +4326,7 @@ class TestRunChecksUnderTheScannerGate:
         assert backend.calls == 0
         row = _row(results, CheckKey.SCANNER)
         assert row.state is CheckState.WARN
-        assert row.message == (
-            "The configured scanner host is not answering, "
-            "so the scanner could not be checked."
-        )
+        assert row.message == message
 
     def test_an_absent_backend_never_touches_the_gate(self, tmp_path: Path) -> None:
         """
