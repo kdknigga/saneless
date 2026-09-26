@@ -23,14 +23,17 @@ already proven.  No test here sleeps.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import socket
+import struct
 import tempfile
 import threading
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass
 from itertools import pairwise
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Final, cast
 
 import httpx2
@@ -46,7 +49,6 @@ from saneless.checks import (
     CheckResult,
     CheckState,
     _saned_hosts,
-    _saned_reachable,
     _scanner_busy,
     _scanner_skipped,
     check_name,
@@ -78,6 +80,7 @@ from saneless.vocabulary import (
     connection_status_message,
 )
 from tests.conftest import StubScannerBackend
+from tests.fake_saned import EXIT_REQUEST, INIT_REQUEST, SanedBehaviour, fake_saned
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -934,33 +937,150 @@ class TestTheParserDocstringIsTrue:
         assert _saned_hosts("scanner.local.") == ()
 
 
-class TestSanedReachable:
-    """The only bounded reachability probe in the tree."""
+def _probe(host: str = "scanbox.lan", port: int = SANED_PORT) -> checks._SanedOutcome:
+    """
+    Run the saned probe with both of its budgets shortened for the suite.
 
-    def test_a_listening_socket_is_reachable(self, listening_port: int) -> None:
+    Args:
+        host: The host to probe.
+        port: The port to dial.
+
+    Returns:
+        What the probe concluded about the host.
+
+    """
+    return checks._probe_saned(host, port, _PROBE_BUDGET, _PROBE_BUDGET)
+
+
+# A valid SANE_NET_INIT reply: status 0 (SANE_STATUS_GOOD), version 1.0.3.
+_VALID_REPLY: Final = struct.pack(">ii", 0, 0x01000003)
+
+
+class TestSanedProbe:
+    """The saned pre-probe, against real loopback sockets and a fake saned."""
+
+    def test_a_peer_that_closes_without_reading_is_rejected(self) -> None:
         """
-        A port that accepts a connection answers True.
+        Accept-then-close is how saned refuses a peer, and it is REJECTED.
+
+        saned's access check runs before it reads anything and closes the
+        socket when the peer is not allowed, so the client sees a reset or an
+        end of file where the reply should be.  A bare ``connect()`` counted
+        that as reachable, which is how the denial came to be reported as a
+        scanner that was switched off.  The race between the fake's close and
+        the probe's send can surface as a reset, a broken pipe or an end of
+        file; all three must read the same.
+        """
+        with fake_saned(SanedBehaviour.CLOSE) as fake:
+            outcome = _probe("127.0.0.1", fake.port)
+        assert outcome is checks._SanedOutcome.REJECTED
+
+    def test_a_closed_port_is_refused(self) -> None:
+        """Nothing listening is REFUSED, and the probe raises nothing."""
+        assert _probe("127.0.0.1", _closed_port()) is checks._SanedOutcome.REFUSED
+
+    def test_a_healthy_saned_hears_one_init_and_one_exit(self) -> None:
+        """
+        A valid reply is HEALTHY, and the probe leaves saned one clean session.
+
+        The fake records every byte it read, and teardown joins its thread,
+        so after the ``with`` block the record is complete: the 21-byte INIT
+        request, then ``SANE_NET_EXIT``, then the end of the connection.
+        Anything else on the wire would be a probe doing more than it says.
+        """
+        with fake_saned(SanedBehaviour.HEALTHY) as fake:
+            outcome = _probe("127.0.0.1", fake.port)
+        assert outcome is checks._SanedOutcome.HEALTHY
+        assert b"".join(fake.received) == INIT_REQUEST + EXIT_REQUEST
+        assert len(INIT_REQUEST) == 21
+
+    def test_a_non_success_status_is_rejected(self) -> None:
+        """A reply carrying a failure status is REJECTED, not HEALTHY."""
+        with fake_saned(SanedBehaviour.BAD_STATUS) as fake:
+            outcome = _probe("127.0.0.1", fake.port)
+        assert outcome is checks._SanedOutcome.REJECTED
+
+    def test_a_version_libsane_would_refuse_is_rejected(self) -> None:
+        """
+        A success status with a foreign major version is REJECTED.
+
+        libsane's net backend accepts a reply only when its major version is 1
+        and its build is 2 or 3, so a peer that answers anything else is not a
+        saned this appliance can scan through.
+        """
+        with fake_saned(SanedBehaviour.BAD_VERSION) as fake:
+            outcome = _probe("127.0.0.1", fake.port)
+        assert outcome is checks._SanedOutcome.REJECTED
+
+    def test_a_peer_that_keeps_sending_is_read_only_eight_bytes(self) -> None:
+        """
+        A valid reply followed by a mebibyte of junk is HEALTHY, and quick.
+
+        The probe reads exactly the eight reply bytes and stops, so a peer
+        that floods it cannot hold it past the handshake budget or make it
+        buffer what it sends.
+        """
+        with fake_saned(SanedBehaviour.FLOOD) as fake:
+            started = monotonic()
+            outcome = _probe("127.0.0.1", fake.port)
+            elapsed = monotonic() - started
+        assert outcome is checks._SanedOutcome.HEALTHY
+        assert elapsed < _PROBE_BUDGET
+
+    def test_a_peer_that_accepts_and_says_nothing_times_out(
+        self, listening_port: int
+    ) -> None:
+        """
+        Accept-but-silent is TIMED_OUT, inside both budgets.
+
+        The fixture listens and never accepts, so the kernel completes the
+        TCP handshake from the backlog and nothing ever replies -- exactly the
+        peer libsane would wait on forever, because nothing bounds its INIT
+        read.  The probe's handshake deadline is what bounds it here.
 
         Args:
             listening_port: A loopback port the fixture is listening on.
 
         """
-        assert _saned_reachable("127.0.0.1", listening_port, _PROBE_BUDGET) is True
+        started = monotonic()
+        outcome = _probe("127.0.0.1", listening_port)
+        elapsed = monotonic() - started
+        assert outcome is checks._SanedOutcome.TIMED_OUT
+        assert elapsed < 3 * _PROBE_BUDGET
 
-    def test_a_closed_port_is_not_reachable(self) -> None:
-        """A refused connect answers False and raises nothing."""
-        assert _saned_reachable("127.0.0.1", _closed_port(), _PROBE_BUDGET) is False
-
-    def test_an_unresolvable_name_is_not_reachable(self) -> None:
+    def test_a_name_that_does_not_resolve_is_unresolved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """
-        A name that does not resolve answers False rather than raising.
+        A resolver error is UNRESOLVED and raises nothing.
 
-        ``socket.gaierror`` subclasses ``OSError``, so the one ``except`` arm
-        covers a DNS failure as well as a refused connect.  The name used here
-        is in the reserved ``.invalid`` TLD (RFC 2606), which is guaranteed
-        never to resolve, so this test needs no network.
+        The resolver is replaced rather than asked about a reserved name, so
+        the suite stays offline: glibc still sends a ``.invalid`` lookup to
+        the configured resolver.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
         """
-        assert _saned_reachable("scanner.invalid", SANED_PORT, _PROBE_BUDGET) is False
+
+        def _fail(*_args: object, **_kwargs: object) -> list[object]:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fail)
+        assert _probe("scanbox.lan") is checks._SanedOutcome.UNRESOLVED
+
+    def test_an_empty_resolver_answer_is_unresolved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A resolver that answers with no addresses is UNRESOLVED.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [])
+        assert _probe("scanbox.lan") is checks._SanedOutcome.UNRESOLVED
 
     def test_the_registered_port_is_used(self) -> None:
         """
@@ -970,6 +1090,64 @@ class TestSanedReachable:
         the constant is pinned so a future edit has to argue with this test.
         """
         assert SANED_PORT == 6566
+
+    def test_the_handshake_budget_is_separate_from_the_connect_budget(self) -> None:
+        """
+        The reply gets its own budget, because saned does name lookups first.
+
+        A working saned on a scanner host with slow DNS must not read as timed
+        out, which it would if one short budget covered connect and reply.
+        """
+        assert checks.PROBE_HANDSHAKE_SECONDS == 5.0
+        assert "PROBE_HANDSHAKE_SECONDS" in checks.__all__
+
+    def test_no_probe_log_line_names_the_host_the_port_or_the_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        listening_port: int,
+    ) -> None:
+        """
+        ASVS V7: probe logs carry outcome names and exception type names only.
+
+        Every outcome a real socket can produce is driven through the probe
+        with DEBUG captured, and no record may contain the address, a port
+        number or the text of any exception the probe caught.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            caplog: pytest's log capture.
+            listening_port: A loopback port the fixture is listening on.
+
+        """
+        caplog.set_level(logging.DEBUG, logger="saneless.checks")
+        ports = [listening_port]
+        for behaviour in SanedBehaviour:
+            with fake_saned(behaviour) as fake:
+                ports.append(fake.port)
+                _probe("127.0.0.1", fake.port)
+        closed = _closed_port()
+        ports.append(closed)
+        _probe("127.0.0.1", closed)
+        _probe("127.0.0.1", listening_port)
+
+        def _fail(*_args: object, **_kwargs: object) -> list[object]:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fail)
+        _probe("scanbox.lan")
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert messages, "the probe logged nothing, so this guard proves nothing"
+        for message in messages:
+            assert "127.0.0.1" not in message
+            assert "scanbox" not in message
+            assert "Name or service" not in message
+            assert "Errno" not in message
+            assert "Connection refused" not in message
+            assert "reset by peer" not in message
+            for port in ports:
+                assert str(port) not in message
 
 
 class _SpendingClock:
@@ -1024,6 +1202,8 @@ class _ProbeRecorder:
         self,
         connectable: Iterable[object] = (),
         clock: _SpendingClock | None = None,
+        *,
+        peer: _PeerScript | None = None,
     ) -> None:
         """
         Start with nothing recorded.
@@ -1036,14 +1216,21 @@ class _ProbeRecorder:
             clock: The scripted clock each dial moves forward, or ``None`` to
                 leave time alone, which is what every case but the shared-budget
                 one wants.
+            peer: How a connected peer behaves once the handshake starts, and
+                which addresses time out instead of refusing.  Omitted, the
+                peer answers with a valid reply and nothing times out.
 
         """
         self.constructions: list[tuple[int, int, int]] = []
         self.events: list[str] = []
         self.timeouts: list[float] = []
         self.addresses: list[object] = []
+        self.sent: list[bytes] = []
+        self.recv_sizes: list[int] = []
+        self.recv_served: list[int] = []
         self.connectable = frozenset(connectable)
         self.clock = clock
+        self.peer = peer if peer is not None else _PeerScript()
 
     def note_a_dial(self) -> None:
         """Charge the scripted clock, if there is one, for the dial just made."""
@@ -1067,6 +1254,30 @@ class _ProbeRecorder:
         return _RecordingSocket(self)
 
 
+@dataclass(frozen=True, slots=True)
+class _PeerScript:
+    """
+    How the far end behaves, for the socket doubles below.
+
+    Attributes:
+        timeout_addresses: Sockaddrs whose ``connect`` times out rather than
+            being refused.
+        reply: The bytes a connected peer has to give; the probe's ``recv``
+            is served from these, and runs dry into an end of file.
+        recv_chunk: The most bytes one ``recv`` hands back, or ``None`` for
+            as many as were asked for.
+        send_error: What ``sendall`` raises, or ``None`` to accept the bytes.
+        recv_error: What ``recv`` raises, or ``None`` to serve ``reply``.
+
+    """
+
+    timeout_addresses: frozenset[object] = frozenset()
+    reply: bytes = _VALID_REPLY
+    recv_chunk: int | None = None
+    send_error: OSError | None = None
+    recv_error: OSError | None = None
+
+
 class _RecordingSocket:
     """A socket that records the calls made to it and refuses by default."""
 
@@ -1079,6 +1290,7 @@ class _RecordingSocket:
 
         """
         self.recorder = recorder
+        self.read_offset = 0
 
     def __enter__(self) -> _RecordingSocket:
         """
@@ -1124,9 +1336,11 @@ class _RecordingSocket:
             address: The sockaddr the probe passed.
 
         Raises:
-            OSError: Whenever the address is not one the recorder was told to
-                accept, the way a closed port does.  That is every address
-                unless a case named one.
+            TimeoutError: When the case named this address as one that does
+                not answer, the way a host whose SYNs are dropped behaves.
+            ConnectionRefusedError: Whenever the address is not one the
+                recorder was told to accept, the way a closed port does.  That
+                is every address unless a case named one.
 
         """
         self.recorder.events.append("connect")
@@ -1134,8 +1348,54 @@ class _RecordingSocket:
         self.recorder.note_a_dial()
         if address in self.recorder.connectable:
             return
-        msg = "Connection refused"
-        raise OSError(msg)
+        if address in self.recorder.peer.timeout_addresses:
+            msg = "timed out"
+            raise TimeoutError(msg)
+        raise ConnectionRefusedError(
+            errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED)
+        )
+
+    def sendall(self, data: bytes) -> None:
+        """
+        Record what the probe sent, or fail the way the case says.
+
+        Args:
+            data: The bytes the probe put on the wire.
+
+        Raises:
+            OSError: The case's ``send_error``, when it set one.
+
+        """
+        self.recorder.events.append("sendall")
+        if self.recorder.peer.send_error is not None:
+            raise self.recorder.peer.send_error
+        self.recorder.sent.append(bytes(data))
+
+    def recv(self, size: int) -> bytes:
+        """
+        Serve the next slice of the scripted reply.
+
+        Args:
+            size: The most bytes the probe asked for.
+
+        Returns:
+            Up to ``size`` bytes (fewer when the case chunks the reply), or
+            ``b""`` once the reply has run out, which is an end of file.
+
+        Raises:
+            OSError: The case's ``recv_error``, when it set one.
+
+        """
+        self.recorder.events.append("recv")
+        self.recorder.recv_sizes.append(size)
+        peer = self.recorder.peer
+        if peer.recv_error is not None:
+            raise peer.recv_error
+        limit = size if peer.recv_chunk is None else min(size, peer.recv_chunk)
+        chunk = peer.reply[self.read_offset : self.read_offset + limit]
+        self.read_offset += len(chunk)
+        self.recorder.recv_served.append(len(chunk))
+        return chunk
 
 
 # Three addresses for one name: the shape a dual-stack scanner host has, and
@@ -1152,14 +1412,15 @@ def _install_probe_recorder(
     *,
     connectable: Iterable[object] = (),
     clock: _SpendingClock | None = None,
+    peer: _PeerScript | None = None,
 ) -> _ProbeRecorder:
     """
     Replace resolution and socket construction with recording doubles.
 
     Nothing leaves the process: ``getaddrinfo`` answers from a constant and
     every socket refuses unless the case names one that may answer, so what is
-    measured is the shape of the walk rather than any real handshake, and the
-    test still sleeps for nothing.
+    measured is the shape of the walk and the handshake rather than any real
+    network, and the test still sleeps for nothing.
 
     Args:
         monkeypatch: pytest's attribute patcher.
@@ -1167,12 +1428,14 @@ def _install_probe_recorder(
         clock: A scripted clock each dial moves forward, substituted for
             ``checks.monotonic``.  Omitted, the real clock is left in place and
             no dial costs anything.
+        peer: How the far end behaves once connected, and which addresses
+            time out.  Omitted, a connected peer answers with a valid reply.
 
     Returns:
         The recorder the probe's calls land in.
 
     """
-    recorder = _ProbeRecorder(connectable, clock)
+    recorder = _ProbeRecorder(connectable, clock, peer=peer)
     monkeypatch.setattr(
         socket, "getaddrinfo", lambda *_args, **_kwargs: _THREE_ADDRESSES
     )
@@ -1205,6 +1468,163 @@ def _install_a_clock_that_jumps(
         return remaining.pop(0) if remaining else final
 
     monkeypatch.setattr(checks, "monotonic", _monotonic)
+
+
+class TestSanedHandshake:
+    """What the probe does once a connection exists, measured on a fake socket."""
+
+    def test_the_reply_is_read_in_bounded_pieces(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        No ``recv`` asks for more than is still missing of the eight-byte reply.
+
+        The double serves at most three bytes per call from a reply that runs
+        far past eight, so a probe that asked for a buffer's worth would be
+        handed junk it then had to parse, and one that looped past eight bytes
+        would be caught by the total.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        answering = _THREE_ADDRESSES[0][4]
+        recorder = _install_probe_recorder(
+            monkeypatch,
+            connectable=[answering],
+            peer=_PeerScript(reply=_VALID_REPLY + b"\xff" * 64, recv_chunk=3),
+        )
+        assert _probe() is checks._SanedOutcome.HEALTHY
+        already = 0
+        for asked, served in zip(
+            recorder.recv_sizes, recorder.recv_served, strict=True
+        ):
+            assert asked == 8 - already
+            already += served
+        assert already == 8
+
+    def test_every_read_is_bounded_by_the_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A timeout is set before every ``recv``, not once before the first.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        answering = _THREE_ADDRESSES[0][4]
+        recorder = _install_probe_recorder(
+            monkeypatch, connectable=[answering], peer=_PeerScript(recv_chunk=1)
+        )
+        assert _probe() is checks._SanedOutcome.HEALTHY
+        read_events = [e for e in recorder.events if e in {"settimeout", "recv"}]
+        assert read_events.count("recv") == 8
+        for earlier, later in pairwise(read_events):
+            if later == "recv":
+                assert earlier == "settimeout", read_events
+
+    def test_a_healthy_reply_is_followed_by_exit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The probe sends INIT, reads the reply, then sends EXIT and nothing else.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        answering = _THREE_ADDRESSES[0][4]
+        recorder = _install_probe_recorder(monkeypatch, connectable=[answering])
+        assert _probe() is checks._SanedOutcome.HEALTHY
+        assert recorder.sent == [INIT_REQUEST, EXIT_REQUEST]
+
+    @pytest.mark.parametrize(
+        ("send_error", "recv_error", "reply"),
+        [
+            pytest.param(BrokenPipeError(), None, _VALID_REPLY, id="send-broken-pipe"),
+            pytest.param(
+                None, ConnectionResetError(), _VALID_REPLY, id="recv-connection-reset"
+            ),
+            pytest.param(None, None, b"", id="eof-before-any-reply"),
+            pytest.param(None, None, _VALID_REPLY[:5], id="eof-mid-reply"),
+            pytest.param(
+                None, None, struct.pack(">ii", 11, 0x01000003), id="failure-status"
+            ),
+            pytest.param(
+                None, None, struct.pack(">ii", 0, 0x02000003), id="wrong-major"
+            ),
+            pytest.param(
+                None, None, struct.pack(">ii", 0, 0x01000007), id="wrong-build"
+            ),
+        ],
+    )
+    def test_a_connection_that_fails_the_handshake_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        send_error: OSError | None,
+        recv_error: OSError | None,
+        reply: bytes,
+    ) -> None:
+        """
+        Anything but a valid reply, once connected, is REJECTED.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            send_error: What ``sendall`` raises, or None.
+            recv_error: What ``recv`` raises, or None.
+            reply: The bytes the peer has to give.
+
+        """
+        answering = _THREE_ADDRESSES[0][4]
+        recorder = _install_probe_recorder(
+            monkeypatch,
+            connectable=[answering],
+            peer=_PeerScript(reply=reply, send_error=send_error, recv_error=recv_error),
+        )
+        assert _probe() is checks._SanedOutcome.REJECTED
+        assert EXIT_REQUEST not in recorder.sent
+
+    def test_a_read_that_times_out_is_timed_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A ``recv`` timeout is TIMED_OUT, not REJECTED.
+
+        ``TimeoutError`` subclasses ``OSError``, so a probe that caught
+        ``OSError`` first would call a silent peer a rejecting one -- and a
+        silent peer is the one that must never be enumerated.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        answering = _THREE_ADDRESSES[0][4]
+        _install_probe_recorder(
+            monkeypatch,
+            connectable=[answering],
+            peer=_PeerScript(recv_error=TimeoutError()),
+        )
+        assert _probe() is checks._SanedOutcome.TIMED_OUT
+
+    def test_a_rejection_is_not_retried_on_the_next_address(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The first address that connects decides, as libsane's ``connect_dev`` does.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        first, second = _THREE_ADDRESSES[0][4], _THREE_ADDRESSES[1][4]
+        recorder = _install_probe_recorder(
+            monkeypatch,
+            connectable=[first, second],
+            peer=_PeerScript(recv_error=ConnectionResetError()),
+        )
+        assert _probe() is checks._SanedOutcome.REJECTED
+        assert recorder.addresses == [first]
 
 
 class TestSanedProbeBound:
@@ -1256,11 +1676,11 @@ class TestSanedProbeBound:
 
         """
         spent = _install_probe_recorder(monkeypatch, clock=_SpendingClock(spend=1.0))
-        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert _probe() is checks._SanedOutcome.TIMED_OUT
         assert sum(spent.timeouts) <= _PROBE_BUDGET, spent.timeouts
 
         partial = _install_probe_recorder(monkeypatch, clock=_SpendingClock(spend=0.25))
-        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert _probe() is checks._SanedOutcome.REFUSED
         assert len(partial.constructions) == 3
         assert all(timeout > 0 for timeout in partial.timeouts), partial.timeouts
         assert all(earlier > later for earlier, later in pairwise(partial.timeouts)), (
@@ -1278,7 +1698,7 @@ class TestSanedProbeBound:
 
         """
         recorder = _install_probe_recorder(monkeypatch)
-        _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
+        _probe()
         assert recorder.addresses == [info[4] for info in _THREE_ADDRESSES]
         assert recorder.constructions == [info[:3] for info in _THREE_ADDRESSES]
 
@@ -1299,7 +1719,7 @@ class TestSanedProbeBound:
 
         """
         recorder = _install_probe_recorder(monkeypatch)
-        _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
+        _probe()
         unspent_budgets = 0
         for event in recorder.events:
             if event == "settimeout":
@@ -1309,11 +1729,11 @@ class TestSanedProbeBound:
                 unspent_budgets -= 1
         assert recorder.events.count("connect") == 3
 
-    def test_a_later_address_that_answers_makes_the_host_reachable(
+    def test_a_later_address_that_answers_decides_the_handshake(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A host answering on its second address is reachable, not dead (R2-CR-01).
+        A host answering on its second address is healthy, not dead (R2-CR-01).
 
         Measured on this machine, ``localhost`` resolves to ``::1`` and then
         ``127.0.0.1``: ``getaddrinfo`` is called without ``AI_ADDRCONFIG``, so
@@ -1324,7 +1744,7 @@ class TestSanedProbeBound:
         on an appliance that scans perfectly well.
 
         The third address is never dialled, because the walk stops at the
-        first address that answers.
+        first address that connects and the handshake on it decides.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1332,12 +1752,13 @@ class TestSanedProbeBound:
         """
         answering = _THREE_ADDRESSES[1][4]
         recorder = _install_probe_recorder(monkeypatch, connectable=[answering])
-        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is True
+        assert _probe() is checks._SanedOutcome.HEALTHY
         assert recorder.addresses == [_THREE_ADDRESSES[0][4], answering]
+        assert recorder.sent == [INIT_REQUEST, EXIT_REQUEST]
 
     def test_the_deadline_stops_the_walk(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """
-        A clock past the deadline ends the walk instead of dialling on.
+        A clock past the deadline ends the walk as TIMED_OUT instead of dialling on.
 
         This is what keeps the multi-address walk inside the bound rather than
         multiplying it: a first attempt that spends the whole budget leaves
@@ -1350,14 +1771,14 @@ class TestSanedProbeBound:
         """
         recorder = _install_probe_recorder(monkeypatch)
         _install_a_clock_that_jumps(monkeypatch, [0.0, 0.0, 99.0])
-        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert _probe() is checks._SanedOutcome.TIMED_OUT
         assert len(recorder.constructions) == 1
 
-    def test_a_resolver_that_returns_nothing_is_not_reachable(
+    def test_a_resolver_that_returns_nothing_is_unresolved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        An empty resolver answer is False, not an ``IndexError`` (R2-IN-01).
+        An empty resolver answer is UNRESOLVED, not an ``IndexError`` (R2-IN-01).
 
         ``getaddrinfo(...)[0]`` on an empty list raises ``IndexError``, which
         is not an ``OSError`` and so escaped the probe's one ``except`` arm
@@ -1371,17 +1792,17 @@ class TestSanedProbeBound:
         recorder = _ProbeRecorder()
         monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [])
         monkeypatch.setattr(socket, "socket", recorder.socket)
-        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert _probe() is checks._SanedOutcome.UNRESOLVED
         assert recorder.constructions == []
 
-    def test_a_resolver_that_raises_is_not_reachable(
+    def test_a_resolver_that_raises_is_unresolved(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A name that cannot be resolved answers False rather than raising.
+        A name that cannot be resolved is UNRESOLVED rather than raising.
 
-        ``socket.gaierror`` subclasses ``OSError``, so the one ``except`` arm
-        covers resolution as well as the handshake.
+        ``socket.gaierror`` subclasses ``OSError``; resolution has its own
+        ``except`` arm, so a resolver failure is never mistaken for a refusal.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1393,7 +1814,62 @@ class TestSanedProbeBound:
             raise socket.gaierror(msg)
 
         monkeypatch.setattr(socket, "getaddrinfo", _fail)
-        assert _saned_reachable("scanbox.invalid", SANED_PORT, _PROBE_BUDGET) is False
+        assert _probe("scanbox.invalid") is checks._SanedOutcome.UNRESOLVED
+
+    def test_every_address_refusing_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Only a refusal from every address is REFUSED: the host is up, saned is not.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        assert _probe() is checks._SanedOutcome.REFUSED
+        assert len(recorder.addresses) == 3
+
+    def test_one_address_timing_out_makes_the_host_timed_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A connect timeout anywhere, with nothing connecting, is TIMED_OUT.
+
+        A refusal proves something is up at that address; a timeout proves
+        nothing, and a host that may be silently dropping packets is the one
+        that must not be enumerated.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        silent = _THREE_ADDRESSES[1][4]
+        recorder = _install_probe_recorder(
+            monkeypatch, peer=_PeerScript(timeout_addresses=frozenset([silent]))
+        )
+        assert _probe() is checks._SanedOutcome.TIMED_OUT
+        assert len(recorder.addresses) == 3
+
+    def test_the_handshake_gets_its_own_budget_after_the_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A connect that spent its whole budget still leaves the reply its own.
+
+        The scripted clock charges the successful dial its entire allowance,
+        so a probe that read the reply against the connect deadline would find
+        nothing left and call a healthy host timed out.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        answering = _THREE_ADDRESSES[0][4]
+        _install_probe_recorder(
+            monkeypatch, connectable=[answering], clock=_SpendingClock(spend=1.0)
+        )
+        assert _probe() is checks._SanedOutcome.HEALTHY
 
 
 class TestImportHygiene:
