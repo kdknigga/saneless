@@ -69,7 +69,7 @@ from saneless.config import (
     discover_config,
     profile_storage_for_loaded,
 )
-from saneless.exceptions import ConfigError, PaperlessError
+from saneless.exceptions import ConfigError, PaperlessError, ScanError
 from saneless.job import JobStore
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import ConnectionStatus, ExitCode, ProfileStorage
@@ -78,6 +78,8 @@ from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     import httpx2
+
+    from saneless.scanner.base import DeviceCapabilities
 
 # Every ExitCode member, written out rather than derived, so that adding a
 # member to the enum fails here as well as in the two doc-truth tests.  D-01
@@ -99,6 +101,24 @@ _NOT_A_PLACEHOLDER = "real-token-value"
 def _record_require_sane() -> None:
     """Record that something called ``require_sane``, and otherwise do nothing."""
     _REQUIRE_SANE_CALLS.append("called")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the developer's own ``SANE_NET_HOSTS`` out of every test in this file.
+
+    The Scanner check probes every host SANE will dial, and a non-empty
+    exported value wins over ``scanner.host``.  The tests here that run the
+    real registry configure no host, so with the variable exported they would
+    dial whatever machine the developer or CI image points it at, and their
+    verdict would depend on whether that machine answered.
+
+    Args:
+        monkeypatch: pytest's environment patcher.
+
+    """
+    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
 
 
 class _ReadyScanner(StubScannerBackend):
@@ -133,6 +153,45 @@ class _TwoScanners(_ReadyScanner):
             DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner"),
             DeviceInfo("hp:002", "HP", "Envy 6055", "multi-function peripheral"),
         ]
+
+
+class _OtherScannerThatOpens(_ReadyScanner):
+    """
+    A backend that lists a device other than the configured one.
+
+    Opening a device succeeds, the way SANE opens an id it never listed.
+    """
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Report a multi-function device that is not the configured flatbed.
+
+        Returns:
+            One device whose id differs from ``_make_settings``'s.
+
+        """
+        return [DeviceInfo("hp:002", "HP", "Envy 6055", "multi-function peripheral")]
+
+
+class _WrongScanner(_OtherScannerThatOpens):
+    """A backend that lists another device and cannot open the configured one."""
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Fail the open the way a device that is not there fails it.
+
+        Args:
+            device_id: The device being opened.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ScanError: Always.
+
+        """
+        msg = f"cannot open {device_id}"
+        raise ScanError(msg)
 
 
 class _ConnectedPaperless:
@@ -173,6 +232,12 @@ def _make_settings(
     real write and an absent directory is a legitimate red row that would mask
     whatever the test is actually about.
 
+    The configured device is the one ``_ReadyScanner`` lists, so a ready run
+    goes down the path where the configured scanner is listed.  The Scanner
+    check looks for the configured device rather than taking whatever is
+    listed first, and a device id no backend here reports would only pass by
+    way of the open that stands in for an unlisted device.
+
     Args:
         tmp_path: pytest's per-test directory.
         token: The paperless-ngx token to configure.
@@ -188,7 +253,7 @@ def _make_settings(
     data_dir.mkdir(parents=True, exist_ok=True)
     scratch_dir.mkdir(parents=True, exist_ok=True)
     return Settings(
-        scanner=ScannerConfig(device="test:device:001"),
+        scanner=ScannerConfig(device="epson:001"),
         paperless=PaperlessConfig(
             url=url,
             token=token,
@@ -549,6 +614,55 @@ class TestDoctorExitCodes:
         result = runner.invoke(cli, ["doctor"])
         assert result.exit_code == ExitCode.CONFIG
         assert result.exit_code == 2
+
+    def test_a_configured_scanner_that_is_absent_fails_and_points_at_devices(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A scanner that is there is not the one configured, so doctor fails.
+
+        The backend lists another device and the configured one does not
+        open, so nothing the configuration names can scan.  The row says so
+        and points at ``saneless devices``, which lists what can be chosen
+        instead.  Neither id is printed: a device id can name a LAN host.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        runner = _patch_doctor(monkeypatch, settings, scanner_cls=_WrongScanner)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "The configured scanner was not found." in result.output
+        assert "saneless devices" in result.output
+        assert "hp:002" not in result.output
+        assert "epson:001" not in result.output
+
+    def test_a_configured_scanner_that_opens_without_being_listed_is_ready(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        SANE opens ids it never lists, and a device that opens can scan.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        runner = _patch_doctor(
+            monkeypatch, settings, scanner_cls=_OtherScannerThatOpens
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        assert "The configured scanner is ready." in result.output
+        assert "The configured scanner was not found." not in result.output
 
     def test_no_new_exit_code_member_was_added(self) -> None:
         """
