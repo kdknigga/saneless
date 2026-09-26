@@ -71,16 +71,20 @@ from saneless.config import (
     Settings,
     discover_config,
 )
-from saneless.exceptions import ScanError
+from saneless.exceptions import ListingCrashedError, ListingTimedOutError, ScanError
 from saneless.paperless import PaperlessClient
-from saneless.scanner.base import DeviceInfo
+from saneless.scanner import listing
+from saneless.scanner import sane_backend as sane_backend_mod
+from saneless.scanner.base import DeviceInfo, DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
+from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     ConnectionStatus,
     ProfileStorage,
     connection_status_message,
 )
 from tests.conftest import StubScannerBackend
+from tests.fake_sane import FakeSaneDev, FakeSaneModule
 from tests.fake_saned import EXIT_REQUEST, INIT_REQUEST, SanedBehaviour, fake_saned
 
 if TYPE_CHECKING:
@@ -2112,6 +2116,78 @@ class _RaisingBackend(_CountingBackend):
         raise ScanError(msg)
 
 
+class _ListingFailureBackend(_CountingBackend):
+    """
+    A backend whose isolated list-then-open fails in one given way.
+
+    It still counts direct listings and opens, which the check must not make:
+    its only way into SANE is the one ``list_and_open`` call.
+    """
+
+    def __init__(self, error: ScanError) -> None:
+        """
+        Fail every list-then-open with ``error``.
+
+        Args:
+            error: What ``list_and_open`` raises.
+
+        """
+        super().__init__()
+        self.error = error
+
+    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+        """
+        Fail the way the configured error says.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ScanError: Always, the error this backend was built with.
+
+        """
+        _ = open_if_unlisted
+        raise self.error
+
+
+class _SurveyRecordingBackend(_CountingBackend):
+    """
+    A backend that answers every list-then-open with one survey, and records it.
+
+    ``asked`` holds the id each call was asked to open, in order.  The direct
+    listing and open counters it inherits must stay at zero.
+    """
+
+    def __init__(self, survey: DeviceSurvey) -> None:
+        """
+        Answer with ``survey``.
+
+        Args:
+            survey: What every ``list_and_open`` returns.
+
+        """
+        super().__init__(list(survey.devices))
+        self.survey = survey
+        self.asked: list[str] = []
+
+    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+        """
+        Record the id the check asked to have opened, and answer.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened.
+
+        Returns:
+            The survey this backend was built with.
+
+        """
+        self.asked.append(open_if_unlisted)
+        return self.survey
+
+
 # The id ``_device()`` reports, and the ``scanner.device`` ``_settings()``
 # configures, so a "ready" test goes down the path where the configured device
 # is listed rather than the one where it has to be opened to be found.
@@ -4030,6 +4106,13 @@ _LISTING_CRASHED_MESSAGE: Final = "The scanner library failed while listing scan
 _LISTING_CRASHED_NEXT: Final = "Press Check again."
 _LISTING_TIMED_OUT_MESSAGE: Final = "The scanner library did not finish listing scanners in time, so the scanner could not be checked."
 _LISTING_TIMED_OUT_NEXT: Final = "Check the scanner, and its scanner host if it has one, are switched on and reachable, then press Check again."
+
+# The texts the listing launcher gives its two failures, which the rows above
+# must never repeat.
+_CRASH_TEXT: Final = "The scanner library failed while listing scanners (SIGSEGV)"
+_TIMEOUT_TEXT: Final = (
+    "The scanner library did not finish listing scanners in time (30 s)"
+)
 
 # The longest message the Scanner row could carry before these two were added,
 # which is what the status strip's layout is already known to hold.
@@ -6320,7 +6403,9 @@ def _gate_sampling_context(
 # - a configured device that is not listed and does not open, and one that is
 #   not listed but opens, both decided by the open held under the gate;
 # - a configured ``net:`` device that is not listed and whose host cannot be
-#   probed, so it is deliberately never opened.
+#   probed, so it is deliberately never opened;
+# - a listing whose child crashed, and one whose child ran past its deadline,
+#   each with its own row.
 #
 # ``_scanner_result``'s docstring lists the same contexts, and
 # ``test_every_gated_context_reaches_a_different_row`` keeps them distinct.
@@ -6335,6 +6420,8 @@ _GATED_CONTEXTS = (
     "wrong-device-open-fails",
     "wrong-device-open-succeeds",
     "unprobed-net-device",
+    "listing-crashed",
+    "listing-timed-out",
 )
 
 # What the stubbed dialler answers in each context; any context not named here
@@ -6402,6 +6489,12 @@ def _gated_context_builder(
         ),
         "unprobed-net-device": lambda: on_scanbox(
             "net:[fe80::1]:brother5:bus0;dev1", _CountingBackend([_device()])
+        ),
+        "listing-crashed": lambda: on_scanbox(
+            "", _ListingFailureBackend(ListingCrashedError(_CRASH_TEXT))
+        ),
+        "listing-timed-out": lambda: on_scanbox(
+            "", _ListingFailureBackend(ListingTimedOutError(_TIMEOUT_TEXT))
         ),
     }
     return factories[scanner_context]
@@ -6964,6 +7057,471 @@ class TestRunChecksUnderTheScannerGate:
         finally:
             gate.lock.release()
         assert [result.key for result in results] == list(CheckKey)
+
+
+# Stand-in listing children for the tests below.  The launcher runs them in
+# isolated mode, so each uses the standard library only.  The environment
+# variables they read have no ``SANELESS_`` prefix, so they survive the child
+# environment's strip.
+
+# Records that it ran, then dies the way a libsane crash kills a listing.
+_CRASHING_LISTING_CHILD = """\
+import os
+import resource
+import signal
+from pathlib import Path
+
+with Path(os.environ["LISTING_TEST_RUNS"]).open("a") as runs:
+    runs.write("ran\\n")
+# No core file: this crash is deliberate.
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+os.kill(os.getpid(), signal.SIGSEGV)
+"""
+
+# Writes its PID, then waits for a signal that only the launcher's kill sends.
+_SLEEPING_LISTING_CHILD = """\
+import os
+import signal
+from pathlib import Path
+
+Path(os.environ["LISTING_TEST_PIDFILE"]).write_text(str(os.getpid()))
+signal.pause()
+"""
+
+# Lists nothing, and reports the configured eSCL device opened only when the
+# request asked it to open exactly that id.
+_OPENING_LISTING_CHILD = """\
+import json
+import sys
+
+request = json.loads(sys.stdin.readline())
+opened = request.get("open") == "escl:http://10.0.0.5:80"
+sys.stdout.write(json.dumps({"devices": [], "opened": opened}) + "\\n")
+"""
+
+# How long a stand-in child gets to start and write its PID file.
+_CHILD_START_BUDGET: Final = 10.0
+
+# How long the check thread gets to finish once its child is under way.
+_CHECK_THREAD_BUDGET: Final = 15.0
+
+
+class _OpenCountingSaneModule(FakeSaneModule):
+    """The fake python-sane module, recording every device this process opens."""
+
+    def __init__(self, device: FakeSaneDev) -> None:
+        """
+        List one fake device and hand out ``device`` on open.
+
+        Args:
+            device: The shared handle ``open()`` returns.
+
+        """
+        super().__init__(
+            device=device, devices=[("fake:0", "Fake", "Zero", "flatbed scanner")]
+        )
+        self.opened: list[str] = []
+
+    def open(self, device_id: str) -> FakeSaneDev:
+        """
+        Record the open, then open the way the plain fake does.
+
+        Args:
+            device_id: The device being opened.
+
+        Returns:
+            The shared device handle.
+
+        """
+        self.opened.append(device_id)
+        return super().open(device_id)
+
+
+class _ReapCheckingLock(_RecordingLock):
+    """A scanner gate that checks, as it is released, the child is already reaped."""
+
+    def __init__(self, pidfile: Path) -> None:
+        """
+        Read the child's PID from ``pidfile`` at each release.
+
+        Args:
+            pidfile: Where the stand-in child writes its PID.
+
+        """
+        super().__init__()
+        self.pidfile = pidfile
+        self.reaped_at_release: list[bool] = []
+
+    def release(self) -> None:
+        """
+        Record whether the child is reaped, then hand the lock back.
+
+        ``waitpid`` raising ``ChildProcessError`` means this process has no
+        unreaped child with that PID: not a running one, and not a zombie.
+        The lock is handed back whatever the check finds.
+        """
+        try:
+            pid = int(self.pidfile.read_text())
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                self.reaped_at_release.append(True)
+            else:
+                self.reaped_at_release.append(False)
+        finally:
+            super().release()
+
+
+@dataclass(frozen=True)
+class _IsolatedCallCase:
+    """
+    One configuration of the check's single list-then-open, and its outcome.
+
+    Attributes:
+        device: The configured ``scanner.device``.
+        survey: What the backend answers.
+        asked: The id the call must be asked to open.
+        message: The row the survey must give.
+
+    """
+
+    device: str
+    survey: DeviceSurvey
+    asked: str
+    message: str
+
+
+class TestIsolatedListingWiring:
+    """
+    The Scanner check reaches SANE only through the backend's isolated listing.
+
+    One ``list_and_open`` call per check lists the devices and, when the
+    configured one is not listed, opens it, both in a short-lived child.  A
+    crashed child and a child stopped at its deadline each get their own row,
+    the scanner gate is held until the child has been reaped, and this process
+    never lists or opens anything itself.
+    """
+
+    @pytest.fixture
+    def isolated_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Callable[[str], tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]]:
+        """
+        Build contexts around a real backend over the fake python-sane module.
+
+        The settings name no scanner host, so no pre-probe runs, and the
+        backend is a real ``SaneBackend``, so its listing goes through the
+        real launcher to whatever stand-in child the test chose.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Patches the fake into the backend module.
+
+        Returns:
+            A function taking the configured device id and returning the
+            context, the fake module and the fake device handle.
+
+        """
+
+        def build(
+            device: str,
+        ) -> tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]:
+            handle = FakeSaneDev()
+            fake = _OpenCountingSaneModule(handle)
+            monkeypatch.setattr(sane_backend_mod, "sane", fake)
+            context = CheckContext(
+                settings=_with_device(_settings(tmp_path), device),
+                scanner=SaneBackend(),
+                paperless=None,
+                profile_storage=ProfileStorage.PERSISTED,
+            )
+            return context, fake, handle
+
+        return build
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            pytest.param(
+                _IsolatedCallCase(
+                    device="",
+                    survey=DeviceSurvey(devices=(_device(),)),
+                    asked="",
+                    message="Brother ADS-2700W is ready.",
+                ),
+                id="no-configured-device",
+            ),
+            pytest.param(
+                _IsolatedCallCase(
+                    device=_LOCAL_DEVICE_ID,
+                    survey=DeviceSurvey(devices=(), configured_opened=True),
+                    asked=_LOCAL_DEVICE_ID,
+                    message="The configured scanner is ready.",
+                ),
+                id="configured-and-openable",
+            ),
+            pytest.param(
+                _IsolatedCallCase(
+                    device=_UNPROBED_NET_ID,
+                    survey=DeviceSurvey(devices=(_device(),)),
+                    asked="",
+                    message=_UNPROBED_DEVICE_MESSAGE,
+                ),
+                id="net-device-on-an-unprobed-host",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_the_check_makes_one_isolated_call(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        case: _IsolatedCallCase,
+        surface: str,
+    ) -> None:
+        """
+        One ``list_and_open`` per check, asked to open only what it may.
+
+        The configured id goes to the call only when the check may open it.
+        A ``net:`` device whose host could not be probed goes as ``""``, so
+        the child lists but opens nothing.  The check never lists or opens
+        through the backend's other methods.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            case: The configuration, the answer and what must follow.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        _recording_dialler(monkeypatch)
+        backend = _SurveyRecordingBackend(case.survey)
+        settings = _with_device(_settings(tmp_path), case.device)
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.asked == [case.asked]
+        assert backend.calls == 0
+        assert backend.opens == 0
+        assert row.message == case.message
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            pytest.param(
+                ListingCrashedError(_CRASH_TEXT),
+                (CheckState.WARN, _LISTING_CRASHED_MESSAGE, _LISTING_CRASHED_NEXT),
+                id="crashed",
+            ),
+            pytest.param(
+                ListingTimedOutError(_TIMEOUT_TEXT),
+                (CheckState.WARN, _LISTING_TIMED_OUT_MESSAGE, _LISTING_TIMED_OUT_NEXT),
+                id="timed-out",
+            ),
+            pytest.param(
+                ScanError("The scanner library returned no answer"),
+                (CheckState.FAIL, "No scanner was found.", _NOTHING_FOUND_NEXT),
+                id="plain-failure",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_failed_listing_gets_the_row_for_how_it_failed(
+        self,
+        tmp_path: Path,
+        error: ScanError,
+        expected: tuple[CheckState, str, str],
+        surface: str,
+    ) -> None:
+        """
+        A crash and a timeout have their own rows; any other failure lists nothing.
+
+        Args:
+            tmp_path: The test's own directory.
+            error: What the backend's list-then-open raises.
+            expected: The row's state, message and next step.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        backend = _ListingFailureBackend(error)
+        settings = _with_device(_settings(tmp_path), "")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert (row.state, row.message, row.next_step) == expected
+        assert backend.calls == 0
+        assert backend.opens == 0
+
+    def test_a_crashed_listing_child_is_the_crash_row_and_is_not_retried(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        stand_in_listing_child: Callable[[str], Path],
+        isolated_context: Callable[
+            [str], tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]
+        ],
+    ) -> None:
+        """
+        A child killed by SIGSEGV is one amber row, one WARNING and one run.
+
+        The WARNING is the launcher's, naming the signal.  The check adds no
+        line of its own, and does not try the listing again.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Sets the stand-in's run-counter variable.
+            caplog: pytest's log capture.
+            stand_in_listing_child: Points the real launcher at a stand-in.
+            isolated_context: Builds a context around a real backend.
+
+        """
+        runs = tmp_path / "runs.txt"
+        monkeypatch.setenv("LISTING_TEST_RUNS", str(runs))
+        stand_in_listing_child(_CRASHING_LISTING_CHILD)
+        context, fake, _handle = isolated_context("")
+        with caplog.at_level(logging.WARNING):
+            results = run_checks(context, scanner_gate=threading.Lock())
+        row = _row(results, CheckKey.SCANNER)
+        assert (row.state, row.message, row.next_step) == (
+            CheckState.WARN,
+            _LISTING_CRASHED_MESSAGE,
+            _LISTING_CRASHED_NEXT,
+        )
+        crash_lines = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "SIGSEGV" in record.getMessage()
+        ]
+        assert len(crash_lines) == 1
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.checks" and record.levelno >= logging.WARNING
+        ] == []
+        assert runs.read_text().splitlines() == ["ran"]
+        assert fake.get_devices_call_count == 0
+
+    def test_a_listing_child_past_its_deadline_is_reaped_before_the_gate_opens(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        stand_in_listing_child: Callable[[str], Path],
+        isolated_context: Callable[
+            [str], tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]
+        ],
+    ) -> None:
+        """
+        A child stopped at the deadline is the timeout row, released after the reap.
+
+        The gate records, at the moment it is handed back, whether the child
+        still exists in any form.  It must not: a gate released while the
+        child was still inside libsane would let a scan in beside it.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Shortens the deadline and sets the PID-file variable.
+            stand_in_listing_child: Points the real launcher at a stand-in.
+            isolated_context: Builds a context around a real backend.
+
+        """
+        pidfile = tmp_path / "child.pid"
+        monkeypatch.setenv("LISTING_TEST_PIDFILE", str(pidfile))
+        monkeypatch.setattr(listing, "LISTING_DEADLINE_SECONDS", 0.2)
+        stand_in_listing_child(_SLEEPING_LISTING_CHILD)
+        context, fake, _handle = isolated_context("")
+        gate = _ReapCheckingLock(pidfile)
+        row = _row(
+            run_checks(context, scanner_gate=cast("threading.Lock", gate)),
+            CheckKey.SCANNER,
+        )
+        assert (row.state, row.message, row.next_step) == (
+            CheckState.WARN,
+            _LISTING_TIMED_OUT_MESSAGE,
+            _LISTING_TIMED_OUT_NEXT,
+        )
+        assert gate.reaped_at_release == [True]
+        assert gate.is_free()
+        assert fake.get_devices_call_count == 0
+
+    def test_the_gate_is_held_while_the_listing_child_runs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        poll_until: Callable[..., bool],
+        stand_in_listing_child: Callable[[str], Path],
+        isolated_context: Callable[
+            [str], tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]
+        ],
+    ) -> None:
+        """
+        While the child is alive the gate is held; once the check ends it is free.
+
+        The check runs on its own thread, the way the refresh route's request
+        thread runs it, and the test watches the gate from outside while the
+        stand-in child waits to be stopped.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Sets the deadline and the PID-file variable.
+            poll_until: Waits, without sleeping, for the child to start.
+            stand_in_listing_child: Points the real launcher at a stand-in.
+            isolated_context: Builds a context around a real backend.
+
+        """
+        pidfile = tmp_path / "child.pid"
+        monkeypatch.setenv("LISTING_TEST_PIDFILE", str(pidfile))
+        monkeypatch.setattr(listing, "LISTING_DEADLINE_SECONDS", 2.0)
+        stand_in_listing_child(_SLEEPING_LISTING_CHILD)
+        context, _fake, _handle = isolated_context("")
+        gate = _RecordingLock()
+        rows: list[CheckResult] = []
+
+        def check() -> None:
+            results = run_checks(context, scanner_gate=cast("threading.Lock", gate))
+            rows.append(_row(results, CheckKey.SCANNER))
+
+        worker = threading.Thread(target=check, daemon=True)
+        worker.start()
+        try:
+            assert poll_until(pidfile.exists, _CHILD_START_BUDGET)
+            assert gate.is_free() is False
+        finally:
+            worker.join(_CHECK_THREAD_BUDGET)
+        assert not worker.is_alive()
+        assert [row.message for row in rows] == [_LISTING_TIMED_OUT_MESSAGE]
+        assert gate.acquires == gate.releases == 1
+        assert gate.is_free()
+
+    def test_a_gated_check_never_enters_libsane_in_this_process(
+        self,
+        stand_in_listing_child: Callable[[str], Path],
+        isolated_context: Callable[
+            [str], tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]
+        ],
+    ) -> None:
+        """
+        An unlisted configured device is opened in the child, not here.
+
+        This is the gated check the refresh route's request thread runs.  The
+        fake module would list its own device and open anything, so the row
+        coming from the stand-in's answer, with the fake never listing and
+        nothing opened, is what shows the check left this process for both.
+
+        Args:
+            stand_in_listing_child: Points the real launcher at a stand-in.
+            isolated_context: Builds a context around a real backend.
+
+        """
+        stand_in_listing_child(_OPENING_LISTING_CHILD)
+        context, fake, handle = isolated_context(_UNLISTED_ESCL_ID)
+        results = run_checks(context, scanner_gate=threading.Lock())
+        row = _row(results, CheckKey.SCANNER)
+        assert (row.state, row.message) == (
+            CheckState.OK,
+            "The configured scanner is ready.",
+        )
+        assert fake.get_devices_call_count == 0
+        assert fake.opened == []
+        assert handle.calls == []
+        assert handle.cancel_calls == 0
+        assert handle.close_calls == 0
 
 
 class TestConfigurationRow:
