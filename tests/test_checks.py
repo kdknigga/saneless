@@ -2435,6 +2435,7 @@ def _recording_dialler(
     *,
     outcome: checks._SanedOutcome = checks._SanedOutcome.HEALTHY,
     outcomes: Mapping[str, checks._SanedOutcome] | None = None,
+    port_outcomes: Mapping[tuple[str, int], checks._SanedOutcome] | None = None,
 ) -> list[tuple[str, int]]:
     """
     Replace the saned probe with one that records what it was asked for.
@@ -2448,6 +2449,8 @@ def _recording_dialler(
         outcome: What the stubbed probe answers for any host.
         outcomes: A per-host answer, which wins over ``outcome`` for the
             hosts it names.
+        port_outcomes: An answer for one host on one port, which wins over
+            both of the others for the ``(host, port)`` pairs it names.
 
     Returns:
         The list the stub appends each ``(host, port)`` pair to.
@@ -2455,12 +2458,13 @@ def _recording_dialler(
     """
     dialled: list[tuple[str, int]] = []
     per_host = dict(outcomes or {})
+    per_address = dict(port_outcomes or {})
 
     def _probe_stub(
         host: str, port: int, _connect_timeout: float, _handshake_timeout: float
     ) -> checks._SanedOutcome:
         dialled.append((host, port))
-        return per_host.get(host, outcome)
+        return per_address.get((host, port), per_host.get(host, outcome))
 
     monkeypatch.setattr(checks, "_probe_saned", _probe_stub)
     return dialled
@@ -2906,6 +2910,70 @@ class TestScannerCheck:
         settings = _settings(tmp_path, host="scanbox.lan")
         row = _scanner_row_on(surface, _context(settings, scanner=backend))
         assert dialled == [("scanbox.lan", SANED_PORT)]
+        assert row.state is CheckState.OK
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
+            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
+        ],
+    )
+    def test_a_configured_net_device_is_probed_on_the_port_libsane_dials(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: checks._SanedOutcome,
+        surface: str,
+    ) -> None:
+        """
+        A setting's probe on another port does not cover the device's host.
+
+        ``scanbox.lan:7000`` is probed on port 7000, but libsane opens a
+        ``net:scanbox.lan:...`` device on saned's registered port.  The answer
+        on 7000 says nothing about that port, so the device's host is probed
+        on it as well, and a dead answer there ends the check before libsane
+        is touched: no listing, and no open.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            outcome: What the device's host answers on saned's registered port.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        dialled = _recording_dialler(
+            monkeypatch, port_outcomes={("scanbox.lan", SANED_PORT): outcome}
+        )
+        backend = _CountingBackend()
+        settings = _settings(tmp_path, host="scanbox.lan:7000")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert dialled == [("scanbox.lan", 7000), ("scanbox.lan", SANED_PORT)]
+        assert backend.calls == 0
+        assert backend.opens == 0
+        assert row.state is CheckState.WARN
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_device_host_answering_on_the_registered_port_may_be_opened(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        """
+        Once the port libsane dials has answered, an unlisted device is opened.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        dialled = _recording_dialler(monkeypatch)
+        backend = _CountingBackend()
+        settings = _settings(tmp_path, host="scanbox.lan:7000")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert dialled == [("scanbox.lan", 7000), ("scanbox.lan", SANED_PORT)]
+        assert backend.calls == 1
+        assert backend.opens == 1
         assert row.state is CheckState.OK
 
     @pytest.mark.parametrize("surface", _SURFACES)
@@ -3838,19 +3906,22 @@ _LOCAL_DEVICE_ID: Final = "epson2:libusb:001:004"
 _UNLISTED_ESCL_ID: Final = "escl:http://10.0.0.5:80"
 
 
-def _hp(host: str, outcome: checks._SanedOutcome) -> checks._HostProbe:
+def _hp(
+    host: str, outcome: checks._SanedOutcome, port: int = SANED_PORT
+) -> checks._HostProbe:
     """
     Build what one configured host's probe found.
 
     Args:
         host: The configured entry.
         outcome: What its probe found.
+        port: The port it was probed on.
 
     Returns:
         The probe result the verdict reads.
 
     """
-    return checks._HostProbe(host, outcome)
+    return checks._HostProbe(host, outcome, port)
 
 
 def _unlabelled_device() -> DeviceInfo:
@@ -4111,6 +4182,21 @@ _VERDICT_CASES: Final = [
             next_step=_UNRESOLVED_NEXT,
         ),
         id="configured-net-device-on-an-unresolved-host",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(
+                _hp("scanbox.lan", _REJECTED, port=7000),
+                _hp("scanbox.lan", _HEALTHY),
+            ),
+            devices=(),
+            configured=_device().name,
+            opened=False,
+            state=CheckState.FAIL,
+            message="The configured scanner was not found.",
+            next_step=_CONFIGURED_MISSING_NEXT,
+        ),
+        id="configured-net-device-whose-host-refuses-only-on-another-port",
     ),
     pytest.param(
         _VerdictCase(

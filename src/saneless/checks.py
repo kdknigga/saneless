@@ -289,13 +289,13 @@ POLL_ATTEMPT_CAP: Final = 10
 # ``PROBE_HANDSHAKE_SECONDS`` -- 7 s -- for each of up to ``_MAX_PROBE_HOSTS``
 # setting entries and the configured ``net:`` device's own host, so 35 s, and
 # a *probed* host that could hang enumeration never reaches it: a configured
-# device is opened only once its own host has been probed and did not time
-# out or refuse.  A host the pre-probe cannot dial is another matter --
-# ``_scanner_preflight`` lists which those are -- and ``get_devices()`` still
-# dials it, so a dead one costs the ~127 s this file documents, as a wedged
-# local backend can.  That is one uninterruptible ``get_devices()`` at most,
-# never two: the open of an unlisted device is refused when its host could
-# not be probed.  35 s of probing, one ~127 s listing and
+# device is opened only once its own host has been probed, on the port libsane
+# opens it on, and did not time out or refuse.  A host the pre-probe cannot
+# dial is another matter -- ``_scanner_preflight`` lists which those are --
+# and ``get_devices()`` still dials it, so a dead one costs the ~127 s this
+# file documents, as a wedged local backend can.  That is one uninterruptible
+# ``get_devices()`` at most, never two: the open of an unlisted device is
+# refused when its host could not be probed on that port.  35 s of probing, one ~127 s listing and
 # ``PROBE_READ_SECONDS`` for Paperless is about 167 s, which leaves little
 # room for the pre-probe's unbounded resolutions, and that is stated rather
 # than hidden.  Below it, a cold start on a wedged scanner stopped asking while
@@ -1417,18 +1417,24 @@ class _HostProbe:
     """
     One configured saned host and what its pre-probe found.
 
-    The host is kept only so enumeration can match a configured ``net:``
-    device to the host it lives on.  It is never rendered and never logged:
-    rows interpolate counts, not hosts (ASVS V7).
+    The host and port are kept only so enumeration can match a configured
+    ``net:`` device to the host it lives on, on the port libsane opens it
+    on.  Neither is ever rendered or logged: rows interpolate counts, not
+    hosts (ASVS V7).
 
     Attributes:
         host: The configured entry that was dialled.
         outcome: What the probe learnt about it.
+        port: The port it was dialled on.  A two-segment ``host:port``
+            setting is probed on its own port, which is not the one libsane
+            opens a ``net:`` device on, so an answer there says nothing
+            about the device's host.
 
     """
 
     host: str
     outcome: _SanedOutcome
+    port: int = SANED_PORT
 
 
 @dataclass(frozen=True, slots=True)
@@ -1443,8 +1449,8 @@ class _ScannerPreflight:
         scanner: The scanner backend enumeration will ask.
         probes: One entry per probed saned host: the setting's entries in
             configured order, then the configured ``net:`` device's own host
-            when the setting did not already cover it.  Empty when there was
-            nothing to probe.
+            when the setting did not already probe it on ``SANED_PORT``.
+            Empty when there was nothing to probe.
         may_open: Whether enumeration may open a configured device it does
             not find listed.  False only for a ``net:`` device whose host the
             probe cannot dial, because opening it would make libsane dial
@@ -1741,7 +1747,11 @@ def _configured_device_probes(
     on the same budgets as every other host, means a timed-out or refused one
     ends the check before libsane is touched, exactly like a configured host.
 
-    A host the setting already probed is not probed twice.  A ``net:`` id
+    A host the setting already probed on ``SANED_PORT`` is not probed twice.
+    The port matters: libsane opens a ``net:`` device on saned's registered
+    port whatever ``scanner.host`` says, so a ``host:port`` setting's answer
+    on another port covers nothing, and the host is probed here on
+    ``SANED_PORT`` as well.  A ``net:`` id
     whose host this module cannot dial -- an IPv6 literal, a numeric
     shorthand ``_saned_hosts`` drops, or an id that names no host -- is not
     probed, and the caller must not open it: nothing has shown the host is
@@ -1760,14 +1770,20 @@ def _configured_device_probes(
     if not device_id.startswith(_NET_DEVICE_PREFIX):
         return probes, True
     entry = _net_device_entry(device_id)
-    if entry is not None and any(probe.host == entry for probe in probes):
+    if entry is not None and any(
+        probe.host == entry and probe.port == SANED_PORT for probe in probes
+    ):
         return probes, True
     dialable = _saned_hosts(entry or "")
     if not dialable:
         return probes, False
-    host, port = dialable[0]
-    outcome = _probe_saned(host, port, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS)
-    return (*probes, _HostProbe(host, outcome)), True
+    # The entry holds no ``:``, so ``_saned_hosts`` cannot have read a port
+    # out of it; the port is named here so the dial plainly is libsane's.
+    host = dialable[0][0]
+    outcome = _probe_saned(
+        host, SANED_PORT, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS
+    )
+    return (*probes, _HostProbe(host, outcome, SANED_PORT)), True
 
 
 def _directory_accepts_a_write(path: Path) -> bool:
@@ -2356,7 +2372,9 @@ def _scanner_unusable_row(
     *because of* that host, so the row says so.  A configured device that is
     not a ``net:`` device is simply not found, even if some unrelated network
     host is also bad, because a network host does not explain a local
-    device's absence.
+    device's absence.  Only the own host's probe on ``SANED_PORT`` is read,
+    because that is the port libsane opened the device on; a ``host:port``
+    setting's answer on another port does not explain the device's absence.
 
     Args:
         probes: What each configured host's probe found; none blocks
@@ -2373,7 +2391,9 @@ def _scanner_unusable_row(
             (
                 probe
                 for probe in probes
-                if probe.host == entry and probe.outcome in _CONFIGURED_HOST_OUTCOMES
+                if probe.host == entry
+                and probe.port == SANED_PORT
+                and probe.outcome in _CONFIGURED_HOST_OUTCOMES
             ),
             None,
         )
@@ -2485,9 +2505,9 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     libsane dials every entry, so a dead second host costs its full
     uninterruptible connect inside ``get_devices()`` however well the first
     one answers.  When ``scanner.device`` is a ``net:`` id whose host none of
-    those entries covers, that host is probed too
-    (``_configured_device_probes``), because the check may open the device
-    and opening it dials its host.
+    those entries covers on ``SANED_PORT``, that host is probed on
+    ``SANED_PORT`` too (``_configured_device_probes``), because the check may
+    open the device and opening it dials its host there.
 
     What is *not* probed is stated rather than hidden, because libsane still
     dials it inside ``get_devices()``.  ``_saned_hosts`` returns at most
@@ -2495,11 +2515,12 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     IPv6 literal, a numeric shorthand, and the rest of a setting it refuses.
     Hosts named only in ``net.conf`` are not read at all.  And a two-segment
     ``host:port`` setting is probed as one host on that port, where libsane
-    dials ``host`` and the port number as two hosts.  Enumeration still runs
-    beside such an entry, as it did before the pre-probe existed, so a dead
-    host there can still cost ``get_devices()`` its uninterruptible connect;
-    refusing to enumerate instead would turn every working IPv6 or
-    five-host setup permanently amber.
+    dials ``host`` and the port number as two hosts, both on ``SANED_PORT``
+    (a configured ``net:`` device on that host is the exception, as above).
+    Enumeration still runs beside such an entry, as it did before the
+    pre-probe existed, so a dead host there can still cost ``get_devices()``
+    its uninterruptible connect; refusing to enumerate instead would turn
+    every working IPv6 or five-host setup permanently amber.
 
     If any probed host timed out -- including one that accepted the
     connection and said nothing -- or refused, the check ends right there
@@ -2524,6 +2545,7 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
         _HostProbe(
             host,
             _probe_saned(host, port, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS),
+            port,
         )
         for host, port in _saned_hosts(_saned_host_setting(context.settings))
     )
