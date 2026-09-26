@@ -942,8 +942,9 @@ def _looks_like_an_ipv6_literal(host_setting: str) -> bool:
     the parser as ``fe80::1:6566`` -- a legal address, since ``6566`` is legal
     hex -- instead of as a name with a stray ``]`` in it.  Mangling the input
     that way is safe here because the answer is only ever used to *refuse*: a
-    false "yes" costs the pre-probe's latency saving, and there is no path from
-    this function to an address that gets dialled.
+    false "yes" leaves the setting unprobed, so a dead host in it can still
+    cost ``get_devices()`` its uninterruptible connect, but there is no path
+    from this function to an address that gets dialled.
 
     A zone suffix needs no handling of its own.  ``ipaddress.ip_address`` has
     accepted scoped literals since Python 3.9, and it was verified against the
@@ -1039,15 +1040,18 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     present: ``: host-a :`` is one host, but adding a port takes the setting
     past two segments and the refusal above takes the whole thing --
     ``localhost:6566:`` and ``:localhost:6566`` each yield ``()``.  That is the
-    safe direction rather than a gap: the refusal costs the pre-probe's latency
-    saving and never produces a wrong verdict.
+    safer direction, though not a free one: the refused entries are not
+    probed, and libsane may still dial them with no timeout, but the refusal
+    never produces a wrong verdict from a probe of something nobody
+    configured.
 
     A fully-qualified name written with its root dot yields ``()`` as well:
     ``scanner.local.`` is legal DNS, and ``_looks_like_a_host_name``'s
     trailing-dot rule rejects it.  This is accepted rather than fixed, because
     widening the accept surface for a spelling that appears nowhere in this
-    project's config examples buys nothing, while the cost of leaving it is
-    only that one latency saving -- the trade the whole module is built on.
+    project's config examples buys little.  The cost of leaving it is the one
+    stated under "Returning ``()``" below: the name is not probed, and libsane
+    may still dial it with no timeout.
 
     **The cap.**  At most ``_MAX_PROBE_HOSTS`` -- four -- distinct entries are
     returned, taken from the front of the configured order after repeats are
