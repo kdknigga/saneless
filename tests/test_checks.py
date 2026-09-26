@@ -2491,9 +2491,11 @@ def _healthy_settings(tmp_path: Path, *, host: str) -> Settings:
     return _settings(tmp_path, host=host, consume_dir=str(folder))
 
 
-# The two outcomes that end the scanner check before enumeration, and the
-# wording each one's amber row carries.  Pinned here, word for word, because
-# the next step is the part of the row a household member acts on.
+# The one outcome that ends the scanner check before enumeration, and the
+# wording its amber row carries, then the two rows a refused host gets once it
+# has been enumerated: red when nothing usable is listed, amber beside a
+# scanner that works.  Pinned here, word for word, because the next step is
+# the part of the row a household member acts on.
 _TIMED_OUT_MESSAGE: Final = (
     "The scanner host is not answering, so the scanner could not be checked."
 )
@@ -2501,8 +2503,11 @@ _TIMED_OUT_NEXT_STEP: Final = (
     "Check the scanner host is switched on and on the network, then press Check again."
 )
 _REFUSED_MESSAGE: Final = (
-    "The scanner host is on, but its scanner service is not running, "
-    "so the scanner could not be checked."
+    "The scanner host is on, but its scanner service is not running."
+)
+_REFUSED_READY_MESSAGE: Final = (
+    "Brother ADS-2700W is ready, but the scanner service is not running "
+    "on the scanner host."
 )
 _REFUSED_NEXT_STEP: Final = (
     "Start saned on the scanner host, or check it is listening on the network, "
@@ -2791,36 +2796,25 @@ class TestScannerCheck:
         assert "scanbox" not in f"{row.message} {row.next_step}"
 
     @pytest.mark.parametrize("surface", _SURFACES)
-    @pytest.mark.parametrize(
-        "outcome",
-        [
-            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
-            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
-        ],
-    )
     def test_a_host_that_must_not_be_enumerated_is_neither_listed_nor_opened(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        outcome: checks._SanedOutcome,
-        surface: str,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
     ) -> None:
         """
-        A refused or silent host never reaches libsane, not even to open a device.
+        A silent host never reaches libsane, not even to open a device.
 
         The configured device is one the backend would not list, which is
-        exactly the case that would otherwise open it.  Enumerating a host
-        whose connection was lost can crash the process inside libsane, and
-        opening a device on it is no different.
+        exactly the case that would otherwise open it.  libsane has no read
+        timeout, so enumerating a host that does not answer would wait on it
+        for as long as it stays silent, and opening a device on it is no
+        different.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
-            outcome: What the configured host answers.
             surface: Which of the two surfaces runs the check.
 
         """
-        _recording_dialler(monkeypatch, outcome=outcome)
+        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT)
         backend = _CountingBackend()
         settings = _with_device(
             _settings(tmp_path, host="scanbox.lan"), _LOCAL_DEVICE_ID
@@ -2831,17 +2825,38 @@ class TestScannerCheck:
         assert row.state is CheckState.WARN
 
     @pytest.mark.parametrize("surface", _SURFACES)
-    @pytest.mark.parametrize(
-        "answer",
-        [
-            pytest.param(
-                (checks._SanedOutcome.REFUSED, _REFUSED_MESSAGE), id="refused"
-            ),
-            pytest.param(
-                (checks._SanedOutcome.TIMED_OUT, _TIMED_OUT_MESSAGE), id="timed-out"
-            ),
-        ],
-    )
+    def test_a_refused_host_is_listed_and_an_unlisted_device_opened(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        """
+        A refused host returns at once inside libsane, so the check goes on.
+
+        The configured device is one the backend would not list, so the check
+        opens it, and a device that opens is one a scan can use: the row is
+        amber, naming the stopped scanner service, never red.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REFUSED)
+        backend = _CountingBackend()
+        settings = _with_device(
+            _settings(tmp_path, host="scanbox.lan"), _LOCAL_DEVICE_ID
+        )
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.calls == 1
+        assert backend.opens == 1
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "The configured scanner is ready, but the scanner service is not "
+            "running on the scanner host."
+        )
+        assert row.next_step == _REFUSED_NEXT_STEP
+
+    @pytest.mark.parametrize("surface", _SURFACES)
     @pytest.mark.parametrize(
         "setting",
         [
@@ -2853,7 +2868,6 @@ class TestScannerCheck:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        answer: tuple[checks._SanedOutcome, str],
         setting: tuple[str, int],
         surface: str,
     ) -> None:
@@ -2866,22 +2880,21 @@ class TestScannerCheck:
         connect the pre-probe exists to prevent -- and on the status strip it
         would be paid holding the scanner gate.  The host is not among the
         probed setting entries (none is configured, or it is past the cap), so
-        the preflight probes it on its own, and a host that must not be
-        enumerated ends the check before libsane is touched at all.
+        the preflight probes it on its own, and a host that does not answer
+        ends the check before libsane is touched at all.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
-            answer: What the configured device's host answers, and the amber
-                row message that answer must produce.
             setting: The configured ``scanner.host``, and how many hosts the
                 preflight must probe for it.
             surface: Which of the two surfaces runs the check.
 
         """
-        outcome, message = answer
         host, expected_dials = setting
-        dialled = _recording_dialler(monkeypatch, outcomes={"scanbox.lan": outcome})
+        dialled = _recording_dialler(
+            monkeypatch, outcomes={"scanbox.lan": checks._SanedOutcome.TIMED_OUT}
+        )
         backend = _CountingBackend()
         settings = _settings(tmp_path, host=host)
         row = _scanner_row_on(surface, _context(settings, scanner=backend))
@@ -2893,7 +2906,62 @@ class TestScannerCheck:
         if host:
             assert "1 of 5 scanner hosts" in row.message
         else:
-            assert row.message == message
+            assert row.message == _TIMED_OUT_MESSAGE
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    @pytest.mark.parametrize(
+        ("setting", "hosts_subject"),
+        [
+            pytest.param(("", 1), "the scanner host", id="no-host-configured"),
+            pytest.param(
+                ("a.lan:b.lan:c.lan:d.lan:scanbox.lan", 5),
+                "1 of 5 scanner hosts",
+                id="past-the-cap",
+            ),
+        ],
+    )
+    def test_a_configured_net_device_on_an_unprobed_refusing_host_is_opened(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        setting: tuple[str, int],
+        hosts_subject: str,
+        surface: str,
+    ) -> None:
+        """
+        A refusing own host is probed, then listed and the device opened.
+
+        A refused connect returns at once inside libsane, so it costs the open
+        nothing, and the open is how the check learns whether a scan could use
+        the device.  This one opens, so the row is amber and names the stopped
+        scanner service without naming the host.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            setting: The configured ``scanner.host``, and how many hosts the
+                preflight must probe for it.
+            hosts_subject: How the row counts the refusing host.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        host, expected_dials = setting
+        dialled = _recording_dialler(
+            monkeypatch, outcomes={"scanbox.lan": checks._SanedOutcome.REFUSED}
+        )
+        backend = _CountingBackend()
+        settings = _settings(tmp_path, host=host)
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert ("scanbox.lan", SANED_PORT) in dialled
+        assert len(dialled) == expected_dials
+        assert backend.calls == 1
+        assert backend.opens == 1
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "The configured scanner is ready, but the scanner service is not "
+            f"running on {hosts_subject}."
+        )
+        assert row.next_step == _REFUSED_NEXT_STEP
 
     @pytest.mark.parametrize("surface", _SURFACES)
     def test_a_configured_net_device_on_a_probed_host_is_dialled_once(
@@ -2917,10 +2985,10 @@ class TestScannerCheck:
 
     @pytest.mark.parametrize("surface", _SURFACES)
     @pytest.mark.parametrize(
-        "outcome",
+        ("outcome", "entered"),
         [
-            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
-            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
+            pytest.param(checks._SanedOutcome.REFUSED, 1, id="refused"),
+            pytest.param(checks._SanedOutcome.TIMED_OUT, 0, id="timed-out"),
         ],
     )
     def test_a_configured_net_device_is_probed_on_the_port_libsane_dials(
@@ -2928,6 +2996,7 @@ class TestScannerCheck:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         outcome: checks._SanedOutcome,
+        entered: int,
         surface: str,
     ) -> None:
         """
@@ -2936,13 +3005,16 @@ class TestScannerCheck:
         ``scanbox.lan:7000`` is probed on port 7000, but libsane opens a
         ``net:scanbox.lan:...`` device on saned's registered port.  The answer
         on 7000 says nothing about that port, so the device's host is probed
-        on it as well, and a dead answer there ends the check before libsane
-        is touched: no listing, and no open.
+        on it as well.  A silent answer there ends the check before libsane
+        is touched: no listing, and no open.  A refusal there does not,
+        because a refused connect returns at once inside libsane, so the
+        device is listed and then opened.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
             outcome: What the device's host answers on saned's registered port.
+            entered: How many listings, and how many opens, libsane sees.
             surface: Which of the two surfaces runs the check.
 
         """
@@ -2953,8 +3025,8 @@ class TestScannerCheck:
         settings = _settings(tmp_path, host="scanbox.lan:7000")
         row = _scanner_row_on(surface, _context(settings, scanner=backend))
         assert dialled == [("scanbox.lan", 7000), ("scanbox.lan", SANED_PORT)]
-        assert backend.calls == 0
-        assert backend.opens == 0
+        assert backend.calls == entered
+        assert backend.opens == entered
         assert row.state is CheckState.WARN
 
     @pytest.mark.parametrize("surface", _SURFACES)
@@ -3180,16 +3252,13 @@ class TestScannerCheck:
         assert scanner_row.state is CheckState.OK
         assert worst_state([scanner_row]) is CheckState.OK
 
-    def test_a_closed_saned_port_skips_the_backend(self, tmp_path: Path) -> None:
+    def test_a_closed_saned_port_is_enumerated(self, tmp_path: Path) -> None:
         """
-        A host with nothing listening is the refused row, and SANE is never entered.
+        A closed saned port is enumerated, and a usable scanner keeps the row amber.
 
-        The pre-probe is the whole mitigation for T-30-22: ``get_devices()``
-        has no timeout at any layer, so the only way not to hang is not to
-        call it.  A refused host is kept away from it for a second reason: a
-        refused scanner host is what one restarting its saned looks like, and
-        enumerating a host whose earlier connection was lost can crash the
-        process inside libsane.
+        A refused connect returns at once inside libsane, so listing costs
+        nothing and is how the check learns a scanner is still usable.  The
+        row names the stopped scanner service once, with one "but".
 
         Args:
             tmp_path: The test's own directory.
@@ -3201,9 +3270,9 @@ class TestScannerCheck:
         )
         results = run_checks(_context(settings, scanner=backend))
         row = _row(results, CheckKey.SCANNER)
-        assert backend.calls == 0
+        assert backend.calls == 1
         assert row.state is CheckState.WARN
-        assert row.message == _REFUSED_MESSAGE
+        assert row.message == _REFUSED_READY_MESSAGE
         assert row.next_step == _REFUSED_NEXT_STEP
 
     def test_a_healthy_saned_reaches_the_backend(self, tmp_path: Path) -> None:
@@ -3268,33 +3337,22 @@ class TestScannerCheck:
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
         assert dialled == [("scanbox-a.lan", SANED_PORT), ("scanbox-b.lan", SANED_PORT)]
 
-    @pytest.mark.parametrize(
-        "dead",
-        [
-            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
-            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
-        ],
-    )
     def test_a_healthy_host_beside_a_dead_one_never_reaches_the_backend(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        dead: checks._SanedOutcome,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        One answering host is not enough to enter SANE when another is dead.
+        One answering host is not enough to enter SANE when another is silent.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
-            dead: What the second host answers.
 
         """
         _recording_dialler(
             monkeypatch,
             outcomes={
                 "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
-                "scanbox-b.lan": dead,
+                "scanbox-b.lan": checks._SanedOutcome.TIMED_OUT,
             },
         )
         backend = _CountingBackend([_device()])
@@ -3306,23 +3364,25 @@ class TestScannerCheck:
     @pytest.mark.parametrize(
         "outcome",
         [
+            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
             pytest.param(checks._SanedOutcome.REJECTED, id="rejected"),
             pytest.param(checks._SanedOutcome.UNRESOLVED, id="unresolved"),
             pytest.param(checks._SanedOutcome.HEALTHY, id="healthy"),
         ],
     )
-    def test_hosts_that_cannot_hang_or_crash_libsane_are_enumerated(
+    def test_hosts_that_cannot_hang_libsane_are_enumerated(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         outcome: checks._SanedOutcome,
     ) -> None:
         """
-        Rejected, unresolved and healthy hosts go on to ``get_devices()``.
+        Refused, rejected, unresolved and healthy hosts go on to ``get_devices()``.
 
-        A rejection and a failed lookup both return at once inside libsane, so
-        the enumeration costs nothing and says whether a scanner is usable
-        anyway.  None of them gets the no-enumeration amber row.
+        A refused connect, a rejection and a failed lookup all return at once
+        inside libsane, so the enumeration costs nothing and says whether a
+        scanner is usable anyway.  None of them gets the no-enumeration amber
+        row.
 
         Args:
             tmp_path: The test's own directory.
@@ -3474,12 +3534,6 @@ class TestScannerCheck:
                 id="one-timed-out",
             ),
             pytest.param(
-                "scanbox.lan",
-                {"scanbox.lan": checks._SanedOutcome.REFUSED},
-                (_REFUSED_MESSAGE, _REFUSED_NEXT_STEP),
-                id="one-refused",
-            ),
-            pytest.param(
                 _TWO_HOSTS,
                 {
                     "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
@@ -3495,32 +3549,6 @@ class TestScannerCheck:
             pytest.param(
                 _TWO_HOSTS,
                 {
-                    "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
-                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
-                },
-                (
-                    "1 of 2 scanner hosts is on, but its scanner service is not "
-                    "running, so the scanner could not be checked.",
-                    _REFUSED_NEXT_STEP,
-                ),
-                id="healthy-and-refused",
-            ),
-            pytest.param(
-                _TWO_HOSTS,
-                {
-                    "scanbox-a.lan": checks._SanedOutcome.REFUSED,
-                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
-                },
-                (
-                    "2 of 2 scanner hosts are on, but their scanner service is "
-                    "not running, so the scanner could not be checked.",
-                    _REFUSED_NEXT_STEP,
-                ),
-                id="both-refused",
-            ),
-            pytest.param(
-                _TWO_HOSTS,
-                {
                     "scanbox-a.lan": checks._SanedOutcome.REFUSED,
                     "scanbox-b.lan": checks._SanedOutcome.TIMED_OUT,
                 },
@@ -3530,19 +3558,6 @@ class TestScannerCheck:
                     _TIMED_OUT_NEXT_STEP,
                 ),
                 id="refused-and-timed-out",
-            ),
-            pytest.param(
-                _TWO_HOSTS,
-                {
-                    "scanbox-a.lan": checks._SanedOutcome.REJECTED,
-                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
-                },
-                (
-                    "1 of 2 scanner hosts is on, but its scanner service is not "
-                    "running, so the scanner could not be checked.",
-                    _REFUSED_NEXT_STEP,
-                ),
-                id="rejected-and-refused",
             ),
         ],
     )
@@ -3581,6 +3596,80 @@ class TestScannerCheck:
         assert row.skipped is False
         assert (row.message, row.next_step) == expected
 
+    @pytest.mark.parametrize(
+        ("host", "outcomes", "hosts_subject"),
+        [
+            pytest.param(
+                "scanbox.lan",
+                {"scanbox.lan": checks._SanedOutcome.REFUSED},
+                "the scanner host",
+                id="one-refused",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
+                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                },
+                "1 of 2 scanner hosts",
+                id="healthy-and-refused",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.REFUSED,
+                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                },
+                "2 of 2 scanner hosts",
+                id="both-refused",
+            ),
+            pytest.param(
+                _TWO_HOSTS,
+                {
+                    "scanbox-a.lan": checks._SanedOutcome.REJECTED,
+                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                },
+                "1 of 2 scanner hosts",
+                id="rejected-and-refused",
+            ),
+        ],
+    )
+    def test_a_refusing_host_beside_a_usable_scanner_is_enumerated_and_amber(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        host: str,
+        outcomes: dict[str, checks._SanedOutcome],
+        hosts_subject: str,
+    ) -> None:
+        """
+        A stopped scanner service is enumerated, and a working scanner keeps it amber.
+
+        A refused connect returns at once inside libsane, so the listing runs
+        and finds the usable scanner.  The row reports the worst outcome among
+        the hosts, with a count once there is more than one, in a sentence
+        with a single "but".
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            host: The configured ``scanner.host``.
+            outcomes: What each configured host answers.
+            hosts_subject: How the row counts the refusing hosts.
+
+        """
+        _recording_dialler(monkeypatch, outcomes=outcomes)
+        backend = _CountingBackend([_device()])
+        settings = _with_device(_healthy_settings(tmp_path, host=host), "")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 1
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "Brother ADS-2700W is ready, but the scanner service is not running "
+            f"on {hosts_subject}."
+        )
+        assert row.next_step == _REFUSED_NEXT_STEP
+
     def test_the_timed_out_and_refused_rows_advise_different_things(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3588,7 +3677,9 @@ class TestScannerCheck:
         A host that is off and a host whose saned is stopped need different fixes.
 
         Both still end in pressing Check again: each state was measured to
-        clear on the next enumeration in the same process, with no restart.
+        clear on the next Check, with no restart.  The silent host is never
+        enumerated, so its row is amber; the refused one is, and with nothing
+        listed its row is red.
 
         Args:
             tmp_path: The test's own directory.
@@ -3598,7 +3689,7 @@ class TestScannerCheck:
         rows = []
         for outcome in (checks._SanedOutcome.TIMED_OUT, checks._SanedOutcome.REFUSED):
             _recording_dialler(monkeypatch, outcome=outcome)
-            settings = _settings(tmp_path, host="scanbox.lan")
+            settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
             rows.append(
                 _row(
                     run_checks(_context(settings, scanner=_CountingBackend())),
@@ -3606,6 +3697,9 @@ class TestScannerCheck:
                 )
             )
         timed_out, refused = rows
+        assert timed_out.state is CheckState.WARN
+        assert refused.state is CheckState.FAIL
+        assert refused.message == _REFUSED_MESSAGE
         assert timed_out.next_step != refused.next_step
         assert timed_out.next_step.endswith("press Check again.")
         assert refused.next_step.endswith("press Check again.")
@@ -3916,16 +4010,36 @@ _REJECTED_NEXT: Final = (
 )
 _UNRESOLVED_NEXT: Final = (
     "Check the host name in [scanner] host or [scanner] device, or in "
-    "SANE_NET_HOSTS if that is set, then restart saneless."
+    "SANE_NET_HOSTS if that is set. If you fixed the name in DNS or the hosts "
+    "file, press Check again; if you changed a setting, restart saneless."
 )
 _TIMED_OUT_NEXT: Final = (
     "Check the scanner host is switched on and on the network, then press Check again."
 )
 _REFUSED_NEXT: Final = "Start saned on the scanner host, or check it is listening on the network, then press Check again."
 _MULTIPLE_DEVICES_NEXT: Final = "Set [scanner] device to the one you use; saneless devices lists them, and saneless auto-profiles writes it for you."
-_CONFIGURED_MISSING_NEXT: Final = "Check it is switched on and connected. If saneless devices lists it, restart saneless; if not, set [scanner] device to one it lists."
-_HOST_ANSWERS_NOTHING_FOUND_NEXT: Final = "Check the scanner is switched on and connected to the scanner host. If saneless devices lists it, restart saneless."
-_NOTHING_FOUND_NEXT: Final = "Check the scanner is switched on and connected, then press Check again. If saneless devices lists it, restart saneless."
+_CONFIGURED_MISSING_NEXT: Final = "Check it is switched on and connected, then press Check again. If saneless devices does not list it, set [scanner] device to one it lists, then restart saneless."
+_HOST_ANSWERS_NOTHING_FOUND_NEXT: Final = "Check the scanner is switched on and connected to the scanner host, then press Check again."
+_NOTHING_FOUND_NEXT: Final = (
+    "Check the scanner is switched on and connected, then press Check again."
+)
+
+# The two rows for a listing that could not see: the scanner library crashed
+# while listing, or did not finish before the deadline.
+_LISTING_CRASHED_MESSAGE: Final = "The scanner library failed while listing scanners, so the scanner could not be checked."
+_LISTING_CRASHED_NEXT: Final = "Press Check again."
+_LISTING_TIMED_OUT_MESSAGE: Final = "The scanner library did not finish listing scanners in time, so the scanner could not be checked."
+_LISTING_TIMED_OUT_NEXT: Final = "Check the scanner, and its scanner host if it has one, are switched on and reachable, then press Check again."
+
+# The longest message the Scanner row could carry before these two were added,
+# which is what the status strip's layout is already known to hold.
+_LONGEST_SCANNER_MESSAGE: Final = _UNPROBED_DEVICE_MESSAGE
+
+# The two listing failures, by value, so the table below can name them.
+_CRASHED: Final = "crashed"
+_LISTING_TIMED_OUT: Final = "timed_out"
+
+_UNPROBED_NET_ID: Final = "net:[fe80::1]:brother5:bus0;dev1"
 
 _UNLISTED_ESCL_ID: Final = "escl:http://10.0.0.5:80"
 
@@ -3978,6 +4092,9 @@ class _VerdictCase:
         state: The row's expected state.
         message: The row's expected message.
         next_step: The row's expected next step.
+        withheld: Whether the configured device was deliberately not opened.
+        failure: The value of the listing failure the enumeration reports,
+            or ``None`` when the listing completed.
 
     """
 
@@ -3988,6 +4105,8 @@ class _VerdictCase:
     state: CheckState
     message: str
     next_step: str
+    withheld: bool = False
+    failure: str | None = None
 
 
 _VERDICT_CASES: Final = [
@@ -4300,11 +4419,124 @@ _VERDICT_CASES: Final = [
             devices=(),
             configured="",
             opened=None,
-            state=CheckState.WARN,
-            message="1 of 2 scanner hosts is on, but its scanner service is not running, so the scanner could not be checked.",
+            state=CheckState.FAIL,
+            message="1 of 2 scanner hosts is on, but its scanner service is not running.",
             next_step=_REFUSED_NEXT,
         ),
         id="refused",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REFUSED),),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="The scanner host is on, but its scanner service is not running.",
+            next_step=_REFUSED_NEXT,
+        ),
+        id="refused-nothing-usable",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REFUSED),),
+            devices=(_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="Brother ADS-2700W is ready, but the scanner service is not running on the scanner host.",
+            next_step=_REFUSED_NEXT,
+        ),
+        id="refused-with-local-scanner",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _HEALTHY), _hp("scanbox.lan", _REFUSED)),
+            devices=(_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="Brother ADS-2700W is ready, but the scanner service is not running on 1 of 2 scanner hosts.",
+            next_step=_REFUSED_NEXT,
+        ),
+        id="refused-one-of-two-with-local-scanner",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REFUSED),),
+            devices=(),
+            configured=_device().name,
+            opened=False,
+            state=CheckState.FAIL,
+            message="The configured scanner's host is on, but its scanner service is not running.",
+            next_step=_REFUSED_NEXT,
+        ),
+        id="configured-net-device-own-host-refused",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(_rogue_device(),),
+            configured=_UNPROBED_NET_ID,
+            opened=None,
+            state=CheckState.WARN,
+            message=_UNPROBED_DEVICE_MESSAGE,
+            next_step=_UNPROBED_DEVICE_NEXT,
+            withheld=True,
+        ),
+        id="configured-net-device-unprobed",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message=_LISTING_CRASHED_MESSAGE,
+            next_step=_LISTING_CRASHED_NEXT,
+            failure=_CRASHED,
+        ),
+        id="crash",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REJECTED),),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message=_LISTING_CRASHED_MESSAGE,
+            next_step=_LISTING_CRASHED_NEXT,
+            failure=_CRASHED,
+        ),
+        id="crash-beside-rejected",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message=_LISTING_TIMED_OUT_MESSAGE,
+            next_step=_LISTING_TIMED_OUT_NEXT,
+            failure=_LISTING_TIMED_OUT,
+        ),
+        id="timeout",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _HEALTHY),),
+            devices=(),
+            configured=_device().name,
+            opened=None,
+            state=CheckState.WARN,
+            message=_LISTING_TIMED_OUT_MESSAGE,
+            next_step=_LISTING_TIMED_OUT_NEXT,
+            failure=_LISTING_TIMED_OUT,
+        ),
+        id="timeout-with-a-configured-device",
     ),
 ]
 
@@ -4322,7 +4554,14 @@ def _verdict(case: _VerdictCase) -> CheckResult:
     """
     return checks._scanner_verdict(
         case.probes,
-        checks._Enumeration(devices=case.devices, configured_opened=case.opened),
+        checks._Enumeration(
+            devices=case.devices,
+            configured_opened=case.opened,
+            open_withheld=case.withheld,
+            failure=(
+                None if case.failure is None else checks._ListingFailure(case.failure)
+            ),
+        ),
         case.configured,
     )
 
@@ -4335,26 +4574,30 @@ def _advice_kind(message: str) -> str:
         message: A Scanner row's message.
 
     Returns:
-        ``"check-again"`` for a host the next enumeration dials again,
-        ``"restart"`` for a name libsane drops for the life of the process,
-        ``"restart-if-listed"`` for a scanner nothing found, and ``"none"``
-        for everything else.
+        ``"restart"`` for the unprobed configured device, whose only way out
+        is a saneless configuration edit; ``"check-again-or-restart-after-edit"``
+        for a name that did not resolve and a configured scanner that was not
+        found, which the next Check clears unless the fix was a changed
+        setting; ``"check-again"`` for every state a fresh listing picks up
+        again; and ``"none"`` for everything else.
 
     """
+    if "cannot be checked in advance" in message:
+        return "restart"
+    if "could not be found by name" in message or "was not found" in message:
+        return "check-again-or-restart-after-edit"
     if any(
-        phrase in message
+        phrase in message.lower()
         for phrase in (
             "refusing this machine",
             "not answering",
             "scanner service is not running",
+            "failed while listing scanners",
+            "did not finish listing scanners",
+            "no scanner was found",
         )
     ):
         return "check-again"
-    if "could not be found by name" in message:
-        return "restart"
-    lowered = message.lower()
-    if "was not found" in lowered or "no scanner was found" in lowered:
-        return "restart-if-listed"
     return "none"
 
 
@@ -4426,13 +4669,14 @@ class TestScannerVerdict:
         self, case: _VerdictCase
     ) -> None:
         """
-        Only states the next check can clear say "press Check again".
+        Only a saneless configuration edit calls for a restart.
 
-        A host that refused this machine, was not listening or did not answer
-        is dialled again by the next enumeration.  A name that did not resolve
-        is dropped for the life of the process, and a scanner that cannot be
-        found may be one a stale process lost, so those rows say restart, the
-        second only if ``saneless devices`` (a fresh process) lists it.
+        Each listing runs in a fresh process with a fresh scanner library, so
+        a host that starts answering, a name that starts resolving and a host
+        that gains a scanner are all picked up by the next Check.  Settings
+        are read once, at start, so a row whose fix may be a changed setting
+        says to restart only after that change, and the one row whose only
+        fix is a setting says restart outright.
 
         Args:
             case: The inputs to the verdict.
@@ -4441,14 +4685,18 @@ class TestScannerVerdict:
         row = _verdict(case)
         match _advice_kind(row.message):
             case "check-again":
-                assert row.next_step.endswith("press Check again.")
+                assert row.next_step.endswith("ress Check again.")
                 assert "restart" not in row.next_step
-            case "restart":
-                assert "restart saneless" in row.next_step
-            case "restart-if-listed":
-                assert "If saneless devices lists it, restart saneless" in (
-                    row.next_step
+            case "check-again-or-restart-after-edit":
+                assert "press Check again" in row.next_step
+                assert row.next_step.endswith("restart saneless.")
+                assert (
+                    "if you changed a setting" in row.next_step
+                    or "set [scanner] device" in row.next_step
                 )
+            case "restart":
+                assert row.next_step.endswith("restart saneless.")
+                assert "press Check again" not in row.next_step
             case _:
                 assert "restart" not in row.next_step
 
@@ -4458,7 +4706,133 @@ class TestScannerVerdict:
             _advice_kind(cast("_VerdictCase", param.values[0]).message)
             for param in _VERDICT_CASES
         }
-        assert kinds >= {"check-again", "restart", "restart-if-listed"}
+        assert kinds >= {
+            "check-again",
+            "check-again-or-restart-after-edit",
+            "restart",
+        }
+
+    @pytest.mark.parametrize("case", _VERDICT_CASES)
+    def test_every_restart_is_tied_to_a_configuration_edit(
+        self, case: _VerdictCase
+    ) -> None:
+        """
+        No row tells the reader to restart saneless for a state a Check clears.
+
+        The old conditional advice, restart if ``saneless devices`` lists the
+        scanner, answered a stale scanner library in a long-lived process.  A
+        fresh library on every listing retired it, so it must never come back,
+        and any restart a row still advises names the setting it follows.
+
+        Args:
+            case: The inputs to the verdict.
+
+        """
+        row = _verdict(case)
+        assert "If saneless devices lists it, restart saneless" not in row.next_step
+        if "restart saneless" in row.next_step:
+            assert any(
+                edit in row.next_step
+                for edit in ("setting", "[scanner] device", "[scanner] host")
+            )
+
+    @pytest.mark.parametrize(
+        ("probes", "message"),
+        [
+            pytest.param(
+                (_hp("scanbox.lan", _REFUSED),),
+                "Brother ADS-2700W is ready, but the scanner service is not running on the scanner host.",
+                id="refused",
+            ),
+            pytest.param(
+                (_hp("a.lan", _HEALTHY), _hp("scanbox.lan", _REFUSED)),
+                "Brother ADS-2700W is ready, but the scanner service is not running on 1 of 2 scanner hosts.",
+                id="refused-one-of-two",
+            ),
+            pytest.param(
+                (_hp("a.lan", _REFUSED), _hp("b.lan", _REFUSED)),
+                "Brother ADS-2700W is ready, but the scanner service is not running on 2 of 2 scanner hosts.",
+                id="refused-two-of-two",
+            ),
+            pytest.param(
+                (_hp("scanbox.lan", _REJECTED),),
+                "Brother ADS-2700W is ready, but the scanner host is refusing this machine.",
+                id="rejected",
+            ),
+            pytest.param(
+                (_hp("a.lan", _REJECTED), _hp("b.lan", _REJECTED)),
+                "Brother ADS-2700W is ready, but 2 of 2 scanner hosts are refusing this machine.",
+                id="rejected-two-of-two",
+            ),
+            pytest.param(
+                (_hp("scanbox.test", _UNRESOLVED),),
+                "Brother ADS-2700W is ready, but the scanner host could not be found by name.",
+                id="unresolved",
+            ),
+            pytest.param(
+                (_hp("a.lan", _HEALTHY), _hp("b.lan", _UNRESOLVED)),
+                "Brother ADS-2700W is ready, but 1 of 2 scanner hosts could not be found by name.",
+                id="unresolved-one-of-two",
+            ),
+        ],
+    )
+    def test_a_ready_row_says_but_once(
+        self, probes: tuple[checks._HostProbe, ...], message: str
+    ) -> None:
+        """
+        A usable scanner beside a host problem is one sentence with one "but".
+
+        The refused wording on its own already has a "but" in it ("is on, but
+        its scanner service is not running"), so appending it to "is ready,
+        but" read as two.  The ready row words that outcome its own way.
+
+        Args:
+            probes: What each configured host's probe found.
+            message: The exact amber sentence expected.
+
+        """
+        row = checks._scanner_verdict(
+            probes, checks._Enumeration(devices=(_device(),)), ""
+        )
+        assert row.state is CheckState.WARN
+        assert row.message == message
+        assert row.message.count(" but ") == 1
+
+    def test_the_listing_failure_rows_name_nothing_and_count_nothing(self) -> None:
+        """
+        The crash and timeout rows are fixed sentences: no host, no number.
+
+        They are amber because neither proves scanning is impossible, and a
+        working appliance never goes red.
+        """
+        for failure in checks._ListingFailure:
+            row = checks._scanner_verdict(
+                (_hp("scanbox.lan", _HEALTHY),),
+                checks._Enumeration(devices=(), failure=failure),
+                "",
+            )
+            assert row.state is CheckState.WARN
+            rendered = f"{row.message} {row.next_step}"
+            assert not any(character.isdigit() for character in rendered)
+            for leaked in _LEAK_MARKERS:
+                assert leaked not in rendered
+
+    @pytest.mark.parametrize(
+        "message",
+        [_LISTING_CRASHED_MESSAGE, _LISTING_TIMED_OUT_MESSAGE],
+        ids=["crash", "timeout"],
+    )
+    def test_a_listing_failure_message_fits_where_the_longest_one_does(
+        self, message: str
+    ) -> None:
+        """
+        The new rows are no longer than a message the status strip already holds.
+
+        Args:
+            message: One of the two listing-failure messages.
+
+        """
+        assert len(message) <= len(_LONGEST_SCANNER_MESSAGE)
 
     @pytest.mark.parametrize("case", _VERDICT_CASES)
     def test_no_row_names_a_host_address_or_device_id(self, case: _VerdictCase) -> None:
@@ -4491,32 +4865,63 @@ class TestScannerVerdict:
         else:
             assert row.next_step
 
-    @pytest.mark.parametrize("outcome", [_TIMED_OUT, _REFUSED])
     @pytest.mark.parametrize(
         "devices",
         [(), (_device(),), (_device(), _rogue_device())],
         ids=["none", "one", "two"],
     )
     def test_a_host_that_must_not_be_enumerated_gives_the_preflight_row(
-        self, outcome: checks._SanedOutcome, devices: tuple[DeviceInfo, ...]
+        self, devices: tuple[DeviceInfo, ...]
     ) -> None:
         """
-        The verdict and the preflight can never disagree about such a host.
+        The verdict and the preflight can never disagree about a silent host.
+
+        Whatever the enumeration is claimed to have seen or failed at, a
+        timed-out host gives the row the preflight returns for it.
 
         Args:
-            outcome: An outcome that keeps the check out of libsane.
             devices: Whatever enumeration is claimed to have listed.
 
         """
-        probes = (_hp("scanbox.lan", _HEALTHY), _hp("b.lan", outcome))
-        row = checks._scanner_verdict(
-            probes, checks._Enumeration(devices=devices), _device().name
-        )
-        assert row == checks._scanner_host_unanswered(probes)
+        probes = (_hp("scanbox.lan", _HEALTHY), _hp("b.lan", _TIMED_OUT))
+        for failure in (None, *checks._ListingFailure):
+            row = checks._scanner_verdict(
+                probes,
+                checks._Enumeration(devices=devices, failure=failure),
+                _device().name,
+            )
+            assert row == checks._scanner_host_unanswered(probes)
+
+    @pytest.mark.parametrize(
+        ("outcome", "blocks"),
+        [
+            pytest.param(_TIMED_OUT, True, id="timed-out"),
+            pytest.param(_REFUSED, False, id="refused"),
+            pytest.param(_UNRESOLVED, False, id="unresolved"),
+            pytest.param(_REJECTED, False, id="rejected"),
+            pytest.param(_HEALTHY, False, id="healthy"),
+        ],
+    )
+    def test_only_a_timed_out_host_keeps_the_check_out_of_libsane(
+        self, outcome: checks._SanedOutcome, *, blocks: bool
+    ) -> None:
+        """
+        Every outcome but a silent host returns at once inside libsane.
+
+        Args:
+            outcome: What one probe found.
+            blocks: Whether that outcome keeps the check out of libsane.
+
+        """
+        assert checks._blocks_enumeration(outcome) is blocks
 
     def test_an_enumeration_records_no_open_by_default(self) -> None:
         """No open was attempted unless the caller says one was."""
         assert checks._Enumeration(devices=()).configured_opened is None
+
+    def test_an_enumeration_records_no_listing_failure_by_default(self) -> None:
+        """A listing completed unless the caller says it crashed or timed out."""
+        assert checks._Enumeration(devices=()).failure is None
 
     @pytest.mark.parametrize(
         ("device_id", "expected"),
@@ -4585,7 +4990,10 @@ class _EndToEndRun:
 
 
 def _run_ungated_and_gated(
-    settings: Settings, devices: Sequence[DeviceInfo]
+    settings: Settings,
+    devices: Sequence[DeviceInfo],
+    *,
+    backend_type: type[_CountingBackend] = _CountingBackend,
 ) -> tuple[_EndToEndRun, _EndToEndRun]:
     """
     Run the whole registry twice: once as ``doctor`` does, once as the strip does.
@@ -4598,6 +5006,8 @@ def _run_ungated_and_gated(
     Args:
         settings: The configuration both runs read.
         devices: What each run's backend lists.
+        backend_type: The counting backend each run is handed, so a case can
+            use one whose opens fail.
 
     Returns:
         The ungated run, then the gated one.
@@ -4606,7 +5016,7 @@ def _run_ungated_and_gated(
     gate = threading.Lock()
     runs: list[_EndToEndRun] = []
     for scanner_gate in (None, gate):
-        backend = _CountingBackend(list(devices))
+        backend = backend_type(list(devices))
         started = monotonic()
         results = run_checks(
             _context(settings, scanner=backend), scanner_gate=scanner_gate
@@ -4760,11 +5170,45 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.row.next_step == _REJECTED_NEXT
         _assert_names_nothing(runs, caplog, fake.port)
 
-    def test_a_refused_connection_is_amber_and_never_enumerated(
+    def test_a_refused_host_is_enumerated_and_red_when_nothing_is_listed(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        Nothing listening is the refused row, and SANE is never entered.
+        A stopped scanner service with nothing else usable is red on both surfaces.
+
+        A refused connect returns at once inside libsane, so the host is
+        listed like any other.  With nothing usable listed, scanning cannot
+        work, so the row is red, and ``saneless doctor`` exits non-zero on a
+        network-only appliance whose saned is down.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        port = _closed_port()
+        settings = _with_device(
+            _healthy_settings(tmp_path, host=f"127.0.0.1:{port}"), ""
+        )
+        runs = _run_ungated_and_gated(settings, [])
+        for run in runs:
+            assert run.backend.calls == 1
+            assert run.row.state is CheckState.FAIL
+            assert run.row.message == _REFUSED_MESSAGE
+            assert run.row.next_step == _REFUSED_NEXT_STEP
+        backend = _CountingBackend()
+        doctor_row = checks._check_scanner(_context(settings, scanner=backend))
+        assert backend.calls == 1
+        assert doctor_row == runs[0].row
+        assert worst_state([doctor_row]) is CheckState.FAIL
+        _assert_names_nothing(runs, caplog, port)
+
+    def test_a_refused_host_beside_a_usable_scanner_is_enumerated_and_amber(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A stopped scanner service beside a scanner that works is a warning.
 
         Args:
             tmp_path: The test's own directory.
@@ -4778,25 +5222,27 @@ class TestScannerCheckAgainstAFakeSaned:
         )
         runs = _run_ungated_and_gated(settings, [_device()])
         for run in runs:
-            assert run.backend.calls == 0
+            assert run.backend.calls == 1
             assert run.row.state is CheckState.WARN
-            assert run.row.message == _REFUSED_MESSAGE
+            assert run.row.message == _REFUSED_READY_MESSAGE
             assert run.row.next_step == _REFUSED_NEXT_STEP
         _assert_names_nothing(runs, caplog, port)
 
-    def test_a_configured_net_device_on_a_refusing_host_is_never_opened(
+    def test_a_configured_net_device_on_a_refusing_host_is_opened_and_reports_its_host(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        A configured device's own host is dialled for real, and it keeps SANE out.
+        A configured device's own host is dialled for real, then the device opened.
 
         No scanner host is configured, and the backend lists nothing, so the
-        check would otherwise open the configured ``net:`` id -- which makes
-        libsane dial that host with no timeout.  The default saned port is
-        pointed at a closed loopback port, so the host refuses.
+        check opens the configured ``net:`` id.  The default saned port is
+        pointed at a closed loopback port, so the host refuses, which returns
+        at once inside libsane and so does not keep the open out.  The open
+        fails, and the row blames the device's own host rather than saying
+        the scanner was not found.
 
         Args:
             tmp_path: The test's own directory.
@@ -4810,12 +5256,15 @@ class TestScannerCheckAgainstAFakeSaned:
         settings = _with_device(
             _healthy_settings(tmp_path, host=""), "net:127.0.0.1:brother5:bus0;dev1"
         )
-        runs = _run_ungated_and_gated(settings, [])
+        runs = _run_ungated_and_gated(settings, [], backend_type=_UnopenableBackend)
         for run in runs:
-            assert run.backend.calls == 0
-            assert run.backend.opens == 0
-            assert run.row.state is CheckState.WARN
-            assert run.row.message == _REFUSED_MESSAGE
+            assert run.backend.calls == 1
+            assert run.backend.opens == 1
+            assert run.row.state is CheckState.FAIL
+            assert run.row.message == (
+                "The configured scanner's host is on, but its scanner service "
+                "is not running."
+            )
             assert run.row.next_step == _REFUSED_NEXT_STEP
         _assert_names_nothing(runs, caplog, port)
 
@@ -4940,14 +5389,14 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.row.next_step == _UNRESOLVED_NEXT
         _assert_names_nothing(runs, caplog, SANED_PORT)
 
-    def test_one_answering_host_beside_a_refusing_one_is_never_enumerated(
+    def test_one_answering_host_beside_a_refusing_one_is_enumerated(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        A second host refusing the connection keeps SANE out, through real sockets.
+        A second host refusing the connection does not keep SANE out.
 
         Both entries use the default port, which is pointed at the fake.  The
         fake listens on 127.0.0.1 only, so the same port on 127.0.0.2 refuses.
@@ -4966,11 +5415,11 @@ class TestScannerCheckAgainstAFakeSaned:
             )
             runs = _run_ungated_and_gated(settings, [_device()])
         for run in runs:
-            assert run.backend.calls == 0
+            assert run.backend.calls == 1
             assert run.row.state is CheckState.WARN
             assert run.row.message == (
-                "1 of 2 scanner hosts is on, but its scanner service is not "
-                "running, so the scanner could not be checked."
+                "Brother ADS-2700W is ready, but the scanner service is not "
+                "running on 1 of 2 scanner hosts."
             )
             assert run.row.next_step == _REFUSED_NEXT_STEP
         assert b"".join(fake.received) == (INIT_REQUEST + EXIT_REQUEST) * len(runs)
@@ -5867,11 +6316,11 @@ def _gate_sampling_context(
 # branch of the scanner check, and each ends in a different row:
 #
 # - no python-sane, decided before anything is touched;
-# - two pre-probe rows decided before the gate is reached, one for a host that
-#   refuses the connection and one for a host that does not answer it;
+# - a pre-probe row decided before the gate is reached, for a host that does
+#   not answer the connection;
 # - an enumeration that lists one device, and one that raises;
-# - a host that refuses this machine, and a name that does not resolve, both
-#   enumerated and finding nothing;
+# - a host that refuses the connection, a host that refuses this machine, and
+#   a name that does not resolve, all enumerated and finding nothing;
 # - a configured device that is not listed and does not open, and one that is
 #   not listed but opens, both decided by the open held under the gate;
 # - a configured ``net:`` device that is not listed and whose host cannot be
@@ -5881,7 +6330,7 @@ def _gate_sampling_context(
 # ``test_every_gated_context_reaches_a_different_row`` keeps them distinct.
 _GATED_CONTEXTS = (
     "no-python-sane",
-    "host-unanswered",
+    "refused",
     "timed-out",
     "one-device",
     "enumeration-raises",
@@ -5897,7 +6346,7 @@ _GATED_CONTEXTS = (
 # is given the outcome that would stop the check if it did.
 _GATED_DIALLER_OUTCOMES: Final[Mapping[str, checks._SanedOutcome]] = {
     "no-python-sane": checks._SanedOutcome.TIMED_OUT,
-    "host-unanswered": checks._SanedOutcome.REFUSED,
+    "refused": checks._SanedOutcome.REFUSED,
     "timed-out": checks._SanedOutcome.TIMED_OUT,
     "rejected": checks._SanedOutcome.REJECTED,
     "unresolved": checks._SanedOutcome.UNRESOLVED,
@@ -5943,9 +6392,7 @@ def _gated_context_builder(
 
     factories: dict[str, Callable[[], CheckContext]] = {
         "no-python-sane": lambda: _context(_settings(tmp_path), scanner=None),
-        "host-unanswered": lambda: on_scanbox(
-            _DEVICE_ID, _CountingBackend([_device()])
-        ),
+        "refused": lambda: on_scanbox("", _CountingBackend()),
         "timed-out": lambda: on_scanbox(_DEVICE_ID, _CountingBackend([_device()])),
         "one-device": lambda: on_scanbox(_DEVICE_ID, _CountingBackend([_device()])),
         "enumeration-raises": lambda: on_scanbox("", _RaisingBackend()),
@@ -6092,9 +6539,10 @@ class TestRunChecksUnderTheScannerGate:
         where the gate is irrelevant (R3-IN-01): a free gate, a backend that
         answers, and no configured host.  Every context whose *row* differs was
         untested, so a gated path that diverged on the no-python-sane row, on a
-        host that refuses the pre-probe, or on an enumeration that raises would
-        have passed.  Every context in ``_GATED_CONTEXTS`` runs here, including
-        the rejected, timed-out, unresolved and wrong-device ones, and all of
+        host that does not answer the pre-probe, or on an enumeration that
+        raises would have passed.  Every context in ``_GATED_CONTEXTS`` runs
+        here, including the refused, rejected, timed-out, unresolved and
+        wrong-device ones, and all of
         them are reached without resolving a name or opening a socket -- the
         dialler is stubbed in every variant, including the one that never
         reaches it.
@@ -6344,22 +6792,8 @@ class TestRunChecksUnderTheScannerGate:
             "The configured scanner is ready."
         )
 
-    @pytest.mark.parametrize(
-        "expected",
-        [
-            pytest.param(
-                (checks._SanedOutcome.TIMED_OUT, _TIMED_OUT_MESSAGE), id="timed-out"
-            ),
-            pytest.param(
-                (checks._SanedOutcome.REFUSED, _REFUSED_MESSAGE), id="refused"
-            ),
-        ],
-    )
-    def test_a_refused_pre_probe_never_touches_the_gate(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        expected: tuple[checks._SanedOutcome, str],
+    def test_a_timed_out_pre_probe_never_touches_the_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
         A check that decides before SANE has no business taking SANE's lock.
@@ -6367,14 +6801,13 @@ class TestRunChecksUnderTheScannerGate:
         Args:
             tmp_path: The test's own directory.
             monkeypatch: Used to make every configured host fail its probe.
-            expected: What the configured host answers, and the amber row
-                message that answer produces.
 
         """
-        outcome, message = expected
         gate = _RecordingLock()
         backend = _CountingBackend([_device()])
-        dialled = _recording_dialler(monkeypatch, outcome=outcome)
+        dialled = _recording_dialler(
+            monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT
+        )
         results = run_checks(
             _context(_settings(tmp_path, host=_DEVICE_HOST), scanner=backend),
             scanner_gate=cast("threading.Lock", gate),
@@ -6384,7 +6817,36 @@ class TestRunChecksUnderTheScannerGate:
         assert backend.calls == 0
         row = _row(results, CheckKey.SCANNER)
         assert row.state is CheckState.WARN
-        assert row.message == message
+        assert row.message == _TIMED_OUT_MESSAGE
+
+    def test_a_refused_pre_probe_takes_the_gate_for_enumeration(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A refused host is enumerated, and enumeration is SANE work under the gate.
+
+        One acquire and one release, and the gate free once the run returns.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to make every configured host refuse its probe.
+
+        """
+        gate = _RecordingLock()
+        backend = _CountingBackend([_device()])
+        dialled = _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REFUSED)
+        results = run_checks(
+            _context(_settings(tmp_path, host=_DEVICE_HOST), scanner=backend),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        assert dialled == [(_DEVICE_HOST, SANED_PORT)]
+        assert gate.acquires == 1
+        assert gate.releases == 1
+        assert gate.is_free() is True
+        assert backend.calls == 1
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.WARN
+        assert row.message == _REFUSED_READY_MESSAGE
 
     def test_an_absent_backend_never_touches_the_gate(self, tmp_path: Path) -> None:
         """
