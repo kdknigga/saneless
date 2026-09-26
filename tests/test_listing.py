@@ -153,6 +153,16 @@ isolated = str(sys.flags.isolated)
 sys.stdout.write(json.dumps({"devices": [[isolated, "v", "m", "t"]]}) + "\\n")
 """
 
+_PROCESS_GROUP_CHILD = """\
+import json
+import os
+import sys
+
+sys.stdin.readline()
+group = str(os.getpgid(0))
+sys.stdout.write(json.dumps({"devices": [[group, "v", "m", "t"]]}) + "\\n")
+"""
+
 # The real child script, kept before any test points the launcher elsewhere.
 _REAL_CHILD_FILE = listing._CHILD_FILE
 
@@ -760,6 +770,23 @@ def test_the_child_argv_is_literal(
         "-c",
         'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
     )
+
+
+def test_the_child_is_outside_this_process_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A signal sent to saneless's process group does not reach the child.
+
+    A terminal's Ctrl-C on ``saneless serve`` signals the whole group.
+    Were the child in it, a listing a job was running would die from
+    SIGINT and be reported as a scanner-library crash.
+    """
+    _use_child(monkeypatch, tmp_path, _PROCESS_GROUP_CHILD)
+
+    reply = run_listing_child(ListingRequest(), configured_host="")
+
+    assert int(reply.devices[0][0]) != os.getpgid(0)
 
 
 def test_the_deadline_is_thirty_seconds() -> None:

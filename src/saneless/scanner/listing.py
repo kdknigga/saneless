@@ -332,8 +332,16 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     happens: on the deadline it is killed and waited for, and so is a child
     still running when the wait is interrupted by a Ctrl-C or a server stop.
     A caller that holds the scanner gate around this call therefore releases
-    it with nothing still inside libsane.  No new session is started, so a
-    terminal's Ctrl-C reaches the child as well.
+    it with nothing still inside libsane.
+
+    The child starts in a session of its own, so a signal sent to saneless's
+    whole process group, such as a terminal's Ctrl-C on ``saneless serve``,
+    does not reach it.  In the shared group, a listing running on the worker
+    thread, where no interruption is raised, would die from that signal and
+    be reported as a crash of the scanner library.  A Ctrl-C or a stop that
+    does reach this call interrupts the wait, and the child is killed and
+    reaped as above; a parent that dies outright leaves the child to its own
+    alarm.
 
     A crash is reported and not retried: a fresh child cannot hit the stale
     connection defect, so a crash here is a new defect that a retry would
@@ -369,6 +377,7 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
         stderr=None,
         env=env,
         close_fds=True,
+        start_new_session=True,
     ) as proc:
         try:
             out, _ = proc.communicate(line, timeout=deadline)
