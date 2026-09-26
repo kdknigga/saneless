@@ -27,13 +27,6 @@ import time
 from pathlib import Path
 
 import pytest
-from saneless.scanner.listing import (
-    ChildError,
-    ListingReply,
-    ListingRequest,
-    child_environment,
-    run_listing_child,
-)
 
 from saneless.exceptions import (
     ListingCrashedError,
@@ -42,6 +35,13 @@ from saneless.exceptions import (
     ScanInterrupted,
 )
 from saneless.scanner import listing
+from saneless.scanner.listing import (
+    ChildError,
+    ListingReply,
+    ListingRequest,
+    child_environment,
+    run_listing_child,
+)
 
 _LOGGER = "saneless.scanner.listing"
 _NET_ID = "net:scanbox.lan:test:0"
@@ -629,14 +629,24 @@ class TestChildEnvironment:
         assert reply.devices[0][0] == "1"
 
 
-def test_the_child_argv_is_literal() -> None:
+def test_the_child_argv_is_literal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """
-    The argv holds no path: the interpreter and the script travel in the env.
+    The argv holds no path and no device id: both travel elsewhere.
 
-    Every element is a literal, and ``exec`` makes the child's PID the
-    interpreter's own, so killing and waiting on it leaves no grandchild.
+    The interpreter and the script are in the environment and the device id
+    is on stdin, because argv is readable by every local user.  ``exec``
+    makes the child's PID the interpreter's own, so killing and waiting on it
+    leaves no grandchild.
     """
-    assert listing._CHILD_ARGV == (
+    started = _spy_on_communicate(monkeypatch)
+    _use_child(monkeypatch, tmp_path, _REPLY_CHILD)
+
+    run_listing_child(ListingRequest(open=_NET_ID), configured_host="")
+
+    assert len(started) == 1
+    assert started[0].args == (
         "/bin/sh",
         "-c",
         'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
