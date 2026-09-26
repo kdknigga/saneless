@@ -2533,9 +2533,10 @@ def _scanner_unusable_row(
     not be found by name is missing *because of* that host, so the row says
     so.  A configured device that is not a ``net:`` device is simply not
     found, even if some unrelated network host is also bad, because a network
-    host does not explain a local device's absence.  Only the own host's probe on ``SANED_PORT`` is read,
-    because that is the port libsane opened the device on; a ``host:port``
-    setting's answer on another port does not explain the device's absence.
+    host does not explain a local device's absence.  Only the own host's probe
+    on ``SANED_PORT`` is read, because that is the port libsane opened the
+    device on; a ``host:port`` setting's answer on another port does not
+    explain the device's absence.
 
     Args:
         probes: What each configured host's probe found; none blocks

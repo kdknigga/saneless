@@ -1404,10 +1404,11 @@ class PaperlessClient:
         runs it in a child process that is stopped at a deadline, and the SANE
         side of the status strip keeps its socket pre-probe as well, so a
         silent host is named in seconds and never holds the scanner gate for
-        the whole deadline; httpx2, by contrast, takes a bound per request.  The status strip and ``saneless doctor`` pass a short budget
-        so an unplugged host is discovered in about two seconds instead of
-        thirty, while ``GET /api/paperless/test`` deliberately keeps today's
-        client default and therefore calls this with no argument at all.
+        the whole deadline; httpx2, by contrast, takes a bound per request.
+        The status strip and ``saneless doctor`` pass a short budget so an
+        unplugged host is discovered in about two seconds instead of thirty,
+        while ``GET /api/paperless/test`` deliberately keeps today's client
+        default and therefore calls this with no argument at all.
 
         Bounding the probe needs no new exception handling.  The
         ``except httpx2.TransportError`` arm below is the base class of
