@@ -1400,6 +1400,25 @@ class _ScannerPreflight:
     probes: tuple[_HostProbe, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _Enumeration:
+    """
+    What the gated half of the Scanner check saw.
+
+    Attributes:
+        devices: What the backend listed, in its order; empty when it listed
+            nothing, and also when listing raised -- the verdict does not need
+            to tell those two apart.
+        configured_opened: ``None`` when no open was attempted; otherwise
+            whether a configured device that the backend did not list could
+            be opened and closed again, which is what a scan does with it.
+
+    """
+
+    devices: tuple[DeviceInfo, ...]
+    configured_opened: bool | None = None
+
+
 def _outcome_severity(outcome: _SanedOutcome) -> int:
     """
     Rank a probe outcome, so several hosts can be reported by the worst one.
@@ -1604,6 +1623,39 @@ def _host_problem_next_step(outcome: _SanedOutcome) -> str:
         case _:
             assert_never(outcome)
     return next_step
+
+
+def _net_device_entry(device_id: str) -> str | None:
+    """
+    Name the host entry a ``net:`` device was listed from.
+
+    libsane's net backend names each remote device ``net:``, then the
+    ``SANE_NET_HOSTS`` entry it dialled, then ``:`` and the name saned gave it
+    (``sane_get_devices`` in ``backend/net.c``).  The entry is therefore the
+    host the device lives on, spelt exactly as it was configured, and an IPv6
+    literal keeps its brackets.
+
+    The result is only ever compared with a probed host.  It is never dialled,
+    rendered or logged, because it is a LAN address (ASVS V7).
+
+    Args:
+        device_id: A SANE device id, as configured or as listed.
+
+    Returns:
+        The host entry, or ``None`` when the id is not a ``net:`` id or names
+        no entry.
+
+    """
+    prefix = "net:"
+    if not device_id.startswith(prefix):
+        return None
+    remainder = device_id.removeprefix(prefix)
+    if remainder.startswith("["):
+        closing = remainder.find("]")
+        entry = remainder[: closing + 1] if closing >= 0 else ""
+    else:
+        entry = remainder.partition(":")[0]
+    return entry or None
 
 
 def _directory_accepts_a_write(path: Path) -> bool:
@@ -1968,6 +2020,327 @@ def _scanner_support_missing() -> CheckResult:
         message="Scanner support is not installed on this machine.",
         next_step="Install saneless with scanner support, then restart it.",
     )
+
+
+# The outcomes that explain why a configured ``net:`` device is missing.  Only
+# these two reach enumeration while still being a problem: a timed-out or
+# refused host ends the check before it, and a healthy one explains nothing.
+_CONFIGURED_HOST_OUTCOMES: Final = frozenset(
+    {_SanedOutcome.REJECTED, _SanedOutcome.UNRESOLVED}
+)
+
+
+def _capitalised(clause: str) -> str:
+    """
+    Start a clause with a capital letter, so it can open a row's sentence.
+
+    Args:
+        clause: A clause starting lower-case, as ``_host_problem_clause``
+            builds them.
+
+    Returns:
+        The same clause with its first character upper-cased.
+
+    """
+    return f"{clause[:1].upper()}{clause[1:]}"
+
+
+def _worst_host_clause(probes: tuple[_HostProbe, ...]) -> tuple[str, _SanedOutcome]:
+    """
+    Say what the worst of the probed hosts found, and how many hosts share it.
+
+    Args:
+        probes: What each configured host's probe found; at least one.
+
+    Returns:
+        The clause for the worst outcome, counted by ``_hosts_subject``, and
+        that outcome, whose next step the row carries.
+
+    """
+    worst = _worst_outcome(probes)
+    count = sum(1 for probe in probes if probe.outcome is worst)
+    subject, plural = _hosts_subject(count, len(probes))
+    return _host_problem_clause(worst, subject, plural=plural), worst
+
+
+def _scanner_ready_subject(
+    enumeration: _Enumeration, configured_device: str
+) -> str | None:
+    """
+    Name the scanner a scan would use, if there is one it can use.
+
+    With ``scanner.device`` set the scan opens exactly that id, so the check
+    looks it up by exact name and labels the device it finds, whatever else
+    is listed and in whatever order.  A device the backend does not list but
+    that opened is usable too: SANE opens ids it never lists.  With the
+    setting empty the scan takes the first device listed, and so does this.
+
+    Args:
+        enumeration: What the gated half of the check saw.
+        configured_device: The configured ``scanner.device``, possibly empty.
+
+    Returns:
+        ``None`` when no usable scanner was seen.  Otherwise the words the
+        row uses for it: the device's label, "The configured scanner" for an
+        unlisted device that opened, or the empty string for a device that
+        reported no vendor and no model.
+
+    """
+    if configured_device:
+        listed = next(
+            (
+                device
+                for device in enumeration.devices
+                if device.name == configured_device
+            ),
+            None,
+        )
+        if listed is not None:
+            return _device_label(listed)
+        if enumeration.configured_opened is True:
+            return "The configured scanner"
+        return None
+    if enumeration.devices:
+        return _device_label(enumeration.devices[0])
+    return None
+
+
+def _scanner_ready_row(
+    probes: tuple[_HostProbe, ...], subject: str, unchosen: int
+) -> CheckResult:
+    """
+    Build the row for a scanner that can be used.
+
+    A host problem still shows, in amber, because scanning works: the rule is
+    that a working appliance never goes red.  It is reported ahead of the
+    several-devices warning, because it is the one that is a failure.
+
+    Args:
+        probes: What each configured host's probe found; none blocks
+            enumeration.
+        subject: The scanner's words from ``_scanner_ready_subject``.
+        unchosen: How many devices are visible with ``scanner.device`` empty;
+            0 when a device is configured.
+
+    Returns:
+        WARN for a host problem or for several devices with none chosen;
+        otherwise OK.
+
+    """
+    if any(probe.outcome is not _SanedOutcome.HEALTHY for probe in probes):
+        clause, worst = _worst_host_clause(probes)
+        return CheckResult(
+            key=CheckKey.SCANNER,
+            state=CheckState.WARN,
+            message=f"{subject or 'The scanner'} is ready, but {clause}.",
+            next_step=_host_problem_next_step(worst),
+        )
+    if unchosen > 1:
+        # With no device configured, every scan goes to whichever device SANE
+        # lists first, and a scanner that appears on the LAN can take that
+        # place.  A warning, not a failure: scanning still works.  Count-only,
+        # because device ids are LAN addresses and this row is LAN-visible.
+        return CheckResult(
+            key=CheckKey.SCANNER,
+            state=CheckState.WARN,
+            message=f"{unchosen} scanners are visible and none is chosen.",
+            next_step=(
+                "Set [scanner] device to the one you use; saneless devices "
+                "lists them, and saneless auto-profiles writes it for you."
+            ),
+        )
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.OK,
+        message=f"{subject} is ready." if subject else "Ready.",
+    )
+
+
+def _scanner_host_problem_row(clause: str, outcome: _SanedOutcome) -> CheckResult:
+    """
+    Build the red row for a host problem that leaves no usable scanner.
+
+    Args:
+        clause: What the host problem is, from ``_host_problem_clause``.
+        outcome: The outcome the clause reports, which picks the next step.
+
+    Returns:
+        The red Scanner row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.FAIL,
+        message=f"{_capitalised(clause)}.",
+        next_step=_host_problem_next_step(outcome),
+    )
+
+
+def _scanner_configured_missing_row() -> CheckResult:
+    """
+    Build the red row for a configured scanner that was not found.
+
+    The next step covers both ways this happens.  If ``saneless devices`` --
+    a fresh process -- lists the device, this process's libsane has lost it
+    and a restart fixes that; if it does not, the configured id is wrong.
+
+    Returns:
+        The red Scanner row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.FAIL,
+        message="The configured scanner was not found.",
+        next_step="Check it is switched on and connected. If saneless devices lists it, restart saneless; if not, set [scanner] device to one it lists.",
+    )
+
+
+def _scanner_nothing_found_row(hosts: int) -> CheckResult:
+    """
+    Build the red row for no scanner at all, with every probed host healthy.
+
+    Args:
+        hosts: How many scanner hosts were probed, all of them healthy.
+
+    Returns:
+        The red Scanner row.
+
+    """
+    if hosts == 0:
+        return CheckResult(
+            key=CheckKey.SCANNER,
+            state=CheckState.FAIL,
+            message="No scanner was found.",
+            next_step="Check the scanner is switched on and connected, then press Check again. If saneless devices lists it, restart saneless.",
+        )
+    message = (
+        "The scanner host is answering, but no scanner was found on it."
+        if hosts == 1
+        else "The scanner hosts are answering, but no scanner was found on them."
+    )
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.FAIL,
+        message=message,
+        next_step="Check the scanner is switched on and connected to the scanner host. If saneless devices lists it, restart saneless.",
+    )
+
+
+def _scanner_unusable_row(
+    probes: tuple[_HostProbe, ...], configured_device: str
+) -> CheckResult:
+    """
+    Build the red row when no usable scanner was seen, naming the likeliest cause.
+
+    The more specific cause wins.  A configured ``net:`` device whose own
+    host was refusing this machine or could not be found by name is missing
+    *because of* that host, so the row says so.  A configured device that is
+    not a ``net:`` device is simply not found, even if some unrelated network
+    host is also bad, because a network host does not explain a local
+    device's absence.
+
+    Args:
+        probes: What each configured host's probe found; none blocks
+            enumeration.
+        configured_device: The configured ``scanner.device``, possibly empty.
+
+    Returns:
+        The red Scanner row.
+
+    """
+    if configured_device:
+        entry = _net_device_entry(configured_device)
+        own_host = next(
+            (
+                probe
+                for probe in probes
+                if probe.host == entry and probe.outcome in _CONFIGURED_HOST_OUTCOMES
+            ),
+            None,
+        )
+        if own_host is None:
+            return _scanner_configured_missing_row()
+        clause = _host_problem_clause(
+            own_host.outcome, "the configured scanner's host", plural=False
+        )
+        return _scanner_host_problem_row(clause, own_host.outcome)
+    if any(probe.outcome is not _SanedOutcome.HEALTHY for probe in probes):
+        return _scanner_host_problem_row(*_worst_host_clause(probes))
+    return _scanner_nothing_found_row(len(probes))
+
+
+def _scanner_verdict(
+    probes: tuple[_HostProbe, ...],
+    enumeration: _Enumeration,
+    configured_device: str,
+) -> CheckResult:
+    """
+    Decide the Scanner row from what the probes and the enumeration found.
+
+    Pure: no socket, no backend and no clock, so every row can be pinned by a
+    unit test.  The row goes red exactly when scanning cannot work.  While a
+    usable scanner is visible a host problem keeps the row amber, because a
+    working appliance never goes red.  With ``scanner.device`` set, the row is
+    about that device, found by its exact id; the first device listed stands
+    in only when the setting is empty, which is the device a scan would use.
+
+    Where two causes compete, the more specific one wins.  A configured
+    ``net:`` device whose own host was refusing this machine or could not be
+    found by name reports that host's problem, which explains the absence.  A
+    configured device that is not a ``net:`` device and is missing is reported
+    as not found, whatever an unrelated host is doing.  With nothing
+    configured, a host problem is reported ahead of the several-devices
+    warning.  Several bad hosts are reported by the worst outcome, with a
+    count.
+
+    The next steps follow what actually clears each state, which was measured
+    against a real saned and agrees with sane-backends' source:
+
+    - libsane's net backend is initialised lazily, inside the first device
+      listing of the process, and resolves each ``SANE_NET_HOSTS`` entry
+      exactly once then (``sane_init`` calling ``add_device`` in
+      ``backend/net.c``).  An entry it cannot resolve is dropped for the life
+      of the process, so the row for a name that did not resolve says to
+      restart saneless.
+    - A host that was refusing this machine, was not listening, or did not
+      answer is dialled again on every listing: ``connect_dev`` closes and
+      resets the connection whenever connecting or the opening handshake
+      fails.  Those rows say press Check again.
+    - A healthy host with nothing visible on it is the state a dropped entry
+      leaves behind, so that row, and the rows for a scanner that was not
+      found, say to restart only conditionally: "If saneless devices lists
+      it, restart saneless".  That is true on both surfaces.
+      ``saneless devices`` and ``saneless doctor`` run in fresh processes,
+      while the web server's libsane may be stale: when the status strip is
+      red but ``saneless devices`` lists the scanner, the server's libsane is
+      what is wrong, and when ``doctor`` is red ``saneless devices`` shows the
+      same nothing, which points the reader at the scanner instead.
+
+    A host that must not be enumerated -- timed out or refused -- gets the
+    same row the preflight returns for it, so the two can never disagree.
+
+    Rows interpolate counts and ``_device_label`` output only.  The
+    configured id and the listed device ids are compared, never rendered,
+    because they are LAN addresses on a LAN-visible page (ASVS V7).
+
+    Args:
+        probes: What each configured host's probe found, in configured order;
+            empty when no host is configured.
+        enumeration: What the gated half of the check saw.
+        configured_device: The configured ``scanner.device``, possibly empty.
+
+    Returns:
+        Exactly one result for ``CheckKey.SCANNER``.
+
+    """
+    if any(_blocks_enumeration(probe.outcome) for probe in probes):
+        return _scanner_host_unanswered(probes)
+    subject = _scanner_ready_subject(enumeration, configured_device)
+    if subject is None:
+        return _scanner_unusable_row(probes, configured_device)
+    unchosen = 0 if configured_device else len(enumeration.devices)
+    return _scanner_ready_row(probes, subject, unchosen)
 
 
 def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight:
