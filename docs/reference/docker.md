@@ -309,7 +309,7 @@ services:
       - SANELESS_SCANNER__HOST=192.168.1.50
 ```
 
-saneless injects this value into `SANE_NET_HOSTS` before initializing the SANE backend, enabling automatic scanner discovery inside the container.
+saneless injects this value into `SANE_NET_HOSTS`, unless `SANE_NET_HOSTS` is already set to a non-empty value, before initializing the SANE backend, enabling automatic scanner discovery inside the container.
 
 For detailed setup instructions, see [Scanner Host Discovery](../how-to/scanner-host-discovery.md).
 
