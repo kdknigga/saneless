@@ -111,8 +111,10 @@ logger = logging.getLogger(__name__)
 # is dialled, and all of them together get this much.  So it bounds one
 # configured host, and nothing else.  Name resolution runs before it and is
 # not inside it -- `getaddrinfo` takes no timeout, so an unreachable resolver
-# costs whatever `resolv.conf` says -- and with N configured hosts the probe's
-# worst case is N times (resolution plus this budget).  The bound still
+# costs whatever `resolv.conf` says.  Once a connect succeeds, the handshake
+# has ``PROBE_HANDSHAKE_SECONDS`` of its own, so one host's worst case is
+# resolution plus this budget plus that one, and every configured host is
+# probed -- up to ``_MAX_PROBE_HOSTS`` of them.  The bound still
 # matters for the reason it always did: what it
 # replaces is `get_devices()`, which has no timeout at any layer and costs
 # roughly 127 s for a silently unreachable host, because Linux retries a SYN
@@ -177,9 +179,10 @@ _ASCII_DIGITS: Final = frozenset(digits)
 _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 
 # How many hosts one setting may put in front of the pre-probe.
-# ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
-# unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` for each, and that
-# walk runs inside the ``POST /api/checks/refresh`` request thread.  The
+# ``_scanner_preflight`` probes every entry, paying an unbounded
+# ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` plus
+# ``PROBE_HANDSHAKE_SECONDS`` for each, and those probes run inside the
+# ``POST /api/checks/refresh`` request thread.  The
 # manual-refresh floor in ``checks_cache.claim_manual_refresh`` bounds the
 # *rate* of those requests and says so; it cannot bound the duration of one, so
 # without this an uncapped setting is a request that can take minutes.
@@ -243,9 +246,9 @@ SKIPPED_STATE_LABEL: Final = "Not checked"
 # at length that an unreachable resolver costs whatever ``resolv.conf`` says,
 # and nothing bounds it.  The saned pre-probe pays that once per configured
 # host, up to ``_MAX_PROBE_HOSTS`` of them.  And the ordinary local-USB
-# deployment has no parseable host at all, so ``_scanner_preflight`` returns
-# ``None`` without dialling anything and ``_scanner_enumeration`` enters
-# ``get_devices()``, which this file costs at roughly 127 s for a silently
+# deployment has no parseable host at all, so ``_scanner_preflight`` hands
+# over to enumeration without dialling anything and ``_scanner_enumeration``
+# enters ``get_devices()``, which this file costs at roughly 127 s for a silently
 # unreachable host, inside a blocking C call nothing can interrupt.
 #
 # So what this cap means is narrower than it used to claim: ten attempts is the
@@ -259,11 +262,14 @@ POLL_ATTEMPT_CAP: Final = 10
 
 # How many times a strip may ask while a probe is demonstrably in flight --
 # that is, while some checker holds the refresher's single-flight lock.
-# Ninety attempts at the real two-second interval is about 180 s,
-# which exceeds the ~127 s worst-case ``get_devices()`` this file documents
-# plus both probe budgets (``PROBE_CONNECT_SECONDS`` for saned and
-# ``PROBE_READ_SECONDS`` for Paperless) with room left over for the pre-probe's
-# unbounded resolutions.  Below it, a cold start on a wedged scanner stopped
+# Ninety attempts at the real two-second interval is about 180 s.  The two
+# slow paths a first check can take are either/or, not both: with no host to
+# probe, ``get_devices()`` can cost the ~127 s this file documents; with
+# hosts, the saned pre-probe costs at most ``PROBE_CONNECT_SECONDS`` plus
+# ``PROBE_HANDSHAKE_SECONDS`` -- 7 s -- for each of up to ``_MAX_PROBE_HOSTS``,
+# so 28 s, and a host that could hang enumeration never reaches it.  Either
+# path plus ``PROBE_READ_SECONDS`` for Paperless leaves room for the
+# pre-probe's unbounded resolutions.  Below it, a cold start on a wedged scanner stopped
 # asking while its first probe was still running and told a household member to
 # press a button that starts the thing already running.
 #
@@ -792,10 +798,10 @@ def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
 
     On Linux a ``connect()`` to ``0.0.0.0`` reaches loopback, so one of those
     in the dial list lets any unrelated local process listening on 6566 make
-    ``any(...)`` true, suppress ``_scanner_host_unanswered`` and let the check
-    fall through to ``get_devices()`` -- reinstating the ~127 s uninterruptible
-    hang the pre-probe exists to avoid, on an appliance whose configured host
-    is in fact dead.
+    that entry HEALTHY or REJECTED instead of timed out or refused, and let
+    enumeration start -- reinstating the ~127 s uninterruptible hang the
+    pre-probe exists to avoid, on an appliance whose configured host is in
+    fact dead.
 
     The rule is in two steps.  If any dot-separated part is not a number glibc
     could read, the segment holds a letter outside a hex prefix and is a name,
@@ -851,8 +857,8 @@ def _looks_like_a_host_name(segment: str) -> bool:
     Being narrow is the safe direction.  A false "no" costs the pre-probe's
     latency saving and nothing else, because ``_saned_hosts`` then returns no
     entries and the scanner check falls through to ``get_devices()``.  A false
-    "yes" costs three junk dials and, through the pre-probe's
-    short circuit, a wrong verdict.
+    "yes" costs junk dials and, through the pre-probe, possibly a wrong
+    verdict.
 
     A segment glibc would read as a number is rejected for that reason and not
     for tidiness, and the rule is wider than "all digits" because glibc's
@@ -1019,10 +1025,10 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     only that one latency saving -- the trade the whole module is built on.
 
     **The cap.**  At most ``_MAX_PROBE_HOSTS`` -- four -- entries are returned,
-    taken from the front of the configured order.  ``_scanner_preflight`` walks
-    them with ``any(...)``, paying an unbounded ``getaddrinfo`` plus
-    ``PROBE_CONNECT_SECONDS`` for each, inside the ``POST /api/checks/refresh``
-    request thread; the manual-refresh floor bounds how often that request may
+    taken from the front of the configured order.  ``_scanner_preflight``
+    probes every one of them, paying an unbounded ``getaddrinfo`` plus
+    ``PROBE_CONNECT_SECONDS`` plus ``PROBE_HANDSHAKE_SECONDS`` for each,
+    inside the ``POST /api/checks/refresh`` request thread; the manual-refresh floor bounds how often that request may
     be made and not how long one of them takes, so the length of this tuple is
     the only place the duration can be bounded.  A longer setting
     loses the pre-probe for its tail rather than losing the bound, which is the
@@ -1087,108 +1093,6 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     return tuple(
         (host, SANED_PORT) for host in present if _looks_like_a_host_name(host)
     )[:_MAX_PROBE_HOSTS]
-
-
-def _saned_reachable(host: str, port: int, timeout: float) -> bool:
-    """
-    Say whether a TCP connection to a saned host can be established in time.
-
-    There is no other reachability probe anywhere in this tree, and this one
-    exists because there is nowhere else to put a bound.
-    ``SaneBackend.get_devices()`` (``sane_backend.py:2036-2078``) calls into
-    libsane, which has no timeout parameter at any layer -- not in
-    python-sane, not in ``sane_get_devices(3)``, and not settable from Python.
-    With the ``net`` backend that call opens a TCP connection to each entry of
-    ``SANE_NET_HOSTS``, so an unplugged host is a connect that hangs until the
-    kernel gives up: on Linux ``tcp_syn_retries`` defaults to 6, roughly 127
-    seconds, inside a blocking C call nothing can interrupt.  Dialling the same
-    address first, with a timeout, is the only bound available.
-
-    The port is 6566, IANA's ``sane-port``, verified in ``/etc/services``.
-
-    **What the budget covers.**  Every address the name resolved to, in
-    resolver order, and all of them together.  The budget is a *deadline*,
-    read once before the walk rather than handed to each socket, so every
-    attempt gets only what the attempts before it left over and a host with
-    three addresses costs no more than a host with one.  That property is
-    wanted, and it is kept.
-
-    An earlier version got it by dialling only the resolver's first answer,
-    and that was a strict regression, for a reason that lives in the resolver
-    rather than in the handshake.  ``getaddrinfo`` is called with no
-    ``AI_ADDRCONFIG``, so glibc returns AAAA records even on a host with no
-    IPv6 route, and RFC 6724 orders the IPv6 address first -- measured on this
-    machine, ``localhost`` resolves to ``::1`` and then ``127.0.0.1``.  saned
-    commonly binds v4-only.  So the justification offered for one address --
-    "the answer for a host that is switched off is the same on every address
-    it has" -- was true of the case that does not matter and false of the one
-    that does: a host that is *on*, answering over one family and not the
-    other, was reported dead, permanently, on an appliance that scans
-    perfectly well.
-
-    Resolution itself is outside the budget and is left that way deliberately.
-    ``getaddrinfo`` takes no timeout, so bounding it means running it on a
-    thread and abandoning the thread when the deadline passes.  That is the
-    same trade the scanner check refuses for the enumeration: a
-    thread parked in a C call that nothing can interrupt is worse than a slow
-    answer, because it is still in there after the caller has moved on.  An
-    unreachable resolver therefore costs whatever ``resolv.conf`` says, and
-    that is stated rather than claimed away.
-
-    **Failure policy.**  This returns ``False`` for every ``OSError`` --
-    refused, timed out, unresolvable, no route -- and raises nothing.  An
-    empty resolver answer is covered by the same promise without a guard of
-    its own: the walk holds no subscript, so nothing to dial is a loop body
-    that never runs.  Subscripting the resolver's first answer raised
-    ``IndexError`` there, which is not an ``OSError`` and so escaped into
-    ``run_checks``' generic red row.  It is
-    the *caller* that decides what a ``False`` means, and the caller never
-    turns "the probe could not be run at all" into a bad row: when
-    ``_saned_hosts`` yields no entries to dial, no probe happens and the
-    scanner check falls back to ``get_devices()``, which is exactly the
-    behaviour that existed before this module.  A probe that actually ran and
-    was refused on every configured entry produces ``WARN``, not ``FAIL`` --
-    it establishes that the configured host did not answer, which is not the
-    same claim as "there is no scanner" (see ``_scanner_host_unanswered``)
-    -- and in that state ``get_devices()`` would spend two minutes reaching a
-    less useful version of the same observation.
-
-    Args:
-        host: The host name or address to dial.
-        port: The TCP port to dial.
-        timeout: How long to wait for the handshake, in seconds.
-
-    Returns:
-        True when the connection was established, False otherwise.
-
-    """
-    try:
-        candidates = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        # Logged at DEBUG, not WARNING: a name that does not resolve is the
-        # ordinary state of an appliance whose scanner host is switched off or
-        # misspelled, and the row the caller renders is where an operator is
-        # told about it.  ``type(exc).__name__`` only -- no host, no address
-        # and no exception text reaches a log line or a row (ASVS V7).
-        logger.debug("saned pre-probe did not resolve: %s", type(exc).__name__)
-        return False
-    deadline = monotonic() + timeout
-    for family, socket_type, protocol, _canonical_name, address in candidates:
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            # The budget is spent, so the addresses left over do not get one.
-            return False
-        try:
-            with socket.socket(family, socket_type, protocol) as probe:
-                probe.settimeout(remaining)
-                probe.connect(address)
-                return True
-        except OSError as exc:
-            # One address refusing says nothing about the next one: this is
-            # exactly the dual-stack case where the IPv6 address the resolver
-            # put first has no listener and the IPv4 address does.
-            logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
-    return False
 
 
 class _SanedOutcome(StrEnum):
@@ -1458,6 +1362,250 @@ def _probe_saned(
     return outcome
 
 
+@dataclass(frozen=True, slots=True)
+class _HostProbe:
+    """
+    One configured saned host and what its pre-probe found.
+
+    The host is kept only so enumeration can match a configured ``net:``
+    device to the host it lives on.  It is never rendered and never logged:
+    rows interpolate counts, not hosts (ASVS V7).
+
+    Attributes:
+        host: The configured entry that was dialled.
+        outcome: What the probe learnt about it.
+
+    """
+
+    host: str
+    outcome: _SanedOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class _ScannerPreflight:
+    """
+    What the gate-free preflight hands to enumeration when it cannot decide.
+
+    Carrying the backend here, already narrowed to not-``None``, is how both
+    type checkers learn that enumeration has one without a cast.
+
+    Attributes:
+        scanner: The scanner backend enumeration will ask.
+        probes: One entry per configured saned host, in configured order;
+            empty when no host is configured or none could be parsed.
+
+    """
+
+    scanner: ScannerBackend
+    probes: tuple[_HostProbe, ...]
+
+
+def _outcome_severity(outcome: _SanedOutcome) -> int:
+    """
+    Rank a probe outcome, so several hosts can be reported by the worst one.
+
+    Most severe first: timed out, refused, unresolved, rejected, healthy.
+    The two outcomes that stop the scanner being checked at all come first,
+    timed out above refused because a refused host is at least up.
+    Unresolved comes next, because it is the only fast outcome whose fix
+    needs a config edit and a restart.  Rejected is last among the problems:
+    the host is up, saned is up, and one line in its ``saned.conf`` fixes it.
+
+    A ``match`` rather than a table, so a new outcome stops type-checking
+    here until it is ranked.
+
+    Args:
+        outcome: What one probe found.
+
+    Returns:
+        A rank: higher is worse, and ``HEALTHY`` is 0.
+
+    Raises:
+        AssertionError: If the value is not a ``_SanedOutcome`` member.
+
+    """
+    match outcome:
+        case _SanedOutcome.HEALTHY:
+            severity = 0
+        case _SanedOutcome.REJECTED:
+            severity = 1
+        case _SanedOutcome.UNRESOLVED:
+            severity = 2
+        case _SanedOutcome.REFUSED:
+            severity = 3
+        case _SanedOutcome.TIMED_OUT:
+            severity = 4
+        case _:
+            assert_never(outcome)
+    return severity
+
+
+def _blocks_enumeration(outcome: _SanedOutcome) -> bool:
+    """
+    Say whether a host with this outcome must keep the check out of libsane.
+
+    A timed-out host must, and that includes a peer that accepted the
+    connection and then said nothing: libsane has no read timeout at any
+    layer -- its net backend's connect timeout is cleared once the connect
+    succeeds (``connect_dev`` in ``backend/net.c``) -- so ``get_devices()``
+    would wait on that host for as long as it stays silent, inside a C call
+    nothing can interrupt.
+
+    A refused host must as well, for a different reason.  Refused is what a
+    scanner host restarting its saned looks like, and libsane's net backend
+    keeps one control connection per host open between enumerations.  When
+    that connection has been lost, ``sane_get_devices`` does not check the
+    failed call's status and goes on to read a reply that was never filled
+    in, which crashes the process.  Enumerating a refused host that was
+    connected earlier would be a new way into that crash.
+
+    Rejected and unresolved hosts return at once inside libsane, and
+    enumeration is how the check learns whether a usable scanner is visible
+    anyway, so they do not block it.
+
+    Args:
+        outcome: What one probe found.
+
+    Returns:
+        True for ``TIMED_OUT`` and ``REFUSED``.
+
+    Raises:
+        AssertionError: If the value is not a ``_SanedOutcome`` member.
+
+    """
+    match outcome:
+        case _SanedOutcome.TIMED_OUT | _SanedOutcome.REFUSED:
+            blocks = True
+        case _SanedOutcome.UNRESOLVED | _SanedOutcome.REJECTED | _SanedOutcome.HEALTHY:
+            blocks = False
+        case _:
+            assert_never(outcome)
+    return blocks
+
+
+def _worst_outcome(probes: tuple[_HostProbe, ...]) -> _SanedOutcome:
+    """
+    Pick the most severe outcome among the probed hosts.
+
+    Args:
+        probes: What each configured host's probe found.
+
+    Returns:
+        The outcome ``_outcome_severity`` ranks highest, or ``HEALTHY`` when
+        nothing was probed.
+
+    """
+    return max(
+        (probe.outcome for probe in probes),
+        key=_outcome_severity,
+        default=_SanedOutcome.HEALTHY,
+    )
+
+
+def _hosts_subject(count: int, total: int) -> tuple[str, bool]:
+    """
+    Name the hosts a row is about, without naming any host.
+
+    Args:
+        count: How many hosts share the outcome being reported.
+        total: How many hosts were probed.
+
+    Returns:
+        The subject of the row's sentence, and whether its verb is plural.
+        One probed host is "the scanner host"; several are counted, as in
+        "1 of 2 scanner hosts".
+
+    """
+    if total == 1:
+        return "the scanner host", False
+    return f"{count} of {total} scanner hosts", count > 1
+
+
+def _host_problem_clause(outcome: _SanedOutcome, subject: str, *, plural: bool) -> str:
+    """
+    Say what a probe outcome means, as the start of a row's sentence.
+
+    Args:
+        outcome: The outcome being reported.
+        subject: Who it is about, from ``_hosts_subject``.
+        plural: Whether ``subject`` takes a plural verb.
+
+    Returns:
+        A clause starting lower-case, with no full stop.
+
+    Raises:
+        AssertionError: If the value is not a ``_SanedOutcome`` member.
+
+    """
+    match outcome:
+        case _SanedOutcome.TIMED_OUT:
+            clause = (
+                f"{subject} are not answering"
+                if plural
+                else f"{subject} is not answering"
+            )
+        case _SanedOutcome.REFUSED:
+            clause = (
+                f"{subject} are on, but their scanner service is not running"
+                if plural
+                else f"{subject} is on, but its scanner service is not running"
+            )
+        case _SanedOutcome.UNRESOLVED:
+            clause = f"{subject} could not be found by name"
+        case _SanedOutcome.REJECTED:
+            clause = (
+                f"{subject} are refusing this machine"
+                if plural
+                else f"{subject} is refusing this machine"
+            )
+        case _SanedOutcome.HEALTHY:
+            clause = f"{subject} are answering" if plural else f"{subject} is answering"
+        case _:
+            assert_never(outcome)
+    return clause
+
+
+def _host_problem_next_step(outcome: _SanedOutcome) -> str:
+    """
+    Return what to do about one probe outcome.
+
+    Each state was measured against a real saned: a host that was refusing
+    this machine, not listening, or not answering is picked up again by the
+    next enumeration in the same process, so pressing Check again is honest
+    advice for all three.  A name that did not resolve is different.
+    libsane's net backend resolves each ``SANE_NET_HOSTS`` entry once, at the
+    first enumeration, and drops one it cannot resolve for the life of the
+    process (``add_device`` in ``backend/net.c``), so that fix needs a
+    restart.
+
+    Args:
+        outcome: The outcome being reported.
+
+    Returns:
+        A next step, or the empty string when there is nothing to do.
+
+    Raises:
+        AssertionError: If the value is not a ``_SanedOutcome`` member.
+
+    """
+    match outcome:
+        case _SanedOutcome.TIMED_OUT:
+            next_step = "Check the scanner host is switched on and on the network, then press Check again."
+        case _SanedOutcome.REFUSED:
+            next_step = "Start saned on the scanner host, or check it is listening on the network, then press Check again."
+        case _SanedOutcome.UNRESOLVED:
+            next_step = (
+                "Check [scanner] host in the config file, then restart saneless."
+            )
+        case _SanedOutcome.REJECTED:
+            next_step = "Add this machine to saned.conf on the scanner host, then press Check again."
+        case _SanedOutcome.HEALTHY:
+            next_step = ""
+        case _:
+            assert_never(outcome)
+    return next_step
+
+
 def _directory_accepts_a_write(path: Path) -> bool:
     """
     Say whether a directory will actually take a file, by putting one there.
@@ -1661,55 +1809,66 @@ def _scanner_unreachable() -> CheckResult:
     )
 
 
-def _scanner_host_unanswered() -> CheckResult:
+def _scanner_host_unanswered(probes: tuple[_HostProbe, ...]) -> CheckResult:
     """
-    Build the "the configured scanner host did not answer" row.
+    Build the row for a scanner host the check must not enumerate.
+
+    This is the row for timed-out and refused hosts -- a peer that accepted
+    the connection and then said nothing counts as timed out -- and only for
+    them: ``_blocks_enumeration`` says why each of those is kept out of
+    libsane.  With several hosts it reports the worst outcome among them, by
+    ``_outcome_severity``, and how many of the hosts share it, so one dead
+    host beside a healthy one is still visible.
 
     Amber, not red, and the distinction is the whole point.  What the
     pre-probe observed is a fact about the *configured host*, not about the
     appliance: ``SANE_NET_HOSTS`` **adds** net devices to what the dll backend
-    enumerates, it does not replace local backend enumeration
-    (``sane_backend.py:876`` only sets the variable), so "every configured
-    sane-net host refused TCP" never implied "there is no scanner".  A machine
-    with a working USB scanner and a switched-off network one scans perfectly,
-    and a true statement about a deployment that still works is amber -- the
-    same shape as the read-only-configuration Profiles row.  Reporting it red
-    would break the rule ``CheckState``'s own docstring states outright: a
-    healthy appliance must never go red.
+    enumerates, it does not replace local backend enumeration (``SaneBackend``
+    only sets the variable), so "a configured sane-net host is dead" never
+    implied "there is no scanner".  A machine with a working USB scanner and a
+    switched-off network one scans perfectly, and a true statement about a
+    deployment that still works is amber -- the same shape as the
+    read-only-configuration Profiles row.  Reporting it red would break the
+    rule ``CheckState``'s own docstring states outright: a healthy appliance
+    must never go red.
 
     The cost is recorded rather than hidden.  An appliance whose *only*
-    scanner is an unreachable network host now reports amber, so ``saneless
-    doctor`` exits 0 for it.  That is accepted: a scripted gate is keyed on
-    red alone by design, the row is still visible, it still names the scanner
-    host as the thing that did not answer, and it still carries the same next
-    step, so a human loses nothing.  Getting the red back means bounding
-    ``get_devices()`` on a second thread, which cannot be done safely while
-    ``sane_get_devices`` is uninterruptible.  A thread past its deadline is
-    still inside libsane after the caller has returned and released the gate,
-    which breaks the gate's one-caller-inside-libsane rule, and
+    scanner is a timed-out or refused network host reports amber, so
+    ``saneless doctor`` exits 0 for it.  That is accepted: a scripted gate is
+    keyed on red alone by design, the row is still visible, it still names the
+    scanner host as the thing that is wrong, and it still carries the next
+    step that fixes it, so a human loses nothing.  Getting the red back means
+    bounding ``get_devices()`` on a second thread, which cannot be done safely
+    while ``sane_get_devices`` is uninterruptible.  A thread past its deadline
+    is still inside libsane after the caller has returned and released the
+    gate, which breaks the gate's one-caller-inside-libsane rule, and
     ``scanner.close()`` would then run ``sane_exit()`` with a SANE call still
     outstanding -- a segfault risk.  Making it safe needs a helper thread that
     owns the gate itself and that the refresher's shutdown can see.
 
-    Neither string names the host, its address or its port.  A LAN address on
-    a LAN-visible page is the same class of disclosure as the SANE device id
-    ``_device_label`` refuses to print (ASVS V7).
+    Neither string names a host, its address or its port; the only thing
+    interpolated is a count.  A LAN address on a LAN-visible page is the same
+    class of disclosure as the SANE device id ``_device_label`` refuses to
+    print (ASVS V7).
+
+    Args:
+        probes: What each configured host's probe found; at least one of them
+            blocks enumeration.
 
     Returns:
         The amber Scanner row, with ``skipped`` false -- the probe was run,
-        and it answered.
+        and what it found is the row.
 
     """
+    worst = _worst_outcome(probes)
+    count = sum(1 for probe in probes if probe.outcome is worst)
+    subject, plural = _hosts_subject(count, len(probes))
+    clause = _host_problem_clause(worst, subject, plural=plural)
     return CheckResult(
         key=CheckKey.SCANNER,
         state=CheckState.WARN,
-        message=(
-            "The configured scanner host is not answering, "
-            "so the scanner could not be checked."
-        ),
-        next_step=(
-            "Check the scanner is switched on and connected, then press Check again."
-        ),
+        message=f"{clause[:1].upper()}{clause[1:]}, so the scanner could not be checked.",
+        next_step=_host_problem_next_step(worst),
     )
 
 
@@ -1811,50 +1970,54 @@ def _scanner_support_missing() -> CheckResult:
     )
 
 
-def _scanner_preflight(context: CheckContext) -> CheckResult | None:
+def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight:
     """
-    Decide the scanner row without entering SANE, or say the backend is needed.
+    Decide the scanner row without entering SANE, or hand over to enumeration.
 
     This is everything the scanner check can settle before libsane is touched,
     and it is a separate function so it can run with the worker's scanner gate
-    **free**.  Nothing here is SANE work: it is a settings read, a
-    name resolution and a TCP handshake.  That matters because resolution is
-    outside every budget this module states -- ``getaddrinfo`` takes no
-    timeout, as ``PROBE_CONNECT_SECONDS`` says at length -- so a check holding
-    the gate across it can park a ``ScanWorker._scan_job`` whose job row
-    already reads ``SCANNING`` for as long as a broken resolver takes, and
-    ``POST /api/checks/refresh`` can re-arm that parking every couple of
-    seconds.
+    **free**.  Nothing here is SANE work: it is a settings read, name
+    resolution and the opening of the SANE network handshake.  That matters
+    because resolution is outside every budget this module states --
+    ``getaddrinfo`` takes no timeout, as ``PROBE_CONNECT_SECONDS`` says at
+    length -- so a check holding the gate across it can park a
+    ``ScanWorker._scan_job`` whose job row already reads ``SCANNING`` for as
+    long as a broken resolver takes, and ``POST /api/checks/refresh`` can
+    re-arm that parking every couple of seconds.
 
     The order inside it is the order ``_check_scanner`` always had.  A machine
-    with no python-sane is its own row and is decided without
-    touching anything.  The host SANE will actually dial is then pre-probed,
-    and every configured entry refusing a TCP connection ends the check right
-    there, with the amber ``_scanner_host_unanswered`` row: ``get_devices()``
-    would spend about two minutes reaching a conclusion inside a C call
-    nothing can interrupt, and the conclusion it would reach is not
-    the one the probe is entitled to report.  A refused dial says the
-    configured host did not answer; it does not say there is no scanner,
-    because ``SANE_NET_HOSTS`` adds net devices rather than replacing local
-    enumeration.
+    with no python-sane is its own row and is decided without touching
+    anything.  Then **every** configured host SANE will dial is probed with
+    ``_probe_saned``, with no short circuit: libsane dials every entry, so a
+    dead second host costs its full uninterruptible connect inside
+    ``get_devices()`` however well the first one answers.  If any host timed
+    out -- including one that accepted the connection and said nothing -- or
+    refused, the check ends right there with the amber
+    ``_scanner_host_unanswered`` row, and ``_blocks_enumeration`` says why
+    neither may be enumerated.  Rejected, unresolved and healthy hosts, and a
+    setting with no host to probe, go on to enumeration.
 
     Args:
         context: The injected dependencies and configuration.
 
     Returns:
-        The row, when it can be decided here; ``None`` to mean "go and
-        enumerate", which is the case where there is no host to probe or one
-        of them answered.
+        The row, when it can be decided here; otherwise what enumeration
+        needs, which is the backend and what each host's probe found.
 
     """
-    if context.scanner is None:
+    scanner = context.scanner
+    if scanner is None:
         return _scanner_support_missing()
-    entries = _saned_hosts(_saned_host_setting(context.settings))
-    if entries and not any(
-        _saned_reachable(host, port, PROBE_CONNECT_SECONDS) for host, port in entries
-    ):
-        return _scanner_host_unanswered()
-    return None
+    probes = tuple(
+        _HostProbe(
+            host,
+            _probe_saned(host, port, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS),
+        )
+        for host, port in _saned_hosts(_saned_host_setting(context.settings))
+    )
+    if any(_blocks_enumeration(probe.outcome) for probe in probes):
+        return _scanner_host_unanswered(probes)
+    return _ScannerPreflight(scanner=scanner, probes=probes)
 
 
 def _scanner_enumeration(context: CheckContext) -> CheckResult:
@@ -1926,10 +2089,11 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     enumeration, in that order, which is the order this check has always had
     -- the split changed where the gate sits, not what any caller sees.
 
-    ``if pre is not None`` rather than a truthiness shortcut: ``CheckResult``
-    is a frozen dataclass and therefore always truthy, so ``pre or
-    _scanner_enumeration(context)`` would read as a bug even though it would
-    work.
+    An ``isinstance`` test against ``CheckResult`` rather than a truthiness
+    shortcut: the preflight returns either a finished row or what enumeration
+    needs, and both are frozen dataclasses and therefore always truthy.  The
+    ``isinstance`` test is also what lets both type checkers narrow ``pre``
+    without a cast.
 
     Args:
         context: The injected dependencies and configuration.
@@ -1939,7 +2103,7 @@ def _check_scanner(context: CheckContext) -> CheckResult:
 
     """
     pre = _scanner_preflight(context)
-    if pre is not None:
+    if isinstance(pre, CheckResult):
         return pre
     return _scanner_enumeration(context)
 
@@ -2256,12 +2420,12 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     enumeration is the only thing any check does inside libsane.  What matters
     is the size of the gated region: the pre-probe runs *first*,
     with the gate free, and only ``_scanner_enumeration`` is held.  The
-    pre-probe is a name resolution and a TCP handshake, and resolution is
-    outside every budget this module states, so holding the gate across it
-    could park a ``ScanWorker._scan_job`` whose job row already reads
-    ``SCANNING`` for as long as a broken resolver takes.  A pre-probe that
-    settles the row -- no python-sane, or every configured host refusing --
-    therefore never touches the gate at all.
+    pre-probe is name resolution and the opening of the SANE network
+    handshake, and resolution is outside every budget this module states, so
+    holding the gate across it could park a ``ScanWorker._scan_job`` whose job
+    row already reads ``SCANNING`` for as long as a broken resolver takes.  A
+    pre-probe that settles the row -- no python-sane, or a configured host
+    that timed out or refused -- therefore never touches the gate at all.
 
     The attempt is non-blocking and a failure is reported rather than waited
     out, which is the single move ``ScanWorker.scanner_gate`` documents as
@@ -2285,7 +2449,7 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     ``test_a_gated_run_returns_what_an_ungated_run_returns`` in
     ``tests/test_checks.py`` -- and that is where anyone changing either half
     should look.  It is parametrised over the four contexts whose rows differ:
-    no python-sane, a configured host that refuses the pre-probe,
+    no python-sane, a configured host that does not answer the pre-probe,
     a host that answers and enumerates one device, and an enumeration that
     raises.  The first two are decided before the gate is reached and the last
     one leaves through ``run_checks``' handler with the gate released in a
@@ -2301,7 +2465,7 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
 
     """
     pre = _scanner_preflight(context)
-    if pre is not None:
+    if isinstance(pre, CheckResult):
         return pre
     if not scanner_gate.acquire(blocking=False):
         return _scanner_busy()
