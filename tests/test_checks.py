@@ -74,6 +74,7 @@ from saneless.config import (
 from saneless.exceptions import ScanError
 from saneless.paperless import PaperlessClient
 from saneless.scanner.base import DeviceInfo
+from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
     ConnectionStatus,
     ProfileStorage,
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from saneless.config import ConfigDiscovery
+    from saneless.scanner.base import DeviceCapabilities, ScannerBackend
 
 # Loopback connects resolve or refuse immediately, so a short budget keeps a
 # hung test from burning the suite's 60 s timeout.
@@ -1903,7 +1905,13 @@ class TestImportHygiene:
 
 
 class _CountingBackend(StubScannerBackend):
-    """A backend that reports what it is told to and counts the times it is asked."""
+    """
+    A backend that reports what it is told to and counts the times it is asked.
+
+    Both ways the Scanner check can enter SANE are counted: ``calls`` for a
+    device listing and ``opens`` for opening a device, which is what
+    ``get_capabilities`` does on the real backend.
+    """
 
     def __init__(self, devices: list[DeviceInfo] | None = None) -> None:
         """
@@ -1915,6 +1923,7 @@ class _CountingBackend(StubScannerBackend):
         """
         self.devices = devices if devices is not None else []
         self.calls = 0
+        self.opens = 0
 
     def get_devices(self) -> list[DeviceInfo]:
         """
@@ -1927,13 +1936,49 @@ class _CountingBackend(StubScannerBackend):
         self.calls += 1
         return self.devices
 
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Count the open, then answer the way the plain stub does.
 
-class _RaisingBackend(StubScannerBackend):
+        Args:
+            device_id: The device being opened.
+
+        Returns:
+            The stub's capabilities.
+
+        """
+        self.opens += 1
+        return super().get_capabilities(device_id)
+
+
+class _UnopenableBackend(_CountingBackend):
+    """A backend that lists what it is told to and cannot open any device."""
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Count the open, then fail it the way a missing device fails.
+
+        Args:
+            device_id: The device being opened.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ScanError: Always, with text that must not reach a row or a log.
+
+        """
+        self.opens += 1
+        msg = f"cannot open {device_id}"
+        raise ScanError(msg)
+
+
+class _RaisingBackend(_CountingBackend):
     """A backend whose enumeration fails the way a wedged SANE fails."""
 
     def __init__(self) -> None:
-        """Start with no calls recorded."""
-        self.calls = 0
+        """Start with no calls and no opens recorded."""
+        super().__init__()
 
     def get_devices(self) -> list[DeviceInfo]:
         """
@@ -1951,6 +1996,12 @@ class _RaisingBackend(StubScannerBackend):
         raise ScanError(msg)
 
 
+# The id ``_device()`` reports, and the ``scanner.device`` ``_settings()``
+# configures, so a "ready" test goes down the path where the configured device
+# is listed rather than the one where it has to be opened to be found.
+_DEVICE_ID: Final = "net:scanbox.lan:brother5:bus0;dev1"
+
+
 def _device(vendor: str = "Brother", model: str = "ADS-2700W") -> DeviceInfo:
     """
     Build a DeviceInfo whose SANE id names a host, as a net-backend id does.
@@ -1964,7 +2015,7 @@ def _device(vendor: str = "Brother", model: str = "ADS-2700W") -> DeviceInfo:
 
     """
     return DeviceInfo(
-        name="net:scanbox.lan:brother5:bus0;dev1",
+        name=_DEVICE_ID,
         vendor=vendor,
         model=model,
         device_type="scanner",
@@ -2144,7 +2195,7 @@ def _settings(
         resolved.mkdir(exist_ok=True)
         data_dir = str(resolved)
     settings = Settings(
-        scanner=ScannerConfig(host=host, device="test:device:001"),
+        scanner=ScannerConfig(host=host, device=_DEVICE_ID),
         paperless=PaperlessConfig(
             url="http://paperless:8000", token=token, consume_dir=consume_dir
         ),
@@ -2339,6 +2390,35 @@ _REFUSED_NEXT_STEP: Final = (
 # probe-every-entry rule have something to count.
 _TWO_HOSTS: Final = "scanbox-a.lan:scanbox-b.lan"
 
+# The two surfaces that show the Scanner row: ``saneless doctor``, which runs
+# the ungated check, and the status strip, which runs it under the scanner gate.
+_SURFACES: Final = ("doctor", "strip")
+
+
+def _scanner_row_on(surface: str, context: CheckContext) -> CheckResult:
+    """
+    Run the Scanner check the way one surface runs it.
+
+    Args:
+        surface: ``"doctor"`` for the ungated check, ``"strip"`` for the full
+            registry run with a free scanner gate handed in.
+        context: The context to check.
+
+    Returns:
+        The Scanner row that surface would show.
+
+    Raises:
+        ValueError: If ``surface`` is not one of ``_SURFACES``.
+
+    """
+    if surface == "doctor":
+        return checks._check_scanner(context)
+    if surface == "strip":
+        gate = cast("threading.Lock", _RecordingLock())
+        return _row(run_checks(context, scanner_gate=gate), CheckKey.SCANNER)
+    msg = f"unknown surface: {surface}"
+    raise ValueError(msg)
+
 
 class TestScannerCheck:
     """The Scanner row, including the pre-probe that keeps it fast (APPL-02)."""
@@ -2391,34 +2471,274 @@ class TestScannerCheck:
         assert "scanbox.lan" not in row.message
         assert "net:" not in row.message
 
-    def test_no_devices_is_not_reachable(self, tmp_path: Path) -> None:
+    def test_no_devices_and_no_host_is_no_scanner_found(self, tmp_path: Path) -> None:
         """
-        A backend that finds nothing is reported as not reachable.
+        A backend that finds nothing, with no host to blame, finds no scanner.
 
         Args:
             tmp_path: The test's own directory.
 
         """
-        results = run_checks(_context(_settings(tmp_path), scanner=_CountingBackend()))
+        settings = _with_device(_settings(tmp_path), "")
+        results = run_checks(_context(settings, scanner=_CountingBackend()))
         row = _row(results, CheckKey.SCANNER)
         assert row.state is CheckState.FAIL
-        assert row.message == "Not reachable."
-        assert row.next_step == (
-            "Check the scanner is switched on and connected, then press Check again."
+        assert row.message == "No scanner was found."
+        assert row.next_step == _NOTHING_FOUND_NEXT
+        assert "Not reachable" not in row.message
+
+    def test_a_raising_backend_finds_no_scanner(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        An enumeration that throws is a red row and a log line, not a crash.
+
+        The log line carries the exception's type and nothing from its text,
+        which is where a device id or a host would be.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: pytest's log capture.
+
+        """
+        settings = _with_device(_settings(tmp_path), "")
+        backend = _RaisingBackend()
+        with caplog.at_level(logging.WARNING, logger="saneless.checks"):
+            results = run_checks(_context(settings, scanner=backend))
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.FAIL
+        assert row.message == "No scanner was found."
+        assert "Not reachable" not in row.message
+        assert backend.opens == 0
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.checks" and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "ScanError" in warnings[0]
+        assert "SANE is wedged" not in warnings[0]
+
+    def test_a_raising_backend_with_a_configured_device_that_opens_is_ready(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A pinned device that opens is usable even when listing fails.
+
+        A scan opens the configured id without listing anything first, so a
+        failed listing says nothing about whether that scan would work.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _RaisingBackend()
+        results = run_checks(_context(_settings(tmp_path), scanner=backend))
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.OK
+        assert row.message == "The configured scanner is ready."
+        assert backend.calls == 1
+        assert backend.opens == 1
+
+    def test_the_not_reachable_row_is_gone(self) -> None:
+        """
+        The old red row that blamed the scanner for every empty listing is gone.
+
+        Its advice, "switched on and connected ... press Check again", was
+        wrong for a host that refuses this machine, which was the case that
+        produced it.
+        """
+        assert not hasattr(checks, "_scanner_unreachable")
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_rejecting_host_with_nothing_listed_is_refusing_this_machine(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        """
+        The 2026-09-22 case reads as a denial, and names the file that grants access.
+
+        saned accepted the connection and then reset it during the opening
+        handshake, so enumeration found nothing.  The row used to say the
+        scanner was not reachable and to check it was switched on, which was
+        wrong on both counts.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REJECTED)
+        backend = _CountingBackend()
+        settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.calls == 1
+        assert row.state is CheckState.FAIL
+        assert row.message == "The scanner host is refusing this machine."
+        assert "saned.conf" in row.next_step
+        for text in (row.message, row.next_step):
+            assert "Not reachable" not in text
+            assert "switched on and connected" not in text
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_rejecting_host_beside_a_usable_scanner_is_amber(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        """
+        A scanner that works keeps the row out of red, whatever a host says.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REJECTED)
+        backend = _CountingBackend([_device()])
+        settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "Brother ADS-2700W is ready, but the scanner host is refusing this machine."
         )
+        assert row.next_step == _REJECTED_NEXT
 
-    def test_a_raising_backend_is_not_reachable(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_an_unresolved_host_is_enumerated_and_named(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
         """
-        An enumeration that throws is a red row, not a crash.
+        A name that did not resolve costs libsane nothing, so it is enumerated.
 
         Args:
             tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
 
         """
-        results = run_checks(_context(_settings(tmp_path), scanner=_RaisingBackend()))
-        row = _row(results, CheckKey.SCANNER)
+        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.UNRESOLVED)
+        backend = _CountingBackend()
+        settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.calls == 1
         assert row.state is CheckState.FAIL
-        assert row.message == "Not reachable."
+        assert row.message == "The scanner host could not be found by name."
+        assert row.next_step == _UNRESOLVED_NEXT
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
+            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
+        ],
+    )
+    def test_a_host_that_must_not_be_enumerated_is_neither_listed_nor_opened(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: checks._SanedOutcome,
+        surface: str,
+    ) -> None:
+        """
+        A refused or silent host never reaches libsane, not even to open a device.
+
+        The configured device is one the backend would not list, which is
+        exactly the case that would otherwise open it.  Enumerating a host
+        whose connection was lost can crash the process inside libsane, and
+        opening a device on it is no different.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            outcome: What the configured host answers.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        _recording_dialler(monkeypatch, outcome=outcome)
+        backend = _CountingBackend()
+        settings = _with_device(
+            _settings(tmp_path, host="scanbox.lan"), _LOCAL_DEVICE_ID
+        )
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.calls == 0
+        assert backend.opens == 0
+        assert row.state is CheckState.WARN
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_configured_device_that_is_not_listed_and_does_not_open_is_red(
+        self, tmp_path: Path, surface: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The configured device is the one checked, not whatever is listed first.
+
+        The log line for the failed open names the exception's type only:
+        neither the configured id nor the exception's text reaches it.
+
+        Args:
+            tmp_path: The test's own directory.
+            surface: Which of the two surfaces runs the check.
+            caplog: pytest's log capture.
+
+        """
+        backend = _UnopenableBackend([_device()])
+        settings = _with_device(_settings(tmp_path), _LOCAL_DEVICE_ID)
+        with caplog.at_level(logging.WARNING, logger="saneless.checks"):
+            row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.opens == 1
+        assert row.state is CheckState.FAIL
+        assert row.message == "The configured scanner was not found."
+        assert "saneless devices" in row.next_step
+        logged = " ".join(record.getMessage() for record in caplog.records)
+        assert "ScanError" in logged
+        assert _LOCAL_DEVICE_ID not in logged
+        assert "cannot open" not in logged
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    def test_a_configured_device_that_is_not_listed_but_opens_is_ready(
+        self, tmp_path: Path, surface: str
+    ) -> None:
+        """
+        SANE opens ids it never lists, so an unlisted device that opens is fine.
+
+        Args:
+            tmp_path: The test's own directory.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _with_device(_settings(tmp_path), _LOCAL_DEVICE_ID)
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.opens == 1
+        assert row.state is CheckState.OK
+        assert row.message == "The configured scanner is ready."
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    @pytest.mark.parametrize(
+        "device",
+        [
+            pytest.param(_DEVICE_ID, id="listed"),
+            pytest.param("", id="unset"),
+        ],
+    )
+    def test_no_device_is_opened_unless_the_configured_one_is_missing(
+        self, tmp_path: Path, device: str, surface: str
+    ) -> None:
+        """
+        The open is a fallback for an unlisted device, never a routine step.
+
+        Args:
+            tmp_path: The test's own directory.
+            device: The configured ``scanner.device``.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _with_device(_settings(tmp_path), device)
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
+        assert backend.opens == 0
+        assert row.state is CheckState.OK
+        assert row.message == "Brother ADS-2700W is ready."
 
     def test_no_scanner_support_is_its_own_row(self, tmp_path: Path) -> None:
         """
@@ -2692,8 +3012,10 @@ class TestScannerCheck:
         """
         An exported-but-empty variable is not a configured host.
 
-        ``sane_backend.py`` only treats a *set* variable as a host list, and an
-        empty one names nothing, so the setting is what remains.
+        The scanner backend and this check read the variable through one
+        helper, and that helper counts an exported empty value as unset: it
+        names no host, so the backend writes the configured host into it and
+        SANE dials that.  The probe therefore dials the configured host too.
 
         Args:
             tmp_path: The test's own directory.
@@ -2702,9 +3024,36 @@ class TestScannerCheck:
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "")
         dialled = _recording_dialler(monkeypatch)
-        settings = _settings(tmp_path, host="config-host")
+        settings = _settings(tmp_path, host="cfg-host")
         run_checks(_context(settings, scanner=_CountingBackend([_device()])))
-        assert dialled == [("config-host", SANED_PORT)]
+        assert dialled == [("cfg-host", SANED_PORT)]
+
+    @pytest.mark.parametrize(
+        "environment",
+        [
+            pytest.param(None, id="unset"),
+            pytest.param("", id="exported-empty"),
+            pytest.param("ext-host", id="exported"),
+        ],
+    )
+    def test_the_probe_and_sane_agree_on_the_host_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, environment: str | None
+    ) -> None:
+        """
+        The probe's host list is the one the scanner backend hands SANE.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            environment: What ``SANE_NET_HOSTS`` holds, or None for unset.
+
+        """
+        if environment is not None:
+            monkeypatch.setenv("SANE_NET_HOSTS", environment)
+        settings = _settings(tmp_path, host="cfg-host")
+        assert checks._saned_host_setting(settings) == effective_sane_net_hosts(
+            "cfg-host"
+        )
 
     @pytest.mark.parametrize(
         ("host", "outcomes", "expected"),
@@ -2969,27 +3318,34 @@ class TestScannerCheck:
             assert "6566" not in text
             assert "switched on and connected" not in text
 
+    @pytest.mark.parametrize("surface", _SURFACES)
     def test_an_enumeration_that_found_nothing_is_still_red(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
     ) -> None:
         """
         The amber row is only for the case where the probe replaced the enumeration.
 
         A probe that answered, followed by a backend reporting no devices, is
-        an enumeration that actually ran, so its verdict stands.
+        an enumeration that actually ran, so its verdict stands -- and it says
+        the host answered, because that rules the network out.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
 
         """
         _recording_dialler(monkeypatch)
         backend = _CountingBackend()
-        settings = _settings(tmp_path, host="scanbox.lan")
-        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
+        row = _scanner_row_on(surface, _context(settings, scanner=backend))
         assert backend.calls == 1
         assert row.state is CheckState.FAIL
-        assert row.message == "Not reachable."
+        assert row.message == (
+            "The scanner host is answering, but no scanner was found on it."
+        )
+        assert row.next_step == _HOST_ANSWERS_NOTHING_FOUND_NEXT
+        assert "Not reachable" not in row.message
 
     def test_a_reachable_host_whose_backend_raises_is_still_red(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3003,12 +3359,15 @@ class TestScannerCheck:
 
         """
         _recording_dialler(monkeypatch)
-        settings = _settings(tmp_path, host="scanbox.lan")
+        settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
         row = _row(
             run_checks(_context(settings, scanner=_RaisingBackend())), CheckKey.SCANNER
         )
         assert row.state is CheckState.FAIL
-        assert row.message == "Not reachable."
+        assert row.message == (
+            "The scanner host is answering, but no scanner was found on it."
+        )
+        assert "Not reachable" not in row.message
 
     def test_an_unparseable_host_still_reaches_the_backend(
         self, tmp_path: Path
@@ -3113,10 +3472,12 @@ class TestScannerCheckMultipleDevices:
             tmp_path: The test's own directory.
 
         """
-        settings = _with_device(_settings(tmp_path), "net:scanbox.lan:x")
-        backend = _CountingBackend([_device(), _rogue_device()])
+        settings = _with_device(_settings(tmp_path), _DEVICE_ID)
+        backend = _CountingBackend([_rogue_device(), _device()])
         row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
         assert row.state is CheckState.OK
+        assert row.message == "Brother ADS-2700W is ready."
+        assert backend.opens == 0
 
     def test_one_device_without_a_pin_multiple_devices_absent_stays_ok(
         self, tmp_path: Path
@@ -4541,6 +4902,37 @@ class _GateSamplingBackend(StubScannerBackend):
         return self.devices
 
 
+class _GateSamplingOpenBackend(_GateSamplingBackend):
+    """A backend that also samples the scanner gate while it opens a device."""
+
+    def __init__(self, probe: _GateProbe, devices: list[DeviceInfo]) -> None:
+        """
+        Report ``devices`` and count opens, sampling the gate on the way.
+
+        Args:
+            probe: The recorder the samples go to.
+            devices: What ``get_devices`` should return.
+
+        """
+        super().__init__(probe, devices)
+        self.opens = 0
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Sample the gate, then open the device the way the plain stub does.
+
+        Args:
+            device_id: The device being opened.
+
+        Returns:
+            The stub's capabilities.
+
+        """
+        self.opens += 1
+        self.probe.sample("open")
+        return super().get_capabilities(device_id)
+
+
 def _gate_sampling_dialler(
     monkeypatch: pytest.MonkeyPatch, probe: _GateProbe, *, outcome: checks._SanedOutcome
 ) -> list[tuple[str, int]]:
@@ -4833,7 +5225,9 @@ class TestRunChecksUnderTheScannerGate:
 
         """
 
-        def boom(_context: CheckContext) -> CheckResult:
+        def boom(
+            _scanner: ScannerBackend, _configured_device: str
+        ) -> checks._Enumeration:
             msg = "the scanner check exploded"
             raise RuntimeError(msg)
 
@@ -4908,6 +5302,41 @@ class TestRunChecksUnderTheScannerGate:
         assert probe.free_during["scanner"] is False
         assert _row(results, CheckKey.SCANNER).state is CheckState.OK
         assert gate.is_free() is True
+
+    def test_the_configured_device_is_opened_under_the_same_gate_hold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Opening an unlisted configured device is SANE work, so the gate covers it.
+
+        The open follows the listing inside one hold: one acquire, one
+        release, the gate held during both, and free during the pre-probe and
+        once the run returns.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to make the pre-probe sample the gate.
+
+        """
+        gate = _RecordingLock()
+        probe = _GateProbe(gate)
+        _gate_sampling_dialler(monkeypatch, probe, outcome=checks._SanedOutcome.HEALTHY)
+        backend = _GateSamplingOpenBackend(probe, [_device()])
+        settings = _with_device(_settings(tmp_path, host="scanbox"), _LOCAL_DEVICE_ID)
+        results = run_checks(
+            _context(settings, scanner=backend),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        assert backend.opens == 1
+        assert probe.free_during["pre-probe"] is True
+        assert probe.free_during["scanner"] is False
+        assert probe.free_during["open"] is False
+        assert gate.acquires == 1
+        assert gate.releases == 1
+        assert gate.is_free() is True
+        assert _row(results, CheckKey.SCANNER).message == (
+            "The configured scanner is ready."
+        )
 
     @pytest.mark.parametrize(
         "expected",
