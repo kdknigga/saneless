@@ -138,6 +138,17 @@
     font-weight: 700;
 }
 
+/* The message takes the space the glyph and name leave, and wraps inside it.
+   Left at the default flex basis, which is the message's width on one line, a
+   message longer than that space moved as a whole onto the next line even at
+   desktop width, so that one row's text started under its name while the
+   others' started beside theirs. A fixed basis moves it below only when fewer
+   than 15rem remain, which on a phone is every row, so the 320px layout, where
+   every message sits on its own line, is unchanged. */
+.check-message {
+    flex: 1 1 15rem;
+}
+
 /* The next step sits under its message rather than beside it, because the two
    together are one sentence a household member reads top to bottom. Muted and
    small: it is guidance, not a second verdict. */

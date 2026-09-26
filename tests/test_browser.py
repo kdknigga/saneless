@@ -73,6 +73,7 @@ from saneless.checks import (
     SKIPPED_STATE_LABEL,
     CheckKey,
     CheckState,
+    check_name,
     check_state_class,
     check_state_glyph,
     check_state_label,
@@ -3181,6 +3182,23 @@ _NAME_COLUMNS_TOO_NARROW = """
 """
 
 
+# Every row's name, the top of its name, the top of its message and the left
+# edge of its message, rounded to whole pixels.  A message that sits in its
+# column shares its name's top and every other message's left edge.
+_CHECK_MESSAGE_POSITIONS = """
+() => Array.from(document.querySelectorAll("#checks-body .check-row"), (row) => {
+    const name = row.querySelector(".check-name").getBoundingClientRect();
+    const message = row.querySelector(".check-message").getBoundingClientRect();
+    return [
+        row.querySelector(".check-name").textContent.trim(),
+        Math.round(name.top),
+        Math.round(message.top),
+        Math.round(message.left),
+    ];
+})
+"""
+
+
 def _check_row(page: Page, name: str) -> Locator:
     """
     Return the strip row whose name column reads exactly ``name``.
@@ -3246,6 +3264,32 @@ def stale_config_strip_server(
     candidates[2].with_name(LEGACY_CONFIG_FILENAME).write_text("", encoding="utf-8")
     settings = _browser_test_settings(tmp_path)
     settings._config_discovery = discover_config(candidates)
+    with _serve(settings, _BrowserTestScanner()) as server:
+        assert server.app.state.refresher.stop(), "the refresher thread did not stop"
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.fixture
+def refused_scanner_strip_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app whose scanner host refuses the connection.
+
+    The host is a loopback port that was bound and released, so the server's
+    own pre-probe is refused at once and the Scanner row is the amber refused
+    row, the longest message the strip carries.  Nothing leaves the machine:
+    the dial is the server's, to 127.0.0.1, and the browser never makes it.
+
+    The refresher is stopped for the reason ``cold_strip_server`` stops it.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port: int = probe.getsockname()[1]
+    base = _browser_test_settings(tmp_path)
+    scanner = base.scanner.model_copy(update={"host": f"127.0.0.1:{closed_port}"})
+    settings = base.model_copy(update={"scanner": scanner})
     with _serve(settings, _BrowserTestScanner()) as server:
         assert server.app.state.refresher.stop(), "the refresher thread did not stop"
         egress_allowlist.append(server.url)
@@ -3586,6 +3630,41 @@ class TestStatusStripInChromium:
 
         too_narrow = page.evaluate(_NAME_COLUMNS_TOO_NARROW)
         assert too_narrow == [], too_narrow
+
+    def test_a_long_message_stays_in_its_column_at_the_desktop_width(
+        self, page: Page, refused_scanner_strip_server: _BrowserServer
+    ) -> None:
+        """
+        The longest Scanner message wraps beside its name, not under it.
+
+        A message wider than the space beside the name used to move, as a
+        whole, onto its own line, so at 1280 px the refused row alone started
+        under its name while the other five started beside theirs.  Every
+        message has to start at one x and on its name's line, with nothing
+        scrolling sideways.
+        """
+        server = refused_scanner_strip_server
+        _probe_now(server)
+        page.set_viewport_size({"width": 1280, "height": 800})
+        page.goto(server.url)
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+        scanner = _check_row(page, check_name(CheckKey.SCANNER))
+        expect(scanner).to_contain_text("is on, but its scanner service is not running")
+        expect(scanner.locator(".check-glyph")).to_have_class(
+            re.compile(rf"\b{check_state_class(CheckState.WARN)}\b")
+        )
+
+        overflow = page.evaluate(
+            "() => document.documentElement.scrollWidth "
+            "- document.documentElement.clientWidth"
+        )
+        assert overflow <= 0, f"the page scrolls sideways by {overflow}px"
+        positions = page.evaluate(_CHECK_MESSAGE_POSITIONS)
+        assert len({left for _name, _top, _message_top, left in positions}) == 1, (
+            positions
+        )
+        for name, name_top, message_top, _left in positions:
+            assert message_top == name_top, (name, positions)
 
     def test_a_leftover_old_name_config_is_the_first_row_and_is_red(
         self, page: Page, stale_config_strip_server: _BrowserServer, tmp_path: Path
