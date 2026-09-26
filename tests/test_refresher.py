@@ -476,7 +476,7 @@ def test_a_gate_held_by_another_checker_is_not_a_running_scan(
 
 
 def test_a_gate_held_by_another_checker_stores_a_row_naming_no_scan(
-    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    default_settings: Settings,
 ) -> None:
     """
     R2-WR-02: the row a lost gate actually stores, from the real registry.
@@ -497,17 +497,15 @@ def test_a_gate_held_by_another_checker_stores_a_row_naming_no_scan(
 
     The context carries a stub backend deliberately.  With no scanner at all
     the check would decide the row before the gate was ever reached, and the
-    case would pass vacuously.  ``SANE_NET_HOSTS`` is cleared for the same
-    reason ``test_checks.py`` clears it: an exported value on the developer's
+    case would pass vacuously.  ``SANE_NET_HOSTS`` is cleared by the suite's
+    own fixture in ``tests/conftest.py``: an exported value on the developer's
     machine would redirect the pre-probe and make the verdict depend on the
     host the suite runs on.
 
     Args:
         default_settings: Settings whose every path is test-safe.
-        monkeypatch: Used to clear the ambient ``SANE_NET_HOSTS``.
 
     """
-    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
     gate = threading.Lock()
     refresher, cache = _build(
         default_settings, _FakeClock(), gate, scanner=StubScannerBackend()

@@ -103,24 +103,6 @@ def _record_require_sane() -> None:
     _REQUIRE_SANE_CALLS.append("called")
 
 
-@pytest.fixture(autouse=True)
-def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Keep the developer's own ``SANE_NET_HOSTS`` out of every test in this file.
-
-    The Scanner check probes every host SANE will dial, and a non-empty
-    exported value wins over ``scanner.host``.  The tests here that run the
-    real registry configure no host, so with the variable exported they would
-    dial whatever machine the developer or CI image points it at, and their
-    verdict would depend on whether that machine answered.
-
-    Args:
-        monkeypatch: pytest's environment patcher.
-
-    """
-    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-
-
 class _ReadyScanner(StubScannerBackend):
     """A backend reporting one device, so the scanner check can come out OK."""
 

@@ -136,25 +136,6 @@ def _refuse_temp_files_in(monkeypatch: pytest.MonkeyPatch, folder: Path) -> None
     monkeypatch.setattr("saneless.checks.tempfile.NamedTemporaryFile", refusing)
 
 
-@pytest.fixture(autouse=True)
-def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Keep the developer's own ``SANE_NET_HOSTS`` out of every test in this file.
-
-    The scanner check reads the environment before it reads ``scanner.host``,
-    because ``_ensure_initialised`` does (``sane_backend.py:876-883``).  That
-    is the behaviour under test, and it is also a way for the suite's verdict
-    to depend on the machine it runs on: a developer or CI image with the
-    variable exported would silently redirect every pre-probe here.  The cases
-    that want it set say so with ``monkeypatch.setenv`` in their own body.
-
-    Args:
-        monkeypatch: pytest's environment patcher.
-
-    """
-    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-
-
 # The real saned probe, kept before any test replaces it, so the probe's own
 # tests can still reach it by name.
 _REAL_PROBE_SANED: Final = checks._probe_saned

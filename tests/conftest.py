@@ -151,6 +151,50 @@ def _suite_leaves_cwd_config_alone() -> Iterator[None]:
         pytest.fail(f"the test suite created or modified {path}")
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _no_ambient_sane_net_hosts_for_the_session() -> Iterator[None]:
+    """
+    Keep the developer's own ``SANE_NET_HOSTS`` away from the whole suite.
+
+    The Scanner check probes the hosts SANE will dial, and a non-empty
+    exported ``SANE_NET_HOSTS`` wins over ``scanner.host``.  With the
+    variable exported in a developer's shell or a CI image, every check that
+    runs the real registry would dial the machines it names -- real network
+    traffic -- and its verdict would depend on whether they answered.
+
+    Session-scoped as well as per test, because the per-test fixture cannot
+    reach a session-scoped server: the browser suite's server starts before
+    any function-scoped fixture runs, and its check refresher reads the
+    environment on every tick, including the first one at start-up.  The
+    variable is restored when the session ends.
+
+    Yields:
+        Nothing; the variable is restored after the last test.
+
+    """
+    with pytest.MonkeyPatch.context() as session_patch:
+        session_patch.delenv("SANE_NET_HOSTS", raising=False)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Start every test with ``SANE_NET_HOSTS`` unset.
+
+    The session fixture above clears the developer's value once; this one
+    also keeps a value an earlier test left behind -- set directly, or
+    written by the scanner backend during SANE initialisation -- out of the
+    next test's body.  A test that wants the variable set says so with
+    ``monkeypatch.setenv`` in its own body.
+
+    Args:
+        monkeypatch: pytest's environment patcher.
+
+    """
+    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+
+
 def reset_sane_process_state() -> None:
     """
     Return SANE to "never initialised, not wedged" for the next test.
