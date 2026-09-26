@@ -2117,6 +2117,9 @@ class _RaisingBackend(_CountingBackend):
 # is listed rather than the one where it has to be opened to be found.
 _DEVICE_ID: Final = "net:scanbox.lan:brother5:bus0;dev1"
 
+# A configured device that is not a ``net:`` device, as a USB scanner is.
+_LOCAL_DEVICE_ID: Final = "epson2:libusb:001:004"
+
 
 def _device(vendor: str = "Brother", model: str = "ADS-2700W") -> DeviceInfo:
     """
@@ -3334,21 +3337,43 @@ class TestScannerCheck:
         assert backend.calls == 1
         assert "could not be checked" not in row.message
 
-    def test_no_configured_host_is_never_pre_probed(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "device",
+        [
+            pytest.param(_LOCAL_DEVICE_ID, id="usb-device-configured"),
+            pytest.param("", id="no-device-configured"),
+        ],
+    )
+    def test_a_usb_deployment_with_no_host_is_never_pre_probed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str
+    ) -> None:
         """
         A USB deployment has no TCP to probe, so the backend runs directly.
 
-        This is also the fallback that cannot produce a false FAIL: when there
-        is no entry to dial, no probe runs and the check behaves exactly as it
-        did before the probe existed.
+        No host is configured and the configured device, if any, is not a
+        ``net:`` device, so there is no entry to dial and nothing is dialled.
+        This is also the fallback that cannot produce a false FAIL: the check
+        behaves exactly as it did before the probe existed.
 
         Args:
             tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            device: The configured ``scanner.device``.
 
         """
-        backend = _CountingBackend([_device()])
-        results = run_checks(_context(_settings(tmp_path, host=""), scanner=backend))
+        dialled = _recording_dialler(monkeypatch)
+        usb_device = DeviceInfo(
+            name=_LOCAL_DEVICE_ID,
+            vendor="Epson",
+            model="DS-530",
+            device_type="scanner",
+        )
+        backend = _CountingBackend([usb_device])
+        settings = _with_device(_settings(tmp_path, host=""), device)
+        results = run_checks(_context(settings, scanner=backend))
+        assert dialled == []
         assert backend.calls == 1
+        assert backend.opens == 0
         assert _row(results, CheckKey.SCANNER).state is CheckState.OK
 
     def test_the_configured_host_is_dialled_when_the_environment_is_unset(
@@ -3902,7 +3927,6 @@ _CONFIGURED_MISSING_NEXT: Final = "Check it is switched on and connected. If san
 _HOST_ANSWERS_NOTHING_FOUND_NEXT: Final = "Check the scanner is switched on and connected to the scanner host. If saneless devices lists it, restart saneless."
 _NOTHING_FOUND_NEXT: Final = "Check the scanner is switched on and connected, then press Check again. If saneless devices lists it, restart saneless."
 
-_LOCAL_DEVICE_ID: Final = "epson2:libusb:001:004"
 _UNLISTED_ESCL_ID: Final = "escl:http://10.0.0.5:80"
 
 
