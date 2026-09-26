@@ -2199,8 +2199,8 @@ class SaneBackend(ScannerBackend):
     (``get_devices``), because a listing on a lost net control connection
     kills the process that makes it.  The Scanner health check's open of an
     unlisted configured device happens in that same child
-    (``list_and_open``), so this backend keeps no ``open_and_close`` of its
-    own: the health check never opens a device in this process.
+    (``list_and_open``), and so does ``open_and_close``: the health check
+    never opens a device in this process.
 
     The device handles this process opens itself, to scan or to read
     capabilities, go through a context manager that ensures cancel() and
@@ -2468,6 +2468,34 @@ class SaneBackend(ScannerBackend):
             configured_opened=reply.opened,
             open_error=reply.open_error.type_name if reply.open_error else None,
         )
+
+    def open_and_close(self, device_id: str) -> None:
+        """
+        Open a device and close it again, in a short-lived listing child.
+
+        The base class's default opens through ``get_capabilities``, in this
+        process, where the open and close logging of ``_open_device`` names
+        the device and carries the exception's text.  That breaks the rule
+        the base class sets for this method, so the open happens in a listing
+        child instead, through ``list_and_open``.  The child opens the id
+        only when its own listing does not include it: a listed device is
+        taken as reachable, as the Scanner health check takes it.
+
+        Args:
+            device_id: SANE device identifier string.
+
+        Raises:
+            ListingCrashedError: The listing child died from a signal.
+            ListingTimedOutError: The listing child did not finish in time.
+            ScanError: If a previous read has not returned, in which case no
+                child is started; if the child gave no usable answer; or if
+                the open failed, naming the failure's class only.
+
+        """
+        survey = self.list_and_open(device_id)
+        if survey.configured_opened is False:
+            msg = f"Could not open the scanner ({survey.open_error})"
+            raise ScanError(msg)
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """

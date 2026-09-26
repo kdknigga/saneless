@@ -1363,16 +1363,50 @@ class TestTheMainProcessNeverLists:
         assert str(exc_info.value) == expected
         assert not has_control_characters(str(exc_info.value))
 
-    def test_the_backend_has_no_main_process_open_and_close(self) -> None:
+    def test_open_and_close_opens_only_in_the_listing_child(
+        self,
+        fake_sane_module: FakeSaneModule,
+        listing_seam: ListingSeam,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """
-        The real backend opens a device for the Scanner check only in its child.
+        The real backend's open-and-close runs in a listing child.
 
-        The check's open happens inside ``list_and_open``'s listing child, so
-        ``SaneBackend`` keeps no ``open_and_close`` of its own that would open
-        the device in this process.  The base default is left for test
-        doubles.
+        The base default opens through ``get_capabilities``, in this process,
+        where this backend's own open and close logging can name the device.
         """
-        assert "open_and_close" not in SaneBackend.__dict__
+        _ = fake_sane_module  # side-effect: patches the sane module
+
+        def open_in_this_process(*_args: object) -> NoReturn:
+            msg = "opened a device in this process"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(SaneBackend, "_open_device", open_in_this_process)
+        backend = SaneBackend(host="scanbox.lan")
+
+        backend.open_and_close(_NET_DEVICE)
+
+        assert listing_seam.calls[-1] == (
+            ListingRequest(open=_NET_DEVICE),
+            "scanbox.lan",
+        )
+
+    def test_a_failed_open_in_the_child_is_a_scan_error_naming_no_device(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The error carries the failure's class name, never the id or its text."""
+        monkeypatch.setattr(
+            sane_backend_mod,
+            "sane",
+            FakeSaneModule(
+                devices=[], open_error=FakeSaneError(f"cannot reach {_NET_DEVICE}")
+            ),
+        )
+
+        with pytest.raises(ScanError) as failed:
+            SaneBackend().open_and_close(_NET_DEVICE)
+
+        assert str(failed.value) == "Could not open the scanner (FakeSaneError)"
 
     def test_the_seam_refuses_to_start_real_libsane(self) -> None:
         """With no fake patched in, a listing fails the test instead of running."""
