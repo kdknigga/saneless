@@ -175,7 +175,7 @@ _REAL_CHILD_FILE = listing._CHILD_FILE
 # is what is tested.  The stand-in's ``init`` writes to fd 1 the two ways C
 # code does: through C stdio, which holds the text in its buffer until the
 # process exits, and straight to the descriptor, with no newline.
-_PRINTING_BACKEND_CHILD = """\
+_PRINTING_BACKEND_SETUP = """\
 import ctypes
 import os
 import runpy
@@ -199,8 +199,13 @@ sane = types.ModuleType("sane")
 sane.init = init
 sane.get_devices = get_devices
 sys.modules["sane"] = sane
+"""
+
+_RUN_REAL_CHILD = """\
 runpy.run_path(os.environ["LISTING_TEST_REAL_CHILD"], run_name="__main__")
 """
+
+_PRINTING_BACKEND_CHILD = _PRINTING_BACKEND_SETUP + _RUN_REAL_CHILD
 
 # Runs the real child script over a stand-in ``sane`` module whose ``init``
 # leaves behind a teardown step that crashes, as a library destructor or an
@@ -236,6 +241,17 @@ sane.get_devices = get_devices
 sys.modules["sane"] = sane
 runpy.run_path(os.environ["LISTING_TEST_REAL_CHILD"], run_name="__main__")
 """
+
+# Runs the real child script as a program whose stderr is closed, over the
+# printing stand-in ``sane`` module above.  Python started with fd 2 closed
+# sets ``sys.stderr`` to None, and one whose fd 2 was closed later keeps a
+# stream on a dead descriptor; the parametrised line picks which.  Either way
+# fd 2 is the lowest free descriptor, so a plain ``dup`` of fd 1 lands there.
+# The close comes after the setup's imports: ``import ctypes`` keeps a
+# descriptor of its own open, which would otherwise take the free fd 2.
+_CLOSED_STDERR_CHILD = (
+    _PRINTING_BACKEND_SETUP + "os.close(2)\n{stderr_line}\n" + _RUN_REAL_CHILD
+)
 
 
 def _use_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str) -> Path:
@@ -408,6 +424,30 @@ class TestHappyPath:
 
         assert reply == ListingReply(devices=(_TEST_DEVICE,))
         assert "backend chatter with no newline" in capfd.readouterr().err
+
+    @pytest.mark.parametrize(
+        "stderr_line",
+        ["sys.stderr = None", "pass"],
+        ids=["no-stderr-stream", "stale-stderr-stream"],
+    )
+    def test_a_closed_stderr_does_not_lose_the_reply(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stderr_line: str
+    ) -> None:
+        """
+        A child with no stderr still answers, and keeps its reply's pipe.
+
+        The child inherits saneless's stderr, which is closed when saneless
+        was started with ``2>&-`` or by a supervisor that closes the
+        standard descriptors.  What the scanner library prints is then
+        discarded rather than written into the reply.
+        """
+        monkeypatch.setenv("LISTING_TEST_REAL_CHILD", str(_REAL_CHILD_FILE))
+        source = _CLOSED_STDERR_CHILD.format(stderr_line=stderr_line)
+        _use_child(monkeypatch, tmp_path, source)
+
+        reply = run_listing_child(ListingRequest(), configured_host="")
+
+        assert reply == ListingReply(devices=(_TEST_DEVICE,))
 
     def test_a_crash_after_the_reply_is_written_does_not_lose_it(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

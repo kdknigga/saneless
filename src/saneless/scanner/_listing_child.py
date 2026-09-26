@@ -54,7 +54,9 @@ duplicates it to a descriptor of its own and points fd 1 at stderr, so
 whatever python-sane or a backend prints lands in the log.  C code shares fd 1
 with Python, and when fd 1 is a pipe C stdio holds its output until the
 process exits, well after the reply was written: left on the reply's pipe, a
-single ``printf`` in any backend would turn a good reply into no answer.
+single ``printf`` in any backend would turn a good reply into no answer.  A
+child whose stderr is closed first opens fd 2 on ``/dev/null``, so that output
+is discarded and the reply still reaches the parent.
 
 Every python-sane call is wrapped in ``except Exception``, never
 ``BaseException``, and its failure travels back as data.  So the child ends
@@ -89,6 +91,12 @@ _BAD_REQUEST: Final = 2
 
 _DEVICE_FIELDS: Final = 4
 """How many fields a listed device has: name, vendor, model and type."""
+
+_STDOUT_FD: Final = 1
+"""The descriptor C code and Python's ``sys.stdout`` write to."""
+
+_STDERR_FD: Final = 2
+"""The descriptor the child inherits as saneless's stderr."""
 
 
 class SaneDevice(Protocol):
@@ -289,14 +297,40 @@ def _private_reply_channel() -> TextIO:
     """
     Take the parent's stdout pipe for the reply, and point fd 1 at stderr.
 
+    The child inherits saneless's stderr, which is closed when saneless was
+    started with it closed.  Then fd 2 is first opened on ``/dev/null``: left
+    free, it would be the lowest free descriptor, so the reply's own copy
+    would land on it and fd 1 would be pointed straight back at the reply's
+    pipe.  What the scanner library prints is then discarded.
+
     Returns:
         A text stream on a new descriptor for the parent's pipe.  From here
         on, anything written to fd 1, by Python or by C code, reaches stderr.
 
     """
-    reply_fd = os.dup(sys.stdout.fileno())
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    try:
+        os.fstat(_STDERR_FD)
+    except OSError:
+        sink = os.open(os.devnull, os.O_WRONLY)
+        if sink != _STDERR_FD:
+            os.dup2(sink, _STDERR_FD)
+            os.close(sink)
+    reply_fd = os.dup(_STDOUT_FD)
+    os.dup2(_STDERR_FD, _STDOUT_FD)
     return os.fdopen(reply_fd, "w", encoding="ascii")
+
+
+def _flush_standard_streams() -> None:
+    """
+    Flush Python's stdout and stderr, as far as they can be flushed.
+
+    Either stream is None when the child started with its descriptor closed,
+    and a failed flush must not cost the reply that is already written.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.flush()
 
 
 if __name__ == "__main__":
@@ -306,6 +340,5 @@ if __name__ == "__main__":
     # libraries' teardown: a crash or a hang in a destructor or an exit hook
     # would otherwise turn a listing that worked into a failed one.  The
     # kernel closes the sockets and USB handles, and a saned sees EOF.
-    sys.stdout.flush()
-    sys.stderr.flush()
+    _flush_standard_streams()
     os._exit(status)
