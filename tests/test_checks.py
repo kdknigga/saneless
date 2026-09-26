@@ -4035,9 +4035,8 @@ _LISTING_TIMED_OUT_NEXT: Final = "Check the scanner, and its scanner host if it 
 # which is what the status strip's layout is already known to hold.
 _LONGEST_SCANNER_MESSAGE: Final = _UNPROBED_DEVICE_MESSAGE
 
-# The two listing failures, by value, so the table below can name them.
-_CRASHED: Final = "crashed"
-_LISTING_TIMED_OUT: Final = "timed_out"
+_CRASHED: Final = checks._ListingFailure.CRASHED
+_LISTING_TIMED_OUT: Final = checks._ListingFailure.TIMED_OUT
 
 _UNPROBED_NET_ID: Final = "net:[fe80::1]:brother5:bus0;dev1"
 
@@ -4093,8 +4092,7 @@ class _VerdictCase:
         message: The row's expected message.
         next_step: The row's expected next step.
         withheld: Whether the configured device was deliberately not opened.
-        failure: The value of the listing failure the enumeration reports,
-            or ``None`` when the listing completed.
+        failure: How the listing failed, or ``None`` when it completed.
 
     """
 
@@ -4106,7 +4104,7 @@ class _VerdictCase:
     message: str
     next_step: str
     withheld: bool = False
-    failure: str | None = None
+    failure: checks._ListingFailure | None = None
 
 
 _VERDICT_CASES: Final = [
@@ -4558,9 +4556,7 @@ def _verdict(case: _VerdictCase) -> CheckResult:
             devices=case.devices,
             configured_opened=case.opened,
             open_withheld=case.withheld,
-            failure=(
-                None if case.failure is None else checks._ListingFailure(case.failure)
-            ),
+            failure=case.failure,
         ),
         case.configured,
     )
