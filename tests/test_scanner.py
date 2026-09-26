@@ -15,19 +15,24 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, NamedTuple, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, cast
 
 import pytest
 from PIL import Image, ImageDraw
 
+import saneless
 import saneless.cli as cli_module
 import saneless.scanner as scanner_pkg
+import saneless.scanner.base as scanner_base
 import saneless.scanner.sane_backend as sane_backend_mod
 import saneless.web.app as app_module
 from saneless import checks
 from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
+    ListingCrashedError,
+    ListingTimedOutError,
     ScanError,
     ScanInterrupted,
 )
@@ -43,11 +48,12 @@ from saneless.scanner.base import (
     SourceKind,
     classify_source,
 )
+from saneless.scanner.listing import ListingRequest
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
-from tests.conftest import images_of, reset_sane_process_state
+from tests.conftest import StubScannerBackend, images_of, reset_sane_process_state
 from tests.fake_sane import (
     FakeSaneDev,
     FakeSaneError,
@@ -58,8 +64,9 @@ from tests.fake_sane import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
-    from pathlib import Path
     from types import FrameType, ModuleType
+
+    from tests.conftest import ListingSeam
 
 # The backend module's own logger, for the tests that read what it reported.
 _BACKEND_LOGGER = "saneless.scanner.sane_backend"
@@ -1089,6 +1096,414 @@ class TestSaneBackendGetDevices:
         assert devices[0].vendor == "TestVendor"
         assert devices[0].model == "TestModel"
         assert devices[0].device_type == "scanner"
+
+
+# A device id the fake never lists, shaped like the ids the Scanner check opens.
+_NET_DEVICE = "net:scanbox.lan:test:0"
+
+# The one device the stand-in child reports, as the backend returns it.
+_STAND_IN_DEVICE = DeviceInfo(
+    name="stand:in", vendor="Stand", model="In", device_type="virtual device"
+)
+
+# A stand-in listing child: it reads the request and reports one device.
+_STAND_IN_CHILD = """\
+import sys
+
+sys.stdin.readline()
+sys.stdout.write(
+    '{"devices": [["stand:in", "Stand", "In", "virtual device"]]}' + "\\n"
+)
+"""
+
+
+def _raise(error: Exception) -> Callable[..., NoReturn]:
+    """
+    Build a stand-in listing launcher that raises ``error``.
+
+    Args:
+        error: What every listing raises.
+
+    Returns:
+        A launcher accepting any arguments.
+
+    """
+
+    def launch(*_args: object, **_kwargs: object) -> NoReturn:
+        raise error
+
+    return launch
+
+
+class TestTheMainProcessNeverLists:
+    """
+    Scanners are listed in a child process, never in this one.
+
+    Listing in the process that already holds libsane's net control
+    connections is what crashes it, once a scanner host's saned has restarted.
+    So no module calls python-sane's ``get_devices``, and ``SaneBackend``
+    hands both its listing and the Scanner check's list-then-open to its
+    launcher.  The suite's seam runs that launcher's child logic in this
+    process over the fake; the runtime guard below puts the real launcher
+    back to show the fake is never asked.
+    """
+
+    def test_the_main_process_never_lists_in_process_static(self) -> None:
+        """
+        Only the child script calls ``get_devices`` on anything but a backend.
+
+        Structural rather than textual, as the interpreter-exit test above is:
+        docstrings name ``sane_get_devices`` freely.  The receivers allowed
+        are the names the scan path, the worker, the CLI and the checks give
+        a ``ScannerBackend``, and ``self`` inside a backend.
+        """
+        package = Path(saneless.__file__).parent
+        child = package / "scanner" / "_listing_child.py"
+        receivers = {
+            f"{path.relative_to(package)}: {ast.unparse(node.func.value)}"
+            for path in sorted(package.rglob("*.py"))
+            if path != child
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_devices"
+        }
+        allowed = {"scanner", "self._scanner", "self"}
+
+        assert receivers, "the walk found no get_devices call at all"
+        assert {
+            receiver
+            for receiver in receivers
+            if receiver.partition(": ")[2] not in allowed
+        } == set()
+
+    def test_the_main_process_never_lists_in_process_runtime(
+        self,
+        fake_sane_module: FakeSaneModule,
+        stand_in_listing_child: Callable[[str], Path],
+    ) -> None:
+        """
+        A real backend over the fake lists through a real child process.
+
+        The fake is patched in and would answer with its own device, so the
+        stand-in's device coming back, with the fake never asked, is what
+        shows the listing left this process.
+        """
+        stand_in_listing_child(_STAND_IN_CHILD)
+
+        devices = SaneBackend(host="scanbox.lan").get_devices()
+
+        assert devices == [_STAND_IN_DEVICE]
+        assert fake_sane_module.get_devices_call_count == 0
+
+    def test_list_and_open_opens_an_unlisted_device_and_closes_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An id the listing lacks is opened, cancelled and closed once."""
+        device = FakeSaneDev()
+        monkeypatch.setattr(
+            sane_backend_mod, "sane", FakeSaneModule(device=device, devices=[])
+        )
+
+        survey = SaneBackend().list_and_open(_NET_DEVICE)
+
+        assert survey == scanner_base.DeviceSurvey(devices=(), configured_opened=True)
+        assert device.cancel_calls == 1
+        assert device.close_calls == 1
+
+    def test_list_and_open_reports_a_failed_open_by_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The open's failure comes back as its class name, and no text."""
+        monkeypatch.setattr(
+            sane_backend_mod,
+            "sane",
+            FakeSaneModule(devices=[], open_error=FakeSaneError("Invalid argument")),
+        )
+
+        survey = SaneBackend().list_and_open(_NET_DEVICE)
+
+        assert survey.devices == ()
+        assert survey.list_error is None
+        assert survey.configured_opened is False
+        assert survey.open_error == "FakeSaneError"
+
+    def test_list_and_open_reports_a_failed_listing_by_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A listing that raised leaves no devices and its class name."""
+        monkeypatch.setattr(
+            sane_backend_mod,
+            "sane",
+            FakeSaneModule(get_devices_error=RuntimeError("boom")),
+        )
+
+        survey = SaneBackend().list_and_open("")
+
+        assert survey.devices == ()
+        assert survey.list_error == "RuntimeError"
+        assert survey.configured_opened is None
+        assert survey.open_error is None
+
+    def test_list_and_open_does_not_open_a_listed_device(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An id the listing already has is not opened at all."""
+        device = FakeSaneDev()
+        monkeypatch.setattr(
+            sane_backend_mod,
+            "sane",
+            FakeSaneModule(
+                device=device, devices=[(_NET_DEVICE, "Vendor", "Model", "scanner")]
+            ),
+        )
+
+        survey = SaneBackend().list_and_open(_NET_DEVICE)
+
+        assert survey.devices == (
+            DeviceInfo(
+                name=_NET_DEVICE, vendor="Vendor", model="Model", device_type="scanner"
+            ),
+        )
+        assert survey.configured_opened is None
+        assert device.close_calls == 0
+
+    def test_the_configured_host_reaches_the_child_for_list_and_open(
+        self,
+        fake_sane_module: FakeSaneModule,
+        listing_seam: ListingSeam,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The child's host is the one the backend was built with.
+
+        Not whatever this process's environment holds at the moment: a value
+        changed after the backend was built does not reach the listing.
+        """
+        _ = fake_sane_module  # side-effect: patches the sane module
+        backend = SaneBackend(host="scanbox.lan")
+
+        backend.get_devices()
+        assert listing_seam.calls[-1] == (ListingRequest(), "scanbox.lan")
+
+        monkeypatch.setenv("SANE_NET_HOSTS", "other.lan")
+        backend.get_devices()
+        assert listing_seam.calls[-1] == (ListingRequest(), "scanbox.lan")
+
+        backend.list_and_open(_NET_DEVICE)
+        assert listing_seam.calls[-1] == (
+            ListingRequest(open=_NET_DEVICE),
+            "scanbox.lan",
+        )
+        backend.list_and_open("")
+        assert listing_seam.calls[-1] == (ListingRequest(), "scanbox.lan")
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ListingCrashedError(
+                "The scanner library failed while listing scanners (SIGSEGV)"
+            ),
+            ListingTimedOutError(
+                "The scanner library did not finish listing scanners in time (30 s)"
+            ),
+        ],
+        ids=["crashed", "timed-out"],
+    )
+    def test_a_failed_child_propagates_from_get_devices_and_list_and_open(
+        self,
+        sane_backend: SaneBackend,
+        monkeypatch: pytest.MonkeyPatch,
+        error: ScanError,
+    ) -> None:
+        """A crashed or stopped child is raised as it is, never re-wrapped."""
+        monkeypatch.setattr(
+            sane_backend_mod, "_launch_listing", _raise(error), raising=False
+        )
+
+        with pytest.raises(type(error)) as listed:
+            sane_backend.get_devices()
+        assert listed.value is error
+        with pytest.raises(type(error)) as surveyed:
+            sane_backend.list_and_open(_NET_DEVICE)
+        assert surveyed.value is error
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            pytest.param("boom", "Could not list scanners: boom", id="plain"),
+            pytest.param(
+                "boom\n  again", "Could not list scanners: boom again", id="multiline"
+            ),
+            pytest.param(
+                "red \x1b[31mboom",
+                "Could not list scanners: red \\x1b[31mboom",
+                id="escape",
+            ),
+        ],
+    )
+    def test_a_listing_error_from_the_child_is_a_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch, message: str, expected: str
+    ) -> None:
+        """
+        The child's reported error is normalised and defused, then raised.
+
+        The text came from libsane, which can repeat what a LAN peer sent, so
+        a control character in it is escaped before it reaches any sink.
+        """
+        monkeypatch.setattr(
+            sane_backend_mod,
+            "sane",
+            FakeSaneModule(get_devices_error=FakeSaneError(message)),
+        )
+
+        with pytest.raises(ScanError) as exc_info:
+            SaneBackend().get_devices()
+
+        assert str(exc_info.value) == expected
+        assert not has_control_characters(str(exc_info.value))
+
+    def test_the_backend_keeps_its_own_open_and_close(self) -> None:
+        """
+        The Scanner check's main-process open is still the backend's own.
+
+        The base default opens through ``get_capabilities``, which logs the
+        device id when a close fails, so the check must not fall through to it
+        while it still calls ``open_and_close``.
+        """
+        assert "open_and_close" in SaneBackend.__dict__
+
+    def test_the_seam_refuses_to_start_real_libsane(self) -> None:
+        """With no fake patched in, a listing fails the test instead of running."""
+        assert sane_backend_mod.sane is None
+
+        with pytest.raises(AssertionError, match="must not start real libsane"):
+            sane_backend_mod._launch_listing(ListingRequest(), configured_host="")
+
+
+class _SurveyedBackend(StubScannerBackend):
+    """A stub whose listing and open are scripted and whose opens are recorded."""
+
+    def __init__(
+        self,
+        devices: list[DeviceInfo] | None = None,
+        *,
+        list_error: Exception | None = None,
+        open_error: Exception | None = None,
+    ) -> None:
+        """
+        Script the listing and the open.
+
+        Args:
+            devices: What ``get_devices`` returns.
+            list_error: What ``get_devices`` raises instead, if anything.
+            open_error: What ``open_and_close`` raises, if anything.
+
+        """
+        self.devices = devices or []
+        self.list_error = list_error
+        self.open_error = open_error
+        self.opened: list[str] = []
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Return the scripted devices, or raise the scripted error.
+
+        Returns:
+            A copy of the scripted devices.
+
+        Raises:
+            Exception: The scripted ``list_error``.
+
+        """
+        if self.list_error is not None:
+            raise self.list_error
+        return list(self.devices)
+
+    def open_and_close(self, device_id: str) -> None:
+        """
+        Record the open, and raise the scripted error if there is one.
+
+        Args:
+            device_id: The device opened.
+
+        Raises:
+            Exception: The scripted ``open_error``.
+
+        """
+        self.opened.append(device_id)
+        if self.open_error is not None:
+            raise self.open_error
+
+
+_LISTED = DeviceInfo(name="listed:0", vendor="V", model="M", device_type="scanner")
+
+
+class TestTheBaseListAndOpen:
+    """The base ``list_and_open``: list, then open an unlisted id, as two calls."""
+
+    def test_list_and_open_with_no_id_opens_nothing(self) -> None:
+        """No configured id means no open."""
+        backend = _SurveyedBackend([_LISTED])
+
+        survey = backend.list_and_open("")
+
+        assert survey == scanner_base.DeviceSurvey(devices=(_LISTED,))
+        assert backend.opened == []
+
+    def test_list_and_open_opens_an_unlisted_id_once(self) -> None:
+        """An id missing from the listing is opened once."""
+        backend = _SurveyedBackend([_LISTED])
+
+        survey = backend.list_and_open("absent:0")
+
+        assert survey.configured_opened is True
+        assert survey.open_error is None
+        assert backend.opened == ["absent:0"]
+
+    def test_list_and_open_does_not_open_a_listed_id(self) -> None:
+        """An id the listing has is not opened."""
+        backend = _SurveyedBackend([_LISTED])
+
+        survey = backend.list_and_open("listed:0")
+
+        assert survey.configured_opened is None
+        assert backend.opened == []
+
+    def test_list_and_open_reports_a_failed_open_by_type(self) -> None:
+        """The open's failure is its class name."""
+        backend = _SurveyedBackend([], open_error=ScanError("Could not open"))
+
+        survey = backend.list_and_open("absent:0")
+
+        assert survey.configured_opened is False
+        assert survey.open_error == "ScanError"
+
+    def test_list_and_open_reports_a_failed_listing_and_still_opens(self) -> None:
+        """A listing that raised is its class name, and the open still runs."""
+        backend = _SurveyedBackend(list_error=ScanError("Could not list"))
+
+        survey = backend.list_and_open("absent:0")
+
+        assert survey.devices == ()
+        assert survey.list_error == "ScanError"
+        assert survey.configured_opened is True
+        assert backend.opened == ["absent:0"]
+
+    @pytest.mark.parametrize(
+        "error",
+        [ListingCrashedError("crashed"), ListingTimedOutError("timed out")],
+        ids=["crashed", "timed-out"],
+    )
+    def test_list_and_open_re_raises_a_failed_child(self, error: ScanError) -> None:
+        """A crashed or stopped listing is not a failed listing: it propagates."""
+        backend = _SurveyedBackend(list_error=error)
+
+        with pytest.raises(type(error)) as raised:
+            backend.list_and_open("absent:0")
+
+        assert raised.value is error
+        assert backend.opened == []
 
 
 class TestSaneBackendScanPages:
@@ -2494,6 +2909,33 @@ class TestSaneBackendCancelSequence:
         # The refusal names the wedged device even though the caller had none
         # to name: enumeration is the call that finds out which devices exist.
         assert _TEST_DEVICE in str(refusal.value)
+
+    def test_a_wedged_backend_refuses_list_and_open_without_a_child(
+        self,
+        sane_backend: SaneBackend,
+        fake_sane_module: FakeSaneModule,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        listing_seam: ListingSeam,
+    ) -> None:
+        """
+        The Scanner check's list-then-open refuses too, and starts nothing.
+
+        A child could not touch this process's stuck handle, so the refusal is
+        not about safety here.  It keeps one rule for every SANE entry point,
+        and an appliance whose read is stuck cannot scan anyway.
+        """
+        self._wedge(sane_backend, fake_device, page_sink)
+        calls_before = list(fake_device.calls)
+        listings_before = list(listing_seam.calls)
+        enumerations_before = fake_sane_module.get_devices_call_count
+
+        with pytest.raises(ScanError, match="Restart saneless"):
+            sane_backend.list_and_open(_NET_DEVICE)
+
+        assert listing_seam.calls == listings_before
+        assert fake_sane_module.get_devices_call_count == enumerations_before
+        assert fake_device.calls == calls_before
 
     def test_shutdown_leaves_sane_up_while_a_read_is_outstanding(
         self,
@@ -4902,7 +5344,13 @@ class TestSaneBoundary:
     def test_get_devices_failure_raises_scan_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """sane.get_devices() failing is a ScanError chained to the original."""
+        """
+        sane.get_devices() failing is a ScanError carrying the original's text.
+
+        The listing runs in a child process, so the original exception object
+        stays there: only its type name and message come back, and there is
+        nothing in this process to chain to.
+        """
         original = FakeSaneError("Out of memory")
         monkeypatch.setattr(
             sane_backend_mod, "sane", FakeSaneModule(get_devices_error=original)
@@ -4913,7 +5361,7 @@ class TestSaneBoundary:
             backend.get_devices()
 
         assert str(exc_info.value) == "Could not list scanners: Out of memory"
-        assert exc_info.value.__cause__ is original
+        assert exc_info.value.__cause__ is None
 
     def test_close_failure_does_not_mask_the_scan_error(
         self,

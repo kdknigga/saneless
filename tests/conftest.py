@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import signal
@@ -31,8 +32,11 @@ from saneless.config import (
 )
 from saneless.paperless import PaperlessClient, UploadResult
 from saneless.pipeline import FlipCoordinator
+from saneless.scanner import _listing_child
+from saneless.scanner import listing as listing_mod
 from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
+from saneless.scanner.listing import ListingReply
 from saneless.vocabulary import FlipOutcome
 
 if TYPE_CHECKING:
@@ -43,6 +47,7 @@ if TYPE_CHECKING:
 
     from saneless.job import Job, JobStore
     from saneless.scanner.base import DeviceInfo, PageRecord, PageSink, ScanSettings
+    from saneless.scanner.listing import ListingRequest
     from saneless.vocabulary import JobState
 
 _POLL_INTERVAL = 0.02
@@ -60,6 +65,18 @@ _XDG_BASES = (
     ("XDG_STATE_HOME", (".local", "state")),
     ("XDG_DATA_HOME", (".local", "share")),
     ("XDG_CACHE_HOME", (".cache",)),
+)
+
+# The backend's real listing launcher, captured before any test replaces it,
+# so the tests that need a real child process can put it back.  Looked up
+# through the module's namespace because the seam is patched in whether or not
+# the backend defines it yet.
+_REAL_LAUNCH_LISTING = sane_backend_mod.__dict__.get("_launch_listing")
+
+_NO_REAL_LIBSANE = (
+    "the default suite must not start real libsane: patch sane_backend.sane "
+    "with a FakeSaneModule, or request real_listing_launcher with a stand-in "
+    "child"
 )
 
 
@@ -267,6 +284,137 @@ def sane_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     reset_sane_process_state()
     yield
     reset_sane_process_state()
+
+
+class ListingSeam:
+    """
+    What the in-process listing seam was asked for, in order.
+
+    Attributes:
+        calls: One ``(request, configured_host)`` pair per listing, as the
+            backend passed them to its launcher.
+
+    """
+
+    def __init__(self) -> None:
+        """Start with no listings recorded."""
+        self.calls: list[tuple[ListingRequest, str]] = []
+
+
+@pytest.fixture(autouse=True)
+def listing_seam(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> ListingSeam:
+    """
+    Run every scanner listing in this process, over the patched fake module.
+
+    The backend lists scanners in a child process, and a child cannot see
+    ``monkeypatch.setattr(sane_backend, "sane", FakeSaneModule())``: it
+    imports the real python-sane and asks the real libsane.  Every test that
+    drives a real ``SaneBackend`` over the fake -- directly, or through the
+    app, the worker, the CLI or the health checks -- would otherwise start
+    real libsane, and see its devices rather than the fake's.
+
+    So the backend's launcher is replaced here, suite-wide and not per module
+    for the reason ``sane_process_state`` gives: a module that forgot would
+    list through real libsane without anyone noticing.  The replacement runs
+    the child's own ``respond()`` over whatever is patched into
+    ``sane_backend.sane``, and decodes the result with the launcher's own
+    decoder, so the child's logic and the reply schema are still what a test
+    exercises.  With nothing patched it fails the test instead of listing.
+
+    A test that needs a real child process requests ``real_listing_launcher``,
+    which puts the real launcher back and points it at a stand-in script, so
+    the real child, and real libsane, still cannot run by accident.  Tests
+    marked ``sane_hardware`` exist to drive real libsane, and are left alone.
+
+    Args:
+        monkeypatch: Undoes the replacement after the test.
+        request: The test's request, to read its markers.
+
+    Returns:
+        The record of every listing the seam served.
+
+    """
+    seam = ListingSeam()
+    if request.node.get_closest_marker("sane_hardware") is not None:
+        return seam
+
+    def launch_in_process(
+        listing_request: ListingRequest, *, configured_host: str
+    ) -> ListingReply:
+        seam.calls.append((listing_request, configured_host))
+        module = sane_backend_mod.sane
+        if module is None:
+            raise AssertionError(_NO_REAL_LIBSANE)
+        reply = _listing_child.respond(
+            {"open": listing_request.open, "alarm": 0}, module
+        )
+        return ListingReply.from_stdout((json.dumps(reply) + "\n").encode())
+
+    monkeypatch.setattr(
+        sane_backend_mod, "_launch_listing", launch_in_process, raising=False
+    )
+    return seam
+
+
+@pytest.fixture
+def real_listing_launcher(
+    listing_seam: ListingSeam, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Give the test the backend's real launcher, running a harmless stand-in.
+
+    The launcher then starts a real child process, but the script it runs is
+    one that exits with status 3 at once, which the launcher reports as no
+    answer.  A test replaces it with its own script through
+    ``stand_in_listing_child``.  The real child script is never the default,
+    because it imports python-sane and would list through real libsane.
+
+    Args:
+        listing_seam: Requested so its replacement is in place to be undone.
+        monkeypatch: Restores the seam and the child script after the test.
+        tmp_path: Where the stand-in script is written.
+
+    """
+    _ = listing_seam  # ordering only: the seam must be patched before undoing it
+    if _REAL_LAUNCH_LISTING is None:
+        pytest.fail(
+            "sane_backend has no _launch_listing to restore, so no test can "
+            "run a real listing child"
+        )
+    monkeypatch.setattr(sane_backend_mod, "_launch_listing", _REAL_LAUNCH_LISTING)
+    stand_in = tmp_path / "listing_child_exits.py"
+    stand_in.write_text("import sys\n\nsys.exit(3)\n")
+    monkeypatch.setattr(listing_mod, "_CHILD_FILE", stand_in)
+
+
+@pytest.fixture
+def stand_in_listing_child(
+    real_listing_launcher: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Callable[[str], Path]:
+    """
+    Return a function that makes the real launcher run a script of the test's.
+
+    Args:
+        real_listing_launcher: Puts the real launcher back first.
+        monkeypatch: Restores the child script after the test.
+        tmp_path: Where the script is written.
+
+    Returns:
+        A function taking the script's source and returning its path, after
+        pointing the launcher at it.
+
+    """
+    _ = real_listing_launcher  # the real launcher, not the seam, runs the script
+
+    def use(source: str) -> Path:
+        script = tmp_path / "listing_child_stand_in.py"
+        script.write_text(source)
+        monkeypatch.setattr(listing_mod, "_CHILD_FILE", script)
+        return script
+
+    return use
 
 
 @pytest.fixture(autouse=True)
