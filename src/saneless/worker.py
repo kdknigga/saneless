@@ -950,12 +950,17 @@ class ScanWorker:
 
         """
         try:
-            # Gated for the same reason _scan_job is, and it
-            # is a real second entry into SANE rather than a precaution:
-            # get_devices() is an enumeration RPC on the net backend's control
-            # wire, and get_capabilities() opens the device and reads its
+            # Gated for the same reason _scan_job is, and it is a real second
+            # entry into SANE rather than a precaution.  get_devices() lists in
+            # a short-lived child process that holds the gate for its whole
+            # life, so the gate still keeps a probe from overlapping it; and
+            # get_capabilities() opens the device in this process and reads its
             # option list.  Held across both, because a probe slipping between
             # them is inside SANE just as surely as one during either.
+            #
+            # No restart of SANE here, unlike the top of every job: this runs
+            # once, before any job, on the SANE the backend's constructor has
+            # only just started, so there is no stale connection to clear.
             #
             # No re-entrancy hazard: this runs once, as the worker thread's
             # first act, strictly before any job -- so the gate is never
@@ -1510,6 +1515,25 @@ class ScanWorker:
                 return True
         return False
 
+    def _record_front_count(self, label: str, count: int) -> None:
+        """
+        Keep the running job's front count, for the flip prompt to show.
+
+        The back count is ignored on purpose.  It arrives a moment before the
+        ScanResult that carries the run's real total, so storing it would
+        replace the number the operator is reading with one that is about to
+        be replaced again -- a flicker in place of information.
+
+        Args:
+            label: Which pass the count is for.
+            count: The pages that pass produced.
+
+        """
+        if label != SCAN_LABEL_FRONT:
+            return
+        with self._front_pages_lock:
+            self._front_pages = count
+
     def _scan_job(self, job: Job) -> None:
         """
         Run one job through the pipeline and record how it ended.
@@ -1566,16 +1590,6 @@ class ScanWorker:
                     exc_info=True,
                 )
 
-        # The back count is ignored on purpose.  It arrives a moment before the
-        # ScanResult that carries the run's real total, so storing it would
-        # replace the number the operator is reading with one that is about to
-        # be replaced again -- a flicker in place of information.
-        def _pass_count_cb(label: str, count: int) -> None:
-            if label != SCAN_LABEL_FRONT:
-                return
-            with self._front_pages_lock:
-                self._front_pages = count
-
         # The worker persisted SCANNING just above, before starting the
         # pipeline.  run_pipeline re-announces it as its first event; rewriting
         # the state we just wrote would blank error/error_category a second
@@ -1629,7 +1643,7 @@ class ScanWorker:
             correspondent=job.correspondent,
             status_callback=_status_cb,
             thumbnail_callback=_thumbnail_cb,
-            pass_count_callback=_pass_count_cb,
+            pass_count_callback=self._record_front_count,
             flip_coordinator=coordinator,
             device_memory=self._device_memory,
             preserving=self._preserving,
@@ -1645,7 +1659,18 @@ class ScanWorker:
             # ``with`` rather than acquire/release, so every exit path -- a
             # jam, an Abort, a shutdown, a Paperless failure -- hands the
             # scanner back.  The release happens before the except block runs.
+            #
+            # Each job restarts SANE first, before its first listing or open.
+            # After a saned restart the net backend keeps using the control
+            # connection the server dropped, and every later open in this
+            # process fails until SANE is restarted (backend/net.c,
+            # sane_open).  The restart runs here, under the gate, where no
+            # handle of this process is open: the previous job closed its
+            # handles before it released the gate.  A restart refused because
+            # a read never returned raises ScanError into the except Exception
+            # below, and fails the job just as a refused scan does.
             with self._scanner_gate:
+                self._scanner.reinitialise()
                 result = run_pipeline(
                     self._scanner,
                     self._paperless,

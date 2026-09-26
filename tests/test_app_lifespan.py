@@ -19,6 +19,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -1195,6 +1196,69 @@ def test_leaf_routes_refuses_to_report_no_routes() -> None:
         leaf_routes(empty)
 
 
+class _SaneCallsByThread:
+    """
+    Record each SANE start and stop, and whether one given thread made it.
+
+    Wraps a fake module's ``init`` and ``exit`` in place, so the fake's own
+    counters keep counting every call.
+    """
+
+    def __init__(
+        self,
+        fake: FakeSaneModule,
+        thread: threading.Thread,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Start recording.
+
+        Args:
+            fake: The module double whose ``init`` and ``exit`` to wrap.
+            thread: The thread whose calls are told apart from the rest.
+            monkeypatch: Undoes the wrapping at the end of the test.
+
+        """
+        self._thread = thread
+        self._calls: list[tuple[str, bool]] = []
+        real_init = fake.init
+        real_exit = fake.exit
+
+        def recording_init() -> tuple[int, int, int]:
+            self._record("init")
+            return real_init()
+
+        def recording_exit() -> None:
+            self._record("exit")
+            real_exit()
+
+        monkeypatch.setattr(fake, "init", recording_init)
+        monkeypatch.setattr(fake, "exit", recording_exit)
+
+    def _record(self, name: str) -> None:
+        self._calls.append((name, threading.current_thread() is self._thread))
+
+    def on_thread(self) -> list[str]:
+        """
+        Name the calls the given thread made, in order.
+
+        Returns:
+            ``"init"`` or ``"exit"`` per call.
+
+        """
+        return [name for name, on in self._calls if on]
+
+    def elsewhere(self) -> list[str]:
+        """
+        Name the calls any other thread made, in order.
+
+        Returns:
+            ``"init"`` or ``"exit"`` per call.
+
+        """
+        return [name for name, on in self._calls if not on]
+
+
 def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1209,6 +1273,11 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
 
     ``exit_while_blocked`` ties the proof to D-12/D-13: whatever the routes did,
     ``sane_exit`` never ran with a read outstanding.
+
+    The worker thread does restart SANE, once at the top of every scan job, so
+    each ``init``/``exit`` call is recorded with the thread that made it: a
+    request path must make none, and the worker exactly one exit and one init
+    per job.
 
     The route map is checked in both directions: every served route is named
     in it, and every entry in it names a route the app serves.
@@ -1234,6 +1303,9 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     )
     app.state.paperless.poll_task = lambda *_a, **_k: {"status": "SUCCESS"}
     store: JobStore = app.state.job_store
+    # Every SANE start and stop from here on, by thread.  The constructor's
+    # init above is already counted by the fake.
+    sane_calls = _SaneCallsByThread(fake, app.state.worker._thread, monkeypatch)
 
     # Size first, contents second: an empty enumeration satisfies every set
     # comparison below, so the count is what makes them mean anything.  The
@@ -1307,9 +1379,10 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
                 response.status_code,
             )
             # The claim is per route, not per run: a single count at the end
-            # could not say which handler had moved it.
-            assert fake.init_call_count == 1, path
-            assert fake.exit_call_count == 0, path
+            # could not say which handler had moved it.  A scan job the route
+            # submitted may be restarting SANE on the worker thread meanwhile,
+            # which is allowed; a call from any other thread is not.
+            assert sane_calls.elsewhere() == [], path
 
         # The submitted scan runs on the worker thread, so it is waited out
         # here rather than raced with the shutdown below: a worker that had
@@ -1325,8 +1398,12 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
         # scan that never started.
         assert fake.open("test:device:001").calls
 
-    assert fake.init_call_count == 1
-    assert fake.exit_call_count == 1
+    # The lifespan's shutdown is the one stop made off the worker thread, and
+    # the worker restarted SANE exactly once for each job it ran.
+    assert sane_calls.elsewhere() == ["exit"]
+    assert sane_calls.on_thread() == ["exit", "init"] * len(submitted)
+    assert fake.init_call_count == 1 + len(submitted)
+    assert fake.exit_call_count == 1 + len(submitted)
     assert fake.exit_while_blocked is False
 
 
