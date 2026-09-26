@@ -37,6 +37,7 @@ message, and every other state stays under the rule above.
 from __future__ import annotations
 
 import contextlib
+import errno
 import ipaddress
 import logging
 import socket
@@ -160,6 +161,17 @@ _PROBE_USER: Final = b"saneless"
 # A ``SANE_NET_INIT`` reply is a status word and a version word and nothing
 # else, so the probe never reads more than this from a peer.
 _INIT_REPLY_LENGTH: Final = 8
+
+# The ways a connect can fail on *this* machine before anything reaches the
+# scanner host: no route to that network, no local address to send from, or
+# no socket family for it at all.  They are what a dual-stack name's IPv6
+# address does inside a container with no IPv6, because the resolver is asked
+# without ``AI_ADDRCONFIG``.  They prove nothing about the host either way, and
+# libsane fails such an address just as fast, so the pre-probe sets them
+# aside rather than counting them as a host that did not answer.
+_ADDRESS_CANNOT_BE_TRIED: Final = frozenset(
+    {errno.ENETUNREACH, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT}
+)
 
 # Every character a segment of ``scanner.host`` may contain and still be read
 # as a host name.  Deliberately narrower than any hostname RFC: this is not a
@@ -1126,11 +1138,14 @@ class _SanedOutcome(StrEnum):
     - ``UNRESOLVED``: the resolver raised, or answered with no address.
     - ``TIMED_OUT``: nothing connected and at least one address did not
       answer -- a connect timed out, the budget ran out before an address was
-      dialled, or the network said there was no route.  A peer that accepted
-      the connection and then sent nothing before the handshake deadline is
+      dialled, or the network said the host was unreachable -- or no address
+      could be dialled from this machine at all.  A peer that accepted the
+      connection and then sent nothing before the handshake deadline is
       counted here too, because it is the peer libsane would wait on forever.
-    - ``REFUSED``: every address refused the connection.  The host is up and
-      nothing is listening on saned's port.
+    - ``REFUSED``: at least one address refused the connection and every
+      other one either refused too or could not be dialled from this machine
+      (``_ADDRESS_CANNOT_BE_TRIED``).  The host is up and nothing is
+      listening on saned's port.
     - ``REJECTED``: a connection was made and the handshake failed: the peer
       closed or reset it, the reply ended early, or it carried a failure
       status or a protocol version libsane does not speak.
@@ -1301,7 +1316,11 @@ def _probe_saned(
     ``::1`` and then ``127.0.0.1``.  saned commonly binds v4-only, so a probe
     that dialled only the first answer reported a host that is *on*,
     answering over one family and not the other, as dead.  A refused address
-    therefore moves the walk on.  The first address that *connects* decides:
+    therefore moves the walk on.  So does an address this machine cannot dial
+    at all (``_ADDRESS_CANNOT_BE_TRIED``), and it is set aside rather than
+    counted as not answering: in a container with no IPv6, the IPv6 address
+    fails locally at once, and a refusal from the IPv4 address is still the
+    host's real answer.  The first address that *connects* decides:
     a rejected handshake there is not retried on the next address, which is
     what libsane's ``connect_dev`` does too.
 
@@ -1348,6 +1367,7 @@ def _probe_saned(
         return _SanedOutcome.UNRESOLVED
     deadline = monotonic() + connect_timeout
     unanswered = False
+    refused = False
     for family, socket_type, protocol, _canonical_name, address in candidates:
         remaining = deadline - monotonic()
         if remaining <= 0:
@@ -1363,22 +1383,31 @@ def _probe_saned(
             # One address refusing says nothing about the next one: this is
             # exactly the dual-stack case where the IPv6 address the resolver
             # put first has no listener and the IPv4 address does.
+            refused = True
             logger.debug("saned pre-probe: one address refused")
             continue
         except OSError as exc:
-            # A timeout, no route, or a socket this machine cannot open for
-            # that family.  None of them proves anything is up there.
-            unanswered = True
+            # A timeout or an unreachable host proves nothing is up there, and
+            # is what libsane would wait on.  A route or family this machine
+            # lacks proves nothing about the host at all, so it is set aside
+            # and cannot outweigh another address's definite refusal.
+            if exc.errno not in _ADDRESS_CANNOT_BE_TRIED:
+                unanswered = True
             logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
             continue
         logger.debug("saned pre-probe: %s", outcome.value)
         return outcome
     if unanswered:
         outcome = _SanedOutcome.TIMED_OUT
+    elif refused:
+        outcome = _SanedOutcome.REFUSED
     elif not candidates:
         outcome = _SanedOutcome.UNRESOLVED
     else:
-        outcome = _SanedOutcome.REFUSED
+        # Every address failed on this machine before anything was sent: the
+        # host cannot be reached from here, which is what TIMED_OUT's row
+        # tells its reader.
+        outcome = _SanedOutcome.TIMED_OUT
     logger.debug("saned pre-probe: %s", outcome.value)
     return outcome
 

@@ -1311,6 +1311,9 @@ class _PeerScript:
     Attributes:
         timeout_addresses: Sockaddrs whose ``connect`` times out rather than
             being refused.
+        connect_errors: Pairs of a sockaddr and the ``errno`` its
+            ``connect`` fails with instead, the way an address this machine has no route
+            to, or no socket family for, fails at once.
         reply: The bytes a connected peer has to give; the probe's ``recv``
             is served from these, and runs dry into an end of file.
         recv_chunk: The most bytes one ``recv`` hands back, or ``None`` for
@@ -1321,6 +1324,7 @@ class _PeerScript:
     """
 
     timeout_addresses: frozenset[object] = frozenset()
+    connect_errors: tuple[tuple[object, int], ...] = ()
     reply: bytes = _VALID_REPLY
     recv_chunk: int | None = None
     send_error: OSError | None = None
@@ -1387,6 +1391,7 @@ class _RecordingSocket:
         Raises:
             TimeoutError: When the case named this address as one that does
                 not answer, the way a host whose SYNs are dropped behaves.
+            OSError: When the case named an ``errno`` for this address.
             ConnectionRefusedError: Whenever the address is not one the
                 recorder was told to accept, the way a closed port does.  That
                 is every address unless a case named one.
@@ -1400,6 +1405,9 @@ class _RecordingSocket:
         if address in self.recorder.peer.timeout_addresses:
             msg = "timed out"
             raise TimeoutError(msg)
+        code = dict(self.recorder.peer.connect_errors).get(address)
+        if code is not None:
+            raise OSError(code, os.strerror(code))
         raise ConnectionRefusedError(
             errno.ECONNREFUSED, os.strerror(errno.ECONNREFUSED)
         )
@@ -1899,6 +1907,85 @@ class TestSanedProbeBound:
         )
         assert _probe() is checks._SanedOutcome.TIMED_OUT
         assert len(recorder.addresses) == 3
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(errno.ENETUNREACH, id="no-route-to-that-network"),
+            pytest.param(errno.EADDRNOTAVAIL, id="no-local-address"),
+            pytest.param(errno.EAFNOSUPPORT, id="no-such-family-here"),
+        ],
+    )
+    def test_an_address_this_machine_cannot_dial_does_not_hide_a_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        """
+        A dual-stack host whose saned is stopped is REFUSED, not TIMED_OUT.
+
+        The resolver is asked without ``AI_ADDRCONFIG``, so a dual-stack name
+        answers its IPv6 address first even inside a container with no IPv6
+        at all, and that address fails on this machine at once.  That says
+        nothing about the scanner host, and it must not outweigh the IPv4
+        addresses' definite answer: the host is up and nothing listens on
+        saned's port, so the advice is to start saned, not to switch the host
+        on.  libsane fails the same address just as fast, so it is no hang
+        risk either.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            code: The ``errno`` the IPv6 address fails with locally.
+
+        """
+        local_only = _THREE_ADDRESSES[0][4]
+        recorder = _install_probe_recorder(
+            monkeypatch, peer=_PeerScript(connect_errors=((local_only, code),))
+        )
+        assert _probe() is checks._SanedOutcome.REFUSED
+        assert len(recorder.addresses) == 3
+
+    def test_an_unreachable_host_still_counts_as_not_answering(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``EHOSTUNREACH`` is the network saying the host is not there.
+
+        Unlike a family or route this machine lacks, it is what a switched-off
+        host on the local network produces once its address stops answering
+        ARP, so it is a real non-answer and still outweighs a refusal.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        unreachable = _THREE_ADDRESSES[1][4]
+        _install_probe_recorder(
+            monkeypatch,
+            peer=_PeerScript(connect_errors=((unreachable, errno.EHOSTUNREACH),)),
+        )
+        assert _probe() is checks._SanedOutcome.TIMED_OUT
+
+    def test_a_host_no_address_of_which_can_be_dialled_is_timed_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Every address failing locally leaves nothing to report but "not answering".
+
+        Nothing was tried, so nothing refused; the host cannot be reached from
+        this machine, which is what the timed-out row tells its reader.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        _install_probe_recorder(
+            monkeypatch,
+            peer=_PeerScript(
+                connect_errors=tuple(
+                    (address, errno.ENETUNREACH) for *_rest, address in _THREE_ADDRESSES
+                )
+            ),
+        )
+        assert _probe() is checks._SanedOutcome.TIMED_OUT
 
     def test_the_handshake_gets_its_own_budget_after_the_connect(
         self, monkeypatch: pytest.MonkeyPatch
