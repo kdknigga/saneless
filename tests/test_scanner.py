@@ -3242,6 +3242,274 @@ class TestSaneBackendCancelSequence:
         assert elapsed < grace
 
 
+class TestReinitialise:
+    """
+    The per-job SANE restart, and the two states in which it must not run.
+
+    After a saned restart, an open in this process keeps failing with an I/O
+    error until SANE is restarted, so each scan job starts by restarting it.
+    ``sane_exit`` closes every open handle with a close request that waits for
+    a reply, and on a host that has silently vanished that wait was measured
+    to last longer than 40 seconds.  So the restart is refused, with no SANE
+    call at all, while a read is stuck or any handle is open.  "No SANE call"
+    is asserted on the fake's own counters, because a refusal that came after
+    ``sane_exit`` would already be too late.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _release_reads(self, fake_device: FakeSaneDev) -> Iterator[None]:
+        """
+        Let any blocked read return after each test, and clear the wedge.
+
+        The release goes through the production path first, so the reader
+        closes its own handle and clears the record.  Whatever is left is then
+        cleared by hand, as ``TestSaneBackendCancelSequence`` does.
+
+        Args:
+            fake_device: The one handle every test here drives.
+
+        Yields:
+            None, before the release and the clear.
+
+        """
+        yield
+        fake_device.release_read()
+        _join_sane_reader_threads()
+        record = sane_backend_mod._WEDGE
+        record.stuck = False
+        record.done = None
+        record.device = None
+        record.iterator = None
+        record.device_id = ""
+        record.page_label = ""
+
+    @staticmethod
+    def _sane_calls(module: FakeSaneModule) -> tuple[int, int, int]:
+        """
+        Snapshot the process-level SANE calls the fake has counted.
+
+        Args:
+            module: The patched fake.
+
+        Returns:
+            The exit, init and device-listing call counts, in that order.
+
+        """
+        return (
+            module.exit_call_count,
+            module.init_call_count,
+            module.get_devices_call_count,
+        )
+
+    def test_reinitialise_exits_then_initialises_once(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One restart is one ``sane_exit`` and one ``sane_init``, host kept."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        backend = SaneBackend(host="scanbox.lan")
+        assert fake_sane_module.init_call_count == 1
+        assert fake_sane_module.exit_call_count == 0
+
+        backend.reinitialise()
+
+        assert fake_sane_module.exit_call_count == 1
+        assert fake_sane_module.init_call_count == 2
+        assert sane_backend_mod._INIT.done is True
+        assert sane_backend_mod._INIT.host == "scanbox.lan"
+        assert os.environ["SANE_NET_HOSTS"] == "scanbox.lan"
+
+    def test_reinitialise_calls_exit_before_init(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The old SANE is shut down before the new one starts, never after."""
+        backend = SaneBackend()
+        order: list[str] = []
+        real_exit = fake_sane_module.exit
+        real_init = fake_sane_module.init
+
+        def recording_exit() -> None:
+            """Record the shutdown, then make it."""
+            order.append("exit")
+            real_exit()
+
+        def recording_init() -> tuple[int, int, int]:
+            """
+            Record the start, then make it.
+
+            Returns:
+                The version the fake reports.
+
+            """
+            order.append("init")
+            return real_init()
+
+        monkeypatch.setattr(fake_sane_module, "exit", recording_exit)
+        monkeypatch.setattr(fake_sane_module, "init", recording_init)
+
+        backend.reinitialise()
+
+        assert order[-2:] == ["exit", "init"]
+
+    def test_reinitialise_is_refused_while_a_read_is_stuck(
+        self,
+        sane_backend: SaneBackend,
+        fake_sane_module: FakeSaneModule,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """A stuck read refuses the restart before any SANE call is made."""
+        TestSaneBackendCancelSequence._wedge(sane_backend, fake_device, page_sink)
+        calls_before = self._sane_calls(fake_sane_module)
+        device_calls_before = list(fake_device.calls)
+
+        with pytest.raises(ScanError, match="Restart saneless"):
+            sane_backend.reinitialise()
+
+        assert self._sane_calls(fake_sane_module) == calls_before
+        assert fake_device.calls == device_calls_before
+        assert fake_sane_module.exit_while_blocked is False
+
+    def test_reinitialise_is_refused_while_a_handle_is_open(
+        self,
+        sane_backend: SaneBackend,
+        fake_sane_module: FakeSaneModule,
+        fake_device: FakeSaneDev,
+    ) -> None:
+        """An open handle refuses the restart; closing it allows it again."""
+        with sane_backend._open_device(_TEST_DEVICE):
+            calls_before = self._sane_calls(fake_sane_module)
+            device_calls_before = list(fake_device.calls)
+
+            with pytest.raises(ScanError, match="still open"):
+                sane_backend.reinitialise()
+
+            assert self._sane_calls(fake_sane_module) == calls_before
+            assert fake_device.calls == device_calls_before
+
+        exits_before = fake_sane_module.exit_call_count
+        sane_backend.reinitialise()
+        assert fake_sane_module.exit_call_count == exits_before + 1
+
+    def test_the_handle_count_follows_opens_and_closes_for_reinitialise(
+        self, sane_backend: SaneBackend
+    ) -> None:
+        """The count is one inside the device block and zero on either exit."""
+        assert sane_backend_mod._handles_open() == 0
+        with sane_backend._open_device(_TEST_DEVICE):
+            assert sane_backend_mod._handles_open() == 1
+        assert sane_backend_mod._handles_open() == 0
+
+        failure = "scan went wrong"
+        with (
+            pytest.raises(RuntimeError, match=failure),
+            sane_backend._open_device(_TEST_DEVICE),
+        ):
+            raise RuntimeError(failure)
+        assert sane_backend_mod._handles_open() == 0
+
+    def test_a_failed_open_is_not_counted_for_reinitialise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A handle that never opened is never counted, so never blocks a job."""
+        module = FakeSaneModule(open_error=FakeSaneError("Invalid argument"))
+        monkeypatch.setattr(sane_backend_mod, "sane", module)
+        backend = SaneBackend()
+
+        with contextlib.ExitStack() as stack, pytest.raises(ScanError):
+            stack.enter_context(backend._open_device(_TEST_DEVICE))
+
+        assert sane_backend_mod._handles_open() == 0
+
+    def test_a_stuck_handle_stays_counted_until_released_for_reinitialise(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        A handle left open by a stuck read is counted until the reader closes it.
+
+        The device block exits without closing the handle, so the count must
+        not drop there.  It drops when the late read returns and the reader
+        closes the handle itself.
+        """
+        TestSaneBackendCancelSequence._wedge(sane_backend, fake_device, page_sink)
+        assert sane_backend_mod._handles_open() == 1
+
+        fake_device.release_read()
+        _join_sane_reader_threads()
+
+        assert fake_device.close_calls == 1
+        assert sane_backend_mod._handles_open() == 0
+
+    def test_reinitialise_logs_one_info_line(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A job adds one INFO line; the shutdown and start lines are DEBUG."""
+        _ = fake_sane_module
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        backend = SaneBackend(host="scanbox.lan")
+        caplog.set_level(logging.DEBUG, logger=_BACKEND_LOGGER)
+        caplog.clear()
+
+        backend.reinitialise()
+
+        records = [r for r in caplog.records if r.name == _BACKEND_LOGGER]
+        loud = [r.getMessage() for r in records if r.levelno >= logging.INFO]
+        assert loud == ["SANE re-initialised before this scan"]
+        quiet = [r.getMessage() for r in records if r.levelno == logging.DEBUG]
+        assert "SANE shut down" in quiet
+        assert any(m.startswith("SANE initialized") for m in quiet)
+        assert any(m.startswith("SANE net host discovery") for m in quiet)
+
+    def test_the_base_reinitialise_does_nothing(self) -> None:
+        """A backend holding no process-global library has nothing to restart."""
+        assert StubScannerBackend().reinitialise() is None
+
+    def test_a_failed_start_during_reinitialise_is_reported_and_retried(
+        self,
+        sane_backend: SaneBackend,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A SANE that will not start again fails the job and is tried next time.
+
+        The guard stays unset, so the next job's restart calls ``sane_init``
+        rather than assuming a SANE that is not there.
+        """
+
+        def failing_init() -> tuple[int, int, int]:
+            """
+            Count the call and fail, as a SANE that cannot start does.
+
+            Raises:
+                FakeSaneError: Always.
+
+            """
+            fake_sane_module.init_call_count += 1
+            reason = "no backend could start"
+            raise FakeSaneError(reason)
+
+        real_init = fake_sane_module.init
+        monkeypatch.setattr(fake_sane_module, "init", failing_init)
+
+        with pytest.raises(ScanError) as failure:
+            sane_backend.reinitialise()
+
+        assert str(failure.value).startswith("Could not initialise SANE: ")
+        assert sane_backend_mod._INIT.done is False
+
+        monkeypatch.setattr(fake_sane_module, "init", real_init)
+        inits_before = fake_sane_module.init_call_count
+        sane_backend.reinitialise()
+        assert fake_sane_module.init_call_count == inits_before + 1
+        assert sane_backend_mod._INIT.done is True
+
+
 # The child process the exit proof runs, and the bound it is given.
 #
 # It blocks in ``os.read`` on a pipe nobody writes to.  That is the honest
