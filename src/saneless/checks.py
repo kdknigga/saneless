@@ -191,8 +191,11 @@ _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 # Four is chosen against the deployment rather than against the clock: this is
 # a household appliance bridging scanners to paperless-ngx, and a LAN with more
 # than four network scanners is not the machine this project is for.  The cost
-# of being wrong about that is small and is the module's usual one -- the fifth
-# host onwards loses the pre-probe, not the check.
+# of being wrong about that is stated rather than hidden: the fifth distinct
+# host onwards loses the pre-probe, not the check, and libsane still dials it
+# inside ``get_devices()``, so a dead one there can hang that call for the
+# ~127 s the pre-probe otherwise prevents.  The configured ``net:`` device's
+# own host is probed on top of the cap, because the check may open it.
 _MAX_PROBE_HOSTS: Final = 4
 
 # How libsane's net backend starts every device id it names
@@ -864,9 +867,9 @@ def _looks_like_a_host_name(segment: str) -> bool:
     it is split on ``:``.  ``[fe80`` and ``1]`` fail on their brackets, and the
     empty string fails on being empty, which is all that is needed.
 
-    Being narrow is the safe direction.  A false "no" costs the pre-probe's
-    latency saving and nothing else, because ``_saned_hosts`` then returns no
-    entries and the scanner check falls through to ``get_devices()``.  A false
+    Being narrow is the safe direction.  A false "no" costs the pre-probe for
+    that entry: ``_saned_hosts`` drops it and the scanner check falls through
+    to ``get_devices()``, which may still dial it with no timeout.  A false
     "yes" costs junk dials and, through the pre-probe, possibly a wrong
     verdict.
 
@@ -1034,24 +1037,32 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     project's config examples buys nothing, while the cost of leaving it is
     only that one latency saving -- the trade the whole module is built on.
 
-    **The cap.**  At most ``_MAX_PROBE_HOSTS`` -- four -- entries are returned,
-    taken from the front of the configured order.  ``_scanner_preflight``
-    probes every one of them, paying an unbounded ``getaddrinfo`` plus
-    ``PROBE_CONNECT_SECONDS`` plus ``PROBE_HANDSHAKE_SECONDS`` for each,
-    inside the ``POST /api/checks/refresh`` request thread; the manual-refresh floor bounds how often that request may
-    be made and not how long one of them takes, so the length of this tuple is
-    the only place the duration can be bounded.  A longer setting
-    loses the pre-probe for its tail rather than losing the bound, which is the
-    module's standard safe direction: no entry means no probe for that host,
-    and the scanner check falls through to ``get_devices()`` exactly as it did
-    before the probe existed.
+    **The cap.**  At most ``_MAX_PROBE_HOSTS`` -- four -- distinct entries are
+    returned, taken from the front of the configured order after repeats are
+    dropped.  ``_scanner_preflight`` probes every one of them, paying an
+    unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` plus
+    ``PROBE_HANDSHAKE_SECONDS`` for each, inside the
+    ``POST /api/checks/refresh`` request thread; the manual-refresh floor
+    bounds how often that request may be made and not how long one of them
+    takes, so the length of this tuple is the only place the duration can be
+    bounded.  A longer setting loses the pre-probe for its tail rather than
+    losing the bound.  That is a real loss, not only a latency one: libsane
+    still dials every entry of the tail inside ``get_devices()``, so a dead
+    fifth host costs the ~127 s uninterruptible connect the pre-probe exists
+    to prevent.  It is accepted, and documented, because refusing to
+    enumerate beside an unprobed entry would turn every working five-host
+    setup permanently amber.
 
     Returning ``()`` is not a silent failure; it is the fallback this module
     documents everywhere else.  No entries means no probe, which means the
     scanner check calls ``get_devices()`` and behaves exactly as it did before
-    the probe existed.  An operator who typed an IPv6 literal loses the
-    pre-probe's latency saving and never gets a wrong verdict, which is the
-    trade the whole module is built on.
+    the probe existed.  The same is true of a segment dropped from a list: it
+    is not probed, and libsane may still dial it.  An operator who typed an
+    IPv6 literal, or a name this module will not guess at, therefore loses
+    the pre-probe's protection for that host -- a dead one can hang
+    ``get_devices()`` -- but never gets a wrong verdict from a probe of
+    something nobody configured, which is the trade the whole module is built
+    on.  ``_scanner_preflight`` lists every kind of entry that goes unprobed.
 
     Args:
         host_setting: The configured ``scanner.host``, possibly empty.
@@ -1097,12 +1108,12 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
             and 0 < int(maybe_port) <= 65535
         ):
             return ((host, int(maybe_port)),)
-    # Filter first, then cap: the cap is on entries that would really be
-    # dialled, not on segments that were dropped before anything reached a
-    # socket.
-    return tuple(
-        (host, SANED_PORT) for host in present if _looks_like_a_host_name(host)
-    )[:_MAX_PROBE_HOSTS]
+    # Filter first, then drop repeats, then cap: the cap is on distinct entries
+    # that would really be dialled, not on segments that were dropped before
+    # anything reached a socket, and a host named twice must not push a
+    # different host past the cap unprobed.
+    names = dict.fromkeys(host for host in present if _looks_like_a_host_name(host))
+    return tuple((host, SANED_PORT) for host in names)[:_MAX_PROBE_HOSTS]
 
 
 class _SanedOutcome(StrEnum):

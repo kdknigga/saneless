@@ -120,6 +120,11 @@ With several scanner hosts, the row reports the worst problem and counts the hos
 
 **The configured scanner's own host.** When `[scanner] device` is a network device (`net:host:...`), the check also tests that device's scanner host in advance, even if it is not in `SANE_NET_HOSTS` or `[scanner] host`. If that host is not answering or its scanner service is not running, the row says so and the check stops there, because opening the device would make SANE wait on the host with no time limit.
 
-**Hosts in `net.conf`.** Apart from the configured scanner's own host, the check tests only the hosts in `SANE_NET_HOSTS` or `[scanner] host`. SANE also dials any host listed in the `net.conf` of the machine saneless runs on (in a container, the container's own `/etc/sane.d/net.conf`), but the check does not test those hosts in advance.
+**Hosts the check does not test in advance.** Apart from the configured scanner's own host, the check tests only the hosts in `SANE_NET_HOSTS` or `[scanner] host`, and not all of those. SANE still connects to every host below when it lists scanners, so if one of them is switched off, the Scanner check can take about two minutes to answer:
+
+- hosts listed only in the `net.conf` of the machine saneless runs on (in a container, the container's own `/etc/sane.d/net.conf`);
+- the fifth and later different hosts in the list, because the check tests at most four so that it always finishes quickly;
+- IPv6 addresses, and any entry that is not a plain host name or IPv4 address, such as a bare number;
+- a port number after a host, as in `scanbox.lan:6566`: the check tests `scanbox.lan` on that port, but SANE reads the number as a second host name. Leave the port out; SANE always uses port 6566.
 
 For a scan that fails after the scanner is discovered, see [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md).

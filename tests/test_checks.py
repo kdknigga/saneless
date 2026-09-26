@@ -908,13 +908,24 @@ class TestProbeHostCap:
         """
         The tail is what is dropped, so the first-named host is still probed.
 
-        Losing the tail is this module's standard safe direction: no entry
-        means no probe for that host, and the scanner check falls through to
-        ``get_devices()`` exactly as it did before the probe existed.
+        No entry means no probe for that host, and the scanner check falls
+        through to ``get_devices()`` exactly as it did before the probe
+        existed -- which still dials the tail, so this is a documented loss
+        of the pre-probe's protection for it, not only of its latency saving.
         """
         entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
         assert entries[0] == ("h1", SANED_PORT)
         assert all(host != "h40" for host, _port in entries)
+
+    def test_a_repeated_host_does_not_use_up_the_cap(self) -> None:
+        """
+        A host named twice is probed once, and does not push another past the cap.
+
+        The cap exists to bound the probing, and a second probe of the same
+        host bounds nothing and learns nothing.  Counting repeats against it
+        would leave a distinct host unprobed -- one libsane still dials.
+        """
+        assert _saned_hosts("a:a:a:a:b") == (("a", SANED_PORT), ("b", SANED_PORT))
 
     def test_a_short_host_list_is_unchanged_entry_for_entry(self) -> None:
         """A setting under the cap is not touched by it."""
