@@ -107,6 +107,7 @@ The SANE development headers are missing. Install the package for your distribut
 - Verify your scanner is visible to SANE directly: `scanimage -L`
 - If using a network scanner via `saned`, ensure `saned` is running on the scanner host and your machine is in its access list
 - Check that the scanner is powered on and connected
+- If saneless's log says `Scanner enumeration failed: ModuleNotFoundError`, python-sane is reachable only through `PYTHONPATH`. saneless lists scanners in a separate Python process that ignores `PYTHONPATH`, so python-sane must be installed in the same environment as saneless: reinstall saneless as in [Step 2](#step-2-install-saneless)
 
 **Permission denied accessing scanner**
 

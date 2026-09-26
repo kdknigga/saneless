@@ -29,8 +29,12 @@ are never re-split.  ruff's S603 accepts only a literal argv, and ``exec``
 replaces the shell, so the child's PID is the interpreter's own and killing
 and waiting on it leaves no grandchild.  ``-I`` runs the interpreter in
 isolated mode: every ``PYTHON*`` variable is ignored and the script's
-directory is not put on ``sys.path``.  The device id travels on stdin, never
-in argv, which any local user can read.
+directory is not put on ``sys.path``.  So python-sane must be importable from
+the interpreter's own site-packages: one reachable only through
+``PYTHONPATH`` imports in saneless but not in the child, whose listing then
+fails with ``ModuleNotFoundError``, and the Scanner check reports that no
+scanner was found rather than that scanner support is missing.  The device id
+travels on stdin, never in argv, which any local user can read.
 
 The child's stderr is inherited, so libsane's ``SANE_DEBUG_*`` output keeps
 reaching the log it always reached.  The child points its own fd 1 at stderr
