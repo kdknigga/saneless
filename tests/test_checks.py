@@ -2771,6 +2771,37 @@ class TestScannerCheck:
         assert row.next_step == _UNRESOLVED_NEXT
 
     @pytest.mark.parametrize("surface", _SURFACES)
+    def test_an_unresolved_name_from_the_environment_points_at_the_variable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+    ) -> None:
+        """
+        A name exported in ``SANE_NET_HOSTS`` is fixed there, and the row says so.
+
+        A non-empty exported variable wins over ``[scanner] host``, so a next
+        step that only named the config file would send the operator to edit
+        a setting that changes nothing, and the row would never clear.  The
+        variable is named; the host never is.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "env-scanbox.lan")
+        dialled = _recording_dialler(
+            monkeypatch, outcome=checks._SanedOutcome.UNRESOLVED
+        )
+        settings = _with_device(_settings(tmp_path, host="cfg-scanbox.lan"), "")
+        row = _scanner_row_on(surface, _context(settings, scanner=_CountingBackend()))
+        assert dialled == [("env-scanbox.lan", SANED_PORT)]
+        assert row.state is CheckState.FAIL
+        assert row.message == "The scanner host could not be found by name."
+        assert "SANE_NET_HOSTS" in row.next_step
+        assert "restart saneless" in row.next_step
+        assert "scanbox" not in f"{row.message} {row.next_step}"
+
+    @pytest.mark.parametrize("surface", _SURFACES)
     @pytest.mark.parametrize(
         "outcome",
         [
@@ -3809,7 +3840,8 @@ _REJECTED_NEXT: Final = (
     "Add this machine to saned.conf on the scanner host, then press Check again."
 )
 _UNRESOLVED_NEXT: Final = (
-    "Check [scanner] host in the config file, then restart saneless."
+    "Check the host name in [scanner] host or [scanner] device, or in "
+    "SANE_NET_HOSTS if that is set, then restart saneless."
 )
 _TIMED_OUT_NEXT: Final = (
     "Check the scanner host is switched on and on the network, then press Check again."

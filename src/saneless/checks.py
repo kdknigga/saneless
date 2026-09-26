@@ -1658,6 +1658,14 @@ def _host_problem_next_step(outcome: _SanedOutcome) -> str:
     process (``add_device`` in ``backend/net.c``), so that fix needs a
     restart.
 
+    That next step names every place the name can have come from, because
+    the row cannot say which: ``[scanner] host``, a ``net:`` id in
+    ``[scanner] device`` (whose host is probed too), and ``SANE_NET_HOSTS``,
+    which wins over ``[scanner] host`` whenever it is exported and not empty
+    (``effective_sane_net_hosts``).  Naming only the config file would send
+    an operator with the variable exported to edit a setting that changes
+    nothing.  The variable is named; the host never is (ASVS V7).
+
     Args:
         outcome: The outcome being reported.
 
@@ -1674,9 +1682,7 @@ def _host_problem_next_step(outcome: _SanedOutcome) -> str:
         case _SanedOutcome.REFUSED:
             next_step = "Start saned on the scanner host, or check it is listening on the network, then press Check again."
         case _SanedOutcome.UNRESOLVED:
-            next_step = (
-                "Check [scanner] host in the config file, then restart saneless."
-            )
+            next_step = "Check the host name in [scanner] host or [scanner] device, or in SANE_NET_HOSTS if that is set, then restart saneless."
         case _SanedOutcome.REJECTED:
             next_step = "Add this machine to saned.conf on the scanner host, then press Check again."
         case _SanedOutcome.HEALTHY:
