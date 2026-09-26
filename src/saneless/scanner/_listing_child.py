@@ -51,7 +51,7 @@ writes can execute when the parent reads it.
 
 That pipe is kept private to the reply.  Before anything else runs, the child
 duplicates it to a descriptor of its own and points fd 1 at stderr, so
-whatever python-sane or a backend prints lands in the log.  C code shares fd 1
+nothing python-sane or a backend prints can reach the reply.  C code shares fd 1
 with Python, and when fd 1 is a pipe C stdio holds its output until the
 process exits, well after the reply was written: left on the reply's pipe, a
 single ``printf`` in any backend would turn a good reply into no answer.  A
@@ -309,7 +309,8 @@ def _private_reply_channel() -> TextIO:
 
     Returns:
         A text stream on a new descriptor for the parent's pipe.  From here
-        on, anything written to fd 1, by Python or by C code, reaches stderr.
+        on, fd 1 is stderr, so nothing written to it, by Python or by C code,
+        reaches the parent's pipe.
 
     """
     try:
