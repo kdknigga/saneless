@@ -4119,6 +4119,402 @@ class TestScannerVerdict:
         assert checks._net_device_entry(device_id) == expected
 
 
+# ---------------------------------------------------------------------------
+# The whole registry against a fake saned
+# ---------------------------------------------------------------------------
+
+# What the rows below may never carry.  The loopback address and a port are
+# what a real scanner host's address and port stand in for here, "scanbox" is
+# the only host name any of these tests configures, and a slash is how every
+# path, URL and device id would show up.  The resolver's own text is checked
+# in the log records, which is where an unguarded ``str(exc)`` would land.
+_E2E_ROW_FORBIDDEN: Final = ("127.0.0", "scanbox", "/")
+_E2E_LOG_FORBIDDEN: Final = ("127.0.0", "scanbox", "Name or service not known")
+
+# The red row for a host that refuses this machine when nothing is usable.
+_REJECTED_MESSAGE: Final = "The scanner host is refusing this machine."
+
+# The red row for a host that answered and listed nothing.
+_ANSWERING_NOTHING_FOUND_MESSAGE: Final = (
+    "The scanner host is answering, but no scanner was found on it."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _EndToEndRun:
+    """
+    One registry run's Scanner row, and the backend that run was handed.
+
+    Attributes:
+        row: The Scanner row ``run_checks`` returned.
+        backend: The fresh backend that run used, so its counts are its own.
+        seconds: How long the whole ``run_checks`` call took.
+
+    """
+
+    row: CheckResult
+    backend: _CountingBackend
+    seconds: float
+
+
+def _run_ungated_and_gated(
+    settings: Settings, devices: Sequence[DeviceInfo]
+) -> tuple[_EndToEndRun, _EndToEndRun]:
+    """
+    Run the whole registry twice: once as ``doctor`` does, once as the strip does.
+
+    Each run gets its own backend, so ``calls`` counts one run and not two.
+    The gated run is handed a real ``threading.Lock``, not a recorder, because
+    what is under test is the registry as the worker drives it; the lock is
+    asserted free afterwards, so a run that kept it fails here.
+
+    Args:
+        settings: The configuration both runs read.
+        devices: What each run's backend lists.
+
+    Returns:
+        The ungated run, then the gated one.
+
+    """
+    gate = threading.Lock()
+    runs: list[_EndToEndRun] = []
+    for scanner_gate in (None, gate):
+        backend = _CountingBackend(list(devices))
+        started = monotonic()
+        results = run_checks(
+            _context(settings, scanner=backend), scanner_gate=scanner_gate
+        )
+        runs.append(
+            _EndToEndRun(
+                row=_row(results, CheckKey.SCANNER),
+                backend=backend,
+                seconds=monotonic() - started,
+            )
+        )
+    assert not gate.locked()
+    ungated, gated = runs
+    assert gated.row == ungated.row
+    return ungated, gated
+
+
+def _assert_names_nothing(
+    runs: Iterable[_EndToEndRun], caplog: pytest.LogCaptureFixture, port: int
+) -> None:
+    """
+    ASVS V7: neither the rows nor anything logged names the host or its port.
+
+    Args:
+        runs: The runs whose rows are checked.
+        caplog: The log capture the runs were made under, at DEBUG.
+        port: The loopback port the fake or the closed socket had.
+
+    """
+    for run in runs:
+        for text in (run.row.message, run.row.next_step):
+            for forbidden in (*_E2E_ROW_FORBIDDEN, str(port)):
+                assert forbidden not in text
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages, "nothing was logged, so the log half of this guard is vacuous"
+    for message in messages:
+        for forbidden in (*_E2E_LOG_FORBIDDEN, str(port)):
+            assert forbidden not in message
+
+
+@pytest.fixture
+def _short_probe_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Shorten both probe budgets, so a silent peer costs half a second, not seven.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+
+    """
+    monkeypatch.setattr(checks, "PROBE_CONNECT_SECONDS", _PROBE_BUDGET)
+    monkeypatch.setattr(checks, "PROBE_HANDSHAKE_SECONDS", _PROBE_BUDGET)
+
+
+@pytest.mark.usefixtures("_short_probe_budgets")
+class TestScannerCheckAgainstAFakeSaned:
+    """
+    The real registry, real sockets and the real gate agree on the Scanner row.
+
+    The tests above this class take one piece at a time, with the probe
+    stubbed or the backend absent.  Here nothing is stubbed between
+    ``run_checks`` and the socket: the pre-probe dials a fake saned on
+    127.0.0.1, the preflight classifies what came back, the gated and ungated
+    paths each enumerate a stub backend, and the verdict writes the row.  Each
+    case runs both paths with a fresh backend and requires the same row from
+    both.  Every fake is used inside its context manager, so a socket left open
+    or an exception escaping its thread fails the test under
+    ``filterwarnings = ["error"]``.
+    """
+
+    def test_accept_then_close_with_nothing_listed_is_a_denial(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The 2026-09-22 signature reads as a denial and names saned.conf.
+
+        saned accepted the connection and closed it before replying, which is
+        what its access list does to a peer it does not allow.  The row this
+        used to produce said the scanner was not reachable and to check it was
+        switched on and connected; it must say the host is refusing this
+        machine.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        with fake_saned(SanedBehaviour.CLOSE) as fake:
+            settings = _with_device(
+                _healthy_settings(tmp_path, host=f"127.0.0.1:{fake.port}"), ""
+            )
+            runs = _run_ungated_and_gated(settings, [])
+        for run in runs:
+            assert run.backend.calls == 1
+            assert run.row.state is CheckState.FAIL
+            assert run.row.message == _REJECTED_MESSAGE
+            assert run.row.next_step == _REJECTED_NEXT
+            assert "saned.conf" in run.row.next_step
+            for text in (run.row.message, run.row.next_step):
+                assert "switched on and connected" not in text
+        _assert_names_nothing(runs, caplog, fake.port)
+
+    def test_accept_then_close_beside_a_usable_scanner_is_amber(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A denial beside a scanner that works is a warning, not a failure.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        with fake_saned(SanedBehaviour.CLOSE) as fake:
+            settings = _with_device(
+                _healthy_settings(tmp_path, host=f"127.0.0.1:{fake.port}"), ""
+            )
+            runs = _run_ungated_and_gated(settings, [_device()])
+        for run in runs:
+            assert run.backend.calls == 1
+            assert run.row.state is CheckState.WARN
+            assert run.row.message == (
+                "Brother ADS-2700W is ready, but the scanner host is refusing "
+                "this machine."
+            )
+            assert run.row.next_step == _REJECTED_NEXT
+        _assert_names_nothing(runs, caplog, fake.port)
+
+    def test_a_failure_status_reads_the_same_as_accept_then_close(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A saned that answers with a failure status is refusing this machine too.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        with fake_saned(SanedBehaviour.BAD_STATUS) as fake:
+            settings = _with_device(
+                _healthy_settings(tmp_path, host=f"127.0.0.1:{fake.port}"), ""
+            )
+            runs = _run_ungated_and_gated(settings, [])
+        for run in runs:
+            assert run.backend.calls == 1
+            assert run.row.state is CheckState.FAIL
+            assert run.row.message == _REJECTED_MESSAGE
+            assert run.row.next_step == _REJECTED_NEXT
+        _assert_names_nothing(runs, caplog, fake.port)
+
+    def test_a_refused_connection_is_amber_and_never_enumerated(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        Nothing listening is the refused row, and SANE is never entered.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        port = _closed_port()
+        settings = _with_device(
+            _healthy_settings(tmp_path, host=f"127.0.0.1:{port}"), ""
+        )
+        runs = _run_ungated_and_gated(settings, [_device()])
+        for run in runs:
+            assert run.backend.calls == 0
+            assert run.row.state is CheckState.WARN
+            assert run.row.message == _REFUSED_MESSAGE
+            assert run.row.next_step == _REFUSED_NEXT_STEP
+        _assert_names_nothing(runs, caplog, port)
+
+    def test_a_silent_peer_is_amber_bounded_and_never_enumerated(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        listening_port: int,
+    ) -> None:
+        """
+        A peer that accepts and says nothing times out inside the budget.
+
+        libsane bounds nothing after its connect, so enumerating this host
+        would wait for as long as the peer stayed quiet.  Each run is timed
+        rather than waited through: it has to come back within a few budgets,
+        and without having entered SANE.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+            listening_port: A loopback port that listens and never answers.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        settings = _with_device(
+            _healthy_settings(tmp_path, host=f"127.0.0.1:{listening_port}"), ""
+        )
+        runs = _run_ungated_and_gated(settings, [_device()])
+        for run in runs:
+            assert run.backend.calls == 0
+            assert run.row.state is CheckState.WARN
+            assert run.row.message == _TIMED_OUT_MESSAGE
+            assert run.row.next_step == _TIMED_OUT_NEXT_STEP
+            assert run.seconds < 4 * _PROBE_BUDGET
+        _assert_names_nothing(runs, caplog, listening_port)
+
+    def test_a_healthy_saned_is_ready_and_left_one_clean_session_per_probe(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A valid handshake reaches the backend, and saned sees INIT then EXIT.
+
+        Two runs are two probes, and the fake serves them one after the other,
+        so the complete record is two sessions end to end: the 21-byte INIT
+        request, then ``SANE_NET_EXIT``, twice, and nothing else.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        with fake_saned(SanedBehaviour.HEALTHY) as fake:
+            settings = _with_device(
+                _healthy_settings(tmp_path, host=f"127.0.0.1:{fake.port}"), ""
+            )
+            runs = _run_ungated_and_gated(settings, [_device()])
+        for run in runs:
+            assert run.backend.calls == 1
+            assert run.row.state is CheckState.OK
+            assert run.row.message == "Brother ADS-2700W is ready."
+            assert run.row.next_step == ""
+        assert len(INIT_REQUEST) == 21
+        assert b"".join(fake.received) == (INIT_REQUEST + EXIT_REQUEST) * len(runs)
+        _assert_names_nothing(runs, caplog, fake.port)
+
+    def test_a_healthy_saned_with_nothing_listed_is_red(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A host that answers rules the network out, so the row says so.
+
+        Args:
+            tmp_path: The test's own directory.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        with fake_saned(SanedBehaviour.HEALTHY) as fake:
+            settings = _with_device(
+                _healthy_settings(tmp_path, host=f"127.0.0.1:{fake.port}"), ""
+            )
+            runs = _run_ungated_and_gated(settings, [])
+        for run in runs:
+            assert run.backend.calls == 1
+            assert run.row.state is CheckState.FAIL
+            assert run.row.message == _ANSWERING_NOTHING_FOUND_MESSAGE
+            assert run.row.next_step == _HOST_ANSWERS_NOTHING_FOUND_NEXT
+        _assert_names_nothing(runs, caplog, fake.port)
+
+    def test_a_name_that_does_not_resolve_is_red_and_says_restart(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        An unresolved name is enumerated, finds nothing, and names the setting.
+
+        The resolver is replaced rather than asked about a reserved name, so
+        the suite stays offline.  Its error text is what an unguarded log line
+        would repeat, so the log half of the guard looks for it.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Replaces the resolver.
+            caplog: Captures every log record at DEBUG.
+
+        """
+
+        def _fail(*_args: object, **_kwargs: object) -> list[object]:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fail)
+        caplog.set_level(logging.DEBUG)
+        settings = _with_device(_healthy_settings(tmp_path, host="scanbox.test"), "")
+        runs = _run_ungated_and_gated(settings, [])
+        for run in runs:
+            assert run.backend.calls == 1
+            assert run.row.state is CheckState.FAIL
+            assert run.row.message == "The scanner host could not be found by name."
+            assert run.row.next_step == _UNRESOLVED_NEXT
+        _assert_names_nothing(runs, caplog, SANED_PORT)
+
+    def test_one_answering_host_beside_a_refusing_one_is_never_enumerated(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A second host refusing the connection keeps SANE out, through real sockets.
+
+        Both entries use the default port, which is pointed at the fake.  The
+        fake listens on 127.0.0.1 only, so the same port on 127.0.0.2 refuses.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Points the default saned port at the fake.
+            caplog: Captures every log record at DEBUG.
+
+        """
+        caplog.set_level(logging.DEBUG)
+        with fake_saned(SanedBehaviour.HEALTHY) as fake:
+            monkeypatch.setattr(checks, "SANED_PORT", fake.port)
+            settings = _with_device(
+                _healthy_settings(tmp_path, host="127.0.0.1:127.0.0.2"), ""
+            )
+            runs = _run_ungated_and_gated(settings, [_device()])
+        for run in runs:
+            assert run.backend.calls == 0
+            assert run.row.state is CheckState.WARN
+            assert run.row.message == (
+                "1 of 2 scanner hosts is on, but its scanner service is not "
+                "running, so the scanner could not be checked."
+            )
+            assert run.row.next_step == _REFUSED_NEXT_STEP
+        assert b"".join(fake.received) == (INIT_REQUEST + EXIT_REQUEST) * len(runs)
+        _assert_names_nothing(runs, caplog, fake.port)
+
+
 _PROBE_OUTCOMES = [
     pytest.param(200, CheckState.OK, ConnectionStatus.CONNECTED, id="connected"),
     pytest.param(
@@ -5004,34 +5400,58 @@ def _gate_sampling_context(
     return context, client, backend
 
 
-# The four scanner contexts whose rows differ, which is what makes them the
-# four a gated-equals-ungated claim has to cover (R3-IN-01).  Each produces a
-# different branch of the scanner check: the no-python-sane row decided before
-# anything is touched, the pre-probe row decided before the gate is reached,
-# the enumeration that answers, and the enumeration that raises and is rendered
-# by ``run_checks``' own handler -- which on the gated path also has to release
-# the gate on its way out.
+# The scanner contexts whose rows differ, which is what makes them the ones a
+# gated-equals-ungated claim has to cover (R3-IN-01).  Each reaches a different
+# branch of the scanner check, and each ends in a different row:
+#
+# - no python-sane, decided before anything is touched;
+# - two pre-probe rows decided before the gate is reached, one for a host that
+#   refuses the connection and one for a host that does not answer it;
+# - an enumeration that lists one device, and one that raises;
+# - a host that refuses this machine, and a name that does not resolve, both
+#   enumerated and finding nothing;
+# - a configured device that is not listed and does not open, and one that is
+#   not listed but opens, both decided by the open held under the gate.
+#
+# ``_scanner_result``'s docstring lists the same contexts, and
+# ``test_every_gated_context_reaches_a_different_row`` keeps them distinct.
 _GATED_CONTEXTS = (
     "no-python-sane",
     "host-unanswered",
+    "timed-out",
     "one-device",
     "enumeration-raises",
+    "rejected",
+    "unresolved",
+    "wrong-device-open-fails",
+    "wrong-device-open-succeeds",
 )
+
+# What the stubbed dialler answers in each context; any context not named here
+# is answered as healthy.  ``no-python-sane`` never reaches the dialler, and it
+# is given the outcome that would stop the check if it did.
+_GATED_DIALLER_OUTCOMES: Final[Mapping[str, checks._SanedOutcome]] = {
+    "no-python-sane": checks._SanedOutcome.TIMED_OUT,
+    "host-unanswered": checks._SanedOutcome.REFUSED,
+    "timed-out": checks._SanedOutcome.TIMED_OUT,
+    "rejected": checks._SanedOutcome.REJECTED,
+    "unresolved": checks._SanedOutcome.UNRESOLVED,
+}
 
 
 def _gated_context_builder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner_context: str
 ) -> Callable[[], CheckContext]:
     """
-    Return a factory for one of the four scanner contexts whose rows differ.
+    Return a factory for one of the scanner contexts whose rows differ.
 
     A factory rather than a context, because the comparison runs the checks
     twice and the backends count their calls: handing the same object to both
     runs would compare a first enumeration against a second.
 
-    The dialler is stubbed for every variant, including the two that never
-    reach it, so no case in this parametrisation can resolve a name or open a
-    socket by accident.
+    The dialler is stubbed for every variant, including the one that never
+    reaches it, so no case in this parametrisation can resolve a name or open
+    a socket by accident.
 
     Args:
         tmp_path: The test's own directory.
@@ -5045,28 +5465,121 @@ def _gated_context_builder(
         ValueError: If ``scanner_context`` is not one of ``_GATED_CONTEXTS``.
 
     """
-    if scanner_context == "no-python-sane":
-        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT)
-        return lambda: _context(_settings(tmp_path), scanner=None)
-    if scanner_context == "host-unanswered":
-        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT)
-        return lambda: _context(
-            _settings(tmp_path, host="scanbox.lan"),
-            scanner=_CountingBackend([_device()]),
+    if scanner_context not in _GATED_CONTEXTS:
+        msg = f"unknown scanner context: {scanner_context}"
+        raise ValueError(msg)
+    _recording_dialler(
+        monkeypatch, outcome=_GATED_DIALLER_OUTCOMES.get(scanner_context, _HEALTHY)
+    )
+
+    def on_scanbox(device: str, backend: StubScannerBackend) -> CheckContext:
+        settings = _with_device(_settings(tmp_path, host="scanbox.lan"), device)
+        return _context(settings, scanner=backend)
+
+    factories: dict[str, Callable[[], CheckContext]] = {
+        "no-python-sane": lambda: _context(_settings(tmp_path), scanner=None),
+        "host-unanswered": lambda: on_scanbox(
+            _DEVICE_ID, _CountingBackend([_device()])
+        ),
+        "timed-out": lambda: on_scanbox(_DEVICE_ID, _CountingBackend([_device()])),
+        "one-device": lambda: on_scanbox(_DEVICE_ID, _CountingBackend([_device()])),
+        "enumeration-raises": lambda: on_scanbox("", _RaisingBackend()),
+        "rejected": lambda: on_scanbox("", _CountingBackend()),
+        "unresolved": lambda: on_scanbox("", _CountingBackend()),
+        "wrong-device-open-fails": lambda: on_scanbox(
+            _LOCAL_DEVICE_ID, _UnopenableBackend([_device()])
+        ),
+        "wrong-device-open-succeeds": lambda: on_scanbox(
+            _LOCAL_DEVICE_ID, _CountingBackend([_device()])
+        ),
+    }
+    return factories[scanner_context]
+
+
+class TestScannerRowGuards:
+    """What no Scanner row may say, across every context whose row differs."""
+
+    @pytest.mark.parametrize("scanner_context", list(_GATED_CONTEXTS))
+    @pytest.mark.parametrize("gated", [False, True], ids=["ungated", "gated"])
+    def test_no_scanner_row_names_a_host_a_device_id_or_a_traceback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        scanner_context: str,
+        *,
+        gated: bool,
+    ) -> None:
+        """
+        ASVS V7 across every probe outcome and both wrong-device contexts.
+
+        The contexts cover every outcome the dialler can return -- refused,
+        timed out, healthy, rejected and unresolved -- and a configured device
+        whose id names a local USB scanner.  The host is ``scanbox.lan``, the
+        listed device's id is a ``net:`` one, and the configured one is an
+        ``epson2`` one; none of them may reach either field of the row.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to stub the probe seam.
+            scanner_context: Which of the scanner contexts to run.
+            gated: Whether the run is handed a free scanner gate.
+
+        """
+        build = _gated_context_builder(tmp_path, monkeypatch, scanner_context)
+        gate = cast("threading.Lock", _RecordingLock()) if gated else None
+        row = _row(run_checks(build(), scanner_gate=gate), CheckKey.SCANNER)
+        for text in (row.message, row.next_step):
+            for forbidden in ("/", "http", "scanbox", "net:", "epson2", "Traceback"):
+                assert forbidden not in text
+
+    @pytest.mark.parametrize("surface", _SURFACES)
+    @pytest.mark.parametrize(
+        "outcomes",
+        [
+            pytest.param({"scanbox.lan": _REJECTED}, id="one-host"),
+            pytest.param(
+                {"scanbox-a.lan": _HEALTHY, "scanbox-b.lan": _REJECTED},
+                id="two-hosts",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "devices",
+        [pytest.param([], id="nothing-usable"), pytest.param([_device()], id="usable")],
+    )
+    def test_no_rejected_row_says_switched_on_and_connected(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcomes: dict[str, checks._SanedOutcome],
+        devices: list[DeviceInfo],
+        surface: str,
+    ) -> None:
+        """
+        A host refusing this machine is never blamed on the scanner's power.
+
+        "Switched on and connected" was the advice the 2026-09-22 denial got,
+        and it sent the reader to the one part of the setup that was fine.
+        Every combination here must reach the refusal wording, so the property
+        cannot pass by never meeting the case it is about.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            outcomes: What each configured host answers.
+            devices: What the backend lists.
+            surface: Which of the two surfaces runs the check.
+
+        """
+        _recording_dialler(monkeypatch, outcomes=outcomes)
+        settings = _with_device(_settings(tmp_path, host=":".join(outcomes)), "")
+        row = _scanner_row_on(
+            surface, _context(settings, scanner=_CountingBackend(devices))
         )
-    if scanner_context == "one-device":
-        _recording_dialler(monkeypatch)
-        return lambda: _context(
-            _settings(tmp_path, host="scanbox.lan"),
-            scanner=_CountingBackend([_device()]),
-        )
-    if scanner_context == "enumeration-raises":
-        _recording_dialler(monkeypatch)
-        return lambda: _context(
-            _settings(tmp_path, host="scanbox.lan"), scanner=_RaisingBackend()
-        )
-    msg = f"unknown scanner context: {scanner_context}"
-    raise ValueError(msg)
+        assert "refusing this machine" in row.message
+        assert "saned.conf" in row.next_step
+        for text in (row.message, row.next_step):
+            assert "switched on and connected" not in text
 
 
 # Matches a row that talks about a *scan*, and deliberately not one that talks
@@ -5112,14 +5625,16 @@ class TestRunChecksUnderTheScannerGate:
         answers, and no configured host.  Every context whose *row* differs was
         untested, so a gated path that diverged on the no-python-sane row, on a
         host that refuses the pre-probe, or on an enumeration that raises would
-        have passed.  All four run here, and all four are reached without
-        resolving a name or opening a socket -- the dialler is stubbed in every
-        variant, including the two that never reach it.
+        have passed.  Every context in ``_GATED_CONTEXTS`` runs here, including
+        the rejected, timed-out, unresolved and wrong-device ones, and all of
+        them are reached without resolving a name or opening a socket -- the
+        dialler is stubbed in every variant, including the one that never
+        reaches it.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: Used to stub the probe seam.
-            scanner_context: Which of the four scanner contexts to run.
+            scanner_context: Which of the scanner contexts to run.
 
         """
         build = _gated_context_builder(tmp_path, monkeypatch, scanner_context)
@@ -5129,6 +5644,28 @@ class TestRunChecksUnderTheScannerGate:
         )
         assert [result.key for result in gated] == list(CheckKey)
         assert gated == ungated
+
+    def test_every_gated_context_reaches_a_different_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        No two parity contexts end in the same Scanner row.
+
+        The parity test is only as good as the branches its contexts reach.
+        Two contexts that produced the same row would be one branch tested
+        twice and another not at all, and the parity test could not tell.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to stub the probe seam.
+
+        """
+        rows: dict[str, tuple[CheckState, str]] = {}
+        for scanner_context in _GATED_CONTEXTS:
+            build = _gated_context_builder(tmp_path, monkeypatch, scanner_context)
+            row = _row(run_checks(build()), CheckKey.SCANNER)
+            rows[scanner_context] = (row.state, row.message)
+        assert len(set(rows.values())) == len(_GATED_CONTEXTS), rows
 
     def test_the_gate_is_held_while_the_scanner_check_runs(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

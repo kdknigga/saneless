@@ -2802,12 +2802,13 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     ``test_a_gated_run_returns_what_an_ungated_run_returns`` in
     ``tests/test_checks.py`` -- and that is where anyone changing either half
     should look.  It is parametrised over the contexts whose rows differ: no
-    python-sane, a configured host that does not answer the pre-probe, a host
-    that answers and enumerates one device, an enumeration that raises, a
-    host that refuses this machine, a host whose name does not resolve, a
-    configured device that is not listed and does not open, and one that is
-    not listed but opens.  Together they reach every branch of this function
-    and compare each against ``_check_scanner``.
+    python-sane, a configured host that refuses the pre-probe's connection,
+    one that does not answer it, a host that answers and enumerates one
+    device, an enumeration that raises, a host that refuses this machine, a
+    host whose name does not resolve, a configured device that is not listed
+    and does not open, and one that is not listed but opens.  Together they
+    reach every branch of this function and compare each against
+    ``_check_scanner``.
 
     Args:
         context: The injected dependencies and configuration.
