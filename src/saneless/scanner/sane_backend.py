@@ -51,6 +51,11 @@ from saneless.scanner.base import (
     SourceKind,
     classify_source,
 )
+from saneless.scanner.net_hosts import (
+    SANE_NET_HOSTS,
+    effective_sane_net_hosts,
+    exported_sane_net_hosts,
+)
 from saneless.text_safety import neutralise_controls
 
 if TYPE_CHECKING:
@@ -845,22 +850,37 @@ class _Init:
     a second suppression to say otherwise.  Keeping it beside ``_WEDGE`` also
     keeps this module's process-global state in one place rather than two.
 
-    ``host`` is the ``host`` argument the initialising construction passed, not
-    the environment variable it may have set.  The two differ whenever
-    ``SANE_NET_HOSTS`` was already set externally, and it is the *argument*
-    that a later construction is compared against: what the comparison has to
-    catch is a second operator-configured host arriving too late to be read.
+    ``host`` is the configured ``host`` argument the initialising construction
+    passed, and it is what a later construction is compared against: what the
+    comparison has to catch is a second operator-configured host arriving too
+    late to be read.  ``effective`` is the host list SANE's net backend will
+    actually read, which differs from ``host`` whenever a non-empty
+    ``SANE_NET_HOSTS`` was exported, and it is what that comparison's warning
+    names, so the operator is pointed at the host SANE is really using.
+
+    ``written`` and ``previous`` let ``shutdown()`` undo saneless's own write,
+    so a later init writes its own host rather than finding the old one and
+    reporting it as set externally.
 
     Attributes:
         done: Whether ``sane.init()`` has returned successfully and not yet
             been undone by ``shutdown()``.
         host: The host argument that was in effect at that init.
+        effective: The host list SANE's net backend will read, recorded at
+            init; empty when there is none.
+        written: The value saneless wrote into ``SANE_NET_HOSTS``, or ``None``
+            when it wrote nothing.
+        previous: What ``SANE_NET_HOSTS`` held before that write: ``None``
+            when it was absent, ``""`` when it was exported empty.
         version: Whatever ``sane.init()`` returned, kept for the log line.
 
     """
 
     done: bool = False
     host: str = ""
+    effective: str = ""
+    written: str | None = None
+    previous: str | None = None
     version: object = None
 
 
@@ -877,6 +897,24 @@ _INIT = _Init()
 _READER_THREAD_PREFIX = "sane-read-"
 
 
+def _restore_sane_net_hosts() -> None:
+    """
+    Undo saneless's own ``SANE_NET_HOSTS`` write, and forget it either way.
+
+    The caller holds ``_INIT_LOCK``.  The variable is put back only while it
+    still holds the value saneless wrote: absent again when it was absent,
+    empty again when it was exported empty.  A value someone else wrote after
+    init is theirs and is left alone.
+    """
+    if _INIT.written is not None and os.environ.get(SANE_NET_HOSTS) == _INIT.written:
+        if _INIT.previous is None:
+            os.environ.pop(SANE_NET_HOSTS, None)
+        else:
+            os.environ[SANE_NET_HOSTS] = _INIT.previous
+    _INIT.written = None
+    _INIT.previous = None
+
+
 def _ensure_initialised(host: str) -> object:
     """
     Initialise SANE, once per process, whoever asks.
@@ -890,19 +928,23 @@ def _ensure_initialised(host: str) -> object:
     wherever they need it.
 
     A later construction naming a *different* host is the case worth a WARNING
-    rather than silence.  The sane-net backend reads ``SANE_NET_HOSTS`` when it
-    is initialised and never again, so the second host is not merely redundant:
-    it does nothing at all, while the operator who configured it has every
-    reason to believe it is in effect.  Only the hostnames from the
-    operator's own configuration are named, which the existing INFO line
-    already logs; no credential is in scope here (ASVS V7).
+    rather than silence.  The sane-net backend reads ``SANE_NET_HOSTS`` once,
+    at the first device listing after ``sane_init`` (the dll backend
+    initialises it lazily), so a host configured later has no effect for the
+    life of the process.  The second host is not merely redundant: it does
+    nothing at all, while the operator who configured it has every reason to
+    believe it is in effect.  The warning names the host list that was in
+    effect at init, which is what SANE is using.  Only host names from the
+    operator's own configuration or environment are named, which the existing
+    INFO line already logs; no credential is in scope here (ASVS V7).
 
     The failure translation is ``ScanError`` because a SANE that will not start
     is a scanning failure the caller reports, and it catches ``Exception``
     because python-sane raises ``_sane.error``, ``RuntimeError`` or
     ``AttributeError`` with no shared base.  A failed init records
-    nothing, so the next construction tries again rather than assuming an
-    initialised SANE that is not there.
+    nothing, the environment included, so the next construction tries again
+    rather than assuming an initialised SANE that is not there, and does not
+    mistake this attempt's host for one set externally.
 
     Args:
         host: Colon-separated sane-net hosts from the caller's configuration,
@@ -921,34 +963,39 @@ def _ensure_initialised(host: str) -> object:
                 logger.warning(
                     "SANE is already initialised with scanner host %s, so the "
                     "host %s configured here has no effect: SANE_NET_HOSTS is "
-                    "read once, at the first initialisation of the process. "
+                    "read once per process, at the first device listing. "
                     "Run one saneless per scanner host, or list both hosts "
                     "colon-separated in one configuration",
-                    _INIT.host or "none",
+                    _INIT.effective or "none",
                     host,
                 )
             return _INIT.version
         # SANE_NET_HOSTS tells the sane-net backend which hosts to probe for
         # scanners.  Multiple hosts are separated by colons — see sane-net(5).
-        # Only set from config when not already present in the environment
-        # (explicit env var takes priority over config file).
-        if host and "SANE_NET_HOSTS" not in os.environ:
-            os.environ["SANE_NET_HOSTS"] = host
+        # An exported non-empty value wins over the configured host; an
+        # exported empty value names no host and counts as unset.
+        exported = exported_sane_net_hosts()
+        if host and not exported:
+            _INIT.previous = os.environ.get(SANE_NET_HOSTS)
+            os.environ[SANE_NET_HOSTS] = host
+            _INIT.written = host
             logger.info("SANE net host discovery configured: %s", host)
-        elif host and "SANE_NET_HOSTS" in os.environ:
+        elif host:
             logger.info(
                 "SANE_NET_HOSTS already set externally (%s), ignoring scanner.host config",
-                os.environ["SANE_NET_HOSTS"],
+                exported,
             )
         try:
             version = _ensure_sane().init()
         except Exception as exc:
             # python-sane raises _sane.error, RuntimeError or AttributeError,
             # with no shared base, so the boundary catches Exception.
+            _restore_sane_net_hosts()
             init_msg = f"Could not initialise SANE: {describe(exc)}"
             raise ScanError(init_msg) from exc
         _INIT.done = True
         _INIT.host = host
+        _INIT.effective = effective_sane_net_hosts(host)
         _INIT.version = version
         logger.info("SANE initialized, version %s", version)
         return version
@@ -997,6 +1044,11 @@ def shutdown() -> None:
     exception here would replace whatever error the operator is being shown.
     The guard is re-armed either way, so a later ``SaneBackend`` initialises
     rather than assuming a SANE that a failed exit may well have left broken.
+
+    ``SANE_NET_HOSTS`` is put back as it was before init when it still holds
+    the value saneless wrote, so a later init writes its own host rather than
+    finding this one and reporting it as set externally.  The two early
+    returns leave it alone, because SANE is still initialised there.
     """
     with _INIT_LOCK:
         if not _INIT.done:
@@ -1013,8 +1065,10 @@ def shutdown() -> None:
             _ensure_sane().exit()
         except Exception:
             logger.warning("Could not shut SANE down", exc_info=True)
+        _restore_sane_net_hosts()
         _INIT.done = False
         _INIT.host = ""
+        _INIT.effective = ""
         _INIT.version = None
         logger.info("SANE shut down")
 
@@ -2010,7 +2064,8 @@ class SaneBackend(ScannerBackend):
         Args:
             host: Colon-separated sane-net hosts, applied only at the first
                 initialisation in the process, and only when
-                ``SANE_NET_HOSTS`` is not already set.  A later, differing host
+                ``SANE_NET_HOSTS`` is not already set to a non-empty value.  A
+                later, differing host
                 is reported as having no effect rather than applied.
 
         Raises:
