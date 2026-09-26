@@ -253,6 +253,35 @@ _CLOSED_STDERR_CHILD = (
     _PRINTING_BACKEND_SETUP + "os.close(2)\n{stderr_line}\n" + _RUN_REAL_CHILD
 )
 
+# Runs the real child script with its stderr closed, over a stand-in ``sane``
+# module whose listing starts a helper program, as a backend that execs one
+# does.  The helper exits 0 only when it starts with a descriptor on fd 2, and
+# its exit status comes back as the listed device's vendor.
+_HELPER_PROGRAM_CHILD = (
+    """\
+import os
+import runpy
+import subprocess
+import sys
+import types
+
+
+def get_devices():
+    helper = [sys.executable, "-I", "-c", "import os; os.fstat(2)"]
+    status = subprocess.run(helper, check=False).returncode
+    return [("test:0", str(status), "frontend-tester", "virtual device")]
+
+
+sane = types.ModuleType("sane")
+sane.init = lambda: (1, 0, 0)
+sane.get_devices = get_devices
+sys.modules["sane"] = sane
+os.close(2)
+sys.stderr = None
+"""
+    + _RUN_REAL_CHILD
+)
+
 
 def _use_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str) -> Path:
     """
@@ -448,6 +477,25 @@ class TestHappyPath:
         reply = run_listing_child(ListingRequest(), configured_host="")
 
         assert reply == ListingReply(devices=(_TEST_DEVICE,))
+
+    def test_a_closed_stderr_is_reopened_for_programs_a_backend_starts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A helper program a backend starts gets the child's replacement fd 2.
+
+        Left close-on-exec, the ``/dev/null`` the child opens on a closed
+        fd 2 would vanish in the helper, whose own first ``open`` would then
+        take fd 2 and receive whatever it writes to stderr.
+        """
+        monkeypatch.setenv("LISTING_TEST_REAL_CHILD", str(_REAL_CHILD_FILE))
+        _use_child(monkeypatch, tmp_path, _HELPER_PROGRAM_CHILD)
+
+        reply = run_listing_child(ListingRequest(), configured_host="")
+
+        assert reply == ListingReply(
+            devices=(("test:0", "0", "frontend-tester", "virtual device"),)
+        )
 
     def test_a_crash_after_the_reply_is_written_does_not_lose_it(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

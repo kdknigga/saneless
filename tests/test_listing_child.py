@@ -49,6 +49,7 @@ _ALLOWED_IMPORTS = frozenset(
     {
         "__future__",
         "contextlib",
+        "fcntl",
         "importlib",
         "json",
         "os",

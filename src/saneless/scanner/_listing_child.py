@@ -74,6 +74,7 @@ with it; libsane's own debug output goes to stderr unbuffered.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import importlib
 import json
 import os
@@ -301,7 +302,10 @@ def _private_reply_channel() -> TextIO:
     started with it closed.  Then fd 2 is first opened on ``/dev/null``: left
     free, it would be the lowest free descriptor, so the reply's own copy
     would land on it and fd 1 would be pointed straight back at the reply's
-    pipe.  What the scanner library prints is then discarded.
+    pipe.  What the scanner library prints is then discarded.  That fd 2 is
+    left inheritable, as fd 1 is, so a helper program a backend starts gets
+    it too, rather than a free fd 2 that the helper's own first ``open``
+    would take.
 
     Returns:
         A text stream on a new descriptor for the parent's pipe.  From here
@@ -312,7 +316,11 @@ def _private_reply_channel() -> TextIO:
         os.fstat(_STDERR_FD)
     except OSError:
         sink = os.open(os.devnull, os.O_WRONLY)
-        if sink != _STDERR_FD:
+        if sink == _STDERR_FD:
+            # os.open makes its descriptor close-on-exec, and only dup2 would
+            # have cleared that.  FD_CLOEXEC is the one descriptor flag.
+            fcntl.fcntl(_STDERR_FD, fcntl.F_SETFD, 0)
+        else:
             os.dup2(sink, _STDERR_FD)
             os.close(sink)
     reply_fd = os.dup(_STDOUT_FD)
