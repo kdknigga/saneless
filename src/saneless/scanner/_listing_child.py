@@ -60,6 +60,13 @@ Every python-sane call is wrapped in ``except Exception``, never
 ``BaseException``, and its failure travels back as data.  So the child ends
 without a reply only when a signal ends it or when it cannot read its request,
 which exits with status 2.  It has no logger: the parent decides what to log.
+
+Once the reply is written the child ends with ``os._exit``, skipping the
+interpreter's and the libraries' teardown.  The parent reads the exit status
+before the reply, so a destructor or an exit hook that crashed or hung after
+the reply was on the pipe would otherwise report a listing that worked as a
+crash or a timeout.  Output a backend left in C stdio's buffer is dropped
+with it; libsane's own debug output goes to stderr unbuffered.
 """
 
 from __future__ import annotations
@@ -295,4 +302,10 @@ def _private_reply_channel() -> TextIO:
 if __name__ == "__main__":
     with _private_reply_channel() as channel:
         status = main(sys.stdin, channel)
-    sys.exit(status)
+    # The reply is on the pipe, so end here, without the interpreter's and the
+    # libraries' teardown: a crash or a hang in a destructor or an exit hook
+    # would otherwise turn a listing that worked into a failed one.  The
+    # kernel closes the sockets and USB handles, and a saned sees EOF.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(status)

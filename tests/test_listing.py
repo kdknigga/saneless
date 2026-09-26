@@ -188,6 +188,41 @@ sys.modules["sane"] = sane
 runpy.run_path(os.environ["LISTING_TEST_REAL_CHILD"], run_name="__main__")
 """
 
+# Runs the real child script over a stand-in ``sane`` module whose ``init``
+# leaves behind a teardown step that crashes, as a library destructor or an
+# ``atexit`` hook registered from C can, after the reply is already written.
+_TEARDOWN_CRASH_CHILD = """\
+import atexit
+import os
+import resource
+import runpy
+import signal
+import sys
+import types
+
+
+def crash():
+    # No core file: this crash is deliberate.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.kill(os.getpid(), signal.SIGSEGV)
+
+
+def init():
+    atexit.register(crash)
+    return (1, 0, 0)
+
+
+def get_devices():
+    return [("test:0", "Noname", "frontend-tester", "virtual device")]
+
+
+sane = types.ModuleType("sane")
+sane.init = init
+sane.get_devices = get_devices
+sys.modules["sane"] = sane
+runpy.run_path(os.environ["LISTING_TEST_REAL_CHILD"], run_name="__main__")
+"""
+
 
 def _use_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str) -> Path:
     """
@@ -359,6 +394,23 @@ class TestHappyPath:
 
         assert reply == ListingReply(devices=(_TEST_DEVICE,))
         assert "backend chatter with no newline" in capfd.readouterr().err
+
+    def test_a_crash_after_the_reply_is_written_does_not_lose_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The child ends without teardown once its reply is on the pipe.
+
+        Library destructors and exit hooks would otherwise run after the
+        reply, and a crash or a hang in them would turn a listing that
+        worked into a crashed or timed-out one.
+        """
+        monkeypatch.setenv("LISTING_TEST_REAL_CHILD", str(_REAL_CHILD_FILE))
+        _use_child(monkeypatch, tmp_path, _TEARDOWN_CRASH_CHILD)
+
+        reply = run_listing_child(ListingRequest(), configured_host="")
+
+        assert reply == ListingReply(devices=(_TEST_DEVICE,))
 
 
 class TestCrash:
