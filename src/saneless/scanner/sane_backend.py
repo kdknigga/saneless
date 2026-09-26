@@ -148,6 +148,23 @@ def _launch_listing(request: ListingRequest, *, configured_host: str) -> Listing
     return run_listing_child(request, configured_host=configured_host)
 
 
+def _listed_devices(reply: ListingReply) -> tuple[DeviceInfo, ...]:
+    """
+    Turn the devices a listing child reported into ``DeviceInfo`` objects.
+
+    Args:
+        reply: The child's validated reply.
+
+    Returns:
+        One ``DeviceInfo`` per device, in the order the child listed them.
+
+    """
+    return tuple(
+        DeviceInfo(name=name, vendor=vendor, model=model, device_type=device_type)
+        for name, vendor, model, device_type in reply.devices
+    )
+
+
 # Per-page timeout: 2x a generous single-page scan estimate (60s at 600 DPI).
 # At 300 DPI typical scan is ~10-15s, so 120s is very conservative.
 #
@@ -2252,15 +2269,7 @@ class SaneBackend(ScannerBackend):
             reason = describe_text(reply.list_error.message, reply.list_error.type_name)
             list_msg = f"Could not list scanners: {neutralise_controls(reason)}"
             raise ScanError(list_msg)
-        return [
-            DeviceInfo(
-                name=d[0],
-                vendor=d[1],
-                model=d[2],
-                device_type=d[3],
-            )
-            for d in reply.devices
-        ]
+        return list(_listed_devices(reply))
 
     def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
         """
@@ -2300,15 +2309,7 @@ class SaneBackend(ScannerBackend):
             configured_host=self._host,
         )
         return DeviceSurvey(
-            devices=tuple(
-                DeviceInfo(
-                    name=d[0],
-                    vendor=d[1],
-                    model=d[2],
-                    device_type=d[3],
-                )
-                for d in reply.devices
-            ),
+            devices=_listed_devices(reply),
             list_error=reply.list_error.type_name if reply.list_error else None,
             configured_opened=reply.opened,
             open_error=reply.open_error.type_name if reply.open_error else None,
