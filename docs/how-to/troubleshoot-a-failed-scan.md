@@ -99,10 +99,11 @@ saneless devices
 If the scanner is missing from that list, or saneless runs in a container, work through
 [Scanner Host Discovery](scanner-host-discovery.md).
 
-If the status strip's Scanner row is red but `saneless devices` lists the scanner, restart saneless.
-The running server can hold on to a scanner host it failed to look up when it started, while
-`saneless devices` starts fresh every time. [What the Scanner row says](scanner-host-discovery.md#what-the-scanner-row-says)
-lists each Scanner row, what fixes it, and whether pressing **Check again** or a restart clears it.
+The status strip and `saneless devices` ask SANE for scanners the same fresh way, in a new
+short-lived process each time, so if the strip's Scanner row is red, pressing **Check again** after
+fixing the cause is enough; a restart is only needed after changing saneless's own settings.
+[What the Scanner row says](scanner-host-discovery.md#what-the-scanner-row-says) lists each Scanner
+row, what fixes it, and whether pressing **Check again** or a restart clears it.
 
 ## Configuration errors (exit 2)
 
