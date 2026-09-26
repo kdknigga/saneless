@@ -3135,6 +3135,629 @@ class TestScannerCheckMultipleDevices:
         assert row.message == "Brother ADS-2700W is ready."
 
 
+_HEALTHY: Final = checks._SanedOutcome.HEALTHY
+_REJECTED: Final = checks._SanedOutcome.REJECTED
+_UNRESOLVED: Final = checks._SanedOutcome.UNRESOLVED
+_REFUSED: Final = checks._SanedOutcome.REFUSED
+_TIMED_OUT: Final = checks._SanedOutcome.TIMED_OUT
+
+_REJECTED_NEXT: Final = (
+    "Add this machine to saned.conf on the scanner host, then press Check again."
+)
+_UNRESOLVED_NEXT: Final = (
+    "Check [scanner] host in the config file, then restart saneless."
+)
+_TIMED_OUT_NEXT: Final = (
+    "Check the scanner host is switched on and on the network, then press Check again."
+)
+_REFUSED_NEXT: Final = "Start saned on the scanner host, or check it is listening on the network, then press Check again."
+_MULTIPLE_DEVICES_NEXT: Final = "Set [scanner] device to the one you use; saneless devices lists them, and saneless auto-profiles writes it for you."
+_CONFIGURED_MISSING_NEXT: Final = "Check it is switched on and connected. If saneless devices lists it, restart saneless; if not, set [scanner] device to one it lists."
+_HOST_ANSWERS_NOTHING_FOUND_NEXT: Final = "Check the scanner is switched on and connected to the scanner host. If saneless devices lists it, restart saneless."
+_NOTHING_FOUND_NEXT: Final = "Check the scanner is switched on and connected, then press Check again. If saneless devices lists it, restart saneless."
+
+_LOCAL_DEVICE_ID: Final = "epson2:libusb:001:004"
+_UNLISTED_ESCL_ID: Final = "escl:http://10.0.0.5:80"
+
+
+def _hp(host: str, outcome: checks._SanedOutcome) -> checks._HostProbe:
+    """
+    Build what one configured host's probe found.
+
+    Args:
+        host: The configured entry.
+        outcome: What its probe found.
+
+    Returns:
+        The probe result the verdict reads.
+
+    """
+    return checks._HostProbe(host, outcome)
+
+
+def _unlabelled_device() -> DeviceInfo:
+    """
+    Build a device that reported neither a vendor nor a model.
+
+    Returns:
+        A DeviceInfo whose label is empty.
+
+    """
+    return DeviceInfo(
+        name="net:scanbox.lan:plain:bus0;dev3",
+        vendor="",
+        model="",
+        device_type="scanner",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _VerdictCase:
+    """
+    One set of inputs to the Scanner verdict and the row it must produce.
+
+    Attributes:
+        probes: What each configured host's probe found.
+        devices: What enumeration listed.
+        configured: The configured ``scanner.device``, possibly empty.
+        opened: Whether opening an unlisted configured device worked, or
+            ``None`` when no open was attempted.
+        state: The row's expected state.
+        message: The row's expected message.
+        next_step: The row's expected next step.
+
+    """
+
+    probes: tuple[checks._HostProbe, ...]
+    devices: tuple[DeviceInfo, ...]
+    configured: str
+    opened: bool | None
+    state: CheckState
+    message: str
+    next_step: str
+
+
+_VERDICT_CASES: Final = [
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.OK,
+            message="Brother ADS-2700W is ready.",
+            next_step="",
+        ),
+        id="one-device-ready",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(_unlabelled_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.OK,
+            message="Ready.",
+            next_step="",
+        ),
+        id="unlabelled-device-ready",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _HEALTHY),),
+            devices=(_rogue_device(), _device()),
+            configured=_device().name,
+            opened=None,
+            state=CheckState.OK,
+            message="Brother ADS-2700W is ready.",
+            next_step="",
+        ),
+        id="configured-device-not-the-first-listed",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(_device(), _rogue_device()),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="2 scanners are visible and none is chosen.",
+            next_step=_MULTIPLE_DEVICES_NEXT,
+        ),
+        id="several-devices-none-chosen",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REJECTED),),
+            devices=(_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="Brother ADS-2700W is ready, but the scanner host is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="rejected-with-a-usable-scanner",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REJECTED),),
+            devices=(_unlabelled_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="The scanner is ready, but the scanner host is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="rejected-with-an-unlabelled-usable-scanner",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _HEALTHY), _hp("b.lan", _REJECTED)),
+            devices=(_device(),),
+            configured=_device().name,
+            opened=None,
+            state=CheckState.WARN,
+            message="Brother ADS-2700W is ready, but 1 of 2 scanner hosts is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="configured-device-ready-beside-a-rejecting-host",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REJECTED),),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="The scanner host is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="rejected-and-nothing-usable",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _HEALTHY), _hp("b.lan", _REJECTED)),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="1 of 2 scanner hosts is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="one-of-two-hosts-rejected",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _REJECTED), _hp("b.lan", _REJECTED)),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="2 of 2 scanner hosts are refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="two-of-two-hosts-rejected",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.test", _UNRESOLVED),),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="The scanner host could not be found by name.",
+            next_step=_UNRESOLVED_NEXT,
+        ),
+        id="unresolved-and-nothing-usable",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _REJECTED), _hp("b.lan", _UNRESOLVED)),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="1 of 2 scanner hosts could not be found by name.",
+            next_step=_UNRESOLVED_NEXT,
+        ),
+        id="the-worst-outcome-is-reported",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.test", _UNRESOLVED),),
+            devices=(_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="Brother ADS-2700W is ready, but the scanner host could not be found by name.",
+            next_step=_UNRESOLVED_NEXT,
+        ),
+        id="unresolved-with-a-usable-scanner",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(_rogue_device(),),
+            configured=_LOCAL_DEVICE_ID,
+            opened=False,
+            state=CheckState.FAIL,
+            message="The configured scanner was not found.",
+            next_step=_CONFIGURED_MISSING_NEXT,
+        ),
+        id="configured-device-absent-and-will-not-open",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(_rogue_device(),),
+            configured=_UNLISTED_ESCL_ID,
+            opened=True,
+            state=CheckState.OK,
+            message="The configured scanner is ready.",
+            next_step="",
+        ),
+        id="configured-device-unlisted-but-opens",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REJECTED),),
+            devices=(),
+            configured="net:other.lan:x:0",
+            opened=True,
+            state=CheckState.WARN,
+            message="The configured scanner is ready, but the scanner host is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="configured-device-opens-beside-a-rejecting-host",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _HEALTHY), _hp("scanbox.lan", _REJECTED)),
+            devices=(),
+            configured=_device().name,
+            opened=False,
+            state=CheckState.FAIL,
+            message="The configured scanner's host is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="configured-net-device-on-a-rejecting-host",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _HEALTHY), _hp("scanbox.lan", _UNRESOLVED)),
+            devices=(),
+            configured=_device().name,
+            opened=False,
+            state=CheckState.FAIL,
+            message="The configured scanner's host could not be found by name.",
+            next_step=_UNRESOLVED_NEXT,
+        ),
+        id="configured-net-device-on-an-unresolved-host",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REJECTED),),
+            devices=(),
+            configured=_LOCAL_DEVICE_ID,
+            opened=False,
+            state=CheckState.FAIL,
+            message="The configured scanner was not found.",
+            next_step=_CONFIGURED_MISSING_NEXT,
+        ),
+        id="configured-local-device-absent-beside-a-rejecting-host",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _HEALTHY),),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="The scanner host is answering, but no scanner was found on it.",
+            next_step=_HOST_ANSWERS_NOTHING_FOUND_NEXT,
+        ),
+        id="healthy-host-nothing-found",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _HEALTHY), _hp("b.lan", _HEALTHY)),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="The scanner hosts are answering, but no scanner was found on them.",
+            next_step=_HOST_ANSWERS_NOTHING_FOUND_NEXT,
+        ),
+        id="healthy-hosts-nothing-found",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.FAIL,
+            message="No scanner was found.",
+            next_step=_NOTHING_FOUND_NEXT,
+        ),
+        id="no-host-nothing-found",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _REJECTED),),
+            devices=(_device(), _rogue_device()),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="Brother ADS-2700W is ready, but the scanner host is refusing this machine.",
+            next_step=_REJECTED_NEXT,
+        ),
+        id="a-host-problem-beats-the-several-devices-warning",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("scanbox.lan", _TIMED_OUT),),
+            devices=(_device(),),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="The scanner host is not answering, so the scanner could not be checked.",
+            next_step=_TIMED_OUT_NEXT,
+        ),
+        id="timed-out",
+    ),
+    pytest.param(
+        _VerdictCase(
+            probes=(_hp("a.lan", _REFUSED), _hp("b.lan", _HEALTHY)),
+            devices=(),
+            configured="",
+            opened=None,
+            state=CheckState.WARN,
+            message="1 of 2 scanner hosts is on, but its scanner service is not running, so the scanner could not be checked.",
+            next_step=_REFUSED_NEXT,
+        ),
+        id="refused",
+    ),
+]
+
+
+def _verdict(case: _VerdictCase) -> CheckResult:
+    """
+    Run the Scanner verdict on one case's inputs.
+
+    Args:
+        case: The inputs, and the expected row, which is not used here.
+
+    Returns:
+        The row the verdict built.
+
+    """
+    return checks._scanner_verdict(
+        case.probes,
+        checks._Enumeration(devices=case.devices, configured_opened=case.opened),
+        case.configured,
+    )
+
+
+def _advice_kind(message: str) -> str:
+    """
+    Say which kind of next step a row's message calls for.
+
+    Args:
+        message: A Scanner row's message.
+
+    Returns:
+        ``"check-again"`` for a host the next enumeration dials again,
+        ``"restart"`` for a name libsane drops for the life of the process,
+        ``"restart-if-listed"`` for a scanner nothing found, and ``"none"``
+        for everything else.
+
+    """
+    if any(
+        phrase in message
+        for phrase in (
+            "refusing this machine",
+            "not answering",
+            "scanner service is not running",
+        )
+    ):
+        return "check-again"
+    if "could not be found by name" in message:
+        return "restart"
+    lowered = message.lower()
+    if "was not found" in lowered or "no scanner was found" in lowered:
+        return "restart-if-listed"
+    return "none"
+
+
+_LEAK_MARKERS: Final = (
+    "scanbox",
+    "a.lan",
+    "b.lan",
+    "other.lan",
+    "rogue.lan",
+    "10.0.0.5",
+    "epson2",
+    "libusb",
+    "net:",
+    "escl:",
+    "/",
+    "6566",
+)
+
+
+class TestScannerVerdict:
+    """
+    One pure function turns probe outcomes and a device list into the Scanner row.
+
+    Every row the check can show is decided here from plain values, so each
+    one is pinned without a socket or a backend.  The rows are amber while a
+    usable scanner is visible and red only when scanning cannot work; a host
+    that refuses this machine is named as such and never blamed on the
+    scanner being switched off; and the next step says "press Check again"
+    only where the next check really can clear the state.
+    """
+
+    @pytest.mark.parametrize("case", _VERDICT_CASES)
+    def test_the_row(self, case: _VerdictCase) -> None:
+        """
+        Each set of inputs gives exactly the expected state, message and next step.
+
+        Args:
+            case: The inputs and the expected row.
+
+        """
+        row = _verdict(case)
+        assert row.key is CheckKey.SCANNER
+        assert (row.state, row.message, row.next_step) == (
+            case.state,
+            case.message,
+            case.next_step,
+        )
+
+    @pytest.mark.parametrize("case", _VERDICT_CASES)
+    def test_a_refusing_host_is_never_blamed_on_the_scanner(
+        self, case: _VerdictCase
+    ) -> None:
+        """
+        A row about a refusing host points at saned.conf, not at the scanner's power.
+
+        Args:
+            case: The inputs to the verdict.
+
+        """
+        row = _verdict(case)
+        if "refusing this machine" not in row.message:
+            return
+        assert "switched on and connected" not in row.message
+        assert "switched on and connected" not in row.next_step
+        assert "saned.conf" in row.next_step
+
+    @pytest.mark.parametrize("case", _VERDICT_CASES)
+    def test_the_next_step_is_the_one_that_clears_the_state(
+        self, case: _VerdictCase
+    ) -> None:
+        """
+        Only states the next check can clear say "press Check again".
+
+        A host that refused this machine, was not listening or did not answer
+        is dialled again by the next enumeration.  A name that did not resolve
+        is dropped for the life of the process, and a scanner that cannot be
+        found may be one a stale process lost, so those rows say restart, the
+        second only if ``saneless devices`` (a fresh process) lists it.
+
+        Args:
+            case: The inputs to the verdict.
+
+        """
+        row = _verdict(case)
+        match _advice_kind(row.message):
+            case "check-again":
+                assert row.next_step.endswith("press Check again.")
+                assert "restart" not in row.next_step
+            case "restart":
+                assert "restart saneless" in row.next_step
+            case "restart-if-listed":
+                assert "If saneless devices lists it, restart saneless" in (
+                    row.next_step
+                )
+            case _:
+                assert "restart" not in row.next_step
+
+    def test_the_restart_property_covers_every_kind_of_advice(self) -> None:
+        """Every kind of next step is exercised by at least one case above."""
+        kinds = {
+            _advice_kind(cast("_VerdictCase", param.values[0]).message)
+            for param in _VERDICT_CASES
+        }
+        assert kinds >= {"check-again", "restart", "restart-if-listed"}
+
+    @pytest.mark.parametrize("case", _VERDICT_CASES)
+    def test_no_row_names_a_host_address_or_device_id(self, case: _VerdictCase) -> None:
+        """
+        Rows are LAN-visible, so they carry counts and device labels only.
+
+        Args:
+            case: The inputs to the verdict.
+
+        """
+        row = _verdict(case)
+        rendered = f"{row.message} {row.next_step}"
+        for leaked in _LEAK_MARKERS:
+            assert leaked not in rendered
+
+    @pytest.mark.parametrize("case", _VERDICT_CASES)
+    def test_a_problem_row_says_what_to_do_and_a_ready_row_does_not(
+        self, case: _VerdictCase
+    ) -> None:
+        """
+        Amber and red rows carry a next step; green rows carry none.
+
+        Args:
+            case: The inputs to the verdict.
+
+        """
+        row = _verdict(case)
+        if row.state is CheckState.OK:
+            assert row.next_step == ""
+        else:
+            assert row.next_step
+
+    @pytest.mark.parametrize("outcome", [_TIMED_OUT, _REFUSED])
+    @pytest.mark.parametrize(
+        "devices",
+        [(), (_device(),), (_device(), _rogue_device())],
+        ids=["none", "one", "two"],
+    )
+    def test_a_host_that_must_not_be_enumerated_gives_the_preflight_row(
+        self, outcome: checks._SanedOutcome, devices: tuple[DeviceInfo, ...]
+    ) -> None:
+        """
+        The verdict and the preflight can never disagree about such a host.
+
+        Args:
+            outcome: An outcome that keeps the check out of libsane.
+            devices: Whatever enumeration is claimed to have listed.
+
+        """
+        probes = (_hp("scanbox.lan", _HEALTHY), _hp("b.lan", outcome))
+        row = checks._scanner_verdict(
+            probes, checks._Enumeration(devices=devices), _device().name
+        )
+        assert row == checks._scanner_host_unanswered(probes)
+
+    def test_an_enumeration_records_no_open_by_default(self) -> None:
+        """No open was attempted unless the caller says one was."""
+        assert checks._Enumeration(devices=()).configured_opened is None
+
+    @pytest.mark.parametrize(
+        ("device_id", "expected"),
+        [
+            ("net:scanbox.lan:brother5:bus0;dev1", "scanbox.lan"),
+            ("net:[fe80::1]:x:0", "[fe80::1]"),
+            ("net:scanbox.lan", "scanbox.lan"),
+            ("epson2:libusb:001:004", None),
+            ("escl:http://10.0.0.5:80", None),
+            ("net:", None),
+            ("net::x:0", None),
+            ("net:[fe80::1", None),
+            ("", None),
+        ],
+    )
+    def test_the_host_a_net_device_lives_on(
+        self, device_id: str, expected: str | None
+    ) -> None:
+        """
+        A ``net:`` device id names the host entry it was listed from.
+
+        Args:
+            device_id: A SANE device id.
+            expected: The host entry, or ``None`` for an id that names none.
+
+        """
+        assert checks._net_device_entry(device_id) == expected
+
+
 _PROBE_OUTCOMES = [
     pytest.param(200, CheckState.OK, ConnectionStatus.CONNECTED, id="connected"),
     pytest.param(
