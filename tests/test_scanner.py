@@ -48,7 +48,7 @@ from saneless.scanner.base import (
     SourceKind,
     classify_source,
 )
-from saneless.scanner.listing import ListingRequest
+from saneless.scanner.listing import ListingReply, ListingRequest
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from saneless.spool import SpooledPageSink
@@ -1407,6 +1407,40 @@ class TestTheMainProcessNeverLists:
             SaneBackend().open_and_close(_NET_DEVICE)
 
         assert str(failed.value) == "Could not open the scanner (FakeSaneError)"
+
+    def test_a_failed_open_with_no_reason_says_so(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reply that says the open failed but not why never reads "(None)"."""
+
+        def unexplained_failure(
+            _request: ListingRequest, *, configured_host: str
+        ) -> ListingReply:
+            _ = configured_host
+            return ListingReply(devices=(), opened=False)
+
+        monkeypatch.setattr(sane_backend_mod, "_launch_listing", unexplained_failure)
+
+        with pytest.raises(ScanError) as failed:
+            SaneBackend().open_and_close(_NET_DEVICE)
+
+        assert str(failed.value) == "Could not open the scanner (unknown error)"
+
+    def test_an_empty_device_id_is_refused_without_a_listing(
+        self, fake_sane_module: FakeSaneModule, listing_seam: ListingSeam
+    ) -> None:
+        """
+        An empty id opens nothing, so it cannot be reported as opened.
+
+        The listing child reads an empty id as a request to list only.
+        """
+        _ = fake_sane_module  # side-effect: patches the sane module
+
+        with pytest.raises(ScanError) as failed:
+            SaneBackend().open_and_close("")
+
+        assert str(failed.value) == "No scanner was named to open"
+        assert listing_seam.calls == []
 
     def test_the_seam_refuses_to_start_real_libsane(self) -> None:
         """With no fake patched in, a listing fails the test instead of running."""

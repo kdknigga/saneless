@@ -2492,14 +2492,20 @@ class SaneBackend(ScannerBackend):
             ListingTimedOutError: The listing child did not finish in time.
             ListingNoAnswerError: The listing child gave no usable answer, or
                 could not be started.
-            ScanError: If a previous read has not returned, in which case no
-                child is started; or if the open failed, naming the failure's
-                class only.
+            ScanError: If ``device_id`` is empty or a previous read has not
+                returned, in which case no child is started; or if the open
+                failed, naming the failure's class only.
 
         """
+        if not device_id:
+            # An empty id asks the listing child to list only, so nothing
+            # would be opened and the call would report success.
+            msg = "No scanner was named to open"
+            raise ScanError(msg)
         survey = self.list_and_open(device_id)
         if survey.configured_opened is False:
-            msg = f"Could not open the scanner ({survey.open_error})"
+            reason = survey.open_error or "unknown error"
+            msg = f"Could not open the scanner ({reason})"
             raise ScanError(msg)
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
