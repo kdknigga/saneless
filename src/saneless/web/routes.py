@@ -376,9 +376,11 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     that has died and a tab left open in front of it.  While a checker
     demonstrably holds the single-flight lock the bound is
     ``POLL_PROBE_ATTEMPT_CAP`` instead, about three minutes, because the worst
-    case this application's own probe can cost is the ~127 s ``get_devices()``
-    ``checks.py`` documents plus unbounded name resolution, and a chain that
-    stopped at twenty seconds never collected the answer it was waiting for.
+    case this application's own probe can cost is the socket pre-probe, plus
+    the listing child's deadline (``LISTING_DEADLINE_SECONDS``, 30 s), plus
+    unbounded name resolution, and a chain that stopped at twenty seconds
+    never collected the answer it was waiting for.  The three-minute cap still
+    covers that sum.
     The larger window is still a cap: ``Lock.locked()`` stays true forever if
     the holder dies.
 

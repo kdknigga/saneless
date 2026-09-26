@@ -1399,11 +1399,12 @@ class PaperlessClient:
 
         The bound is a per-request override rather than a constructor
         argument, because the two kinds of caller want different budgets.
-        ``SaneBackend.get_devices()`` has no timeout at any layer -- not in
-        python-sane, not in ``sane_get_devices(3)``, and not settable from
-        Python -- so the SANE side of the status strip needs a socket
-        pre-probe to get any bound at all; httpx2, by contrast, takes one per
-        request.  The status strip and ``saneless doctor`` pass a short budget
+        ``SaneBackend.get_devices()`` still has no timeout inside python-sane
+        or ``sane_get_devices(3)``, and none is settable from Python.  saneless
+        runs it in a child process that is stopped at a deadline, and the SANE
+        side of the status strip keeps its socket pre-probe as well, so a
+        silent host is named in seconds and never holds the scanner gate for
+        the whole deadline; httpx2, by contrast, takes a bound per request.  The status strip and ``saneless doctor`` pass a short budget
         so an unplugged host is discovered in about two seconds instead of
         thirty, while ``GET /api/paperless/test`` deliberately keeps today's
         client default and therefore calls this with no argument at all.
