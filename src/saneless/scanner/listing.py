@@ -102,8 +102,9 @@ _CHILD_VARIABLE: Final = "SANELESS_LISTING_CHILD"
 
 # The child's environment keeps everything SANE and its backends read (SANE
 # settings, locale, proxies, certificates) and drops saneless's own settings,
-# which include the Paperless token.
-_OWN_PREFIX: Final = "SANELESS_"
+# which include the Paperless token.  Matched ignoring case, because the
+# settings loader reads its variables ignoring case.
+_OWN_PREFIX: Final = "saneless_"
 
 _NO_ANSWER: Final = "The scanner library returned no answer while listing scanners"
 
@@ -297,11 +298,11 @@ def child_environment(configured_host: str) -> dict[str, str]:
     """
     Build the environment a listing child runs in.
 
-    It is this process's environment minus every ``SANELESS_*`` variable, so
-    no saneless setting or secret reaches the child.  ``SANE_NET_HOSTS`` is
-    set from the same derivation the scanner check probes, never copied from
-    whatever this process's environment holds at the moment, and removed
-    when that derivation names no host.
+    It is this process's environment minus every ``SANELESS_*`` variable, in
+    any case, so no saneless setting or secret reaches the child.
+    ``SANE_NET_HOSTS`` is set from the same derivation the scanner check
+    probes, never copied from whatever this process's environment holds at
+    the moment, and removed when that derivation names no host.
 
     Args:
         configured_host: The ``scanner.host`` setting, possibly empty.
@@ -314,7 +315,7 @@ def child_environment(configured_host: str) -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(_OWN_PREFIX)
+        if not key.casefold().startswith(_OWN_PREFIX)
     }
     hosts = effective_sane_net_hosts(configured_host)
     if hosts:

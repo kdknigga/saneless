@@ -702,6 +702,29 @@ class TestChildEnvironment:
         assert env["SANE_CONFIG_DIR"] == "/x"
         assert env["SANE_NET_HOSTS"] == "scanbox.lan"
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            pytest.param("saneless_paperless__token", id="lowercase"),
+            pytest.param("Saneless_Paperless__Token", id="mixed-case"),
+        ],
+    )
+    def test_saneless_variables_are_dropped_in_any_case(
+        self, monkeypatch: pytest.MonkeyPatch, key: str
+    ) -> None:
+        """
+        The prefix is matched as the settings loader matches it, ignoring case.
+
+        The loader reads ``saneless_paperless__token`` as the Paperless token,
+        so the filter must drop it too.
+        """
+        monkeypatch.setenv(key, "secret")
+
+        env = child_environment("")
+
+        assert key not in env
+        assert "secret" not in env.values()
+
     def test_an_exported_host_list_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A non-empty exported SANE_NET_HOSTS is passed on over the setting."""
         monkeypatch.setenv("SANE_NET_HOSTS", "a.lan:b.lan")
