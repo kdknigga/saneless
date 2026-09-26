@@ -153,6 +153,41 @@ isolated = str(sys.flags.isolated)
 sys.stdout.write(json.dumps({"devices": [[isolated, "v", "m", "t"]]}) + "\\n")
 """
 
+# The real child script, kept before any test points the launcher elsewhere.
+_REAL_CHILD_FILE = listing._CHILD_FILE
+
+# Runs the real child script as a program, over a stand-in ``sane`` module,
+# so what the real entry point does with the process's own file descriptors
+# is what is tested.  The stand-in's ``init`` writes to fd 1 the two ways C
+# code does: through C stdio, which holds the text in its buffer until the
+# process exits, and straight to the descriptor, with no newline.
+_PRINTING_BACKEND_CHILD = """\
+import ctypes
+import os
+import runpy
+import sys
+import types
+
+libc = ctypes.CDLL(None)
+
+
+def init():
+    libc.puts(b"backend chatter through C stdio")
+    os.write(1, b"backend chatter with no newline")
+    return (1, 0, 0)
+
+
+def get_devices():
+    return [("test:0", "Noname", "frontend-tester", "virtual device")]
+
+
+sane = types.ModuleType("sane")
+sane.init = init
+sane.get_devices = get_devices
+sys.modules["sane"] = sane
+runpy.run_path(os.environ["LISTING_TEST_REAL_CHILD"], run_name="__main__")
+"""
+
 
 def _use_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str) -> Path:
     """
@@ -302,6 +337,28 @@ class TestHappyPath:
         reply = run_listing_child(ListingRequest(), configured_host="")
 
         assert reply.devices == (_TEST_DEVICE,)
+
+    def test_a_backend_writing_to_stdout_does_not_touch_the_reply(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capfd: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        What the scanner library prints goes to the log, not into the reply.
+
+        The real child keeps the reply's pipe to itself and points fd 1 at
+        stderr before python-sane is loaded.  Otherwise C stdio's buffer,
+        flushed when the process exits, lands after the reply line, and a
+        write with no newline runs into it.
+        """
+        monkeypatch.setenv("LISTING_TEST_REAL_CHILD", str(_REAL_CHILD_FILE))
+        _use_child(monkeypatch, tmp_path, _PRINTING_BACKEND_CHILD)
+
+        reply = run_listing_child(ListingRequest(), configured_host="")
+
+        assert reply == ListingReply(devices=(_TEST_DEVICE,))
+        assert "backend chatter with no newline" in capfd.readouterr().err
 
 
 class TestCrash:

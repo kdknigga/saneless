@@ -31,7 +31,8 @@ for ``SIGALRM`` ends the process even inside a blocking C call.  The device id
 arrives on stdin and never in argv, because any local user can read a process's
 argv, and a network device id names a host on the LAN.
 
-The reply is one JSON line on stdout, holding only these keys:
+The reply is one JSON line on the pipe the parent reads as stdout, holding
+only these keys:
 
 - ``devices``, always: a list of ``[name, vendor, model, type]`` lists of
   strings, in python-sane's order, and empty when the listing raised;
@@ -48,6 +49,13 @@ string, a lone surrogate from a name python-sane could not decode included,
 reaches the parent unchanged.  JSON rather than pickle: nothing the child
 writes can execute when the parent reads it.
 
+That pipe is kept private to the reply.  Before anything else runs, the child
+duplicates it to a descriptor of its own and points fd 1 at stderr, so
+whatever python-sane or a backend prints lands in the log.  C code shares fd 1
+with Python, and when fd 1 is a pipe C stdio holds its output until the
+process exits, well after the reply was written: left on the reply's pipe, a
+single ``printf`` in any backend would turn a good reply into no answer.
+
 Every python-sane call is wrapped in ``except Exception``, never
 ``BaseException``, and its failure travels back as data.  So the child ends
 without a reply only when a signal ends it or when it cannot read its request,
@@ -59,9 +67,10 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
+import os
 import signal
 import sys
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, TextIO
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -229,19 +238,24 @@ def _read_request(line: str) -> dict[str, object] | None:
     return request
 
 
-def main() -> int:
+def main(stdin: TextIO, reply_channel: TextIO) -> int:
     """
     Read the request, list the scanners, and write the reply.
 
     The alarm is armed before python-sane is imported, so nothing below it can
     outlast the deadline the parent chose.
 
+    Args:
+        stdin: Where the request line is read from.
+        reply_channel: Where the reply line is written: the parent's pipe,
+            which nothing else in the process can write to.
+
     Returns:
         0 once the reply is written, or 2 when the request cannot be read, in
         which case nothing is written and python-sane is never imported.
 
     """
-    request = _read_request(sys.stdin.readline())
+    request = _read_request(stdin.readline())
     if request is None:
         return _BAD_REQUEST
     alarm = request["alarm"]
@@ -259,10 +273,26 @@ def main() -> int:
             reply["open_error"] = error
     else:
         reply = respond(request, sane)
-    sys.stdout.write(json.dumps(reply) + "\n")
-    sys.stdout.flush()
+    reply_channel.write(json.dumps(reply) + "\n")
+    reply_channel.flush()
     return 0
 
 
+def _private_reply_channel() -> TextIO:
+    """
+    Take the parent's stdout pipe for the reply, and point fd 1 at stderr.
+
+    Returns:
+        A text stream on a new descriptor for the parent's pipe.  From here
+        on, anything written to fd 1, by Python or by C code, reaches stderr.
+
+    """
+    reply_fd = os.dup(sys.stdout.fileno())
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    return os.fdopen(reply_fd, "w", encoding="ascii")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    with _private_reply_channel() as channel:
+        status = main(sys.stdin, channel)
+    sys.exit(status)

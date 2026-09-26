@@ -33,7 +33,9 @@ directory is not put on ``sys.path``.  The device id travels on stdin, never
 in argv, which any local user can read.
 
 The child's stderr is inherited, so libsane's ``SANE_DEBUG_*`` output keeps
-reaching the log it always reached.
+reaching the log it always reached.  So does anything a backend prints to
+stdout: the child points its own fd 1 at stderr and keeps the stdout pipe for
+the reply alone.
 
 This is a leaf.  It imports neither python-sane nor the health checks: the
 child does the SANE work, and the checks import the scanner layer, not the

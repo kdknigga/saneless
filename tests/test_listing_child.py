@@ -51,6 +51,7 @@ _ALLOWED_IMPORTS = frozenset(
         "contextlib",
         "importlib",
         "json",
+        "os",
         "signal",
         "sys",
         "typing",
@@ -239,7 +240,9 @@ def _run_main(
     Run the child's entry point in this process, over a fake ``sane`` module.
 
     The alarm is replaced by a recorder: pytest-timeout uses the signal
-    method, so a real alarm armed here would end the test run.
+    method, so a real alarm armed here would end the test run.  The request
+    and the reply travel through in-memory streams; the descriptor handling
+    around the entry point is left to the tests that run the real script.
 
     Args:
         monkeypatch: The test's monkeypatch fixture.
@@ -248,12 +251,11 @@ def _run_main(
         events: The shared list the alarm recorder appends to.
 
     Returns:
-        The exit status ``main()`` returned, and everything it wrote to stdout.
+        The exit status ``main()`` returned, and everything it wrote as its
+        reply.
 
     """
-    stdout = io.StringIO()
-    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin_text))
-    monkeypatch.setattr(sys, "stdout", stdout)
+    reply_channel = io.StringIO()
     monkeypatch.setitem(sys.modules, "sane", fake)
 
     def record_alarm(seconds: int) -> int:
@@ -261,8 +263,8 @@ def _run_main(
         return 0
 
     monkeypatch.setattr(_listing_child.signal, "alarm", record_alarm)
-    status = _listing_child.main()
-    return status, stdout.getvalue()
+    status = _listing_child.main(io.StringIO(stdin_text), reply_channel)
+    return status, reply_channel.getvalue()
 
 
 def test_main_arms_the_alarm_before_initialising_and_writes_one_line(
