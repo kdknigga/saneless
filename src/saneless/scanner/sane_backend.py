@@ -40,17 +40,20 @@ from saneless.exceptions import (
     ScanError,
     ScanInterrupted,
     describe,
+    describe_text,
 )
 from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
+    DeviceSurvey,
     ScanBatch,
     ScannerBackend,
     ScanSettings,
     SourceKind,
     classify_source,
 )
+from saneless.scanner.listing import ListingReply, ListingRequest, run_listing_child
 from saneless.scanner.net_hosts import (
     SANE_NET_HOSTS,
     effective_sane_net_hosts,
@@ -124,6 +127,25 @@ def require_sane() -> None:
             "Install on Bare Metal in the documentation"
         )
         raise ConfigError(msg) from exc
+
+
+def _launch_listing(request: ListingRequest, *, configured_host: str) -> ListingReply:
+    """
+    Start one listing child and return its reply.
+
+    This is the one place this module starts a listing child, and it is looked
+    up at call time, so the test suite can replace it with an in-process
+    stand-in that answers from a fake python-sane module.
+
+    Args:
+        request: What to ask the child for beyond the listing.
+        configured_host: The ``scanner.host`` setting, possibly empty.
+
+    Returns:
+        The child's validated reply.
+
+    """
+    return run_listing_child(request, configured_host=configured_host)
 
 
 # Per-page timeout: 2x a generous single-page scan estimate (60s at 600 DPI).
@@ -2052,7 +2074,12 @@ class SaneBackend(ScannerBackend):
     ordinary object -- there is no singleton and no factory, because the three
     one-shot CLI commands and the web server each construct their own.
 
-    Device handles are opened via a context manager that ensures cancel() and
+    Scanners are listed in a short-lived child process, never in this one
+    (``get_devices``), because a listing on a lost net control connection
+    kills the process that makes it.
+
+    The device handles this process opens itself, to scan or to read
+    capabilities, go through a context manager that ensures cancel() and
     close() are called on all code paths, unless a read on the handle has not
     returned, in which case neither may be issued at all.
     """
@@ -2074,6 +2101,9 @@ class SaneBackend(ScannerBackend):
 
         """
         require_sane()
+        # Kept for every listing child, whose SANE_NET_HOSTS is derived from
+        # this setting and never copied from this process's environment.
+        self._host = host
         _ensure_initialised(host)
 
     def close(self) -> None:
@@ -2176,26 +2206,38 @@ class SaneBackend(ScannerBackend):
 
     def get_devices(self) -> list[DeviceInfo]:
         """
-        Enumerate available scanning devices.
+        List the available scanning devices, in a short-lived child process.
 
-        Refuses while a read is outstanding, exactly as ``scan_pages`` and
-        ``get_capabilities`` do. ``sane_get_devices`` is not a handle-level
-        call, but the rule is "never call another SANE operation while one is
-        outstanding", and on the ``net`` backend
-        enumeration is an RPC on the same control wire the stuck read is on.
+        The listing never runs in this process.  libsane's net backend keeps
+        one control connection per scanner host open between listings, and
+        once the saned on that host restarts, the next ``sane_get_devices``
+        fails its request, ignores the failed status and reads a reply that
+        was never filled in (sane-backends ``backend/net.c``,
+        ``sane_get_devices``), which kills the process that made the call.  A
+        child starts from a fresh ``sane_init`` every time, so it never holds
+        a stale connection, and a crash or a hang in it is a failed listing
+        rather than a dead server.  Every caller -- the scan path's device
+        resolution, the worker, the CLI and the health checks -- lists
+        through here.
 
-        The path is not hypothetical: ``_resolve_device`` calls this whenever
-        ``scanner.device`` is empty -- the documented auto-detection default --
-        and it does so *before* ``scan_pages``, which is to say before the
-        refusal that would otherwise have stopped the job.
+        It still refuses while a read is outstanding, exactly as
+        ``scan_pages`` and ``get_capabilities`` do, and before any child is
+        started.  A child could not touch this process's stuck handle; the
+        refusal keeps one rule for every SANE entry point, and a scanner
+        whose read is stuck cannot scan anyway.  The scan path reaches this
+        whenever ``scanner.device`` is empty -- the documented
+        auto-detection default -- before ``scan_pages`` would have refused.
 
         Returns:
             List of DeviceInfo objects for each discovered device.
 
         Raises:
+            ListingCrashedError: The listing child died from a signal.
+            ListingTimedOutError: The listing child did not finish in time.
             ScanError: If a previous read has not returned, in which case no
-                SANE call is made at all; or if SANE cannot enumerate
-                devices, chained to its error.
+                child is started; if SANE could not list the devices, with
+                its message normalised and its control characters escaped;
+                or if the child gave no usable answer.
 
         """
         # No device to name, because enumeration is the call that finds out
@@ -2203,11 +2245,13 @@ class SaneBackend(ScannerBackend):
         # from its own record either way, so the message still says which
         # scanner is holding things up.
         _refuse_if_wedged("the scanners", "list")
-        try:
-            raw_devices = _ensure_sane().get_devices()
-        except Exception as exc:
-            list_msg = f"Could not list scanners: {describe(exc)}"
-            raise ScanError(list_msg) from exc
+        reply = _launch_listing(ListingRequest(), configured_host=self._host)
+        if reply.list_error is not None:
+            # libsane's text can repeat what a LAN peer sent, so it is
+            # defused here, where the message is built.
+            reason = describe_text(reply.list_error.message, reply.list_error.type_name)
+            list_msg = f"Could not list scanners: {neutralise_controls(reason)}"
+            raise ScanError(list_msg)
         return [
             DeviceInfo(
                 name=d[0],
@@ -2215,8 +2259,60 @@ class SaneBackend(ScannerBackend):
                 model=d[2],
                 device_type=d[3],
             )
-            for d in raw_devices
+            for d in reply.devices
         ]
+
+    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+        """
+        List the devices and open an unlisted configured one, in one child.
+
+        This is the Scanner health check's list-then-open.  Both steps run in
+        the same short-lived child, for the reason ``get_devices`` gives, so
+        the check never touches this process's libsane and always sees a
+        fresh control connection.  The child opens the configured id only
+        when its own listing does not include it, and cancels and closes it
+        again at once.
+
+        Nothing is logged here, and the survey carries exception class names
+        only: no device id and no exception text, since a ``net:`` id is a
+        LAN address and the text of a SANE error can repeat it.
+
+        It refuses while a read is outstanding, before any child is started,
+        exactly as ``get_devices`` does.
+
+        Args:
+            open_if_unlisted: The configured device id, or ``""`` when none
+                is configured.
+
+        Returns:
+            What the child's listing and open found.
+
+        Raises:
+            ListingCrashedError: The listing child died from a signal.
+            ListingTimedOutError: The listing child did not finish in time.
+            ScanError: If a previous read has not returned, in which case no
+                child is started; or if the child gave no usable answer.
+
+        """
+        _refuse_if_wedged("the scanners", "list")
+        reply = _launch_listing(
+            ListingRequest(open=open_if_unlisted or None),
+            configured_host=self._host,
+        )
+        return DeviceSurvey(
+            devices=tuple(
+                DeviceInfo(
+                    name=d[0],
+                    vendor=d[1],
+                    model=d[2],
+                    device_type=d[3],
+                )
+                for d in reply.devices
+            ),
+            list_error=reply.list_error.type_name if reply.list_error else None,
+            configured_opened=reply.opened,
+            open_error=reply.open_error.type_name if reply.open_error else None,
+        )
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """

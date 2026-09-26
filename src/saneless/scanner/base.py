@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
+from saneless.exceptions import ListingCrashedError, ListingTimedOutError
 from saneless.text_safety import neutralise_controls
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DeviceCapabilities",
     "DeviceInfo",
+    "DeviceSurvey",
     "PageRecord",
     "PageSink",
     "ScanBatch",
@@ -148,6 +150,34 @@ class DeviceInfo:
         self.vendor = neutralise_controls(self.vendor)
         self.model = neutralise_controls(self.model)
         self.device_type = neutralise_controls(self.device_type)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceSurvey:
+    """
+    What one list-then-open found: the Scanner health check's evidence.
+
+    Every failure is recorded as an exception's class name and nothing else.
+    The check reports these, and nothing it causes to be logged may carry a
+    device id or an exception's text, since a ``net:`` id is a LAN address and
+    the text of a SANE error can repeat it.
+
+    Attributes:
+        devices: The devices listed, empty when the listing raised.
+        list_error: The class name of the exception the listing raised, or
+            ``None`` when it did not raise.
+        configured_opened: Whether opening the configured device worked, or
+            ``None`` when no open was attempted, because no device was
+            configured or the listing already included it.
+        open_error: The class name of the exception the open raised, or
+            ``None`` when it did not raise or was not attempted.
+
+    """
+
+    devices: tuple[DeviceInfo, ...]
+    list_error: str | None = None
+    configured_opened: bool | None = None
+    open_error: str | None = None
 
 
 @dataclass
@@ -435,6 +465,63 @@ class ScannerBackend(ABC):
 
         """
         self.get_capabilities(device_id)
+
+    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+        """
+        List the devices, then open a configured device the listing lacks.
+
+        This is the Scanner health check's list-then-open.  A configured id
+        the listing does not include may still be usable, since a scan opens
+        it without listing first, so it is opened and closed again to find
+        out.  An id the listing includes is not opened.
+
+        Deliberately not an ``@abstractmethod``.  The default makes the two
+        calls this interface already offers, ``get_devices`` and then
+        ``open_and_close``, which keeps every stub and test double working
+        unchanged.  A real backend overrides it to list and open in one
+        isolated step.
+
+        A listing that crashed or was stopped at its deadline is not a failed
+        listing: it propagates, so the caller can report it as what it was.
+        Any other failure, of the listing or of the open, is recorded by
+        class name.  Nothing is logged here; the caller logs type names.
+
+        Args:
+            open_if_unlisted: The configured device id, or ``""`` when none
+                is configured.
+
+        Returns:
+            What the listing and the open found.
+
+        Raises:
+            ListingCrashedError: The listing died from a signal.
+            ListingTimedOutError: The listing did not finish in time.
+
+        """
+        devices: tuple[DeviceInfo, ...] = ()
+        list_error: str | None = None
+        try:
+            devices = tuple(self.get_devices())
+        except ListingCrashedError, ListingTimedOutError:
+            raise
+        except Exception as exc:
+            list_error = type(exc).__name__
+        if not open_if_unlisted or any(
+            device.name == open_if_unlisted for device in devices
+        ):
+            return DeviceSurvey(devices=devices, list_error=list_error)
+        try:
+            self.open_and_close(open_if_unlisted)
+        except Exception as exc:
+            return DeviceSurvey(
+                devices=devices,
+                list_error=list_error,
+                configured_opened=False,
+                open_error=type(exc).__name__,
+            )
+        return DeviceSurvey(
+            devices=devices, list_error=list_error, configured_opened=True
+        )
 
     @abstractmethod
     def scan_pages(
