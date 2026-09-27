@@ -611,6 +611,10 @@ class RequestRejection(StrEnum):
     # setting to fill in rather than the token.
     URL_UNSET = "URL_UNSET"
     UNKNOWN_PROFILE = "UNKNOWN_PROFILE"
+    # Multiple pages asked for on a manual-duplex profile.  The form disables
+    # the checkbox for such a profile, so this is the refusal a forged or stale
+    # submit gets, before any job row exists; its sentence says what to change.
+    MULTI_PAGE_MANUAL_DUPLEX = "MULTI_PAGE_MANUAL_DUPLEX"
     TITLE_TOO_LONG = "TITLE_TOO_LONG"
     # A tab, ESC or any other C0/C1 control in the title: refused, never
     # stripped, and its sentence names the field to fix.
@@ -2373,6 +2377,12 @@ def rejection_message(rejection: RequestRejection) -> str:
                 "That scan profile does not exist. Reload the page to see the "
                 "current profiles."
             )
+        case RequestRejection.MULTI_PAGE_MANUAL_DUPLEX:
+            message = (
+                "Multiple pages is not available with manual duplex, so the scan "
+                "was not started. Untick Multiple pages or choose another "
+                "profile, then try again."
+            )
         case RequestRejection.TITLE_TOO_LONG:
             message = (
                 "The title is too long. Shorten it to "
@@ -2432,6 +2442,7 @@ def rejection_status_code(rejection: RequestRejection) -> int:
             status_code = 503
         case (
             RequestRejection.UNKNOWN_PROFILE
+            | RequestRejection.MULTI_PAGE_MANUAL_DUPLEX
             | RequestRejection.TITLE_TOO_LONG
             | RequestRejection.TITLE_HAS_CONTROL
             | RequestRejection.INVALID_REQUEST

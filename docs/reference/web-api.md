@@ -19,6 +19,7 @@ Direct calls, such as from `curl` or a script, work too, but only those two JSON
 | GET | `/api/tags` | Fetch paperless-ngx tags, optionally filtered |
 | GET | `/api/correspondents` | Fetch paperless-ngx correspondents |
 | GET | `/api/profiles/description` | One profile's description sentence |
+| GET | `/api/profiles/multi-page` | The Multiple pages checkbox for one profile |
 | POST | `/api/cache/invalidate` | Refresh cached metadata |
 | GET | `/api/jobs/history` | Job history table |
 | POST | `/api/flip/continue` | Continue manual duplex scan |
@@ -95,6 +96,7 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 | `title` | string | no | Document title, at most 256 characters, with no tab or other control character (auto-generated from timestamp if empty) |
 | `tags` | int[] | no | Paperless-ngx tag IDs, at most 100 |
 | `correspondent` | int | no | Paperless-ngx correspondent ID |
+| `multi_page` | boolean | no | `on` when Multiple pages is ticked. Chosen for this scan only; it is not stored on the profile or the job. Absent means one pass. Refused with `422` on a manual-duplex profile |
 
 **Responses:**
 
@@ -102,7 +104,7 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 |-------------|---------|
 | 200 | The job is queued. HTML partial: the status indicator for HTMX swap, plus an out-of-band Scan button and an out-of-band clear of any earlier error message. |
 | 403 | The request was blocked as cross-site. See [Cross-site requests](#cross-site-requests). |
-| 422 | The request is not valid: the profile does not exist, the title is longer than 256 characters, the title contains a tab or another control character, more than 100 `tags` were sent, or a required field is missing. No job is created. |
+| 422 | The request is not valid: the profile does not exist, Multiple pages was asked for on a manual-duplex profile, the title is longer than 256 characters, the title contains a tab or another control character, more than 100 `tags` were sent, or a required field is missing. No job is created. |
 | 429 | The scan queue is full: 10 jobs are already waiting to start. The response carries `Retry-After: 30`. |
 | 503 | The worker is not running, or it is degraded (see [`GET /health`](#get-health)). |
 
@@ -229,6 +231,28 @@ Returns the one-sentence description of a scan profile, for the help line beneat
 
 ---
 
+### `GET /api/profiles/multi-page`
+
+Returns the Multiple pages checkbox, with its help line, for one scan profile. The web UI fetches it when the profile selection changes, so the checkbox is disabled for a manual-duplex profile and enabled for any other.
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile` | string | yes | The profile name. Validated against the configured profiles before anything else happens; an unknown name is rejected with `422` |
+| `multi_page` | boolean | no | `on` when the checkbox was ticked before the change. A ticked box stays ticked when the new profile allows it |
+
+**Responses:**
+
+| Status Code | Meaning |
+|-------------|---------|
+| 200 | HTML partial: the checkbox and its wrapper, which replaces the one on the page. On a manual-duplex profile the checkbox is disabled and unticked, and the help line reads `Not available with manual duplex.` |
+| 422 | The profile does not exist. |
+
+The checkbox is never ticked when the page loads: Multiple pages is chosen for each scan.
+
+---
+
 ### `POST /api/cache/invalidate`
 
 Invalidates a specific cache entry and returns fresh data from paperless-ngx.
@@ -325,6 +349,7 @@ One sentence per kind of refusal, and every sentence is a fixed developer consta
 | `TOKEN_UNSET` | 503 | The paperless-ngx API token has not been set, so the scan was not started. Put a real API token in the saneless config file, then restart saneless. |
 | `URL_UNSET` | 503 | The paperless-ngx address has not been set, so the scan was not started. Set paperless.url in the saneless config file, then restart saneless. |
 | `UNKNOWN_PROFILE` | 422 | That scan profile does not exist. Reload the page to see the current profiles. |
+| `MULTI_PAGE_MANUAL_DUPLEX` | 422 | Multiple pages is not available with manual duplex, so the scan was not started. Untick Multiple pages or choose another profile, then try again. |
 | `TITLE_TOO_LONG` | 422 | The title is too long. Shorten it to 256 characters or fewer. |
 | `TITLE_HAS_CONTROL` | 422 | The title contains a tab or another control character. Remove it, then try again. |
 | `INVALID_REQUEST` | 422 | The request was not valid. Reload the page, then try again. |

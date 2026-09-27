@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 
-from fastapi import APIRouter, Form, Query, Request
+from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator
 from pydantic_core import PydanticCustomError
@@ -37,6 +37,9 @@ from saneless.scanner.base import SourceKind, classify_source
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
+    MULTI_PAGE_DISABLED_REASON,
+    MULTI_PAGE_HELP,
+    MULTI_PAGE_LABEL,
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
     SCAN_BLOCKED_URL_REASON,
@@ -57,11 +60,12 @@ from saneless.vocabulary import (
 )
 from saneless.web.errors import TITLE_CONTROL_TYPE, RequestRejected
 from saneless.web.job_view import build_job_view, owns_detail
+from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
     from starlette.datastructures import State
 
-    from saneless.config import Settings
+    from saneless.config import ProfileConfig, Settings
     from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
     from saneless.web.cache import MetadataCache
@@ -913,12 +917,17 @@ class _ProfileOption:
             the text a household member reads is new here.
         label: The human name shown in the dropdown.
         description: The sentence shown beneath the select for this profile.
+        manual_duplex: Whether the profile scans both sides by the manual
+            flip, which is what disables the Multiple pages checkbox when the
+            page opens on it.  Read here, from the same locked lookup as the
+            text, so the page never looks the profile up a second time.
 
     """
 
     name: str
     label: str
     description: str
+    manual_duplex: bool = False
 
 
 def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
@@ -970,6 +979,7 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
                     # backfills the text, and the how-to says so.
                     label=profile.label or name,
                     description=profile.description,
+                    manual_duplex=_is_manual_duplex(profile),
                 ),
                 classify_source(profile.source),
             )
@@ -980,6 +990,54 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
         # the only thing this changes is which group comes first.
         entries.sort(key=lambda entry: not entry[1].uses_feeder)
     return tuple(option for option, _ in entries)
+
+
+def _is_manual_duplex(profile: ProfileConfig) -> bool:
+    """
+    Say whether ``profile`` scans both sides by the manual flip.
+
+    The one place the web layer reads this, so the checkbox on the page, its
+    refresh and the refusal of a submit all agree on which profiles it means.
+
+    Args:
+        profile: The chosen profile.
+
+    Returns:
+        True only for a manual-duplex profile.
+
+    """
+    return profile.duplex == "manual"
+
+
+def _multi_page_field(*, manual_duplex: bool, ticked: bool) -> dict[str, object]:
+    """
+    Build the context the Multiple pages field renders from.
+
+    The full page and ``GET /api/profiles/multi-page`` both render the field
+    through this, so the two cannot disagree about when it is disabled or what
+    the line beneath it says.  The template composes no prose: the label and
+    the help line or the reason come from the vocabulary.
+
+    Args:
+        manual_duplex: Whether the chosen profile is manual duplex, which
+            disables the box and puts the reason in place of the help line.
+        ticked: Whether the box was ticked before this render.  A full page
+            load passes False, so the box is unticked on every load.
+
+    Returns:
+        The field's template context.
+
+    """
+    return {
+        "multi_page_label": MULTI_PAGE_LABEL,
+        "multi_page_disabled": manual_duplex,
+        # A disabled box is never also ticked: it would not be submitted, so a
+        # tick on it would show a choice the scan would not make.
+        "multi_page_checked": ticked and not manual_duplex,
+        "multi_page_help": (
+            MULTI_PAGE_DISABLED_REASON if manual_duplex else MULTI_PAGE_HELP
+        ),
+    }
 
 
 def _history_views(request: Request) -> list[JobView]:
@@ -1059,6 +1117,13 @@ def index(request: Request) -> Response:
             # necessarily the first profile in the config file.
             "selected": profiles[0].name if profiles else "",
             "selected_description": profiles[0].description if profiles else "",
+            # The Multiple pages field for the profile the page opens on, and
+            # never ticked: the choice is made per scan, so a page load starts
+            # it afresh.
+            **_multi_page_field(
+                manual_duplex=bool(profiles) and profiles[0].manual_duplex,
+                ticked=False,
+            ),
             **tag_list,
             "correspondents": correspondents,
             **status,
@@ -1166,6 +1231,44 @@ def paperless_test(request: Request) -> JSONResponse:
     except TimeoutError as exc:
         answer = _paperless_test_error(exc)
     return JSONResponse(answer.body, status_code=answer.status_code)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScanChoice:
+    """
+    Which profile a scan submission names, and whether it is multi-page.
+
+    Grouped into one dependency because ``start_scan`` already takes five
+    parameters, and one more would take it past ``PLR0913``'s ceiling.  A
+    suppression is not allowed, and ``_StatusFacts`` settled the answer to the
+    same limit the same way.  Both fields are what decides how the job runs,
+    which is why they, and not the title or the tags, travel together.
+    """
+
+    profile: str
+    multi_page: bool
+
+
+def _scan_choice(
+    *,
+    profile: Annotated[str, Form()],
+    multi_page: Annotated[bool, Form()] = False,
+) -> _ScanChoice:
+    """
+    Read the profile and the Multiple pages choice from a scan submission.
+
+    Keyword-only so the boolean is never a positional flag.  An unticked
+    checkbox sends nothing at all, so its absence is False.
+
+    Args:
+        profile: The scan profile name.
+        multi_page: Whether Multiple pages was ticked.
+
+    Returns:
+        The two, together.
+
+    """
+    return _ScanChoice(profile=profile, multi_page=multi_page)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1384,7 +1487,7 @@ def _refuse_control_characters(value: str) -> str:
 @router.post("/api/scan")
 def start_scan(
     request: Request,
-    profile: Annotated[str, Form()],
+    choice: Annotated[_ScanChoice, Depends(_scan_choice)],
     title: Annotated[
         str,
         Form(max_length=TITLE_MAX_LENGTH),
@@ -1400,7 +1503,13 @@ def start_scan(
     ``TITLE_MAX_LENGTH``, a title holding a tab or any other control
     character, more than ``TAGS_MAX_COUNT`` tags, or a profile that is not
     configured (checked under the worker's profile lock) is a 422 and writes
-    nothing.
+    nothing.  So is Multiple pages on a manual-duplex profile: the form
+    disables the checkbox for one, and this is the refusal that holds for a
+    submit that did not come through that form.
+
+    An accepted job is handed to the worker with its ``ScanOptions``, which is
+    how the Multiple pages choice reaches the scan without being stored on the
+    job row.
 
     A valid submit creates the job row and offers it to the worker, returning
     the status partial once the job is queued.  That response re-renders the
@@ -1416,22 +1525,28 @@ def start_scan(
 
     Args:
         request: The incoming HTTP request.
-        profile: Scan profile name.
+        choice: The scan profile name and whether Multiple pages was ticked.
         title: Document title; when blank, the profile's title, else
             'Scan <time>'.
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
 
     Raises:
-        RequestRejected: The profile is unknown, or the submit was refused.
+        RequestRejected: The profile is unknown, Multiple pages was asked for
+            on a manual-duplex profile, or the submit was refused.
 
     """
     state = request.app.state
     # One locked lookup both validates the profile and yields its title, so
     # there is no check-then-read gap for a profile rewrite to fall into.
-    found = state.worker.get_profile(profile)
+    found = state.worker.get_profile(choice.profile)
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    # Refused like an unknown profile, ahead of every refusal that writes a
+    # row: this is a request the form would not have made, not an attempt to
+    # scan that Job History should show.
+    if choice.multi_page and _is_manual_duplex(found):
+        raise RequestRejected(RequestRejection.MULTI_PAGE_MANUAL_DUPLEX)
     title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
     # Hiding a control changes the form, never the scan: with
     # ``[web] show_tags`` or ``show_correspondent`` off, the submit carries
@@ -1458,7 +1573,7 @@ def start_scan(
     if not state.settings.web.show_correspondent:
         correspondent = found.default_correspondent
     form = _ScanForm(
-        profile=profile, title=title, tags=tags, correspondent=correspondent
+        profile=choice.profile, title=title, tags=tags, correspondent=correspondent
     )
 
     # The route guard is the enforcement and the disabled Scan button is
@@ -1506,7 +1621,9 @@ def start_scan(
         owner_token=owner,
     )
     # Annotated because app.state is untyped; assert_never needs the real type.
-    result: SubmitResult = state.worker.submit(job)
+    result: SubmitResult = state.worker.submit(
+        job, ScanOptions(multi_page=choice.multi_page)
+    )
     match result:
         case SubmitResult.ACCEPTED:
             # A job created by this request cannot have a flip answer yet.
@@ -1900,6 +2017,47 @@ def get_profile_description(request: Request, profile: str) -> Response:
         request,
         "partials/profile_description.html",
         {"description": found.description},
+    )
+
+
+@router.get("/api/profiles/multi-page")
+def get_multi_page_field(
+    request: Request, profile: str, *, multi_page: bool = False
+) -> Response:
+    """
+    Re-render the Multiple pages field for a newly chosen profile.
+
+    The select's change carries the profile and, when it is ticked, the
+    checkbox.  A tick survives a change to a profile that allows it, so a
+    profile switch never silently drops a choice; a manual-duplex profile
+    renders the box disabled and unticked, with the reason in place of the help
+    line.
+
+    The profile is validated exactly as ``get_profile_description`` validates
+    it: one locked lookup, and an unknown name is a 422.  The field is its own
+    swap target, rather than an out-of-band swap riding the description
+    response, because that response is the description text and nothing else.
+
+    Args:
+        request: The incoming HTTP request.
+        profile: The profile name now chosen.
+        multi_page: Whether the box was ticked before the change.
+
+    Returns:
+        The field, wrapper and all.
+
+    Raises:
+        RequestRejected: The profile is not configured.
+
+    """
+    state = request.app.state
+    found = state.worker.get_profile(profile)
+    if found is None:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    return state.templates.TemplateResponse(
+        request,
+        "partials/multi_page_field.html",
+        _multi_page_field(manual_duplex=_is_manual_duplex(found), ticked=multi_page),
     )
 
 
