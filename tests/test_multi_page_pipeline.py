@@ -11,7 +11,8 @@ as the double's fault and not the pipeline's.
 The second half drives whole runs through ``run_pipeline``: which requests are
 refused before the scanner is touched, and how a run of passes becomes one
 document -- its page order, the questions asked between passes, and every way
-the loop can end, the page cap and a pass that fails part way included.
+the loop can end, the page cap and a pass that fails part way included -- and
+how the operator decides, once per pass, about the pages that look blank.
 
 No test here sleeps: a wait on an unanswered slot is given ``0``, and every
 operator answer comes from a script.
@@ -31,6 +32,7 @@ from PIL import Image
 import saneless.pipeline as pipeline_module
 from saneless.config import ProfileConfig
 from saneless.exceptions import (
+    AllPagesBlankError,
     ConfigError,
     FeederEmptyError,
     ListingCrashedError,
@@ -55,13 +57,16 @@ from saneless.pipeline import (
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScannerBackend, ScanSettings
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import (
+    ErrorCategory,
     FlipOutcome,
     JobState,
     PassAnswer,
     PassPrompt,
     PassWait,
     ScanOutcome,
+    blank_timeout_finish_warning,
     cap_finish_warning,
+    classify_error,
     pass_wait_state,
     timeout_finish_warning,
 )
@@ -1350,3 +1355,294 @@ class TestMultiPageScannerFault:
             if record.levelno == logging.WARNING and repr(jam) in record.getMessage()
         ]
         assert len(logged) == 1
+
+
+# The answers a blank-page prompt offers: throw the pass away, or take it
+# without its blank pages, or with them.
+_BLANK_ANSWERS = frozenset(
+    {PassAnswer.RESCAN, PassAnswer.SKIP_BLANKS, PassAnswer.KEEP_BLANKS}
+)
+
+_SKIP = PassAnswer.SKIP_BLANKS
+_KEEP = PassAnswer.KEEP_BLANKS
+
+
+@pytest.fixture
+def blank_rig(tmp_path: Path) -> _Rig:
+    """
+    Return a multi-page rig over a flatbed profile with detection on.
+
+    Returns:
+        The rig.
+
+    """
+    return _Rig(multi_page_settings(tmp_path, detection=True))
+
+
+class TestMultiPageBlankPages:
+    """
+    The operator decides about blank pages, once per pass, inside the loop.
+
+    A single-pass scan removes blank pages on its own; a multi-page scan asks
+    instead, because the operator is standing there and a page kept on purpose
+    must never be removed later.  Skipped pages are reported the way removed
+    ones always were, numbered over the document the operator built.
+    """
+
+    def test_a_blank_pass_asks_once_and_skip_leaves_it_out(
+        self, blank_rig: _Rig
+    ) -> None:
+        """One blank page in pass 2: one blank prompt, and Skip leaves it out."""
+        latest: list[PipelineEvent] = []
+
+        def _note_at_prompt_2(prompt: PassPrompt) -> None:
+            if prompt.number == 2:
+                latest.append(blank_rig.events[-1])
+
+        scanner = DistinctPageScanner(passes=((0,), (1,), (2,)), blank={1})
+        coordinator = ScriptedPassCoordinator(
+            [_NEXT, _SKIP, _NEXT, _FINISH], on_ask=_note_at_prompt_2
+        )
+
+        result = blank_rig.run(scanner, coordinator)
+
+        blank = coordinator.prompts[1]
+        assert blank.wait is PassWait.BLANK_DECISION
+        assert blank.pass_pages == 1
+        assert blank.blank_positions == (1,)
+        assert blank.pages_kept == 1
+        assert blank.offered == _BLANK_ANSWERS
+        assert blank.timeout_seconds == _TIMEOUT
+        assert latest == [PipelineEvent.AWAITING_BLANK_DECISION]
+        after = coordinator.prompts[2]
+        assert after.wait is PassWait.NEXT_PASS
+        assert after.pages_kept == 1
+        assert after.last_pass_pages == 1
+        assert after.last_pass_kept == 0
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+        assert result.pages_scanned == 3
+        assert result.pages_removed == 1
+        assert result.removed_positions == (2,)
+        assert result.pages_uploaded == 2
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 2])
+
+    def test_keep_adds_the_blank_page_and_it_is_never_judged_again(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Keep puts the blank page in the document, and nothing removes it later."""
+        scanner = DistinctPageScanner(passes=((0,), (1,), (2,)), blank={1})
+        coordinator = ScriptedPassCoordinator([_NEXT, _KEEP, _NEXT, _FINISH])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert coordinator.prompts[2].last_pass_kept == 1
+        assert result.pages_uploaded == 3
+        assert result.pages_removed == 0
+        assert result.removed_positions == ()
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 1, 2])
+
+    def test_rescan_at_the_blank_prompt_scans_again_at_once(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Re-scan throws the blank pass away and scans its replacement straight away."""
+        listed: list[list[str]] = []
+
+        def _list_at_prompt_3(prompt: PassPrompt) -> None:
+            if prompt.number == 3:
+                listed.append(blank_rig.spool_names())
+
+        scanner = DistinctPageScanner(passes=((0,), (1,), (3,), (2,)), blank={1})
+        coordinator = ScriptedPassCoordinator(
+            [_NEXT, _RESCAN, _NEXT, _FINISH], on_ask=_list_at_prompt_3
+        )
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert [prompt.wait for prompt in coordinator.prompts] == [
+            PassWait.NEXT_PASS,
+            PassWait.BLANK_DECISION,
+            PassWait.NEXT_PASS,
+            PassWait.NEXT_PASS,
+        ]
+        assert scanner.calls == 4
+        (names,) = listed
+        assert [name for name in names if name.startswith("a-00002-")] == []
+        assert result.pages_scanned == 3
+        assert result.removed_positions == ()
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 3, 2])
+
+    def test_a_pass_of_several_blanks_is_asked_about_once(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Two blank pages in one four-sheet pass: one prompt naming both."""
+        scanner = DistinctPageScanner(passes=((0, 1, 2, 3),), blank={1, 3})
+        coordinator = ScriptedPassCoordinator([_SKIP, _FINISH])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        blanks = [
+            prompt
+            for prompt in coordinator.prompts
+            if prompt.wait is PassWait.BLANK_DECISION
+        ]
+        (blank,) = blanks
+        assert blank.pass_pages == 4
+        assert blank.blank_positions == (2, 4)
+        assert result.removed_positions == (2, 4)
+        assert result.pages_uploaded == 2
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 2])
+
+    def test_a_pass_with_no_blank_page_is_not_asked_about(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Detection on, no blank page: only the next-pass question is asked."""
+        scanner = DistinctPageScanner(passes=((0,), (1,)))
+        coordinator = ScriptedPassCoordinator([_NEXT, _FINISH])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert [prompt.wait for prompt in coordinator.prompts] == [
+            PassWait.NEXT_PASS
+        ] * 2
+        assert PipelineEvent.AWAITING_BLANK_DECISION not in blank_rig.events
+        assert result.pages_uploaded == 2
+
+    def test_a_blank_prompt_timeout_skips_them_and_finishes_warned(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Nobody answered about the blank page: it is left out, and the rest uploads."""
+        scanner = DistinctPageScanner(passes=((0,), (1,)), blank={1})
+        coordinator = ScriptedPassCoordinator([_NEXT, PassAnswer.TIMED_OUT])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert len(coordinator.prompts) == 2
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == blank_timeout_finish_warning(1, _TIMEOUT)
+        assert result.pages_scanned == 2
+        assert result.removed_positions == (2,)
+        assert result.pages_uploaded == 1
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0])
+
+    def test_a_blank_prompt_timeout_with_nothing_kept_is_all_blank(
+        self, blank_rig: _Rig
+    ) -> None:
+        """The only page looked blank and nobody answered: the all-blank failure."""
+        scanner = DistinctPageScanner(passes=((0,),), blank={0})
+        coordinator = ScriptedPassCoordinator([PassAnswer.TIMED_OUT])
+
+        with pytest.raises(AllPagesBlankError) as raised:
+            blank_rig.run(scanner, coordinator)
+
+        assert classify_error(raised.value) is ErrorCategory.ALL_BLANK
+        blank_rig.paperless.upload_document.assert_not_called()
+        assert blank_rig.kept_partials() == []
+        assert embedded_streams(blank_rig.kept_document()) == _pages(scanner, [0])
+
+    def test_finish_is_withheld_after_a_skip_leaves_nothing(
+        self, blank_rig: _Rig
+    ) -> None:
+        """
+        Skipping the only page offers no Finish, and a timeout then is all-blank.
+
+        A document of no pages can never be finished by a press, and a wait
+        that runs out on one fails the way a scan of blank paper always has.
+        """
+        scanner = DistinctPageScanner(passes=((0,),), blank={0})
+        coordinator = ScriptedPassCoordinator([_SKIP, PassAnswer.TIMED_OUT])
+
+        with pytest.raises(AllPagesBlankError) as raised:
+            blank_rig.run(scanner, coordinator)
+
+        after = coordinator.prompts[1]
+        assert after.wait is PassWait.NEXT_PASS
+        assert after.pages_kept == 0
+        assert _FINISH not in after.offered
+        assert classify_error(raised.value) is ErrorCategory.ALL_BLANK
+        blank_rig.paperless.upload_document.assert_not_called()
+        assert embedded_streams(blank_rig.kept_document()) == _pages(scanner, [0])
+
+    def test_a_skip_to_nothing_can_still_go_on(self, blank_rig: _Rig) -> None:
+        """Scan next after skipping the only page: the skipped page is still reported."""
+        scanner = DistinctPageScanner(passes=((0,), (1,)), blank={0})
+        coordinator = ScriptedPassCoordinator([_SKIP, _NEXT, _FINISH])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_scanned == 2
+        assert result.removed_positions == (1,)
+        assert result.pages_uploaded == 1
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [1])
+
+    def test_detection_off_never_asks(self, rig: _Rig) -> None:
+        """With detection off a blank page is just a page: no prompt, not removed."""
+        scanner = DistinctPageScanner(passes=((0,), (1,), (2,)), blank={1})
+        coordinator = ScriptedPassCoordinator([_NEXT, _NEXT, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        assert [prompt.wait for prompt in coordinator.prompts] == [
+            PassWait.NEXT_PASS
+        ] * 3
+        assert result.pages_uploaded == 3
+        assert result.removed_positions == ()
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 1, 2])
+
+    def test_a_stop_at_the_blank_prompt_keeps_the_document_and_the_pass(
+        self, blank_rig: _Rig
+    ) -> None:
+        """The undecided pass is kept as a pass in flight, beside the document."""
+        scanner = DistinctPageScanner(passes=((0,), (1,)), blank={1})
+        coordinator = ScriptedPassCoordinator([_NEXT, PassAnswer.INTERRUPTED])
+
+        with pytest.raises(ScanInterrupted):
+            blank_rig.run(scanner, coordinator)
+
+        assert embedded_streams(blank_rig.kept_document()) == _pages(scanner, [0])
+        (partial,) = blank_rig.kept_partials()
+        assert embedded_streams(partial) == _pages(scanner, [1])
+        blank_rig.paperless.upload_document.assert_not_called()
+
+    def test_rescan_takes_the_skipped_pages_away_with_the_pass(
+        self, blank_rig: _Rig
+    ) -> None:
+        """A skipped page thrown away by a Re-scan is not reported as removed."""
+        scanner = DistinctPageScanner(passes=((0,), (1, 2), (3,)), blank={2})
+        coordinator = ScriptedPassCoordinator([_NEXT, _SKIP, _RESCAN, _FINISH])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert coordinator.prompts[1].blank_positions == (2,)
+        assert result.removed_positions == ()
+        assert result.pages_removed == 0
+        assert result.pages_scanned == 2
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 3])
+
+    def test_a_single_pass_scan_still_removes_blanks_by_itself(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Without the multi-page loop, blank pages go without a question, as before."""
+        scanner = DistinctPageScanner(passes=((0, 1, 2, 3),), blank={1, 3})
+        coordinator = ScriptedPassCoordinator([])
+
+        result = blank_rig.run(scanner, coordinator, multi_page=False)
+
+        assert coordinator.prompts == []
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.removed_positions == (2, 4)
+        assert result.pages_scanned == 4
+        assert result.pages_removed == 2
+        assert result.pages_uploaded == 2
+        assert result.warning is None
+        (document,) = blank_rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 2])
