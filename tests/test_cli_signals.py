@@ -345,13 +345,44 @@ def _run_cli(
         What the run left behind.
 
     """
+    return _run_scan(
+        tmp_path,
+        monkeypatch,
+        ["--profile", profile],
+        scanner=scanner,
+        recorder=recorder,
+    )
+
+
+def _run_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    options: Sequence[str],
+    *,
+    scanner: DistinctPageScanner,
+    recorder: RecordingPaperless | None = None,
+) -> _CliRun:
+    """
+    Run the real ``saneless scan`` with any options, as ``_run_cli`` does.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+        monkeypatch: Replaces the environment ``saneless.cli`` reaches for.
+        options: The ``scan`` options, such as ``--profile`` and ``--multi-page``.
+        scanner: The scanner the command opens.
+        recorder: The in-memory paperless-ngx; a plain one if omitted.
+
+    Returns:
+        What the run left behind.
+
+    """
     settings = _settings(tmp_path)
     recorder = recorder if recorder is not None else RecordingPaperless()
     _patch_environment(monkeypatch, settings, scanner=scanner)
     monkeypatch.setattr("saneless.cli.PaperlessClient", cli_client_builder(recorder))
-    # The flip prompt needs a terminal, which CliRunner is not.
+    # The flip and multi-page prompts need a terminal, which CliRunner is not.
     monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
-    result = CliRunner().invoke(cli, ["scan", "--profile", profile, "--title", _TITLE])
+    result = CliRunner().invoke(cli, ["scan", "--title", _TITLE, *options])
     failed_dir = settings.output.failed_dir
     failed = sorted(failed_dir.iterdir()) if failed_dir.is_dir() else []
     return _CliRun(result=result, failed=failed, recorder=recorder, scanner=scanner)
@@ -521,6 +552,77 @@ def test_a_hangup_whose_end_of_input_lands_first_still_keeps_the_fronts(
     assert kept.stem.endswith("-quarterly-report-fronts"), kept.name
     assert _kept_pages(kept) == _spooled_idat(scanner, (0, 2, 4))
     assert scanner.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("signum", "expected"),
+    [(signal.SIGHUP, ExitCode.HANGUP), (signal.SIGTERM, ExitCode.TERMINATED)],
+    ids=["sighup", "sigterm"],
+)
+def test_a_signal_at_the_multi_page_prompt_keeps_the_pages_scanned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signum: signal.Signals,
+    expected: ExitCode,
+) -> None:
+    """
+    A signal while ``--multi-page`` waits after two pages: both kept, none sent.
+
+    The first prompt is answered "next"; the signal comes from inside the
+    second, as a dropped session or a supervisor's stop would deliver it.  A
+    hangup also ends the prompt's input, as a closed terminal does; a stop
+    leaves the prompt waiting.  Either way it is an interruption, not the
+    operator's cancel, so the two accepted pages are kept as one PDF.
+    """
+    signaller = _Signaller()
+    release = threading.Event()
+    questions: list[str] = []
+
+    def prompt(
+        text: str, *, value_proc: Callable[[str], object], **_kwargs: object
+    ) -> object:
+        """
+        Answer "next" once, then deliver the signal at the second question.
+
+        Returns:
+            The first question's parsed answer, or the stop's late one.
+
+        Raises:
+            click.Abort: For a hangup, the end of input it gives the prompt.
+
+        """
+        questions.append(text)
+        if len(questions) == 1:
+            return value_proc("n")
+        signaller.send(signum)
+        if signum is signal.SIGHUP:
+            raise click.Abort
+        release.wait()
+        return value_proc("f")
+
+    monkeypatch.setattr("saneless.cli.click.prompt", prompt)
+    scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
+
+    try:
+        run = _run_scan(
+            tmp_path,
+            monkeypatch,
+            ["--profile", _SIMPLEX, "--multi-page"],
+            scanner=scanner,
+        )
+    finally:
+        release.set()
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signum]
+    assert len(questions) == 2
+    assert run.result.exit_code == expected, run.result.output
+    (kept,) = run.failed
+    assert run.interrupted_lines == [run.interrupted_lines[0]]
+    assert str(kept) in run.interrupted_lines[0]
+    assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1))
+    assert scanner.calls == 2
+    assert run.recorder.uploads() == []
 
 
 def test_ctrl_c_is_still_a_cancel(

@@ -18,9 +18,11 @@ import shutil
 import signal
 import socket
 import sys
+import termios
 import threading
 import traceback
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, assert_never
 from uuid import uuid4
@@ -71,8 +73,10 @@ from .job import CLI_JOBS_DEFAULT_LIMIT, JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import (
+    AnswerSlot,
     FlipAnswerSlot,
     FlipCoordinator,
+    PassCoordinator,
     PipelineEvent,
     PipelineRequest,
     Settled,
@@ -83,14 +87,23 @@ from .scanner.sane_backend import SaneBackend, require_sane
 from .text_safety import neutralise_controls
 from .vocabulary import (
     FALLBACK_NOT_UPLOADED_LINE,
+    MULTI_PAGE_NEEDS_TERMINAL,
+    MULTI_PAGE_OPTION_HELP,
+    NOTHING_TO_FINISH,
     WARNED_UPLOAD_LABEL,
     ConfigFileState,
     ErrorCategory,
     ExitCode,
     FlipOutcome,
     JobState,
+    PassAnswer,
+    PassWait,
     ScanOutcome,
+    abort_question,
     classify_error,
+    cli_choice_hint,
+    cli_pass_choices,
+    cli_pass_question,
     error_next_step,
     exit_code_for,
     exit_code_for_outcome,
@@ -98,6 +111,7 @@ from .vocabulary import (
     job_label,
     job_state_for,
     local_time,
+    multi_page_manual_duplex_refusal,
     outcome_line,
     progress_label,
     removed_pages_note,
@@ -116,8 +130,9 @@ if TYPE_CHECKING:
     from .auto_profiles import ProfileWriteResult
     from .config import ProfileConfig
     from .scanner.base import DeviceCapabilities, DeviceInfo, ScannerBackend
+    from .vocabulary import PassPrompt
 
-__all__ = ["ClickFlipCoordinator", "cli"]
+__all__ = ["ClickFlipCoordinator", "ClickPassCoordinator", "cli"]
 
 logger = logging.getLogger(__name__)
 
@@ -203,10 +218,11 @@ def _stdin_is_interactive() -> bool:
 _INTERRUPT_SIGNALS: Final = (signal.SIGTERM, signal.SIGHUP)
 
 # A dropped SSH session delivers SIGHUP to the main thread and end of input to
-# the flip prompt's thread at nearly the same moment, in no promised order. End
-# of input on its own is a cancel, which keeps nothing, so the prompt thread
+# a terminal prompt's thread at nearly the same moment, in no promised order.
+# End of input on its own is a cancel, which keeps nothing, so the prompt thread
 # waits this long for the signal before it treats end of input as one: the
-# signal wins, and the hangup keeps the fronts.
+# signal wins, and the hangup keeps the pages scanned -- the fronts at the flip
+# prompt, the accepted pages at a multi-page one.
 _HANGUP_GRACE_SECONDS: Final = 0.25
 
 
@@ -214,8 +230,8 @@ class _Interruption:
     """
     Whether a SIGTERM or SIGHUP has reached the running command, and which.
 
-    Set by the signal handler on the main thread and read by the flip prompt's
-    thread, which is why the signal itself is an ``Event`` and not a bare
+    Set by the signal handler on the main thread and read by a terminal
+    prompt's thread, which is why the signal itself is an ``Event`` and not a bare
     flag.  On the main thread that Event's lock is taken only inside the
     handler, and in ``clear``, which runs only while the handler is not
     installed.
@@ -356,6 +372,35 @@ def _install_interrupt_handlers() -> Callable[[], None]:
     return restore
 
 
+def _end_of_input(settle_abort: Callable[[], object], what: str) -> None:
+    """
+    Treat end of input at a prompt as a cancel, unless a hangup caused it.
+
+    A terminal that closes sends SIGHUP to the main thread and end of input to
+    the prompt's thread at nearly the same moment, in no promised order.  The
+    signal is an interruption, which keeps the pages scanned; end of input on
+    its own is the operator's cancel, which keeps nothing.  So the prompt
+    thread waits ``_HANGUP_GRACE_SECONDS`` for a signal first.  If one came,
+    it claims nothing and leaves the calling thread to the ``ScanInterrupted``
+    the signal raised there; otherwise it settles the cancel.  Every terminal
+    prompt shares this, so a hangup means the same thing at each of them.
+
+    Args:
+        settle_abort: Claims the prompt's cancel answer.
+        what: The prompt, as its log line names it.
+
+    """
+    if _INTERRUPTION.wait(_HANGUP_GRACE_SECONDS):
+        logger.info(
+            "%s reached end of input after a signal (%s); "
+            "leaving the answer to the interruption",
+            what,
+            _INTERRUPTION.signum,
+        )
+        return
+    settle_abort()
+
+
 class ClickFlipCoordinator(FlipCoordinator):
     """
     The CLI flip coordinator: a terminal prompt with a bounded wait.
@@ -449,14 +494,9 @@ class ClickFlipCoordinator(FlipCoordinator):
             # (or already at) the calling thread as ScanInterrupted, and
             # settling ABORTED here first would turn that interruption into a
             # cancel that keeps nothing.  So the signal gets a moment to win.
-            if _INTERRUPTION.wait(_HANGUP_GRACE_SECONDS):
-                logger.info(
-                    "Flip prompt reached end of input after a signal (%s); "
-                    "leaving the answer to the interruption",
-                    _INTERRUPTION.signum,
-                )
-                return
-            self._slot.settle(FlipOutcome.ABORTED)
+            _end_of_input(
+                partial(self._slot.settle, FlipOutcome.ABORTED), "Flip prompt"
+            )
             return
         except Exception as exc:
             # Anything else used to kill this thread silently, leaving the
@@ -475,6 +515,184 @@ class ClickFlipCoordinator(FlipCoordinator):
                     self._abort_cause = exc
             return
         self._slot.settle(FlipOutcome.CONTINUED if flipped else FlipOutcome.ABORTED)
+
+
+def _flush_typed_ahead() -> None:
+    """
+    Throw away keys typed while a pass ran, so none answers the next question.
+
+    A second ``n`` pressed during a pass sits in the terminal's input queue and
+    would answer the next prompt the moment it appeared, starting a pass on a
+    platen nobody has changed.  Only a terminal has such a queue; anything else
+    -- a test's fake stdin, a stream with no descriptor, a terminal that went
+    away -- is left alone, and the prompt reads it as it is.
+    """
+    try:
+        if sys.stdin.isatty():
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except OSError, ValueError, termios.error:
+        return
+
+
+def _read_pass_answer(prompt: PassPrompt) -> PassAnswer:
+    """
+    Ask one multi-page question at the terminal until it has an answer.
+
+    Only the first character of a line counts, in either case, and only a
+    letter the prompt lists is accepted.  Anything else is refused with the
+    letters on offer, and ``f`` while nothing is kept says why there is
+    nothing to finish; either way the question is asked again.  An abort is
+    confirmed first, No by default, and a No asks the question again.
+
+    Args:
+        prompt: The open question.
+
+    Returns:
+        The operator's answer, one of those ``prompt`` offers.
+
+    """
+    letters = {choice.letter: choice.answer for choice in cli_pass_choices(prompt)}
+
+    def parse(text: str) -> PassAnswer:
+        """
+        Turn a typed line into the answer its first letter picks.
+
+        Args:
+            text: What the operator typed.
+
+        Returns:
+            The answer.
+
+        Raises:
+            click.BadParameter: The letter picks nothing this question offers;
+                click prints the reason and asks again.
+
+        """
+        letter = text.strip().lower()[:1]
+        answer = letters.get(letter)
+        if answer is not None:
+            return answer
+        if letter == "f" and prompt.wait is not PassWait.BLANK_DECISION:
+            raise click.BadParameter(NOTHING_TO_FINISH)
+        raise click.BadParameter(cli_choice_hint(prompt))
+
+    _flush_typed_ahead()
+    while True:
+        answer = click.prompt(
+            cli_pass_question(prompt), value_proc=parse, show_default=False
+        )
+        if answer is not PassAnswer.ABORT:
+            return answer
+        if click.confirm(abort_question(prompt.pages_kept), default=False):
+            return answer
+
+
+class ClickPassCoordinator(PassCoordinator):
+    """
+    The CLI multi-page coordinator: a one-letter prompt with a bounded wait.
+
+    Built as ``ClickFlipCoordinator`` is, for the same reasons.  ``click.prompt``
+    has no timeout of its own, so it runs on a daemon thread while the calling
+    thread waits for at most the prompt's ``timeout_seconds``, and the
+    operator's answer and the clock race for one ``AnswerSlot``.  Every
+    question gets a fresh slot, so an answer to one question can never be
+    read as the answer to the next.
+
+    The question lists only the letters it accepts, and keys typed during the
+    pass are thrown away before it is shown (``_read_pass_answer``).  Ctrl-C
+    is a cancel, with no confirmation however many pages are kept: SIGINT
+    raises in the calling thread's wait, which answers ``ABORT``, and a page
+    is only ever kept by choosing to finish.  End of input is a cancel too,
+    unless a hangup caused it (``_end_of_input``).  A prompt that fails with a
+    read error answers ``ABORT`` at once, logged with its traceback, and
+    records the exception as ``abort_cause``: nobody chose to stop, so the
+    scan is reported as failed, not cancelled, and its pages are kept.
+
+    Accepted cost, as at the flip prompt, deliberate and not a leak: after a
+    timeout the prompt thread is abandoned.  It keeps its read on stdin until
+    the process exits, and its question may be left sitting on the terminal.
+    A timeout always ends the document, so at most one thread is ever
+    abandoned, and a daemon thread parked on stdin does not delay interpreter
+    shutdown.  It must stay a daemon thread: a non-daemon one would hold the
+    interpreter open at exit waiting for an answer nobody is going to give.
+    """
+
+    def __init__(self) -> None:
+        """Start with no abort cause."""
+        # Held across a broken prompt's claim and its cause, so the calling
+        # thread, woken by that claim, cannot read the cause before it is set.
+        self._cause_lock = threading.Lock()
+        self._abort_cause: Exception | None = None
+
+    @property
+    def abort_cause(self) -> Exception | None:
+        """
+        The exception a broken prompt raised, if that failure claimed the answer.
+
+        Returns:
+            The prompt's exception, or ``None`` when the answer came from the
+            operator (a letter, end of input, Ctrl-C) or from the clock.
+
+        """
+        with self._cause_lock:
+            return self._abort_cause
+
+    def ask(self, prompt: PassPrompt) -> PassAnswer:
+        """
+        Put ``prompt`` to the operator; claim ``TIMED_OUT`` if its wait expires.
+
+        Args:
+            prompt: The question, and the only answers it accepts.
+
+        Returns:
+            The one answer this question resolved to.
+
+        """
+        slot = AnswerSlot[PassAnswer]()
+        reader = threading.Thread(
+            target=self._prompt,
+            args=(prompt, slot),
+            name="saneless-multi-page-prompt",
+            daemon=True,
+        )
+        reader.start()
+        try:
+            slot.wait(prompt.timeout_seconds)
+        except KeyboardInterrupt:
+            # Ctrl-C lands here, not in click.prompt: Python handles SIGINT on
+            # the main thread, which is this one, parked in the wait.  It is
+            # the operator's cancel, unconfirmed, whatever has been kept.
+            return slot.settle(PassAnswer.ABORT)
+        # One path for both endings, as at the flip prompt: an answer already
+        # claimed is handed back, and an expired wait claims TIMED_OUT.
+        return slot.settle(PassAnswer.TIMED_OUT)
+
+    def _prompt(self, prompt: PassPrompt, slot: AnswerSlot[PassAnswer]) -> None:
+        """
+        Ask the operator on the prompt thread and claim their answer.
+
+        Args:
+            prompt: The open question.
+            slot: This question's slot.
+
+        """
+        try:
+            answer = _read_pass_answer(prompt)
+        except click.Abort:
+            _end_of_input(partial(slot.settle, PassAnswer.ABORT), "Multi-page prompt")
+            return
+        except Exception as exc:
+            # As at the flip prompt: a prompt that broke ends the wait now as
+            # ABORT, with the exception kept as abort_cause so the run reports
+            # a failure that keeps its pages rather than a cancel.  The cause
+            # is set only if this claim won, and the failure is logged before
+            # the claim, so the record exists once the wait wakes.
+            logger.exception("Multi-page prompt failed; treating it as an abort")
+            with self._cause_lock:
+                if slot.offer(PassAnswer.ABORT):
+                    self._abort_cause = exc
+            return
+        slot.settle(answer)
 
 
 def _truncate(value: str, width: int) -> str:
@@ -1063,8 +1281,9 @@ def _recover_orphaned_workspaces(settings: Settings) -> None:
     default="",
     help="Document title (default: the profile's title, else 'Scan <time>').",
 )
+@click.option("--multi-page", "multi_page", is_flag=True, help=MULTI_PAGE_OPTION_HELP)
 @click.pass_context
-def scan(ctx: click.Context, profile: str, title: str) -> None:
+def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> None:
     """Scan a document and upload to paperless-ngx."""
     # python-sane is mandatory: a command that needs it refuses before loading
     # config or touching the device, exit 2 through the guard. --help never
@@ -1113,6 +1332,16 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         raise ConfigError(msg)
 
     manual_duplex = settings.profiles[profile].duplex == "manual"
+    # Both multi-page refusals come before the backend exists, so no paper
+    # moves.  Manual duplex first: a terminal would not help there, so the
+    # operator is told the reason that would.  Off a terminal nobody can say
+    # whether there is another page, so cron or a pipe never drives the loop.
+    if multi_page and manual_duplex:
+        click.echo(multi_page_manual_duplex_refusal(profile), err=True)
+        ctx.exit(ExitCode.CONFIG)
+    if multi_page and not _stdin_is_interactive():
+        click.echo(MULTI_PAGE_NEEDS_TERMINAL, err=True)
+        ctx.exit(ExitCode.CONFIG)
     # Refused here, before the backend exists, so no paper moves: from cron or a
     # pipe there is nobody to flip the stack, and pass A would be wasted.
     if manual_duplex and not _stdin_is_interactive():
@@ -1165,6 +1394,10 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             # run_pipeline is synchronous, so the flip wait holds this thread;
             # only the click.confirm read itself moves to the prompt thread.
             flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
+            # The same holds for every multi-page question: the run waits on
+            # this thread, and only each click.prompt read moves off it.
+            multi_page=multi_page,
+            pass_coordinator=ClickPassCoordinator() if multi_page else None,
             # The run sets it once its outcome is fixed, and from then on
             # _interrupt_handler defers a signal instead of raising it.
             settled=_INTERRUPTION.settled,
