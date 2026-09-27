@@ -39,6 +39,12 @@ __all__ = [
     "HIDDEN_PRESERVED_ERROR",
     "HIDDEN_WARNING_LINE",
     "LOCAL_TIME_FORMAT",
+    "MULTI_PAGE_DISABLED_REASON",
+    "MULTI_PAGE_HELP",
+    "MULTI_PAGE_LABEL",
+    "MULTI_PAGE_NEEDS_TERMINAL",
+    "MULTI_PAGE_OPTION_HELP",
+    "NOTHING_TO_FINISH",
     "PASS_WAIT_STATES",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
@@ -52,6 +58,7 @@ __all__ = [
     "WARNED_UPLOAD_LABEL",
     "WORKER_DEGRADED_JOB_ERROR",
     "WORKER_DOWN_JOB_ERROR",
+    "CliChoice",
     "ConfigFileState",
     "ConnectionStatus",
     "ErrorAdvice",
@@ -63,6 +70,7 @@ __all__ = [
     "PaperSize",
     "PassAnswer",
     "PassPrompt",
+    "PassPromptCopy",
     "PassWait",
     "ProfileStorage",
     "RemovedPagesNoted",
@@ -70,10 +78,14 @@ __all__ = [
     "ScanOutcome",
     "SubmitResult",
     "WorkerHealth",
+    "abort_question",
     "blank_timeout_finish_warning",
     "busy_line",
     "cap_finish_warning",
     "classify_error",
+    "cli_choice_hint",
+    "cli_pass_choices",
+    "cli_pass_question",
     "connection_status_message",
     "duration_phrase",
     "error_advice",
@@ -86,10 +98,12 @@ __all__ = [
     "job_label",
     "job_state_for",
     "local_time",
+    "multi_page_manual_duplex_refusal",
     "outcome_line",
     "page_counts",
     "pages_phrase",
     "pass_answer_label",
+    "pass_prompt_copy",
     "pass_wait_state",
     "progress_label",
     "rejection_message",
@@ -1431,6 +1445,537 @@ def blank_timeout_finish_warning(pages_kept: int, timeout_seconds: float) -> str
         f"about the blank pages within {duration_phrase(timeout_seconds)}, so "
         "they were left out; the document may be missing pages."
     )
+
+
+# The wording of a multi-page scan's questions.  Each sentence is read by both
+# the web prompt and the terminal, so the two surfaces say the same thing.
+
+NOTHING_TO_FINISH: Final = (
+    "Nothing to finish yet: every page so far was skipped as blank. "
+    "Scan another page, or abort."
+)
+"""
+Why Finish is withheld while no page is kept.
+
+The web page shows it beside the disabled Finish button; the terminal prints it
+when ``f`` is typed at the same point.  One sentence, so the two agree.
+"""
+
+MULTI_PAGE_LABEL: Final = "Multiple pages"
+"""The scan form checkbox's label."""
+
+MULTI_PAGE_HELP: Final = (
+    "Asks after each scan whether there is another page, and puts every page "
+    "in one document."
+)
+"""The help line under the scan form checkbox while it can be ticked."""
+
+MULTI_PAGE_DISABLED_REASON: Final = "Not available with manual duplex."
+"""The line in place of the checkbox's help while a manual-duplex profile is chosen."""
+
+MULTI_PAGE_OPTION_HELP: Final = (
+    "Ask after each scan whether there is another page, and put every page in "
+    "one document. Needs an interactive terminal."
+)
+"""The ``--multi-page`` option's help text."""
+
+MULTI_PAGE_NEEDS_TERMINAL: Final = (
+    "--multi-page needs an interactive terminal: saneless asks after each scan "
+    "whether there is another page. Run it from a terminal, or scan from the "
+    "web UI."
+)
+"""The refusal when ``--multi-page`` is given without a terminal to ask on."""
+
+_FINISH_LABEL: Final = "Finish document"
+_ABORT_LABEL: Final = "Abort scan"
+_ABORT_UPLOADS_NOTHING: Final = "Abort scan stops without uploading anything."
+_ENDS_WITHOUT_UPLOAD: Final = "ends the scan without uploading anything."
+_FAILED_SCAN_ALERT: Final = "The last scan failed, so none of its pages were added."
+_NO_PAGES_KEPT: Final = "No pages kept yet."
+_PUT_NEXT_PAGE: Final = "Put the next page on the scanner, then press Scan next page."
+
+
+@dataclass(frozen=True, slots=True)
+class PassPromptCopy:
+    """
+    Every sentence a web multi-page prompt shows, in display order.
+
+    This is the one source of the prompt's wording: a template lays these
+    strings out and composes none of its own.  A field a question does not
+    use is None, so a template can test for it rather than for the question.
+
+    Attributes:
+        alert: For a failed pass only: the warning line saying none of its
+            pages were added.
+        detail: For a failed pass only: what the scanner reported, when
+            anything was.
+        headline: The bold first line.
+        instruction: What to do next; None for the blank-page question, whose
+            buttons say it.
+        buttons: Each answer with its label, in display order.  The next-page
+            question always lists Finish, even when the prompt does not offer
+            it, so the web page can show it disabled beside its reason.
+        finish_blocked: For the next-page question when Finish is not offered:
+            why not.
+        notes: The small lines under the buttons, in display order.
+        abort_question: The confirmation Abort asks; None where there is no
+            Abort button.
+
+    """
+
+    alert: str | None
+    detail: str | None
+    headline: str
+    instruction: str | None
+    buttons: tuple[tuple[PassAnswer, str], ...]
+    finish_blocked: str | None
+    notes: tuple[str, ...]
+    abort_question: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CliChoice:
+    """
+    One answer a terminal multi-page prompt accepts, with the letter that picks it.
+
+    Attributes:
+        letter: The single lower-case letter that picks this answer.
+        answer: The answer it picks.
+        label: How the prompt lists it, the letter in brackets, e.g.
+            ``"[r]e-scan last"``.
+
+    """
+
+    letter: str
+    answer: PassAnswer
+    label: str
+
+
+def abort_question(pages_kept: int) -> str:
+    """
+    Return the confirmation a multi-page scan asks before it aborts.
+
+    This is the one source of that question for both the web page's Abort
+    button and the terminal's ``a``.  With nothing kept it is the flip
+    prompt's sentence, byte for byte, because nothing is lost but the scan.
+
+    Args:
+        pages_kept: How many pages the document holds.
+
+    Returns:
+        The question, naming the pages that will not be uploaded.
+
+    """
+    if pages_kept < 1:
+        return "Abort this scan? It will stop and cannot be resumed."
+    return (
+        f"Abort this scan? The {pages_phrase(pages_kept)} kept so far will not be "
+        "uploaded, and the scan cannot be resumed."
+    )
+
+
+def multi_page_manual_duplex_refusal(profile: str) -> str:
+    """
+    Return the refusal for ``--multi-page`` with a manual-duplex profile.
+
+    This is the one source of that refusal's wording.
+
+    Args:
+        profile: The profile name the operator gave.
+
+    Returns:
+        The refusal, naming the profile and what to do instead.
+
+    """
+    return (
+        f"Profile '{profile}' is manual duplex, and --multi-page is not "
+        "available with manual duplex. Scan without --multi-page, or choose "
+        "another profile."
+    )
+
+
+def _kept_headline(pages_kept: int) -> str:
+    """
+    Return the line saying how many pages the document holds so far.
+
+    Args:
+        pages_kept: How many pages the document holds.
+
+    Returns:
+        E.g. ``"4 pages kept so far."`` or ``"No pages kept yet."``.
+
+    """
+    if pages_kept < 1:
+        return _NO_PAGES_KEPT
+    return f"{pages_phrase(pages_kept)} kept so far."
+
+
+def _these_pages(pages_kept: int) -> str:
+    """
+    Return the kept pages as a demonstrative phrase.
+
+    Args:
+        pages_kept: How many pages the document holds; at least one.
+
+    Returns:
+        ``"this page"`` for one page, else e.g. ``"these 4 pages"``.
+
+    """
+    return "this page" if pages_kept == 1 else f"these {pages_kept} pages"
+
+
+def _finish_timeout_note(prompt: PassPrompt) -> str:
+    """
+    Return what an unanswered next-page or failed-pass question will do.
+
+    Args:
+        prompt: The open question.
+
+    Returns:
+        The timeout note: it finishes with the pages kept, or, with none,
+        ends the scan.
+
+    """
+    within = f"No answer within {duration_phrase(prompt.timeout_seconds)}"
+    if prompt.pages_kept < 1:
+        return f"{within} {_ENDS_WITHOUT_UPLOAD}"
+    return f"{within} finishes the document with {_these_pages(prompt.pages_kept)}."
+
+
+def _last_pass(prompt: PassPrompt) -> str:
+    """
+    Return the last accepted pass's pages as the object of a re-scan.
+
+    Args:
+        prompt: The open next-page question.
+
+    Returns:
+        ``"page"`` for a one-page pass, else e.g. ``"3 pages"``.
+
+    """
+    if prompt.last_pass_pages >= 2:
+        return pages_phrase(prompt.last_pass_pages)
+    return "page"
+
+
+def _next_pass_copy(prompt: PassPrompt) -> PassPromptCopy:
+    """
+    Return the wording of the question whether there is another page.
+
+    Args:
+        prompt: The open next-page question.
+
+    Returns:
+        Its copy.
+
+    """
+    kept = prompt.pages_kept
+    rescan = f"Re-scan throws away the last {_last_pass(prompt)} and scans again."
+    if kept >= 1:
+        instruction = (
+            f"{_PUT_NEXT_PAGE} When there are no more pages, press {_FINISH_LABEL}."
+        )
+        consequence = (
+            f"{_FINISH_LABEL} uploads {_these_pages(kept)} as one document. "
+            f"{rescan} {_ABORT_UPLOADS_NOTHING}"
+        )
+    else:
+        instruction = _PUT_NEXT_PAGE
+        consequence = f"{rescan} {_ABORT_UPLOADS_NOTHING}"
+    finish_offered = PassAnswer.FINISH in prompt.offered
+    return PassPromptCopy(
+        alert=None,
+        detail=None,
+        headline=_kept_headline(kept),
+        instruction=instruction,
+        buttons=(
+            (PassAnswer.NEXT, "Scan next page"),
+            (PassAnswer.FINISH, _FINISH_LABEL),
+            (PassAnswer.RESCAN, f"Re-scan last {_last_pass(prompt)}"),
+            (PassAnswer.ABORT, _ABORT_LABEL),
+        ),
+        finish_blocked=None if finish_offered else NOTHING_TO_FINISH,
+        notes=(consequence, _finish_timeout_note(prompt)),
+        abort_question=abort_question(kept),
+    )
+
+
+def _blank_list(prompt: PassPrompt) -> str:
+    """
+    Return the positions of a pass's blank pages as a headline subject.
+
+    Positions are comma-separated, the style of the removed-as-blank note.
+
+    Args:
+        prompt: The open blank-page question.
+
+    Returns:
+        E.g. ``"Pages 2, 4, 6 of the 6 just scanned look blank."``, or
+        ``"Page 3 of the 4 just scanned looks blank."`` for one blank page.
+
+    """
+    listed = ", ".join(str(position) for position in prompt.blank_positions)
+    if len(prompt.blank_positions) == 1:
+        return f"Page {listed} of the {prompt.pass_pages} just scanned looks blank."
+    return f"Pages {listed} of the {prompt.pass_pages} just scanned look blank."
+
+
+def _blank_copy(prompt: PassPrompt) -> PassPromptCopy:
+    """
+    Return the wording of the question what to do about blank-looking pages.
+
+    There is no Abort here: it is one Skip away, at the next-page question.
+
+    Args:
+        prompt: The open blank-page question.
+
+    Returns:
+        Its copy.
+
+    """
+    blanks = len(prompt.blank_positions)
+    survivors = prompt.pages_kept + prompt.pass_pages - blanks
+    within = f"No answer within {duration_phrase(prompt.timeout_seconds)}"
+    if prompt.pass_pages <= 1:
+        headline = "This page looks blank."
+        skip, keep, rescan = "Skip page", "Keep page", "Re-scan page"
+        consequence = (
+            "Skip page leaves it out of the document. Keep page adds it anyway. "
+            "Re-scan page scans it again."
+        )
+        skipped = "skips it"
+    else:
+        headline = _blank_list(prompt)
+        noun = "page" if blanks == 1 else "pages"
+        skip, keep = f"Skip blank {noun}", f"Keep blank {noun}"
+        rescan = f"Re-scan all {prompt.pass_pages}"
+        left_out, them = (
+            ("that page", "it")
+            if blanks == 1
+            else (
+                f"those {blanks} pages",
+                "them",
+            )
+        )
+        consequence = (
+            f"Skip leaves {left_out} out of the document. Keep adds {them} "
+            f"anyway. Re-scan throws away all {prompt.pass_pages} and scans "
+            "them again."
+        )
+        skipped = "skips the blank pages"
+    if survivors >= 1:
+        timeout = f"{within} {skipped} and finishes the document."
+    else:
+        timeout = f"{within} {_ENDS_WITHOUT_UPLOAD}"
+    if prompt.pages_kept < 1:
+        kept_note = _NO_PAGES_KEPT
+    else:
+        kept_note = f"{pages_phrase(prompt.pages_kept)} already kept."
+    return PassPromptCopy(
+        alert=None,
+        detail=None,
+        headline=headline,
+        instruction=None,
+        buttons=(
+            (PassAnswer.SKIP_BLANKS, skip),
+            (PassAnswer.KEEP_BLANKS, keep),
+            (PassAnswer.RESCAN, rescan),
+        ),
+        finish_blocked=None,
+        notes=(consequence, kept_note, timeout),
+        abort_question=None,
+    )
+
+
+def _retry_copy(prompt: PassPrompt, error: str | None) -> PassPromptCopy:
+    """
+    Return the wording of the question what to do after a pass failed.
+
+    There is no Re-scan here: the failed pass added nothing to throw away.
+
+    Args:
+        prompt: The open failed-pass question.
+        error: What the scanner reported, as it should be shown.
+
+    Returns:
+        Its copy.
+
+    """
+    kept = prompt.pages_kept
+    return PassPromptCopy(
+        alert=_FAILED_SCAN_ALERT,
+        detail=None if error is None else f"The scanner reported: {error}",
+        headline=_kept_headline(kept),
+        instruction=(
+            "Clear the scanner, put back every page from the failed scan, then "
+            "press Scan again."
+        ),
+        buttons=(
+            (PassAnswer.NEXT, "Scan again"),
+            (PassAnswer.FINISH, _FINISH_LABEL),
+            (PassAnswer.ABORT, _ABORT_LABEL),
+        ),
+        finish_blocked=None,
+        notes=(
+            f"{_FINISH_LABEL} uploads the {pages_phrase(kept)} kept. "
+            f"{_ABORT_UPLOADS_NOTHING}",
+            _finish_timeout_note(prompt),
+        ),
+        abort_question=abort_question(kept),
+    )
+
+
+def pass_prompt_copy(prompt: PassPrompt, *, error: str | None = None) -> PassPromptCopy:
+    """
+    Return every sentence the web page shows for an open multi-page question.
+
+    This is the one source of the prompt's wording; the terminal's prompts
+    (``cli_pass_question``) are built from the same sentences, so the two
+    surfaces say the same thing.
+
+    Args:
+        prompt: The open question.
+        error: For a failed pass, the error text to show in place of
+            ``prompt.error``.  ``prompt.error`` is unscrubbed, so the web
+            passes the scrubbed text here.
+
+    Returns:
+        The prompt's copy.
+
+    Raises:
+        AssertionError: If the prompt's wait is not a PassWait member.
+
+    """
+    match prompt.wait:
+        case PassWait.NEXT_PASS:
+            copy = _next_pass_copy(prompt)
+        case PassWait.BLANK_DECISION:
+            copy = _blank_copy(prompt)
+        case PassWait.RETRY:
+            copy = _retry_copy(prompt, prompt.error if error is None else error)
+        case _:
+            assert_never(prompt.wait)
+    return copy
+
+
+def _cli_rescan_label(prompt: PassPrompt) -> str:
+    """
+    Return how a terminal prompt lists the re-scan answer.
+
+    Args:
+        prompt: The open question.
+
+    Returns:
+        ``"[r]e-scan last"`` between passes, ``"[r]e-scan"`` for a one-page
+        blank pass, else e.g. ``"[r]e-scan all 6"``.
+
+    """
+    if prompt.wait is PassWait.NEXT_PASS:
+        return "[r]e-scan last"
+    if prompt.pass_pages <= 1:
+        return "[r]e-scan"
+    return f"[r]e-scan all {prompt.pass_pages}"
+
+
+def cli_pass_choices(prompt: PassPrompt) -> tuple[CliChoice, ...]:
+    """
+    Return the answers a terminal multi-page prompt accepts, in listing order.
+
+    This is the one source of the terminal's letters and how it lists them.
+    Only the answers the prompt offers are returned, so a letter for one it
+    does not offer is not listed and is not accepted.
+
+    Args:
+        prompt: The open question.
+
+    Returns:
+        The offered choices: next, re-scan, finish, abort between passes;
+        skip, keep, re-scan for blank pages; scan again, finish, abort after
+        a failed pass.
+
+    Raises:
+        AssertionError: If the prompt's wait is not a PassWait member.
+
+    """
+    rescan = CliChoice("r", PassAnswer.RESCAN, _cli_rescan_label(prompt))
+    finish = CliChoice("f", PassAnswer.FINISH, "[f]inish")
+    abort = CliChoice("a", PassAnswer.ABORT, "[a]bort")
+    match prompt.wait:
+        case PassWait.NEXT_PASS:
+            order = (CliChoice("n", PassAnswer.NEXT, "[n]ext"), rescan, finish, abort)
+        case PassWait.BLANK_DECISION:
+            order = (
+                CliChoice("s", PassAnswer.SKIP_BLANKS, "[s]kip"),
+                CliChoice("k", PassAnswer.KEEP_BLANKS, "[k]eep"),
+                rescan,
+            )
+        case PassWait.RETRY:
+            order = (
+                CliChoice("n", PassAnswer.NEXT, "[n] scan again"),
+                finish,
+                abort,
+            )
+        case _:
+            assert_never(prompt.wait)
+    return tuple(choice for choice in order if choice.answer in prompt.offered)
+
+
+def _cli_choice_list(prompt: PassPrompt) -> str:
+    """
+    Return the offered choices as a comma-separated list.
+
+    Args:
+        prompt: The open question.
+
+    Returns:
+        E.g. ``"[n]ext, [r]e-scan last, [f]inish, [a]bort"``.
+
+    """
+    return ", ".join(choice.label for choice in cli_pass_choices(prompt))
+
+
+def cli_pass_question(prompt: PassPrompt) -> str:
+    """
+    Return the full text of a terminal multi-page prompt.
+
+    This is the one source of the terminal's question; it reuses the web
+    prompt's headlines, so the two say the same thing.  The failed-pass
+    question is two lines: what failed, then what to do.  The error text is
+    shown as given: the terminal belongs to the host's own operator.
+
+    Args:
+        prompt: The open question.
+
+    Returns:
+        The prompt text, ending with the offered choices.
+
+    """
+    choices = _cli_choice_list(prompt)
+    if prompt.wait is PassWait.RETRY:
+        failed = _FAILED_SCAN_ALERT
+        if prompt.error is not None:
+            failed = f"{failed.removesuffix('.')}: {prompt.error}"
+        return (
+            f"{failed}\n{_kept_headline(prompt.pages_kept)} Put back every page "
+            f"from the failed scan. {choices}"
+        )
+    return f"{pass_prompt_copy(prompt).headline} {choices}"
+
+
+def cli_choice_hint(prompt: PassPrompt) -> str:
+    """
+    Return what a terminal multi-page prompt says after an unrecognised letter.
+
+    This is the one source of that hint.  It lists only the offered letters.
+
+    Args:
+        prompt: The open question.
+
+    Returns:
+        E.g. ``"Choose one of: [n]ext, [r]e-scan last, [f]inish, [a]bort"``.
+
+    """
+    return f"Choose one of: {_cli_choice_list(prompt)}"
 
 
 def job_state_for(outcome: ScanOutcome) -> JobState:
