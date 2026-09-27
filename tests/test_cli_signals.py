@@ -9,8 +9,9 @@ cancel that keeps nothing (exit 130).
 
 Every signal here is real, sent with ``os.kill`` to this very process, and each
 is sent from inside the run at the moment it matters: from the in-memory
-paperless-ngx while it receives the upload, and from the flip prompt's own
-thread, where a dropped SSH session delivers its hangup.  That is the only way
+paperless-ngx while it receives the upload, and from the flip prompt's or a
+multi-page question's own thread, where a dropped SSH session delivers its
+hangup.  That is the only way
 to prove the handler is live at that moment, rather than merely installed at
 some point.
 
@@ -388,6 +389,90 @@ def _run_scan(
     return _CliRun(result=result, failed=failed, recorder=recorder, scanner=scanner)
 
 
+class _SignalAtSecondQuestion:
+    """
+    Stand in for ``click.prompt`` under ``--multi-page``: "next", then a signal.
+
+    The first question is answered "next".  The signal is sent from inside
+    the second, as a dropped session or a supervisor's stop would deliver
+    it.  A hangup also ends the question's input, as a closed terminal does;
+    a stop leaves the question waiting until ``release`` is set, and its late
+    answer then reaches a question the interruption already settled.
+
+    Attributes:
+        questions: Every question asked, in order.
+        release: Set by the test once the run has returned.
+
+    """
+
+    def __init__(self, signaller: _Signaller, signum: signal.Signals) -> None:
+        """
+        Prepare to send ``signum`` through ``signaller`` at the second question.
+
+        Args:
+            signaller: Sends the signal under the safety rule.
+            signum: The signal the second question delivers.
+
+        """
+        self._signaller = signaller
+        self._signum = signum
+        self.questions: list[str] = []
+        self.release = threading.Event()
+
+    def __call__(
+        self, text: str, *, value_proc: Callable[[str], object], **_kwargs: object
+    ) -> object:
+        """
+        Answer "next" once, then deliver the signal at the second question.
+
+        Returns:
+            The first question's parsed answer, or the stop's late one.
+
+        Raises:
+            click.Abort: For a hangup, the end of input it gives the prompt.
+
+        """
+        self.questions.append(text)
+        if len(self.questions) == 1:
+            return value_proc("n")
+        self._signaller.send(self._signum)
+        if self._signum is signal.SIGHUP:
+            raise click.Abort
+        self.release.wait()
+        return value_proc("f")
+
+
+def _run_multi_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: _SignalAtSecondQuestion,
+    scanner: DistinctPageScanner,
+) -> _CliRun:
+    """
+    Run ``saneless scan --multi-page`` with ``prompt`` answering its questions.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+        monkeypatch: Replaces the environment ``saneless.cli`` reaches for.
+        prompt: The stand-in for ``click.prompt``.
+        scanner: The scanner the command opens.
+
+    Returns:
+        What the run left behind.
+
+    """
+    monkeypatch.setattr("saneless.cli.click.prompt", prompt)
+    try:
+        return _run_scan(
+            tmp_path,
+            monkeypatch,
+            ["--profile", _SIMPLEX, "--multi-page"],
+            scanner=scanner,
+        )
+    finally:
+        prompt.release.set()
+
+
 def _kept_pages(kept: Path) -> list[bytes]:
     """
     Read a PDF kept in ``failed/`` back, one raw image stream per page.
@@ -568,58 +653,145 @@ def test_a_signal_at_the_multi_page_prompt_keeps_the_pages_scanned(
     """
     A signal while ``--multi-page`` waits after two pages: both kept, none sent.
 
-    The first prompt is answered "next"; the signal comes from inside the
-    second, as a dropped session or a supervisor's stop would deliver it.  A
-    hangup also ends the prompt's input, as a closed terminal does; a stop
-    leaves the prompt waiting.  Either way it is an interruption, not the
-    operator's cancel, so the two accepted pages are kept as one PDF.
+    It is an interruption, not the operator's cancel, so the two accepted
+    pages are kept as one PDF.
     """
     signaller = _Signaller()
-    release = threading.Event()
+    prompt = _SignalAtSecondQuestion(signaller, signum)
+    scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
+
+    run = _run_multi_page(tmp_path, monkeypatch, prompt, scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signum]
+    assert len(prompt.questions) == 2
+    assert run.result.exit_code == expected, run.result.output
+    (kept,) = run.failed
+    assert run.interrupted_lines == [run.interrupted_lines[0]]
+    assert str(kept) in run.interrupted_lines[0]
+    assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1))
+    assert scanner.calls == 2
+    assert run.recorder.uploads() == []
+
+
+def test_sighup_at_the_blank_page_question_keeps_the_document_and_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A hangup while the blank-page question is open: exit 129, both kept apart.
+
+    The accepted page is kept as the document.  The pass that looked blank
+    was never decided on, so it is kept too, as its own ``(partial)`` PDF,
+    rather than dropped as blank or merged into the document.
+    """
+    signaller = _Signaller()
+    prompt = _SignalAtSecondQuestion(signaller, signal.SIGHUP)
+    scanner = DistinctPageScanner(passes=((0,), (1,)), blank={1})
+
+    run = _run_multi_page(tmp_path, monkeypatch, prompt, scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGHUP]
+    assert len(prompt.questions) == 2
+    assert "looks blank" in prompt.questions[1]
+    assert run.result.exit_code == ExitCode.HANGUP, run.result.output
+    (document,) = [kept for kept in run.failed if "partial" not in kept.name]
+    (partial,) = [kept for kept in run.failed if "partial" in kept.name]
+    assert _kept_pages(document) == _spooled_idat(scanner, (0,))
+    assert _kept_pages(partial) == _spooled_idat(scanner, (1,))
+    (line,) = run.interrupted_lines
+    assert str(document) in line
+    assert str(partial) in line
+    assert scanner.calls == 2
+    assert run.recorder.uploads() == []
+
+
+def test_sigterm_at_the_failed_pass_question_keeps_only_the_accepted_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A stop while the failed-pass question is open: exit 143, pass 1 kept alone.
+
+    The jammed pass spooled its page before it failed, but a failed pass
+    contributes nothing to the document, so that page is not kept either.
+    """
+    signaller = _Signaller()
+    prompt = _SignalAtSecondQuestion(signaller, signal.SIGTERM)
+    scanner = DistinctPageScanner(
+        passes=((0,), (1,)), fail_on={2: ScanError("Scanner error: jam")}
+    )
+
+    run = _run_multi_page(tmp_path, monkeypatch, prompt, scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGTERM]
+    assert len(prompt.questions) == 2
+    assert "jam" in prompt.questions[1]
+    assert run.result.exit_code == ExitCode.TERMINATED, run.result.output
+    (kept,) = run.failed
+    assert "partial" not in kept.name
+    assert _kept_pages(kept) == _spooled_idat(scanner, (0,))
+    (line,) = run.interrupted_lines
+    assert str(kept) in line
+    assert scanner.calls == 2
+    assert run.recorder.uploads() == []
+
+
+def test_a_hangup_whose_end_of_input_lands_first_at_a_multi_page_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    End of input first, SIGHUP a moment later, at a multi-page question: kept.
+
+    The multi-page question's version of the flip prompt's race.  The
+    signal is sent from inside the prompt thread's wait for it, so it lands
+    after end of input by construction, with no timed pause.  Settling the
+    question as an abort without that wait would end the run as a cancel
+    that keeps nothing.
+    """
+    signaller = _Signaller()
+    real_wait = _INTERRUPTION.wait
     questions: list[str] = []
 
     def prompt(
         text: str, *, value_proc: Callable[[str], object], **_kwargs: object
     ) -> object:
         """
-        Answer "next" once, then deliver the signal at the second question.
+        Answer "next" once, then be the closed terminal's end of input.
 
         Returns:
-            The first question's parsed answer, or the stop's late one.
+            The first question's parsed answer.
 
         Raises:
-            click.Abort: For a hangup, the end of input it gives the prompt.
+            click.Abort: At the second question.
 
         """
         questions.append(text)
         if len(questions) == 1:
             return value_proc("n")
-        signaller.send(signum)
-        if signum is signal.SIGHUP:
-            raise click.Abort
-        release.wait()
-        return value_proc("f")
+        raise click.Abort
+
+    def signal_arrives(timeout: float) -> bool:
+        """Deliver the hangup's SIGHUP now, then wait for it as the code does."""
+        signaller.send(signal.SIGHUP)
+        return real_wait(timeout)
 
     monkeypatch.setattr("saneless.cli.click.prompt", prompt)
+    monkeypatch.setattr(_INTERRUPTION, "wait", signal_arrives)
     scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
 
-    try:
-        run = _run_scan(
-            tmp_path,
-            monkeypatch,
-            ["--profile", _SIMPLEX, "--multi-page"],
-            scanner=scanner,
-        )
-    finally:
-        release.set()
+    run = _run_scan(
+        tmp_path,
+        monkeypatch,
+        ["--profile", _SIMPLEX, "--multi-page"],
+        scanner=scanner,
+    )
 
     assert signaller.refusals == []
-    assert signaller.sent == [signum]
+    assert signaller.sent == [signal.SIGHUP]
     assert len(questions) == 2
-    assert run.result.exit_code == expected, run.result.output
+    assert run.result.exit_code == ExitCode.HANGUP, run.result.output
     (kept,) = run.failed
-    assert run.interrupted_lines == [run.interrupted_lines[0]]
-    assert str(kept) in run.interrupted_lines[0]
     assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1))
     assert scanner.calls == 2
     assert run.recorder.uploads() == []

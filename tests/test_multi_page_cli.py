@@ -46,6 +46,7 @@ from saneless.vocabulary import (
     PassPrompt,
     PassWait,
     abort_question,
+    blank_timeout_finish_warning,
     cli_choice_hint,
     multi_page_manual_duplex_refusal,
     timeout_finish_warning,
@@ -172,8 +173,36 @@ def _scan(
         What the run left behind.
 
     """
-    settings = multi_page_settings(tmp_path)
     scanner = DistinctPageScanner(passes=passes)
+    return _scan_with(tmp_path, monkeypatch, args, scanner=scanner, text=text)
+
+
+def _scan_with(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: Sequence[str],
+    *,
+    scanner: DistinctPageScanner,
+    text: str | None = None,
+) -> _Run:
+    """
+    Run the real ``saneless scan`` with a prepared scanner, as ``_scan`` does.
+
+    Empty-page detection is on exactly when ``scanner`` feeds blank paper, so
+    a run about the loop is never also a run about blank pages.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+        monkeypatch: Replaces what ``saneless.cli`` reaches outside itself.
+        args: The arguments after ``scan``.
+        scanner: The scanner the command opens.
+        text: What the operator types, if anything.
+
+    Returns:
+        What the run left behind.
+
+    """
+    settings = multi_page_settings(tmp_path, detection=bool(scanner.blank))
     recorder = RecordingPaperless()
     opened: list[str] = []
 
@@ -480,6 +509,95 @@ class TestMultiPageScan:
         assert run.result.exit_code == ExitCode.SUCCESS, run.result.output
         assert "kept so far" not in run.result.output
         assert run.scanner.calls == 1
+
+
+def _script(
+    monkeypatch: pytest.MonkeyPatch, answers: Sequence[PassAnswer]
+) -> list[ScriptedPassCoordinator]:
+    """
+    Answer the run's questions from ``answers`` instead of the terminal.
+
+    Args:
+        monkeypatch: Replaces ``saneless.cli.ClickPassCoordinator``.
+        answers: The scripted answers, in order.
+
+    Returns:
+        The coordinators the command built, filled in as it builds them.
+
+    """
+    created: list[ScriptedPassCoordinator] = []
+
+    def scripted() -> ScriptedPassCoordinator:
+        """Stand in for the terminal with the scripted answers."""
+        coordinator = ScriptedPassCoordinator(answers)
+        created.append(coordinator)
+        return coordinator
+
+    monkeypatch.setattr("saneless.cli.ClickPassCoordinator", scripted)
+    return created
+
+
+class TestMultiPageBlankTimeouts:
+    """
+    Nobody answering a question about blank pages.
+
+    With a page kept, a timeout skips the blank pages and uploads the rest
+    with a warning.  With none kept there is nothing to upload, so the run
+    fails the way an all-blank scan does: exit 8, the skipped pages kept in
+    ``failed/``.
+    """
+
+    @pytest.mark.parametrize(
+        "answers",
+        [
+            (PassAnswer.TIMED_OUT,),
+            (PassAnswer.SKIP_BLANKS, PassAnswer.TIMED_OUT),
+        ],
+        ids=["blank-question-times-out", "skipped-then-next-question-times-out"],
+    )
+    def test_a_timeout_with_nothing_kept_exits_8_and_keeps_the_page(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        answers: tuple[PassAnswer, ...],
+    ) -> None:
+        """The only page looks blank and is never kept: all-blank, nothing sent."""
+        created = _script(monkeypatch, answers)
+        _interactive(monkeypatch)
+        scanner = DistinctPageScanner(passes=((0,),), blank={0})
+
+        run = _scan_with(tmp_path, monkeypatch, ["--multi-page"], scanner=scanner)
+
+        assert run.result.exit_code == ExitCode.ALL_BLANK, run.result.output
+        (coordinator,) = created
+        assert coordinator.prompts[0].wait is PassWait.BLANK_DECISION
+        assert [prompt.pages_kept for prompt in coordinator.prompts] == [0] * len(
+            answers
+        )
+        (kept,) = run.failed
+        assert embedded_streams(kept) == run.spooled((0,))
+        assert run.recorder.uploads() == []
+        assert "empty_page_coverage_threshold" in run.result.stderr
+
+    def test_a_blank_question_timeout_with_a_page_kept_exits_7(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A kept page, then a blank pass nobody answers: the page uploads, warned."""
+        created = _script(monkeypatch, [PassAnswer.NEXT, PassAnswer.TIMED_OUT])
+        _interactive(monkeypatch)
+        scanner = DistinctPageScanner(passes=((0,), (1,)), blank={1})
+
+        run = _scan_with(tmp_path, monkeypatch, ["--multi-page"], scanner=scanner)
+
+        assert run.result.exit_code == ExitCode.UPLOADED_WITH_WARNING, run.result.output
+        (coordinator,) = created
+        assert [prompt.wait for prompt in coordinator.prompts] == [
+            PassWait.NEXT_PASS,
+            PassWait.BLANK_DECISION,
+        ]
+        assert blank_timeout_finish_warning(1, _TIMEOUT) in run.result.output
+        assert run.uploaded_pages() == run.spooled((0,))
+        assert run.failed == []
 
 
 class TestClickPassCoordinatorAnswers:
