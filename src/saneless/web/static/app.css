@@ -165,6 +165,15 @@
     color: var(--pico-muted-color);
 }
 
+/* While the strip polls, its body carries aria-busy, and Pico sets
+   white-space: nowrap on every busy element that is not a form control so a
+   spinner and its label stay on one line.  Here that would stop the rows and
+   the freshness line from wrapping, and at 320px "Paused during scan -- not
+   checked yet." alone widened the page past the screen. */
+#checks-body[aria-busy="true"] {
+    white-space: normal;
+}
+
 /* Pico buttons are full width by default, which would make a secondary control
    look like the primary Scan button; width: auto stops that. The min-height is
    the WCAG 2.5.5 touch-target floor, stated rather than relied upon -- Pico's
