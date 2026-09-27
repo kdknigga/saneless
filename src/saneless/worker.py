@@ -949,9 +949,8 @@ class ScanWorker:
         """
         Answer prompt ``number`` of ``job_id``'s multi-page scan with ``answer``.
 
-        The coordinator is read once, and ``job_id`` is compared with that
-        coordinator's own job id, as for a flip signal: one snapshot, so the
-        check and the answer cannot straddle a job boundary.
+        The coordinator is read once and checked against ``job_id``, as for a
+        flip signal (see ``_pass_coordinator_for``).
 
         Args:
             job_id: The job the operator is answering.
@@ -965,8 +964,8 @@ class ScanWorker:
             it was already answered.
 
         """
-        coordinator = self._pass_coordinator
-        if coordinator is None or coordinator.job_id != job_id:
+        coordinator = self._pass_coordinator_for(job_id)
+        if coordinator is None:
             logger.info(
                 "Multi-page: %s to prompt %d for job %s dropped: "
                 "not the running multi-page job",
@@ -1008,10 +1007,8 @@ class ScanWorker:
             multi-page job, otherwise ``None``.
 
         """
-        coordinator = self._pass_coordinator
-        if coordinator is None or coordinator.job_id != job_id:
-            return None
-        return coordinator.open_prompt
+        coordinator = self._pass_coordinator_for(job_id)
+        return None if coordinator is None else coordinator.open_prompt
 
     def pass_answer(self, job_id: str) -> PassAnswer | None:
         """
@@ -1029,11 +1026,30 @@ class ScanWorker:
             is unanswered.
 
         """
+        coordinator = self._pass_coordinator_for(job_id)
+        claimed = None if coordinator is None else coordinator.claimed
+        return None if claimed is None else claimed[1]
+
+    def _pass_coordinator_for(self, job_id: str) -> WorkerPassCoordinator | None:
+        """
+        Read the pass coordinator once, and return it only if it is ``job_id``'s.
+
+        One snapshot, compared with the coordinator's own job id rather than
+        with ``_current_job_id``, so a caller's check and its use cannot
+        straddle a job boundary and reach the next job's prompt.
+
+        Args:
+            job_id: The job the caller means.
+
+        Returns:
+            The running multi-page job's coordinator when that job is
+            ``job_id``, otherwise ``None``.
+
+        """
         coordinator = self._pass_coordinator
         if coordinator is None or coordinator.job_id != job_id:
             return None
-        claimed = coordinator.claimed
-        return None if claimed is None else claimed[1]
+        return coordinator
 
     @property
     def is_alive(self) -> bool:
