@@ -127,13 +127,21 @@ _LISTEN_BACKLOG: Final = 2048
 
 # Width of the Status column in `saneless jobs`, derived rather than written
 # down: the humanised labels are longer than the raw enum values they replaced,
-# and a ninth JobState member must not be able to overflow an 80-column
+# and a new JobState member must not be able to overflow an 80-column
 # terminal without anyone noticing. A DONE row that carries a warning is
 # labelled from the state and the warning together rather than by a state of
-# its own, so its label joins the max explicitly -- it is the widest of all.
+# its own, so its label joins the max explicitly.
 _STATUS_COL_WIDTH = max(
     *(len(state_label(state)) for state in JobState), len(WARNED_UPLOAD_LABEL)
 )
+
+# Width of the Profile column in `saneless jobs`, and the floor the Title
+# column never shrinks below. At 80 columns the Timestamp, Profile and Status
+# columns and the three separators leave the Title exactly its floor; the
+# Profile column gave up its fifteenth character so the widest status label,
+# "Waiting: blank pages found", still fits without eating into the title.
+_PROFILE_COL_WIDTH: Final = 14
+_TITLE_COL_FLOOR: Final = 15
 
 # The widest zone token ``%Z`` produces at a realistic offset: five characters,
 # the ``+0545`` shape the tz database falls back to where there is no
@@ -1514,9 +1522,11 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
         else:
             cols = shutil.get_terminal_size((80, 24)).columns
             ts_w = _TIME_COL_WIDTH
-            profile_w = 15
+            profile_w = _PROFILE_COL_WIDTH
             # Three single spaces separate the four columns.
-            title_w = max(15, cols - (ts_w + profile_w + _STATUS_COL_WIDTH + 3))
+            title_w = max(
+                _TITLE_COL_FLOOR, cols - (ts_w + profile_w + _STATUS_COL_WIDTH + 3)
+            )
             header = (
                 f"{'Timestamp':<{ts_w}} {'Profile':<{profile_w}} "
                 f"{'Title':<{title_w}} {'Status'}"
