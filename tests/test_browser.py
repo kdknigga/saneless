@@ -100,18 +100,25 @@ from saneless.vocabulary import (
     MULTI_PAGE_DISABLED_REASON,
     MULTI_PAGE_HELP,
     MULTI_PAGE_LABEL,
+    NOTHING_TO_FINISH,
     TERMINAL_STATES,
     ErrorCategory,
     FlipOutcome,
     JobState,
+    PassAnswer,
+    PassPrompt,
+    PassWait,
     ScanOutcome,
     WorkerHealth,
+    abort_question,
     error_message,
     error_next_step,
+    job_label,
+    progress_label,
 )
 from saneless.web.app import TEMPLATE_DIR, create_app
-from saneless.worker import WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, scan_batch
+from saneless.worker import WorkerFlipCoordinator, WorkerPassCoordinator
+from tests.conftest import StubScannerBackend, poll_until, scan_batch
 
 # Every palette value these tests assert against, in one place. All of them are
 # valid only for Pico 2.1.1, the version vendored as
@@ -5690,3 +5697,525 @@ class TestRemovedBlankPagesRendering:
             assert violations == [], (
                 f"a page violated its Content-Security-Policy: {violations}"
             )
+
+
+# ---------------------------------------------------------------------------
+# The multi-page prompt, clicked through in a real browser.
+#
+# The route and template tests prove what the server renders and accepts.
+# What only a browser can show is that the page is usable: that htmx sends the
+# answers the buttons carry, that Abort's native confirmation really stands
+# between a click and the request, that the row of buttons fits a phone, and
+# that keyboard focus survives the status area being replaced every second.
+# ---------------------------------------------------------------------------
+
+_MULTI_PAGE_TITLE = "Two Pages One Document"
+"""The title the click-through scans under, so its history row can be found."""
+
+_PROMPT_BUTTON_ORDER = ["mp-next", "mp-finish", "mp-rescan", "mp-abort"]
+"""The between-pass prompt's buttons, in the order the page must show them."""
+
+_WAITING_FOR_YOU = "Waiting for you…"
+"""The Scan button's caption while a multi-page document waits for its operator."""
+
+_TOUCH_FLOOR_PX = 44
+"""The smallest height a prompt button may have: the touch target floor."""
+
+_ANSWER_URL = "/api/multi-page/answer"
+"""Where every prompt button posts its answer."""
+
+# One read of the prompt's layout, taken in a single call so no status swap can
+# land between the measurements.  A function, not a bare expression: the
+# page's Content-Security-Policy refuses eval.
+_MEASURE_PROMPT = """
+() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+    overflowing: Array.from(document.body.querySelectorAll("*"))
+        .filter((el) => el.getBoundingClientRect().right
+            > document.documentElement.clientWidth)
+        .map((el) => `${el.tagName.toLowerCase()}#${el.id}.${el.className}`
+            + ` right=${el.getBoundingClientRect().right}`),
+    overflowingText: (() => {
+        const out = [];
+        const walker = document.createTreeWalker(
+            document.body, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            const range = document.createRange();
+            range.selectNodeContents(node);
+            const right = range.getBoundingClientRect().right;
+            if (right > document.documentElement.clientWidth) {
+                out.push(`${node.parentElement.tagName}#${node.parentElement.id}`
+                    + `.${node.parentElement.className}: `
+                    + `${node.textContent.trim().slice(0, 60)} right=${right}`);
+            }
+        }
+        return out;
+    })(),
+    buttons: Array.from(
+        document.querySelectorAll("#status-area .prompt-actions button"),
+    ).map((button) => {
+        const box = button.getBoundingClientRect();
+        return {
+            id: button.id,
+            top: box.top,
+            left: box.left,
+            right: box.right,
+            height: box.height,
+        };
+    }),
+})
+"""
+
+
+@pytest.fixture
+def multi_page_scan_server(
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app that runs real multi-page scans on its flatbed profile.
+
+    Private for the reasons ``flip_server`` is: the owner cookie a real submit
+    mints, and the rows these scans leave behind, must not follow later tests
+    onto the session server.  The scanner is the one-page stub, so every pass
+    keeps exactly one page, and uploads are delivered at once so Finish reaches
+    DONE.  ``monkeypatch`` is requested here rather than by the test so the
+    stubbed Paperless client outlives the server's shutdown.
+    """
+    with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
+        _make_paperless_deliver(server.app, monkeypatch)
+        egress_allowlist.append(server.url)
+        yield server
+
+
+def _await_status_swap(page: Page) -> None:
+    """
+    Wait until a status poll has replaced the status area and htmx has settled it.
+
+    The area in the page now is marked first, and the wait is for the mark to
+    be gone, so the wait cannot be satisfied by the area that was already
+    there.  It then waits for htmx to process the new area, which happens a
+    moment after the swap: until then its buttons have no handler, and a click
+    would be lost.  Once both have happened, the next poll is most of a second
+    away, which is time enough for a click to land on the area just measured.
+
+    Args:
+        page: The browser page, showing an active job.
+
+    """
+    page.locator("#status-area").evaluate("area => area.setAttribute('data-stale', '')")
+    with page.expect_response(lambda r: _POLL_URL.search(r.url) is not None):
+        pass
+    expect(page.locator("#status-area[data-stale]")).to_have_count(0)
+    expect(page.locator("#status-area.htmx-added")).to_have_count(0)
+
+
+def _start_multi_page_scan(
+    page: Page,
+    server: _BrowserServer,
+    wait_for_state: Callable[..., Job],
+    title: str,
+) -> str:
+    """
+    Tick Multiple pages, press Scan, and wait for the first between-pass prompt.
+
+    The submit is a real one, so this page's browser becomes the job's owner
+    through the cookie the response sets.
+
+    Args:
+        page: The browser page that submits, and so becomes the owner.
+        server: The private server to submit to.
+        wait_for_state: The conftest waiter, polling the job store.
+        title: The title to submit.
+
+    Returns:
+        The id of the job now waiting for its second page.
+
+    """
+    job_store: JobStore = server.app.state.job_store
+    page.goto(server.url)
+    page.locator("#multi-page").check()
+    page.fill("#title-input", title)
+    with page.expect_response(lambda r: r.url.endswith("/api/scan")):
+        page.click("#scan-btn")
+    recent = job_store.list_recent(1)
+    assert recent, "the scan submit created no job row"
+    job_id = recent[0].id
+    wait_for_state(job_store, job_id, JobState.AWAITING_NEXT_PASS, timeout=20.0)
+    expect(page.locator("#status-area .pages-prompt")).to_contain_text(
+        "1 page kept so far.", timeout=10_000
+    )
+    return job_id
+
+
+def _abort_the_document(
+    server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
+) -> None:
+    """
+    End a multi-page job a test left running, by answering Abort to its prompt.
+
+    A job left waiting would hold the server's shutdown until the operator
+    timeout, so every test that starts one ends it here.  A job mid-pass is
+    given until its next prompt; a job that has already ended is left alone.
+
+    Args:
+        server: The private server the job runs on.
+        job_id: The job to end.
+        wait_for_state: The conftest waiter, polling the job store.
+
+    """
+    job_store: JobStore = server.app.state.job_store
+    worker = server.app.state.worker
+
+    def _ended_or_aborted() -> bool:
+        job = job_store.get_job(job_id)
+        if job is None or job.state in TERMINAL_STATES:
+            return True
+        prompt = worker.pass_prompt(job_id)
+        return prompt is not None and worker.answer_pass(
+            job_id, prompt.number, PassAnswer.ABORT
+        )
+
+    assert poll_until(_ended_or_aborted, _JOB_FINISH_TIMEOUT), (
+        f"job {job_id} neither ended nor reached a prompt that could be aborted"
+    )
+    wait_for_state(job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT)
+
+
+class _StagedPrompt(NamedTuple):
+    """A multi-page job staged at an open prompt, and the thread asking it."""
+
+    job_id: str
+    coordinator: WorkerPassCoordinator
+    asker: threading.Thread
+
+
+@contextmanager
+def _staged_prompt(
+    server: _BrowserServer, owner_token: str, prompt: PassPrompt
+) -> Generator[_StagedPrompt]:
+    """
+    Stage a job waiting on ``prompt`` without scanning anything.
+
+    Some prompts cannot be reached with the one-page stub scanner -- one with
+    no page kept needs every page so far skipped as blank -- so the worker's
+    current job and pass coordinator are set directly, the reach-through the
+    flip browser tests use.  The prompt is asked on a thread of its own, as the
+    worker thread would ask it, and is interrupted on the way out.
+
+    Args:
+        server: The server whose worker and store are staged.
+        owner_token: The owner token the row records.
+        prompt: The open question.
+
+    Yields:
+        The staged job, its coordinator and the asking thread.
+
+    """
+    job_store: JobStore = server.app.state.job_store
+    worker = server.app.state.worker
+    job = job_store.create_job(
+        profile="default", title="Staged Pages", owner_token=owner_token
+    )
+    job_store.update_state(job.id, JobState.AWAITING_NEXT_PASS)
+    coordinator = WorkerPassCoordinator(job.id, stopping=threading.Event())
+    asker = threading.Thread(target=coordinator.ask, args=(prompt,), daemon=True)
+    worker._current_job_id = job.id
+    worker._pass_coordinator = coordinator
+    asker.start()
+    try:
+        assert poll_until(
+            lambda: coordinator.open_prompt == prompt, _JOB_FINISH_TIMEOUT
+        ), "the staged prompt was never published"
+        yield _StagedPrompt(job_id=job.id, coordinator=coordinator, asker=asker)
+    finally:
+        coordinator.interrupt_for_shutdown()
+        asker.join(_JOB_FINISH_TIMEOUT)
+        worker._pass_coordinator = None
+        worker._current_job_id = None
+        job_store.delete_job(job.id)
+        assert not asker.is_alive(), "the staged prompt's ask never returned"
+
+
+@pytest.mark.browser
+class TestMultiPagePromptInTheBrowser:
+    """
+    A multi-page scan answered through its buttons, in Chromium.
+
+    Every test but one drives a real scan: the Multiple pages box is ticked and
+    Scan pressed, so the page is the job's owner by the cookie its own submit
+    received, and each click goes through htmx to the answer route and on to
+    the worker that is really waiting.
+    """
+
+    def test_a_two_page_document_is_scanned_page_by_page_and_finished(
+        self,
+        page: Page,
+        multi_page_scan_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Tick, Scan, Scan next page, Finish document, and the document is uploaded.
+
+        Between passes the page says what it is waiting for and the Scan
+        button says whose move it is, so the scan never looks hung.  Only
+        Abort asks for confirmation, and the buttons come in their fixed order.
+        """
+        server = multi_page_scan_server
+        job_store: JobStore = server.app.state.job_store
+        job_id = _start_multi_page_scan(page, server, wait_for_state, _MULTI_PAGE_TITLE)
+        try:
+            prompt = page.locator("#status-area .pages-prompt")
+            scan_btn = page.locator("#scan-btn")
+            expect(scan_btn).to_have_text(_WAITING_FOR_YOU)
+            expect(scan_btn).to_be_disabled()
+            expect(scan_btn).not_to_have_attribute("aria-busy", "true")
+            expect(page.locator("#status-area [aria-busy]")).to_have_count(0)
+            buttons = prompt.locator(".prompt-actions button")
+            expect(buttons).to_have_count(len(_PROMPT_BUTTON_ORDER))
+            assert [
+                buttons.nth(i).get_attribute("id")
+                for i in range(len(_PROMPT_BUTTON_ORDER))
+            ] == _PROMPT_BUTTON_ORDER
+            confirming = prompt.locator("[hx-confirm]")
+            expect(confirming).to_have_count(1)
+            expect(confirming).to_have_id("mp-abort")
+
+            _await_status_swap(page)
+            with page.expect_response(lambda r: r.url.endswith(_ANSWER_URL)) as sent:
+                page.click("#mp-next")
+            assert sent.value.status == 200
+
+            expect(prompt).to_contain_text("2 pages kept so far.", timeout=15_000)
+
+            _await_status_swap(page)
+            with page.expect_response(lambda r: r.url.endswith(_ANSWER_URL)) as sent:
+                page.click("#mp-finish")
+            assert sent.value.status == 200
+
+            expect(page.locator("#status-area .status-done")).to_contain_text(
+                _MULTI_PAGE_TITLE, timeout=15_000
+            )
+            done = wait_for_state(job_store, job_id, JobState.DONE)
+            assert done.pages_uploaded == 2, done
+            newest = page.locator("#history-body tr").first
+            expect(newest).to_contain_text(_MULTI_PAGE_TITLE)
+            status_cell = newest.locator("td").nth(3)
+            expect(status_cell).to_have_text(job_label(JobState.DONE, None))
+            expect(status_cell).to_have_class("status-done")
+            expect(scan_btn).to_be_enabled()
+            expect(scan_btn).to_have_text("Scan")
+        finally:
+            _abort_the_document(server, job_id, wait_for_state)
+
+    def test_abort_asks_first_and_does_nothing_when_the_answer_is_no(
+        self,
+        page: Page,
+        multi_page_scan_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Abort raises the native confirmation naming the kept page; "no" keeps it.
+
+        The "no" half is asserted from a recorded list of requests after a
+        whole status poll has come back, so it says no answer was sent rather
+        than that none was sent in the same instant as the click.
+        """
+        server = multi_page_scan_server
+        job_store: JobStore = server.app.state.job_store
+        asked: list[str] = []
+        answer = ["dismiss"]
+        posted: list[str] = []
+
+        def _on_dialog(dialog: Dialog) -> None:
+            asked.append(dialog.message)
+            if answer[0] == "accept":
+                dialog.accept()
+            else:
+                dialog.dismiss()
+
+        def _on_request(request: Request) -> None:
+            if request.method == "POST":
+                posted.append(request.url)
+
+        page.on("dialog", _on_dialog)
+        page.on("request", _on_request)
+        job_id = _start_multi_page_scan(page, server, wait_for_state, "Abort Pages")
+        try:
+            _await_status_swap(page)
+            page.click("#mp-abort")
+            assert asked == [abort_question(1)], asked
+
+            with page.expect_response(lambda r: _POLL_URL.search(r.url) is not None):
+                pass
+            assert [url for url in posted if url.endswith(_ANSWER_URL)] == [], posted
+            waiting = job_store.get_job(job_id)
+            assert waiting is not None
+            assert waiting.state is JobState.AWAITING_NEXT_PASS
+            expect(page.locator("#status-area .pages-prompt")).to_contain_text(
+                "1 page kept so far."
+            )
+
+            answer[0] = "accept"
+            _await_status_swap(page)
+            with page.expect_response(lambda r: r.url.endswith(_ANSWER_URL)):
+                page.click("#mp-abort")
+
+            assert asked == [abort_question(1), abort_question(1)], asked
+            expect(page.locator("#status-area .status-cancelled")).to_be_visible(
+                timeout=15_000
+            )
+            wait_for_state(
+                job_store, job_id, JobState.CANCELLED, timeout=_JOB_FINISH_TIMEOUT
+            )
+        finally:
+            _abort_the_document(server, job_id, wait_for_state)
+
+    def test_finish_is_disabled_with_its_reason_while_no_page_is_kept(
+        self, page: Page, multi_page_scan_server: _BrowserServer
+    ) -> None:
+        """
+        With nothing kept, Finish keeps its place, disabled, with the reason shown.
+
+        Staged rather than scanned: a prompt with no page kept needs every page
+        so far skipped as blank, which the one-page stub never produces.
+        """
+        server = multi_page_scan_server
+        prompt = PassPrompt(
+            number=1,
+            wait=PassWait.NEXT_PASS,
+            pages_kept=0,
+            offered=frozenset({PassAnswer.NEXT, PassAnswer.RESCAN, PassAnswer.ABORT}),
+            timeout_seconds=600,
+            last_pass_pages=1,
+            last_pass_kept=0,
+        )
+        with _staged_prompt(server, _as_owner(page, server.url), prompt):
+            page.goto(server.url)
+
+            finish = page.locator("#mp-finish")
+            reason = page.locator("#finish-blocked-reason")
+            expect(page.locator("#status-area .pages-prompt")).to_contain_text(
+                "No pages kept yet."
+            )
+            expect(finish).to_be_disabled()
+            expect(finish).to_have_accessible_description(NOTHING_TO_FINISH)
+            expect(reason).to_be_visible()
+            expect(reason).to_have_text(NOTHING_TO_FINISH)
+            for enabled in ("#mp-next", "#mp-rescan", "#mp-abort"):
+                expect(page.locator(enabled)).to_be_enabled()
+
+    def test_a_second_browser_sees_the_waiting_line_and_no_buttons(
+        self,
+        page: Page,
+        browser: Browser,
+        multi_page_scan_server: _BrowserServer,
+        egress_allowlist: list[str],
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Only the browser that started the scan is asked; anyone else is told.
+
+        Two cookie jars: the owner's page holds the cookie its submit received,
+        and a second context built by hand holds none.  The second is shown the
+        plain waiting line with no spinner, and no control at all, rather than
+        hidden ones.  It installs the egress gate and the policy recorder
+        itself and is checked after it closes.
+        """
+        server = multi_page_scan_server
+        job_id = _start_multi_page_scan(page, server, wait_for_state, "Not Yours")
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        viewer_ctx = browser.new_context()
+        try:
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(viewer_ctx, violations)
+            viewer_page = viewer_ctx.new_page()
+            viewer_page.goto(server.url)
+
+            viewer_status = viewer_page.locator("#status-area")
+            expect(viewer_status).to_contain_text(
+                progress_label(JobState.AWAITING_NEXT_PASS)
+            )
+            expect(viewer_status.locator("button")).to_have_count(0)
+            expect(viewer_status.locator(".pages-prompt")).to_have_count(0)
+            expect(viewer_status.locator("[aria-busy]")).to_have_count(0)
+            expect(viewer_page.locator(f"[hx-post='{_ANSWER_URL}']")).to_have_count(0)
+            # The owner, polling at the same moment, is still asked.
+            expect(page.locator("#status-area .pages-prompt")).to_be_visible()
+        finally:
+            viewer_ctx.close()
+            _abort_the_document(server, job_id, wait_for_state)
+            assert seen, "the hand-built context's gate handled no request"
+            assert blocked == [], f"a page tried to reach the network: {blocked}"
+            assert violations == [], (
+                f"a page violated its Content-Security-Policy: {violations}"
+            )
+
+    def test_the_buttons_wrap_on_a_320px_phone_without_a_sideways_scrollbar(
+        self,
+        page: Page,
+        multi_page_scan_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Four buttons fit a 320 px screen by wrapping, each a full touch target.
+
+        The layout is read after a status poll has settled, so it is the layout
+        the page keeps rather than the one before htmx processed the swap.
+        """
+        server = multi_page_scan_server
+        page.set_viewport_size({"width": 320, "height": 640})
+        job_id = _start_multi_page_scan(page, server, wait_for_state, "Phone Pages")
+        try:
+            _await_status_swap(page)
+            layout = page.evaluate(_MEASURE_PROMPT)
+
+            assert layout["scrollWidth"] <= layout["clientWidth"], (
+                "the page scrolls sideways at 320px; wider than the viewport: "
+                f"{layout['overflowing']} {layout['overflowingText']}"
+            )
+            buttons = layout["buttons"]
+            assert [button["id"] for button in buttons] == _PROMPT_BUTTON_ORDER
+            for button in buttons:
+                assert button["height"] >= _TOUCH_FLOOR_PX, button
+                assert button["left"] >= 0, button
+                assert button["right"] <= layout["clientWidth"], button
+            rows = {round(button["top"]) for button in buttons}
+            assert len(rows) > 1, f"the buttons did not wrap: {buttons}"
+        finally:
+            _abort_the_document(server, job_id, wait_for_state)
+
+    def test_keyboard_focus_on_a_button_survives_the_status_poll(
+        self,
+        page: Page,
+        multi_page_scan_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A keyboard user keeps their place while the status area is replaced.
+
+        The area is replaced once a second while the job waits, and focus on a
+        replaced button is lost unless htmx finds a button with the same id in
+        the new area.  The swap is proven to have happened -- the marked button
+        is gone -- before focus is read, so the read cannot be of the button
+        the keyboard reached.  It is read once, not retried.
+        """
+        server = multi_page_scan_server
+        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Pages")
+        try:
+            _await_status_swap(page)
+            page.locator("#mp-finish").focus()
+            page.keyboard.press("Shift+Tab")
+            assert page.evaluate("() => document.activeElement.id") == "mp-next"
+            page.locator("#mp-next").evaluate(
+                "button => button.setAttribute('data-focused', '')"
+            )
+
+            _await_status_swap(page)
+
+            expect(page.locator("#mp-next[data-focused]")).to_have_count(0)
+            assert page.evaluate("() => document.activeElement.id") == "mp-next"
+        finally:
+            _abort_the_document(server, job_id, wait_for_state)
