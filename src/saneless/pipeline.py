@@ -25,6 +25,7 @@ from saneless.exceptions import (
     ScanCancelledError,
     ScanError,
     ScanInterrupted,
+    SpoolError,
     describe,
 )
 from saneless.pages import BlankFilterResult, filter_blank_pages
@@ -33,12 +34,15 @@ from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import (
+    ErrorCategory,
     FlipOutcome,
     JobState,
     PassAnswer,
     PassPrompt,
     PassWait,
     ScanOutcome,
+    cap_finish_warning,
+    classify_error,
     timeout_finish_warning,
 )
 from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace, has_pages_left
@@ -1399,6 +1403,43 @@ _ENDINGS_NOBODY_OFFERS: Final = frozenset(
 )
 
 
+# The answers the prompt after a failed pass offers.  No Re-scan: the failed
+# pass contributed nothing, so there is no last pass of its own to throw away,
+# and Scan next is already the try-again.
+_RETRY_ANSWERS: Final = frozenset(
+    {PassAnswer.NEXT, PassAnswer.FINISH, PassAnswer.ABORT}
+)
+
+
+def _returns_to_prompt(exc: Exception) -> bool:
+    """
+    Say whether a failed pass of a multi-page document is worth asking about.
+
+    True for ``ErrorCategory.SCANNER`` and ``ErrorCategory.FEEDER`` only, and
+    never for a ``SpoolError``.  A device fault or an empty feeder is one the
+    operator can put right -- clear a jam, close a cover, load the next sheet
+    -- and then try the pass again.  A ``SpoolError`` is a full disk, raised
+    as a ``ScanError``, and the same pass would fail the same way at once.
+    The other categories -- configuration, assembly, upload, and anything
+    unclassified, a bug among them -- are not the scanner's, so trying the
+    pass again cannot help.
+
+    The caller also requires a page to be kept: with none there is nothing a
+    return to the prompt would protect, and the failure ends the job as a
+    single-pass failure does.
+
+    Args:
+        exc: What the pass raised.
+
+    Returns:
+        True if the run should go back to the operator instead of failing.
+
+    """
+    category = classify_error(exc)
+    returnable = category in {ErrorCategory.SCANNER, ErrorCategory.FEEDER}
+    return returnable and not isinstance(exc, SpoolError)
+
+
 def _unoffered_answer(answer: PassAnswer, number: int) -> ScanError:
     """
     Build the failure for a coordinator that answered off the prompt's menu.
@@ -2072,6 +2113,11 @@ class _PipelineRun:
         while no page is kept, so the job's preview stays the document's first
         page and no later pass replaces it.
 
+        Two things end the document without the operator: the page cap, once
+        a pass takes the kept pages to it, and a prompt nobody answers.  A
+        pass the scanner fails while a page is kept goes back to the operator
+        instead of failing the job, with the failed pass thrown away.
+
         Args:
             context: The pass coordinator, and the timeout on every prompt.
 
@@ -2085,15 +2131,20 @@ class _PipelineRun:
             ScanInterrupted: If saneless is stopping; every accepted page is
                 kept.
             ScanError: If a prompt broke, or the coordinator answered with
-                something the prompt did not offer; or a pass failed.
+                something the prompt did not offer; or a pass failed in a way
+                that does not go back to the operator.
 
         """
         document = _MultiPageDocument()
         pass_number = 0
         while True:
             pass_number += 1
-            self._scan_pass(document, pass_number)
-            answer = self._ask(context, self._next_pass_prompt(context, document))
+            prompt = self._after_pass(context, document, pass_number)
+            if prompt is None:
+                return document
+            # Asked here, outside the pass's try, so a prompt that broke can
+            # never be taken for another scanner fault.
+            answer = self._ask(context, prompt)
             # A match with assert_never rather than an if-chain, so a new
             # PassAnswer member fails ty and pyrefly here at edit time instead
             # of falling through into another pass.
@@ -2129,17 +2180,68 @@ class _PipelineRun:
                 case _:
                     assert_never(answer)
 
-    def _scan_pass(self, document: _MultiPageDocument, pass_number: int) -> None:
+    def _after_pass(
+        self,
+        context: _MultiPageContext,
+        document: _MultiPageDocument,
+        pass_number: int,
+    ) -> PassPrompt | None:
         """
-        Scan one pass of a multi-page document, and accept it.
+        Scan one pass, and say what the operator is asked next, if anything.
+
+        Args:
+            context: The timeout every prompt carries.
+            document: The document the pass is accepted into.
+            pass_number: The pass's 1-based number within the run.
+
+        Returns:
+            The prompt after a failed pass, the next-pass prompt after an
+            accepted one, or None when the accepted pass took the document to
+            the page cap and it is finished.
+
+        """
+        failure = self._scan_pass(document, pass_number)
+        if failure is not None:
+            return self._retry_prompt(context, document, failure)
+        # Read at call time rather than bound at import, and checked here,
+        # between passes, only: the pass that crossed the cap is kept whole.
+        cap = MAX_DOCUMENT_PAGES
+        if document.kept >= cap:
+            logger.warning(
+                "The multi-page document holds %d page(s), at or past the cap "
+                "of %d; finishing it",
+                document.kept,
+                cap,
+            )
+            document.warning = cap_finish_warning(document.kept, cap)
+            return None
+        return self._next_pass_prompt(context, document)
+
+    def _scan_pass(
+        self, document: _MultiPageDocument, pass_number: int
+    ) -> Exception | None:
+        """
+        Scan one pass of a multi-page document, and accept it if it succeeds.
+
+        A pass that fails with a fault the operator can do something about,
+        while a page is kept, is thrown away -- its page files deleted, and
+        none of it counted -- and its failure is returned instead of raised.
+        Only the pass itself is inside the ``try``: accepting it is not a
+        scanner fault, and no prompt is ever asked from inside it.
 
         Args:
             document: The document the pass is accepted into.
             pass_number: The pass's 1-based number within the run, counting
                 passes that were later thrown away.
 
+        Returns:
+            The failure the operator is to be asked about, or None when the
+            pass was accepted.
+
         Raises:
-            ScanError: ``No pages were scanned`` if the pass returned no pages.
+            ScanError: ``No pages were scanned`` if the pass returned no pages,
+                or whatever else the pass raised, when no page is kept yet or
+                the failure is not one worth asking about.
 
         """
         if pass_number > 1:
@@ -2150,17 +2252,63 @@ class _PipelineRun:
         # Registered before the pass runs, as every pass is: a fault part-way
         # through it has to find the sink that has been collecting its pages.
         self.ledger.register(preservation.PARTIAL_SUFFIX, sink)
-        if pass_number > 1:
-            # A scanner host restarted during a long wait between passes
-            # would otherwise leave SANE holding a stale control connection,
-            # and every later pass would fail with an I/O error.  This is the
-            # restart made at the top of every job, made again before each
-            # later pass, when no device handle is open: scan_pages closes the
-            # device at the end of every pass.
-            self.scanner.reinitialise()
-        batch = self.scanner.scan_pages(self.device_id, self.scan_settings, sink)
-        _require_pages(batch)
+        try:
+            if pass_number > 1:
+                # A scanner host restarted during a long wait between passes
+                # would otherwise leave SANE holding a stale control
+                # connection, and every later pass would fail with an I/O
+                # error.  This is the restart made at the top of every job,
+                # made again before each later pass, when no device handle is
+                # open: scan_pages closes the device at the end of every pass.
+                self.scanner.reinitialise()
+            batch = self.scanner.scan_pages(self.device_id, self.scan_settings, sink)
+            _require_pages(batch)
+        except Exception as exc:
+            if document.kept == 0 or not _returns_to_prompt(exc):
+                raise
+            # Deleted now, before the operator is asked: the pass contributes
+            # nothing, and a stop at the prompt must not keep it as a pass in
+            # flight.
+            self.ledger.discard(sink)
+            logger.warning(
+                "Multi-page pass %d failed, %d page(s) kept: %r",
+                pass_number,
+                document.kept,
+                exc,
+            )
+            return exc
         self._accept_pass(document, sink, batch)
+        return None
+
+    def _retry_prompt(
+        self,
+        context: _MultiPageContext,
+        document: _MultiPageDocument,
+        failure: Exception,
+    ) -> PassPrompt:
+        """
+        Build the question asked after a failed pass: try again, or stop here.
+
+        Finish is always offered, because a pass only comes back to the
+        operator while a page is kept.
+
+        Args:
+            context: The timeout every prompt carries.
+            document: The document so far.
+            failure: What the failed pass raised, whose text the prompt shows.
+
+        Returns:
+            The numbered prompt.
+
+        """
+        return PassPrompt(
+            number=document.number_prompt(),
+            wait=PassWait.RETRY,
+            pages_kept=document.kept,
+            offered=_RETRY_ANSWERS,
+            timeout_seconds=context.timeout,
+            error=describe(failure),
+        )
 
     def _accept_pass(
         self, document: _MultiPageDocument, sink: SpooledPageSink, batch: ScanBatch
