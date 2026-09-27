@@ -1431,8 +1431,9 @@ _RETRY_ANSWERS: Final = frozenset(
 
 # The answers the prompt about a pass's blank pages offers: throw the whole
 # pass away and scan it again, or take it without the pages that look blank,
-# or with them.  No Abort: the pass is undecided, and the next-pass prompt
-# that follows a Skip or a Keep offers it.
+# or with them.  Only those three: the question is about this pass alone, and
+# Finish and Abort are left to the next-pass prompt that follows a Skip or a
+# Keep.
 _BLANK_ANSWERS: Final = frozenset(
     {PassAnswer.RESCAN, PassAnswer.SKIP_BLANKS, PassAnswer.KEEP_BLANKS}
 )
