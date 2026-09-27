@@ -917,12 +917,17 @@ class _ProfileOption:
             the text a household member reads is new here.
         label: The human name shown in the dropdown.
         description: The sentence shown beneath the select for this profile.
+        manual_duplex: Whether the profile scans both sides by the manual
+            flip, which is what disables the Multiple pages checkbox when the
+            page opens on it.  Read here, from the same locked lookup as the
+            text, so the page never looks the profile up a second time.
 
     """
 
     name: str
     label: str
     description: str
+    manual_duplex: bool = False
 
 
 def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
@@ -974,6 +979,7 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
                     # backfills the text, and the how-to says so.
                     label=profile.label or name,
                     description=profile.description,
+                    manual_duplex=_is_manual_duplex(profile),
                 ),
                 classify_source(profile.source),
             )
@@ -986,18 +992,21 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
     return tuple(option for option, _ in entries)
 
 
-def _is_manual_duplex(profile: ProfileConfig | None) -> bool:
+def _is_manual_duplex(profile: ProfileConfig) -> bool:
     """
     Say whether ``profile`` scans both sides by the manual flip.
 
+    The one place the web layer reads this, so the checkbox on the page, its
+    refresh and the refusal of a submit all agree on which profiles it means.
+
     Args:
-        profile: The chosen profile, or None when the name no longer names one.
+        profile: The chosen profile.
 
     Returns:
         True only for a manual-duplex profile.
 
     """
-    return profile is not None and profile.duplex == "manual"
+    return profile.duplex == "manual"
 
 
 def _multi_page_field(*, manual_duplex: bool, ticked: bool) -> dict[str, object]:
@@ -1074,7 +1083,6 @@ def index(request: Request) -> Response:
     # leaves its cold-start rows.
     state.refresher.note_watcher()
     profiles = _profile_options(state.worker)
-    selected = profiles[0].name if profiles else ""
     # A full page render is the unfiltered, nothing-ticked case of the same
     # context the filter route builds, so it goes through the same function
     # rather than a second shape the two could drift apart on.
@@ -1107,15 +1115,13 @@ def index(request: Request) -> Response:
             # and the description beneath it cannot disagree on first paint --
             # and after the feeder-first regrouping the first option is no longer
             # necessarily the first profile in the config file.
-            "selected": selected,
+            "selected": profiles[0].name if profiles else "",
             "selected_description": profiles[0].description if profiles else "",
             # The Multiple pages field for the profile the page opens on, and
             # never ticked: the choice is made per scan, so a page load starts
-            # it afresh.  A profile rewritten away between the listing and this
-            # lookup reads as not manual duplex, the same as it would on the
-            # next change of the select.
+            # it afresh.
             **_multi_page_field(
-                manual_duplex=_is_manual_duplex(state.worker.get_profile(selected)),
+                manual_duplex=bool(profiles) and profiles[0].manual_duplex,
                 ticked=False,
             ),
             **tag_list,
