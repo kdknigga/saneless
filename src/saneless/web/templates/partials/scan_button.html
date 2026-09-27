@@ -19,9 +19,14 @@
    still come from the job's state alone, and the label stays Scan when there
    is no job.  The reason line lives in index.html,
    because a disabled button is not focusable and cannot be reliably hovered,
-   so the explanation has to be visible text rather than a tooltip. #}
+   so the explanation has to be visible text rather than a tooltip.
+
+   A multi-page document waiting between passes reads "Waiting for you", not
+   "Scanning": the scanner is idle and the next move is the person's.  Like the
+   flip caption it carries no spinner, because aria-busy follows is_busy and a
+   waiting job is not busy. #}
 <button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
         {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% endif %}
         {% if scan_blocked or (job and job.is_active) %}disabled{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
-    {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
+    {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.state in pass_wait_states %}Waiting for you&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
 </button>

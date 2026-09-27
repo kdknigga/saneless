@@ -40,6 +40,7 @@ from saneless.vocabulary import (
     MULTI_PAGE_DISABLED_REASON,
     MULTI_PAGE_HELP,
     MULTI_PAGE_LABEL,
+    PASS_WAIT_STATES,
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
     SCAN_BLOCKED_URL_REASON,
@@ -51,15 +52,17 @@ from saneless.vocabulary import (
     ErrorCategory,
     FlipOutcome,
     JobState,
+    PassAnswer,
     RequestRejection,
     SubmitResult,
     WorkerHealth,
     busy_line,
     local_time,
+    pass_prompt_copy,
     worker_health_detail,
 )
 from saneless.web.errors import TITLE_CONTROL_TYPE, RequestRejected
-from saneless.web.job_view import build_job_view, owns_detail
+from saneless.web.job_view import build_job_view, owns_detail, scrub_for_owner
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
@@ -68,6 +71,7 @@ if TYPE_CHECKING:
     from saneless.config import ProfileConfig, Settings
     from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
+    from saneless.vocabulary import PassPrompt, PassPromptCopy
     from saneless.web.cache import MetadataCache
     from saneless.web.checks_cache import CachedChecks
     from saneless.web.job_view import JobView
@@ -204,10 +208,11 @@ def _is_owner(presented: str | None, recorded: str | None) -> bool:
 
 def _owner_answers(presented: str | None, job: Job | None) -> bool:
     """
-    Report whether this request may answer the named job's flip prompt.
+    Report whether this request may answer the named job's prompt.
 
-    An unknown job id answers False: there is nothing to own, and the worker
-    would have dropped the answer anyway.  The outcome is logged as a match or
+    One rule for both kinds of wait: the manual-duplex flip prompt and every
+    multi-page prompt.  An unknown job id answers False: there is nothing to
+    own, and the worker would have dropped the answer anyway.  The outcome is logged as a match or
     a mismatch and never as a value -- the token is not allowed into a log
     line any more than into the markup.
 
@@ -223,7 +228,7 @@ def _owner_answers(presented: str | None, job: Job | None) -> bool:
         return False
     matched = _is_owner(presented, job.owner_token)
     logger.debug(
-        "Flip answer for job %s: owner %s",
+        "Answer for job %s: owner %s",
         job.id,
         "matched" if matched else "did not match",
     )
@@ -684,12 +689,17 @@ def _busy_line(
     vocabulary: a page that assembled its own sentence would be a second place
     for the copy to drift from what ``vocabulary.busy_line`` says.
 
-    Three situations, in the precedence ``busy_line`` itself documents.  A
+    Four situations, in the precedence ``busy_line`` itself documents.  A
     PENDING job while the worker runs a *different* one is waiting in the
     queue, and is told what it is waiting for and how many jobs are ahead.
     The job the worker is actually running, on its second
-    manual-duplex pass, leads with the pages counted on the first.  Everything
-    else is the plain progress prose, unchanged.
+    manual-duplex pass, leads with the pages counted on the first; on a later
+    pass of a multi-page document, it leads with the pages already kept.
+    Everything else is the plain progress prose, unchanged.
+
+    Both counts are the worker's, and so only ever passed for the job the
+    worker is running.  ``busy_line`` reads each only in the state it belongs
+    to, so passing both here cannot put a count on the wrong line.
 
     The zero case reads as being next in line; a count of none ahead is never
     spelled out as a number, because it is technically true and reads like a
@@ -724,8 +734,12 @@ def _busy_line(
                 else HIDDEN_JOB_TITLE
             )
             return busy_line(job.state, queue_title=title, queue_ahead=ahead)
-    if job.id == running_id and job.state is JobState.SCANNING_REVERSE:
-        return busy_line(job.state, front_pages=worker.front_pages)
+    if job.id == running_id:
+        return busy_line(
+            job.state,
+            front_pages=worker.front_pages,
+            pages_kept=worker.pages_kept,
+        )
     return busy_line(job.state)
 
 
@@ -748,10 +762,16 @@ class _StatusFacts:
     ``settings`` is the running configuration, carried so ``_status_context``
     can build the job's view: which host paths the owner's text names by
     setting is read from it.
+
+    ``claimed`` and ``claimed_pass`` are the flip answer and the multi-page
+    answer this request itself claimed, each with the job it names.  They are
+    two fields rather than one because the two waits have two answer types,
+    and a flip answer must never be read as a multi-page one.
     """
 
     settings: Settings
     claimed: tuple[str, FlipOutcome] | None = None
+    claimed_pass: tuple[str, PassAnswer] | None = None
     followed_job_id: str | None = None
     owner_token: str | None = None
     scan_blocked: bool = False
@@ -761,6 +781,7 @@ def _status_facts(
     request: Request,
     *,
     claimed: tuple[str, FlipOutcome] | None = None,
+    claimed_pass: tuple[str, PassAnswer] | None = None,
     followed_job_id: str | None = None,
 ) -> _StatusFacts:
     """
@@ -785,7 +806,9 @@ def _status_facts(
 
     Args:
         request: The incoming request, for its cookies and the app's settings.
-        claimed: The job id and answer this request itself claimed, if any.
+        claimed: The job id and flip answer this request itself claimed, if any.
+        claimed_pass: The job id and multi-page answer this request itself
+            claimed, if any.
         followed_job_id: The job this browser submitted, if it submitted one.
 
     Returns:
@@ -796,6 +819,7 @@ def _status_facts(
     return _StatusFacts(
         settings=settings,
         claimed=claimed,
+        claimed_pass=claimed_pass,
         followed_job_id=followed_job_id,
         owner_token=_presented_owner(request),
         scan_blocked=_scan_block(settings) is not None,
@@ -870,12 +894,16 @@ def _status_context(
     because the property being defended is that the flag lives in one partial
     fed from one builder, not that each caller remembered.
 
+    A job waiting on a multi-page question gets the same treatment through
+    ``_pass_wait_context``: its claimed answer, and, for a viewer who may
+    answer, the open question and its wording.
+
     Returns:
-        This viewer's view of the job, its flip answer, the followed job's id,
-        the one busy line, whether this viewer may answer the job's flip
-        prompt, whether the Scan button is blocked and a false strip-refresh
-        flag.  ``flip_answer`` is None unless the
-        rendered job is ``AWAITING_FLIP`` and has been answered.
+        This viewer's view of the job, its flip answer, its multi-page answer,
+        prompt and wording, the followed job's id, the one busy line, whether
+        this viewer may answer the job's prompt, whether the Scan button is
+        blocked and a false strip-refresh flag.  ``flip_answer`` is None unless
+        the rendered job is ``AWAITING_FLIP`` and has been answered.
 
     """
     followed = (
@@ -895,15 +923,71 @@ def _status_context(
         if job is not None
         else None
     )
+    is_owner = job is not None and _is_owner(facts.owner_token, job.owner_token)
     return {
         "job": view,
         "flip_answer": answer,
+        **_pass_wait_context(worker, job, facts, is_owner=is_owner),
         "refresh_checks": False,
         "followed_job_id": followed.id if followed is not None else None,
         "busy_line": _busy_line(worker, job_store, job, presented=facts.owner_token),
-        "is_owner": job is not None and _is_owner(facts.owner_token, job.owner_token),
+        "is_owner": is_owner,
         "scan_blocked": facts.scan_blocked,
     }
+
+
+def _pass_wait_context(
+    worker: ScanWorker,
+    job: Job | None,
+    facts: _StatusFacts,
+    *,
+    is_owner: bool,
+) -> dict[str, object]:
+    """
+    Build the status context a job waiting on a multi-page question adds.
+
+    Three keys, all None unless the rendered job's row is in one of the
+    multi-page waiting states.
+
+    ``pass_answer`` is the answer already claimed for the job's latest
+    question, so the partial acknowledges it rather than re-rendering buttons
+    that look as though the click did nothing.  As with the flip answer, a
+    route that has just claimed one is authoritative for the job it named,
+    because the worker may move on before the route reads it back; the claim
+    counts only when it names the job being rendered.
+
+    ``pass_prompt`` and ``pass_copy`` are the open question and every sentence
+    it shows.  They are built only for a viewer who may answer, by the same
+    rule as the flip prompt: the owner, or anyone when the job recorded no
+    owner.  Nobody else gets a prompt number, a button or the scanner's error
+    text, because none of it is put in their context at all.  The error text
+    is scrubbed of host paths and addresses before it goes into the copy, so
+    even the owner never sees one.
+
+    Args:
+        worker: The scan worker, for the open question and its answer.
+        job: The job being rendered, or None.
+        facts: The per-request bundle, for the claimed answer and the settings.
+        is_owner: Whether this viewer may answer the job's questions.
+
+    Returns:
+        ``pass_answer``, ``pass_prompt`` and ``pass_copy``.
+
+    """
+    answer: PassAnswer | None = None
+    prompt: PassPrompt | None = None
+    copy: PassPromptCopy | None = None
+    if job is not None and job.state in PASS_WAIT_STATES:
+        if facts.claimed_pass is not None and facts.claimed_pass[0] == job.id:
+            answer = facts.claimed_pass[1]
+        else:
+            answer = worker.pass_answer(job.id)
+        if answer is None and is_owner:
+            prompt = worker.pass_prompt(job.id)
+    if prompt is not None:
+        error = scrub_for_owner(prompt.error, facts.settings) if prompt.error else None
+        copy = pass_prompt_copy(prompt, error=error)
+    return {"pass_answer": answer, "pass_prompt": prompt, "pass_copy": copy}
 
 
 @dataclass(frozen=True, slots=True)
@@ -2225,6 +2309,77 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
                 _status_facts(
                     request,
                     claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+                ),
+            ),
+            "terminal_reload": True,
+        },
+    )
+
+
+@router.post("/api/multi-page/answer")
+def answer_multi_page(
+    request: Request,
+    job_id: Annotated[str, Form()],
+    prompt: Annotated[int, Form(ge=1)],
+    answer: Annotated[PassAnswer, Form()],
+) -> Response:
+    """
+    Answer the named job's open multi-page question.
+
+    The posted ``job_id`` and ``prompt`` scope the answer: it is claimed only
+    for that job, only while that numbered question is the one open, and only
+    when the question offers ``answer``.  Anything else is dropped -- an
+    answer for another job, a click on a question that has since been
+    replaced, a second click, or an answer the page never offered, such as
+    Finish on a document with no pages -- and the route still returns the
+    current status rather than an error.  Nothing is waited for: the route
+    renders whatever the store has recorded, and the one-second poll picks up
+    the next pass from there.
+
+    ``answer`` and ``prompt`` are validated before the handler runs: a value
+    that is not one of the answers, or a prompt number below 1, is a 422.  The
+    clock's and the shutdown's answers pass that check but are never in a
+    question's offered set, so the worker drops them like any other answer
+    the page did not offer.
+
+    Once this request has claimed the answer, the partial acknowledges it in
+    place of the buttons even though the store still reads the job as
+    waiting, so a claimed or repeated click never re-renders a question that
+    looks unanswered.
+
+    An answer from a browser that does not hold the job's owner token is
+    dropped in exactly the same way: somebody else's document is not theirs to
+    finish or abort, and they are not shown a failure for trying either.  A
+    job whose ``owner_token`` is NULL is unowned and anyone may answer it.
+
+    The response re-renders the Scan button out-of-band from server state
+    and leaves ``#status-message`` alone.
+
+    Args:
+        request: The incoming request.
+        job_id: The job the answer is for.
+        prompt: The number of the question the answer is for.
+        answer: What the operator chose.
+
+    Returns:
+        The status partial, as this browser may see it.
+
+    """
+    state = request.app.state
+    presented = _presented_owner(request)
+    claimed = False
+    if _owner_answers(presented, state.job_store.get_job(job_id)):
+        claimed = state.worker.answer_pass(job_id, prompt, answer)
+    return state.templates.TemplateResponse(
+        request,
+        "partials/status_response.html",
+        {
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(
+                    request,
+                    claimed_pass=(job_id, answer) if claimed else None,
                 ),
             ),
             "terminal_reload": True,

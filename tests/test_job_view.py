@@ -42,7 +42,12 @@ from saneless.vocabulary import (
     page_counts,
     removed_pages,
 )
-from saneless.web.job_view import JobView, build_job_view, owns_detail
+from saneless.web.job_view import (
+    JobView,
+    build_job_view,
+    owns_detail,
+    scrub_for_owner,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -812,3 +817,24 @@ def test_refused_row_is_nobodys(
     assert view.title == HIDDEN_JOB_TITLE
     assert view.thumbnail is None
     assert view.error_category is ErrorCategory.REJECTED
+
+
+def test_scrub_for_owner_is_the_job_views_own_rule(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """
+    Text shown outside a job view is scrubbed exactly as the view's text is.
+
+    The failed-pass prompt shows the scanner's error before any job row holds
+    it, so it cannot borrow a view; one rule, applied the same way, is what
+    keeps the two from drifting.
+    """
+    kept = settings.output.data_dir / "failed" / "pass-3.pnm"
+    text = f"Could not write {kept}; device /dev/bus/usb/001/004 went away."
+    job = _job(state=JobState.ERROR, error_category=ErrorCategory.SCANNER, error=text)
+
+    scrubbed = scrub_for_owner(text, settings)
+
+    assert scrubbed == ("Could not write failed/pass-3.pnm; device <path> went away.")
+    owner = _view(job, presented=_OWNER, settings=settings, tmp_path=tmp_path)
+    assert owner.error == scrubbed

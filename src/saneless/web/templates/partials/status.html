@@ -52,6 +52,34 @@
       {% else %}
       <p aria-busy="true">Waiting for the stack to be flipped</p>
       {% endif %}
+    {% elif job.state in pass_wait_states %}
+      {# A multi-page document waiting on its operator.  Three arms, in the
+         same order as the flip branch above.
+
+         First, once the open question is answered, acknowledge the answer
+         instead of re-rendering buttons that look as though the click did
+         nothing.  That line is busy: the machine is about to act on it.
+
+         The second arm is the owner gate, decided on the server by the same
+         rule as the flip prompt: the owner, or anyone when the job recorded
+         no owner.  Nobody else is handed a prompt, so the buttons and the
+         scanner's error text are not emitted for them at all; hiding them
+         with CSS would be an ASVS V4 failure and is forbidden.
+
+         Otherwise one plain line says what the job is waiting on.  That is
+         what anyone else sees, and what the owner sees for the moment before
+         the worker publishes the question.  It is the same server-built line
+         the busy branch renders, which for a waiting state is that state's
+         progress wording.  It deliberately carries no aria-busy: the job waits
+         for a person, not the machine, and a spinner here is exactly what
+         makes a waiting scan look hung. #}
+      {% if pass_answer %}
+      <p aria-busy="true">{{ pass_answer | pass_answer_label }}</p>
+      {% elif is_owner and pass_copy %}
+      {% include "partials/pages_prompt.html" %}
+      {% else %}
+      <p>{{ busy_line }}</p>
+      {% endif %}
     {% elif job.state == JobState.DONE %}
       {# The counts are a footnote to the outcome, so they read after it and
          before the preview.

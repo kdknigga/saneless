@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from saneless.job import Job
     from saneless.vocabulary import ErrorCategory, JobState
 
-__all__ = ["JobView", "build_job_view", "owns_detail"]
+__all__ = ["JobView", "build_job_view", "owns_detail", "scrub_for_owner"]
 
 # Any web address.  Stored text names paperless-ngx by its configured URL, and
 # a URL from an earlier configuration, or from a library's own message, would
@@ -290,6 +290,28 @@ def _relativise(text: str, settings: Settings) -> str:
     text = paths.sub(lambda match: names[match.group()], text)
     text = _URL.sub(lambda match: _name(match, "<paperless.url>"), text)
     return _OTHER_PATH.sub(lambda match: _name(match, "<path>"), text)
+
+
+def scrub_for_owner(text: str, settings: Settings) -> str:
+    """
+    Replace every host path and web address in text shown to a job's owner.
+
+    This is the one host-path rule for owner-visible text that does not come
+    out of a job view: the failed-pass prompt shows the scanner's error while
+    the job is still waiting, before any row stores it.  It applies exactly the
+    rule a job view applies to its error and warning text, so the two cannot
+    drift.  Whether the viewer is the owner at all is the caller's decision;
+    anyone else must not be shown the text in any form.
+
+    Args:
+        text: The text to show, as the scanner or the pipeline wrote it.
+        settings: The running configuration.
+
+    Returns:
+        The text with no configured host path and no web address in it.
+
+    """
+    return _relativise(text, settings)
 
 
 def _name(match: re.Match[str], name: str) -> str:

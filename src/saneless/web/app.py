@@ -25,6 +25,7 @@ from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
 from saneless.private_dirs import ensure_private_dir, make_private_dir
 from saneless.vocabulary import (
+    PASS_WAIT_STATES,
     RESTART_REASON,
     JobState,
     error_message,
@@ -34,6 +35,7 @@ from saneless.vocabulary import (
     local_time,
     outcome_line,
     page_counts,
+    pass_answer_label,
     progress_label,
     removed_pages,
 )
@@ -100,6 +102,7 @@ def _build_templates() -> Jinja2Templates:
     templates.env.filters["outcome_line"] = outcome_line
     templates.env.filters["progress_label"] = progress_label
     templates.env.filters["flip_answer_label"] = flip_answer_label
+    templates.env.filters["pass_answer_label"] = pass_answer_label
     templates.env.filters["check_name"] = check_name
     # The strip draws its rows with these three and not with the state lookups
     # they delegate to: a row the registry skipped carries `CheckState.OK` so
@@ -129,6 +132,11 @@ def _build_templates() -> Jinja2Templates:
     # resulting false positive with a comment.
     job_state_global: Any = JobState
     templates.env.globals["JobState"] = job_state_global
+    # The multi-page waiting states, by the same route and for the same reason.
+    # The status area and the Scan button test membership of this one set, so
+    # a template never lists the states by hand and cannot drift from it.
+    pass_wait_states_global: Any = PASS_WAIT_STATES
+    templates.env.globals["pass_wait_states"] = pass_wait_states_global
     return templates
 
 
