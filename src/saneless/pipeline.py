@@ -2404,10 +2404,13 @@ class _PipelineRun:
             )
             raise AllPagesBlankError(msg)
         removed = tuple(sorted(document.removed))
+        # A set for the membership test: a document can run to several
+        # hundred pages, and a tuple would be searched once per page.
+        skipped = frozenset(removed)
         kept = [
             record
             for position, record in enumerate(records, start=1)
-            if position not in removed
+            if position not in skipped
         ]
         rejected_warning = _rejected_pages_warning(document.unreadable)
         pdf_path = self._assemble(kept)
