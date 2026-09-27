@@ -31,16 +31,19 @@ from saneless.job import ErrorCategory as JobErrorCategory
 from saneless.job import Job
 from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
+    _BUSY_SEPARATOR,
     ACTIVE_STATES,
     BUSY_STATES,
     FALLBACK_NOT_UPLOADED_LINE,
     LOCAL_TIME_FORMAT,
+    PASS_WAIT_STATES,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
     URL_UNSET_JOB_ERROR,
+    WAITING_STATES,
     WARNED_UPLOAD_LABEL,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
@@ -50,14 +53,20 @@ from saneless.vocabulary import (
     ExitCode,
     FlipOutcome,
     JobState,
+    PassAnswer,
+    PassPrompt,
+    PassWait,
     ProfileStorage,
     RequestRejection,
     ScanOutcome,
     SubmitResult,
     WorkerHealth,
+    blank_timeout_finish_warning,
     busy_line,
+    cap_finish_warning,
     classify_error,
     connection_status_message,
+    duration_phrase,
     error_advice,
     error_message,
     error_next_step,
@@ -70,12 +79,16 @@ from saneless.vocabulary import (
     local_time,
     outcome_line,
     page_counts,
+    pages_phrase,
+    pass_answer_label,
+    pass_wait_state,
     progress_label,
     rejection_message,
     rejection_status_code,
     removed_pages,
     removed_pages_note,
     state_label,
+    timeout_finish_warning,
     worker_health_detail,
 )
 
@@ -86,16 +99,16 @@ if TYPE_CHECKING:
 class TestJobStateMembers:
     """JobState membership tests."""
 
-    def test_job_state_has_exactly_ten_members(self) -> None:
+    def test_job_state_has_exactly_thirteen_members(self) -> None:
         """
-        JobState declares exactly ten lifecycle members (CTR-01, DPLX-06, D-01).
+        JobState declares exactly thirteen lifecycle members.
 
         A count guard, not a name list: adding a member should fail the
         parametrised completeness tests below -- which force a label and a
         classification decision -- rather than a hand-written roster that only
         records what the enum happened to contain when it was written.
         """
-        assert len(list(JobState)) == 10
+        assert len(list(JobState)) == 13
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:
@@ -199,13 +212,16 @@ class TestStateClassifications:
         assert not (ACTIVE_STATES & TERMINAL_STATES)
 
     def test_active_states_membership(self) -> None:
-        """ACTIVE_STATES is the six in-flight lifecycle states (CTR-01, DPLX-06)."""
+        """ACTIVE_STATES is the nine in-flight lifecycle states."""
         assert (
             frozenset(
                 {
                     JobState.PENDING,
                     JobState.SCANNING,
                     JobState.AWAITING_FLIP,
+                    JobState.AWAITING_NEXT_PASS,
+                    JobState.AWAITING_BLANK_DECISION,
+                    JobState.AWAITING_RETRY,
                     JobState.SCANNING_REVERSE,
                     JobState.ASSEMBLING,
                     JobState.UPLOADING,
@@ -234,8 +250,54 @@ class TestStateClassifications:
         assert JobState.CANCELLED.value == "CANCELLED"
 
     def test_busy_states_is_derived_from_active_states(self) -> None:
-        """BUSY_STATES is ACTIVE_STATES minus AWAITING_FLIP (CTR-01)."""
-        assert ACTIVE_STATES - {JobState.AWAITING_FLIP} == BUSY_STATES
+        """BUSY_STATES is ACTIVE_STATES minus every state waiting for a person."""
+        assert ACTIVE_STATES - WAITING_STATES == BUSY_STATES
+
+    def test_waiting_states_are_the_pass_waits_and_the_flip_wait(self) -> None:
+        """WAITING_STATES is the three multi-page waits plus the flip wait."""
+        assert PASS_WAIT_STATES | {JobState.AWAITING_FLIP} == WAITING_STATES
+
+    def test_pass_wait_states_membership(self) -> None:
+        """PASS_WAIT_STATES is exactly the three multi-page waits."""
+        assert (
+            frozenset(
+                {
+                    JobState.AWAITING_NEXT_PASS,
+                    JobState.AWAITING_BLANK_DECISION,
+                    JobState.AWAITING_RETRY,
+                }
+            )
+            == PASS_WAIT_STATES
+        )
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            JobState.AWAITING_NEXT_PASS,
+            JobState.AWAITING_BLANK_DECISION,
+            JobState.AWAITING_RETRY,
+        ],
+    )
+    def test_a_multi_page_wait_is_active_but_not_busy(self, state: JobState) -> None:
+        """
+        A job waiting for more pages is in flight, but the machine is idle.
+
+        Classified exactly as the flip wait is: a waiting job that showed the
+        busy spinner would look like a scan that hung.
+        """
+        assert state in ACTIVE_STATES
+        assert state not in BUSY_STATES
+        assert state in WAITING_STATES
+        assert state in PASS_WAIT_STATES
+
+    def test_the_flip_wait_is_waiting_but_not_a_pass_wait(self) -> None:
+        """AWAITING_FLIP waits for a person, but not for a multi-page answer."""
+        assert JobState.AWAITING_FLIP in WAITING_STATES
+        assert JobState.AWAITING_FLIP not in PASS_WAIT_STATES
+
+    def test_waiting_states_are_a_subset_of_active_states(self) -> None:
+        """No state can wait for a person without also being in flight."""
+        assert WAITING_STATES <= ACTIVE_STATES
 
     def test_awaiting_flip_is_active_but_not_busy(self) -> None:
         """AWAITING_FLIP is in flight but the machine is idle then (CTR-01)."""
@@ -256,6 +318,9 @@ class TestStateLabel:
             (JobState.PENDING, "Pending"),
             (JobState.SCANNING, "Scanning"),
             (JobState.AWAITING_FLIP, "Waiting for flip"),
+            (JobState.AWAITING_NEXT_PASS, "Waiting for more pages"),
+            (JobState.AWAITING_BLANK_DECISION, "Waiting: blank pages found"),
+            (JobState.AWAITING_RETRY, "Waiting: last scan failed"),
             (JobState.SCANNING_REVERSE, "Scanning backs"),
             (JobState.ASSEMBLING, "Assembling"),
             (JobState.UPLOADING, "Uploading"),
@@ -286,6 +351,15 @@ class TestProgressLabel:
             (JobState.PENDING, "Starting scan..."),
             (JobState.SCANNING, "Scanning..."),
             (JobState.AWAITING_FLIP, "Awaiting flip..."),
+            (JobState.AWAITING_NEXT_PASS, "Waiting for the next page..."),
+            (
+                JobState.AWAITING_BLANK_DECISION,
+                "Waiting for a decision about blank pages...",
+            ),
+            (
+                JobState.AWAITING_RETRY,
+                "The last scan failed; waiting for a decision...",
+            ),
             (JobState.SCANNING_REVERSE, "Scanning reverse sides..."),
             (JobState.ASSEMBLING, "Assembling PDF..."),
             (JobState.UPLOADING, "Uploading to paperless-ngx..."),
@@ -354,6 +428,244 @@ class TestFlipAnswerLabel:
         assert label != outcome.value
         assert label.endswith("...")
         assert "…" not in label
+
+
+class TestPassWaitState:
+    """pass_wait_state maps each multi-page question to its persisted state."""
+
+    @pytest.mark.parametrize(
+        ("wait", "expected"),
+        [
+            (PassWait.NEXT_PASS, JobState.AWAITING_NEXT_PASS),
+            (PassWait.BLANK_DECISION, JobState.AWAITING_BLANK_DECISION),
+            (PassWait.RETRY, JobState.AWAITING_RETRY),
+        ],
+    )
+    def test_pass_wait_state(self, wait: PassWait, expected: JobState) -> None:
+        """Each open question has its own state, so the row says what it waits on."""
+        assert pass_wait_state(wait) == expected
+
+    @pytest.mark.parametrize("wait", list(PassWait))
+    def test_every_pass_wait_lands_in_a_pass_wait_state(self, wait: PassWait) -> None:
+        """No multi-page question can put a job in a busy or terminal state."""
+        assert pass_wait_state(wait) in PASS_WAIT_STATES
+
+    def test_pass_wait_values_equal_names(self) -> None:
+        """PassWait has exactly three members, each valued as its name."""
+        assert [wait.value for wait in PassWait] == [
+            "NEXT_PASS",
+            "BLANK_DECISION",
+            "RETRY",
+        ]
+
+
+class TestPassAnswer:
+    """PassAnswer members and pass_answer_label acknowledgment copy."""
+
+    def test_pass_answer_has_exactly_eight_members_in_order(self) -> None:
+        """
+        A multi-page wait ends in exactly one of eight ways.
+
+        Six are the operator's buttons, one is the clock running out and one
+        is saneless stopping, which keeps the pages already scanned.
+        """
+        assert [answer.value for answer in PassAnswer] == [
+            "NEXT",
+            "RESCAN",
+            "FINISH",
+            "ABORT",
+            "SKIP_BLANKS",
+            "KEEP_BLANKS",
+            "TIMED_OUT",
+            "INTERRUPTED",
+        ]
+
+    def test_flip_outcome_is_not_widened(self) -> None:
+        """The flip wait keeps its four outcomes; the new answers are a sibling."""
+        assert [outcome.value for outcome in FlipOutcome] == [
+            "CONTINUED",
+            "ABORTED",
+            "TIMED_OUT",
+            "INTERRUPTED",
+        ]
+
+    @pytest.mark.parametrize(
+        ("answer", "expected"),
+        [
+            (PassAnswer.NEXT, "Scanning more pages..."),
+            (PassAnswer.RESCAN, "Discarded the last scan. Scanning again..."),
+            (PassAnswer.FINISH, "Finishing the document..."),
+            (PassAnswer.ABORT, "Aborting scan..."),
+            (PassAnswer.SKIP_BLANKS, "Skipping blank pages..."),
+            (PassAnswer.KEEP_BLANKS, "Keeping blank pages..."),
+            (PassAnswer.TIMED_OUT, "Nobody answered; finishing the document..."),
+            (
+                PassAnswer.INTERRUPTED,
+                "Stopping: saneless is shutting down and keeping the pages "
+                "already scanned...",
+            ),
+        ],
+    )
+    def test_pass_answer_label_strings(self, answer: PassAnswer, expected: str) -> None:
+        """pass_answer_label returns the acknowledgment copy verbatim."""
+        assert pass_answer_label(answer) == expected
+
+    def test_abort_reads_the_same_as_the_flip_abort(self) -> None:
+        """Aborting a multi-page wait says exactly what aborting a flip says."""
+        assert pass_answer_label(PassAnswer.ABORT) == flip_answer_label(
+            FlipOutcome.ABORTED
+        )
+
+    def test_interrupted_reads_the_same_as_the_flip_interruption(self) -> None:
+        """A server stop during either wait is acknowledged in the same words."""
+        assert pass_answer_label(PassAnswer.INTERRUPTED) == flip_answer_label(
+            FlipOutcome.INTERRUPTED
+        )
+
+    @pytest.mark.parametrize("answer", list(PassAnswer))
+    def test_pass_answer_label_is_complete(self, answer: PassAnswer) -> None:
+        """Every PassAnswer has acknowledgment prose ending in ASCII dots."""
+        label = pass_answer_label(answer)
+        assert label
+        assert label != answer.value
+        assert label.endswith("...")
+        assert "…" not in label
+
+
+class TestPassPrompt:
+    """PassPrompt value-type tests."""
+
+    @staticmethod
+    def _prompt() -> PassPrompt:
+        return PassPrompt(
+            number=1,
+            wait=PassWait.NEXT_PASS,
+            pages_kept=2,
+            offered=frozenset({PassAnswer.NEXT}),
+            timeout_seconds=600,
+        )
+
+    def test_pass_prompt_defaults(self) -> None:
+        """The per-question fields default to empty, so each wait sets only its own."""
+        prompt = self._prompt()
+        assert prompt.number == 1
+        assert prompt.wait is PassWait.NEXT_PASS
+        assert prompt.pages_kept == 2
+        assert prompt.offered == frozenset({PassAnswer.NEXT})
+        assert prompt.timeout_seconds == 600
+        assert prompt.last_pass_pages == 0
+        assert prompt.last_pass_kept == 0
+        assert prompt.pass_pages == 0
+        assert prompt.blank_positions == ()
+        assert prompt.error is None
+
+    def test_pass_prompt_is_frozen(self) -> None:
+        """
+        A prompt cannot be widened after it is built, so its offer is fixed.
+
+        The attribute name is a local rather than a literal so this exercises
+        the dataclass's own runtime guard rather than a linter's rule about
+        constant ``setattr`` targets.
+        """
+        prompt = self._prompt()
+        attribute = "offered"
+        with pytest.raises(FrozenInstanceError):
+            setattr(prompt, attribute, frozenset(PassAnswer))
+
+    def test_pass_prompt_is_slotted(self) -> None:
+        """PassPrompt is slotted, so a typo cannot add a silent extra field."""
+        assert not hasattr(self._prompt(), "__dict__")
+
+    def test_pass_prompt_field_order(self) -> None:
+        """The fields are the documented ones, in the documented order."""
+        assert [field.name for field in fields(PassPrompt)] == [
+            "number",
+            "wait",
+            "pages_kept",
+            "offered",
+            "timeout_seconds",
+            "last_pass_pages",
+            "last_pass_kept",
+            "pass_pages",
+            "blank_positions",
+            "error",
+        ]
+
+
+class TestDurationPhrase:
+    """duration_phrase names an operator-wait bound in the largest whole unit."""
+
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [
+            (600, "10 minutes"),
+            (90, "90 seconds"),
+            (3600, "1 hour"),
+            (7200, "2 hours"),
+            (60, "1 minute"),
+            (1, "1 second"),
+            (5400, "90 minutes"),
+            (600.0, "10 minutes"),
+            (599.6, "10 minutes"),
+        ],
+    )
+    def test_duration_phrase(self, seconds: float, expected: str) -> None:
+        """Seconds are rounded to whole seconds, then named in the largest unit."""
+        assert duration_phrase(seconds) == expected
+
+
+class TestPagesPhrase:
+    """pages_phrase counts pages with the right noun."""
+
+    @pytest.mark.parametrize(
+        ("count", "expected"),
+        [(0, "0 pages"), (1, "1 page"), (4, "4 pages")],
+    )
+    def test_pages_phrase(self, count: int, expected: str) -> None:
+        """One page is a page; any other count is pages."""
+        assert pages_phrase(count) == expected
+
+
+class TestFinishWarnings:
+    """The warnings a document finished without the operator pressing Finish carries."""
+
+    def test_timeout_finish_warning(self) -> None:
+        """A between-pass timeout names the page count and the wait."""
+        assert timeout_finish_warning(4, 600) == (
+            "Finished after 4 pages because nobody answered within 10 minutes; the document may be missing pages."
+        )
+
+    def test_timeout_finish_warning_single_page(self) -> None:
+        """One page is a page, not pages."""
+        assert timeout_finish_warning(1, 600) == (
+            "Finished after 1 page because nobody answered within 10 minutes; "
+            "the document may be missing pages."
+        )
+
+    def test_timeout_finish_warning_uses_the_duration_phrase(self) -> None:
+        """The wait is named the way duration_phrase names it."""
+        assert "within 90 seconds;" in timeout_finish_warning(4, 90)
+
+    def test_cap_finish_warning(self) -> None:
+        """The cap warning names where the document ended and the cap."""
+        assert cap_finish_warning(512, 500) == (
+            "Finished at 512 pages: no new scan starts once a document has 500 pages. Scan any remaining pages as a new document."
+        )
+
+    def test_blank_timeout_finish_warning(self) -> None:
+        """A blank-prompt timeout says the blank pages were left out."""
+        assert blank_timeout_finish_warning(4, 600) == (
+            "Finished after 4 pages because nobody answered about the blank "
+            "pages within 10 minutes, so they were left out; the document may "
+            "be missing pages."
+        )
+
+    def test_blank_timeout_finish_warning_single_page(self) -> None:
+        """One page is a page, not pages, and an hour is named as an hour."""
+        assert blank_timeout_finish_warning(1, 3600).startswith(
+            "Finished after 1 page because nobody answered about the blank "
+            "pages within 1 hour,"
+        )
 
 
 class TestErrorAdvice:
@@ -971,6 +1283,50 @@ class TestBusyLine:
             queue_title="Tax return",
             queue_ahead=2,
         ) == ("Waiting for 'Tax return' to finish (2 ahead of you)")
+
+    def test_busy_line_leads_with_the_pages_kept_so_far(self) -> None:
+        """A later multi-page pass names how many pages the document holds."""
+        assert busy_line(JobState.SCANNING, pages_kept=4) == (
+            f"4 pages so far {_BUSY_SEPARATOR} " + progress_label(JobState.SCANNING)
+        )
+
+    def test_busy_line_pluralises_the_pages_kept(self) -> None:
+        """One kept page is a page, not pages."""
+        assert busy_line(JobState.SCANNING, pages_kept=1) == (
+            f"1 page so far {_BUSY_SEPARATOR} " + progress_label(JobState.SCANNING)
+        )
+
+    @pytest.mark.parametrize("pages_kept", [0, None])
+    def test_busy_line_omits_an_empty_or_unknown_pages_kept(
+        self, pages_kept: int | None
+    ) -> None:
+        """With no page kept yet the first pass reads exactly as before."""
+        assert busy_line(JobState.SCANNING, pages_kept=pages_kept) == (
+            progress_label(JobState.SCANNING)
+        )
+
+    @pytest.mark.parametrize("state", sorted(set(JobState) - {JobState.SCANNING}))
+    def test_busy_line_shows_the_pages_kept_only_while_scanning(
+        self, state: JobState
+    ) -> None:
+        """The kept count belongs to SCANNING and no other state."""
+        assert busy_line(state, pages_kept=4) == progress_label(state)
+
+    def test_busy_line_front_count_ignores_pages_kept(self) -> None:
+        """The manual-duplex front count is unchanged by a kept count."""
+        assert busy_line(JobState.SCANNING_REVERSE, front_pages=12, pages_kept=4) == (
+            f"Front: 12 pages {_BUSY_SEPARATOR} "
+            + progress_label(JobState.SCANNING_REVERSE)
+        )
+
+    def test_busy_line_queue_position_wins_over_the_pages_kept(self) -> None:
+        """The queue line is still the first branch."""
+        assert busy_line(
+            JobState.SCANNING,
+            pages_kept=4,
+            queue_title="Tax return",
+            queue_ahead=0,
+        ) == ("Waiting for 'Tax return' to finish (next in line)")
 
 
 class TestWorkerHealth:

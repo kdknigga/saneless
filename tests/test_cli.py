@@ -5923,8 +5923,7 @@ def _jobs_header_title_width(header: str) -> int:
         The Title column's width in characters.
 
     """
-    after_profile = cli_module._TIME_COL_WIDTH + 1 + 15 + 1
-    return header[after_profile:].index("Status") - 1
+    return header.index("Status") - header.index("Title") - 1
 
 
 class TestJobsTableWidth:
@@ -5978,15 +5977,18 @@ class TestJobsTableWidth:
         assert len(local_time(datetime.now(tz=UTC))) <= cli_module._TIME_COL_WIDTH
         assert cli_module._TIME_COL_WIDTH == 22
 
-    def test_the_title_column_is_17_at_80_columns(
+    def test_the_title_column_is_15_at_80_columns(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        At 80 columns the title keeps 17, above the floor of 15.
+        At 80 columns the title keeps its floor of 15.
 
         It was 24 until the Status column had to hold "Uploaded with a
-        warning", seven characters wider than "Saved to folder". The zone
-        token still fits in the timestamp column's own slack.
+        warning", seven characters wider than "Saved to folder", and 17 until
+        it had to hold "Waiting: blank pages found", three wider again.  The
+        Profile column gave up one character so the title did not drop below
+        its floor.  The zone token still fits in the timestamp column's own
+        slack.
         """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
@@ -5997,7 +5999,7 @@ class TestJobsTableWidth:
 
         assert result.exit_code == 0, result.output
         lines = result.output.strip().split("\n")
-        assert _jobs_header_title_width(lines[0]) == 17
+        assert _jobs_header_title_width(lines[0]) == 15
         assert all(len(line) <= 80 for line in lines)
 
     def test_a_narrow_terminal_floors_the_title_column_at_15(

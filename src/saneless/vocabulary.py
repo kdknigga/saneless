@@ -39,6 +39,7 @@ __all__ = [
     "HIDDEN_PRESERVED_ERROR",
     "HIDDEN_WARNING_LINE",
     "LOCAL_TIME_FORMAT",
+    "PASS_WAIT_STATES",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
     "SCAN_BLOCKED_REASON",
@@ -47,6 +48,7 @@ __all__ = [
     "TITLE_MAX_LENGTH",
     "TOKEN_UNSET_JOB_ERROR",
     "URL_UNSET_JOB_ERROR",
+    "WAITING_STATES",
     "WARNED_UPLOAD_LABEL",
     "WORKER_DEGRADED_JOB_ERROR",
     "WORKER_DOWN_JOB_ERROR",
@@ -59,15 +61,21 @@ __all__ = [
     "JobState",
     "PageCounted",
     "PaperSize",
+    "PassAnswer",
+    "PassPrompt",
+    "PassWait",
     "ProfileStorage",
     "RemovedPagesNoted",
     "RequestRejection",
     "ScanOutcome",
     "SubmitResult",
     "WorkerHealth",
+    "blank_timeout_finish_warning",
     "busy_line",
+    "cap_finish_warning",
     "classify_error",
     "connection_status_message",
+    "duration_phrase",
     "error_advice",
     "error_message",
     "error_next_step",
@@ -80,12 +88,16 @@ __all__ = [
     "local_time",
     "outcome_line",
     "page_counts",
+    "pages_phrase",
+    "pass_answer_label",
+    "pass_wait_state",
     "progress_label",
     "rejection_message",
     "rejection_status_code",
     "removed_pages",
     "removed_pages_note",
     "state_label",
+    "timeout_finish_warning",
     "worker_health_detail",
 ]
 
@@ -99,12 +111,25 @@ its dimensions in ``saneless.paper_sizes.PAPER_SIZES_MM``.
 """
 
 
+# The member values for the two members whose names end in "PASS", named
+# rather than written inline for the same reason ``_REJECTED_WIRE_VALUE`` is:
+# ruff's S105 reads any string literal assigned to a name ending in "pass" as
+# a hardcoded password.  A multi-page scan pass is not a password, the member
+# names are fixed, and every StrEnum here has value == name, so the literals
+# get names S105 does not flag rather than the convention getting an exception.
+_NEXT_WAIT_STATE_VALUE = "AWAITING_NEXT_PASS"
+_NEXT_WAIT_VALUE = "NEXT_PASS"
+
+
 class JobState(StrEnum):
     """States in the scan job lifecycle."""
 
     PENDING = "PENDING"
     SCANNING = "SCANNING"
     AWAITING_FLIP = "AWAITING_FLIP"
+    AWAITING_NEXT_PASS = _NEXT_WAIT_STATE_VALUE
+    AWAITING_BLANK_DECISION = "AWAITING_BLANK_DECISION"
+    AWAITING_RETRY = "AWAITING_RETRY"
     SCANNING_REVERSE = "SCANNING_REVERSE"
     ASSEMBLING = "ASSEMBLING"
     UPLOADING = "UPLOADING"
@@ -372,6 +397,103 @@ class FlipOutcome(StrEnum):
     INTERRUPTED = "INTERRUPTED"
 
 
+class PassWait(StrEnum):
+    """
+    Which question a multi-page document is waiting on.
+
+    The three members are exhaustive over the questions a multi-page scan can
+    ask between passes: whether there is another page, what to do about pages
+    that look blank, and what to do after a pass that failed.  Each has its own
+    ``JobState`` (see ``pass_wait_state``), so a history row or ``saneless jobs``
+    can say what the job is waiting on without asking the worker.
+    """
+
+    NEXT_PASS = _NEXT_WAIT_VALUE
+    BLANK_DECISION = "BLANK_DECISION"
+    RETRY = "RETRY"
+
+
+class PassAnswer(StrEnum):
+    """
+    How a multi-page wait resolved.
+
+    The eight members are exhaustive over the ways any of the three
+    multi-page questions can end.  Six are the operator's answers: scan
+    another pass, scan the last pass again, finish the document, abort it,
+    and -- for pages that look blank -- skip or keep them.  ``TIMED_OUT`` is
+    the clock running out first.  ``INTERRUPTED`` is saneless stopping; as
+    with ``FlipOutcome.INTERRUPTED`` it is not the operator's decision, so it
+    keeps the pages already scanned rather than discarding them.  Which of the
+    operator's answers a given question accepts is carried by
+    ``PassPrompt.offered``, not by this enum.
+
+    This is a sibling of ``FlipOutcome`` and deliberately not a widening of
+    it.  The flip wait's four outcomes, and what each of them means, must not
+    change because a second kind of wait exists: every ``match`` over
+    ``FlipOutcome`` would otherwise gain arms that can never be reached there.
+
+    There is deliberately no "still waiting" member, for the same reason
+    ``FlipOutcome`` has none: a wait only returns once it has resolved, so
+    such a value could never be observed.
+    """
+
+    NEXT = "NEXT"
+    RESCAN = "RESCAN"
+    FINISH = "FINISH"
+    ABORT = "ABORT"
+    SKIP_BLANKS = "SKIP_BLANKS"
+    KEEP_BLANKS = "KEEP_BLANKS"
+    TIMED_OUT = "TIMED_OUT"
+    INTERRUPTED = "INTERRUPTED"
+
+
+@dataclass(frozen=True, slots=True)
+class PassPrompt:
+    """
+    One open multi-page question, as the operator is asked it.
+
+    A prompt is built once per wait and never changed: it is frozen, so
+    nothing between the worker that opens it and the surface that renders it
+    can widen the answers it accepts.  The web UI and the CLI both render
+    from this value directly.
+
+    Attributes:
+        number: The prompt's 1-based sequence number within the run.  An
+            answer names the prompt it answers, so a click on a prompt that
+            has already been replaced is recognised as stale.
+        wait: Which question is open.
+        pages_kept: How many pages the document holds now.  Pages skipped as
+            blank are not counted.
+        offered: The only answers this prompt accepts.  An answer outside
+            this set -- stale, or forged -- is refused by set membership, so
+            every consumer applies the same rule.
+        timeout_seconds: How long the operator has to answer before the wait
+            resolves as ``PassAnswer.TIMED_OUT``.
+        last_pass_pages: For ``PassWait.NEXT_PASS``: how many pages the last
+            accepted pass produced, kept and skipped together.
+        last_pass_kept: For ``PassWait.NEXT_PASS``: how many of the last
+            accepted pass's pages were kept.
+        pass_pages: For ``PassWait.BLANK_DECISION``: how many pages the pass
+            under decision produced.
+        blank_positions: For ``PassWait.BLANK_DECISION``: the 1-based
+            positions, within that pass, of the pages that look blank.
+        error: For ``PassWait.RETRY``: the failed pass's error text.  It is
+            unscrubbed, so a web renderer must scrub it before showing it.
+
+    """
+
+    number: int
+    wait: PassWait
+    pages_kept: int
+    offered: frozenset[PassAnswer]
+    timeout_seconds: float
+    last_pass_pages: int = 0
+    last_pass_kept: int = 0
+    pass_pages: int = 0
+    blank_positions: tuple[int, ...] = ()
+    error: str | None = None
+
+
 # The wire string for a rejected API token, named rather than written inline
 # below.  Ruff's S105 reads any string literal assigned to a name containing
 # "token" as a hardcoded credential; this is a public API value that
@@ -581,9 +703,20 @@ HIDDEN_ERROR_DETAIL: Final = (
 # columns of title at 80 columns.
 LOCAL_TIME_FORMAT: Final = "%Y-%m-%d %H:%M %Z"
 
-# The separator between the pass-A front count and the progress prose on the
-# manual-duplex busy line.  U+00B7 MIDDLE DOT with a space either side.
+# The separator between a count and the progress prose on the busy line: the
+# manual-duplex front count, or the pages a multi-page document holds so far.
+# U+00B7 MIDDLE DOT with a space either side.
 _BUSY_SEPARATOR: Final = "·"
+
+# The acknowledgements a flip wait and a multi-page wait share, so the two
+# can never drift apart: aborting, or saneless stopping while either waits.
+_ABORTING_ACKNOWLEDGEMENT: Final = "Aborting scan..."
+_INTERRUPTED_ACKNOWLEDGEMENT: Final = (
+    "Stopping: saneless is shutting down and keeping the pages already scanned..."
+)
+
+_SECONDS_PER_MINUTE: Final = 60
+_SECONDS_PER_HOUR: Final = 3600
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
@@ -591,6 +724,9 @@ ACTIVE_STATES: frozenset[JobState] = frozenset(
         JobState.PENDING,
         JobState.SCANNING,
         JobState.AWAITING_FLIP,
+        JobState.AWAITING_NEXT_PASS,
+        JobState.AWAITING_BLANK_DECISION,
+        JobState.AWAITING_RETRY,
         JobState.SCANNING_REVERSE,
         JobState.ASSEMBLING,
         JobState.UPLOADING,
@@ -611,16 +747,106 @@ Together with ``ACTIVE_STATES`` this partitions ``JobState``: every member is in
 exactly one of the two sets.
 """
 
-BUSY_STATES: frozenset[JobState] = ACTIVE_STATES - {JobState.AWAITING_FLIP}
+PASS_WAIT_STATES: frozenset[JobState] = frozenset(
+    {
+        JobState.AWAITING_NEXT_PASS,
+        JobState.AWAITING_BLANK_DECISION,
+        JobState.AWAITING_RETRY,
+    }
+)
+"""Job states where a multi-page document is waiting for the operator's answer.
+
+One state per ``PassWait`` question, so the row itself says what is being
+waited on.  ``AWAITING_FLIP`` is not here: it waits for a person too, but for
+a manual-duplex flip, not for a multi-page answer.
+"""
+
+WAITING_STATES: frozenset[JobState] = PASS_WAIT_STATES | {JobState.AWAITING_FLIP}
+"""Job states where the job is in flight but waiting for a person.
+
+The scanner is idle and nothing happens until someone acts: the flip wait and
+the three multi-page waits.  Every one of them is in ``ACTIVE_STATES`` -- the
+job is not finished -- and none is in ``BUSY_STATES``.
+"""
+
+BUSY_STATES: frozenset[JobState] = ACTIVE_STATES - WAITING_STATES
 """Job states where the machine itself is working.
 
-Derived from ``ACTIVE_STATES`` so the two can never drift apart.  The
-distinction is "the machine is working" versus "we are waiting for the human":
-``AWAITING_FLIP`` is active -- the job is not finished -- but the scanner is
-idle and the person has to act.  The web UI's scan-button text and its
-``aria-busy`` attribute depend on that difference, so they read ``BUSY_STATES``
-and not ``ACTIVE_STATES``.
+Derived from ``ACTIVE_STATES`` and ``WAITING_STATES`` so the three can never
+drift apart.  The distinction is "the machine is working" versus "we are
+waiting for a person": a job in ``WAITING_STATES`` is active -- it is not
+finished -- but the scanner is idle and the person has to act.  The web UI's
+scan-button text and its ``aria-busy`` attribute depend on that difference, so
+they read ``BUSY_STATES`` and not ``ACTIVE_STATES``.  A waiting job that showed
+the busy spinner would look like a scan that hung.
 """
+
+
+# The three multi-page waits as a type, so their labels can live in helpers of
+# their own and still be checked for exhaustiveness.  With the waits inline,
+# ``state_label`` and ``progress_label`` would each carry one arm per
+# ``JobState`` member and cross ruff's PLR0912 branch limit; the limit is
+# respected rather than raised, and nothing is suppressed.
+type _PassWaitState = Literal[
+    JobState.AWAITING_NEXT_PASS,
+    JobState.AWAITING_BLANK_DECISION,
+    JobState.AWAITING_RETRY,
+]
+
+
+def _pass_wait_state_label(state: _PassWaitState) -> str:
+    """
+    Return the short history label for a multi-page wait.
+
+    Each names what the job is waiting on, so the row says it without the
+    worker.
+
+    Args:
+        state: The multi-page wait to label.
+
+    Returns:
+        The user-facing label, e.g. ``"Waiting for more pages"``.
+
+    Raises:
+        AssertionError: If the value is not one of the three waits.
+
+    """
+    match state:
+        case JobState.AWAITING_NEXT_PASS:
+            label = "Waiting for more pages"
+        case JobState.AWAITING_BLANK_DECISION:
+            label = "Waiting: blank pages found"
+        case JobState.AWAITING_RETRY:
+            label = "Waiting: last scan failed"
+        case _:
+            assert_never(state)
+    return label
+
+
+def _pass_wait_progress_label(state: _PassWaitState) -> str:
+    """
+    Return the progress prose for a multi-page wait.
+
+    Args:
+        state: The multi-page wait to describe.
+
+    Returns:
+        The user-facing progress sentence, e.g. ``"Waiting for the next page..."``.
+
+    Raises:
+        AssertionError: If the value is not one of the three waits.
+
+    """
+    match state:
+        case JobState.AWAITING_NEXT_PASS:
+            label = "Waiting for the next page..."
+        case JobState.AWAITING_BLANK_DECISION:
+            label = "Waiting for a decision about blank pages..."
+        case JobState.AWAITING_RETRY:
+            label = "The last scan failed; waiting for a decision..."
+        case _:
+            assert_never(state)
+    return label
 
 
 def state_label(state: JobState) -> str:
@@ -647,6 +873,12 @@ def state_label(state: JobState) -> str:
             label = "Scanning"
         case JobState.AWAITING_FLIP:
             label = "Waiting for flip"
+        case (
+            JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+        ):
+            label = _pass_wait_state_label(state)
         case JobState.SCANNING_REVERSE:
             label = "Scanning backs"
         case JobState.ASSEMBLING:
@@ -731,12 +963,14 @@ def progress_label(state: JobState) -> str:
     Return the progress prose for a job state.
 
     This is the longer sentence the status area shows while a scan is running,
-    and the line the CLI echoes.  The six in-flight strings are byte identical
-    to what shipped before -- including the literal three-period spelling of
-    the trailing ellipsis, which is three ASCII periods and not U+2026.
-    ``SCANNING_REVERSE`` is the newest of them, and its prose is the exact line
-    the CLI printed for the second duplex pass before the state existed, so
-    giving pass B its own state changed no CLI output.
+    and the line the CLI echoes.  The six original in-flight strings are byte
+    identical to what shipped before -- including the literal three-period
+    spelling of the trailing ellipsis, which is three ASCII periods and not
+    U+2026.  ``SCANNING_REVERSE``'s prose is the exact line the CLI printed for
+    the second duplex pass before the state existed, so giving pass B its own
+    state changed no CLI output.  The three multi-page waits keep the same
+    ellipsis and each names what it is waiting on, so a job that is waiting
+    for a person never reads as a scan that is still running.
 
     ``DONE``, ``ERROR``, ``FALLBACK`` and ``CANCELLED`` have no progress prose
     in production: the status partial and the CLI both branch structurally for
@@ -760,6 +994,12 @@ def progress_label(state: JobState) -> str:
             label = "Scanning..."
         case JobState.AWAITING_FLIP:
             label = "Awaiting flip..."
+        case (
+            JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+        ):
+            label = _pass_wait_progress_label(state)
         case JobState.SCANNING_REVERSE:
             label = "Scanning reverse sides..."
         case JobState.ASSEMBLING:
@@ -785,18 +1025,22 @@ def busy_line(
     queue_title: str | None = None,
     queue_ahead: int | None = None,
     front_pages: int | None = None,
+    pages_kept: int | None = None,
 ) -> str:
     """
     Return the one line the status area shows while a job is in flight.
 
-    Three branches in strict precedence:
+    Four branches in strict precedence:
 
     1. The job is queued behind another one, so it is told what it is waiting
        for and how many jobs are ahead.  This wins outright: a job that has not
        started has nothing else worth saying.
     2. The job is on the second manual-duplex pass and the front count is
        known, so the count leads the progress prose.
-    3. Otherwise the progress prose alone, exactly as before.
+    3. The job is scanning a later pass of a multi-page document that already
+       holds at least one page, so the kept count leads the progress prose.
+       With no page kept yet the first pass reads exactly as before.
+    4. Otherwise the progress prose alone, exactly as before.
 
     ``(0 ahead of you)`` is never produced.  It is technically true and reads
     like a bug, so the last job in the queue is told it is ``next in line``.
@@ -816,6 +1060,8 @@ def busy_line(
         queue_ahead: How many jobs are ahead of the followed job.
         front_pages: Pages counted on the first manual-duplex pass, when that
             count is known.
+        pages_kept: Pages a multi-page document holds so far, when it is one.
+            Only read while the job is ``SCANNING``.
 
     Returns:
         One line of plain text.
@@ -826,8 +1072,9 @@ def busy_line(
         return f"Waiting for '{queue_title}' to finish ({position})"
     label = progress_label(state)
     if state is JobState.SCANNING_REVERSE and front_pages is not None:
-        noun = "page" if front_pages == 1 else "pages"
-        return f"Front: {front_pages} {noun} {_BUSY_SEPARATOR} {label}"
+        return f"Front: {pages_phrase(front_pages)} {_BUSY_SEPARATOR} {label}"
+    if state is JobState.SCANNING and pages_kept:
+        return f"{pages_phrase(pages_kept)} so far {_BUSY_SEPARATOR} {label}"
     return label
 
 
@@ -980,17 +1227,210 @@ def flip_answer_label(outcome: FlipOutcome) -> str:
         case FlipOutcome.CONTINUED:
             label = "Flip confirmed. Scanning reverse sides next..."
         case FlipOutcome.ABORTED:
-            label = "Aborting scan..."
+            label = _ABORTING_ACKNOWLEDGEMENT
         case FlipOutcome.TIMED_OUT:
             label = "Flip wait timed out..."
         case FlipOutcome.INTERRUPTED:
-            label = (
-                "Stopping: saneless is shutting down and keeping the pages "
-                "already scanned..."
-            )
+            label = _INTERRUPTED_ACKNOWLEDGEMENT
         case _:
             assert_never(outcome)
     return label
+
+
+def pass_wait_state(wait: PassWait) -> JobState:
+    """
+    Return the job state a multi-page question puts its job in.
+
+    Args:
+        wait: The question that is open.
+
+    Returns:
+        The member of ``PASS_WAIT_STATES`` naming that question.
+
+    Raises:
+        AssertionError: If the value is not a PassWait member.
+
+    """
+    match wait:
+        case PassWait.NEXT_PASS:
+            state = JobState.AWAITING_NEXT_PASS
+        case PassWait.BLANK_DECISION:
+            state = JobState.AWAITING_BLANK_DECISION
+        case PassWait.RETRY:
+            state = JobState.AWAITING_RETRY
+        case _:
+            assert_never(wait)
+    return state
+
+
+def pass_answer_label(answer: PassAnswer) -> str:
+    """
+    Return the acknowledgment the status area shows for an answered pass wait.
+
+    The multi-page counterpart of ``flip_answer_label``: once a multi-page
+    question has been answered but the worker has not yet persisted the job's
+    next state, the status area shows this sentence in place of the prompt,
+    so its buttons do not come back as though the click did nothing.  The
+    trailing ellipsis is three ASCII periods, matching ``progress_label``.
+    Aborting and being interrupted read exactly as they do for a flip wait.
+
+    ``TIMED_OUT`` has an arm for totality: a timed-out wait finishes the
+    document within the same worker step, so the status area is not expected
+    to show it.
+
+    Args:
+        answer: The answer the job's multi-page wait received.
+
+    Returns:
+        The user-facing acknowledgment, e.g. ``"Scanning more pages..."``.
+
+    Raises:
+        AssertionError: If the value is not a PassAnswer member.
+
+    """
+    match answer:
+        case PassAnswer.NEXT:
+            label = "Scanning more pages..."
+        case PassAnswer.RESCAN:
+            label = "Discarded the last scan. Scanning again..."
+        case PassAnswer.FINISH:
+            label = "Finishing the document..."
+        case PassAnswer.ABORT:
+            label = _ABORTING_ACKNOWLEDGEMENT
+        case PassAnswer.SKIP_BLANKS:
+            label = "Skipping blank pages..."
+        case PassAnswer.KEEP_BLANKS:
+            label = "Keeping blank pages..."
+        case PassAnswer.TIMED_OUT:
+            label = "Nobody answered; finishing the document..."
+        case PassAnswer.INTERRUPTED:
+            label = _INTERRUPTED_ACKNOWLEDGEMENT
+        case _:
+            assert_never(answer)
+    return label
+
+
+def _counted(count: int, unit: str) -> str:
+    """
+    Return ``count`` followed by ``unit``, pluralised unless the count is one.
+
+    Args:
+        count: How many.
+        unit: The singular noun, which pluralises with a trailing ``s``.
+
+    Returns:
+        E.g. ``"1 page"`` or ``"4 pages"``.
+
+    """
+    return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+
+
+def pages_phrase(count: int) -> str:
+    """
+    Return a page count with its noun.
+
+    Args:
+        count: How many pages.
+
+    Returns:
+        ``"1 page"`` for one page, ``"4 pages"`` or ``"0 pages"`` otherwise.
+
+    """
+    return _counted(count, "page")
+
+
+def duration_phrase(seconds: float) -> str:
+    """
+    Name an operator-wait bound in the largest unit that divides it evenly.
+
+    The value is rounded to whole seconds first, so a configured ``600.0``
+    reads as ``10 minutes``.  A bound that is a whole number of hours is named
+    in hours, else one that is a whole number of minutes in minutes, else in
+    seconds: ``5400`` is ``90 minutes``, not ``1.5 hours``, and ``90`` is
+    ``90 seconds``, not ``1.5 minutes``.
+
+    Args:
+        seconds: The bound in seconds.
+
+    Returns:
+        E.g. ``"10 minutes"``, ``"1 hour"`` or ``"90 seconds"``.
+
+    """
+    whole = round(seconds)
+    if whole and whole % _SECONDS_PER_HOUR == 0:
+        return _counted(whole // _SECONDS_PER_HOUR, "hour")
+    if whole and whole % _SECONDS_PER_MINUTE == 0:
+        return _counted(whole // _SECONDS_PER_MINUTE, "minute")
+    return _counted(whole, "second")
+
+
+def timeout_finish_warning(pages_kept: int, timeout_seconds: float) -> str:
+    """
+    Return the warning for a document finished because nobody answered.
+
+    A multi-page wait that times out with pages already kept finishes the
+    document rather than discarding it, but the operator never said it was
+    complete, so the upload carries this warning instead of reading as a
+    clean success.  Only a page count and a duration are interpolated.
+
+    Args:
+        pages_kept: How many pages the finished document holds.
+        timeout_seconds: The wait that ran out.
+
+    Returns:
+        The warning sentence.
+
+    """
+    return (
+        f"Finished after {pages_phrase(pages_kept)} because nobody answered "
+        f"within {duration_phrase(timeout_seconds)}; the document may be "
+        "missing pages."
+    )
+
+
+def cap_finish_warning(pages_kept: int, cap: int) -> str:
+    """
+    Return the warning for a document finished because it reached the page cap.
+
+    The cap stops a new pass from starting; it cannot cut one short, so the
+    finished document may hold more pages than the cap, and the sentence says
+    so honestly rather than claiming the document stopped at the cap.
+
+    Args:
+        pages_kept: How many pages the finished document holds.
+        cap: The page count at which no new pass starts.
+
+    Returns:
+        The warning sentence.
+
+    """
+    return (
+        f"Finished at {pages_phrase(pages_kept)}: no new scan starts once a "
+        f"document has {pages_phrase(cap)}. Scan any remaining pages as a new "
+        "document."
+    )
+
+
+def blank_timeout_finish_warning(pages_kept: int, timeout_seconds: float) -> str:
+    """
+    Return the warning for a document finished while blank pages went unanswered.
+
+    Nobody said whether to keep the pages that looked blank, so they were left
+    out and the document finished with the pages kept before them.
+
+    Args:
+        pages_kept: How many pages the finished document holds.
+        timeout_seconds: The wait that ran out.
+
+    Returns:
+        The warning sentence.
+
+    """
+    return (
+        f"Finished after {pages_phrase(pages_kept)} because nobody answered "
+        f"about the blank pages within {duration_phrase(timeout_seconds)}, so "
+        "they were left out; the document may be missing pages."
+    )
 
 
 def job_state_for(outcome: ScanOutcome) -> JobState:
