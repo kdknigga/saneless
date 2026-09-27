@@ -17,15 +17,23 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, override
 
+from saneless.config import ProfileConfig
 from saneless.pipeline import PassCoordinator
 from saneless.vocabulary import PassAnswer
+from tests.conftest import build_settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from pathlib import Path
 
+    from saneless.config import Settings
     from saneless.vocabulary import PassPrompt
 
-__all__ = ["ScriptedPassCoordinator"]
+__all__ = ["DUPLEX_PROFILE", "ScriptedPassCoordinator", "multi_page_settings"]
+
+# The name of the manual-duplex profile ``multi_page_settings`` adds, which a
+# multi-page scan must refuse.
+DUPLEX_PROFILE = "duplex"
 
 # The two answers that are not the operator's choice: the clock running out,
 # and saneless stopping.  A prompt never offers them, so a script may return
@@ -127,3 +135,40 @@ class ScriptedPassCoordinator(PassCoordinator):
 
         """
         return self._cause if self._last is PassAnswer.ABORT else None
+
+
+def multi_page_settings(
+    tmp_path: Path, *, detection: bool = False, timeout: int = 600
+) -> Settings:
+    """
+    Build settings for a multi-page run, every directory under ``tmp_path``.
+
+    The ``default`` profile is a flatbed, the headline multi-page case.  Beside
+    it sit an ADF profile, so the configuration never has just one profile,
+    and a manual-duplex profile named ``DUPLEX_PROFILE``, which a multi-page
+    scan must be refused on.  Scratch space and ``failed/`` sit on separate
+    subtrees, as ``build_settings`` arranges.
+
+    Args:
+        tmp_path: The test's own temporary directory.
+        detection: Whether the ``default`` profile has empty-page detection on.
+            Off by default, so a test about the loop is never also a test
+            about blank pages.
+        timeout: The operator-wait bound, in seconds, every prompt carries.
+
+    Returns:
+        A fresh Settings instance.
+
+    """
+    settings = build_settings(
+        tmp_path,
+        profiles={
+            "default": ProfileConfig(
+                source="Flatbed", enable_empty_page_detection=detection
+            ),
+            "adf": ProfileConfig(source="ADF"),
+            DUPLEX_PROFILE: ProfileConfig(source="ADF", duplex="manual"),
+        },
+    )
+    settings.output.operator_wait_timeout_seconds = timeout
+    return settings

@@ -2273,16 +2273,21 @@ class SaneBackend(ScannerBackend):
 
     def reinitialise(self) -> None:
         """
-        Restart this process's SANE before a scan job, or refuse to.
+        Restart this process's SANE before a scan job or a later pass, or refuse to.
 
         Called at the top of each scan job, under the scanner gate, before the
-        job's first open, and nowhere else.  After a saned restart the net
-        backend keeps its old control connection: ``sane_open`` in
-        ``backend/net.c`` checks the reply status but never drops or
-        reconnects a connection that has gone bad, so every later open in this
-        process fails with an I/O error until SANE is restarted.  Restarting
-        at each job gives every scan a fresh connection, which also covers a
-        saned restart between two jobs that no check would have seen.
+        job's first open; and before every pass of a multi-page scan after the
+        first, still under the gate the job holds, when the previous pass has
+        closed its device.  Nowhere else: the second pass of a manual-duplex
+        scan does not call it.  Either way no handle is open.  After a saned
+        restart the net backend keeps its old control connection:
+        ``sane_open`` in ``backend/net.c`` checks the reply status but never
+        drops or reconnects a connection that has gone bad, so every later
+        open in this process fails with an I/O error until SANE is restarted.
+        Restarting at each job gives every scan a fresh connection, which also
+        covers a saned restart between two jobs that no check would have seen,
+        and restarting before each later pass covers one during the wait for
+        the operator between passes.
 
         Two states refuse the restart, and both refuse before any SANE call,
         because the call itself is the hazard:

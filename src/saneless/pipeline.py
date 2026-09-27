@@ -39,6 +39,7 @@ from saneless.vocabulary import (
     PassPrompt,
     PassWait,
     ScanOutcome,
+    timeout_finish_warning,
 )
 from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace, has_pages_left
 
@@ -459,6 +460,31 @@ class _FlipContext:
     timeout: float
 
 
+@dataclass(frozen=True)
+class _MultiPageContext:
+    """
+    What ``_PipelineRun._scan_multi_page`` needs to ask between passes.
+
+    One record, built before the run starts, so a multi-page request that
+    cannot run is refused before the device is touched.
+
+    It carries the coordinator as non-Optional.
+    ``PipelineRequest.pass_coordinator`` is ``PassCoordinator | None`` because
+    a single-pass run legitimately has none, so the narrowing to "there is
+    one" happens exactly once, where this record is built, and the callee
+    never needs an ``assert`` (which ``S101`` bans in ``src/``) to prove it.
+
+    Attributes:
+        coordinator: The seam that answers every multi-page prompt.
+        timeout: Seconds each prompt may hold the pipeline, from
+            ``output.operator_wait_timeout_seconds``.
+
+    """
+
+    coordinator: PassCoordinator
+    timeout: float
+
+
 @dataclass
 class DeviceMemory:
     """
@@ -824,6 +850,25 @@ def _accepted_how(upload: UploadResult) -> str:
     return "had already been saved to the paperless-ngx consume folder"
 
 
+def _unlink_pages(records: Sequence[PageRecord]) -> None:
+    """
+    Delete the page files of a pass that was thrown away.
+
+    A thrown-away pass must leave no file behind: the guard, on a failure, and
+    the startup sweep, after a crash, both move every page file they find into
+    ``failed/``, so a leftover page would come back as a pass the operator
+    threw away.  A file already gone, or one that cannot be removed, does not
+    stop the rest from going.
+
+    Args:
+        records: The pass's page records, whose files are removed.
+
+    """
+    for record in records:
+        with contextlib.suppress(OSError):
+            record.path.unlink(missing_ok=True)
+
+
 @dataclass
 class _SpoolLedger:
     """
@@ -885,19 +930,14 @@ class _SpoolLedger:
         """
         Delete a thrown-away pass's page files, then stop tracking it.
 
-        A discarded pass must leave no file behind: the guard, on a failure,
-        and the startup sweep, after a crash, both move every page file they
-        find into ``failed/``, so a leftover page would come back as a pass
-        the operator threw away.  A file already gone, or one that cannot be
-        removed, does not stop the rest from going.
+        The files go through ``_unlink_pages``, which says why none may be
+        left behind.
 
         Args:
             sink: The sink the discarded pass spooled into.
 
         """
-        for record in sink.records:
-            with contextlib.suppress(OSError):
-                record.path.unlink(missing_ok=True)
+        _unlink_pages(sink.records)
         self.forget(sink)
 
     def spooled(self) -> list[tuple[str, tuple[PageRecord, ...]]]:
@@ -1040,6 +1080,71 @@ class _DuplexMismatch:
     fronts: Sequence[PageRecord]
     backs: Sequence[PageRecord]
     unreadable_sheets: int
+
+
+@dataclass(frozen=True)
+class _AcceptedPass:
+    """
+    One pass a multi-page document accepted, as Re-scan needs it undone.
+
+    Attributes:
+        sink: The sink the pass spooled into, whose files a Re-scan deletes.
+        pages: How many pages the pass added to the document, kept and
+            skipped together: the last ``pages`` records are this pass's.
+        kept: How many of them were kept.
+        rejected: How many fed sheets the pass could not read.
+
+    """
+
+    sink: SpooledPageSink
+    pages: int
+    kept: int
+    rejected: int
+
+
+@dataclass
+class _MultiPageDocument:
+    """
+    A multi-page document as it grows, pass by pass: the loop's mutable state.
+
+    Its own record rather than locals of the loop, so the pass loop's steps can
+    be separate methods and each stay within ruff's complexity limits.
+
+    Attributes:
+        records: Every accepted page, kept and skipped, in scan order.  The
+            positions below number this list, which is also what a failed run
+            keeps as the unfiltered document.
+        removed: The 1-based positions in ``records`` of pages skipped as blank.
+        passes: Every accepted pass, in scan order.
+        unreadable: How many fed sheets the accepted passes could not read.
+        warning: Why the document finished without the operator pressing
+            Finish, or None when they did.
+        prompts: The number of the last prompt put to the operator.
+
+    """
+
+    records: list[PageRecord] = field(default_factory=list)
+    removed: list[int] = field(default_factory=list)
+    passes: list[_AcceptedPass] = field(default_factory=list)
+    unreadable: int = 0
+    warning: str | None = None
+    prompts: int = 0
+
+    @property
+    def kept(self) -> int:
+        """How many pages the document holds: accepted and not skipped."""
+        return len(self.records) - len(self.removed)
+
+    def number_prompt(self) -> int:
+        """
+        Give the next prompt its number, one more than the last.
+
+        Returns:
+            The new prompt's 1-based number within the run.
+
+        """
+        self.prompts += 1
+        return self.prompts
 
 
 def _duplex_resolution(front: ScanBatch, back: ScanBatch) -> int:
@@ -1235,6 +1340,88 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
     )
 
 
+def _multi_page_context(
+    request: PipelineRequest, profile: ProfileConfig, settings: Settings
+) -> _MultiPageContext | None:
+    """
+    Build the context a multi-page run asks its questions with, or refuse it.
+
+    Called only by ``run_pipeline``, before any scanner contact, for the same
+    reason ``_flip_context`` is: a request that cannot run must never touch
+    the device.  The web form and the CLI refuse both combinations first;
+    this is the last line, so a request that reached the pipeline some other
+    way is refused just the same.
+
+    Args:
+        request: The pipeline request.
+        profile: The request's scan profile.
+        settings: Application settings, for
+            ``output.operator_wait_timeout_seconds``.
+
+    Returns:
+        None for a single-pass request; otherwise the coordinator, narrowed to
+        non-Optional, with the configured timeout.
+
+    Raises:
+        ConfigError: If a multi-page request names a manual-duplex profile, or
+            carries no pass coordinator.
+
+    """
+    if not request.multi_page:
+        return None
+    if profile.duplex == "manual":
+        # Each pass of a manual-duplex scan is itself two passes and a flip,
+        # and nothing here knows how a "next page" would fit between them.
+        msg = (
+            f"Profile '{request.profile_name}' is manual duplex, and a "
+            "multi-page scan is not available with manual duplex"
+        )
+        raise ConfigError(msg)
+    if request.pass_coordinator is None:
+        # With no coordinator nothing could answer the first prompt, and
+        # scanning anyway would mean deciding for the operator.
+        msg = (
+            f"A multi-page scan with profile '{request.profile_name}' needs a "
+            "pass coordinator to ask whether there is another page, and none "
+            "was supplied"
+        )
+        raise ConfigError(msg)
+    return _MultiPageContext(
+        coordinator=request.pass_coordinator,
+        timeout=settings.output.operator_wait_timeout_seconds,
+    )
+
+
+# The two ways a multi-page wait can end that no prompt offers, because they
+# are not the operator's choice: the clock running out, and saneless stopping.
+_ENDINGS_NOBODY_OFFERS: Final = frozenset(
+    {PassAnswer.TIMED_OUT, PassAnswer.INTERRUPTED}
+)
+
+
+def _unoffered_answer(answer: PassAnswer, number: int) -> ScanError:
+    """
+    Build the failure for a coordinator that answered off the prompt's menu.
+
+    A ``ScanError`` rather than obedience: the offered set is how a stale or
+    forged answer is refused, so an answer outside it is a broken coordinator,
+    and nobody chose it.  The guard keeps the accepted pages.
+
+    Args:
+        answer: What the coordinator answered.
+        number: The prompt it answered.
+
+    Returns:
+        The error to raise, naming the answer and the prompt.
+
+    """
+    msg = (
+        f"The multi-page coordinator answered {answer.value} to prompt "
+        f"{number}, which did not offer it"
+    )
+    return ScanError(msg)
+
+
 def _resolve_device(
     scanner: ScannerBackend,
     settings: Settings,
@@ -1308,7 +1495,7 @@ class _PipelineRun:
     failure and carries on.  An observer is somebody watching the run, so its
     fault can never end one.
 
-    A dataclass for its constructor alone: the run needs nine values, and a
+    A dataclass for its constructor alone: the run needs eleven values, and a
     hand-written ``__init__`` taking them would break ruff's ``PLR0913``
     argument limit, which this project neither raises nor suppresses.  Every
     one is keyword-only.
@@ -1323,6 +1510,8 @@ class _PipelineRun:
         scan_settings: The scan settings every pass runs with.
         flip: The flip coordinator and its timeout for a manual-duplex run;
             None for every other run.
+        multi_page: The pass coordinator and its timeout for a multi-page
+            run; None for every other run.
         workspace: The job's locked workspace directory, which holds the
             spool and the assembled PDFs and is removed when the run ends.
         keep_workspace: Leaves the workspace in place when the run ends, for
@@ -1342,6 +1531,7 @@ class _PipelineRun:
     device_id: str
     scan_settings: ScanSettings
     flip: _FlipContext | None
+    multi_page: _MultiPageContext | None
     workspace: Path
     keep_workspace: Callable[[], bool]
     ledger: _SpoolLedger = field(init=False)
@@ -1393,8 +1583,8 @@ class _PipelineRun:
             How the run resolved.
 
         Raises:
-            ScanCancelledError: If the operator cancelled at the flip prompt;
-                nothing is kept.
+            ScanCancelledError: If the operator cancelled at the flip prompt
+                or at a multi-page prompt; nothing is kept.
             ScanInterrupted: If a signal or a server shutdown interrupted the
                 run; what it had is kept, and the note says where.
             Exception: Any other failure, re-raised as itself with the note.
@@ -1545,15 +1735,11 @@ class _PipelineRun:
             self.request.profile_name,
             self.device_id,
         )
-        acquired = (
-            self._scan_simplex()
-            if self.flip is None
-            else self._scan_manual_duplex(self.flip)
-        )
+        acquired = self._acquire()
         # A match with assert_never, not a dict or an isinstance chain, on
         # purpose: a variant missing from a dict draws no diagnostic from
         # either ty or pyrefly, while the same omission in a match is caught by
-        # both, at edit time, before a third result type can fall silently
+        # both, at edit time, before a new result type can fall silently
         # through an else.
         match acquired:
             case ScanBatch():
@@ -1562,8 +1748,29 @@ class _PipelineRun:
                 # Deliberately skips the blank-page filter -- see
                 # _finish_mismatch for why.
                 return self._finish_mismatch(acquired)
+            case _MultiPageDocument():
+                # Also skips the automatic blank-page filter -- see
+                # _finish_multi_page for why.
+                return self._finish_multi_page(acquired)
             case _:
                 assert_never(acquired)
+
+    def _acquire(self) -> ScanBatch | _DuplexMismatch | _MultiPageDocument:
+        """
+        Run whichever acquisition strategy this run's request asked for.
+
+        ``run_pipeline`` never builds both contexts: a multi-page request on a
+        manual-duplex profile is refused before the run exists.
+
+        Returns:
+            What acquisition produced.
+
+        """
+        if self.multi_page is not None:
+            return self._scan_multi_page(self.multi_page)
+        if self.flip is None:
+            return self._scan_simplex()
+        return self._scan_manual_duplex(self.flip)
 
     def _notify(self, event: PipelineEvent) -> None:
         """
@@ -1837,6 +2044,273 @@ class _PipelineRun:
             pages_rejected=rejected,
         )
 
+    def _scan_multi_page(self, context: _MultiPageContext) -> _MultiPageDocument:
+        """
+        Build one document from as many passes as the operator asks for.
+
+        After every accepted pass the operator is asked what happens next, and
+        nothing more is scanned without an answer: Scan next starts another
+        pass, Re-scan throws the last pass away and scans it again at once,
+        Finish ends the document, and Abort cancels the job.  A prompt nobody
+        answers in time finishes the document with what it has, but warned,
+        because nobody said it was complete.
+
+        Every pass spools under its own label -- ``a-00001``, ``a-00002``, and
+        so on -- because a sink numbers its files from 1, so a label shared
+        between passes would have each pass overwrite the one before.  The
+        labels also sort into scan order, which is the order the startup
+        sweep rebuilds a crashed run's pages in.
+
+        Everything this runs is inside ``execute``'s one guard, and the loop
+        keeps the guard informed rather than opening a window of its own.  An
+        accepted pass joins ``artefacts.document`` straight away, while the
+        stage is still ``ACQUIRING``, and a pass in flight stays registered
+        with the ledger, so a failure or an interruption at any point keeps
+        the accepted pages as one PDF and the pass in flight beside it.
+
+        Only the first page's sink carries the thumbnail observer, and only
+        while no page is kept, so the job's preview stays the document's first
+        page and no later pass replaces it.
+
+        Args:
+            context: The pass coordinator, and the timeout on every prompt.
+
+        Returns:
+            The finished document, with the warning that explains a finish
+            the operator did not press, if any.
+
+        Raises:
+            ScanCancelledError: If the operator aborts at a prompt.  Nothing
+                is kept.
+            ScanInterrupted: If saneless is stopping; every accepted page is
+                kept.
+            ScanError: If a prompt broke, or the coordinator answered with
+                something the prompt did not offer; or a pass failed.
+
+        """
+        document = _MultiPageDocument()
+        pass_number = 0
+        while True:
+            pass_number += 1
+            self._scan_pass(document, pass_number)
+            answer = self._ask(context, self._next_pass_prompt(context, document))
+            # A match with assert_never rather than an if-chain, so a new
+            # PassAnswer member fails ty and pyrefly here at edit time instead
+            # of falling through into another pass.
+            match answer:
+                case PassAnswer.NEXT:
+                    continue
+                case PassAnswer.RESCAN:
+                    self._discard_last_pass(document)
+                case PassAnswer.FINISH:
+                    return document
+                case PassAnswer.TIMED_OUT:
+                    logger.warning(
+                        "Nobody answered multi-page prompt %d within %g seconds; "
+                        "finishing the document with %d page(s)",
+                        document.prompts,
+                        context.timeout,
+                        document.kept,
+                    )
+                    document.warning = timeout_finish_warning(
+                        document.kept, context.timeout
+                    )
+                    return document
+                case (
+                    PassAnswer.ABORT
+                    | PassAnswer.INTERRUPTED
+                    | PassAnswer.SKIP_BLANKS
+                    | PassAnswer.KEEP_BLANKS
+                ):
+                    # _ask has already ended the run for an abort or a stop,
+                    # and refused the blank-page answers, which this prompt
+                    # never offers; reaching this arm means that changed.
+                    raise _unoffered_answer(answer, document.prompts)
+                case _:
+                    assert_never(answer)
+
+    def _scan_pass(self, document: _MultiPageDocument, pass_number: int) -> None:
+        """
+        Scan one pass of a multi-page document, and accept it.
+
+        Args:
+            document: The document the pass is accepted into.
+            pass_number: The pass's 1-based number within the run, counting
+                passes that were later thrown away.
+
+        Raises:
+            ScanError: ``No pages were scanned`` if the pass returned no pages.
+
+        """
+        if pass_number > 1:
+            # Takes the operator's prompt off the screen as the pass starts.
+            self._notify(PipelineEvent.SCANNING)
+        thumbnail = self._thumbnail_observer() if document.kept == 0 else None
+        sink = self._sink(f"{_SPOOL_LABEL_A}-{pass_number:05d}", thumbnail)
+        # Registered before the pass runs, as every pass is: a fault part-way
+        # through it has to find the sink that has been collecting its pages.
+        self.ledger.register(preservation.PARTIAL_SUFFIX, sink)
+        if pass_number > 1:
+            # A scanner host restarted during a long wait between passes
+            # would otherwise leave SANE holding a stale control connection,
+            # and every later pass would fail with an I/O error.  This is the
+            # restart made at the top of every job, made again before each
+            # later pass, when no device handle is open: scan_pages closes the
+            # device at the end of every pass.
+            self.scanner.reinitialise()
+        batch = self.scanner.scan_pages(self.device_id, self.scan_settings, sink)
+        _require_pages(batch)
+        self._accept_pass(document, sink, batch)
+
+    def _accept_pass(
+        self, document: _MultiPageDocument, sink: SpooledPageSink, batch: ScanBatch
+    ) -> None:
+        """
+        Add a finished pass's pages to the document the guard keeps.
+
+        The ledger stops tracking the pass, because its pages now belong to the
+        document; tracking them in both places would keep them twice.
+
+        Args:
+            document: The document the pass joins.
+            sink: The sink the pass spooled into.
+            batch: What the pass produced.
+
+        """
+        pages = len(batch.pages)
+        document.records.extend(batch.pages)
+        document.passes.append(
+            _AcceptedPass(
+                sink=sink, pages=pages, kept=pages, rejected=batch.pages_rejected
+            )
+        )
+        document.unreadable += batch.pages_rejected
+        self.ledger.unreadable_sheets += batch.pages_rejected
+        self.artefacts.document = tuple(document.records)
+        self.ledger.forget(sink)
+        logger.info(
+            "Multi-page pass %d: scanned %d page(s); %d kept so far",
+            len(document.passes),
+            pages,
+            document.kept,
+        )
+
+    def _discard_last_pass(self, document: _MultiPageDocument) -> None:
+        """
+        Throw the last accepted pass away, pages, files and all.
+
+        The document the guard keeps is updated before a file is deleted, so
+        an interruption in between can never keep a document whose pages are
+        gone.  A thrown-away pass is not counted as scanned: the numbering
+        matches the document the operator is building.
+
+        Args:
+            document: The document to take the pass back out of.
+
+        """
+        last = document.passes.pop()
+        first = len(document.records) - last.pages
+        del document.records[first:]
+        document.removed = [
+            position for position in document.removed if position <= first
+        ]
+        document.unreadable -= last.rejected
+        self.ledger.unreadable_sheets -= last.rejected
+        self.artefacts.document = tuple(document.records)
+        _unlink_pages(last.sink.records)
+        logger.info(
+            "Re-scan: discarded the last pass's %d page(s); %d kept",
+            last.pages,
+            document.kept,
+        )
+
+    def _next_pass_prompt(
+        self, context: _MultiPageContext, document: _MultiPageDocument
+    ) -> PassPrompt:
+        """
+        Build the question asked after every pass: is there another page.
+
+        Finish is offered only while a page is kept, so a document of no pages
+        can never be finished by a press.
+
+        Args:
+            context: The timeout every prompt carries.
+            document: The document so far, whose last pass the prompt reports.
+
+        Returns:
+            The numbered prompt.
+
+        """
+        offered = {PassAnswer.NEXT, PassAnswer.RESCAN, PassAnswer.ABORT}
+        if document.kept > 0:
+            offered.add(PassAnswer.FINISH)
+        last = document.passes[-1] if document.passes else None
+        return PassPrompt(
+            number=document.number_prompt(),
+            wait=PassWait.NEXT_PASS,
+            pages_kept=document.kept,
+            offered=frozenset(offered),
+            timeout_seconds=context.timeout,
+            last_pass_pages=last.pages if last is not None else 0,
+            last_pass_kept=last.kept if last is not None else 0,
+        )
+
+    def _ask(self, context: _MultiPageContext, prompt: PassPrompt) -> PassAnswer:
+        """
+        Announce the wait, put ``prompt`` to the operator, and end the run if told.
+
+        The waiting event is reported before the coordinator is asked, so the
+        job says what it is waiting on for the whole of the wait.
+
+        Never call this inside a ``try`` that wraps a scan: a prompt that broke
+        must not be mistaken for a scanner fault.
+
+        Args:
+            context: The coordinator to ask.
+            prompt: The question, and the only answers it accepts.
+
+        Returns:
+            The answer, when it is one the caller acts on: a member of
+            ``prompt.offered`` other than ``ABORT``, or ``TIMED_OUT``.
+
+        Raises:
+            ScanError: If the coordinator answered with something the prompt
+                did not offer, or answered ``ABORT`` because its prompt broke.
+            ScanCancelledError: If the operator aborted.
+            ScanInterrupted: If saneless is stopping.
+
+        """
+        self._notify(_wait_event(prompt.wait))
+        answer = context.coordinator.ask(prompt)
+        logger.info("Multi-page prompt %d answered %s", prompt.number, answer)
+        if answer not in prompt.offered and answer not in _ENDINGS_NOBODY_OFFERS:
+            # Set membership, not trust: a coordinator that answers off the
+            # menu -- Finish with no page kept, say -- is refused, not obeyed.
+            raise _unoffered_answer(answer, prompt.number)
+        if answer is PassAnswer.ABORT:
+            cause = context.coordinator.abort_cause
+            if cause is not None:
+                msg = f"Multi-page prompt failed: {describe(cause)}"
+                raise ScanError(msg) from cause
+            # The one ending that keeps NOTHING, and the asymmetry is policy
+            # rather than oversight: the pages are kept after a timeout, a
+            # broken prompt or a stop precisely because nobody chose to stop,
+            # and are deliberately not kept here because somebody did.
+            # ``failed/`` is never pruned automatically, so filing an abandoned
+            # scan into it would leave the operator tidying up after a
+            # decision they already made.  ``execute``'s guard lets this
+            # exception through untouched, by type; do not turn it into a
+            # ScanError to "simplify" the handler.
+            msg = "Multi-page scan cancelled at the prompt"
+            raise ScanCancelledError(msg)
+        if answer is PassAnswer.INTERRUPTED:
+            # The server is stopping.  That is nobody's decision to throw the
+            # scan away, so it is an interruption rather than a cancel, and
+            # the guard keeps every accepted page.
+            msg = "The server is stopping"
+            raise ScanInterrupted(msg)
+        return answer
+
     def _finish_document(self, batch: ScanBatch) -> ScanResult:
         """
         Filter, assemble and deliver one document.
@@ -1893,6 +2367,69 @@ class _PipelineRun:
         )
         self._notify(PipelineEvent.DONE)
         logger.info("Pipeline complete for %r", self.request.title)
+        return result
+
+    def _finish_multi_page(self, document: _MultiPageDocument) -> ScanResult:
+        """
+        Assemble and deliver a multi-page document, without filtering it again.
+
+        The automatic blank-page filter does not run here, on purpose.  Every
+        page in the document is one the loop accepted, so a page kept there
+        must never be removed afterwards, and a document of pages kept on
+        purpose must never be failed as all blank.
+
+        Args:
+            document: The finished document.
+
+        Returns:
+            How the run resolved.  Its warning says why the document finished
+            without the operator pressing Finish, beside any delivery or
+            unreadable-sheet warning.
+
+        Raises:
+            AllPagesBlankError: If no page is kept; the guard keeps the
+                skipped pages as one PDF.
+
+        """
+        records = tuple(document.records)
+        # Recorded before anything can raise, so a failure from here on --
+        # the zero-kept verdict included -- keeps the whole document as one
+        # PDF, in scan order, and never a pass beside it.
+        self.artefacts.stage = preservation.RunStage.FILTERING
+        self.artefacts.document = records
+        if document.kept == 0:
+            msg = (
+                f"All {len(records)} page(s) of the multi-page scan were "
+                "skipped as blank, so nothing was uploaded"
+            )
+            raise AllPagesBlankError(msg)
+        removed = tuple(sorted(document.removed))
+        # A set for the membership test: a document can run to several
+        # hundred pages, and a tuple would be searched once per page.
+        skipped = frozenset(removed)
+        kept = [
+            record
+            for position, record in enumerate(records, start=1)
+            if position not in skipped
+        ]
+        rejected_warning = _rejected_pages_warning(document.unreadable)
+        pdf_path = self._assemble(kept)
+        outcome, warning = self._deliver_document(pdf_path)
+        result = ScanResult(
+            outcome=outcome,
+            pages_scanned=len(records),
+            pages_removed=len(removed),
+            pages_uploaded=len(kept),
+            warning=_join_warnings(warning, rejected_warning, document.warning),
+            removed_positions=removed,
+        )
+        self._notify(PipelineEvent.DONE)
+        logger.info(
+            "Pipeline complete for %r (%d page(s) across %d pass(es))",
+            self.request.title,
+            len(kept),
+            len(document.passes),
+        )
         return result
 
     def _assemble(self, records: Sequence[PageRecord]) -> Path:
@@ -2154,18 +2691,24 @@ def run_pipeline(
 
     Raises:
         ConfigError: If the profile or device is not configured, a manual
-            duplex profile is run with no flip coordinator, or the working
-            directory under ``tmp_dir`` cannot be created or measured. Nothing
-            has been scanned yet, so nothing is kept.
+            duplex profile is run with no flip coordinator, a multi-page scan
+            is asked for on a manual duplex profile or with no pass
+            coordinator, or the working directory under ``tmp_dir`` cannot be
+            created or measured. Nothing has been scanned yet, so nothing is
+            kept.
         ScanCancelledError: If the operator aborts a manual duplex scan at the
-            flip prompt. Nothing is kept.
-        AllPagesBlankError: If empty-page detection judged every page blank.
-            Nothing is uploaded, and the unfiltered pages are kept as one PDF.
-        ScanInterrupted: If a signal or a server shutdown interrupted the run.
-            What it had is kept, like any failure.
+            flip prompt, or a multi-page scan at any of its prompts. Nothing
+            is kept.
+        AllPagesBlankError: If empty-page detection judged every page blank,
+            or a multi-page scan ended with no page kept. Nothing is uploaded,
+            and the unfiltered pages are kept as one PDF.
+        ScanInterrupted: If a signal or a server shutdown interrupted the run,
+            a multi-page prompt included. What it had is kept, like any
+            failure.
         ScanError: If scanning fails; ``No pages were scanned`` if a scan pass
-            returned no pages; or if a manual duplex flip prompt fails or its
-            wait times out.
+            returned no pages; if a manual duplex flip prompt fails or its
+            wait times out; or if a multi-page prompt fails or is answered
+            with something it did not offer.
         PdfError: If the PDF cannot be assembled, or the free space is under
             twice the spooled pages plus ``min_free_space_mb``, which is
             checked before assembly starts.
@@ -2189,7 +2732,9 @@ def run_pipeline(
     # _resolve_device, which calls get_devices() when scanner.device is empty,
     # so a request that cannot run never touches the device.  Refusing inside
     # _scan_manual_duplex would be too late -- that method scans pass A
-    # first, so it would use up a full feeder pass before failing.
+    # first, so it would use up a full feeder pass before failing.  The
+    # multi-page refusals come first and for the same reason.
+    multi_page = _multi_page_context(request, profile, settings)
     manual_duplex = profile.duplex == "manual"
     flip = _flip_context(request, settings) if manual_duplex else None
 
@@ -2223,6 +2768,7 @@ def run_pipeline(
             device_id=device_id,
             scan_settings=scan_settings,
             flip=flip,
+            multi_page=multi_page,
             workspace=workspace.path,
             keep_workspace=workspace.keep,
         )
