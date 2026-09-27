@@ -51,12 +51,14 @@ Settings are resolved in this order (highest to lowest priority):
 | `SANELESS_OUTPUT__HISTORY_MAX_ROWS` | `output.history_max_rows` | int | `500` |
 | `SANELESS_OUTPUT__PAPERLESS_TASK_TIMEOUT` | `output.paperless_task_timeout` | int | `300` |
 | `SANELESS_OUTPUT__PAPERLESS_CACHE_TTL_SECONDS` | `output.paperless_cache_ttl_seconds` | int | `60` |
-| `SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS` | `output.flip_timeout_seconds` | int | `600` |
+| `SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS` | `output.operator_wait_timeout_seconds` | int | `600` |
 | `SANELESS_OUTPUT__MIN_FREE_SPACE_MB` | `output.min_free_space_mb` | int | `500` |
 | `SANELESS_OUTPUT__WEB_HOST` | `output.web_host` | string | `0.0.0.0` (the default: all network interfaces) |
 | `SANELESS_OUTPUT__WEB_PORT` | `output.web_port` | int | `8080` |
 
 `SANELESS_OUTPUT__MIN_FREE_SPACE_MB` is the free disk space saneless keeps in reserve for assembling the PDF. It is checked twice: once before a scan starts, and again before each page is written to disk, against that page's size *plus* this reserve. A scan that runs out of room fails naming the page number and the path, and the pages already scanned are preserved. See [`[output]`](configuration.md#output) for every field in this section.
+
+`SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS` was renamed from `SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS`, with no alias: the old variable is rejected at startup like any other unknown `SANELESS_OUTPUT__` variable, and the error suggests `operator_wait_timeout_seconds`.
 
 ### Web
 

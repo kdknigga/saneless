@@ -1624,7 +1624,7 @@ class ScanWorker:
                     # stop() may have run before this job had a coordinator,
                     # found nothing to answer, and returned to its join.
                     # Interrupt now, or the wait would hold the thread for
-                    # flip_timeout_seconds after shutdown began.
+                    # operator_wait_timeout_seconds after shutdown began.
                     coordinator.interrupt_for_shutdown()
             # Only a write that landed advances persisted_state, so a state
             # whose write failed is tried again at the next event instead of

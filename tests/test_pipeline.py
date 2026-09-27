@@ -1700,7 +1700,7 @@ class TestManualDuplex:
         ``AWAITING_FLIP`` is announced before the wait and ``SCANNING_REVERSE``
         only after it, and the timeout handed over is the configured one.
         """
-        default_settings.output.flip_timeout_seconds = 42
+        default_settings.output.operator_wait_timeout_seconds = 42
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1829,7 +1829,7 @@ class TestManualDuplex:
     ) -> None:
         """TIMED_OUT fails the run naming the flip wait and its timeout (DPLX-05)."""
         _duplex_settings(default_settings, tmp_path)
-        default_settings.output.flip_timeout_seconds = 17
+        default_settings.output.operator_wait_timeout_seconds = 17
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
@@ -4009,7 +4009,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
     ) -> None:
         """Nobody chose to stop, so the fronts are kept (D-10, Phase 28 D-02)."""
         failed_dir = _duplex_settings(default_settings, tmp_path)
-        default_settings.output.flip_timeout_seconds = 17
+        default_settings.output.operator_wait_timeout_seconds = 17
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
             [distinct_page(index) for index in range(3)]

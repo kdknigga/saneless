@@ -273,7 +273,7 @@ def _settings(tmp_path: Path) -> Settings:
             tmp_dir=str(tmp_path / "scratch"),
             data_dir=str(data_dir),
             log_file=str(tmp_path / "logs" / "saneless.log"),
-            flip_timeout_seconds=_FLIP_TIMEOUT_SECONDS,
+            operator_wait_timeout_seconds=_FLIP_TIMEOUT_SECONDS,
         ),
         profiles={
             "default": ProfileConfig(),

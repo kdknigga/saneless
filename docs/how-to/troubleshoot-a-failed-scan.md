@@ -49,10 +49,10 @@ What the common cases mean:
 - **Every page looked blank.** This is not a scanner error and does not exit 1: the scanner
   returned pages and empty-page detection removed all of them. It exits 8; see
   [Every page looked blank](#every-page-looked-blank-exit-8).
-- **The flip wait timed out.** A manual duplex scan waited `flip_timeout_seconds` for someone to
-  flip the stack and nobody answered. A timeout is a failure, not a cancel. The front sides the
-  first pass already scanned are kept: saneless assembles them into a PDF under `failed/` in its
-  data directory and names the path in the error. See
+- **The flip wait timed out.** A manual duplex scan waited `operator_wait_timeout_seconds` for
+  someone to flip the stack and nobody answered. A timeout is a failure, not a cancel. The front
+  sides the first pass already scanned are kept: saneless assembles them into a PDF under
+  `failed/` in its data directory and names the path in the error. See
   [Manual Duplex](set-up-adf-duplex.md#manual-duplex).
 - **The flip prompt failed.** Reading your answer failed while `saneless scan` was asking you to
   flip the stack, for example with an I/O error or input that could not be decoded. The cause is

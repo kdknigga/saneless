@@ -774,15 +774,18 @@ class OutputConfig(BaseModel):
     history_max_rows: int = 500
     paperless_task_timeout: int = 300
     paperless_cache_ttl_seconds: int = 60
-    # How long a manual-duplex job waits for the operator to flip the stack.
+    # The one bound on every wait for a person: the manual-duplex flip, and
+    # each prompt of a multi-page scan. The outcomes differ: a flip that times
+    # out fails the job, while a multi-page wait that times out finishes the
+    # document with the pages it has.
     # A config key, unlike the scan-side module constants
     # (_DEFAULT_PAGE_TIMEOUT_SECONDS, _MAX_ADF_PAGES): this is the only timeout
     # that waits on a human rather than a machine, and ten minutes is a guess
     # about someone else's household. Bounded at load: zero or a negative value
     # would fail every manual-duplex job right after pass A, and a value above
     # threading.TIMEOUT_MAX makes Event.wait raise OverflowError at the same
-    # point. One day is the ceiling -- far beyond any real flip.
-    flip_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
+    # point. One day is the ceiling -- far beyond any real wait.
+    operator_wait_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     # A TCP port number. Bounded at load because the resolver truncates a

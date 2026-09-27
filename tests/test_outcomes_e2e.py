@@ -40,7 +40,7 @@ together sleep for well under a second, using only seams that already exist:
 * ``paperless_task_timeout`` is 0 for the poll-timeout case, so ``poll_task``'s
   monotonic deadline has already passed when the first poll comes back without
   a terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
-* ``flip_timeout_seconds`` is 1 for the flip-timeout case, the smallest value
+* ``operator_wait_timeout_seconds`` is 1 for the flip-timeout case, the smallest value
   config accepts, so the flip wait costs one second -- the only wall clock
   this module spends.  See ``_FLIP_TIMEOUT_BUDGET``.
 * The other cases reach a terminal status, or fall back, on the first
@@ -368,7 +368,7 @@ class _Case:
         scan_passes: Page count per scan_pages call.  Two entries means two
             passes, and two different numbers means a duplex mismatch.
         task_timeout: settings.output.paperless_task_timeout for this case.
-        flip_timeout: settings.output.flip_timeout_seconds for this case.
+        flip_timeout: settings.output.operator_wait_timeout_seconds for this case.
         with_consume_dir: Whether the client is given a consume directory.
         awaits_flip: Whether the run parks in AWAITING_FLIP at all.
         operator_flips: Whether the test answers the flip prompt with
@@ -624,7 +624,7 @@ def _build_settings(
             data_dir=str(data_dir),
             log_file=str(tmp_path / "logs" / "saneless.log"),
             paperless_task_timeout=case.task_timeout,
-            flip_timeout_seconds=case.flip_timeout,
+            operator_wait_timeout_seconds=case.flip_timeout,
         ),
         profiles={
             # Settings' field validator requires this one.  Only the worker

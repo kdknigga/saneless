@@ -850,7 +850,9 @@ _FLIP_PROMPT_FRAGMENT = "Flip the stack"
 _FLIP_CANCEL_LINE = "Manual duplex scan cancelled at the flip prompt"
 
 
-def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Settings:
+def _duplex_settings(
+    tmp_path: Path, operator_wait_timeout_seconds: int = 600
+) -> Settings:
     """
     Build settings with a manual-duplex profile, writing only under ``tmp_path``.
 
@@ -860,7 +862,7 @@ def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Setting
 
     Args:
         tmp_path: The pytest temporary directory for tmp, data and log files.
-        flip_timeout_seconds: The flip-wait bound, in seconds.
+        operator_wait_timeout_seconds: The flip-wait bound, in seconds.
 
     Returns:
         Settings whose ``duplex`` profile is manual duplex on a feeder source.
@@ -872,7 +874,7 @@ def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Setting
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
             log_file=str(tmp_path / "saneless.log"),
-            flip_timeout_seconds=flip_timeout_seconds,
+            operator_wait_timeout_seconds=operator_wait_timeout_seconds,
         ),
         profiles={
             "default": ProfileConfig(),
@@ -1230,7 +1232,7 @@ class TestManualDuplexPrompt:
         WR-08: an unexpected prompt failure ends the wait now, as ``ABORTED``.
 
         A prompt thread that died on anything but ``click.Abort`` used to leave
-        the calling thread waiting out the whole ``flip_timeout_seconds`` and
+        the calling thread waiting out the whole ``operator_wait_timeout_seconds`` and
         then report that nobody confirmed the flip, which was false.  It is an
         abort, not a fourth outcome (D-09), and the traceback in the log carries
         the real cause.  The failure itself is kept as ``abort_cause``, so the
@@ -1349,7 +1351,7 @@ class TestManualDuplexPrompt:
         ``wait_for_flip(0)`` with nobody answering resolves ``TIMED_OUT``.
 
         The coordinator's own contract, independent of the config bounds that
-        keep zero out of ``flip_timeout_seconds`` (WR-01): its ``timeout``
+        keep zero out of ``operator_wait_timeout_seconds`` (WR-01): its ``timeout``
         argument is the zero-cost seam, so no wall clock is spent here.
         """
         release = threading.Event()
@@ -1376,7 +1378,7 @@ class TestManualDuplexPrompt:
         An answer that never arrives fails the job on the flip wait (D-19).
 
         The timeout is one second, the smallest value config accepts: zero is
-        no longer a legal ``flip_timeout_seconds`` (WR-01), and the field is
+        no longer a legal ``operator_wait_timeout_seconds`` (WR-01), and the field is
         typed ``int``, so a fractional float is rejected too.  One second of
         wall clock buys the whole ``scan`` command end to end -- the bounded
         wait expires and ``TIMED_OUT`` is claimed before pass B.  The
@@ -1401,7 +1403,7 @@ class TestManualDuplexPrompt:
         uploads: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_duplex_settings(tmp_path, flip_timeout_seconds=1),
+            settings=_duplex_settings(tmp_path, operator_wait_timeout_seconds=1),
             scanner_cls=_counting_scanner(calls),
             paperless_cls=_recording_paperless(uploads),
         )

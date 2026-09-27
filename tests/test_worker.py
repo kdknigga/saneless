@@ -1972,7 +1972,7 @@ class TestWorkerStopAndSubmit:
         D-07: a stop at the flip prompt is an interruption, not a cancel.
 
         stop() answers the open wait with ``INTERRUPTED``, so the thread exits
-        at once rather than after ``flip_timeout_seconds``.  Nobody chose to
+        at once rather than after ``operator_wait_timeout_seconds``.  Nobody chose to
         throw the scan away, so pass A's fronts are kept as a ``(fronts)`` PDF
         in ``failed/``.  The row says the server stopped the scan and where
         the fronts went, with no category, and it is not logged as a failure.
@@ -2208,7 +2208,7 @@ class TestWorkerStopAndSubmit:
         """
         scanner = _GatedScanner(frozenset({1}))
         settings = isolated_duplex_settings
-        assert settings.output.flip_timeout_seconds > _STATE_BUDGET * 10
+        assert settings.output.operator_wait_timeout_seconds > _STATE_BUDGET * 10
         states_seen: list[JobState] = []
         store = JobStore()
         original_update = store.update_state
@@ -7382,7 +7382,7 @@ class TestProgressWriteFailures:
         """
         caplog.set_level(logging.WARNING, logger="saneless.worker")
         settings = isolated_duplex_settings
-        settings.output.flip_timeout_seconds = _SHORT_FLIP_TIMEOUT
+        settings.output.operator_wait_timeout_seconds = _SHORT_FLIP_TIMEOUT
         scanner = _CountedPassScanner(fronts=2, backs=2)
         store = JobStore()
         updates = _FailingStateWrite(
