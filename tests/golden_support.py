@@ -40,6 +40,7 @@ import threading
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import MappingProxyType
 from typing import TYPE_CHECKING, override
 from urllib.parse import parse_qs, urlsplit
 
@@ -49,10 +50,11 @@ from PIL import Image, ImageDraw
 
 from saneless.logging_config import configure_logging
 from saneless.paperless import PaperlessClient
+from tests.blank_fixtures import tinted_blank
 from tests.conftest import StubScannerBackend, scan_batch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
+    from collections.abc import Callable, Collection, Generator, Mapping, Sequence
     from pathlib import Path
 
     from saneless.scanner.base import PageRecord, PageSink, ScanBatch, ScanSettings
@@ -159,6 +161,16 @@ def embedded_streams(pdf: bytes | Path) -> list[bytes]:
     return streams
 
 
+# The resolution ``DistinctPageScanner`` draws a blank page at: small, so the
+# noisy paper spools quickly, and large enough that it still measures blank.
+_BLANK_PAGE_DPI = 100
+
+# ``DistinctPageScanner``'s default for ``fail_on``: no call fails.  A shared
+# read-only mapping rather than a ``{}`` default, which every call would share
+# and could mutate.
+_NO_FAILURES: Mapping[int, BaseException] = MappingProxyType({})
+
+
 class DistinctPageScanner(StubScannerBackend):
     """
     A scanner that feeds pages it can later identify, one pass per call.
@@ -172,6 +184,12 @@ class DistinctPageScanner(StubScannerBackend):
     sink has written it, because the files live in the job workspace and that
     is deleted when ``run_pipeline`` returns.
 
+    Two options play the ways a pass of a multi-page document goes wrong.
+    ``fail_on`` makes a call raise *after* it has spooled its pages, the way a
+    jam part way through a feed leaves the pages before it on disk.  ``blank``
+    spools the named page indices as blank paper instead of a distinct page,
+    so the pipeline's blank-page judgement sees a page it would remove.
+
     The ``host`` parameter makes the class usable wherever the CLI builds its
     ``SaneBackend(host=...)``; a test hands the CLI a factory that returns one
     prepared instance.
@@ -183,6 +201,8 @@ class DistinctPageScanner(StubScannerBackend):
         *,
         passes: Sequence[Sequence[int]] = ((0,),),
         rejected: Sequence[int] = (),
+        fail_on: Mapping[int, BaseException] = _NO_FAILURES,
+        blank: Collection[int] = (),
     ) -> None:
         """
         Prepare the passes this scanner will feed.
@@ -193,11 +213,18 @@ class DistinctPageScanner(StubScannerBackend):
             passes: The page indices each successive call feeds, in order.
             rejected: How many sheets each pass reports having skipped; a pass
                 without an entry skipped none.
+            fail_on: The exception to raise from a call, keyed by that call's
+                1-based number.  It is raised after the call has spooled every
+                page of its pass.
+            blank: The page indices to spool as blank paper rather than as a
+                distinct page.
 
         """
         self.host = host
         self.passes = tuple(tuple(indices) for indices in passes)
         self.rejected = tuple(rejected)
+        self.fail_on = dict(fail_on)
+        self.blank = frozenset(blank)
         self.spooled: dict[int, bytes] = {}
         self.calls = 0
 
@@ -218,6 +245,8 @@ class DistinctPageScanner(StubScannerBackend):
         Raises:
             AssertionError: If called more times than there are passes, so a
                 rescan fails loudly instead of feeding the same pages again.
+            BaseException: Whatever ``fail_on`` holds for this call, once its
+                pages are spooled.
 
         """
         index = self.calls
@@ -230,13 +259,20 @@ class DistinctPageScanner(StubScannerBackend):
             raise AssertionError(msg)
         records: list[PageRecord] = []
         for page_index in self.passes[index]:
-            image = distinct_page(page_index)
+            image = (
+                tinted_blank(dpi=_BLANK_PAGE_DPI)
+                if page_index in self.blank
+                else distinct_page(page_index)
+            )
             try:
                 record = sink.add(image, dpi=settings.resolution)
             finally:
                 image.close()
             self.spooled[page_index] = record.path.read_bytes()
             records.append(record)
+        failure = self.fail_on.get(self.calls)
+        if failure is not None:
+            raise failure
         skipped = self.rejected[index] if index < len(self.rejected) else 0
         return scan_batch(records, resolution=settings.resolution, rejected=skipped)
 

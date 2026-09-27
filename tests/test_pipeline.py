@@ -2977,6 +2977,12 @@ class TestPipelineEventEnum:
         assert PipelineEvent.ASSEMBLING.job_state is JobState.ASSEMBLING
         assert PipelineEvent.UPLOADING.job_state is JobState.UPLOADING
         assert PipelineEvent.DONE.job_state is JobState.DONE
+        assert PipelineEvent.AWAITING_NEXT_PASS.job_state is JobState.AWAITING_NEXT_PASS
+        assert (
+            PipelineEvent.AWAITING_BLANK_DECISION.job_state
+            is JobState.AWAITING_BLANK_DECISION
+        )
+        assert PipelineEvent.AWAITING_RETRY.job_state is JobState.AWAITING_RETRY
 
     def test_scanning_reverse_projects_to_its_own_job_state(self) -> None:
         """
