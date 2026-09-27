@@ -1746,17 +1746,12 @@ def _blank_copy(prompt: PassPrompt) -> PassPromptCopy:
         skipped = "skips it"
     else:
         headline = _blank_list(prompt)
-        noun = "page" if blanks == 1 else "pages"
+        if blanks == 1:
+            noun, left_out, them = "page", "that page", "it"
+        else:
+            noun, left_out, them = "pages", f"those {blanks} pages", "them"
         skip, keep = f"Skip blank {noun}", f"Keep blank {noun}"
         rescan = f"Re-scan all {prompt.pass_pages}"
-        left_out, them = (
-            ("that page", "it")
-            if blanks == 1
-            else (
-                f"those {blanks} pages",
-                "them",
-            )
-        )
         consequence = (
             f"Skip leaves {left_out} out of the document. Keep adds {them} "
             f"anyway. Re-scan throws away all {prompt.pass_pages} and scans "
