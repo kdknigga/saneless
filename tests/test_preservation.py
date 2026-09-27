@@ -33,6 +33,8 @@ from saneless.spool import SpooledPageSink
 from tests.golden_support import distinct_page, embedded_streams, png_idat
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from saneless.scanner.base import PageRecord
 
 _JOB_ID = "job-pres-1"
@@ -458,6 +460,189 @@ class TestTheMostFinishedArtefactIsKept:
         assert report.sentence() is None
         assert pdf.exists()
         assert not artefacts.failed_dir.exists()
+
+
+def _multi_page_run(
+    tmp_path: Path, in_flight: int
+) -> tuple[RunArtefacts, tuple[PageRecord, ...], tuple[PageRecord, ...]]:
+    """
+    Build a run that accepted two passes into its document and is scanning a third.
+
+    Only a run that accepts passes into a document before acquisition ends
+    has a document while its stage is still ``ACQUIRING``; simplex and
+    manual duplex set the document only once acquisition is over.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        in_flight: How many pages the pass still running has spooled.
+
+    Returns:
+        The artefacts, the accepted document's records, in order, and the
+        pass in flight's records.
+
+    """
+    artefacts = _artefacts(tmp_path, RunStage.ACQUIRING)
+    first = _spool(artefacts.spool_dir, "a-00001", 2)
+    second = _spool(artefacts.spool_dir, "a-00002", 1, first=2)
+    document = first + second
+    running = _spool(artefacts.spool_dir, "a-00003", in_flight, first=3)
+    artefacts.document = document
+    artefacts.passes = [(PARTIAL_SUFFIX, running)]
+    return artefacts, document, running
+
+
+def _refusing_the_partial_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Make ``assemble_pdf`` refuse the ``(partial)`` PDF and build every other.
+
+    Args:
+        monkeypatch: pytest's monkeypatch fixture.
+
+    """
+    real = preservation_module.assemble_pdf
+
+    def assemble(
+        records: Sequence[PageRecord], output_dir: Path, filename: str, *, title: str
+    ) -> Path:
+        if title.endswith(PARTIAL_SUFFIX):
+            msg = "qpdf refused the pass in flight"
+            raise PdfError(msg)
+        return real(records, output_dir, filename, title=title)
+
+    monkeypatch.setattr(preservation_module, "assemble_pdf", assemble)
+
+
+class TestAMultiPageDocumentAndItsPassInFlight:
+    """
+    A run that already accepted pages keeps them and the pass it was scanning.
+
+    The accepted pages are one document, so they are kept as one PDF; the pass
+    that was running when the run stopped is not part of it yet, so it is
+    kept beside it as its own ``(partial)`` PDF.
+    """
+
+    def test_the_document_and_the_pass_in_flight_are_two_pdfs(
+        self, tmp_path: Path
+    ) -> None:
+        """The accepted pages in order, then the pass in flight, and no page files."""
+        artefacts, document, running = _multi_page_run(tmp_path, 2)
+        expected_document = _streams_of(document)
+        expected_running = _streams_of(running)
+
+        report = preserve_most_finished(artefacts)
+
+        assert [group.kind for group in report.groups] == [
+            KeptKind.DOCUMENT,
+            KeptKind.PASSES,
+        ]
+        document_pdf, partial_pdf = report.kept_paths
+        assert document_pdf.name.endswith(f"{_NAME_TAIL}.pdf")
+        assert partial_pdf.name.endswith(f"{_NAME_TAIL}-partial.pdf")
+        assert embedded_streams(document_pdf) == expected_document
+        assert embedded_streams(partial_pdf) == expected_running
+        with pikepdf.open(partial_pdf) as pdf:
+            assert str(pdf.docinfo["/Title"]) == f"{_TITLE} {PARTIAL_SUFFIX}"
+        assert all(_mode(path) == _PRIVATE_FILE_MODE for path in report.kept_paths)
+        # Both PDFs were built, so no raw page file was moved.
+        assert sorted(artefacts.failed_dir.iterdir()) == sorted(
+            [document_pdf, partial_pdf]
+        )
+        assert all(record.path.exists() for record in document + running)
+        sentence = report.sentence()
+        assert sentence is not None
+        assert f"The 3 scanned page(s) were preserved at {document_pdf}" in sentence
+        assert (
+            f"The 2 page(s) scanned before the error were preserved at {partial_pdf}"
+        ) in sentence
+
+    @pytest.mark.parametrize("empty_passes", [0, 1])
+    def test_with_no_page_in_flight_only_the_document_is_kept(
+        self, tmp_path: Path, empty_passes: int
+    ) -> None:
+        """No pass, or only an empty one, adds nothing beside the document."""
+        artefacts, document, _ = _multi_page_run(tmp_path, 0)
+        artefacts.passes = [(PARTIAL_SUFFIX, ())] * empty_passes
+
+        report = preserve_most_finished(artefacts)
+
+        assert report.kind is KeptKind.DOCUMENT
+        (kept,) = report.kept_paths
+        assert kept.name.endswith(f"{_NAME_TAIL}.pdf")
+        assert embedded_streams(kept) == _streams_of(document)
+        assert list(artefacts.failed_dir.iterdir()) == [kept]
+
+    def test_a_document_that_will_not_build_keeps_the_page_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every spooled page, accepted or in flight, is kept, and nothing raises."""
+        artefacts, _, _ = _multi_page_run(tmp_path, 2)
+        monkeypatch.setattr(
+            preservation_module,
+            "assemble_pdf",
+            _refusing_assembly("qpdf refused the document"),
+        )
+
+        report = preserve_most_finished(artefacts)
+
+        page_dir = _only_page_dir(artefacts.failed_dir)
+        assert len(list(page_dir.iterdir())) == 5
+        assert report.kind is KeptKind.PAGE_FILES
+        sentence = report.sentence()
+        assert sentence is not None
+        assert f"preserved at {page_dir}" in sentence
+        assert "qpdf refused the document" in sentence
+
+    def test_a_pass_in_flight_that_will_not_build_keeps_the_page_files_too(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The document PDF is kept, and the page files cover the pass it lacks."""
+        artefacts, document, _ = _multi_page_run(tmp_path, 2)
+        _refusing_the_partial_pdf(monkeypatch)
+
+        report = preserve_most_finished(artefacts)
+
+        assert [group.kind for group in report.groups] == [
+            KeptKind.DOCUMENT,
+            KeptKind.PAGE_FILES,
+        ]
+        document_pdf = report.groups[0].paths[0]
+        assert embedded_streams(document_pdf) == _streams_of(document)
+        page_dir = _only_page_dir(artefacts.failed_dir)
+        assert len(list(page_dir.iterdir())) == 5
+        sentence = report.sentence()
+        assert sentence is not None
+        assert "qpdf refused the pass in flight" in sentence
+
+    def test_without_a_document_the_pass_in_flight_is_kept_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """Nothing accepted yet: the running pass is the only thing to keep."""
+        artefacts = _artefacts(tmp_path, RunStage.ACQUIRING)
+        running = _spool(artefacts.spool_dir, "a-00001", 2)
+        artefacts.passes = [(PARTIAL_SUFFIX, running)]
+
+        report = preserve_most_finished(artefacts)
+
+        assert report.kind is KeptKind.PASSES
+        (kept,) = report.kept_paths
+        assert kept.name.endswith(f"{_NAME_TAIL}-partial.pdf")
+        assert embedded_streams(kept) == _streams_of(running)
+
+    def test_after_acquisition_the_passes_are_never_kept_beside_the_document(
+        self, tmp_path: Path
+    ) -> None:
+        """Once acquisition is over the passes are inside the document already."""
+        artefacts = _artefacts(tmp_path, RunStage.FILTERING)
+        records = _spool(artefacts.spool_dir, "a", 3)
+        artefacts.passes = [(PARTIAL_SUFFIX, records)]
+        artefacts.document = records
+
+        report = preserve_most_finished(artefacts)
+
+        assert report.kind is KeptKind.DOCUMENT
+        (kept,) = report.kept_paths
+        assert not kept.name.endswith("-partial.pdf")
+        assert list(artefacts.failed_dir.iterdir()) == [kept]
 
 
 class TestTheSentenceSaysWhatSurvived:

@@ -38,6 +38,7 @@ from saneless.exceptions import (
 )
 from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.scanner.base import (
+    MAX_PAGES_PER_PASS,
     DeviceCapabilities,
     DeviceInfo,
     PageRecord,
@@ -1993,6 +1994,16 @@ class TestAdfPageCap:
         pages = backend.scan_pages("test:0", _feeder_settings(), page_sink).pages
 
         assert len(pages) == cap
+
+    def test_the_per_pass_cap_is_the_one_shared_constant(self) -> None:
+        """
+        The backend's cap is the backend-neutral per-pass number, not a copy.
+
+        A document that grows pass by pass is capped against the same number,
+        so the two cannot drift apart by one being edited alone.
+        """
+        assert MAX_PAGES_PER_PASS == 500
+        assert sane_backend_mod._MAX_ADF_PAGES == MAX_PAGES_PER_PASS
 
 
 class TestSaneBackendPageValidation:

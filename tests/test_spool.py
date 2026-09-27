@@ -13,10 +13,11 @@ import pytest
 from PIL import Image, ImageDraw
 
 import saneless.spool as spool_module
-from saneless.exceptions import ScanError, ScanInterrupted
+from saneless.exceptions import ScanError, ScanInterrupted, SpoolError
 from saneless.pages import InkMeasurement, measure_ink
 from saneless.scanner.base import PageRecord, PageSink
 from saneless.spool import SpooledPageSink
+from saneless.vocabulary import ErrorCategory, classify_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -398,6 +399,67 @@ class TestSpooledPageSinkFailures:
         assert str(spool) in message
         assert isinstance(excinfo.value.__cause__, OSError)
         assert sink.records == ()
+
+
+class TestSpoolErrorSeparatesTheDiskFromTheScanner:
+    """
+    Every disk refusal is a ``SpoolError``; a scanner-delivered fault is not.
+
+    A ``SpoolError`` is still a ``ScanError``, so it keeps the ``SCANNER``
+    category and its exit code, while a caller that must treat a full or
+    failing disk differently from a device fault can test for it exactly.
+    """
+
+    @staticmethod
+    def _assert_a_disk_refusal(error: ScanError, text: str) -> None:
+        """
+        Check that ``error`` is a disk refusal that still files as a scanner one.
+
+        Args:
+            error: What the sink raised.
+            text: The part of the message that says which refusal it was.
+
+        """
+        assert isinstance(error, SpoolError)
+        assert isinstance(error, ScanError)
+        assert classify_error(error) is ErrorCategory.SCANNER
+        assert text in str(error)
+
+    def test_a_shortfall_is_a_spool_error(self, tmp_path: Path) -> None:
+        """Too little free space for the page is a disk refusal."""
+        sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_disk_refusal(excinfo.value, "Insufficient disk space")
+
+    def test_an_unmeasurable_directory_is_a_spool_error(self, tmp_path: Path) -> None:
+        """Free space that cannot be measured is a disk refusal."""
+        spool = tmp_path / "spool"
+        spool.mkdir()
+        sink = SpooledPageSink(spool, "a", 0)
+        spool.rmdir()
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_disk_refusal(excinfo.value, "Could not measure free space")
+
+    def test_a_failed_write_is_a_spool_error(self, tmp_path: Path) -> None:
+        """A page that could not be written is a disk refusal."""
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory")
+        sink = SpooledPageSink(blocked, "a", 0)
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_disk_refusal(excinfo.value, "Could not write page")
+
+    def test_an_unsupported_image_mode_is_not_a_spool_error(
+        self, tmp_path: Path
+    ) -> None:
+        """The scanner delivered a page saneless cannot store: a scanner fault."""
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(ScanError) as excinfo:
+            sink.add(Image.new("CMYK", (40, 60)), dpi=300)
+        assert not isinstance(excinfo.value, SpoolError)
+        assert classify_error(excinfo.value) is ErrorCategory.SCANNER
 
 
 # The modes a SANE snap produces, spooled exactly as they arrive.
