@@ -180,10 +180,10 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
         route for route in leaf_routes(_app(client)) if isinstance(route, APIRoute)
     ]
     # The exact count, not just a non-empty one: a filter that found a single
-    # route would satisfy `assert routes` while leaving the other fourteen
+    # route would satisfy `assert routes` while leaving the other fifteen
     # handlers unchecked.
-    assert len(routes) == 15, (
-        f"the app serves {len(routes)} API routes, not the 15 this test pins; "
+    assert len(routes) == 16, (
+        f"the app serves {len(routes)} API routes, not the 16 this test pins; "
         f"a route was added or removed, so update this literal"
     )
     for route in routes:
@@ -318,7 +318,9 @@ def titled_client(
     app = create_app(settings, web_scanner)
     app.state.paperless.get_tags = list
     app.state.paperless.get_correspondents = list
-    monkeypatch.setattr(app.state.worker, "submit", lambda _job: SubmitResult.ACCEPTED)
+    monkeypatch.setattr(
+        app.state.worker, "submit", lambda _job, _options: SubmitResult.ACCEPTED
+    )
     with TestClient(app) as tc:
         yield tc
 
@@ -511,7 +513,9 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     )
     job_store.update_state(job.id, JobState.SCANNING)
     worker._current_job_id = job.id
-    monkeypatch.setattr(worker, "submit", lambda _job: SubmitResult.QUEUE_FULL)
+    monkeypatch.setattr(
+        worker, "submit", lambda _job, _options: SubmitResult.QUEUE_FULL
+    )
 
     rejected = client.post(
         "/api/scan", data={"profile": "default", "title": "Refused Scan"}
@@ -1187,7 +1191,9 @@ def _other_browser(client: TestClient) -> TestClient:
 def accepting_client(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """Return the shared client, with submits accepted but no pipeline run."""
     monkeypatch.setattr(
-        _app(client).state.worker, "submit", lambda _job: SubmitResult.ACCEPTED
+        _app(client).state.worker,
+        "submit",
+        lambda _job, _options: SubmitResult.ACCEPTED,
     )
     return client
 
@@ -2049,11 +2055,17 @@ class TestProfileSelectMarkup:
     def test_the_profile_select_has_exactly_one_help_line(
         self, client: TestClient
     ) -> None:
-        """The description doubles as the control's help text (APPL-10)."""
+        """
+        The description doubles as the control's help text (APPL-10).
+
+        The Multiple pages field sits between the profile and the title, and
+        its help line belongs to its own checkbox, so the count stops where
+        that field starts.
+        """
         response = client.get("/")
 
         under_profile = response.text.split('<label for="profile-select">', 1)[1].split(
-            '<label for="title-input">', 1
+            '<div id="multi-page-field"', 1
         )[0]
         assert under_profile.count("<small") == 1
 
@@ -2382,7 +2394,9 @@ _PROFILE_DEFAULT_CORRESPONDENT = 43
 # The two rules UI-SPEC S6 adds to app.css, property by property. Written out
 # here rather than matched loosely, because "the tap target is 44 px" is the
 # whole of D-30 and a rule that lost one declaration would still look right.
-_TAG_OPTION_RULE = """label.tag-option {
+# The Multiple pages checkbox shares the tag rows' rule rather than a copy.
+_TAG_OPTION_RULE = """label.tag-option,
+label.multi-page-option {
     display: flex;
     align-items: center;
     gap: 0.5rem;
@@ -2489,19 +2503,25 @@ class TestSimpleForm:
     def test_simple_form_with_both_off_is_profile_title_and_scan(
         self, tmp_path: Path
     ) -> None:
-        """What is left is the shortest form the appliance has."""
+        """
+        What is left is the shortest form the appliance has.
+
+        Multiple pages is not behind either key: it is on every form.
+        """
         with TestClient(
             _simple_form_app(tmp_path, show_tags=False, show_correspondent=False)
         ) as client:
             page = client.get("/").text
 
         assert 'name="profile"' in page
+        assert 'name="multi_page"' in page
         assert 'name="title"' in page
         assert 'id="scan-btn"' in page
-        # Profile and Title keep their help lines; the two that went with the
-        # hidden controls are the only ones that leave.
+        # Profile, Multiple pages and Title keep their help lines; the two that
+        # went with the hidden controls are the only ones that leave.
         assert re.findall(r'<small id="([^"]+)"', page) == [
             "profile-description",
+            "multi-page-help",
             "title-help",
         ]
 
@@ -2596,7 +2616,7 @@ class TestSimpleForm:
         css = _web_asset("static", "app.css")
 
         assert "\n.tag-option {" not in css
-        assert css.count("label.tag-option {") == 1
+        assert css.count("label.tag-option,\nlabel.multi-page-option {") == 1
 
     def test_simple_form_touch_targets_add_no_colour_to_the_stylesheet(self) -> None:
         """A tap target is a size; the palette may not move (UI-SPEC S6)."""

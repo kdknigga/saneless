@@ -72,6 +72,13 @@
         </select>
         <small id="profile-description" aria-live="polite">{{ selected_description }}</small>
 
+        {# Multiple pages sits directly under the profile, because the profile
+           decides whether it can be ticked.  The partial's wrapper names its
+           own hx-target and hx-swap, so it does not inherit this form's
+           status-area target, and no attribute is added to the form element:
+           the inheritance fix above stays exactly as written. #}
+        {% include "partials/multi_page_field.html" %}
+
         {# Every control below gets one line of help in plain words, each one an
            adjacent <small> its control points at with aria-describedby: that
            adjacency is both Pico's own help-text pattern and what makes a

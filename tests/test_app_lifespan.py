@@ -1100,6 +1100,7 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     # Driven with a real profile name, so the handler runs its locked lookup
     # and renders rather than short-circuiting on the 422 an unknown name gets.
     "/api/profiles/description": {"method": "GET", "params": {"profile": "default"}},
+    "/api/profiles/multi-page": {"method": "GET", "params": {"profile": "default"}},
     "/api/cache/invalidate": {"method": "POST", "params": {"resource": "tags"}},
     "/api/jobs/history": {"method": "GET"},
     # Answering a prompt no job is waiting at is a real request that the route
@@ -1135,6 +1136,7 @@ _LEAF_PATHS = frozenset(
         "/api/jobs/{job_id}/status",
         "/api/paperless/test",
         "/api/profiles/description",
+        "/api/profiles/multi-page",
         "/api/scan",
         "/api/tags",
         "/health",
@@ -1162,13 +1164,13 @@ def test_leaf_routes_flattens_the_included_router(settings: Settings) -> None:
     with TestClient(app):
         leaves = leaf_routes(app)
 
-        assert len(leaves) == 16, (
-            f"the app serves {len(leaves)} leaf routes, not the 16 this test "
+        assert len(leaves) == 17, (
+            f"the app serves {len(leaves)} leaf routes, not the 17 this test "
             f"pins; a route was added or removed, so update this literal"
         )
         api_routes = [route for route in leaves if isinstance(route, APIRoute)]
-        assert len(api_routes) == 15, (
-            f"{len(api_routes)} of the leaves are APIRoute, not the 15 this "
+        assert len(api_routes) == 16, (
+            f"{len(api_routes)} of the leaves are APIRoute, not the 16 this "
             f"test pins; a route was added or removed, so update this literal"
         )
         # D-03's whole point: the Mount survives the flattening.
@@ -1315,8 +1317,8 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     enumerated = [
         route for route in leaf_routes(app) if isinstance(route, Route | Mount)
     ]
-    assert len(enumerated) == 16, (
-        f"the app serves {len(enumerated)} Route/Mount leaves, not the 16 this "
+    assert len(enumerated) == 17, (
+        f"the app serves {len(enumerated)} Route/Mount leaves, not the 17 this "
         f"test pins; a route was added or removed, so update this literal"
     )
 
@@ -1352,13 +1354,13 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
             for route in leaf_routes(app)
             if getattr(route, "path", "") in _ROUTE_CALLS
         ]
-        assert len(leaf_routes(app)) == 16, (
-            f"the app serves {len(leaf_routes(app))} leaves, not the 16 this "
+        assert len(leaf_routes(app)) == 17, (
+            f"the app serves {len(leaf_routes(app))} leaves, not the 17 this "
             f"test pins; a route was added or removed, so update this literal"
         )
-        assert len(drivable) == 15, (
+        assert len(drivable) == 16, (
             f"{len(drivable)} of the leaves are named in _ROUTE_CALLS, not the "
-            f"15 this test pins; a route was added or removed, so update this "
+            f"16 this test pins; a route was added or removed, so update this "
             f"literal"
         )
 
@@ -1429,8 +1431,8 @@ def test_the_schema_builds_in_process_and_is_not_served(settings: Settings) -> N
         }
         # Both sides of the comparison below would be empty if the app served
         # no API routes, so the size is asserted before the contents.
-        assert len(served) == 15, (
-            f"the app serves {len(served)} APIRoute paths, not the 15 this "
+        assert len(served) == 16, (
+            f"the app serves {len(served)} APIRoute paths, not the 16 this "
             f"test pins; a route was added or removed, so update this literal"
         )
         assert set(schema["paths"]) == served

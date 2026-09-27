@@ -245,7 +245,9 @@ class TestOwnedRow:
     ) -> None:
         """A submit queued behind the owner's scan names it to the owner alone."""
         monkeypatch.setattr(
-            _app(owner).state.worker, "submit", lambda _job: SubmitResult.ACCEPTED
+            _app(owner).state.worker,
+            "submit",
+            lambda _job, _options: SubmitResult.ACCEPTED,
         )
         store = _store(owner)
         running = store.create_job(

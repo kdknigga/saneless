@@ -58,7 +58,7 @@ from saneless.vocabulary import (
 from saneless.web import errors
 from saneless.web.app import create_app
 from saneless.web.routes import OWNER_COOKIE
-from saneless.worker import ScanWorker
+from saneless.worker import ScanOptions, ScanWorker
 from tests.conftest import StubScannerBackend, poll_until
 
 if TYPE_CHECKING:
@@ -844,7 +844,7 @@ def _refuse_submit(
     """Make the worker refuse every submit with ``result``; return the offers."""
     offered: list[Job] = []
 
-    def submit(job: Job) -> SubmitResult:
+    def submit(job: Job, _options: ScanOptions) -> SubmitResult:
         offered.append(job)
         return result
 

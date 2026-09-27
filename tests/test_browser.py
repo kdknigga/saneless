@@ -22,7 +22,8 @@ which read like a palette regression. If a run fails that way in bulk, read
 ``test_pico_css_applied`` first -- it is the load canary, and it is the one that
 says so in plain words.
 
-Requires: pytest-playwright, chromium browser (uv run playwright install chromium)
+Requires: pytest-playwright, and the chromium and firefox browsers
+(uv run playwright install chromium firefox); Firefox runs the reload test only.
 """
 
 from __future__ import annotations
@@ -2913,6 +2914,14 @@ def _choose_profile(page: Page, profile: str) -> Locator:
     an assertion read the old checkbox, and a tick that survives the change
     reads the same on the old one as on the new one.
 
+    The wait then continues until htmx has processed the new field, which it
+    does only when the swap settles, a moment after the field is in the page.
+    Until then the new field is not listening for the select's next change, so
+    a test that changed the profile again straight away would lose that change
+    some of the time.  htmx marks new content with ``htmx-added`` and removes
+    the class in the same step that processes it, so the class going is the
+    signal.
+
     Returns:
         The checkbox as it is after the swap.
 
@@ -2920,9 +2929,21 @@ def _choose_profile(page: Page, profile: str) -> Locator:
     page.locator("#multi-page").evaluate("box => box.setAttribute('data-stale', '')")
     page.select_option("#profile-select", profile)
     expect(page.locator("#multi-page[data-stale]")).to_have_count(0)
+    expect(page.locator("#multi-page-field.htmx-added")).to_have_count(0)
     box = page.locator("#multi-page")
     expect(box).to_have_count(1)
     return box
+
+
+def _drop_cache_control(route: Route) -> None:
+    """Pass a request to the server and its response back without ``Cache-Control``."""
+    response = route.fetch()
+    headers = {
+        name: value
+        for name, value in response.headers.items()
+        if name.lower() != "cache-control"
+    }
+    route.fulfill(response=response, headers=headers)
 
 
 @pytest.mark.browser
@@ -2980,20 +3001,31 @@ class TestMultiPageCheckbox:
         expect(box).to_be_enabled()
         expect(box).to_be_checked()
 
+    @pytest.mark.parametrize("served", ["as-served", "without-no-store"])
     def test_multi_page_checkbox_unchecked_on_reload_in_firefox(
         self,
         playwright: Playwright,
         browser_server_url: str,
         egress_allowlist: list[str],
+        served: Literal["as-served", "without-no-store"],
     ) -> None:
         """
         A tick does not come back when Firefox reloads the page.
 
-        Firefox restores a form control's state on reload unless the control
-        opts out, and Chromium does not, so this is the one browser that can
-        tell whether the opt-out is there.  The read after the reload is a
-        single ``is_checked`` rather than a retrying assertion: a retry could
-        pass on a moment before a restore instead of on the settled page.
+        Firefox restores a form control's state on reload unless something
+        stops it, and Chromium does not, so this is the one browser that can
+        tell.  Two things stop it on this page: the ``Cache-Control: no-store``
+        every page response carries, and ``autocomplete="off"`` on the
+        checkbox.  Either alone is enough, so the page as served cannot tell
+        whether the checkbox's own opt-out is there.  The second case therefore
+        strips ``no-store`` from the page response on its way to the browser,
+        leaving the attribute as the only thing between a reload and a restored
+        tick: that case fails when the attribute is removed.  The first case
+        keeps the page exactly as the server sends it.
+
+        The read after the reload is a single ``is_checked`` rather than a
+        retrying assertion: a retry could pass on a moment before a restore
+        instead of on the settled page.
 
         The context is built by hand from a Firefox browser, so it installs the
         egress gate and the policy recorder itself and is checked after it
@@ -3006,6 +3038,10 @@ class TestMultiPageCheckbox:
         try:
             ctx = firefox.new_context()
             ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            if served == "without-no-store":
+                # Registered after the gate, so it takes the page request
+                # itself; the page's address is on the allowlist either way.
+                ctx.route(f"{browser_server_url}/", _drop_cache_control)
             _make_csp_gate(ctx, violations)
             page = ctx.new_page()
             page.goto(browser_server_url)

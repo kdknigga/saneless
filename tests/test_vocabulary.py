@@ -1422,6 +1422,11 @@ _REJECTION_MESSAGES: list[tuple[RequestRejection, str]] = [
         "profiles.",
     ),
     (
+        RequestRejection.MULTI_PAGE_MANUAL_DUPLEX,
+        "Multiple pages is not available with manual duplex, so the scan was not "
+        "started. Untick Multiple pages or choose another profile, then try again.",
+    ),
+    (
         RequestRejection.TITLE_TOO_LONG,
         "The title is too long. Shorten it to 256 characters or fewer.",
     ),
@@ -1472,6 +1477,7 @@ _REJECTION_STATUS_CODES: list[tuple[RequestRejection, int]] = [
     (RequestRejection.TOKEN_UNSET, 503),
     (RequestRejection.URL_UNSET, 503),
     (RequestRejection.UNKNOWN_PROFILE, 422),
+    (RequestRejection.MULTI_PAGE_MANUAL_DUPLEX, 422),
     (RequestRejection.TITLE_TOO_LONG, 422),
     (RequestRejection.TITLE_HAS_CONTROL, 422),
     (RequestRejection.INVALID_REQUEST, 422),
@@ -1505,6 +1511,7 @@ class TestRequestRejection:
             "TOKEN_UNSET",
             "URL_UNSET",
             "UNKNOWN_PROFILE",
+            "MULTI_PAGE_MANUAL_DUPLEX",
             "TITLE_TOO_LONG",
             "TITLE_HAS_CONTROL",
             "INVALID_REQUEST",

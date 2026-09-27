@@ -1,0 +1,39 @@
+{# The Multiple pages field, wrapper and all: the wrapper is the swap target of
+   its own refresh, and an outerHTML swap replaces the element it is aimed at,
+   so the element carrying the id has to be rendered here -- the shape the tag
+   list's partial has for the same reason.
+
+   The wrapper names its own hx-target and hx-swap, so it never inherits the
+   scan form's status-area target and nothing is added to the form element.
+   The include is mandatory on a GET, as it is for the tag filter: htmx does
+   not gather the enclosing form for one.  It carries the chosen profile and,
+   when it is ticked, the box, so a tick survives a change to a profile that
+   allows it.  A disabled box is not sent, so leaving a manual-duplex profile
+   always finds it unticked.
+
+   Always rendered, for every profile, never hidden with a stylesheet.  On a
+   manual-duplex profile the box carries the real disabled attribute and the
+   reason takes the help line's place in the same small element, so the
+   description it points at does not move.  Turning autocomplete off is what stops a
+   browser that restores form state on reload from ticking it again: the
+   choice is made per scan and starts afresh on every page load.  No live
+   region: the profile description above already announces a profile change.
+
+   Every string comes from the context; this file composes no prose. #}
+<div id="multi-page-field"
+     hx-get="/api/profiles/multi-page"
+     hx-trigger="change from:#profile-select"
+     hx-include="#profile-select, #multi-page"
+     hx-target="this"
+     hx-swap="outerHTML">
+    <fieldset>
+        <label for="multi-page" class="multi-page-option">
+            <input type="checkbox" id="multi-page" name="multi_page"
+                   autocomplete="off"
+                   aria-describedby="multi-page-help"
+                   {%- if multi_page_disabled %} disabled{% elif multi_page_checked %} checked{% endif %}>
+            {{ multi_page_label }}
+        </label>
+    </fieldset>
+    <small id="multi-page-help">{{ multi_page_help }}</small>
+</div>

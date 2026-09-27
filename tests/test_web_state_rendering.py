@@ -2183,6 +2183,7 @@ _HELP_TEXT = {
 # because it is a state of the list and not a help line for a control.
 _HELP_SLOT_IDS = [
     "profile-description",
+    "multi-page-help",
     "title-help",
     "tag-filter-help",
     "tags-help",
@@ -2193,6 +2194,7 @@ _HELP_SLOT_IDS = [
 # so each slot has to be its control's *adjacent* sibling. The markup that must
 # sit immediately before each one, whitespace aside.
 _HELP_ADJACENCY = [
+    (r"</fieldset>", "multi-page-help"),
     (r'id="title-input"[^>]*>', "title-help"),
     (r'id="tag-filter"[^>]*>', "tag-filter-help"),
     (r"</fieldset>", "tags-help"),
@@ -2239,7 +2241,7 @@ class TestFormHelpTextAndTagPicker:
         self, client: TestClient
     ) -> None:
         """
-        Exactly five slots, in order, and Profile's is the live description.
+        Exactly six slots, in order, and Profile's is the live description.
 
         Asserted as the whole list rather than by membership, so a second help
         line under any one control fails here -- Profile's included, where the
