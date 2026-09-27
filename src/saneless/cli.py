@@ -218,10 +218,11 @@ def _stdin_is_interactive() -> bool:
 _INTERRUPT_SIGNALS: Final = (signal.SIGTERM, signal.SIGHUP)
 
 # A dropped SSH session delivers SIGHUP to the main thread and end of input to
-# the flip prompt's thread at nearly the same moment, in no promised order. End
-# of input on its own is a cancel, which keeps nothing, so the prompt thread
+# a terminal prompt's thread at nearly the same moment, in no promised order.
+# End of input on its own is a cancel, which keeps nothing, so the prompt thread
 # waits this long for the signal before it treats end of input as one: the
-# signal wins, and the hangup keeps the fronts.
+# signal wins, and the hangup keeps the pages scanned -- the fronts at the flip
+# prompt, the accepted pages at a multi-page one.
 _HANGUP_GRACE_SECONDS: Final = 0.25
 
 
@@ -229,8 +230,8 @@ class _Interruption:
     """
     Whether a SIGTERM or SIGHUP has reached the running command, and which.
 
-    Set by the signal handler on the main thread and read by the flip prompt's
-    thread, which is why the signal itself is an ``Event`` and not a bare
+    Set by the signal handler on the main thread and read by a terminal
+    prompt's thread, which is why the signal itself is an ``Event`` and not a bare
     flag.  On the main thread that Event's lock is taken only inside the
     handler, and in ``clear``, which runs only while the handler is not
     installed.
