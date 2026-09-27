@@ -30,9 +30,16 @@ from saneless.exceptions import (
 from saneless.pages import BlankFilterResult, filter_blank_pages
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import ensure_private_dir
-from saneless.scanner.base import ScanBatch, ScanSettings
+from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
-from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
+from saneless.vocabulary import (
+    FlipOutcome,
+    JobState,
+    PassAnswer,
+    PassPrompt,
+    PassWait,
+    ScanOutcome,
+)
 from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace, has_pages_left
 
 if TYPE_CHECKING:
@@ -44,10 +51,13 @@ if TYPE_CHECKING:
     from saneless.scanner.base import PageRecord, ScannerBackend
 
 __all__ = [
+    "MAX_DOCUMENT_PAGES",
     "SCAN_LABEL_BACK",
     "SCAN_LABEL_FRONT",
+    "AnswerSlot",
     "FlipAnswerSlot",
     "FlipCoordinator",
+    "PassCoordinator",
     "PipelineEvent",
     "PipelineRequest",
     "ScanResult",
@@ -56,12 +66,22 @@ __all__ = [
 ]
 
 
+# The value of the one event whose name ends in "PASS", named rather than
+# written inline: ruff's S105 reads a string literal assigned to a name ending
+# in "pass" as a hardcoded password.  A scan pass is not a password, and the
+# convention that every member's value is its name stays unbroken this way.
+_NEXT_WAIT_EVENT_VALUE: Final = "AWAITING_NEXT_PASS"
+
+
 class PipelineEvent(StrEnum):
     """Events emitted by the scan pipeline to report progress."""
 
     SCANNING = "SCANNING"
     AWAITING_FLIP = "AWAITING_FLIP"
     SCANNING_REVERSE = "SCANNING_REVERSE"
+    AWAITING_NEXT_PASS = _NEXT_WAIT_EVENT_VALUE
+    AWAITING_BLANK_DECISION = "AWAITING_BLANK_DECISION"
+    AWAITING_RETRY = "AWAITING_RETRY"
     ASSEMBLING = "ASSEMBLING"
     UPLOADING = "UPLOADING"
     DONE = "DONE"
@@ -77,6 +97,12 @@ class PipelineEvent(StrEnum):
         and the job leaves ``AWAITING_FLIP`` the moment pass B starts -- which
         is what takes the flip prompt, and its Continue and Abort controls, off
         the screen while the backs feed.
+
+        The three multi-page waits -- ``AWAITING_NEXT_PASS``,
+        ``AWAITING_BLANK_DECISION`` and ``AWAITING_RETRY`` -- each project to the
+        job state of the same name, so a job says which question it is waiting
+        on, and the next ``SCANNING`` event is what takes that prompt off the
+        screen when the operator asks for another pass.
 
         Note that the returned state is not an instruction to write it:
         ``DONE`` is terminal and the worker writes it only after the
@@ -96,6 +122,12 @@ class PipelineEvent(StrEnum):
                 state = JobState.AWAITING_FLIP
             case PipelineEvent.SCANNING_REVERSE:
                 state = JobState.SCANNING_REVERSE
+            case PipelineEvent.AWAITING_NEXT_PASS:
+                state = JobState.AWAITING_NEXT_PASS
+            case PipelineEvent.AWAITING_BLANK_DECISION:
+                state = JobState.AWAITING_BLANK_DECISION
+            case PipelineEvent.AWAITING_RETRY:
+                state = JobState.AWAITING_RETRY
             case PipelineEvent.ASSEMBLING:
                 state = JobState.ASSEMBLING
             case PipelineEvent.UPLOADING:
@@ -105,6 +137,32 @@ class PipelineEvent(StrEnum):
             case _:
                 assert_never(self)
         return state
+
+
+def _wait_event(wait: PassWait) -> PipelineEvent:
+    """
+    Return the event a multi-page run emits when it opens ``wait``.
+
+    Args:
+        wait: The question the run is about to ask.
+
+    Returns:
+        The waiting event whose job state names that question.
+
+    Raises:
+        AssertionError: If the value is not a PassWait member.
+
+    """
+    match wait:
+        case PassWait.NEXT_PASS:
+            event = PipelineEvent.AWAITING_NEXT_PASS
+        case PassWait.BLANK_DECISION:
+            event = PipelineEvent.AWAITING_BLANK_DECISION
+        case PassWait.RETRY:
+            event = PipelineEvent.AWAITING_RETRY
+        case _:
+            assert_never(wait)
+    return event
 
 
 logger = logging.getLogger(__name__)
@@ -125,6 +183,15 @@ logger = logging.getLogger(__name__)
 # asserts on the convention one place to import it from.
 _SPOOL_LABEL_A: Final = "a"
 _SPOOL_LABEL_B: Final = "b"
+
+# The most pages a multi-page document may hold before the run stops offering
+# another pass.  The same number as the per-pass cap, and defined by it, because
+# the two are one judgement about paper -- how big a stack anyone scans as one
+# document -- so if one moves the other must move with it.  The cap is checked
+# only between passes, never inside one, so a document can reach
+# ``MAX_DOCUMENT_PAGES - 1 + MAX_PAGES_PER_PASS`` pages: a pass that starts one
+# page short of the cap is allowed to finish.
+MAX_DOCUMENT_PAGES: Final = MAX_PAGES_PER_PASS
 
 # Which half of a manual-duplex run a ``pass_count_callback`` call is reporting.
 # Shared constants rather than a literal spelled once here and once in the
@@ -203,17 +270,88 @@ class FlipCoordinator(ABC):
         return None
 
 
-class FlipAnswerSlot:
+class PassCoordinator(ABC):
     """
-    One flip answer, claimed once, and final: the claim both coordinators share.
+    The one way a multi-page run asks the operator what happens next.
+
+    Between passes the pipeline asks this seam one question at a time -- is
+    there another page, what about the pages that look blank, what now that a
+    pass failed -- and gets back a single ``PassAnswer``.  The web worker
+    answers it from the multi-page routes, and the CLI from a terminal prompt.
+
+    It is a sibling of ``FlipCoordinator`` and deliberately not a widening of
+    it: the manual-duplex flip wait keeps its own seam and its own outcomes, so
+    a multi-page answer can never reach a manual-duplex run.
+
+    This is an ``ABC`` and not a ``typing.Protocol`` on purpose, and the rule is
+    observable in the tree: ``Protocol`` describes shapes this project does not
+    own (``SaneDevice`` for python-sane's handle, ``_SettingsFactory`` for
+    pydantic's constructor), while ``ABC`` defines seams the project implements
+    itself (``ScannerBackend``, ``FlipCoordinator``).
+    """
+
+    @abstractmethod
+    def ask(self, prompt: PassPrompt) -> PassAnswer:
+        """
+        Put ``prompt`` to the operator and block until it resolves.
+
+        The wait holds the calling thread for at most
+        ``prompt.timeout_seconds``.  An implementation answers once, and its
+        answer is final: whichever of the operator, the clock or a stop
+        resolves the wait first is what this returns.
+
+        A coordinator that could not show the prompt -- its terminal broke,
+        say -- must report ``ABORT`` and set ``abort_cause``, so the pipeline
+        records a failure rather than an operator's cancel.
+
+        Args:
+            prompt: The question, and the only answers it accepts.
+
+        Returns:
+            A member of ``prompt.offered``; ``TIMED_OUT`` when nobody answered
+            within ``prompt.timeout_seconds``; or ``INTERRUPTED`` when saneless
+            is stopping.
+
+        """
+
+    @property
+    def abort_cause(self) -> Exception | None:
+        """
+        Why the wait answered ``ABORT``, when it was not the operator's choice.
+
+        An ``ABORT`` answer usually means someone gave up at the prompt, and
+        the pipeline reports that as a cancellation.  But a coordinator can
+        also answer ``ABORT`` because its prompt broke -- a read error such as
+        an I/O error or undecodable input -- and nobody chose to stop.  End of
+        input, a closed terminal included, is not such a break: it is the
+        operator's cancel.  Such a coordinator returns the exception here, so
+        the pipeline records a failure rather than a cancellation without a
+        further ``PassAnswer`` member.
+
+        Concrete rather than abstract, so a coordinator whose aborts are always
+        an operator's needs no change.
+
+        Returns:
+            The exception that forced the abort, or ``None`` when there was
+            none -- including whenever the answer was not ``ABORT``.
+
+        """
+        return None
+
+
+class AnswerSlot[T: StrEnum]:
+    """
+    One answer, claimed once, and final: the claim every coordinator shares.
 
     The web worker's and the CLI's coordinators differ in where an answer comes
-    from -- the Continue and Abort routes, or a terminal prompt -- but not in
-    how it is claimed.  That claim lives here, once, so a fix to it reaches
-    both.  This is a concrete helper the coordinators compose, not a second
-    seam: ``FlipCoordinator`` stays the only contract the pipeline waits on,
-    and anything a coordinator adds on top -- the web one's arming, for
-    instance -- stays in that coordinator.
+    from -- the web routes, or a terminal prompt -- but not in how it is
+    claimed.  That claim lives here, once, so a fix to it reaches both.  It is
+    generic over the answer's enum, so the flip wait (``FlipOutcome``) and the
+    multi-page waits (``PassAnswer``) share the claim without sharing anything
+    else.  This is a concrete helper the coordinators compose, not a seam:
+    ``FlipCoordinator`` and ``PassCoordinator`` stay the only contracts the
+    pipeline waits on, and anything a coordinator adds on top -- the web one's
+    arming, for instance -- stays in that coordinator.
 
     The answer is written under the lock *before* the event is set, so a waiter
     that wakes always finds an answer to read -- there is no window in which the
@@ -225,15 +363,15 @@ class FlipAnswerSlot:
         """Start unanswered."""
         self._lock = threading.Lock()
         self._event = threading.Event()
-        self._outcome: FlipOutcome | None = None
+        self._outcome: T | None = None
 
     @property
-    def answer(self) -> FlipOutcome | None:
+    def answer(self) -> T | None:
         """The claimed answer, or ``None`` while the slot is unanswered."""
         with self._lock:
             return self._outcome
 
-    def offer(self, outcome: FlipOutcome) -> bool:
+    def offer(self, outcome: T) -> bool:
         """
         Claim the answer with ``outcome`` if nothing has claimed it yet.
 
@@ -253,13 +391,13 @@ class FlipAnswerSlot:
         self._event.set()
         return True
 
-    def settle(self, outcome: FlipOutcome) -> FlipOutcome:
+    def settle(self, outcome: T) -> T:
         """
         Claim the answer with ``outcome`` unless one is claimed, and return it.
 
         This is the path that ends a wait: a timeout, or a CLI answer.
         Returning the answer in effect, rather than asserting one exists, is
-        what narrows ``FlipOutcome | None`` to ``FlipOutcome`` without an
+        what narrows ``T | None`` to ``T`` without an
         ``assert`` -- which ``S101`` bans in ``src/``.
 
         Args:
@@ -290,6 +428,10 @@ class FlipAnswerSlot:
 
         """
         self._event.wait(timeout)
+
+
+class FlipAnswerSlot(AnswerSlot[FlipOutcome]):
+    """The flip wait's slot, by the name every caller and test already uses."""
 
 
 @dataclass(frozen=True)
@@ -422,6 +564,14 @@ class PipelineRequest:
     # the second to learn why -- the two-step that once left an Abort pressed
     # during pass B doing nothing at all.
     flip_coordinator: FlipCoordinator | None = None
+    # Whether this run builds one document from several flatbed passes.  Its
+    # own field, not a profile setting, because it is a choice about this
+    # scan -- one sheet or a stack of them -- made when the scan is started.
+    multi_page: bool = False
+    # Where a multi-page run's answers come from: the web routes or a terminal
+    # prompt.  Its own field beside ``flip_coordinator`` rather than a widening
+    # of it, so neither kind of wait can be answered with the other's answers.
+    pass_coordinator: PassCoordinator | None = None
     # The worker's record of the device its last auto-detection chose, so a
     # change between jobs is logged.  Defaulted, like every field here, so the
     # CLI -- one scan per process, nothing to compare with -- passes none.
@@ -715,6 +865,40 @@ class _SpoolLedger:
 
         """
         self.passes.append((suffix, sink))
+
+    def forget(self, sink: SpooledPageSink) -> None:
+        """
+        Stop tracking an accepted pass, and leave its page files where they are.
+
+        The pages now belong to the document, which the guard keeps on its
+        own; tracking them here as well would keep them twice.
+
+        Args:
+            sink: The sink the accepted pass spooled into.
+
+        """
+        self.passes = [
+            (suffix, kept) for suffix, kept in self.passes if kept is not sink
+        ]
+
+    def discard(self, sink: SpooledPageSink) -> None:
+        """
+        Delete a thrown-away pass's page files, then stop tracking it.
+
+        A discarded pass must leave no file behind: the guard, on a failure,
+        and the startup sweep, after a crash, both move every page file they
+        find into ``failed/``, so a leftover page would come back as a pass
+        the operator threw away.  A file already gone, or one that cannot be
+        removed, does not stop the rest from going.
+
+        Args:
+            sink: The sink the discarded pass spooled into.
+
+        """
+        for record in sink.records:
+            with contextlib.suppress(OSError):
+                record.path.unlink(missing_ok=True)
+        self.forget(sink)
 
     def spooled(self) -> list[tuple[str, tuple[PageRecord, ...]]]:
         """
