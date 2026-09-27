@@ -72,7 +72,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 
 The `source` field determines how pages are fed to the scanner:
 
-- **`"Flatbed"`** -- Single-page flatbed scanning. Place the document on the glass.
+- **`"Flatbed"`** -- Flatbed scanning. Place the page on the glass; each scan takes one page. For a document of several pages, tick **Multiple pages** on the scan form (or pass `saneless scan --multi-page`) and saneless asks after each page whether there is another, then puts every page in one document. See [Scan a Multi-Page Document](scan-a-multi-page-document.md).
 - **`"ADF"`** -- Automatic Document Feeder, one side per page. Load a stack of pages.
 - **`"ADF Duplex"`** -- Hardware duplex via ADF. The scanner scans both sides of each page automatically (requires hardware support).
 
@@ -87,6 +87,8 @@ mode = "Color"
 ```
 
 See [Set Up ADF Duplex Scanning](set-up-adf-duplex.md#manual-duplex) for the full flow.
+
+**Multiple pages** is a choice made for each scan, not a profile setting, so no profile key turns it on. It works with every source above, and on a feeder it lets you hand-feed a document a sheet or a few sheets at a time. It is not available with a `duplex = "manual"` profile.
 
 ## Auto source
 

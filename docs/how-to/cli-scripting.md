@@ -111,12 +111,20 @@ saneless jobs --json --limit 5
 ```
 
 `state` is always the raw uppercase enum value — `PENDING`, `SCANNING`,
-`AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`,
-`FALLBACK` or `CANCELLED` — so it is safe to compare against in a script. `AWAITING_FLIP`
+`AWAITING_FLIP`, `AWAITING_NEXT_PASS`, `AWAITING_BLANK_DECISION`, `AWAITING_RETRY`,
+`SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK` or
+`CANCELLED` — so it is safe to compare against in a script. `AWAITING_FLIP`
 and `SCANNING_REVERSE` only occur in manual duplex jobs: the wait for the
-operator to flip the stack, and the second pass over the back sides. `CANCELLED`
-is a scan the operator stopped at the flip prompt, not a failure. The human-readable labels the table
-view prints ("Complete", "Failed", "Saved to folder", "Cancelled") never appear in `--json`.
+operator to flip the stack, and the second pass over the back sides.
+`AWAITING_NEXT_PASS`, `AWAITING_BLANK_DECISION` and `AWAITING_RETRY` only occur in
+[multi-page](scan-a-multi-page-document.md) jobs, while the job waits for the
+operator's answer: whether there is another page, what to do about pages that
+look blank, and what to do after a scan that failed. Like `AWAITING_FLIP`, they
+are not finished, but nothing happens in them until someone answers or the wait
+runs out. `CANCELLED` is a scan the operator stopped at the flip prompt or with
+Abort at a multi-page question, not a failure. The human-readable labels the table
+view prints ("Complete", "Failed", "Saved to folder", "Cancelled", "Waiting for more
+pages") never appear in `--json`.
 
 `created_at` is always a UTC ISO-8601 timestamp carrying the `+00:00` offset, whatever timezone the server is in, so a script can parse it without knowing where the appliance lives. The table `saneless jobs` prints without `--json` is the other way round: it renders the same instant in the server's local timezone with the zone named, for example `2026-03-22 09:30 CDT`. Only the table follows the server's timezone; the JSON never does.
 
@@ -160,15 +168,15 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 |---|---|---|
 | 0 | Success | Scan completed and uploaded |
 | 1 | Scan error | Scanner disconnected mid-scan, empty feeder, no pages scanned, flip wait timed out |
-| 2 | Configuration, profile or setup error | Unknown profile name, a `--config` file that does not exist, a TOML syntax error, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, python-sane not installed, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set (a scan is refused before the scanner is opened) |
+| 2 | Configuration, profile or setup error | Unknown profile name, a `--config` file that does not exist, a TOML syntax error, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `saneless scan --multi-page` without an interactive terminal or with a manual duplex profile, python-sane not installed, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set (a scan is refused before the scanner is opened) |
 | 3 | Paperless upload error | paperless-ngx unreachable, invalid API token |
 | 4 | PDF assembly error | Disk full while writing the PDF, unwritable output directory |
 | 5 | Unexpected error (a saneless bug) | Prints one line; the traceback is in the log file -- attach it to a bug report |
 | 6 | Saved to the consume folder | paperless-ngx could not be reached, so the PDF went to the consume folder without its title, tags or correspondent; stdout reads `Saved to folder: <title>`. The document was delivered: do not rescan |
-| 7 | Uploaded with a warning | A sheet the scanner skipped, or manual-duplex front and back counts that differed (uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr. The document was delivered: do not rescan the whole stack |
+| 7 | Uploaded with a warning | A sheet the scanner skipped, manual-duplex front and back counts that differed (uploaded as two documents), or a multi-page document finished because nobody answered in time or it reached the page limit; stdout reads `Uploaded with a warning: <title>` and the warning is on stderr. The document was delivered: do not rescan the whole stack |
 | 8 | Every page looked blank | Empty-page detection judged every page blank, so nothing was uploaded; the pages were kept in `failed/`, normally as one PDF, and stderr names what was kept. The scanner worked: lower `empty_page_coverage_threshold` or turn detection off if the pages are not blank |
 | 129 | Interrupted by SIGHUP | The terminal or SSH session running the command went away. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
-| 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; Ctrl-C during a one-shot command |
+| 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; a confirmed abort, Ctrl-D or Ctrl-C at a multi-page question; Ctrl-C during a one-shot command |
 | 143 | Interrupted by SIGTERM | `kill`, a service manager or a container runtime stopped the command. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 
 130 means someone chose to stop, so nothing was kept. 129 and 143 (128 plus the signal number)
@@ -219,6 +227,18 @@ paperless-ngx restart. Use the web server's `/health` endpoint for that.
     that is not confirmed within `operator_wait_timeout_seconds`, or a read error at the
     prompt (an I/O error, or input that cannot be decoded), fails the scan with code 1. See
     [Set Up ADF Duplex Scanning](set-up-adf-duplex.md#manual-duplex).
+
+!!! warning "`--multi-page` cannot be scripted either"
+    `saneless scan --multi-page` asks after every scan whether there is another page, so it is
+    interactive only. When stdin is not a terminal it is refused with exit code 2 before the
+    scanner is opened:
+
+    ```
+    --multi-page needs an interactive terminal: saneless asks after each scan whether there is another page. Run it from a terminal, or scan from the web UI.
+    ```
+
+    There is no scripted form with a fixed number of pages. See
+    [Scan a Multi-Page Document](scan-a-multi-page-document.md#scan-from-the-command-line).
 
 ## Scripting examples
 

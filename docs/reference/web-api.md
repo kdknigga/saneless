@@ -119,7 +119,9 @@ A title holding a control character -- a tab, an escape character, any other C0 
 
 Returns the current or most recent job status. Used by HTMX polling to update the status indicator.
 
-**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`, `CANCELLED`.
+**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `AWAITING_NEXT_PASS`, `AWAITING_BLANK_DECISION`, `AWAITING_RETRY`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`, `CANCELLED`.
+
+`AWAITING_FLIP` and the three multi-page states `AWAITING_NEXT_PASS`, `AWAITING_BLANK_DECISION` and `AWAITING_RETRY` mean the job is waiting for a person: the flip of a manual duplex stack, or the answer to a multi-page question (see [`POST /api/multi-page/answer`](#post-apimulti-pageanswer)). The job is not finished, so the partial keeps polling and the Scan button stays disabled, but the scanner is idle and the partial shows no busy spinner: the browser that started the job sees the question and its buttons, and every other client sees one line saying what the job is waiting for, such as `Waiting for the next page...`. The Scan button reads `Waiting for you…` during a multi-page question.
 
 `DONE`, `ERROR`, `FALLBACK` and `CANCELLED` are terminal: once the job reaches one of them the partial stops polling and the Scan button is enabled again. The terminal partial also reloads the job history table and the checks strip once, so the finished job's row appears and the strip stops saying a scan is running. The main page (`GET /`) renders the same job without that reload, because it has just rendered both. `CANCELLED` means the operator stopped the scan on purpose, such as with Abort scan at the flip prompt. The web UI shows it as `Cancelled: <title>` in muted grey, not as an error.
 
@@ -129,7 +131,7 @@ What the partial shows depends on who asks. The browser that started the job see
 
 ### `GET /api/jobs/{job_id}/status`
 
-Returns the status of one named job, rather than whichever job is current. The web UI polls this after a submit, so the browser that started a scan keeps following *its* job even when another one is running: that is what decides whether the flip prompt is shown to you or the "someone else started this scan" line.
+Returns the status of one named job, rather than whichever job is current. The web UI polls this after a submit, so the browser that started a scan keeps following *its* job even when another one is running: that is what decides whether the flip prompt or a multi-page question is shown to you, or the line saying what someone else's scan is waiting for.
 
 **Path parameter:**
 
@@ -353,6 +355,16 @@ While the job is still recorded in its waiting state and the question has been a
 - **An answer counts only for the question that is open.** It is dropped when it names another job, names a question that has already been answered or replaced, or is an answer that question does not offer, such as `FINISH` on a document that holds no page yet. A dropped answer changes nothing, and the endpoint still returns the current status rather than an error.
 - **The first answer is final.** A repeated or double-clicked answer to the same question is dropped, so it cannot answer the next question too.
 - **The scanner's error is for the owner only.** After a failed pass, the owner's question shows what the scanner reported, with host paths and addresses replaced by the setting that names them. No other browser is shown the error.
+
+How the job ends depends on the answer, or on its absence:
+
+- `FINISH` uploads the pages kept as one document, and the job ends `DONE`.
+- `ABORT` uploads nothing and keeps nothing, and the job ends `CANCELLED`, not `ERROR`. The web UI's Abort scan button asks the browser to confirm first; the endpoint itself does not.
+- A question nobody answers within `operator_wait_timeout_seconds` finishes the document with the pages kept, and the job ends `DONE` with a warning. If the document holds no page at that point, because every page so far was skipped as blank, nothing is uploaded and the job ends `ERROR`, the same failure as a scan whose every page looked blank.
+- A document that holds 500 pages or more after a scan is finished without another question, and the job ends `DONE` with a warning. A scan already running is not cut short, so the document can hold up to 999 pages.
+- A server stop while the job waits ends it `ERROR` with `The server restarted before this scan finished`, followed by where the pages kept were saved in `failed/`. Nothing is uploaded.
+
+See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md) for the whole flow.
 
 ---
 

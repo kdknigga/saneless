@@ -60,6 +60,21 @@ What the common cases mean:
   of input is not a failure: Ctrl-D at the prompt cancels the scan (exit 130). A terminal or SSH
   session that closes at the prompt is not a cancel either: it is an interruption that keeps the
   fronts (exit 129).
+- **A multi-page scan failed.** With **Multiple pages** (or `saneless scan --multi-page`), a
+  scanner fault or an empty feeder does not end the scan once the document holds at least one
+  page. saneless asks instead: *"The last scan failed, so none of its pages were added."*, followed
+  by what the scanner reported, with **Scan again**, **Finish document** and **Abort scan** (`n`,
+  `f` and `a` at the terminal). The failed scan adds nothing, so clear the scanner, put back every
+  page from that scan, and scan again. An empty feeder -- Scan next page pressed before the next
+  sheet was loaded -- brings up the same question. Only a failure on the first scan, or while
+  re-scanning the only scan so far, ends the job with exit 1, as any scan failure does. The
+  working directory running out of room still ends the job whatever the page count, with the pages
+  kept so far saved under `failed/`. If nobody answers the question, the document is finished with
+  the pages kept (exit 7). See
+  [Scan a Multi-Page Document](scan-a-multi-page-document.md#when-a-scan-fails-part-way).
+- **The multi-page prompt failed.** Reading your answer at a `saneless scan --multi-page` question
+  failed, for example with an I/O error. The scan fails with exit 1, and the pages kept so far are
+  saved as a PDF under `failed/`, with the path in the error.
 - **The scan stopped part-way through the stack.** The scanner failed after some sheets had
   already been fed -- a jam, a misfeed, a page that took too long, or the working directory
   running out of room. Those sheets are not lost. saneless assembles them into a PDF under
@@ -118,6 +133,10 @@ Other causes of exit 2, each on one line:
 - **Manual duplex without a terminal.** A profile with `duplex = "manual"` needs someone to flip
   the stack, so `saneless scan` refuses it when stdin is not a terminal (cron, a pipe, CI). Run it
   from a terminal or scan from the web UI.
+- **`--multi-page` without a terminal, or with manual duplex.** `saneless scan --multi-page` asks
+  after every scan whether there is another page, so it is refused when stdin is not a terminal.
+  It is refused for a `duplex = "manual"` profile too, because the two flows cannot be combined:
+  scan without `--multi-page`, or choose another profile.
 - **No scanner found.** saneless discovered no scanner to use: `scan` with `scanner.device` empty,
   or `auto-profiles`. Set `scanner.device`, or fix discovery with `saneless devices`.
 - **`serve` cannot start.** The port is already in use, SANE could not be initialised, or the web
@@ -318,6 +337,14 @@ again. The warning is one of these:
   order the second pass fed them in. In paperless-ngx, find the sheets missing from either
   document and scan them again, or scan the whole stack again and delete both documents.
 
+- **Finished after N pages because nobody answered.** A multi-page scan waited
+  `operator_wait_timeout_seconds` for an answer and nobody gave one, so saneless finished the
+  document with the pages it had. The warning says whether the question was about the next page or
+  about blank pages; in the second case, those blank pages were left out. Open the document and scan
+  whatever is missing as a new document.
+- **Finished at N pages: no new scan starts once a document has 500 pages.** A multi-page document
+  reached the page limit, so saneless finished it. Scan any remaining pages as a new document.
+
 A run that was saved to the consume folder *and* carries a warning exits 6, not 7: the missing
 title, tags and correspondent are the larger problem.
 
@@ -338,6 +365,9 @@ names their directory. Open what was kept:
   off for it with `enable_empty_page_detection = false`, then scan again. Or keep the preserved
   PDF and upload it yourself.
 
+A multi-page scan fails the same way, with exit 8, when a question times out while the document
+holds no page because every page so far was skipped as blank. The skipped pages are what is kept.
+
 [When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank)
 explains how detection decides.
 
@@ -352,7 +382,8 @@ Each code is 128 plus the signal number, the shell's convention. Nobody chose to
 it is not treated as a cancel: the pages already scanned are kept, normally as a PDF, under
 `failed/` in the data directory, and the line names the path. A line that names no path kept
 nothing, because there was nothing to keep: the command was not a scan, or the scan was stopped
-before its first page. Scan the rest of the stack, or the whole stack again,
+before its first page. A `saneless scan --multi-page` run waiting for your answer counts too: the
+pages kept so far are saved, not uploaded. Scan the rest of the stack, or the whole stack again,
 and delete or upload the kept file yourself. The exceptions are a signal that arrives while
 saneless waits for paperless-ngx to consume a document it has already accepted, and one that
 arrives while the document is being sent: the line then says the kept file had already been
@@ -394,6 +425,11 @@ They are recovered the next time saneless starts: when `saneless serve` starts, 
 - In the web UI, the job shows as failed with "The server restarted before this scan finished",
   followed by where its pages were kept. Only the browser that started the scan sees the path. A
   scan started with `saneless scan` has no job in the web UI, so the log warning is where to look.
+- A web job that was waiting for someone -- at the flip prompt, or at a multi-page question -- is
+  marked failed the same way at the next start of `saneless serve`, so the page stops waiting for
+  an answer that can no longer arrive. Start this release at least once before going back to an
+  older one: a release from before multi-page scanning cannot read a job left waiting at a
+  multi-page question.
 
 Nothing recovered is uploaded. Check the kept file, then upload it yourself or scan the stack
 again, and delete it once the document is in paperless-ngx.
@@ -409,15 +445,19 @@ done.
 Exit 130 means the scan was stopped on purpose, not that something broke:
 
 - You answered no, pressed Ctrl-D or pressed Ctrl-C at the manual duplex flip prompt.
+- You aborted a multi-page scan: **Abort scan** in the web UI, a confirmed `a`, or Ctrl-D or
+  Ctrl-C at a `saneless scan --multi-page` question. Ctrl-C and Ctrl-D do not ask to confirm,
+  however many pages were kept; press `f` to keep them.
 - You pressed Ctrl-C while a one-shot command (`scan`, `devices`, `auto-profiles`, `jobs`) was
   running, or while `serve` was still starting up.
 
 Nothing is uploaded, and nothing is kept in `failed/` either. A failure keeps whatever it can,
 because you cannot get those sheets back without feeding them again; a cancel keeps nothing,
 because you chose to stop and saneless would only be leaving you files to delete. In the web UI, a
-scan cancelled with **Abort scan** at the flip step is shown as Cancelled, in grey rather than as
-an error. A flip wait that times out is not a cancel: it
-fails with exit 1. Ctrl-C on `saneless serve` once the web server is running is a normal stop and
+scan cancelled with **Abort scan** at the flip step or at a multi-page question is shown as
+Cancelled, in grey rather than as an error. A flip wait that times out is not a cancel: it
+fails with exit 1. A multi-page question that times out is not a cancel either: it finishes the
+document with the pages kept (exit 7). Ctrl-C on `saneless serve` once the web server is running is a normal stop and
 exits 0.
 
 ## Unexpected errors (exit 5)

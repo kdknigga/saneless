@@ -41,29 +41,30 @@ Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` 
 Scan a document and upload to paperless-ngx.
 
 ```
-saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
+saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME] [--multi-page]
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--title` | TEXT | the profile's `title`, else `Scan <local date time with the zone named>` | Document title for paperless-ngx; a blank title counts as omitted |
 | `--profile` | TEXT | `default` | Scan profile name from config |
+| `--multi-page` | flag | off | Ask after each scan whether there is another page, and put every page in one document. Needs an interactive terminal, and is refused for a manual duplex profile. See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md) |
 
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Scan and upload completed successfully |
-| 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt) |
-| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, an unset or placeholder paperless-ngx API token, no scanner found, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
+| 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt or a multi-page question) |
+| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `--multi-page` without an interactive terminal or with a manual duplex profile, an unset or placeholder paperless-ngx API token, no scanner found, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
 | 3 | Paperless-ngx upload error (unreachable after retries, or upload rejected) |
 | 4 | PDF assembly error (disk full, unwritable output directory) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 6 | Saved to the consume folder, not uploaded: the document is there but its title, tags and correspondent were not applied; stdout reads `Saved to folder: <title>` |
-| 7 | Uploaded with a warning (a sheet the scanner skipped, or manual-duplex front and back counts that differed, uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |
-| 8 | Every page looked blank to empty-page detection; nothing was uploaded, and the pages were kept in `failed/`, normally as one PDF (the error line names what was kept) |
+| 7 | Uploaded with a warning (a sheet the scanner skipped, manual-duplex front and back counts that differed, uploaded as two documents, or a `--multi-page` document finished because a question timed out or the document reached the page limit); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |
+| 8 | Every page looked blank to empty-page detection, or a `--multi-page` question timed out while every page so far had been skipped as blank; nothing was uploaded, and the pages were kept in `failed/`, normally as one PDF (the error line names what was kept) |
 | 129 | Interrupted by SIGHUP (for example a dropped SSH session); pages already scanned, if any, were kept in `failed/` when they could be, and the `Interrupted:` line says what was kept, or where the pages were left |
-| 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt, or Ctrl-C during the scan) |
+| 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt; a confirmed `a`, Ctrl-D or Ctrl-C at a `--multi-page` question; or Ctrl-C during the scan) |
 | 143 | Interrupted by SIGTERM; pages already scanned, if any, were kept in `failed/` when they could be, and the `Interrupted:` line says what was kept, or where the pages were left |
 
 With neither `--title` nor a profile `title`, the document title is the scan's start time rendered in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. Set `TZ` on the server (or in `docker-compose.yml`) if that zone is wrong; a container reports UTC unless you do.
@@ -71,6 +72,8 @@ With neither `--title` nor a profile `title`, the document title is the scan's s
 If the paperless-ngx API token is unset, blank or still one of the shipped placeholders such as `changeme`, or `paperless.url` is empty, `scan` refuses with exit code 2 before the scanner is opened, so no paper is fed for an upload that cannot succeed. A configured `paperless.consume_dir` fallback does not change this: run `saneless doctor` to see the same fact the web UI reports.
 
 For a profile with `duplex = "manual"`, `scan` pauses between the two passes and asks `Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:`. Yes (the default) scans the back sides. No, Ctrl-D (end of input) or Ctrl-C at the flip prompt cancels the scan, prints one line and exits with code 130. A terminal or SSH session that closes at the prompt sends SIGHUP as well as end of input, and the signal wins: that is an interruption, which keeps the fronts in `failed/` and exits with code 129. A read error at the flip prompt, such as an I/O error or undecodable input, fails the scan with exit code 1, and the error is logged with its traceback. When stdin is not a terminal, `scan` refuses the profile with exit code 2 before any page is fed. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
+
+With `--multi-page`, `scan` scans once and then asks, after every scan, what to do next: `[n]ext, [r]e-scan last, [f]inish, [a]bort`, headed by how many pages are kept so far. `n` scans again and adds the pages to the document, `r` throws away the last scan and scans it again, `f` finishes and uploads the document, and `a` asks you to confirm and then cancels (exit 130). A letter that is not offered prints the letters that are, and asks again; `f` is not offered while every page so far was skipped as blank. When the profile has empty-page detection on and a scan produced a page that looks blank, it asks `[s]kip, [k]eep, [r]e-scan` first. When a scan fails with a scanner fault or an empty feeder after at least one page is kept, it asks `[n] scan again, [f]inish, [a]bort` instead of failing. Ctrl-C or Ctrl-D at any of these questions cancels at once, with no confirmation, and keeps nothing (exit 130). Each question waits `operator_wait_timeout_seconds`; a timeout finishes the document with the pages kept and exits 7, or exits 8 if every page so far was skipped as blank. SIGTERM or SIGHUP at a question keeps the pages in `failed/` and exits 143 or 129. `--multi-page` is refused with exit code 2 before the scanner is opened when stdin is not a terminal, and for a manual duplex profile. See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md).
 
 ---
 
