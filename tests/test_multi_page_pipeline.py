@@ -11,7 +11,7 @@ as the double's fault and not the pipeline's.
 The second half drives whole runs through ``run_pipeline``: which requests are
 refused before the scanner is touched, and how a run of passes becomes one
 document -- its page order, the questions asked between passes, and every way
-the loop can end.
+the loop can end, the page cap and a pass that fails part way included.
 
 No test here sleeps: a wait on an unanswered slot is given ``0``, and every
 operator answer comes from a script.
@@ -20,6 +20,7 @@ operator answer comes from a script.
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, override
 from unittest.mock import MagicMock
@@ -31,6 +32,8 @@ import saneless.pipeline as pipeline_module
 from saneless.config import ProfileConfig
 from saneless.exceptions import (
     ConfigError,
+    FeederEmptyError,
+    ListingCrashedError,
     ScanCancelledError,
     ScanError,
     ScanInterrupted,
@@ -58,6 +61,7 @@ from saneless.vocabulary import (
     PassPrompt,
     PassWait,
     ScanOutcome,
+    cap_finish_warning,
     pass_wait_state,
     timeout_finish_warning,
 )
@@ -995,3 +999,354 @@ class TestMultiPageLoop:
 
         (kept,) = rig.kept_pdfs()
         assert embedded_streams(kept) == _pages(scanner, [0, 1, 2, 5, 6])
+
+
+class TestMultiPageCap:
+    """
+    A document stops offering another pass once it holds the page cap.
+
+    The cap is lowered for each test so a handful of pages reaches it; the
+    pipeline reads it when it checks, so the lowered value is the one in force.
+    """
+
+    def test_the_pass_that_crosses_the_cap_is_kept_whole(
+        self, rig: _Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cap 3, then a two-page pass at 2 kept: all four upload, warned, no prompt."""
+        monkeypatch.setattr(pipeline_module, "MAX_DOCUMENT_PAGES", 3)
+        scanner = DistinctPageScanner(passes=((0, 1), (2, 3)))
+        coordinator = ScriptedPassCoordinator([_NEXT])
+
+        result = rig.run(scanner, coordinator)
+
+        assert len(coordinator.prompts) == 1
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == cap_finish_warning(4, 3)
+        assert result.pages_uploaded == 4
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 1, 2, 3])
+
+    def test_reaching_the_cap_exactly_finishes(
+        self, rig: _Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Three kept at a cap of 3 is the cap reached: finished, warned."""
+        monkeypatch.setattr(pipeline_module, "MAX_DOCUMENT_PAGES", 3)
+        scanner = DistinctPageScanner(passes=((0, 1), (2,)))
+        coordinator = ScriptedPassCoordinator([_NEXT])
+
+        result = rig.run(scanner, coordinator)
+
+        assert len(coordinator.prompts) == 1
+        assert result.warning == cap_finish_warning(3, 3)
+        assert result.pages_uploaded == 3
+
+    def test_below_the_cap_the_operator_is_still_asked(
+        self, rig: _Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two kept under a cap of 3: asked twice, and Finish is a plain DONE."""
+        monkeypatch.setattr(pipeline_module, "MAX_DOCUMENT_PAGES", 3)
+        scanner = DistinctPageScanner(passes=((0,), (1,)))
+        coordinator = ScriptedPassCoordinator([_NEXT, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        assert len(coordinator.prompts) == 2
+        assert result.warning is None
+        assert result.pages_uploaded == 2
+
+    def test_the_cap_warning_sits_beside_the_unreadable_sheet_warning(
+        self, rig: _Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neither reason for the warning hides the other."""
+        monkeypatch.setattr(pipeline_module, "MAX_DOCUMENT_PAGES", 2)
+        scanner = DistinctPageScanner(passes=((0,), (1,)), rejected=(1, 0))
+        coordinator = ScriptedPassCoordinator([_NEXT])
+
+        result = rig.run(scanner, coordinator)
+
+        unreadable = _rejected_pages_warning(1)
+        assert unreadable is not None
+        assert result.warning is not None
+        assert cap_finish_warning(2, 2) in result.warning
+        assert unreadable in result.warning
+
+
+# A jam part way through a later pass: the scanner's fault, not the operator's.
+_JAM = "Document feeder jammed"
+
+
+def _jams_on_pass_2() -> DistinctPageScanner:
+    """
+    Build a scanner whose second pass spools its page and then jams.
+
+    Returns:
+        A scanner feeding page 0, then page 1 before the jam, then page 2.
+
+    """
+    return DistinctPageScanner(passes=((0,), (1,), (2,)), fail_on={2: ScanError(_JAM)})
+
+
+class _WedgedRestart(DistinctPageScanner):
+    """A distinct-page scanner whose first restart before a later pass fails."""
+
+    def __init__(self, *, passes: Sequence[Sequence[int]], message: str) -> None:
+        """
+        Prepare the passes and the restart's failure.
+
+        Args:
+            passes: The page indices each successive scan feeds.
+            message: What the failing restart says.
+
+        """
+        super().__init__(passes=passes)
+        self.message = message
+        self.restarts = 0
+
+    @override
+    def reinitialise(self) -> None:
+        """
+        Fail the first restart, and let every later one through.
+
+        Raises:
+            ScanError: On the first call.
+
+        """
+        self.restarts += 1
+        if self.restarts == 1:
+            raise ScanError(self.message)
+
+
+class TestMultiPageScannerFault:
+    """A later pass that the scanner fails goes back to the operator."""
+
+    def test_a_jam_on_a_later_pass_asks_the_operator(self, rig: _Rig) -> None:
+        """
+        The jammed pass is thrown away, and the operator decides what next.
+
+        The failed pass's page is gone from the spool by the time the question
+        is asked, and it is neither uploaded nor counted as scanned.
+        """
+        latest: list[PipelineEvent] = []
+        listed: list[list[str]] = []
+
+        def _at_prompt_2(prompt: PassPrompt) -> None:
+            if prompt.number == 2:
+                latest.append(rig.events[-1])
+                listed.append(rig.spool_names())
+
+        scanner = _jams_on_pass_2()
+        coordinator = ScriptedPassCoordinator(
+            [_NEXT, _NEXT, _FINISH], on_ask=_at_prompt_2
+        )
+
+        result = rig.run(scanner, coordinator)
+
+        retry = coordinator.prompts[1]
+        assert retry.wait is PassWait.RETRY
+        assert retry.offered == frozenset({_NEXT, _FINISH, _ABORT})
+        assert retry.pages_kept == 1
+        assert retry.timeout_seconds == _TIMEOUT
+        assert retry.error is not None
+        assert _JAM in retry.error
+        assert latest == [PipelineEvent.AWAITING_RETRY]
+        (names,) = listed
+        assert [name for name in names if name.startswith("a-00002-")] == []
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_scanned == 2
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 2])
+
+    def test_finish_after_a_jam_is_a_plain_done(self, rig: _Rig) -> None:
+        """Finish pressed at the retry prompt is the operator's choice: no warning."""
+        scanner = _jams_on_pass_2()
+        coordinator = ScriptedPassCoordinator([_NEXT, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0])
+
+    def test_a_timeout_after_a_jam_finishes_warned(self, rig: _Rig) -> None:
+        """Nobody answered the retry prompt: the kept page uploads, warned."""
+        scanner = _jams_on_pass_2()
+        coordinator = ScriptedPassCoordinator([_NEXT, PassAnswer.TIMED_OUT])
+
+        result = rig.run(scanner, coordinator)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == timeout_finish_warning(1, _TIMEOUT)
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0])
+
+    def test_abort_after_a_jam_keeps_nothing(self, rig: _Rig) -> None:
+        """Abort at the retry prompt is a cancel, like Abort anywhere else."""
+        coordinator = ScriptedPassCoordinator([_NEXT, _ABORT])
+
+        with pytest.raises(ScanCancelledError):
+            rig.run(_jams_on_pass_2(), coordinator)
+
+        assert rig.kept_pdfs() == []
+        rig.paperless.upload_document.assert_not_called()
+
+    def test_a_stop_after_a_jam_keeps_only_the_accepted_pages(self, rig: _Rig) -> None:
+        """The thrown-away pass never comes back as a ``(partial)`` in ``failed/``."""
+        scanner = _jams_on_pass_2()
+        coordinator = ScriptedPassCoordinator([_NEXT, PassAnswer.INTERRUPTED])
+
+        with pytest.raises(ScanInterrupted):
+            rig.run(scanner, coordinator)
+
+        (kept,) = rig.kept_pdfs()
+        assert "partial" not in kept.name
+        assert embedded_streams(kept) == _pages(scanner, [0])
+
+    def test_a_jam_on_the_first_pass_fails_the_job(self, rig: _Rig) -> None:
+        """With nothing kept there is nothing to go back to: the failure stands."""
+        jam = ScanError("jam")
+        scanner = DistinctPageScanner(passes=((0,),), fail_on={1: jam})
+        coordinator = ScriptedPassCoordinator([])
+
+        with pytest.raises(ScanError) as raised:
+            rig.run(scanner, coordinator)
+
+        assert raised.value is jam
+        assert coordinator.prompts == []
+        (partial,) = rig.kept_partials()
+        assert embedded_streams(partial) == _pages(scanner, [0])
+
+    def test_a_jam_on_the_rescan_of_the_only_pass_fails_the_job(
+        self, rig: _Rig
+    ) -> None:
+        """Re-scan of the only pass leaves nothing kept, so its jam ends the job."""
+        jam = ScanError("jam")
+        scanner = DistinctPageScanner(passes=((0,), (1,), (2,)), fail_on={2: jam})
+        coordinator = ScriptedPassCoordinator([_RESCAN])
+
+        with pytest.raises(ScanError) as raised:
+            rig.run(scanner, coordinator)
+
+        assert raised.value is jam
+        assert len(coordinator.prompts) == 1
+        rig.paperless.upload_document.assert_not_called()
+
+    def test_a_full_disk_on_a_later_pass_is_not_a_scanner_fault(
+        self, rig: _Rig
+    ) -> None:
+        """A disk refusal would fail again at once, so it ends the job."""
+        refusal = SpoolError("Insufficient disk space for page 1")
+        scanner = DistinctPageScanner(passes=((0,), (1,)), fail_on={2: refusal})
+        coordinator = ScriptedPassCoordinator([_NEXT])
+
+        with pytest.raises(SpoolError) as raised:
+            rig.run(scanner, coordinator)
+
+        assert raised.value is refusal
+        assert [prompt.wait for prompt in coordinator.prompts] == [PassWait.NEXT_PASS]
+        assert embedded_streams(rig.kept_document()) == _pages(scanner, [0])
+
+    def test_an_empty_feeder_on_a_later_pass_asks_the_operator(self, rig: _Rig) -> None:
+        """Scan next pressed before the sheet was loaded is a retry, not a failure."""
+        empty = FeederEmptyError("No paper detected in feeder")
+        scanner = DistinctPageScanner(passes=((0,), (), (2,)), fail_on={2: empty})
+        coordinator = ScriptedPassCoordinator([_NEXT, _NEXT, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        retry = coordinator.prompts[1]
+        assert retry.wait is PassWait.RETRY
+        assert retry.offered == frozenset({_NEXT, _FINISH, _ABORT})
+        assert retry.error is not None
+        assert "No paper detected in feeder" in retry.error
+        assert result.pages_uploaded == 2
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 2])
+
+    def test_an_empty_feeder_on_the_first_pass_fails_the_job(self, rig: _Rig) -> None:
+        """With nothing kept, an empty feeder is the ordinary failure it is today."""
+        empty = FeederEmptyError("No paper detected in feeder")
+        scanner = DistinctPageScanner(passes=((),), fail_on={1: empty})
+        coordinator = ScriptedPassCoordinator([])
+
+        with pytest.raises(FeederEmptyError) as raised:
+            rig.run(scanner, coordinator)
+
+        assert raised.value is empty
+        assert coordinator.prompts == []
+
+    @pytest.mark.parametrize(
+        ("passes", "failure", "said"),
+        [
+            (((0,), (1,)), ListingCrashedError("died"), "died"),
+            (((0,), ()), None, "No pages were scanned"),
+        ],
+        ids=["listing-crashed", "empty-pass"],
+    )
+    def test_other_scanner_faults_ask_the_operator(
+        self,
+        rig: _Rig,
+        passes: tuple[tuple[int, ...], ...],
+        failure: ScanError | None,
+        said: str,
+    ) -> None:
+        """A crashed device listing and a pass that came back empty both return."""
+        fail_on = {} if failure is None else {2: failure}
+        scanner = DistinctPageScanner(passes=passes, fail_on=fail_on)
+        coordinator = ScriptedPassCoordinator([_NEXT, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        retry = coordinator.prompts[1]
+        assert retry.wait is PassWait.RETRY
+        assert retry.error is not None
+        assert said in retry.error
+        assert result.pages_uploaded == 1
+
+    def test_a_failed_restart_before_a_pass_asks_the_operator(self, rig: _Rig) -> None:
+        """A restart that fails is the pass failing; the next try restarts again."""
+        scanner = _WedgedRestart(passes=((0,), (1,)), message="wedged read")
+        coordinator = ScriptedPassCoordinator([_NEXT, _NEXT, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        retry = coordinator.prompts[1]
+        assert retry.wait is PassWait.RETRY
+        assert retry.error is not None
+        assert "wedged read" in retry.error
+        assert scanner.restarts == 2
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 1])
+        assert result.pages_scanned == 2
+
+    def test_a_broken_retry_prompt_is_not_another_scanner_fault(
+        self, rig: _Rig
+    ) -> None:
+        """A retry prompt that broke fails the run; it is never asked again."""
+        cause = RuntimeError("tty gone")
+        coordinator = ScriptedPassCoordinator([_NEXT, _ABORT], cause=cause)
+
+        with pytest.raises(ScanError) as raised:
+            rig.run(_jams_on_pass_2(), coordinator)
+
+        assert str(raised.value).startswith("Multi-page prompt failed")
+        assert raised.value.__cause__ is cause
+        assert len(coordinator.prompts) == 2
+
+    def test_the_failure_is_logged_once(
+        self, rig: _Rig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The jam is logged at WARNING, once, as the exception's ``repr``."""
+        jam = ScanError(_JAM)
+        scanner = DistinctPageScanner(passes=((0,), (1,)), fail_on={2: jam})
+        coordinator = ScriptedPassCoordinator([_NEXT, _FINISH])
+        caplog.set_level(logging.WARNING)
+
+        rig.run(scanner, coordinator)
+
+        logged = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and repr(jam) in record.getMessage()
+        ]
+        assert len(logged) == 1
