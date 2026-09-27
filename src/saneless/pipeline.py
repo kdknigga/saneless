@@ -41,6 +41,7 @@ from saneless.vocabulary import (
     PassPrompt,
     PassWait,
     ScanOutcome,
+    blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
     timeout_finish_warning,
@@ -1124,6 +1125,8 @@ class _MultiPageDocument:
         warning: Why the document finished without the operator pressing
             Finish, or None when they did.
         prompts: The number of the last prompt put to the operator.
+        started: How many passes have been started, thrown-away ones
+            included.
 
     """
 
@@ -1133,6 +1136,7 @@ class _MultiPageDocument:
     unreadable: int = 0
     warning: str | None = None
     prompts: int = 0
+    started: int = 0
 
     @property
     def kept(self) -> int:
@@ -1149,6 +1153,20 @@ class _MultiPageDocument:
         """
         self.prompts += 1
         return self.prompts
+
+    def start_pass(self) -> int:
+        """
+        Give the next pass its number, one more than the last one started.
+
+        Thrown-away passes keep their numbers, so no two passes of a run ever
+        share one, nor the spool label made from it.
+
+        Returns:
+            The new pass's 1-based number within the run.
+
+        """
+        self.started += 1
+        return self.started
 
 
 def _duplex_resolution(front: ScanBatch, back: ScanBatch) -> int:
@@ -1408,6 +1426,15 @@ _ENDINGS_NOBODY_OFFERS: Final = frozenset(
 # and Scan next is already the try-again.
 _RETRY_ANSWERS: Final = frozenset(
     {PassAnswer.NEXT, PassAnswer.FINISH, PassAnswer.ABORT}
+)
+
+
+# The answers the prompt about a pass's blank pages offers: throw the whole
+# pass away and scan it again, or take it without the pages that look blank,
+# or with them.  No Abort: the pass is undecided, and the next-pass prompt
+# that follows a Skip or a Keep offers it.
+_BLANK_ANSWERS: Final = frozenset(
+    {PassAnswer.RESCAN, PassAnswer.SKIP_BLANKS, PassAnswer.KEEP_BLANKS}
 )
 
 
@@ -2118,6 +2145,15 @@ class _PipelineRun:
         pass the scanner fails while a page is kept goes back to the operator
         instead of failing the job, with the failed pass thrown away.
 
+        Blank pages are the operator's decision here, asked once per pass and
+        only for a pass that has one, while a single-pass scan removes them on
+        its own.  The operator is standing at the scanner between passes, so
+        a page that only looks blank -- a faint form, a signature page -- can
+        be kept, skipped, or scanned again, rather than silently lost.  For
+        the same reason no blank-page filter runs over the finished document:
+        a page kept on purpose must never be removed afterwards, and a
+        document of pages kept on purpose must never be failed as all blank.
+
         Args:
             context: The pass coordinator, and the timeout on every prompt.
 
@@ -2136,10 +2172,8 @@ class _PipelineRun:
 
         """
         document = _MultiPageDocument()
-        pass_number = 0
         while True:
-            pass_number += 1
-            prompt = self._after_pass(context, document, pass_number)
+            prompt = self._after_pass(context, document)
             if prompt is None:
                 return document
             # Asked here, outside the pass's try, so a prompt that broke can
@@ -2182,28 +2216,35 @@ class _PipelineRun:
                     assert_never(answer)
 
     def _after_pass(
-        self,
-        context: _MultiPageContext,
-        document: _MultiPageDocument,
-        pass_number: int,
+        self, context: _MultiPageContext, document: _MultiPageDocument
     ) -> PassPrompt | None:
         """
         Scan one pass, and say what the operator is asked next, if anything.
 
+        A pass the operator throws away at its blank-page prompt is scanned
+        again at once, with no other question in between, so this can scan
+        more than one pass before it returns.
+
         Args:
             context: The timeout every prompt carries.
             document: The document the pass is accepted into.
-            pass_number: The pass's 1-based number within the run.
 
         Returns:
             The prompt after a failed pass, the next-pass prompt after an
-            accepted one, or None when the accepted pass took the document to
-            the page cap and it is finished.
+            accepted one, or None when the document is finished: nobody
+            answered about the pass's blank pages, or the pass took the
+            document to the page cap.
 
         """
-        failure = self._scan_pass(document, pass_number)
-        if failure is not None:
-            return self._retry_prompt(context, document, failure)
+        while True:
+            scanned = self._scan_pass(document, document.start_pass())
+            if isinstance(scanned, Exception):
+                return self._retry_prompt(context, document, scanned)
+            decision = self._settle_blanks(context, document, *scanned)
+            if decision is not PassAnswer.RESCAN:
+                break
+        if decision is PassAnswer.TIMED_OUT:
+            return None
         # Read at call time rather than bound at import, and checked here,
         # between passes, only: the pass that crossed the cap is kept whole.
         cap = MAX_DOCUMENT_PAGES
@@ -2220,24 +2261,28 @@ class _PipelineRun:
 
     def _scan_pass(
         self, document: _MultiPageDocument, pass_number: int
-    ) -> Exception | None:
+    ) -> Exception | tuple[SpooledPageSink, ScanBatch]:
         """
-        Scan one pass of a multi-page document, and accept it if it succeeds.
+        Scan one pass of a multi-page document, and leave it undecided.
+
+        The pass stays registered with the ledger as a pass in flight until it
+        is accepted or thrown away, so a stop while its blank pages are being
+        asked about keeps it beside the document.
 
         A pass that fails with a fault the operator can do something about,
         while a page is kept, is thrown away -- its page files deleted, and
         none of it counted -- and its failure is returned instead of raised.
-        Only the pass itself is inside the ``try``: accepting it is not a
-        scanner fault, and no prompt is ever asked from inside it.
+        Only the pass itself is inside the ``try``: no prompt is ever asked
+        from inside it.
 
         Args:
-            document: The document the pass is accepted into.
+            document: The document the pass is for.
             pass_number: The pass's 1-based number within the run, counting
                 passes that were later thrown away.
 
         Returns:
-            The failure the operator is to be asked about, or None when the
-            pass was accepted.
+            The failure the operator is to be asked about, or the sink the
+            pass spooled into and what the pass produced.
 
         Raises:
             ScanError: ``No pages were scanned`` if the pass returned no pages,
@@ -2278,8 +2323,117 @@ class _PipelineRun:
                 exc,
             )
             return exc
-        self._accept_pass(document, sink, batch)
-        return None
+        return sink, batch
+
+    def _blank_positions(self, batch: ScanBatch) -> tuple[int, ...]:
+        """
+        Say which pages of a pass look blank, when the profile asks.
+
+        Args:
+            batch: What the pass produced.
+
+        Returns:
+            The 1-based positions, within the pass, of the pages that look
+            blank; none when the profile has empty-page detection off.
+
+        """
+        if not self.profile.enable_empty_page_detection:
+            return ()
+        verdict = filter_blank_pages(
+            batch.pages,
+            coverage_threshold=self.profile.empty_page_coverage_threshold,
+        )
+        return verdict.removed_positions
+
+    def _settle_blanks(
+        self,
+        context: _MultiPageContext,
+        document: _MultiPageDocument,
+        sink: SpooledPageSink,
+        batch: ScanBatch,
+    ) -> PassAnswer | None:
+        """
+        Accept a scanned pass, asking the operator first if a page looks blank.
+
+        One question for the whole pass, never one per page.  Skip accepts the
+        pass without the pages that look blank, Keep accepts all of it, and
+        Re-scan throws the whole pass away.  Nobody answering skips them and
+        finishes the document, warned, because nobody said it was complete.
+
+        Args:
+            context: The coordinator to ask, and the timeout on the prompt.
+            document: The document the pass is accepted into.
+            sink: The sink the pass spooled into.
+            batch: What the pass produced.
+
+        Returns:
+            The answer to the blank-page prompt, or None when no page looked
+            blank and the pass was accepted without a question.
+
+        Raises:
+            ScanError: If the coordinator answered with something the prompt
+                did not offer, or its prompt broke.
+            ScanCancelledError: If the operator aborted.
+            ScanInterrupted: If saneless is stopping; the undecided pass is
+                kept beside the document.
+
+        """
+        blanks = self._blank_positions(batch)
+        if not blanks:
+            self._accept_pass(document, sink, batch, ())
+            return None
+        prompt = PassPrompt(
+            number=document.number_prompt(),
+            wait=PassWait.BLANK_DECISION,
+            pages_kept=document.kept,
+            offered=_BLANK_ANSWERS,
+            timeout_seconds=context.timeout,
+            pass_pages=len(batch.pages),
+            blank_positions=blanks,
+        )
+        answer = self._ask(context, prompt)
+        match answer:
+            case PassAnswer.RESCAN:
+                # Never accepted, so neither counted as scanned nor reported
+                # as removed: the numbering matches the document being built.
+                self.ledger.discard(sink)
+                logger.info(
+                    "Re-scan: discarded a pass of %d page(s), %d of them "
+                    "blank; %d kept",
+                    len(batch.pages),
+                    len(blanks),
+                    document.kept,
+                )
+            case PassAnswer.SKIP_BLANKS:
+                self._accept_pass(document, sink, batch, blanks)
+            case PassAnswer.KEEP_BLANKS:
+                self._accept_pass(document, sink, batch, ())
+            case PassAnswer.TIMED_OUT:
+                self._accept_pass(document, sink, batch, blanks)
+                logger.warning(
+                    "Nobody answered multi-page prompt %d within %g seconds; "
+                    "skipping the blank page(s) and finishing the document "
+                    "with %d page(s)",
+                    prompt.number,
+                    context.timeout,
+                    document.kept,
+                )
+                document.warning = blank_timeout_finish_warning(
+                    document.kept, context.timeout
+                )
+            case (
+                PassAnswer.NEXT
+                | PassAnswer.FINISH
+                | PassAnswer.ABORT
+                | PassAnswer.INTERRUPTED
+            ):
+                # _ask has already ended the run for an abort or a stop, and
+                # refused Scan next and Finish, which this prompt does not
+                # offer; reaching this arm means that changed.
+                raise _unoffered_answer(answer, prompt.number)
+            case _:
+                assert_never(answer)
+        return answer
 
     def _retry_prompt(
         self,
@@ -2312,10 +2466,19 @@ class _PipelineRun:
         )
 
     def _accept_pass(
-        self, document: _MultiPageDocument, sink: SpooledPageSink, batch: ScanBatch
+        self,
+        document: _MultiPageDocument,
+        sink: SpooledPageSink,
+        batch: ScanBatch,
+        skipped: tuple[int, ...],
     ) -> None:
         """
         Add a finished pass's pages to the document the guard keeps.
+
+        Every page of the pass joins the document, skipped ones included, so
+        a failed run keeps them all.  A skipped page is recorded by its
+        position in the document, which is how the finished document leaves
+        it out and how it is reported as removed.
 
         The ledger stops tracking the pass, because its pages now belong to the
         document; tracking them in both places would keep them twice.
@@ -2324,13 +2487,20 @@ class _PipelineRun:
             document: The document the pass joins.
             sink: The sink the pass spooled into.
             batch: What the pass produced.
+            skipped: The 1-based positions, within the pass, of the pages the
+                document leaves out as blank.
 
         """
         pages = len(batch.pages)
+        before = len(document.records)
+        document.removed.extend(before + position for position in skipped)
         document.records.extend(batch.pages)
         document.passes.append(
             _AcceptedPass(
-                sink=sink, pages=pages, kept=pages, rejected=batch.pages_rejected
+                sink=sink,
+                pages=pages,
+                kept=pages - len(skipped),
+                rejected=batch.pages_rejected,
             )
         )
         document.unreadable += batch.pages_rejected
@@ -2338,9 +2508,10 @@ class _PipelineRun:
         self.artefacts.document = tuple(document.records)
         self.ledger.forget(sink)
         logger.info(
-            "Multi-page pass %d: scanned %d page(s); %d kept so far",
+            "Multi-page pass %d: scanned %d page(s), skipped %d; %d kept so far",
             len(document.passes),
             pages,
+            len(skipped),
             document.kept,
         )
 
