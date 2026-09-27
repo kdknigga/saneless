@@ -1630,12 +1630,12 @@ def test_no_shipped_file_references_the_old_owner() -> None:
 # leaves ordinary text alone: UTF-8, ISO-8601, SHA-384, A4, "N-1" and a bare
 # PLAN (SQLite's EXPLAIN QUERY PLAN) do not match. The no-planning-citations
 # hook in .pre-commit-config.yaml carries the same pattern, and the test after
-# the guard keeps the two identical. The architecture and enumeration
-# requirement IDs are covered too, because their prefixes appear in no other
-# identifier shape above.
+# the guard keeps the two identical. The architecture, enumeration and
+# multi-page requirement IDs are covered too, because their prefixes appear in
+# no other identifier shape above.
 PLANNING_CITATION = re.compile(
     r"\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
-    r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|OUTC|ROBU|"
+    r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|MPG|OUTC|ROBU|"
     r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\bT-[0-9]+-[0-9]+\b|"
     r"\b[Pp]hase [0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
     r"\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|"
