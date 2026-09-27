@@ -606,20 +606,31 @@ def test_scan_button_disabled_and_busy_split(
     assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
 
 
+def _scan_caption(state: JobState) -> str:
+    """
+    Return the Scan button's exact caption while a job is in ``state``.
+
+    A job waiting for a person says which person-shaped wait it is: the flip
+    has its own caption, and every multi-page wait shares one.
+    """
+    if state is JobState.AWAITING_FLIP:
+        return "Waiting for flip&#8230;"
+    if state in PASS_WAIT_STATES:
+        return "Waiting for you&#8230;"
+    if state in BUSY_STATES:
+        return "Scanning&#8230;"
+    return "Scan"
+
+
 @pytest.mark.parametrize("state", list(JobState))
 def test_scan_button_text(client: TestClient, state: JobState) -> None:
-    """The button keeps its three exact captions, HTML entity included (UI-07)."""
+    """The button keeps its exact captions, HTML entity included (UI-07)."""
     _job_in_state(client, state)
     match = _SCAN_BUTTON.search(client.get("/").text)
     assert match is not None, "scan button markup not found"
     text = match.group("text").strip()
 
-    if state is JobState.AWAITING_FLIP:
-        expected = "Waiting for flip&#8230;"
-    elif state in BUSY_STATES:
-        expected = "Scanning&#8230;"
-    else:
-        expected = "Scan"
+    expected = _scan_caption(state)
     assert text == expected
 
 
@@ -684,12 +695,7 @@ def test_poll_scan_button_follows_the_state_table(
     assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
     assert 'aria-busy="false"' not in text
 
-    if state is JobState.AWAITING_FLIP:
-        expected = "Waiting for flip&#8230;"
-    elif state in BUSY_STATES:
-        expected = "Scanning&#8230;"
-    else:
-        expected = "Scan"
+    expected = _scan_caption(state)
     assert match.group("text").strip() == expected
 
 
@@ -1896,12 +1902,7 @@ class TestScanBlocked:
         assert _DESCRIBED_BY in attrs
         assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
 
-        if state is JobState.AWAITING_FLIP:
-            expected = "Waiting for flip&#8230;"
-        elif state in BUSY_STATES:
-            expected = "Scanning&#8230;"
-        else:
-            expected = "Scan"
+        expected = _scan_caption(state)
         assert match.group("text").strip() == expected
 
     def test_an_unblocked_page_carries_no_describedby_and_no_reason(

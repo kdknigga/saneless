@@ -337,3 +337,28 @@ label.multi-page-option {
     white-space: nowrap;
     border: 0;
 }
+
+/* The multi-page prompt's button row wraps instead of overflowing: Pico's
+   [role=group] is a joined, non-wrapping row, so it is deliberately not used
+   here, and four buttons would run off a narrow phone. */
+.prompt-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: var(--pico-spacing);
+}
+
+/* Pico buttons stretch in some contexts; these sit side by side at their own
+   width, at the 44px touch floor. */
+.prompt-actions > button {
+    width: auto;
+    min-height: 2.75rem;
+    margin-bottom: 0;
+}
+
+/* The prompt's consequence, timeout and Finish-blocked lines: guidance, not a
+   verdict, so they read muted, each on its own line. */
+.prompt-note {
+    display: block;
+    color: var(--pico-muted-color);
+}
