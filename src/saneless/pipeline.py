@@ -2174,8 +2174,9 @@ class _PipelineRun:
                     | PassAnswer.KEEP_BLANKS
                 ):
                     # _ask has already ended the run for an abort or a stop,
-                    # and refused the blank-page answers, which this prompt
-                    # never offers; reaching this arm means that changed.
+                    # and refused the blank-page answers, which neither the
+                    # next-pass nor the retry prompt offers; reaching this arm
+                    # means that changed.
                     raise _unoffered_answer(answer, document.prompts)
                 case _:
                     assert_never(answer)
