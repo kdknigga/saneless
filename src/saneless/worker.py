@@ -37,9 +37,11 @@ from .exceptions import (
 from .job import JobResult
 from .pipeline import (
     SCAN_LABEL_FRONT,
+    AnswerSlot,
     DeviceMemory,
     FlipAnswerSlot,
     FlipCoordinator,
+    PassCoordinator,
     PipelineEvent,
     PipelineRequest,
     run_pipeline,
@@ -47,10 +49,13 @@ from .pipeline import (
 from .vocabulary import (
     ACTIVE_STATES,
     RESTART_REASON,
+    WAITING_STATES,
     ConfigFileState,
     ErrorCategory,
     FlipOutcome,
     JobState,
+    PassAnswer,
+    PassWait,
     ProfileStorage,
     SubmitResult,
     WorkerHealth,
@@ -66,12 +71,16 @@ if TYPE_CHECKING:
     from .job import Job, JobStore
     from .paperless import PaperlessClient
     from .scanner.base import ScannerBackend
+    from .vocabulary import PassPrompt
 
 __all__ = [
+    "DEFAULT_SCAN_OPTIONS",
     "PRESERVATION_JOIN_SECONDS",
     "STOP_JOIN_SECONDS",
+    "ScanOptions",
     "ScanWorker",
     "WorkerFlipCoordinator",
+    "WorkerPassCoordinator",
 ]
 
 logger = logging.getLogger(__name__)
@@ -149,6 +158,46 @@ class _OwedWrite:
     result: JobResult | None = None
     error: str | None = None
     category: ErrorCategory | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScanOptions:
+    """
+    The per-scan choices a web request makes, carried to the job that runs it.
+
+    They travel on the queue beside the job, and are deliberately not a ``Job``
+    field or a job-table column, for the reason ``ScanWorker.front_pages`` is
+    not one: a choice made for one scan means nothing once that scan ends, and
+    a column would cost a schema migration of every existing job database.
+    Nor are they a profile setting: the same profile scans one sheet or a
+    whole document, and the operator decides which each time.
+
+    Attributes:
+        multi_page: Whether the scan is a multi-page document: the operator is
+            asked between passes whether there is another page.
+
+    """
+
+    multi_page: bool = False
+
+
+# A single-pass scan: what a submit without options runs.
+DEFAULT_SCAN_OPTIONS: Final = ScanOptions()
+
+
+@dataclass(frozen=True, slots=True)
+class _Queued:
+    """
+    One queued job and the choices it was submitted with.
+
+    Attributes:
+        job: The job to run.
+        options: Its per-scan choices.
+
+    """
+
+    job: Job
+    options: ScanOptions
 
 
 def _profiles_after_persist(
@@ -334,6 +383,154 @@ class WorkerFlipCoordinator(FlipCoordinator):
         return self._slot.offer(outcome)
 
 
+class WorkerPassCoordinator(PassCoordinator):
+    """
+    The web pass coordinator: one open prompt at a time, each answered once.
+
+    A multi-page job asks its operator a question after every pass, through
+    the multi-page routes on request threads while the worker thread waits
+    here.  Each ``ask`` publishes its prompt with a fresh answer slot, so every
+    prompt is claimed once and its claim is final, exactly as the flip wait's
+    is: whichever of the operator, the clock or a stop claims first is the
+    answer.
+
+    An answer must name the prompt it answers by number, and must be one that
+    prompt offers.  That replaces the flip coordinator's arming latch, which
+    only works because a manual-duplex job asks its one question once.  A
+    multi-page job asks the same question with the same buttons again and
+    again, so a delayed double-click on "Scan next page" that arrived after the
+    next pass finished would otherwise answer the next prompt too, and start a
+    pass on a platen nobody has changed.  Membership of the offered set also
+    refuses a forged answer the page never showed, such as Finish on a
+    document with no pages.
+
+    The stopping latch is the worker's own stop flag, and it is sticky: once
+    set, every ``ask`` returns ``INTERRUPTED`` at once without publishing a
+    prompt.  ``interrupt_for_shutdown`` only reaches a prompt that is open when
+    the stop lands; a stop that arrives mid-pass, or before this job had a
+    coordinator at all, must not leave the next prompt waiting its full
+    timeout while the server tries to exit.
+
+    Args:
+        job_id: The id of the job whose prompts this coordinator answers.
+        stopping: The worker's stop flag.
+
+    """
+
+    def __init__(self, job_id: str, *, stopping: threading.Event) -> None:
+        """Start with no prompt, bound to ``job_id``."""
+        self._job_id = job_id
+        self._stopping = stopping
+        # Guards the pair below, so a reader never sees one prompt's number
+        # with another prompt's slot.
+        self._lock = threading.Lock()
+        self._prompt: PassPrompt | None = None
+        self._slot: AnswerSlot[PassAnswer] | None = None
+
+    @property
+    def job_id(self) -> str:
+        """The id of the job whose prompts this coordinator answers."""
+        return self._job_id
+
+    @property
+    def open_prompt(self) -> PassPrompt | None:
+        """The prompt published and not yet answered, or ``None``."""
+        prompt, slot = self._snapshot()
+        if prompt is None or slot is None or slot.answer is not None:
+            return None
+        return prompt
+
+    @property
+    def claimed(self) -> tuple[PassPrompt, PassAnswer] | None:
+        """The latest prompt and its claimed answer, or ``None`` while unanswered."""
+        prompt, slot = self._snapshot()
+        if prompt is None or slot is None:
+            return None
+        answer = slot.answer
+        if answer is None:
+            return None
+        return prompt, answer
+
+    def ask(self, prompt: PassPrompt) -> PassAnswer:
+        """
+        Publish ``prompt`` and block until it is answered or times out.
+
+        Args:
+            prompt: The question, and the only answers it accepts.
+
+        Returns:
+            The operator's answer; ``TIMED_OUT`` when nobody answered within
+            ``prompt.timeout_seconds``; or ``INTERRUPTED`` when the worker is
+            stopping.
+
+        """
+        if self._stopping.is_set():
+            return PassAnswer.INTERRUPTED
+        slot: AnswerSlot[PassAnswer] = AnswerSlot()
+        with self._lock:
+            self._prompt = prompt
+            self._slot = slot
+        # Checked again once the prompt is published.  stop() sets the flag
+        # before it interrupts, so a stop that the check above missed either
+        # finds this slot or is seen here.
+        if self._stopping.is_set():
+            slot.offer(PassAnswer.INTERRUPTED)
+        # One path for both endings, as the flip wait has: an answered slot
+        # hands its answer back, and an expired one claims TIMED_OUT unless an
+        # answer beat it after all.
+        slot.wait(prompt.timeout_seconds)
+        return slot.settle(PassAnswer.TIMED_OUT)
+
+    def answer(self, number: int, answer: PassAnswer) -> bool:
+        """
+        Offer the operator's ``answer`` to prompt ``number``.
+
+        Args:
+            number: The prompt the operator is answering.
+            answer: What the operator chose.
+
+        Returns:
+            Whether ``answer`` became the prompt's answer.  ``False`` means it
+            was dropped: prompt ``number`` is not the open prompt, the prompt
+            does not offer ``answer``, or it was already answered.
+
+        """
+        prompt, slot = self._snapshot()
+        if prompt is None or slot is None:
+            return False
+        if prompt.number != number or answer not in prompt.offered:
+            return False
+        return slot.offer(answer)
+
+    def interrupt_for_shutdown(self) -> bool:
+        """
+        Answer the open prompt with ``INTERRUPTED`` because the server is stopping.
+
+        ``INTERRUPTED`` is never in a prompt's offered set: this is the
+        shutdown path, not an operator's answer.  A prompt asked after the
+        stop is answered by the stopping latch instead.
+
+        Returns:
+            Whether this shutdown claimed an answer.
+
+        """
+        _prompt, slot = self._snapshot()
+        if slot is None:
+            return False
+        return slot.offer(PassAnswer.INTERRUPTED)
+
+    def _snapshot(self) -> tuple[PassPrompt | None, AnswerSlot[PassAnswer] | None]:
+        """
+        Read the latest prompt and its slot together.
+
+        Returns:
+            The latest prompt and its slot, or ``(None, None)`` before any.
+
+        """
+        with self._lock:
+            return self._prompt, self._slot
+
+
 class ScanWorker:
     """
     Background worker that processes scan jobs from a queue.
@@ -362,13 +559,17 @@ class ScanWorker:
         self._paperless = paperless
         self._settings = settings
         self._job_store: JobStore = job_store
-        self._queue: queue.Queue[Job] = queue.Queue(maxsize=_QUEUE_DEPTH)
+        self._queue: queue.Queue[_Queued] = queue.Queue(maxsize=_QUEUE_DEPTH)
         self._thread = threading.Thread(target=self._run, daemon=True)
         # Set once by stop(); read by the loop, submit() and the flip callback.
         self._stopping = threading.Event()
         # Guards every read and every rebind of self._settings.profiles.
         self._profiles_lock = threading.Lock()
         self._flip_coordinator: WorkerFlipCoordinator | None = None
+        # The running multi-page job's coordinator, read by request threads
+        # answering or rendering its prompts.  A bare attribute read is one
+        # snapshot; every caller reads it once and checks its job id.
+        self._pass_coordinator: WorkerPassCoordinator | None = None
         self._current_job_id: str | None = None
         # Pass A's page count for the job in flight, written by the pipeline's
         # pass-count callback on the worker thread and read by request threads
@@ -557,7 +758,8 @@ class ScanWorker:
         stay active and the next startup's recovery fails them.  An open flip
         wait is answered with ``INTERRUPTED``, and one not yet reached is
         pre-answered, so a manual-duplex job lets the thread go as soon as it
-        is at the prompt.  That is nobody's decision to discard the scan, so
+        is at the prompt.  A multi-page prompt is answered the same way,
+        whether it is open now or asked later.  That is nobody's decision to discard the scan, so
         the job keeps pass A's fronts in ``failed/`` and records the restart.
 
         The join is bounded by ``STOP_JOIN_SECONDS``.  If the thread is still
@@ -587,6 +789,12 @@ class ScanWorker:
             # in pass A the moment it asks.  An answer the operator already
             # gave keeps its own meaning.
             coordinator.interrupt_for_shutdown()
+        pass_coordinator = self._pass_coordinator
+        if pass_coordinator is not None:
+            # An open multi-page prompt is interrupted now.  One asked later
+            # meets the stop flag this coordinator shares, so a stop that
+            # lands mid-pass does not wait out the next prompt's timeout.
+            pass_coordinator.interrupt_for_shutdown()
         if self._thread.is_alive():
             self._thread.join(timeout=STOP_JOIN_SECONDS)
         if self._thread.is_alive() and self._preserving.is_set():
@@ -600,7 +808,9 @@ class ScanWorker:
             logger.info("ScanWorker stopped")
         return stopped
 
-    def submit(self, job: Job) -> SubmitResult:
+    def submit(
+        self, job: Job, options: ScanOptions = DEFAULT_SCAN_OPTIONS
+    ) -> SubmitResult:
         """
         Offer a job to the worker without ever blocking.
 
@@ -610,6 +820,8 @@ class ScanWorker:
 
         Args:
             job: The Job to process.
+            options: The per-scan choices the job runs with; a single-pass
+                scan unless given.
 
         Returns:
             ``ACCEPTED`` when the job is queued, ``QUEUE_FULL`` when the queue
@@ -627,7 +839,7 @@ class ScanWorker:
         # Two except clauses rather than one bracketless PEP 758 clause: the
         # two exceptions mean different things to the caller.
         try:
-            self._queue.put_nowait(job)
+            self._queue.put_nowait(_Queued(job, options))
         except queue.Full:
             return SubmitResult.QUEUE_FULL
         except queue.ShutDown:
@@ -733,6 +945,96 @@ class ScanWorker:
             )
         return claimed
 
+    def answer_pass(self, job_id: str, number: int, answer: PassAnswer) -> bool:
+        """
+        Answer prompt ``number`` of ``job_id``'s multi-page scan with ``answer``.
+
+        The coordinator is read once, and ``job_id`` is compared with that
+        coordinator's own job id, as for a flip signal: one snapshot, so the
+        check and the answer cannot straddle a job boundary.
+
+        Args:
+            job_id: The job the operator is answering.
+            number: The prompt the operator is answering.
+            answer: What the operator chose.
+
+        Returns:
+            Whether the answer was claimed.  ``False`` means it was dropped:
+            ``job_id`` is not the multi-page job running now, prompt ``number``
+            is not its open prompt, that prompt does not offer ``answer``, or
+            it was already answered.
+
+        """
+        coordinator = self._pass_coordinator
+        if coordinator is None or coordinator.job_id != job_id:
+            logger.info(
+                "Multi-page: %s to prompt %d for job %s dropped: "
+                "not the running multi-page job",
+                answer.value,
+                number,
+                job_id,
+            )
+            return False
+        claimed = coordinator.answer(number, answer)
+        if claimed:
+            logger.info(
+                "Multi-page: %s to prompt %d for job %s claimed",
+                answer.value,
+                number,
+                job_id,
+            )
+        else:
+            logger.info(
+                "Multi-page: %s to prompt %d for job %s dropped: "
+                "not an open prompt offering it, or already answered",
+                answer.value,
+                number,
+                job_id,
+            )
+        return claimed
+
+    def pass_prompt(self, job_id: str) -> PassPrompt | None:
+        """
+        Report ``job_id``'s open multi-page prompt, if it is the live job.
+
+        The web status rendering reads this to draw the prompt's buttons, each
+        carrying the prompt's number.
+
+        Args:
+            job_id: The job whose prompt is wanted.
+
+        Returns:
+            The published, unanswered prompt when ``job_id`` is the running
+            multi-page job, otherwise ``None``.
+
+        """
+        coordinator = self._pass_coordinator
+        if coordinator is None or coordinator.job_id != job_id:
+            return None
+        return coordinator.open_prompt
+
+    def pass_answer(self, job_id: str) -> PassAnswer | None:
+        """
+        Report the claimed answer to ``job_id``'s latest multi-page prompt.
+
+        The web status rendering reads this to tell an answered prompt from an
+        open one.
+
+        Args:
+            job_id: The job whose answer is wanted.
+
+        Returns:
+            The latest prompt's claimed answer when ``job_id`` is the running
+            multi-page job, otherwise ``None`` -- including while the prompt
+            is unanswered.
+
+        """
+        coordinator = self._pass_coordinator
+        if coordinator is None or coordinator.job_id != job_id:
+            return None
+        claimed = coordinator.claimed
+        return None if claimed is None else claimed[1]
+
     @property
     def is_alive(self) -> bool:
         """Whether the worker thread is currently running."""
@@ -767,6 +1069,38 @@ class ScanWorker:
         """
         with self._front_pages_lock:
             return self._front_pages
+
+    @property
+    def pages_kept(self) -> int | None:
+        """
+        How many pages the running multi-page document holds, or ``None``.
+
+        The busy line reads it while a later pass scans, to say how many
+        pages are already kept.  It comes from the latest answered prompt:
+        that prompt's count, less the last accepted pass when the answer was
+        to scan that pass again from the between-pass prompt.  A re-scan from
+        the blank-page prompt takes nothing off, because the pass under
+        decision was never counted.  Like ``front_pages``, deliberately not a
+        ``Job`` column.
+
+        Returns:
+            The count; ``0`` while the first pass scans; ``None`` when no
+            multi-page job is running.
+
+        """
+        coordinator = self._pass_coordinator
+        if coordinator is None:
+            return None
+        claimed = coordinator.claimed
+        if claimed is None:
+            # Nothing answered yet: the first pass is scanning, or a prompt is
+            # open and its own count is the document's.
+            waiting = coordinator.open_prompt
+            return 0 if waiting is None else waiting.pages_kept
+        prompt, answer = claimed
+        if prompt.wait is PassWait.NEXT_PASS and answer is PassAnswer.RESCAN:
+            return prompt.pages_kept - prompt.last_pass_kept
+        return prompt.pages_kept
 
     @property
     def scanner_gate(self) -> threading.Lock:
@@ -1137,18 +1471,19 @@ class ScanWorker:
             logger.exception("Auto-profiles: startup generation failed")
         while not self._stopping.is_set():
             try:
-                job = self._queue.get(timeout=_IDLE_TICK_SECONDS)
+                queued = self._queue.get(timeout=_IDLE_TICK_SECONDS)
             except queue.Empty:
                 self._idle_housekeeping()
                 continue
             except queue.ShutDown:
                 break
+            job = queued.job
             if self._stopping.is_set():
                 # Dequeued just as stopping began: not started.  Its row stays
                 # PENDING and the next startup's recovery fails it.
                 break
             try:
-                self._process_job(job)
+                self._process_job(job, queued.options)
             except Exception as exc:
                 logger.exception("Worker loop failed while handling job %s", job.id)
                 self._record_loop_failure()
@@ -1454,23 +1789,27 @@ class ScanWorker:
         self._degraded.clear()
         logger.info("Scan worker recovered: the job store accepted a write")
 
-    def _process_job(self, job: Job) -> None:
+    def _process_job(self, job: Job, options: ScanOptions) -> None:
         """
         Execute a single scan job, clearing the live-job state however it ends.
 
         Args:
             job: The Job to process.
+            options: The per-scan choices it was submitted with.
 
         """
         self._current_job_id = job.id
         try:
-            self._scan_job(job)
+            self._scan_job(job, options)
         finally:
             # Cleared on every ending, a loop-level failure included, so a
             # raise from the SCANNING write cannot leave a stale current job
             # or flip coordinator behind.  No prune here any more: it runs on
             # the idle tick, where its failure cannot fail a job.
             self._flip_coordinator = None
+            # Cleared with it, so a late click on a finished job's prompt
+            # answers nothing, and never a later job's.
+            self._pass_coordinator = None
             self._current_job_id = None
             # Cleared here rather than at the start of the next job, so no
             # observer can ever read the previous job's count against a row
@@ -1484,10 +1823,11 @@ class ScanWorker:
 
         The write only tells observers how far the scan has got, so a store
         error is logged at WARNING with its traceback and the scan carries on.
-        ``AWAITING_FLIP`` is tried twice: the flip prompt renders from the row,
-        so while that write is missing nobody sees a prompt to answer.  If the
-        second attempt fails too, the flip wait still runs, and its timeout
-        ends the job with pass A's fronts kept.
+        Every waiting state -- ``AWAITING_FLIP`` and the three multi-page
+        waits -- is tried twice: each renders its prompt from the row, so while
+        that write is missing nobody sees a prompt to answer.  If the second
+        attempt fails too, the wait still runs, and its timeout ends it the way
+        any unanswered prompt ends.
 
         Args:
             job_id: The running job's row.
@@ -1497,7 +1837,7 @@ class ScanWorker:
             Whether the write landed.
 
         """
-        attempts = 2 if state is JobState.AWAITING_FLIP else 1
+        attempts = 2 if state in WAITING_STATES else 1
         for attempt in range(1, attempts + 1):
             try:
                 self._job_store.update_state(job_id, state)
@@ -1534,7 +1874,7 @@ class ScanWorker:
         with self._front_pages_lock:
             self._front_pages = count
 
-    def _scan_job(self, job: Job) -> None:
+    def _scan_job(self, job: Job, options: ScanOptions) -> None:
         """
         Run one job through the pipeline and record how it ended.
 
@@ -1554,6 +1894,7 @@ class ScanWorker:
 
         Args:
             job: The Job to process.
+            options: The per-scan choices it was submitted with.
 
         """
         self._job_store.update_state(job.id, JobState.SCANNING)
@@ -1570,6 +1911,15 @@ class ScanWorker:
 
         coordinator = WorkerFlipCoordinator(job.id) if is_manual_duplex else None
         self._flip_coordinator = coordinator
+        # A multi-page job's prompts need no arming before their waiting state
+        # is persisted: an answer names its prompt's number, and there is no
+        # number to name until the prompt is published.
+        pass_coordinator = (
+            WorkerPassCoordinator(job.id, stopping=self._stopping)
+            if options.multi_page
+            else None
+        )
+        self._pass_coordinator = pass_coordinator
 
         # Neither progress callback lets a store error out.  One raised inside
         # run_pipeline would end the run -- filed as a scanner fault, and with
@@ -1645,6 +1995,8 @@ class ScanWorker:
             thumbnail_callback=_thumbnail_cb,
             pass_count_callback=self._record_front_count,
             flip_coordinator=coordinator,
+            multi_page=options.multi_page,
+            pass_coordinator=pass_coordinator,
             device_memory=self._device_memory,
             preserving=self._preserving,
         )
