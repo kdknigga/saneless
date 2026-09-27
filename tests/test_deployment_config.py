@@ -1758,6 +1758,12 @@ def test_the_citation_guard_catches_architecture_and_enumeration_ids() -> None:
     assert not PLANNING_CITATION.search("UTF-8")
 
 
+def test_the_citation_guard_catches_multi_page_ids() -> None:
+    """Multi-page requirement IDs are citations, with or without a leading zero."""
+    assert PLANNING_CITATION.search("MPG-01")
+    assert PLANNING_CITATION.search("MPG-4")
+
+
 def test_the_citation_hook_uses_the_guard_pattern() -> None:
     """The commit hook and the guard above match exactly the same text."""
     text, name = _read(PRE_COMMIT_CONFIG)
@@ -3805,6 +3811,27 @@ def test_no_doc_page_names_a_removed_threshold_key() -> None:
         for page in _doc_pages()
         for key in REMOVED_THRESHOLD_KEYS
         if key in page.read_text(encoding="utf-8")
+    ]
+    assert not offenders, "\n".join(offenders)
+
+
+def test_no_doc_page_tells_a_reader_to_set_the_flip_timeout_key() -> None:
+    """
+    The old flip-timeout key appears only where a page says it was renamed.
+
+    ``output.flip_timeout_seconds`` became ``operator_wait_timeout_seconds``
+    with no alias, so a config or environment that still sets the old name
+    fails to load.  A page naming it for any other reason hands the reader a
+    setting that cannot load.
+    """
+    offenders = [
+        f"{page.relative_to(REPO_ROOT)}:{number}"
+        for page in _doc_pages()
+        for number, line in enumerate(
+            page.read_text(encoding="utf-8").splitlines(), start=1
+        )
+        if ("flip_timeout_seconds" in line or "FLIP_TIMEOUT_SECONDS" in line)
+        and "renamed" not in line
     ]
     assert not offenders, "\n".join(offenders)
 

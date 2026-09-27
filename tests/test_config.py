@@ -2774,59 +2774,104 @@ class TestEmptyPageDetectionToggle:
         assert profile.enable_empty_page_detection is False
 
 
-class TestFlipTimeoutSeconds:
+class TestOperatorWaitTimeoutSeconds:
     """
-    OutputConfig flip_timeout_seconds field (DPLX-05, D-10, WR-01).
+    OutputConfig operator_wait_timeout_seconds field.
 
-    The wait is bounded to one second through one day.  Zero or a negative
-    value makes the flip wait expire at once, failing every manual-duplex job
-    right after pass A; a value above ``threading.TIMEOUT_MAX`` makes
-    ``Event.wait`` raise ``OverflowError`` at the same point.  Both are
-    rejected at load, where the CLI reports a configuration error.
+    The one bound on every wait for a person: the manual-duplex flip and each
+    prompt of a multi-page scan.  The wait is bounded to one second through
+    one day.  Zero or a negative value makes the wait expire at once, failing
+    every manual-duplex job right after pass A; a value above
+    ``threading.TIMEOUT_MAX`` makes ``Event.wait`` raise ``OverflowError`` at
+    the same point.  Both are rejected at load, where the CLI reports a
+    configuration error.  The key was renamed from ``flip_timeout_seconds``
+    with no alias, so the old key is refused like any other unknown key.
     """
 
-    def test_flip_timeout_seconds_default(self) -> None:
-        """Settings default the manual-duplex flip wait to ten minutes."""
-        assert Settings().output.flip_timeout_seconds == 600
+    def test_operator_wait_timeout_seconds_default(self) -> None:
+        """Settings default the operator wait to ten minutes."""
+        assert Settings().output.operator_wait_timeout_seconds == 600
 
     @pytest.mark.parametrize("value", [0, -5, 86_401])
-    def test_flip_timeout_seconds_out_of_bounds_rejected(self, value: int) -> None:
+    def test_operator_wait_timeout_seconds_out_of_bounds_rejected(
+        self, value: int
+    ) -> None:
         """Zero, a negative value and anything above a day fail validation."""
-        with pytest.raises(ValidationError, match="flip_timeout_seconds"):
-            OutputConfig(flip_timeout_seconds=value)
+        with pytest.raises(ValidationError, match="operator_wait_timeout_seconds"):
+            OutputConfig(operator_wait_timeout_seconds=value)
 
     @pytest.mark.parametrize("value", [1, 86_400])
-    def test_flip_timeout_seconds_bounds_accepted(self, value: int) -> None:
+    def test_operator_wait_timeout_seconds_bounds_accepted(self, value: int) -> None:
         """One second and exactly one day are the inclusive bounds."""
-        assert OutputConfig(flip_timeout_seconds=value).flip_timeout_seconds == value
+        output = OutputConfig(operator_wait_timeout_seconds=value)
+        assert output.operator_wait_timeout_seconds == value
 
-    def test_flip_timeout_seconds_zero_in_toml_rejected(
+    def test_operator_wait_timeout_seconds_zero_in_toml_rejected(
         self, tmp_config_dir: Path
     ) -> None:
-        """A TOML ``flip_timeout_seconds = 0`` fails at load, not after pass A."""
+        """A TOML ``operator_wait_timeout_seconds = 0`` fails at load."""
         toml_content = """\
 [output]
-flip_timeout_seconds = 0
+operator_wait_timeout_seconds = 0
 
 [profiles.default]
 """
-        config_file = tmp_config_dir / "flip_timeout_zero.toml"
+        config_file = tmp_config_dir / "operator_wait_zero.toml"
         config_file.write_text(toml_content)
-        with pytest.raises(ConfigError, match="flip_timeout_seconds"):
+        with pytest.raises(ConfigError, match="operator_wait_timeout_seconds"):
             load_settings(config_path=str(config_file))
 
-    def test_flip_timeout_seconds_from_toml(self, tmp_config_dir: Path) -> None:
+    def test_operator_wait_timeout_seconds_from_toml(
+        self, tmp_config_dir: Path
+    ) -> None:
         """The timeout is read from the [output] section."""
         toml_content = """\
 [output]
-flip_timeout_seconds = 90
+operator_wait_timeout_seconds = 90
 
 [profiles.default]
 """
-        config_file = tmp_config_dir / "flip_timeout.toml"
+        config_file = tmp_config_dir / "operator_wait.toml"
         config_file.write_text(toml_content)
         settings = load_settings(config_path=str(config_file))
-        assert settings.output.flip_timeout_seconds == 90
+        assert settings.output.operator_wait_timeout_seconds == 90
+
+    def test_old_flip_timeout_key_is_rejected_with_a_hint(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """The pre-rename key fails to load and points at the new name."""
+        err = _load_error(
+            tmp_config_dir / "old_flip_timeout.toml",
+            "[output]\nflip_timeout_seconds = 30\n\n[profiles.default]\n",
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if "unknown key 'flip_timeout_seconds'" in line
+        ]
+        assert len(matching) == 1
+        assert "did you mean 'operator_wait_timeout_seconds'" in matching[0]
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_operator_wait_timeout_seconds_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS", "42")
+        settings = load_settings()
+        assert settings.output.operator_wait_timeout_seconds == 42
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_old_flip_timeout_variable_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pre-rename environment variable fails at startup with a hint."""
+        monkeypatch.setenv("SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS", "42")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        line = _env_line(exc_info.value, "SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS")
+        assert "unknown key 'flip_timeout_seconds' in [output]" in line
+        assert "did you mean 'operator_wait_timeout_seconds'" in line
 
 
 class TestWebPort:
