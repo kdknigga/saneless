@@ -6,7 +6,7 @@ was delivered and what the operator was told about it:
 
 - the right pages, byte for byte the ones the scanner spooled;
 - in the right order, including a manual-duplex stack fed front-first and then
-  flipped;
+  flipped, and a multi-page document grown one flatbed pass at a time;
 - carrying the operator's title, tags and correspondent, and nothing else;
 - uploaded exactly once, and polled once for the task paperless-ngx issued;
 - and reported truthfully, on the web page and on the command line, when the
@@ -45,9 +45,15 @@ from saneless.config import (
     Settings,
 )
 from saneless.paperless import PaperlessClient
-from saneless.vocabulary import TERMINAL_STATES, JobState
+from saneless.vocabulary import (
+    TERMINAL_STATES,
+    JobState,
+    PassAnswer,
+    PassWait,
+    pass_wait_state,
+)
 from saneless.web.app import create_app
-from tests.conftest import wait_for_state
+from tests.conftest import poll_until, wait_for_state
 from tests.golden_support import (
     DistinctPageScanner,
     RecordingPaperless,
@@ -63,6 +69,8 @@ if TYPE_CHECKING:
     from click.testing import Result
 
     from saneless.job import Job, JobStore
+    from saneless.vocabulary import PassPrompt
+    from saneless.worker import ScanWorker
 
 _TITLE = "Quarterly Report"
 _TAGS = ["3", "7"]
@@ -110,6 +118,8 @@ class _Scenario:
         rejected: The sheets each pass reports having skipped.
         document_order: The spooled pages, in the order the PDF must hold them.
         warning: The warning the stored job must carry, or None.
+        answers: For a multi-page scan, the operator's answer to each
+            between-pass question, in order; empty for any other scan.
 
     """
 
@@ -119,11 +129,17 @@ class _Scenario:
     rejected: tuple[int, ...]
     document_order: tuple[int, ...]
     warning: str | None
+    answers: tuple[PassAnswer, ...] = ()
+
+    @property
+    def multi_page(self) -> bool:
+        """Whether the scan grows its document pass by pass."""
+        return bool(self.answers)
 
     @property
     def flips(self) -> bool:
         """Whether the run waits for the operator to flip the stack."""
-        return len(self.passes) == 2
+        return len(self.passes) == 2 and not self.multi_page
 
 
 _SIMPLEX_RUN = _Scenario(
@@ -153,6 +169,21 @@ _WARNED_RUN = _Scenario(
     document_order=(0, 1, 2),
     warning=_SKIPPED_SHEET,
 )
+
+# Four flatbed passes of one sheet each: "Scan next" three times, then
+# "Finish".  Document order is scan order.
+_MULTI_PAGE_RUN = _Scenario(
+    label="multi_page",
+    profile=_SIMPLEX,
+    passes=((0,), (1,), (2,), (3,)),
+    rejected=(),
+    document_order=(0, 1, 2, 3),
+    warning=None,
+    answers=(PassAnswer.NEXT, PassAnswer.NEXT, PassAnswer.NEXT, PassAnswer.FINISH),
+)
+
+# The letter the terminal prompt takes for each answer a scenario scripts.
+_CLI_LETTERS = {PassAnswer.NEXT: "n", PassAnswer.FINISH: "f"}
 
 _WEB_SCENARIOS = (_SIMPLEX_RUN, _DUPLEX_RUN, _WARNED_RUN)
 _CLI_SCENARIOS = (_SIMPLEX_RUN, _DUPLEX_RUN)
@@ -269,6 +300,7 @@ class _WebRun:
         index_html: The index page, entity-decoded.
         history_html: The job history rows, entity-decoded.
         scratch: Whatever was left in ``tmp_dir`` after the app stopped.
+        prompts: The multi-page questions the operator answered, in order.
 
     """
 
@@ -279,6 +311,51 @@ class _WebRun:
     index_html: str
     history_html: str
     scratch: list[Path]
+    prompts: tuple[PassPrompt, ...]
+
+
+def _answer_passes(
+    worker: ScanWorker,
+    store: JobStore,
+    job_id: str,
+    answers: tuple[PassAnswer, ...],
+) -> tuple[PassPrompt, ...]:
+    """
+    Answer a multi-page job's questions through the real worker, one at a time.
+
+    Each answer waits for a question newer than the last one answered: the
+    worker publishes a fresh prompt per wait, and an answer naming any other
+    prompt is dropped, not queued.  While the question is open, the stored row
+    must already say what the job is waiting on.
+
+    Args:
+        worker: The app's worker, running the job.
+        store: The app's job store.
+        job_id: The multi-page job.
+        answers: The operator's answers, in order.
+
+    Returns:
+        The questions answered, in the order they were asked.
+
+    """
+    asked: list[PassPrompt] = []
+    for answer in answers:
+        answered = asked[-1].number if asked else 0
+
+        def newer_prompt(after: int = answered) -> bool:
+            """Report whether a question newer than ``after`` is open."""
+            prompt = worker.pass_prompt(job_id)
+            return prompt is not None and prompt.number > after
+
+        assert poll_until(newer_prompt, _BUDGET), f"no question after {answered}"
+        prompt = worker.pass_prompt(job_id)
+        assert prompt is not None
+        row = store.get_job(job_id)
+        assert row is not None
+        assert row.state is pass_wait_state(prompt.wait)
+        assert worker.answer_pass(job_id, prompt.number, answer)
+        asked.append(prompt)
+    return tuple(asked)
 
 
 def _run_web(
@@ -312,19 +389,21 @@ def _run_web(
         "saneless.web.app.PaperlessClient", web_client_builder(recorder)
     )
     app = create_app(settings, scanner)
+    form: dict[str, str | list[str]] = {
+        "profile": scenario.profile,
+        "title": _TITLE,
+        "tags": _TAGS,
+        "correspondent": _CORRESPONDENT,
+    }
+    if scenario.multi_page:
+        # The ticked "Multiple pages" checkbox, as a browser posts it.
+        form["multi_page"] = "on"
     with TestClient(app) as client:
-        submitted = client.post(
-            "/api/scan",
-            data={
-                "profile": scenario.profile,
-                "title": _TITLE,
-                "tags": _TAGS,
-                "correspondent": _CORRESPONDENT,
-            },
-        )
+        submitted = client.post("/api/scan", data=form)
         assert submitted.status_code == 200, submitted.text
         store: JobStore = app.state.job_store
         job_id = store.list_recent(limit=1)[0].id
+        prompts = _answer_passes(app.state.worker, store, job_id, scenario.answers)
         if scenario.flips:
             # The coordinator accepts an answer only once armed, and the worker
             # arms it as it records AWAITING_FLIP: a Continue sent earlier is
@@ -344,6 +423,7 @@ def _run_web(
         index_html=index_html,
         history_html=history_html,
         scratch=sorted(settings.output.tmp_dir.iterdir()),
+        prompts=prompts,
     )
 
 
@@ -449,6 +529,40 @@ def test_web_consume_folder_fallback_is_reported(
     assert "Complete" not in run.history_html
 
 
+def test_multi_page_web_job_uploads_every_pass_in_scan_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Four flatbed passes answered through the worker become one four-page PDF.
+
+    The form ticks "Multiple pages"; the real worker asks after every pass and
+    is told "Scan next" three times and then "Finish".  Every page of the one
+    upload is the page that pass spooled, byte for byte, in the order the
+    passes ran, and a finish the operator pressed is a plain Done.
+    """
+    run = _run_web(tmp_path, monkeypatch, _MULTI_PAGE_RUN)
+
+    assert [prompt.wait for prompt in run.prompts] == [PassWait.NEXT_PASS] * 4
+    assert [prompt.pages_kept for prompt in run.prompts] == [1, 2, 3, 4]
+    assert run.scanner.calls == 4
+    assert len(run.recorder.uploads()) == 1
+    _assert_operator_metadata(run.recorder.upload_fields(0))
+    assert embedded_streams(run.recorder.document(0)) == [
+        png_idat(run.scanner.spooled[index]) for index in _MULTI_PAGE_RUN.document_order
+    ]
+    assert run.job.state is JobState.DONE
+    assert run.job.warning is None
+    assert (
+        run.job.pages_scanned,
+        run.job.pages_removed,
+        run.job.pages_uploaded,
+    ) == (4, 0, 4)
+    assert run.recorder.issued == ["golden-task-1"]
+    assert run.scratch == []
+    for page in (run.status_html, run.index_html):
+        assert _DONE_LINE in page
+
+
 # --------------------------------------------------------------------------
 # The command line: the real `saneless scan`, the same in-memory paperless-ngx.
 # --------------------------------------------------------------------------
@@ -533,16 +647,20 @@ def _run_cli(
     monkeypatch.setattr("saneless.cli.require_sane", require_sane)
     monkeypatch.setattr("saneless.cli.SaneBackend", sane_backend)
     monkeypatch.setattr("saneless.cli.PaperlessClient", cli_client_builder(recorder))
+    args = ["scan", "--profile", scenario.profile, "--title", _TITLE]
+    typed: str | None = None
     if scenario.flips:
-        # CliRunner is not a terminal; the flip prompt needs one, and "y" on
-        # stdin is the operator confirming the stack is flipped.
+        # "y" on stdin is the operator confirming the stack is flipped.
+        typed = "y\n"
+    if scenario.multi_page:
+        # One letter per between-pass question, as the operator types them.
+        args.append("--multi-page")
+        typed = "".join(f"{_CLI_LETTERS[answer]}\n" for answer in scenario.answers)
+    if typed is not None:
+        # CliRunner is not a terminal, and both prompts need one.
         monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
 
-    result = CliRunner().invoke(
-        cli,
-        ["scan", "--profile", scenario.profile, "--title", _TITLE],
-        input="y\n" if scenario.flips else None,
-    )
+    result = CliRunner().invoke(cli, args, input=typed)
     consumed = sorted(consume_dir.glob("*.pdf")) if consume_dir is not None else []
     return _CliRun(
         recorder=recorder,
@@ -610,6 +728,31 @@ def test_cli_clean_scan_prints_done_and_exits_zero(
     assert _warning_lines(run.result.stderr) == []
     assert run.recorder.issued == ["golden-task-1"]
     assert _task_ids(run.recorder) == run.recorder.issued
+    assert run.scratch == []
+
+
+def test_multi_page_cli_scan_uploads_every_pass_in_scan_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``saneless scan --multi-page`` answered n, n, n, f uploads four pages in order.
+
+    The same four flatbed passes as the web job, answered at the terminal.
+    The one upload holds every pass's page in scan order, the run says Done,
+    and it exits 0.
+    """
+    run = _run_cli(tmp_path, monkeypatch, _MULTI_PAGE_RUN)
+
+    assert run.result.exit_code == 0, run.result.output
+    assert run.scanner.calls == 4
+    assert len(run.recorder.uploads()) == 1
+    _assert_operator_metadata(run.recorder.upload_fields(0))
+    assert embedded_streams(run.recorder.document(0)) == [
+        png_idat(run.scanner.spooled[index]) for index in _MULTI_PAGE_RUN.document_order
+    ]
+    assert _DONE_LINE in run.result.stdout
+    assert _warning_lines(run.result.stderr) == []
+    assert run.recorder.issued == ["golden-task-1"]
     assert run.scratch == []
 
 

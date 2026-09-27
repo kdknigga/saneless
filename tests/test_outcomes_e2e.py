@@ -15,7 +15,9 @@ Exactly two things are stubbed, and nothing else:
 * **the scanner** -- a ``MagicMock(spec=ScannerBackend)`` spooling PIL images
   into the pipeline's own sink, because there is no SANE device in CI.  It is
   the real ``SpooledPageSink`` that writes them and the real records that come
-  back, so the pages this module's PDFs embed are real files;
+  back, so the pages this module's PDFs embed are real files.  The multi-page
+  cases use ``DistinctPageScanner`` instead, the same seam with pages that can
+  be told apart, so a kept PDF can be read back page by page;
 * **the HTTP layer** -- an ``httpx2.MockTransport`` passed through
   ``PaperlessClient(..., transport=...)``, the seam ``tests/test_paperless.py``
   uses throughout.  It sits *below* ``httpx2.Client``, so the real
@@ -41,8 +43,10 @@ together sleep for well under a second, using only seams that already exist:
   monotonic deadline has already passed when the first poll comes back without
   a terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
 * ``operator_wait_timeout_seconds`` is 1 for the flip-timeout case, the smallest value
-  config accepts, so the flip wait costs one second -- the only wall clock
-  this module spends.  See ``_FLIP_TIMEOUT_BUDGET``.
+  config accepts, so the flip wait costs one second.  See
+  ``_FLIP_TIMEOUT_BUDGET``.  The two multi-page cases that wait a question
+  out use the same one second, and they are the only other wall clock this
+  module spends.
 * The other cases reach a terminal status, or fall back, on the first
   request, before any sleep, and cost nothing.
 
@@ -57,8 +61,9 @@ tests, for a problem two existing constructor parameters already solve.
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 from unittest.mock import MagicMock
 
@@ -79,21 +84,36 @@ from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
 from saneless.scanner.base import ScannerBackend
 from saneless.vocabulary import (
+    RESTART_REASON,
     TERMINAL_STATES,
     ErrorCategory,
     JobState,
+    PassAnswer,
+    PassWait,
     ScanOutcome,
+    SubmitResult,
+    pass_wait_state,
+    timeout_finish_warning,
 )
-from saneless.worker import ScanWorker
-from tests.conftest import spooling_in_turn
-from tests.golden_support import loopback_paperless, production_debug_logging
+from saneless.worker import ScanOptions, ScanWorker
+from tests.conftest import poll_until, spooling_in_turn
+from tests.golden_support import (
+    DistinctPageScanner,
+    RecordingPaperless,
+    embedded_streams,
+    loopback_paperless,
+    png_idat,
+    production_debug_logging,
+)
+from tests.multi_page_support import multi_page_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator, Mapping, Sequence
     from pathlib import Path
 
     from saneless.job import Job
     from saneless.scanner.base import PageSink, ScanBatch, ScanSettings
+    from saneless.vocabulary import PassPrompt
 
 _DOCUMENTS_PATH = "/api/documents/post_document/"
 _TASKS_PATH = "/api/tasks/"
@@ -1030,3 +1050,348 @@ class TestClientSideMisconfigurationEndToEnd:
             settings.output.failed_dir,
             tmp_path / "consume",
         )
+
+
+# --------------------------------------------------------------------------
+# Multi-page documents: the real worker asking between passes, and every way
+# a wait there can end without the operator pressing Finish.
+# --------------------------------------------------------------------------
+
+# The operator-wait bound for the cases that wait a question out: one second,
+# the smallest value config accepts, as for the flip timeout above.
+_MULTI_PAGE_TIMEOUT = 1
+
+# The waits every multi-page case observes: a prompt being published, a job
+# reaching a terminal state that no wait holds up.
+_MULTI_PAGE_BUDGET = 2.0
+
+_MULTI_PAGE = ScanOptions(multi_page=True)
+
+
+@contextlib.contextmanager
+def _multi_page_worker(
+    settings: Settings, scanner: DistinctPageScanner, recorder: RecordingPaperless
+) -> Generator[tuple[ScanWorker, JobStore]]:
+    """
+    Run the real worker over ``scanner`` and an in-memory paperless-ngx.
+
+    The worker is stopped before the store and the client are closed, and
+    stopping it again after a test already has is safe.
+
+    Args:
+        settings: Settings from ``multi_page_settings``: a flatbed "default"
+            profile beside two others, so startup never generates profiles.
+        scanner: The scanner the worker opens for every pass.
+        recorder: The in-memory paperless-ngx every request goes to.
+
+    Yields:
+        The started worker and its job store.
+
+    """
+    settings.output.data_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(db_path=settings.output.db_path)
+    paperless = PaperlessClient(
+        url=settings.paperless.url,
+        token=settings.paperless.token.get_secret_value(),
+        consume_dir=settings.paperless.consume_dir,
+        max_retries=1,
+        transport=httpx2.MockTransport(recorder),
+    )
+    worker = ScanWorker(scanner, paperless, settings, store)
+    try:
+        worker.start()
+        yield worker, store
+    finally:
+        worker.stop()
+        paperless.close()
+        store.close()
+
+
+def _submit_multi_page(worker: ScanWorker, store: JobStore, title: str) -> Job:
+    """
+    Create a job row on the flatbed profile and queue it as a multi-page scan.
+
+    Args:
+        worker: The running worker.
+        store: Its job store.
+        title: The document title.
+
+    Returns:
+        The queued job.
+
+    """
+    job = store.create_job("default", title)
+    assert worker.submit(job, _MULTI_PAGE) is SubmitResult.ACCEPTED
+    return job
+
+
+def _next_question(
+    worker: ScanWorker, store: JobStore, job_id: str, *, after: int
+) -> PassPrompt:
+    """
+    Wait for the job's next multi-page question and return it, unanswered.
+
+    The worker publishes a fresh prompt for every wait, so "next" means a
+    prompt numbered above ``after``.  While it is open the stored row must
+    already name the wait, because that row is what the web page and
+    ``saneless jobs`` render.
+
+    Args:
+        worker: The running worker.
+        store: Its job store.
+        job_id: The multi-page job.
+        after: The number of the last question already seen; 0 for the first.
+
+    Returns:
+        The open question.
+
+    """
+
+    def asked() -> bool:
+        """Report whether a question newer than ``after`` is open."""
+        prompt = worker.pass_prompt(job_id)
+        return prompt is not None and prompt.number > after
+
+    assert poll_until(asked, _MULTI_PAGE_BUDGET), f"no question after {after}"
+    prompt = worker.pass_prompt(job_id)
+    assert prompt is not None
+    row = store.get_job(job_id)
+    assert row is not None
+    assert row.state is pass_wait_state(prompt.wait)
+    return prompt
+
+
+def _kept(settings: Settings) -> tuple[list[Path], list[Path]]:
+    """
+    Split the PDFs kept in ``failed/`` into documents and passes in flight.
+
+    Args:
+        settings: The run's settings, for ``failed_dir``.
+
+    Returns:
+        The kept documents, then the kept ``(partial)`` passes, each sorted.
+
+    """
+    failed_dir = settings.output.failed_dir
+    kept = sorted(failed_dir.glob("*.pdf")) if failed_dir.exists() else []
+    return (
+        [pdf for pdf in kept if "partial" not in pdf.name],
+        [pdf for pdf in kept if "partial" in pdf.name],
+    )
+
+
+def _spooled(scanner: DistinctPageScanner, indices: Sequence[int]) -> list[bytes]:
+    """
+    Return what a PDF of exactly these spooled pages, in this order, embeds.
+
+    Args:
+        scanner: The scanner that spooled them.
+        indices: The page indices, in document order.
+
+    Returns:
+        One compressed pixel stream per page, comparable with
+        ``embedded_streams``.
+
+    """
+    return [png_idat(scanner.spooled[index]) for index in indices]
+
+
+class TestMultiPageTimeoutFinishes:
+    """
+    A between-pass question nobody answers finishes the document it has.
+
+    The opposite of the flip timeout on purpose: pages already scanned are
+    the operator's work, so they are uploaded rather than failed -- but with a
+    warning, because nobody said the document was complete.
+    """
+
+    def test_a_timed_out_question_uploads_the_pages_and_frees_the_worker(
+        self, tmp_path: Path, wait_for_state: Callable[..., Job]
+    ) -> None:
+        """Two passes, "Scan next" once, then silence: a warned upload of both."""
+        settings = multi_page_settings(tmp_path, timeout=_MULTI_PAGE_TIMEOUT)
+        recorder = RecordingPaperless()
+        # Two passes for the forgotten document, one for the job after it.
+        scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
+        with _multi_page_worker(settings, scanner, recorder) as (worker, store):
+            forgotten = _submit_multi_page(worker, store, "Forgotten Pages")
+            first = _next_question(worker, store, forgotten.id, after=0)
+            assert worker.answer_pass(forgotten.id, first.number, PassAnswer.NEXT)
+            second = _next_question(worker, store, forgotten.id, after=first.number)
+            # Nobody answers the second question.
+            timed_out = wait_for_state(
+                store,
+                forgotten.id,
+                TERMINAL_STATES,
+                _MULTI_PAGE_TIMEOUT + _MULTI_PAGE_BUDGET,
+            )
+
+            # A plain single-pass job: held up only if the worker still is.
+            follow_up = store.create_job("default", "Next In Line")
+            assert worker.submit(follow_up) is SubmitResult.ACCEPTED
+            finished = wait_for_state(
+                store, follow_up.id, TERMINAL_STATES, _MULTI_PAGE_BUDGET
+            )
+
+        assert (first.wait, second.wait) == (PassWait.NEXT_PASS, PassWait.NEXT_PASS)
+        assert second.pages_kept == 2
+        assert timed_out.state is JobState.DONE
+        assert timed_out.warning == timeout_finish_warning(2, _MULTI_PAGE_TIMEOUT)
+        assert (
+            timed_out.pages_scanned,
+            timed_out.pages_removed,
+            timed_out.pages_uploaded,
+        ) == (2, 0, 2)
+        assert finished.state is JobState.DONE
+        assert finished.pages_scanned == 1
+        assert len(recorder.uploads()) == 2
+        assert embedded_streams(recorder.document(0)) == _spooled(scanner, (0, 1))
+        assert embedded_streams(recorder.document(1)) == _spooled(scanner, (2,))
+        assert _kept(settings) == ([], [])
+
+
+@dataclass(frozen=True)
+class _StopCase:
+    """
+    One multi-page wait the server stops during, and what it must keep.
+
+    Every case answers the first question "Scan next", so the stop lands at
+    the second question, with one or two pages already accepted.
+
+    Attributes:
+        label: The parametrize id.
+        wait: The question open when the server stops.
+        passes: The page indices each scanner pass feeds.
+        document: The accepted pages the kept document must hold, in order.
+        partial: The pages of an undecided pass, kept beside the document.
+        blank: Pages spooled as blank paper; empty-page detection is on
+            exactly when there are any.
+        fail_on: The failure each 1-based scanner call raises after spooling.
+
+    """
+
+    label: str
+    wait: PassWait
+    passes: tuple[tuple[int, ...], ...]
+    document: tuple[int, ...]
+    partial: tuple[int, ...] = ()
+    blank: frozenset[int] = frozenset()
+    fail_on: Mapping[int, BaseException] = field(default_factory=dict)
+
+
+_STOP_CASES = (
+    _StopCase(
+        label="next-pass",
+        wait=PassWait.NEXT_PASS,
+        passes=((0,), (1,)),
+        document=(0, 1),
+    ),
+    # The blank pass was spooled and never decided on: it is kept as a pass
+    # in flight, beside the document, rather than dropped or merged into it.
+    _StopCase(
+        label="blank-decision",
+        wait=PassWait.BLANK_DECISION,
+        passes=((0,), (1,)),
+        document=(0,),
+        partial=(1,),
+        blank=frozenset({1}),
+    ),
+    # The failed pass contributes nothing, even the page it spooled before
+    # the jam: only the accepted pass is kept.
+    _StopCase(
+        label="retry",
+        wait=PassWait.RETRY,
+        passes=((0,), (1,)),
+        document=(0,),
+        fail_on={2: ScanError("jam")},
+    ),
+)
+
+
+class TestMultiPageStopDuringEachWait:
+    """
+    A server stop during any multi-page wait keeps the pages and uploads nothing.
+
+    A stop is not the operator's decision, so it neither discards the scan
+    like Abort nor finishes it like a timeout: an upload would make the stop
+    wait on paperless-ngx.  The accepted pages go to ``failed/`` and the row
+    records the restart.
+    """
+
+    @pytest.mark.parametrize("case", _STOP_CASES, ids=[c.label for c in _STOP_CASES])
+    def test_a_stop_at_the_question_keeps_the_accepted_pages(
+        self, case: _StopCase, tmp_path: Path
+    ) -> None:
+        """The stop returns in time, the row says why, the pages are in failed/."""
+        settings = multi_page_settings(tmp_path, detection=bool(case.blank))
+        recorder = RecordingPaperless()
+        scanner = DistinctPageScanner(
+            passes=case.passes, blank=case.blank, fail_on=case.fail_on
+        )
+        with _multi_page_worker(settings, scanner, recorder) as (worker, store):
+            job = _submit_multi_page(worker, store, _TITLE)
+            first = _next_question(worker, store, job.id, after=0)
+            assert worker.answer_pass(job.id, first.number, PassAnswer.NEXT)
+            waiting = _next_question(worker, store, job.id, after=first.number)
+
+            # Within STOP_JOIN_SECONDS, or its bounded extension while the
+            # pages are being kept: never the operator-wait timeout.
+            assert worker.stop()
+            ended = store.get_job(job.id)
+
+        assert waiting.wait is case.wait
+        assert ended is not None
+        assert ended.state is JobState.ERROR
+        assert ended.error is not None
+        assert ended.error.startswith(f"{RESTART_REASON}. ")
+        documents, partials = _kept(settings)
+        (document,) = documents
+        assert embedded_streams(document) == _spooled(scanner, case.document)
+        assert [embedded_streams(pdf) for pdf in partials] == (
+            [_spooled(scanner, case.partial)] if case.partial else []
+        )
+        for pdf in (*documents, *partials):
+            assert pdf.name in ended.error
+        assert scanner.calls == 2
+        assert recorder.uploads() == []
+
+
+class TestMultiPageNothingKept:
+    """A wait that times out with no page kept has nothing to finish."""
+
+    def test_multi_page_blank_timeout_at_zero_kept_is_all_blank(
+        self, tmp_path: Path, wait_for_state: Callable[..., Job]
+    ) -> None:
+        """
+        The only page looks blank and nobody answers: the all-blank failure.
+
+        A blank-prompt timeout skips the blank pages, which here leaves none,
+        so there is no document to upload.  The job fails as every-page-blank
+        does -- its own category, nothing uploaded -- and the skipped page is
+        kept in ``failed/`` so it is not lost if it was not blank after all.
+        """
+        settings = multi_page_settings(
+            tmp_path, detection=True, timeout=_MULTI_PAGE_TIMEOUT
+        )
+        recorder = RecordingPaperless()
+        scanner = DistinctPageScanner(passes=((0,),), blank={0})
+        with _multi_page_worker(settings, scanner, recorder) as (worker, store):
+            job = _submit_multi_page(worker, store, _TITLE)
+            question = _next_question(worker, store, job.id, after=0)
+            # Nobody answers.
+            ended = wait_for_state(
+                store,
+                job.id,
+                TERMINAL_STATES,
+                _MULTI_PAGE_TIMEOUT + _MULTI_PAGE_BUDGET,
+            )
+
+        assert question.wait is PassWait.BLANK_DECISION
+        assert question.pages_kept == 0
+        assert ended.state is JobState.ERROR
+        assert ended.error_category is ErrorCategory.ALL_BLANK
+        documents, partials = _kept(settings)
+        (kept,) = documents
+        assert partials == []
+        assert embedded_streams(kept) == _spooled(scanner, (0,))
+        assert recorder.uploads() == []
