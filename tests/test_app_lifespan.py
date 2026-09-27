@@ -1107,6 +1107,12 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     # handles by design (D-16), so the flip routes need no job to be driven.
     "/api/flip/continue": {"method": "POST", "data": {"job_id": "no-such-job"}},
     "/api/flip/abort": {"method": "POST", "data": {"job_id": "no-such-job"}},
+    # The same holds for a multi-page answer: it names no waiting job, so the
+    # route drops it and renders the status, reaching the handler all the same.
+    "/api/multi-page/answer": {
+        "method": "POST",
+        "data": {"job_id": "no-such-job", "prompt": "1", "answer": "NEXT"},
+    },
 }
 
 # The entries the proof does not drive, each named with its reason rather than
@@ -1134,6 +1140,7 @@ _LEAF_PATHS = frozenset(
         "/api/jobs/current/status",
         "/api/jobs/history",
         "/api/jobs/{job_id}/status",
+        "/api/multi-page/answer",
         "/api/paperless/test",
         "/api/profiles/description",
         "/api/profiles/multi-page",
@@ -1164,13 +1171,13 @@ def test_leaf_routes_flattens_the_included_router(settings: Settings) -> None:
     with TestClient(app):
         leaves = leaf_routes(app)
 
-        assert len(leaves) == 17, (
-            f"the app serves {len(leaves)} leaf routes, not the 17 this test "
+        assert len(leaves) == 18, (
+            f"the app serves {len(leaves)} leaf routes, not the 18 this test "
             f"pins; a route was added or removed, so update this literal"
         )
         api_routes = [route for route in leaves if isinstance(route, APIRoute)]
-        assert len(api_routes) == 16, (
-            f"{len(api_routes)} of the leaves are APIRoute, not the 16 this "
+        assert len(api_routes) == 17, (
+            f"{len(api_routes)} of the leaves are APIRoute, not the 17 this "
             f"test pins; a route was added or removed, so update this literal"
         )
         # D-03's whole point: the Mount survives the flattening.
@@ -1317,8 +1324,8 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     enumerated = [
         route for route in leaf_routes(app) if isinstance(route, Route | Mount)
     ]
-    assert len(enumerated) == 17, (
-        f"the app serves {len(enumerated)} Route/Mount leaves, not the 17 this "
+    assert len(enumerated) == 18, (
+        f"the app serves {len(enumerated)} Route/Mount leaves, not the 18 this "
         f"test pins; a route was added or removed, so update this literal"
     )
 
@@ -1354,13 +1361,13 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
             for route in leaf_routes(app)
             if getattr(route, "path", "") in _ROUTE_CALLS
         ]
-        assert len(leaf_routes(app)) == 17, (
-            f"the app serves {len(leaf_routes(app))} leaves, not the 17 this "
+        assert len(leaf_routes(app)) == 18, (
+            f"the app serves {len(leaf_routes(app))} leaves, not the 18 this "
             f"test pins; a route was added or removed, so update this literal"
         )
-        assert len(drivable) == 16, (
+        assert len(drivable) == 17, (
             f"{len(drivable)} of the leaves are named in _ROUTE_CALLS, not the "
-            f"16 this test pins; a route was added or removed, so update this "
+            f"17 this test pins; a route was added or removed, so update this "
             f"literal"
         )
 
@@ -1431,8 +1438,8 @@ def test_the_schema_builds_in_process_and_is_not_served(settings: Settings) -> N
         }
         # Both sides of the comparison below would be empty if the app served
         # no API routes, so the size is asserted before the contents.
-        assert len(served) == 16, (
-            f"the app serves {len(served)} APIRoute paths, not the 16 this "
+        assert len(served) == 17, (
+            f"the app serves {len(served)} APIRoute paths, not the 17 this "
             f"test pins; a route was added or removed, so update this literal"
         )
         assert set(schema["paths"]) == served

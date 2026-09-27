@@ -24,6 +24,7 @@ Direct calls, such as from `curl` or a script, work too, but only those two JSON
 | GET | `/api/jobs/history` | Job history table |
 | POST | `/api/flip/continue` | Continue manual duplex scan |
 | POST | `/api/flip/abort` | Abort manual duplex scan |
+| POST | `/api/multi-page/answer` | Answer a multi-page scan's open question |
 
 ---
 
@@ -321,6 +322,37 @@ Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt.
 - **An answer counts only for the named job, once it is waiting.** The worker accepts an answer only for the job named by `job_id`, and only once that job has reached `AWAITING_FLIP`. An answer sent during pass A, one naming a different job from the one at the flip prompt, or one arriving after the job ended is dropped: it changes nothing, and the endpoint still returns the current status rather than an error. A direct API caller should poll `/api/jobs/current/status` for `AWAITING_FLIP` before answering.
 - **A repeated click cannot reach the next job.** Because every answer names its job, a double-clicked or retried Continue or Abort is dropped once the job it names has moved on, even when another manual duplex job is already queued behind it.
 - **The prompt is acknowledged, then replaced.** After an accepted answer the partial shows the acknowledgment until the job leaves `AWAITING_FLIP`. Once pass B starts the status indicator shows `Scanning reverse sides...`.
+
+---
+
+### `POST /api/multi-page/answer`
+
+Answers the question a multi-page scan is waiting on. A multi-page job asks one question after every pass, and waits in one of three states while it does:
+
+| State | Question | Answers it offers |
+|-------|----------|-------------------|
+| `AWAITING_NEXT_PASS` | Is there another page? | `NEXT`, `FINISH`, `RESCAN`, `ABORT` (`FINISH` only once the document holds a page) |
+| `AWAITING_BLANK_DECISION` | The pages just scanned look blank: keep them? | `SKIP_BLANKS`, `KEEP_BLANKS`, `RESCAN` |
+| `AWAITING_RETRY` | The last scan failed: try it again? | `NEXT` (scan again), `FINISH`, `ABORT` |
+
+**Request fields (form-encoded):**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `job_id` | string | yes | The id of the job the answer is for. |
+| `prompt` | integer, 1 or more | yes | The number of the question the answer is for. Every question a job asks has a new number, and the web UI's buttons send the number of the question they were drawn for. |
+| `answer` | string | yes | One of `NEXT`, `RESCAN`, `FINISH`, `ABORT`, `SKIP_BLANKS` or `KEEP_BLANKS`. |
+
+A missing field, a `prompt` below 1, or an `answer` that is not one of the answers above is rejected with `422` before anything reaches the worker.
+
+**Response:** HTML partial (the status indicator for HTMX swap), for the current job, else the most recent one. The endpoint does not wait for the next pass to start; the one-second status poll picks it up.
+
+While the job is still recorded in its waiting state and the question has been answered, the partial shows an acknowledgment instead of the buttons, for example `Scanning more pages...` after `NEXT` or `Finishing the document...` after `FINISH`.
+
+- **Only the browser that started the scan can answer.** An answer from any other browser is dropped, and so are its buttons: only the browser holding the job's owner cookie is shown the question at all. Every other browser sees one line saying what the job is waiting for.
+- **An answer counts only for the question that is open.** It is dropped when it names another job, names a question that has already been answered or replaced, or is an answer that question does not offer, such as `FINISH` on a document that holds no page yet. A dropped answer changes nothing, and the endpoint still returns the current status rather than an error.
+- **The first answer is final.** A repeated or double-clicked answer to the same question is dropped, so it cannot answer the next question too.
+- **The scanner's error is for the owner only.** After a failed pass, the owner's question shows what the scanner reported, with host paths and addresses replaced by the setting that names them. No other browser is shown the error.
 
 ---
 
