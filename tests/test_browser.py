@@ -49,6 +49,7 @@ if TYPE_CHECKING:
         Dialog,
         Locator,
         Page,
+        Playwright,
         Request,
         Response,
         Route,
@@ -95,6 +96,9 @@ from saneless.scanner.base import DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
     HIDDEN_PRESERVED_ERROR,
+    MULTI_PAGE_DISABLED_REASON,
+    MULTI_PAGE_HELP,
+    MULTI_PAGE_LABEL,
     TERMINAL_STATES,
     ErrorCategory,
     FlipOutcome,
@@ -2868,6 +2872,158 @@ class TestProfileDescriptionSwap:
 
         expect(helps).to_have_count(1)
         expect(helps).to_have_id("profile-description")
+
+
+# The third profile the Multiple pages tests switch to: a feeder that is not
+# manual duplex, so a tick has somewhere to go that allows it.
+_MULTI_PAGE_FEEDER = "feeder"
+_MULTI_PAGE_FEEDER_DESCRIPTION = "Scans every page in the document feeder."
+
+
+@pytest.fixture
+def multi_page_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app with a flatbed, a manual-duplex and a plain feeder profile.
+
+    Private because the session server has only the first two, and the tick
+    that survives a profile change needs a second profile that allows it.  No
+    scan is started here, so Paperless needs no stub.
+    """
+    base = _browser_test_settings(tmp_path)
+    profiles = {
+        **base.profiles,
+        _MULTI_PAGE_FEEDER: ProfileConfig(
+            source="ADF", description=_MULTI_PAGE_FEEDER_DESCRIPTION
+        ),
+    }
+    settings = base.model_copy(update={"profiles": profiles})
+    with _serve(settings, _BrowserTestScanner()) as server:
+        egress_allowlist.append(server.url)
+        yield server
+
+
+def _choose_profile(page: Page, profile: str) -> Locator:
+    """
+    Choose ``profile`` and wait for the Multiple pages field to be replaced.
+
+    The field is swapped whole, so the old checkbox is marked first and the
+    wait is for the mark to be gone.  Waiting for the response alone would let
+    an assertion read the old checkbox, and a tick that survives the change
+    reads the same on the old one as on the new one.
+
+    Returns:
+        The checkbox as it is after the swap.
+
+    """
+    page.locator("#multi-page").evaluate("box => box.setAttribute('data-stale', '')")
+    page.select_option("#profile-select", profile)
+    expect(page.locator("#multi-page[data-stale]")).to_have_count(0)
+    box = page.locator("#multi-page")
+    expect(box).to_have_count(1)
+    return box
+
+
+@pytest.mark.browser
+class TestMultiPageCheckbox:
+    """The Multiple pages checkbox in a real browser, including Firefox's reload."""
+
+    def test_it_is_visible_enabled_and_unticked_on_load(
+        self, page: Page, multi_page_server: _BrowserServer
+    ) -> None:
+        """Named by its label, described by its help line, never ticked on load."""
+        page.goto(multi_page_server.url)
+        box = page.locator("#multi-page")
+
+        expect(box).to_be_visible()
+        expect(box).to_be_enabled()
+        expect(box).not_to_be_checked()
+        expect(box).to_have_accessible_name(MULTI_PAGE_LABEL)
+        expect(box).to_have_accessible_description(MULTI_PAGE_HELP)
+        expect(page.locator("#multi-page-help")).to_be_visible()
+
+    def test_manual_duplex_disables_it_and_another_profile_restores_it(
+        self, page: Page, multi_page_server: _BrowserServer
+    ) -> None:
+        """
+        The reason replaces the help line while manual duplex is chosen.
+
+        A disabled checkbox is not sent with the refresh, so coming back from
+        manual duplex always finds it unticked, even if it was ticked before.
+        """
+        page.goto(multi_page_server.url)
+        page.locator("#multi-page").check()
+
+        box = _choose_profile(page, "duplex")
+
+        expect(box).to_be_disabled()
+        expect(box).not_to_be_checked()
+        expect(page.locator("#multi-page-help")).to_be_visible()
+        expect(box).to_have_accessible_description(MULTI_PAGE_DISABLED_REASON)
+
+        box = _choose_profile(page, "default")
+
+        expect(box).to_be_enabled()
+        expect(box).not_to_be_checked()
+        expect(box).to_have_accessible_description(MULTI_PAGE_HELP)
+
+    def test_a_tick_survives_a_change_to_another_profile_that_allows_it(
+        self, page: Page, multi_page_server: _BrowserServer
+    ) -> None:
+        """A profile switch must not silently drop a choice."""
+        page.goto(multi_page_server.url)
+        page.locator("#multi-page").check()
+
+        box = _choose_profile(page, _MULTI_PAGE_FEEDER)
+
+        expect(box).to_be_enabled()
+        expect(box).to_be_checked()
+
+    def test_multi_page_checkbox_unchecked_on_reload_in_firefox(
+        self,
+        playwright: Playwright,
+        browser_server_url: str,
+        egress_allowlist: list[str],
+    ) -> None:
+        """
+        A tick does not come back when Firefox reloads the page.
+
+        Firefox restores a form control's state on reload unless the control
+        opts out, and Chromium does not, so this is the one browser that can
+        tell whether the opt-out is there.  The read after the reload is a
+        single ``is_checked`` rather than a retrying assertion: a retry could
+        pass on a moment before a restore instead of on the settled page.
+
+        The context is built by hand from a Firefox browser, so it installs the
+        egress gate and the policy recorder itself and is checked after it
+        closes, as the two-browser ownership test does.
+        """
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        firefox = playwright.firefox.launch()
+        try:
+            ctx = firefox.new_context()
+            ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(ctx, violations)
+            page = ctx.new_page()
+            page.goto(browser_server_url)
+            box = page.locator("#multi-page")
+            box.check()
+            expect(box).to_be_checked()
+
+            page.reload()
+
+            expect(box).to_have_count(1)
+            assert not box.is_checked(), "Firefox restored the tick on reload"
+        finally:
+            firefox.close()
+        assert seen, "the hand-built context's gate handled no request"
+        assert blocked == [], f"a page tried to reach the network: {blocked}"
+        assert violations == [], (
+            f"a page violated its Content-Security-Policy: {violations}"
+        )
 
 
 # The tags the filter tests run against. The shared browser server points at a
