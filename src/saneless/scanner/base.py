@@ -621,12 +621,16 @@ class ScannerBackend(ABC):
         """
         Restart whatever process-wide library this backend drives, before a job.
 
+        Called at the top of each scan job, and again before every pass of a
+        multi-page scan after the first, never with a device handle open.  The
+        second pass of a manual-duplex scan does not call it.
+
         Deliberately **not** an ``@abstractmethod``, for the reason ``close()``
         gives: the default does nothing, because a backend holding no
         process-global library has nothing to restart, and requiring the
         method would force an empty override onto every test stub.
-        ``SaneBackend`` overrides it to restart SANE at the start of each scan
-        job, and refuses there while a read is stuck or a handle is open.
+        ``SaneBackend`` overrides it to restart SANE at each of those points,
+        and refuses there while a read is stuck or a handle is open.
 
         The DEBUG line is the body, as in ``close()``, so ruff's ``B027`` has
         no empty method on an ABC to flag.

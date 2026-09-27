@@ -6704,12 +6704,19 @@ class TestPerJobReinitialise:
 
     def test_reinitialise_is_called_only_from_the_scan_job(self) -> None:
         """
-        The job's gated block is the one place SANE is restarted.
+        SANE is restarted in the job's gated block and nowhere outside the job.
 
-        A restart anywhere else could run while a handle is open or a listing
-        child holds the gate, which is exactly the state it must never see.
+        The job's own restart is in ``_scan_job``; the only other one is a
+        multi-page scan's before each later pass, which runs inside that same
+        job, under the gate it holds, after the previous pass closed its
+        device.  A restart anywhere else could run while a handle is open or a
+        listing child holds the gate, which is exactly the state it must never
+        see.
         """
-        assert _reinit_call_sites() == [("worker.py", "_scan_job")]
+        assert _reinit_call_sites() == [
+            ("pipeline.py", "_scan_pass"),
+            ("worker.py", "_scan_job"),
+        ]
 
 
 class TestProfileStorage:
