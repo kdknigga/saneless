@@ -54,6 +54,7 @@ from saneless.exceptions import (
 )
 from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
 from saneless.scanner.base import (
+    MAX_PAGES_PER_PASS,
     DeviceCapabilities,
     DeviceInfo,
     DeviceSurvey,
@@ -243,14 +244,14 @@ _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 # This cap's contribution is only that the loop cannot keep asking
 # forever while that check does its work.
 #
-# SCOPE: the cap is per scan_pages() call. The two manual-duplex passes
-# each call scan_pages() separately, so this is a per-pass cap, not a per-job
-# one.
+# SCOPE: the cap is per scan_pages() call, so it is a per-pass cap, not a
+# per-job one: every pass of a job calls scan_pages() separately.
 #
-# The value matches the largest production ADF hoppers, so no real stack should
-# reach it. That is a judgement about hardware, not a measurement, and it is
-# cheap to revise precisely because the error names the cap.
-_MAX_ADF_PAGES: int = 500
+# The value is base.MAX_PAGES_PER_PASS, not a second literal: the scope and the
+# hopper-size judgement behind the number are recorded there, and a document
+# cap that has to be read together with this one is paired with that constant
+# rather than with a copy of it.
+_MAX_ADF_PAGES: int = MAX_PAGES_PER_PASS
 
 # The one message reported when a feeder produced no pages at all.
 _FEEDER_EMPTY_MESSAGE = "No paper detected in feeder"

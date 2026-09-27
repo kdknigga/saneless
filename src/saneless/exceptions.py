@@ -19,6 +19,7 @@ __all__ = [
     "ScanCancelledError",
     "ScanError",
     "ScanInterrupted",
+    "SpoolError",
     "StorageError",
     "describe",
     "describe_text",
@@ -68,6 +69,18 @@ class ListingTimedOutError(ScanError):
 
     The listing was stopped: the process running it was killed and reaped
     before this was raised.
+    """
+
+
+class SpoolError(ScanError):
+    """
+    The spool refused or failed to write a page (disk space or a write error).
+
+    A ``ScanError`` subclass, so ``classify_error`` still files it as
+    ``ErrorCategory.SCANNER`` and every exit code and message stays what it
+    was.  It exists so a caller that must treat a full or failing disk
+    differently from a device fault can test for it exactly: a jammed feeder
+    is worth trying again, a disk with no room is not.
     """
 
 

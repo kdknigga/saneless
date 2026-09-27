@@ -43,7 +43,7 @@ import shutil
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
-from .exceptions import ScanError, ScanInterrupted, describe
+from .exceptions import ScanError, ScanInterrupted, SpoolError, describe
 from .pages import generate_thumbnail, measure_ink
 from .scanner.base import PageRecord, PageSink
 
@@ -262,9 +262,12 @@ class SpooledPageSink(PageSink):
             paper white.
 
         Raises:
-            ScanError: If the page's mode is one the spool refuses, if the page
-                plus the assembly reserve would not fit, or if writing it
-                failed.  No raw OSError escapes this method.
+            ScanError: If the page's mode is one the spool refuses: the
+                scanner delivered a page saneless cannot store.
+            SpoolError: If the page plus the assembly reserve would not fit,
+                if free space could not be measured, or if writing it failed.
+                A ``ScanError`` too, so a caller catching that still catches
+                it.  No raw OSError escapes this method.
 
         """
         # The record is appended inside the try, with no call between the
@@ -333,6 +336,7 @@ class SpooledPageSink(PageSink):
 
         Raises:
             ScanError: As ``add`` documents.
+            SpoolError: As ``add`` documents.
 
         """
         sequence = len(self._records) + 1
@@ -371,8 +375,8 @@ class SpooledPageSink(PageSink):
             png_path: Where it would have been written, for the message.
 
         Raises:
-            ScanError: If free space is below the page plus the reserve, or if
-                it could not be measured at all.  ``add``'s "no raw OSError
+            SpoolError: If free space is below the page plus the reserve, or
+                if it could not be measured at all.  ``add``'s "no raw OSError
                 escapes this method" promise covers the measurement as
                 well as the write: a spool directory that has been removed, or
                 whose mount went away, raises ``FileNotFoundError`` here, and
@@ -400,14 +404,14 @@ class SpooledPageSink(PageSink):
                 f"Could not measure free space for page {sequence} in "
                 f"{self._directory}: {describe(exc)}"
             )
-            raise ScanError(measure_msg) from exc
+            raise SpoolError(measure_msg) from exc
         if free_mb < required_mb:
             msg = (
                 f"Insufficient disk space for page {sequence}: "
                 f"{free_mb} MB free in {png_path}, {required_mb} MB required "
                 "(configure min_free_space_mb to adjust)"
             )
-            raise ScanError(msg)
+            raise SpoolError(msg)
 
     def _write(
         self, image: Image.Image, sequence: int, png_path: Path, dpi: int
@@ -428,7 +432,7 @@ class SpooledPageSink(PageSink):
             dpi: The resolution written into the PNG's pHYs chunk.
 
         Raises:
-            ScanError: If the write or the rename failed, chained from the
+            SpoolError: If the write or the rename failed, chained from the
                 original OSError.
 
         """
@@ -447,4 +451,4 @@ class SpooledPageSink(PageSink):
             with contextlib.suppress(OSError):
                 part_path.unlink(missing_ok=True)
             msg = f"Could not write page {sequence} to {png_path}: {describe(exc)}"
-            raise ScanError(msg) from exc
+            raise SpoolError(msg) from exc

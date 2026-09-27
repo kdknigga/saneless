@@ -467,8 +467,12 @@ class RunArtefacts:
         stage: How far the run got.
         passes: One ``(title suffix, records)`` pair per acquisition pass, in
             pass order, with pass B's records in the order it scanned them.
-        document: Every page in document order, unfiltered, once acquisition
-            has finished; None before that.
+        document: Every page accepted into the document, in document order,
+            unfiltered; None while there is none.  Simplex and manual duplex
+            set it only once acquisition has finished.  A run that accepts
+            passes into its document one at a time sets it while acquisition
+            is still going on, and ``passes`` then holds only the pass in
+            flight, whose pages are not part of it yet.
         pdfs: Assembled PDFs not yet delivered, still in the workspace.
         accepted: Of those PDFs, each one paperless-ngx had already taken --
             accepted by its API, or saved to its consume folder -- or may
@@ -845,6 +849,32 @@ def _keep_document(artefacts: RunArtefacts, report: PreservationReport) -> bool:
     return True
 
 
+def _keep_document_and_passes_in_flight(
+    artefacts: RunArtefacts, report: PreservationReport
+) -> bool:
+    """
+    Keep the document accepted so far, and beside it every pass still in flight.
+
+    Both are attempted whatever happens to the other: a document too large for
+    the disk rule does not stop a small pass in flight from being kept as a
+    PDF, and the reverse.
+
+    Args:
+        artefacts: The run, for its document, its passes and ``failed/``.
+        report: Where the kept PDFs and any failure are recorded.
+
+    Returns:
+        True when the document and every non-empty pass in flight were kept
+        as PDFs; False sends the caller to the page files, which hold both.
+
+    """
+    document_kept = _keep_document(artefacts, report)
+    if not any(records for _, records in artefacts.passes):
+        return document_kept
+    passes_kept = _keep_passes(artefacts, report)
+    return document_kept and passes_kept
+
+
 def _keep_passes(artefacts: RunArtefacts, report: PreservationReport) -> bool:
     """
     Keep each non-empty acquisition pass as its own PDF in ``failed/``.
@@ -980,9 +1010,15 @@ def preserve_most_finished(artefacts: RunArtefacts) -> PreservationReport:
     3. ``ASSEMBLING``: straight to the page files. Assembly is what failed, or
        the disk rule refused it, so building another PDF would fail the same
        way.
-    4. Otherwise, once acquisition has finished (``document`` is set): the
+    4. ``ACQUIRING`` with ``document`` set: the accepted document as one PDF,
+       and then each non-empty pass in flight as its own ``(partial)`` PDF,
+       because those pages are not part of the document yet.  Only a run that
+       accepts passes into its document before acquisition ends reaches this;
+       simplex and manual duplex set ``document`` only once acquisition is
+       over.
+    5. Otherwise, once acquisition has finished (``document`` is set): the
        unfiltered document, in document order, as one PDF.
-    5. Otherwise each non-empty pass as its own PDF, the ``(backs)`` pass in
+    6. Otherwise each non-empty pass as its own PDF, the ``(backs)`` pass in
        sheet order.
 
     Every PDF built here first passes ``ensure_room_to_assemble``. When a PDF
@@ -1016,6 +1052,8 @@ def preserve_most_finished(artefacts: RunArtefacts) -> PreservationReport:
         kept_as_pdf = _keep_assembled(artefacts, report)
     elif artefacts.stage is RunStage.ASSEMBLING:
         pass
+    elif artefacts.stage is RunStage.ACQUIRING and artefacts.document:
+        kept_as_pdf = _keep_document_and_passes_in_flight(artefacts, report)
     elif artefacts.document:
         kept_as_pdf = _keep_document(artefacts, report)
     elif any(records for _, records in artefacts.passes):

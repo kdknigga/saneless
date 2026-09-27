@@ -597,6 +597,8 @@ class TestAMultiPageDocumentAndItsPassInFlight:
     ) -> None:
         """The document PDF is kept, and the page files cover the pass it lacks."""
         artefacts, document, _ = _multi_page_run(tmp_path, 2)
+        # Read now: the page files are moved out of the spool by the keep.
+        expected_document = _streams_of(document)
         _refusing_the_partial_pdf(monkeypatch)
 
         report = preserve_most_finished(artefacts)
@@ -606,7 +608,7 @@ class TestAMultiPageDocumentAndItsPassInFlight:
             KeptKind.PAGE_FILES,
         ]
         document_pdf = report.groups[0].paths[0]
-        assert embedded_streams(document_pdf) == _streams_of(document)
+        assert embedded_streams(document_pdf) == expected_document
         page_dir = _only_page_dir(artefacts.failed_dir)
         assert len(list(page_dir.iterdir())) == 5
         sentence = report.sentence()

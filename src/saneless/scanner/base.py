@@ -12,7 +12,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, assert_never
+from typing import TYPE_CHECKING, Final, assert_never
 
 from saneless.exceptions import (
     ListingCrashedError,
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from saneless.vocabulary import PaperSize
 
 __all__ = [
+    "MAX_PAGES_PER_PASS",
     "DeviceCapabilities",
     "DeviceInfo",
     "DeviceSurvey",
@@ -42,6 +43,21 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+# The most pages one acquisition pass may produce: one scan_pages() call.
+#
+# SCOPE: per pass, not per job. The two manual-duplex passes each call
+# scan_pages() separately, and a document grown pass by pass calls it once per
+# pass, so each is bounded by this number on its own. A cap on a whole
+# document is a separate number, paired with this one where it is declared.
+#
+# The value matches the largest production ADF hoppers, so no real stack should
+# reach it in one pass. That is a judgement about hardware, not a measurement,
+# and it is cheap to revise precisely because the error names the cap. It lives
+# here, backend-neutral, so every number derived from it is derived from one
+# place; what the cap bounds, and what it does not, is explained where the SANE
+# backend enforces it (_MAX_ADF_PAGES in sane_backend.py).
+MAX_PAGES_PER_PASS: Final = 500
 
 
 class SourceKind(StrEnum):
@@ -123,7 +139,8 @@ def classify_source(source: str) -> SourceKind:
     # above. That is visible to the operator and is fixed by one entry in a
     # tuple. The opposite failure -- treating a flatbed as a feeder and
     # re-scanning the platen until something stops it -- is the expensive one,
-    # and it is bounded separately by _MAX_ADF_PAGES in sane_backend.py.
+    # and it is bounded separately by MAX_PAGES_PER_PASS above, which
+    # sane_backend.py enforces as _MAX_ADF_PAGES.
     #
     # This is a settled answer. Do not re-open it as an unmade decision.
     return SourceKind.UNKNOWN
