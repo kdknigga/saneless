@@ -42,6 +42,7 @@ from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    PASS_WAIT_STATES,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     ErrorCategory,
@@ -347,6 +348,10 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     assert ("flip-prompt" in text) is (state is JobState.AWAITING_FLIP)
     if state not in BUSY_STATES:
         assert 'aria-busy="true"' not in text
+    # A multi-page prompt needs the worker to hold an open question for the
+    # job; a row merely recorded as waiting, as every row here is, has none,
+    # so no state renders one.
+    assert "pages-prompt" not in text
 
     if state is JobState.DONE:
         assert '<p class="status-done">&#10003; Done: Render Test</p>' in text
@@ -372,6 +377,23 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     # The history-refresh hook belongs to the terminal states only -- all four
     # of them, FALLBACK and CANCELLED included, or the table goes stale.
     assert ('hx-get="/api/jobs/history"' in text) is (state in TERMINAL_STATES)
+
+
+@pytest.mark.parametrize("state", sorted(PASS_WAIT_STATES))
+def test_multi_page_wait_names_what_it_waits_on(
+    client: TestClient, state: JobState
+) -> None:
+    """
+    A multi-page job waiting with no open question says what it waits on.
+
+    The line carries no ``aria-busy``: the job waits for a person, so a
+    spinner would make it look hung.
+    """
+    _job_in_state(client, state)
+    text = client.get("/api/jobs/current/status").text
+
+    assert f"<p>{escape(progress_label(state))}</p>" in text
+    assert 'aria-busy="true"' not in text
 
 
 # The alert region and the disclosure, captured whole. Neither nests a <div> or
