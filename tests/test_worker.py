@@ -5130,10 +5130,14 @@ class TestWorkerEnumDispatch:
             # which the worker persisted before starting the pipeline and which
             # run_pipeline merely re-announces as its first event.  Rewriting it
             # would blank error/error_category a second time and signal a
-            # transition that did not occur.
+            # transition that did not occur.  The three multi-page waits are
+            # active states like the flip wait, so each is persisted as well.
             assert from_callback == [
                 JobState.AWAITING_FLIP,
                 JobState.SCANNING_REVERSE,
+                JobState.AWAITING_NEXT_PASS,
+                JobState.AWAITING_BLANK_DECISION,
+                JobState.AWAITING_RETRY,
                 JobState.ASSEMBLING,
                 JobState.UPLOADING,
             ]
