@@ -20,6 +20,7 @@ SANE scanner to paperless-ngx bridge. Web UI and CLI for triggering scans, assem
 - [Deploy with Docker Compose](how-to/deploy-docker-compose.md) -- Run saneless as a container alongside paperless-ngx.
 - [Configure Scan Profiles](how-to/configure-scan-profiles.md) -- Create profiles for different scan types (color, grayscale, high-res).
 - [Set Up ADF Duplex Scanning](how-to/set-up-adf-duplex.md) -- Scan double-sided documents with an automatic document feeder.
+- [Scan a Multi-Page Document](how-to/scan-a-multi-page-document.md) -- Build one PDF from several scans, on the flatbed or by hand-feeding the feeder.
 - [Scanner Host Discovery (Containers)](how-to/scanner-host-discovery.md) -- Connect a containerized saneless instance to a remote scanner.
 - [Use the CLI for Scripting](how-to/cli-scripting.md) -- Automate scans with shell scripts and JSON output.
 

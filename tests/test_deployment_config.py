@@ -112,7 +112,8 @@ from saneless.pages import (
     filter_blank_pages,
     is_blank,
 )
-from saneless.scanner.base import PageRecord
+from saneless.pipeline import MAX_DOCUMENT_PAGES, PipelineEvent
+from saneless.scanner.base import MAX_PAGES_PER_PASS, PageRecord
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
     ExitCode,
@@ -6881,3 +6882,126 @@ def test_proxy_docs_require_the_original_host_header() -> None:
         if "turns the Host check off" not in sections[where]
     )
     assert not offenders, "\n".join(offenders)
+
+
+# ---------------------------------------------------------------------------
+# Multi-page scanning: every documented state list, and the honest page ceiling
+# ---------------------------------------------------------------------------
+
+MULTI_PAGE_HOWTO = DOCS_DIR / "how-to" / "scan-a-multi-page-document.md"
+
+# A backticked upper-case enum value inside a documented list, e.g. `DONE`.
+DOCUMENTED_ENUM_VALUE = re.compile(r"`([A-Z][A-Z_]*)`")
+
+# The sentence in each page that lists every job state, found by a phrase
+# that belongs to that list alone: the list itself is the capture group.
+JOB_STATE_LISTS = (
+    (
+        CLI_SCRIPTING,
+        re.compile(
+            r"`state` is always the raw uppercase enum value —(?P<list>.*?)—", re.DOTALL
+        ),
+    ),
+    (
+        WEB_API_REFERENCE,
+        re.compile(r"Possible states: (?P<list>.*?)\.\n"),
+    ),
+)
+
+# The architecture page's list of pipeline events, in its parentheses.
+PIPELINE_EVENT_LIST = re.compile(
+    r"Each stage emits a `PipelineEvent` \((?P<list>[^)]*)\)"
+)
+
+
+def _documented_values(text: str, name: Path, anchor: re.Pattern[str]) -> set[str]:
+    """
+    Return the enum values a documented list names.
+
+    Args:
+        text: The page's text.
+        name: The page's repo-relative name, for the failure message.
+        anchor: A pattern whose ``list`` group is the documented list.
+
+    Returns:
+        Every backticked upper-case word in the list.
+
+    """
+    match = anchor.search(text)
+    assert match is not None, (
+        f"{name} no longer has the list {anchor.pattern!r} finds, so nothing "
+        "pins its values to the code"
+    )
+    return set(DOCUMENTED_ENUM_VALUE.findall(match.group("list")))
+
+
+def _list_drift(listed: set[str], real: set[str]) -> str:
+    """
+    Describe how a documented list differs from the enum it documents.
+
+    Args:
+        listed: The values the page names.
+        real: The enum's values.
+
+    Returns:
+        The missing and the extra values, or an empty string if none.
+
+    """
+    problems = []
+    if missing := sorted(real - listed):
+        problems.append(f"missing {missing}")
+    if extra := sorted(listed - real):
+        problems.append(f"names values the code does not have: {extra}")
+    return "; ".join(problems)
+
+
+@pytest.mark.parametrize(
+    ("page", "anchor"),
+    JOB_STATE_LISTS,
+    ids=[page.name for page, _ in JOB_STATE_LISTS],
+)
+def test_every_state_list_in_the_docs_names_every_job_state(
+    page: Path, anchor: re.Pattern[str]
+) -> None:
+    """
+    Each page's list of job states is exactly ``JobState``.
+
+    A script compares ``saneless jobs --json`` and the status partial against
+    these lists, so a state the code gains -- such as a new waiting state --
+    must appear in them, and a state it drops must leave them.
+    """
+    text, name = _read(page)
+    drift = _list_drift(
+        _documented_values(text, name, anchor), {state.value for state in JobState}
+    )
+    assert not drift, f"{name}'s list of job states is out of date: {drift}"
+
+
+def test_the_architecture_page_lists_every_pipeline_event() -> None:
+    """The architecture page's list of pipeline events is exactly ``PipelineEvent``."""
+    text, name = _read(ARCHITECTURE)
+    drift = _list_drift(
+        _documented_values(text, name, PIPELINE_EVENT_LIST),
+        {event.value for event in PipelineEvent},
+    )
+    assert not drift, f"{name}'s list of pipeline events is out of date: {drift}"
+
+
+def test_the_multi_page_how_to_states_the_real_page_ceiling() -> None:
+    """
+    The how-to names both the cap and the largest document the cap allows.
+
+    The cap is checked between scans only, so a scan that starts one page
+    short of it can still add a whole feeder pass: the real ceiling is the
+    cap less one plus the per-pass limit.  Both numbers are computed from the
+    code, so changing either constant fails here until the page says so.
+    """
+    text, name = _read(MULTI_PAGE_HOWTO)
+    ceiling = MAX_DOCUMENT_PAGES - 1 + MAX_PAGES_PER_PASS
+    for number, what in (
+        (MAX_DOCUMENT_PAGES, "the page count at which no new scan starts"),
+        (ceiling, "the largest document a scan already running can produce"),
+    ):
+        assert re.search(rf"\b{number}\b", text), (
+            f"{name} does not state {what}, {number}"
+        )

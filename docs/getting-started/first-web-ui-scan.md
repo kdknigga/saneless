@@ -31,15 +31,17 @@ These are the same checks `saneless doctor` prints from a terminal. If the Paper
 
 ## Fill in scan details
 
-Each control has one line of help text beneath it. The form has up to four fields -- an operator can hide Tags and Correspondent with `show_tags` and `show_correspondent` in the `[web]` section of the config file, for a simpler form; see [Configuration](../reference/configuration.md#web). Hiding them does not change what a scan does: the profile's default tags and correspondent still apply.
+Each control has one line of help text beneath it. The form has up to five fields -- an operator can hide Tags and Correspondent with `show_tags` and `show_correspondent` in the `[web]` section of the config file, for a simpler form; see [Configuration](../reference/configuration.md#web). Hiding them does not change what a scan does: the profile's default tags and correspondent still apply.
 
 1. **Profile** -- A dropdown listing your configured scan profiles. Select the one that matches your scan type. Beneath it, a description line explains the selected profile in a sentence ("Feeder, double-sided", for example) and updates as you change the selection. The profile named "default" is selected when the page loads. Profiles control scanner source, resolution, color mode, and default metadata. See [Configure Scan Profiles](../how-to/configure-scan-profiles.md) to create additional profiles.
 
-2. **Title** -- A text field for the document title, helped by *"What this document should be called in paperless-ngx."* Enter a descriptive name, for example "Electricity Bill March 2026". Leave it empty and saneless titles the document `Scan <date time>` in the server's local time.
+2. **Multiple pages** -- A checkbox beneath the profile description, helped by *"Asks after each scan whether there is another page, and puts every page in one document."* Tick it to build one document from several scans, such as a letter of more than two pages on the flatbed. It is unticked every time the page loads, and on a manual duplex profile it is greyed out with *"Not available with manual duplex."* beneath it. See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md).
 
-3. **Tags** -- A list of checkboxes, one per tag in your paperless-ngx instance, sized to tap with a thumb. Tick as many as you like. Above the list is a **Filter tags** box: type in it to narrow the list, and tags you have already ticked stay ticked and stay visible even when they do not match the filter, so filtering can never silently drop a tag from your scan. The circular-arrow button beside the **Tags** heading reloads the list from paperless-ngx if you have just added tags there.
+3. **Title** -- A text field for the document title, helped by *"What this document should be called in paperless-ngx."* Enter a descriptive name, for example "Electricity Bill March 2026". Leave it empty and saneless titles the document `Scan <date time>` in the server's local time.
 
-4. **Correspondent** -- A single-select dropdown populated from your paperless-ngx instance, helped by *"Who sent this document? Optional."* and with "No correspondent" as the default. Click the refresh button next to the label to reload the correspondent list.
+4. **Tags** -- A list of checkboxes, one per tag in your paperless-ngx instance, sized to tap with a thumb. Tick as many as you like. Above the list is a **Filter tags** box: type in it to narrow the list, and tags you have already ticked stay ticked and stay visible even when they do not match the filter, so filtering can never silently drop a tag from your scan. The circular-arrow button beside the **Tags** heading reloads the list from paperless-ngx if you have just added tags there.
+
+5. **Correspondent** -- A single-select dropdown populated from your paperless-ngx instance, helped by *"Who sent this document? Optional."* and with "No correspondent" as the default. Click the refresh button next to the label to reload the correspondent list.
 
 ## Start the scan
 
@@ -52,6 +54,7 @@ The status area below the form updates as the scan progresses through these stag
 - **Scanning** -- The scanner is acquiring pages.
 - **Waiting for flip** -- Manual duplex profiles only: the front sides are scanned and saneless is waiting for you to flip the stack (see below).
 - **Scanning backs** -- Manual duplex profiles only: the scanner is acquiring the back sides.
+- **Waiting for more pages**, **Waiting: blank pages found** or **Waiting: last scan failed** -- Multiple pages only: saneless is waiting for you to say whether there is another page, what to do about pages that look blank, or what to do after a scan that failed (see below).
 - **Assembling** -- Pages are being assembled into a PDF.
 - **Uploading** -- The PDF is being uploaded to paperless-ngx.
 - **Done** -- The document has been successfully uploaded.
@@ -65,6 +68,8 @@ A thumbnail of the first scanned page appears once the first page is acquired, i
 If your profile uses manual duplex scanning, a flip prompt appears after the front sides are scanned. Keep the pages in the same order, flip the whole stack over the long edge, load it back into the feeder, and click **Continue** to scan the back sides. As soon as the click is received, the prompt is replaced by a short confirmation, and the status moves on once the back sides start scanning. To stop instead, click **Abort scan** and confirm -- the browser asks *"Abort this scan? It will stop and cannot be resumed."* -- after which the back sides are not scanned and nothing is uploaded. If nobody answers the prompt within `operator_wait_timeout_seconds` (10 minutes by default), the scan fails the same way. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
 
 **Only the browser that started the scan gets those buttons.** Somebody else watching the same page sees "Waiting for the stack to be flipped" instead, because the person holding the paper is the one who should answer.
+
+If you ticked **Multiple pages**, a question appears after every scan instead, with the number of pages kept so far and the buttons **Scan next page**, **Finish document**, **Re-scan last page** and **Abort scan**. Put the next page on the scanner and press **Scan next page**; when the last page is in, press **Finish document** and every page is uploaded as one document. While the question is open the Scan button reads **Waiting for you…**. If nobody answers within `operator_wait_timeout_seconds` (10 minutes by default), the document is finished with the pages kept and uploaded with a warning, rather than failed as a flip prompt would be. Here too, only the browser that started the scan gets the buttons. See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md) for the blank-page and failed-scan questions.
 
 **Only the browser that started a scan sees what it is.** saneless recognises that browser by a cookie it sets when you press Scan. The cookie lasts a year, so a browser still knows its own scans after a restart. Anyone else on your network who opens the page sees the state, the outcome and the page counts. They see the title as "Scan (title hidden)" and no thumbnail. A different browser on your own phone or laptop counts as somebody else.
 
