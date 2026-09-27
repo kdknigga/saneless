@@ -309,7 +309,7 @@ class _FlipContext:
     Attributes:
         coordinator: The seam that answers the flip wait.
         timeout: Seconds the wait may hold the pipeline, from
-            ``output.flip_timeout_seconds``.
+            ``output.operator_wait_timeout_seconds``.
 
     """
 
@@ -1024,7 +1024,8 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
 
     Args:
         request: The pipeline request, which must carry a flip coordinator.
-        settings: Application settings, for ``output.flip_timeout_seconds``.
+        settings: Application settings, for
+            ``output.operator_wait_timeout_seconds``.
 
     Returns:
         The coordinator, narrowed to non-Optional, with the configured timeout.
@@ -1046,7 +1047,7 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
     coordinator = request.flip_coordinator
     return _FlipContext(
         coordinator=coordinator,
-        timeout=settings.output.flip_timeout_seconds,
+        timeout=settings.output.operator_wait_timeout_seconds,
     )
 
 
