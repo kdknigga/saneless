@@ -46,6 +46,7 @@ from saneless.paperless import (
     ApiDelivery,
     FolderDelivery,
     PaperlessClient,
+    PaperlessTiming,
     UploadResult,
 )
 from saneless.pdf import assemble_pdf
@@ -6973,8 +6974,8 @@ def _recording_client(
     return PaperlessClient(
         url=settings.paperless.url,
         token=settings.paperless.token.get_secret_value(),
-        max_retries=1,
         transport=httpx2.MockTransport(recorder),
+        timing=PaperlessTiming(send_budget=0.0),
     )
 
 

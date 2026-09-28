@@ -22,7 +22,6 @@ from fastapi.routing import _IncludedRouter
 from PIL import Image, ImageDraw
 
 from saneless import logging_config
-from saneless import paperless as paperless_module
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -30,7 +29,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.paperless import ApiDelivery, PaperlessClient
+from saneless.paperless import ApiDelivery, PaperlessClient, PaperlessTiming
 from saneless.pipeline import FlipCoordinator
 from saneless.scanner import _listing_child
 from saneless.scanner import listing as listing_mod
@@ -38,6 +37,7 @@ from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
 from saneless.scanner.listing import ListingReply
 from saneless.vocabulary import FlipOutcome
+from tests.fake_clock import FakeClock
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -630,17 +630,19 @@ def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     ``create_app`` still builds a real ``PaperlessClient``; only its transport
     is replaced, by one that fails every request with the same ``ConnectError``
-    a refused connection raises. The upload backoff is recorded instead of
-    slept. Tests that replace ``app.state.paperless`` methods are unaffected.
+    a refused connection raises. The upload's before-send budget runs on a
+    ``FakeClock``, so its waits are recorded instead of slept and the budget
+    is spent at once. Tests that replace ``app.state.paperless`` methods are
+    unaffected.
 
     Args:
-        monkeypatch: Undoes both patches after the test.
+        monkeypatch: Undoes the patch after the test.
 
     Returns:
         The backoff delays the client asked for, in order.
 
     """
-    delays: list[float] = []
+    clock = FakeClock()
 
     def build_client(
         *, url: str, token: str, consume_dir: Path | None = None
@@ -657,13 +659,11 @@ def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
             token=token,
             consume_dir=consume_dir,
             transport=httpx2.MockTransport(_refuse_every_request),
+            timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
         )
 
     monkeypatch.setattr("saneless.web.app.PaperlessClient", build_client)
-    # ``saneless.paperless`` reaches its backoff through the ``time`` module, so
-    # this swaps that module's ``sleep`` for the length of the test.
-    monkeypatch.setattr(paperless_module.time, "sleep", delays.append)
-    return delays
+    return clock.waits
 
 
 def _inked_page() -> Image.Image:
