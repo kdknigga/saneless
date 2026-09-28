@@ -4167,7 +4167,11 @@ def _advertising(*values: str | None) -> tuple[list[str | None], PaperlessClient
     def handler(request: httpx2.Request) -> httpx2.Response:
         accepts.append(request.headers.get("accept"))
         value = values[min(len(accepts), len(values)) - 1]
-        headers = {} if value is None else {"X-Api-Version": value}
+        # As UTF-8 bytes, the way a server can send them; httpx2 refuses a
+        # non-ASCII str header value but decodes such bytes on the way in.
+        headers: dict[bytes, bytes] = (
+            {} if value is None else {b"X-Api-Version": value.encode()}
+        )
         return httpx2.Response(200, json={"count": 0, "results": []}, headers=headers)
 
     return accepts, _poll_client(handler)

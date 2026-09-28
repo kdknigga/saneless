@@ -50,14 +50,22 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# The API version this client is written against.  paperless-ngx negotiates via
-# ``Accept: application/json; version=N`` and serves its own current default --
-# today 10 -- to a client that sends no header, so pinning turns a hidden
-# assumption into an explicit contract.  Servers old enough to predate task
-# versioning ignore the header.  An *invalid* version string makes paperless-ngx
-# answer 406 Not Acceptable, which poll_task reports immediately as a hard
-# failure, so the string has to be exactly right.
-_API_VERSION_ACCEPT = "application/json; version=9"
+# The API versions this client speaks.  paperless-ngx negotiates via
+# ``Accept: application/json; version=N`` and serves its own current default to
+# a client that sends none, so every request names one, turning a hidden
+# assumption into an explicit contract.  paperless-ngx 2.16 through 2.20 allow
+# versions up to 9, and 3.x allows 9 and 10.  A server outside that range --
+# anything before 2.16 allows only up to 7 -- answers a version it does not allow
+# with 406 Not Acceptable.  The highest version a server allows is announced in
+# ``X-Api-Version``, but only on responses to an authenticated request: never on
+# a 401, and never on the 406 itself.  So the first request speaks 9, which every
+# supported server allows, and its answer says whether 10 may follow.
+_SUPPORTED_API_VERSIONS: Final = (9, 10)
+_ACCEPT_TEMPLATE: Final = "application/json; version={version}"
+# One to three ASCII digits, the whole value: a longer, signed, spaced or
+# non-ASCII value is not a version and is never read.  ``[0-9]``, not ``\d``,
+# which also matches digits from other scripts that ``int()`` accepts.
+_API_VERSION_HEADER: Final = re.compile(r"[0-9]{1,3}")
 
 # paperless-ngx's COMPLETE_STATUSES, normalised to the v9 uppercase spelling.
 # REVOKED belongs here: it is an administrative cancellation that will never
@@ -935,14 +943,22 @@ class PaperlessClient:
                     "paperless-ngx API token in paperless.token"
                 )
                 raise PaperlessError(msg) from None
+            # The highest API version the server has announced, or None until
+            # an answer names one.  Set before the client exists, because its
+            # hooks read it.
+            self._server_max: int | None = None
+            # Accept is not a default header: it names the version, which can
+            # change once an answer announces a higher one, so the request
+            # hook sets it on each request and the defaults are never mutated.
             self._client = httpx2.Client(
                 base_url=base_url,
-                headers={
-                    "Authorization": f"Token {token}",
-                    "Accept": _API_VERSION_ACCEPT,
-                },
+                headers={"Authorization": f"Token {token}"},
                 timeout=_CLIENT_TIMEOUT_SECONDS,
                 transport=transport,
+                event_hooks={
+                    "request": [self._set_accept],
+                    "response": [self._learn_api_version],
+                },
             )
         except httpx2.InvalidURL:
             # The parser's own text can quote part of a password: a "/" in
@@ -952,9 +968,8 @@ class PaperlessClient:
             msg = f"Paperless URL {self._display_url} is not valid"
             raise PaperlessError(msg) from None
         except UnicodeEncodeError:
-            # Only header values are encoded here and the Accept value is a
-            # constant, so the token holds the character; the codec's text
-            # quotes it.
+            # Only header values are encoded here and the token is the only
+            # one, so it holds the character; the codec's text quotes it.
             msg = (
                 "Paperless API token in paperless.token contains a character "
                 "an HTTP header cannot carry"
@@ -983,6 +998,78 @@ class PaperlessClient:
         self._upload_timeout = timing.upload_timeout
         # Kept only to strike it out of third-party text; see _strike.
         self._token = token
+
+    @property
+    def api_version(self) -> int:
+        """
+        Name the API version the next request will ask for.
+
+        It is 10 once a server has announced 10 or higher, and 9 otherwise:
+        before any answer, when no answer named a version, and when the
+        latest usable announcement was 9.  A server announcing more than 10
+        still allows 10, the highest this client knows; speaking a later
+        version is deferred until saneless is written against it.
+
+        Returns:
+            One of the supported versions, 9 or 10.
+
+        """
+        oldest, newest = _SUPPORTED_API_VERSIONS
+        if self._server_max is not None and self._server_max >= newest:
+            return newest
+        return oldest
+
+    def _set_accept(self, request: httpx2.Request) -> None:
+        """
+        Name the API version on one outgoing request.
+
+        The request event hook.  The value is built from an int, never from
+        anything a server sent.
+
+        Args:
+            request: The request about to be sent.
+
+        """
+        request.headers["Accept"] = _ACCEPT_TEMPLATE.format(version=self.api_version)
+
+    def _learn_api_version(self, response: httpx2.Response) -> None:
+        """
+        Remember the highest API version an answer announces.
+
+        The response event hook, which runs for every answer, including one
+        that later raises from ``raise_for_status``, and adds no request.
+        Only a value of one to three ASCII digits naming at least 9 is kept;
+        anything else, and an answer without the header, leaves what was
+        learned as it is.  The value is stored as an int and never quoted.
+        The web client is shared by several threads, and this is one
+        attribute write, so racing answers from one server can only write the
+        same value.
+
+        Args:
+            response: The answer just received.
+
+        """
+        value = response.headers.get("X-Api-Version")
+        if value is None or not _API_VERSION_HEADER.fullmatch(value):
+            return
+        announced = int(value)
+        if announced >= _SUPPORTED_API_VERSIONS[0]:
+            self._server_max = announced
+
+    def _incompatible_message(self) -> str:
+        """
+        Build the fixed text for a server that refused the API version.
+
+        No server text is quoted: a 406 body only restates the refusal.
+
+        Returns:
+            The message naming the supported versions and the release needed.
+
+        """
+        return (
+            f"Paperless{self._at_url} does not accept API version "
+            "9 or 10; saneless needs paperless-ngx 2.16 or later"
+        )
 
     def upload_document(
         self,
@@ -1081,10 +1168,7 @@ class PaperlessClient:
                         msg = self._uncertain_send_message(exc, size_bytes, timeout)
                         raise PaperlessUncertainSendError(msg) from self._cause(exc)
                     case _RetryDecision.INCOMPATIBLE:
-                        msg = (
-                            f"Paperless{self._at_url} does not accept API version "
-                            "9 or 10; saneless needs paperless-ngx 2.16 or later"
-                        )
+                        msg = self._incompatible_message()
                         raise PaperlessIncompatibleError(msg) from None
                     case _RetryDecision.REFUSED if isinstance(
                         exc, httpx2.HTTPStatusError
@@ -1476,9 +1560,9 @@ class PaperlessClient:
         failure text is a flat ``result`` string.  API v10 paginates the
         list into ``{"count", "next", "previous", "results"}``, spells the
         status in lowercase, and moved the failure text into
-        ``result_data["error_message"]``.  The client pins v9 in its
-        ``Accept`` header, and reading both shapes anyway means it keeps
-        working if that pin ever stops being honoured.
+        ``result_data["error_message"]``.  The client asks for v10 once the
+        server has announced it and for v9 until then (see ``api_version``),
+        so either shape can arrive.
 
         A 200 carrying no task is not an error.  A task is not always
         visible immediately after the upload that created it, so an empty
@@ -1718,6 +1802,8 @@ class PaperlessClient:
                 ``paperless.url`` and ``paperless.token``, with fixed text and
                 no cause.  A request refused for another reason is a
                 ``PaperlessError`` with fixed text and no cause.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
+                not accept API version 9 or 10.  Fixed text, no cause.
             PaperlessError: If any page request fails for any other
                 ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
                 naming the endpoint and base URL and chained to the cause
@@ -1738,6 +1824,8 @@ class PaperlessClient:
                 ``paperless.url`` and ``paperless.token``, with fixed text and
                 no cause.  A request refused for another reason is a
                 ``PaperlessError`` with fixed text and no cause.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
+                not accept API version 9 or 10.  Fixed text, no cause.
             PaperlessError: If any page request fails for any other
                 ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
                 naming the endpoint and base URL and chained to the cause
@@ -1788,6 +1876,8 @@ class PaperlessClient:
                 sent from the configured URL and token.  With no URL set the
                 `` at <url>`` is left out.  A request refused for any other
                 reason is a ``PaperlessError`` of the same shape.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
+                not accept API version 9 or 10.  Fixed text, no cause.
             PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
                 <reason>``, chained to the httpx2 error or the ValueError
                 unless its chain quotes the token, or
@@ -1857,6 +1947,8 @@ class PaperlessClient:
                 fault; the library's text, which can quote the token, is left
                 out.  Otherwise the same fixed-text error is a
                 ``PaperlessError``.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
+                not accept API version 9 or 10.  Fixed text, no cause.
             PaperlessError: ``<prefix>: <reason>``, with the token struck out
                 of the reason, chained to any other httpx2 error or the
                 ValueError unless that cause's chain quotes the token.
@@ -1868,10 +1960,15 @@ class PaperlessClient:
             )
             response.raise_for_status()
         except httpx2.HTTPError as exc:
-            if _retry_decision(exc) is _RetryDecision.MISCONFIGURED:
+            decision = _retry_decision(exc)
+            if decision is _RetryDecision.MISCONFIGURED:
                 # from None for the reason upload_document gives: a chained
                 # h11 error would print the refused token in a traceback.
                 raise self._unsendable_error(exc, prefix) from None
+            if decision is _RetryDecision.INCOMPATIBLE:
+                # The same fixed text as a refused upload; the 406 body only
+                # restates the refusal.
+                raise PaperlessIncompatibleError(self._incompatible_message()) from None
             msg = f"{prefix}: {self._reason(exc)}"
             raise PaperlessError(msg) from self._cause(exc)
         try:
