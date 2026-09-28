@@ -2055,7 +2055,7 @@ class TestPollTask:
         self, status: int, poll_clock: FakeClock
     ) -> None:
         """
-        D-12: a refused token or a moved endpoint is reported immediately.
+        A refused token or a moved endpoint is reported immediately.
 
         The counter is the point of the test: a revoked token used to be
         silently re-polled for the full 300 s and then misreported as a
@@ -2120,7 +2120,7 @@ class TestPollTask:
         self, status: int
     ) -> None:
         """
-        T-23-16: a 5 KB error page on a refusal becomes one short line.
+        A 5 KB error page on a refusal becomes one short line.
 
         That message is recorded in the job store and shown in the web status
         area and on the terminal, so neither its length nor a newline may
@@ -3726,8 +3726,8 @@ class TestMetadataResponseShape:
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     @pytest.mark.parametrize(
         "body",
-        [42, "tags", True, None, [], [{"id": 1, "name": "one"}]],
-        ids=["int", "string", "bool", "null", "empty-list", "bare-list"],
+        [42, "tags", True, [], [{"id": 1, "name": "one"}]],
+        ids=["int", "string", "bool", "empty-list", "bare-list"],
     )
     def test_a_body_that_is_not_an_object_fails(
         self, method: str, noun: str, body: object

@@ -261,7 +261,7 @@ def _metadata_items(value: object, prefix: str, page: int) -> list[dict[str, obj
     characters or keys.
 
     Args:
-        value: The page's items: a bare-list body or a page's ``results``.
+        value: The page's items: its ``results``.
         prefix: The message prefix naming the collection and base URL.
         page: The page number, for the message.
 
@@ -1866,9 +1866,15 @@ class PaperlessClient:
         logger.warning("Unexpected paperless status %s", response.status_code)
         return ConnectionStatus.SERVER_ERROR
 
-    def get_tags(self) -> list[dict[str, object]]:
+    def get_tags(self, *, timeout: float | None = None) -> list[dict[str, object]]:
         """
         Fetch all tags from paperless-ngx.
+
+        Args:
+            timeout: The per-request budget in seconds, sent on every page
+                request, or None to use the client's own 30 s default.  A
+                check made before a scan starts passes a short one, so a
+                paperless-ngx that is down is reported in seconds.
 
         Returns:
             List of tag dicts with at least 'id' and 'name' keys.
@@ -1886,11 +1892,19 @@ class PaperlessClient:
                 unless the cause's chain quotes the token.
 
         """
-        return self._fetch_collection("/api/tags/", "tags")
+        return self._fetch_collection("/api/tags/", "tags", timeout=timeout)
 
-    def get_correspondents(self) -> list[dict[str, object]]:
+    def get_correspondents(
+        self, *, timeout: float | None = None
+    ) -> list[dict[str, object]]:
         """
         Fetch all correspondents from paperless-ngx.
+
+        Args:
+            timeout: The per-request budget in seconds, sent on every page
+                request, or None to use the client's own 30 s default.  A
+                check made before a scan starts passes a short one, so a
+                paperless-ngx that is down is reported in seconds.
 
         Returns:
             List of correspondent dicts with at least 'id' and 'name' keys.
@@ -1908,9 +1922,13 @@ class PaperlessClient:
                 unless the cause's chain quotes the token.
 
         """
-        return self._fetch_collection("/api/correspondents/", "correspondents")
+        return self._fetch_collection(
+            "/api/correspondents/", "correspondents", timeout=timeout
+        )
 
-    def _fetch_collection(self, path: str, noun: str) -> list[dict[str, object]]:
+    def _fetch_collection(
+        self, path: str, noun: str, *, timeout: float | None = None
+    ) -> list[dict[str, object]]:
         """
         Fetch every page of one metadata collection.
 
@@ -1921,9 +1939,9 @@ class PaperlessClient:
         requested: a server behind a misconfigured proxy builds it
         from the wrong host or scheme, and following it would send the API
         token there.  A redirect is not followed either; it fails the fetch.
-        A bare-list response on page 1 is the whole collection; on a later
-        page it fails the fetch rather than replacing the pages collected.
-        Each page's items must be a list of objects.
+        Every paperless-ngx release this client supports paginates tags and
+        correspondents, so each page must be an object whose ``results`` is
+        a list of objects; a bare list is not a collection.
 
         The client does not take the server's word alone that it is making
         progress.  A proxy that drops the query string, or a server that
@@ -1942,9 +1960,11 @@ class PaperlessClient:
         Args:
             path: The collection endpoint, e.g. ``/api/tags/``.
             noun: What the collection holds, for the message.
+            timeout: The per-request budget in seconds for every page, or
+                None for the client's default.
 
         Returns:
-            The ``results`` of every page in order, or a bare list as is.
+            The ``results`` of every page in order.
 
         Raises:
             ConfigError: ``Could not fetch <noun> from Paperless at <url>:
@@ -1968,14 +1988,9 @@ class PaperlessClient:
         page_limit = _METADATA_MAX_PAGES
         page = 1
         while True:
-            data = self._fetch_page(path, page, prefix)
-            if isinstance(data, list):
-                if page > 1:
-                    msg = f"{prefix}: page {page} was a bare list, which only page 1 may be"
-                    raise PaperlessError(msg)
-                return _metadata_items(data, prefix, page)
+            data = self._fetch_page(path, page, prefix, timeout=timeout)
             if not isinstance(data, dict):
-                msg = f"{prefix}: the response was neither a list nor an object"
+                msg = f"{prefix}: the response was not an object"
                 raise PaperlessError(msg)
             batch = _metadata_items(data.get("results"), prefix, page)
             if not batch:
@@ -2004,7 +2019,9 @@ class PaperlessClient:
             previous = batch
             page += 1
 
-    def _fetch_page(self, path: str, page: int, prefix: str) -> object:
+    def _fetch_page(
+        self, path: str, page: int, prefix: str, *, timeout: float | None = None
+    ) -> object:
         """
         Request one metadata page and return its decoded JSON body.
 
@@ -2012,6 +2029,8 @@ class PaperlessClient:
             path: The collection endpoint, e.g. ``/api/tags/``.
             page: The page number to ask for.
             prefix: The message prefix naming the collection and base URL.
+            timeout: The request's budget in seconds, or None for the
+                client's default.
 
         Returns:
             The decoded body, whatever its shape.
@@ -2032,7 +2051,9 @@ class PaperlessClient:
         """
         try:
             response = self._client.get(
-                path, params={"page": page, "page_size": _METADATA_PAGE_SIZE}
+                path,
+                params={"page": page, "page_size": _METADATA_PAGE_SIZE},
+                timeout=timeout if timeout is not None else httpx2.USE_CLIENT_DEFAULT,
             )
             response.raise_for_status()
         except httpx2.HTTPError as exc:
