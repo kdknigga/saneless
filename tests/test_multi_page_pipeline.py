@@ -342,6 +342,42 @@ class TestSpoolLedgerAcceptAndDiscard:
         assert tracked_while_deleting == [False]
         assert ledger.spooled() == []
 
+    def test_a_page_that_cannot_be_deleted_is_logged_and_the_rest_go(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A discarded page left behind is named in the log, with its cause.
+
+        It would come back in ``failed/`` beside some later failure, so the
+        log has to say where it came from.
+        """
+        sink = _sink_with_pages(tmp_path, "a", 2)
+        stuck, second = (record.path for record in sink.records)
+        ledger = _SpoolLedger()
+        ledger.register("(partial)", sink)
+        real_unlink = type(stuck).unlink
+
+        def _refuse_one(path: Path, *, missing_ok: bool = False) -> None:
+            if path == stuck:
+                msg = "read-only file system"
+                raise OSError(msg)
+            real_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(type(stuck), "unlink", _refuse_one)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            ledger.discard(sink)
+
+        assert stuck.exists()
+        assert not second.exists()
+        (record,) = [r for r in caplog.records if stuck.name in r.getMessage()]
+        assert record.levelno == logging.WARNING
+        assert "failed/" in record.getMessage()
+        assert record.exc_info is not None
+
     def test_discard_tolerates_a_page_already_gone(self, tmp_path: Path) -> None:
         """A page file that is already missing does not stop the rest going."""
         sink = _sink_with_pages(tmp_path, "a", 2)

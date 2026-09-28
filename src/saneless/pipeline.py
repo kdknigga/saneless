@@ -884,15 +884,23 @@ def _unlink_pages(records: Sequence[PageRecord]) -> None:
     the startup sweep, after a crash, both move every page file they find into
     ``failed/``, so a leftover page would come back as a pass the operator
     threw away.  A file already gone, or one that cannot be removed, does not
-    stop the rest from going.
+    stop the rest from going; one that cannot be removed is logged with its
+    cause, so a page that later turns up in ``failed/`` can be traced back to
+    the pass it was thrown away with.
 
     Args:
         records: The pass's page records, whose files are removed.
 
     """
     for record in records:
-        with contextlib.suppress(OSError):
+        try:
             record.path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Could not delete %s from a discarded pass; it may reappear in failed/",
+                record.path.name,
+                exc_info=True,
+            )
 
 
 @dataclass
