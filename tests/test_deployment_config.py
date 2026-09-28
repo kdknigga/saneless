@@ -902,6 +902,31 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "a wedged scanner refuses the next scan and asks for a restart",
         ("refus", "restart saneless"),
     ),
+    (
+        "only page reads and the cancel after a timeout run under a bound",
+        ("page reads", "under a bound"),
+    ),
+    (
+        "opening the device, setting options and closing it run on the job's "
+        "thread without a bound",
+        ("opening the device", "without a bound"),
+    ),
+    (
+        "python-sane holds the GIL during those calls, so a hung one freezes the "
+        "whole process and cannot be abandoned",
+        ("global interpreter lock", "/health", "cannot be abandoned"),
+    ),
+    (
+        "listing scanners runs in a separate process with its own deadline",
+        ("separate process", "deadline"),
+    ),
+)
+
+# What the subsection used to promise about blocking scanner calls, and must not
+# promise again: only page reads and the cancel after a timeout run on a daemon
+# thread, so a scanner that stops answering during any other call is not bounded.
+ARCHITECTURE_MEMORY_RETRACTED: tuple[str, ...] = (
+    "every blocking scanner call runs on a daemon thread",
 )
 
 
@@ -928,6 +953,11 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
                 f"{name}: the memory, disk and timeouts subsection no longer "
                 f"says that {claim} (looked for {needle!r})"
             )
+    for retracted in ARCHITECTURE_MEMORY_RETRACTED:
+        assert retracted not in body, (
+            f"{name}: the memory, disk and timeouts subsection claims again that "
+            f"{retracted!r}; only page reads and the cancel after a timeout do"
+        )
 
     # The two claims the page used to make and must not make again. A PNG
     # re-encode is lossless, but the bytes in the PDF are not the bytes the
