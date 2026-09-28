@@ -71,6 +71,7 @@ from saneless.vocabulary import (
     FlipOutcome,
     JobState,
     ScanOutcome,
+    backs_not_scanned_warning,
     classify_error,
     pass_cap_warning,
     substituted_source_warning,
@@ -6117,6 +6118,228 @@ class TestBatchFactWarnings:
         assert result.warning is not None
         assert "\x1b" not in result.warning
         assert "Flat" in result.warning
+
+
+def _passes_in_turn(
+    *passes: Callable[[str, ScanSettings, PageSink], ScanBatch],
+) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
+    """
+    Build one ``side_effect`` that hands each ``scan_pages`` call its own pass.
+
+    ``spooling_in_turn`` spools a different page list per call but gives every
+    call a plain batch; a manual-duplex test that needs a fact on one pass
+    only, such as a cap, composes one ``spooling`` callable per pass instead.
+
+    Args:
+        passes: One ``spooling`` callable per expected call, in call order.
+
+    Returns:
+        One callable with ``scan_pages``' own shape.
+
+    """
+    remaining = list(passes)
+
+    def _next_pass(device_id: str, settings: ScanSettings, sink: PageSink) -> ScanBatch:
+        """Run the pass belonging to this call number."""
+        if not remaining:
+            msg = f"scan_pages was called more than {len(passes)} time(s)"
+            raise AssertionError(msg)
+        return remaining.pop(0)(device_id, settings, sink)
+
+    return _next_pass
+
+
+class TestManualDuplexPassCap:
+    """
+    A manual-duplex pass that stops at its cap never produces mis-paired pages.
+
+    After a capped fronts pass the sheet past the cap is already in the output
+    tray, so no flip is asked for and the fronts are delivered alone. A capped
+    backs pass is delivered as the two halves, even when the counts agree,
+    because the cap says a sheet was fed that the other pass never saw.
+    """
+
+    _CAP = PassCapReached(500, 501, auto_source=False)
+
+    @staticmethod
+    def _run(
+        scanner: MagicMock,
+        paperless: MagicMock,
+        settings: Settings,
+        coordinator: FlipCoordinator,
+        events: list[PipelineEvent],
+    ) -> ScanResult:
+        settings.profiles["default"].source = "ADF"
+        settings.profiles["default"].duplex = "manual"
+        return run_pipeline(
+            scanner=scanner,
+            paperless=paperless,
+            settings=settings,
+            request=PipelineRequest(
+                profile_name="default",
+                title="Capped Duplex",
+                status_callback=events.append,
+                flip_coordinator=coordinator,
+            ),
+        )
+
+    @staticmethod
+    def _pages(count: int, start: int = 0) -> list[Image.Image]:
+        return [distinct_page(start + index) for index in range(count)]
+
+    def test_a_capped_fronts_pass_ends_the_job_without_a_flip(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """No flip prompt and no backs pass; the fronts go up with both sentences."""
+        events: list[PipelineEvent] = []
+        coordinator = _FixedFlipCoordinator(FlipOutcome.CONTINUED, events)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3), cap_reached=self._CAP),
+            spooling(self._pages(3, start=3)),
+        )
+
+        result = self._run(
+            scanner, mock_paperless, default_settings, coordinator, events
+        )
+
+        assert scanner.scan_pages.call_count == 1
+        assert coordinator.timeouts == []
+        assert PipelineEvent.AWAITING_FLIP not in events
+        assert PipelineEvent.SCANNING_REVERSE not in events
+        mock_paperless.upload_document.assert_called_once()
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_uploaded == 3
+        assert result.warning == " ".join(
+            (
+                pass_cap_warning(3, 500, 501, auto_source=False),
+                backs_not_scanned_warning(501),
+            )
+        )
+
+    def test_a_capped_backs_pass_with_a_different_count_is_two_halves(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """The halves go up apart, and the warning says why and names the sheet."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3)),
+            spooling(self._pages(4, start=3), cap_reached=self._CAP),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        titles = [
+            call.args[1] for call in mock_paperless.upload_document.call_args_list
+        ]
+        assert len(titles) == 2
+        assert "(fronts)" in titles[0]
+        assert "(backs)" in titles[1]
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_uploaded == 7
+        assert result.warning is not None
+        assert "could not be paired reliably" in result.warning
+        assert (
+            result.warning.count(pass_cap_warning(4, 500, 501, auto_source=False)) == 1
+        )
+
+    def test_a_capped_backs_pass_is_never_interleaved_even_when_counts_agree(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """Equal counts prove nothing once a sheet was fed that pass A never saw."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3)),
+            spooling(self._pages(3, start=3), cap_reached=self._CAP),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        titles = [
+            call.args[1] for call in mock_paperless.upload_document.call_args_list
+        ]
+        assert len(titles) == 2
+        assert "(fronts)" in titles[0]
+        assert "(backs)" in titles[1]
+        assert result.warning is not None
+        assert "could not be paired reliably" in result.warning
+        # Three fronts and three backs are not a count mismatch, and saying so
+        # would be false.
+        assert "Page count mismatch" not in result.warning
+        assert (
+            result.warning.count(pass_cap_warning(3, 500, 501, auto_source=False)) == 1
+        )
+
+    def test_an_interleaved_run_reports_a_feeder_substitution(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """A flatbed request taken through the feeder is not lost by the interleave."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(2), substituted_source="Flatbed"),
+            spooling(self._pages(2, start=2), substituted_source="Flatbed"),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        mock_paperless.upload_document.assert_called_once()
+        assert result.pages_uploaded == 4
+        assert result.warning == substituted_source_warning("Flatbed")
+
+    def test_a_split_run_reports_a_feeder_substitution_once(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """Both halves came through the same substitution; it is said once."""
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3), substituted_source="Flatbed"),
+            spooling(self._pages(2, start=3), substituted_source="Flatbed"),
+        )
+
+        result = self._run(
+            scanner,
+            mock_paperless,
+            default_settings,
+            AlwaysContinueFlipCoordinator(),
+            events,
+        )
+
+        assert mock_paperless.upload_document.call_count == 2
+        assert result.warning is not None
+        assert "Page count mismatch: 3 fronts, 2 backs" in result.warning
+        assert result.warning.count(substituted_source_warning("Flatbed")) == 1
 
 
 class TestTitleLogEscaping:

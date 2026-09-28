@@ -62,6 +62,7 @@ from saneless.vocabulary import (
     SubmitResult,
     WorkerHealth,
     ambiguous_source_error,
+    backs_not_scanned_warning,
     blank_timeout_finish_warning,
     busy_line,
     cap_finish_warning,
@@ -694,6 +695,14 @@ class TestFinishWarnings:
         """A single kept page is a page, not pages."""
         assert pass_cap_warning(1, 500, 501, auto_source=False).startswith(
             "Finished at 1 page: "
+        )
+
+    def test_backs_not_scanned_warning(self) -> None:
+        """A capped fronts pass names the sheet that makes pairing impossible."""
+        assert backs_not_scanned_warning(501) == (
+            "The backs were not scanned: sheet 501 is already in the output "
+            "tray, so turning the stack over would pair every back with the "
+            "wrong front."
         )
 
     def test_substituted_source_warning(self) -> None:
