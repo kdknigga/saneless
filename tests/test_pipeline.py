@@ -5150,7 +5150,7 @@ class TestAssemblyFailureKeepsThePageFiles:
 
         with (
             patch("saneless.pipeline.assemble_pdf", assembling),
-            pytest.raises(PdfError) as excinfo,
+            pytest.raises(DiskSpaceError) as excinfo,
         ):
             run_pipeline(
                 scanner=scanner,
@@ -5173,7 +5173,8 @@ class TestAssemblyFailureKeepsThePageFiles:
         assert "MB needed" in message
         assert "1 MB free" in message
         assert f"The 3 spooled page file(s) were preserved at {kept[0]}" in message
-        assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
+        assert classify_error(excinfo.value) is ErrorCategory.DISK_SPACE
+        assert exit_code_for(classify_error(excinfo.value)) is ExitCode.DISK_SPACE
 
     def test_mismatch_halves_are_refused_up_front_without_the_room(
         self,
@@ -5189,7 +5190,7 @@ class TestAssemblyFailureKeepsThePageFiles:
 
         with (
             patch("saneless.pipeline.assemble_pdf", assembling),
-            pytest.raises(PdfError, match="MB needed"),
+            pytest.raises(DiskSpaceError, match="MB needed"),
         ):
             run_pipeline(
                 scanner=_mismatched_duplex_scanner(),

@@ -10,6 +10,7 @@ is deliberately not the spool, because the spooled pages are supposed to
 survive assembly untouched.
 """
 
+import errno
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ import pytest
 from PIL import Image
 
 import saneless.pdf as pdf_mod
-from saneless.exceptions import PdfError
+from saneless.exceptions import DiskSpaceError, PdfError
 from saneless.paper_sizes import crop_to_paper_size
 from saneless.pdf import (
     assemble_pdf,
@@ -34,6 +35,7 @@ from saneless.pdf import (
 )
 from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.spool import SpooledPageSink
+from saneless.vocabulary import ErrorCategory, classify_error
 from tests.golden_support import embedded_streams, png_idat
 
 if TYPE_CHECKING:
@@ -1040,6 +1042,102 @@ class TestPdfBoundary:
 
         with pytest.raises(KeyboardInterrupt):
             assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+
+class _FullDiskJob:
+    """A ``pikepdf.Job`` stand-in whose merge runs out of disk space."""
+
+    def __init__(self, argv: list[str]) -> None:
+        """Accept and keep the argv a real ``pikepdf.Job`` would be given."""
+        self.argv = argv
+
+    def run(self) -> NoReturn:
+        """Fail with pikepdf's own type, raised from the disk's ``ENOSPC``."""
+        msg = "fake qpdf write failure"
+        full = OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        raise pikepdf.PdfError(msg) from full
+
+
+class TestAssemblyOutOfSpace:
+    """A full disk while assembling is disk space; anything else stays PDF."""
+
+    @pytest.mark.parametrize(
+        "code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"]
+    )
+    def test_img2pdf_out_of_space_is_a_disk_space_error(
+        self,
+        one_page: list[PageRecord],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        code: int,
+    ) -> None:
+        """A page write the disk has no room for names the page count and path."""
+        original = OSError(code, os.strerror(code))
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
+
+        with pytest.raises(DiskSpaceError) as excinfo:
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            f"Could not assemble 1 page(s) into {output_dir / 'x.pdf'}: "
+        )
+        assert os.strerror(code) in message
+        assert excinfo.value.__cause__ is original
+        assert not isinstance(excinfo.value, PdfError)
+        assert classify_error(excinfo.value) is ErrorCategory.DISK_SPACE
+
+    def test_a_merge_raised_from_a_full_disk_is_a_disk_space_error(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The disk's errno is found under the merge's own exception type."""
+        records = spool_pages(
+            [Image.new("RGB", (120, 160), colour) for colour in ("white", "red")]
+        )
+        monkeypatch.setattr(pdf_mod.pikepdf, "Job", _FullDiskJob)
+
+        with pytest.raises(DiskSpaceError) as excinfo:
+            assemble_pdf(records, output_dir, "full.pdf", title=_TITLE)
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            f"Could not assemble 2 page(s) into {output_dir / 'full.pdf'}: "
+        )
+        assert isinstance(excinfo.value.__cause__, pikepdf.PdfError)
+
+    def test_a_bad_image_is_not_a_disk_space_error(
+        self,
+        one_page: list[PageRecord],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Any other failure is still the PDF writer's."""
+        monkeypatch.setattr(
+            pdf_mod.img2pdf, "convert", _raising(ValueError("bad image"))
+        )
+
+        with pytest.raises(PdfError, match="bad image") as excinfo:
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+        assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
+
+    def test_a_disk_space_error_passes_through_unwrapped(
+        self,
+        one_page: list[PageRecord],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Like ``PdfError``, saneless's own disk-space error is not re-wrapped."""
+        original = DiskSpaceError("Insufficient disk space")
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
+
+        with pytest.raises(DiskSpaceError) as excinfo:
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
+
+        assert excinfo.value is original
 
 
 class TestSanitiseTitleForFilename:
