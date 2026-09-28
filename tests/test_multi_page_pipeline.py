@@ -36,6 +36,7 @@ from saneless.config import ProfileConfig
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
+    DiskSpaceError,
     FeederEmptyError,
     ListingCrashedError,
     PaperlessError,
@@ -982,13 +983,23 @@ class TestMultiPageLoop:
         assert embedded_streams(partial) == _pages(scanner, [2])
         rig.paperless.upload_document.assert_not_called()
 
-    def test_a_full_disk_ends_the_job_and_keeps_the_document(self, rig: _Rig) -> None:
+    @pytest.mark.parametrize(
+        ("kind", "message"),
+        [
+            (DiskSpaceError, "Insufficient disk space for page 1"),
+            (SpoolError, "Could not write page 1"),
+        ],
+        ids=["disk_space", "spool_write"],
+    )
+    def test_a_full_disk_ends_the_job_and_keeps_the_document(
+        self, rig: _Rig, kind: type[DiskSpaceError | SpoolError], message: str
+    ) -> None:
         """A disk refusal is not the scanner's fault: the job ends, pass 1 kept."""
-        refusal = SpoolError("Insufficient disk space for page 1")
+        refusal = kind(message)
         scanner = DistinctPageScanner(passes=((0,), (1,)), fail_on={2: refusal})
         coordinator = ScriptedPassCoordinator([_NEXT])
 
-        with pytest.raises(SpoolError) as raised:
+        with pytest.raises(kind) as raised:
             rig.run(scanner, coordinator)
 
         assert raised.value is refusal
@@ -1365,15 +1376,23 @@ class TestMultiPageScannerFault:
         assert len(coordinator.prompts) == 1
         rig.paperless.upload_document.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("kind", "message"),
+        [
+            (DiskSpaceError, "Insufficient disk space for page 1"),
+            (SpoolError, "Could not write page 1"),
+        ],
+        ids=["disk_space", "spool_write"],
+    )
     def test_a_full_disk_on_a_later_pass_is_not_a_scanner_fault(
-        self, rig: _Rig
+        self, rig: _Rig, kind: type[DiskSpaceError | SpoolError], message: str
     ) -> None:
         """A disk refusal would fail again at once, so it ends the job."""
-        refusal = SpoolError("Insufficient disk space for page 1")
+        refusal = kind(message)
         scanner = DistinctPageScanner(passes=((0,), (1,)), fail_on={2: refusal})
         coordinator = ScriptedPassCoordinator([_NEXT])
 
-        with pytest.raises(SpoolError) as raised:
+        with pytest.raises(kind) as raised:
             rig.run(scanner, coordinator)
 
         assert raised.value is refusal

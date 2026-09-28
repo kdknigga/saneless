@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import errno
 import logging
+import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 from PIL import Image, ImageDraw
 
 import saneless.spool as spool_module
-from saneless.exceptions import ScanError, ScanInterrupted, SpoolError
+from saneless.exceptions import (
+    DiskSpaceError,
+    ScanError,
+    ScanInterrupted,
+    SpoolError,
+)
 from saneless.pages import InkMeasurement, measure_ink
 from saneless.scanner.base import PageRecord, PageSink
 from saneless.spool import SpooledPageSink
@@ -332,14 +339,15 @@ class TestSpooledPageSinkThumbnail:
 class TestSpooledPageSinkFailures:
     """No raw OSError escapes, and a shortfall names the page (D-07)."""
 
-    def test_disk_shortfall_raises_scan_error_naming_the_page(
+    def test_disk_shortfall_raises_disk_space_error_naming_the_page(
         self, tmp_path: Path
     ) -> None:
         """A per-page shortfall names the page, the path and the config key."""
         sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
-        with pytest.raises(ScanError) as excinfo:
+        with pytest.raises(DiskSpaceError) as excinfo:
             sink.add(_white_page(), dpi=300)
         message = str(excinfo.value)
+        assert message.startswith("Insufficient disk space for page 1: ")
         assert "page 1" in message
         assert str(tmp_path / "a-0001.png") in message
         assert "configure min_free_space_mb to adjust" in message
@@ -347,7 +355,7 @@ class TestSpooledPageSinkFailures:
     def test_disk_shortfall_leaves_no_partial_file(self, tmp_path: Path) -> None:
         """Nothing is written when the page could not have fitted."""
         sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
-        with pytest.raises(ScanError):
+        with pytest.raises(DiskSpaceError):
             sink.add(_white_page(), dpi=300)
         assert list(tmp_path.iterdir()) == []
         assert sink.records == ()
@@ -403,12 +411,30 @@ class TestSpooledPageSinkFailures:
 
 class TestSpoolErrorSeparatesTheDiskFromTheScanner:
     """
-    Every disk refusal is a ``SpoolError``; a scanner-delivered fault is not.
+    A full disk is a ``DiskSpaceError``; any other disk fault is a ``SpoolError``.
 
-    A ``SpoolError`` is still a ``ScanError``, so it keeps the ``SCANNER``
-    category and its exit code, while a caller that must treat a full or
-    failing disk differently from a device fault can test for it exactly.
+    A ``DiskSpaceError`` is not a ``ScanError`` at all, so it files as
+    ``DISK_SPACE`` and exits 10.  A ``SpoolError`` -- a write that failed for
+    another reason, or a spool whose free space cannot be measured -- is still
+    a ``ScanError``, so it keeps the ``SCANNER`` category and its exit code,
+    while a caller that must treat a failing disk differently from a device
+    fault can test for it exactly.  A scanner-delivered fault is neither.
     """
+
+    @staticmethod
+    def _assert_a_full_disk(error: BaseException, text: str) -> None:
+        """
+        Check that ``error`` is a full disk, filed as disk space.
+
+        Args:
+            error: What the sink raised.
+            text: The part of the message that says which refusal it was.
+
+        """
+        assert isinstance(error, DiskSpaceError)
+        assert not isinstance(error, ScanError)
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert text in str(error)
 
     @staticmethod
     def _assert_a_disk_refusal(error: ScanError, text: str) -> None:
@@ -425,12 +451,73 @@ class TestSpoolErrorSeparatesTheDiskFromTheScanner:
         assert classify_error(error) is ErrorCategory.SCANNER
         assert text in str(error)
 
-    def test_a_shortfall_is_a_spool_error(self, tmp_path: Path) -> None:
-        """Too little free space for the page is a disk refusal."""
+    def test_a_shortfall_is_a_disk_space_error(self, tmp_path: Path) -> None:
+        """Too little free space for the page is a full disk, not the scanner."""
         sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(_white_page(), dpi=300)
+        self._assert_a_full_disk(excinfo.value, "Insufficient disk space")
+
+    @pytest.mark.parametrize(
+        "code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"]
+    )
+    def test_an_out_of_space_write_is_a_disk_space_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        """
+        A write the disk ran out of room for is a full disk, cleaned up.
+
+        The room check passes here -- the disk filled between the check and
+        the write, or a quota ran out -- so it is the write's own errno that
+        says what happened.
+        """
+
+        def full_disk_save(_image: Image.Image, fp: Path, **_params: object) -> None:
+            Path(fp).write_bytes(b"\x89PNG half a page")
+            raise OSError(code, os.strerror(code))
+
+        monkeypatch.setattr(Image.Image, "save", full_disk_save)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(_inked_page(), dpi=300)
+
+        self._assert_a_full_disk(excinfo.value, "Could not write page 1")
+        assert str(tmp_path / "a-0001.png") in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert excinfo.value.__cause__.errno == code
+        assert list(tmp_path.iterdir()) == []
+        assert sink.records == ()
+
+    def test_an_io_error_write_is_not_a_disk_space_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A write that failed for another reason stays a spool write error."""
+
+        def failing_save(_image: Image.Image, fp: Path, **_params: object) -> None:
+            Path(fp).write_bytes(b"\x89PNG half a page")
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        monkeypatch.setattr(Image.Image, "save", failing_save)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(SpoolError) as excinfo:
+            sink.add(_inked_page(), dpi=300)
+
+        self._assert_a_disk_refusal(excinfo.value, "Could not write page 1")
+        assert list(tmp_path.iterdir()) == []
+
+    def test_an_unmeasurable_spool_is_not_a_disk_space_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Free space that cannot be read says nothing about how much there is."""
+
+        def vanished(path: object) -> NoReturn:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", vanished)
+        sink = SpooledPageSink(tmp_path, "a", 0)
         with pytest.raises(SpoolError) as excinfo:
             sink.add(_white_page(), dpi=300)
-        self._assert_a_disk_refusal(excinfo.value, "Insufficient disk space")
+        self._assert_a_disk_refusal(excinfo.value, "Could not measure free space")
 
     def test_an_unmeasurable_directory_is_a_spool_error(self, tmp_path: Path) -> None:
         """Free space that cannot be measured is a disk refusal."""
@@ -615,7 +702,7 @@ class TestSpooledPageSinkModes:
         """The estimate counts what the page will be, not what it arrived as."""
         monkeypatch.setattr("saneless.spool.shutil.disk_usage", _no_free_space)
         sink = SpooledPageSink(tmp_path, "a", 0)
-        with pytest.raises(ScanError) as excinfo:
+        with pytest.raises(DiskSpaceError) as excinfo:
             sink.add(Image.new(mode, size), dpi=300)
         assert f"{required_mb} MB required" in str(excinfo.value)
 
