@@ -1615,6 +1615,10 @@ _HANDLE_OPEN_REFUSAL: Final = (
 # identifiable in a ``faulthandler`` dump or a debugger without guessing.
 _READER_THREAD_PREFIX = "sane-read-"
 
+# The name of the thread that cancels a timed-out read, for the same reason:
+# a cancel the scanner is slow to answer leaves it running past the grace.
+_CANCEL_THREAD_NAME = "sane-cancel"
+
 
 def _restore_sane_net_hosts() -> None:
     """
@@ -2133,7 +2137,7 @@ def _settle_or_wedge(
     began = time.monotonic()
     deadline = began + grace
     canceller = threading.Thread(
-        target=_cancel_read, args=(dev, done), name="sane-cancel", daemon=True
+        target=_cancel_read, args=(dev, done), name=_CANCEL_THREAD_NAME, daemon=True
     )
     started = False
     try:
