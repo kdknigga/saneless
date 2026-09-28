@@ -617,7 +617,11 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     "not found at that URL" row instead of a ``PaperlessError``. No 4: it
     assembles nothing.
 
-    Only ``scan`` judges pages blank, so only ``scan`` has 8.  Every one-shot
+    Only ``scan`` judges pages blank, so only ``scan`` has 8.  Only ``scan``
+    uploads a document and writes pages to disk, so only ``scan`` has 9 (the
+    document may already be in paperless-ngx) and 10 (the server ran out of
+    disk space).  ``serve`` exits with neither: its scans are jobs, whose
+    outcome is on the job, not on the process.  Every one-shot
     command but ``serve`` installs handlers for SIGHUP and SIGTERM, so each of
     them has 129 and 143 (128 + the signal number): an interruption that keeps
     the pages already scanned, unlike the cancel's 130.  ``serve`` keeps
@@ -642,6 +646,8 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
         6,
         7,
         8,
+        9,
+        10,
         129,
         130,
         143,
@@ -809,6 +815,56 @@ def _first_table(text: str) -> str:
     return "\n".join(rows)
 
 
+def _anchor(heading: str) -> str:
+    """Return the anchor MkDocs gives a heading: lowercase, words joined by hyphens."""
+    kept = re.sub(r"[^\w\s-]", "", heading.lower())
+    return re.sub(r"\s+", "-", kept.strip())
+
+
+def _heading_for_code(text: str, code: int, name: Path) -> str:
+    """Return the one ``## `` heading that ends with ``(exit <code>)``."""
+    headings = re.findall(rf"^## (.+\(exit {code}\))$", text, re.MULTILINE)
+    assert len(headings) == 1, f"{name}: expected one '## ... (exit {code})' heading"
+    return headings[0]
+
+
+def test_troubleshooting_page_explains_exit_9_and_10() -> None:
+    """
+    Exit 9 and 10 each have a section, linked from the table's row for the code.
+
+    Exit 9 is the one code a script must never rescan on, so its section says
+    how to check paperless-ngx's document list and when to import the copy
+    kept in ``failed/``.  Exit 10's section names the setting that decides how
+    much free space a scan needs.
+    """
+    text, name = _read(TROUBLESHOOTING)
+    table = _first_table(text)
+    for code in (9, 10):
+        heading = _heading_for_code(text, code, name)
+        row = _table_row(table, str(code))
+        assert f"(#{_anchor(heading)})" in row, (
+            f"{name}: the table's {code} row does not link to {heading!r}"
+        )
+    unconfirmed = _heading_section(text, "(exit 9)", name)
+    for needle in ("document list", "failed/", "not in paperless-ngx"):
+        assert needle in unconfirmed, (
+            f"{name}: the exit-9 section does not mention {needle!r}"
+        )
+    disk = _heading_section(text, "(exit 10)", name)
+    assert "min_free_space_mb" in disk, (
+        f"{name}: the exit-10 section does not name min_free_space_mb"
+    )
+
+
+def test_scripting_exit_9_row_says_never_to_rescan() -> None:
+    """A script that rescans on 9 could store the document twice."""
+    text, name = _read(CLI_SCRIPTING)
+    row = _table_row(_section(text, "## Exit codes", name), "9")
+    assert "never rescan on 9" in row.lower(), (
+        f"{name}: the exit-9 row does not tell a script never to rescan"
+    )
+
+
 def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
     """
     The troubleshooting how-to exists, is navigable, and covers every code (D-13).
@@ -841,6 +897,8 @@ def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
         "Unexpected",
         "blank",
         "Interrupted",
+        "already be in paperless-ngx",
+        "disk space",
     ):
         assert any(word in heading for heading in headings), (
             f"{name} has no heading containing {word!r}"
