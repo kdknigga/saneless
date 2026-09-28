@@ -105,9 +105,9 @@ def _rounded_media_box(page: pikepdf.Page) -> list[int]:
     """
     Read a page's MediaBox as four whole points.
 
-    Rounding is not incidental: the true A4-at-300-DPI box is 595.2 x 841.92,
-    and 595.2 x 841.68 for what ``crop_to_paper_size`` actually produces, so an
-    exact comparison against 595 x 842 would never hold.
+    Rounding is not incidental: A4 itself is 595.28 x 841.89 points, and the
+    2480 x 3508 raster ``crop_to_paper_size`` produces at 300 DPI lays out as
+    595.2 x 841.92, so an exact comparison against 595 x 842 would never hold.
 
     Args:
         page: The page whose MediaBox to read.
@@ -1234,10 +1234,10 @@ class TestMediaBox:
         spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
         output_dir: Path,
     ) -> None:
-        """What crop_to_paper_size really produces is 2480 x 3507, and still A4."""
-        # int(297 * 300 / 25.4) == 3507, so the exact box is 595.2 x 841.68.
+        """What crop_to_paper_size really produces is 2480 x 3508, and still A4."""
+        # round(297 * 300 / 25.4) == 3508, so the exact box is 595.2 x 841.92.
         cropped = crop_to_paper_size(Image.new("RGB", (2600, 3700), "white"), "a4", 300)
-        assert cropped.size == (2480, 3507)
+        assert cropped.size == (2480, 3508)
 
         records = spool_pages([cropped])
         pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", title=_TITLE)

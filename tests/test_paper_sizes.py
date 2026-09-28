@@ -91,12 +91,12 @@ class TestCropToPaperSize:
         assert result is img
 
     def test_a4_at_300dpi_crops_correctly(self) -> None:
-        """crop_to_paper_size with 'a4' at 300 DPI crops to (2480, 3507) pixels."""
-        # A4 at 300 DPI: 210mm * 300 / 25.4 = 2480.3 -> 2480
-        # A4 at 300 DPI: 297mm * 300 / 25.4 = 3507.8 -> 3507
+        """crop_to_paper_size with 'a4' at 300 DPI crops to (2480, 3508) pixels."""
+        # A4 at 300 DPI: 210 * 300 / 25.4 = 2480.31, rounds to 2480
+        # A4 at 300 DPI: 297 * 300 / 25.4 = 3507.87, rounds to 3508
         img = Image.new("RGB", (5000, 6000), "red")
         result = crop_to_paper_size(img, "a4", 300)
-        assert result.size == (2480, 3507)
+        assert result.size == (2480, 3508)
 
     def test_clamps_to_image_dimensions(self) -> None:
         """crop_to_paper_size clamps to image dimensions when crop exceeds image size."""

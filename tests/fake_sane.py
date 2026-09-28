@@ -91,6 +91,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 __all__ = [
+    "TYPE_FIXED",
+    "TYPE_INT",
     "FakeSaneDev",
     "FakeSaneError",
     "FakeSaneHandle",
@@ -107,6 +109,11 @@ _TYPE_FIXED = 2
 _TYPE_STRING = 3
 _TYPE_BUTTON = 4
 _TYPE_GROUP = 5
+
+# The two numeric value types by their python-sane names, so a test can choose
+# one for the geometry or page-size options without restating SANE's codes.
+TYPE_INT = _TYPE_INT
+TYPE_FIXED = _TYPE_FIXED
 
 # SANE units.  There is no UNIT_CM and no UNIT_INCH.
 _UNIT_NONE = 0
@@ -162,6 +169,17 @@ _GEOMETRY_OPTIONS = (
 # reports.  Attribute assignment uses underscores (dev.tl_x); both spellings are
 # load-bearing and one set used for both would be wrong on one side.
 _GEOMETRY_NAMES = tuple(name for name, _title in _GEOMETRY_OPTIONS)
+
+# The paper-size options a centring feeder offers, as the fujitsu and canon_dr
+# backends name them, with the title and description each reports.
+_PAGE_SIZE_OPTIONS = (
+    ("page-width", "Page width", "Width of the paper in the document feeder"),
+    ("page-height", "Page height", "Height of the paper in the document feeder"),
+)
+_PAGE_SIZE_NAMES = tuple(name for name, _title, _desc in _PAGE_SIZE_OPTIONS)
+
+# The one source on which those options are inactive.
+_FLATBED_SOURCE = "Flatbed"
 
 # Small enough to keep a multi-page feeder test cheap, and deliberately smaller
 # than any paper size at a realistic dpi -- see set_page_size().
@@ -399,6 +417,7 @@ def build_option_table(
     geometry_unit: int = _UNIT_MM,
     omit: tuple[str, ...] = (),
     geometry_settable: bool = True,
+    geometry_type: int = _TYPE_FIXED,
 ) -> list[tuple]:
     """
     Build the default option table, adjusted for the case a test must model.
@@ -430,14 +449,22 @@ def build_option_table(
         geometry_settable: When False the geometry options are still reported
             but are marked not software-settable, so assigning one raises the
             measured ``AttributeError`` instead of storing the value.
+        geometry_type: The SANE value type the geometry options report at
+            index 4: ``TYPE_FIXED``, the default, or ``TYPE_INT``, which some
+            backends use for a scan area in pixels.  An integer option's
+            range is reported in whole numbers, and it refuses a float.
 
     Returns:
         The option table, ready to hand to :class:`FakeSaneDev`.
 
     """
     cap = _CAP_SETTABLE if geometry_settable else _CAP_NOT_SETTABLE
+    span: tuple[float, float, float] = geometry_range
+    if geometry_type == _TYPE_INT:
+        low, high, step = geometry_range
+        span = (int(low), int(high), int(step))
     return [
-        (*option[:5], geometry_unit, option[6], cap, option[8])
+        (*option[:4], geometry_type, geometry_unit, option[6], cap, span)
         if option[1] in _GEOMETRY_NAMES
         else option
         for option in _build_option_table(geometry_range=geometry_range)
@@ -1456,6 +1483,77 @@ class FakeSaneDev:
         if values:
             self.__dict__["_values"]["depth"] = values[0]
 
+    def offer_page_size_options(
+        self,
+        *,
+        value_type: int = _TYPE_FIXED,
+        unit: int = _UNIT_MM,
+        span: tuple[float, float, float] = _DEFAULT_GEOMETRY_RANGE,
+    ) -> None:
+        """
+        Offer ``page-width`` and ``page-height``, active only off the flatbed.
+
+        Modelled on the fujitsu backend, whose canon_dr sibling has the same
+        shape: the two options tell a feeder how large the paper is, so that
+        it can place its scan window over a sheet it guides into its middle.
+        They are ``TYPE_FIXED`` millimetre ranges by default, and they are
+        **inactive while the** ``Flatbed`` **source is selected**.  Assigning
+        any other source makes them active, as the option reload a source
+        change triggers does on that driver, and assigning ``Flatbed`` makes
+        them inactive again.  Their activity starts out following the source
+        currently stored, and each starts at the top of its range.
+
+        Opt-in, like ``offer_depth``: most devices have no such options, and
+        the default table stays the one every other test was written against.
+
+        Args:
+            value_type: ``TYPE_FIXED``, the fujitsu shape, or ``TYPE_INT``.
+            unit: The SANE unit code reported at index 5.
+            span: The ``(min, max, step)`` range, in that unit.  An integer
+                option's range is reported in whole numbers.
+
+        """
+        number = int if value_type == _TYPE_INT else float
+        low, high, step = span
+        constraint = (number(low), number(high), number(step))
+        options = self.__dict__["_options"]
+        index = max((option[0] for option in options), default=0) + 1
+        for offset, (name, title, desc) in enumerate(_PAGE_SIZE_OPTIONS):
+            option = (
+                index + offset,
+                name,
+                title,
+                desc,
+                value_type,
+                unit,
+                4,
+                _CAP_SETTABLE,
+                constraint,
+            )
+            options.append(option)
+            key = name.replace("-", "_")
+            self.__dict__["opt"][key] = option
+            self.__dict__["_values"][key] = constraint[1]
+        self._follow_source_with_page_size()
+
+    def _follow_source_with_page_size(self) -> None:
+        """
+        Make the page-size options inactive on the flatbed, active elsewhere.
+
+        Read from the source as stored, in the device's own spelling, so an
+        assignment the device matched case-insensitively counts as the entry
+        it matched.  A table without the options is left alone.
+
+        """
+        source = self.__dict__["_values"].get("source")
+        cap = _CAP_INACTIVE_OPTION if source == _FLATBED_SOURCE else _CAP_SETTABLE
+        options = self.__dict__["_options"]
+        for index, option in enumerate(options):
+            if option[1] in _PAGE_SIZE_NAMES:
+                reloaded = (*option[:7], cap, option[8])
+                options[index] = reloaded
+                self.__dict__["opt"][option[1].replace("-", "_")] = reloaded
+
     def _replace_constraint(self, name: str, constraint: object) -> None:
         """
         Swap one option's constraint, keeping the lookup table consistent.
@@ -1544,10 +1642,14 @@ class FakeSaneDev:
         against the platen's range stands unchanged against the feeder's
         narrower one, so only assigning the source first keeps it legal.
 
+        The same reload switches the page-size options, when the device
+        offers them, on or off for the source now selected.
+
         Args:
             source: The source name just assigned.
 
         """
+        self._follow_source_with_page_size()
         narrowed = self.__dict__["_source_resolution_ranges"].get(source)
         if narrowed is None:
             return

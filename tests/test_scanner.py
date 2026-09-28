@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, cast
 
 import pytest
 from PIL import Image, ImageDraw
@@ -56,6 +56,7 @@ from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
 from tests.conftest import StubScannerBackend, images_of, reset_sane_process_state
 from tests.fake_sane import (
+    TYPE_INT,
     FakeSaneDev,
     FakeSaneError,
     FakeSaneModule,
@@ -3883,8 +3884,9 @@ class TestFakeFeederStartOrdering:
 # reads.  Assignment uses underscores (dev.tl_x); see fake_sane._GEOMETRY_NAMES.
 _GEOMETRY_OPTION_NAMES = ("tl-x", "tl-y", "br-x", "br-y")
 
-# A4 is 210 x 297 mm; at 300 dpi that is 2480 x 3507 px.
-_A4_AT_300_DPI = (2480, 3507)
+# A4 is 210 x 297 mm; at 300 dpi that is 2480.3 x 3507.87 px, which rounds to
+# 2480 x 3508.
+_A4_AT_300_DPI = (2480, 3508)
 
 
 def _warning_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -4035,10 +4037,16 @@ class TestPaperSizeCropFallback:
         assert len(pages) == 1
         assert pages[0].size == (5000, 6000)
 
-    def test_adf_crop_fallback(
+    def test_adf_pages_are_not_cropped_without_page_size_options(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """ADF pages are cropped when geometry options are unavailable."""
+        """
+        A fed page keeps the full window when the feeder cannot centre it.
+
+        Where a feeder puts the sheet is unknown without ``page-width``: a
+        top-left crop cuts the right edge off every page of a feeder that
+        centres the sheet.  So the page stays whole, larger but complete.
+        """
         backend = _backend_with(_geometry_less_device(pages=2), monkeypatch)
         settings = ScanSettings(
             source="Automatic Document Feeder",
@@ -4047,9 +4055,7 @@ class TestPaperSizeCropFallback:
             paper_size="a4",
         )
         pages = backend.scan_pages("test:0", settings, page_sink).pages
-        assert len(pages) == 2
-        for page in pages:
-            assert page.size == _A4_AT_300_DPI
+        assert [page.size for page in pages] == [(3000, 4000), (3000, 4000)]
 
 
 class TestFakeDeviceAreaMatchesTheLibrary:
@@ -4278,20 +4284,31 @@ class TestGeometryUnit:
         requested value would reintroduce the very substitution bug D-11 cures,
         one layer further down.
 
-        This asserts the quantised value: A4 at 1200 dpi is 9921.26 x 14031.50
-        pixels, which the range's 1-pixel step stores as 9921.0 x 14031.0.  At
-        the requested 5000 dpi it would have been over 41,000 pixels wide.
+        A scan area in pixels is an integer option on a real device, so the
+        device is given whole pixels: A4 at 1200 dpi is 9921.26 x 14031.50
+        pixels, written as 9921 x 14031.  At the requested 5000 dpi it would
+        have been over 41,000 pixels wide.
         """
-        dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
+        dev = FakeSaneDev(
+            options=build_option_table(
+                geometry_type=TYPE_INT,
+                geometry_unit=GeometryUnit.UNIT_PIXEL,
+                geometry_range=_ROOMY_GEOMETRY_RANGE,
+            ),
+            pages=1,
+        )
+        dev.set_page_size(3000, 4000)
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(
             source="Flatbed", resolution=5000, mode="Color", paper_size="a4"
         )
 
-        backend.scan_pages("test:0", settings, page_sink)
+        pages = backend.scan_pages("test:0", settings, page_sink).pages
 
-        assert dev.br_x == 9921.0
-        assert dev.br_y == 14031.0
+        assert dev.br_x == 9921
+        assert dev.br_y == 14031
+        # The area was set on the device, so saneless does not crop as well.
+        assert pages[0].size == (3000, 4000)
 
     @pytest.mark.parametrize("unit", sorted(set(GeometryUnit) - _CONVERTIBLE_UNITS))
     def test_an_unconvertible_unit_falls_through_to_the_crop(
@@ -4510,9 +4527,298 @@ class TestClampedScanArea:
 
         pages = backend.scan_pages("test:0", settings, page_sink).pages
 
-        # A4 at the 75 dpi the device settled on, not at the 300 asked for,
-        # which would have been 2480x3507.
-        assert pages[0].size == (620, 876)
+        # A4 at the 75 dpi the device settled on, 620.1 x 876.97 px, not at
+        # the 300 asked for, which would have been 2480x3508.
+        assert pages[0].size == (620, 877)
+
+
+# The options a paper size is written to, in the underscore spelling attribute
+# access and the fake's assignment log use.
+_PAPER_ATTRIBUTES = frozenset(
+    {"page_width", "page_height", "tl_x", "tl_y", "br_x", "br_y"}
+)
+
+# A5 is 148 x 210 mm; at 300 dpi that is 1748.03 x 2480.31 px.
+_A5_AT_300_DPI = (1748, 2480)
+
+
+def _feeder_device(*, page_size_options: bool, pages: int = 1) -> FakeSaneDev:
+    """
+    Build a device with a flatbed, a feeder and an Auto source.
+
+    Args:
+        page_size_options: Whether the device offers ``page-width`` and
+            ``page-height``, which are active only off the flatbed.
+        pages: How many sheets the feeder holds.
+
+    Returns:
+        A device whose pages are larger than A4 at 300 dpi, so a crop is
+        observable.
+
+    """
+    dev = FakeSaneDev(pages=pages)
+    dev.report_sources(["Flatbed", "ADF", "Auto"])
+    if page_size_options:
+        dev.offer_page_size_options()
+    dev.set_page_size(3000, 4000)
+    return dev
+
+
+def _paper_assignments(dev: FakeSaneDev) -> list[tuple[str, object]]:
+    """
+    List the paper-size and scan-area assignments the device received.
+
+    Args:
+        dev: The fake device after a scan.
+
+    Returns:
+        ``(name, value)`` pairs in the order the options were assigned, each
+        with the value the device stored.
+
+    """
+    return [
+        (name, getattr(dev, name))
+        for name in dev.assignments
+        if name in _PAPER_ATTRIBUTES
+    ]
+
+
+def _info_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """
+    Return the INFO messages captured so far.
+
+    Args:
+        caplog: The pytest log-capture fixture.
+
+    Returns:
+        One string per captured INFO record.
+
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO
+    ]
+
+
+class TestFeederPaperSize:
+    """
+    ``paper_size`` on a feeder uses the device's own centring, or nothing.
+
+    A feeder may guide a sheet into the middle of its window rather than
+    against one side, and saneless cannot see which.  A top-left scan area or
+    crop then cuts the right edge off every page.  Where the device offers
+    ``page-width`` and ``page-height`` it is told the paper size and centres
+    its own window, and the scan area is set inside that window.  Where it does
+    not, the paper size is not applied at all: the page is the full window,
+    larger but complete.  The flatbed keeps its top-left area and crop, since a
+    sheet on the glass sits in the corner.
+    """
+
+    def test_the_page_size_is_set_before_the_scan_area_on_a_feeder(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """Page width and height first, then the area, and no crop."""
+        dev = _feeder_device(page_size_options=True)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="ADF", resolution=300, mode="Color", paper_size="a5"
+        )
+
+        pages = backend.scan_pages("test:0", settings, page_sink).pages
+
+        assert _paper_assignments(dev) == [
+            ("page_width", 148.0),
+            ("page_height", 210.0),
+            ("tl_x", 0.0),
+            ("tl_y", 0.0),
+            ("br_x", 148.0),
+            ("br_y", 210.0),
+        ]
+        assert [page.size for page in pages] == [(3000, 4000)]
+
+    def test_the_page_size_is_not_set_on_the_flatbed(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """The options are inactive on the flatbed, which keeps its own area."""
+        dev = _feeder_device(page_size_options=True)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a5"
+        )
+
+        backend.scan_pages("test:0", settings, page_sink)
+
+        assert _paper_assignments(dev) == [
+            ("tl_x", 0.0),
+            ("tl_y", 0.0),
+            ("br_x", 148.0),
+            ("br_y", 210.0),
+        ]
+
+    def test_a_rejected_scan_area_inside_the_centred_window_is_cropped(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        Once the device has centred its window, the top-left crop is right.
+
+        The window starts at the sheet's left edge, so cutting it down to the
+        paper size from its top-left corner loses nothing.
+        """
+        dev = FakeSaneDev(options=build_option_table(omit=_GEOMETRY_OPTION_NAMES))
+        dev.report_sources(["Flatbed", "ADF"])
+        dev.offer_page_size_options()
+        dev.set_page_size(3000, 4000)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="ADF", resolution=300, mode="Color", paper_size="a5"
+        )
+
+        pages = backend.scan_pages("test:0", settings, page_sink).pages
+
+        assert _paper_assignments(dev) == [
+            ("page_width", 148.0),
+            ("page_height", 210.0),
+        ]
+        assert [page.size for page in pages] == [_A5_AT_300_DPI]
+
+    @pytest.mark.parametrize(
+        ("source", "auto_source_mode"),
+        [("ADF", "flatbed"), ("Auto", "adf")],
+        ids=["named-feeder", "auto-routed-to-the-feeder"],
+    )
+    def test_a_feeder_without_page_size_options_is_left_whole(
+        self,
+        source: str,
+        auto_source_mode: Literal["flatbed", "adf"],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        No area, no crop, and one INFO line saying why.
+
+        The routing decides, not the source's name: an Auto source sent
+        through the feeder has the same unknown registration as a named one.
+        Nothing is lost, so it is a log line and not a warning.
+        """
+        dev = _feeder_device(page_size_options=False, pages=2)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source=source,
+            resolution=300,
+            mode="Color",
+            paper_size="a4",
+            auto_source_mode=auto_source_mode,
+        )
+
+        with caplog.at_level(logging.INFO, logger="saneless.scanner.sane_backend"):
+            pages = backend.scan_pages("test:0", settings, page_sink).pages
+
+        assert _paper_assignments(dev) == []
+        assert [page.size for page in pages] == [(3000, 4000), (3000, 4000)]
+        skipped = [m for m in _info_messages(caplog) if "a4" in m and "page-width" in m]
+        assert len(skipped) == 1
+        paper_warnings = [
+            m
+            for m in _warning_messages(caplog)
+            if "a4" in m or "scan area" in m.lower() or "crop" in m.lower()
+        ]
+        assert paper_warnings == []
+
+    def test_an_auto_source_kept_on_the_glass_keeps_its_scan_area(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """An Auto source scanned as a flatbed is framed as a flatbed."""
+        dev = _feeder_device(page_size_options=False)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Auto",
+            resolution=300,
+            mode="Color",
+            paper_size="a5",
+            auto_source_mode="flatbed",
+        )
+
+        backend.scan_pages("test:0", settings, page_sink)
+
+        assert _paper_assignments(dev) == [
+            ("tl_x", 0.0),
+            ("tl_y", 0.0),
+            ("br_x", 148.0),
+            ("br_y", 210.0),
+        ]
+
+    def test_integer_page_size_options_are_given_whole_numbers(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """A float refused by an integer option would fail the whole scan."""
+        dev = _feeder_device(page_size_options=False)
+        dev.offer_page_size_options(
+            value_type=TYPE_INT,
+            unit=GeometryUnit.UNIT_PIXEL,
+            span=_ROOMY_GEOMETRY_RANGE,
+        )
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="ADF", resolution=300, mode="Color", paper_size="a5"
+        )
+
+        backend.scan_pages("test:0", settings, page_sink)
+
+        # 148 mm and 210 mm at 300 dpi, rounded to the nearest pixel.
+        assert dev.page_width == round(148 / 25.4 * 300) == 1748
+        assert dev.page_height == round(210 / 25.4 * 300) == 2480
+
+
+class TestIntegerGeometry:
+    """
+    A scan area of integer options is written as whole numbers.
+
+    python-sane refuses a float for an integer option, even a whole one, so
+    writing ``0.0`` to a pixel scan area raised, and the page fell back to a
+    crop that the device could have done itself.
+    """
+
+    @pytest.mark.parametrize(
+        ("unit", "expected"),
+        [
+            (
+                GeometryUnit.UNIT_PIXEL,
+                (round(210 / 25.4 * 300), round(297 / 25.4 * 300)),
+            ),
+            (GeometryUnit.UNIT_MM, (210, 297)),
+        ],
+        ids=["pixels", "millimetres"],
+    )
+    def test_the_area_is_written_as_integers_and_accepted(
+        self,
+        unit: GeometryUnit,
+        expected: tuple[int, int],
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """The device keeps the area, so nothing is cropped afterwards."""
+        dev = FakeSaneDev(
+            options=build_option_table(
+                geometry_type=TYPE_INT,
+                geometry_unit=unit,
+                geometry_range=_ROOMY_GEOMETRY_RANGE,
+            ),
+            pages=1,
+        )
+        dev.set_page_size(3000, 4000)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        pages = backend.scan_pages("test:0", settings, page_sink).pages
+
+        area = [dev.tl_x, dev.tl_y, dev.br_x, dev.br_y]
+        assert [type(value) for value in area] == [int, int, int, int]
+        assert (dev.br_x, dev.br_y) == expected
+        assert pages[0].size == (3000, 4000)
 
 
 # ---------------------------------------------------------------------------
