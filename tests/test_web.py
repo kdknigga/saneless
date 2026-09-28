@@ -2736,10 +2736,12 @@ class TestStaleDefaultAndUnlistedRows:
         self, client: TestClient
     ) -> None:
         """Pinned, filtered, stale and unlisted rows all carry the attribute."""
-        _serve_known_lists(client)
-        known = client.get("/api/tags", params={"q": "tax", "tags": [3, 99]}).text
+        # Unreachable first: once a list has been read, the cache keeps it as
+        # the last good copy and a failed fetch would render that instead.
         _serve_nothing(client)
         unlisted = client.get("/api/tags", params={"tags": [5]}).text
+        _serve_known_lists(client)
+        known = client.get("/api/tags", params={"q": "tax", "tags": [3, 99]}).text
 
         boxes = re.findall(r'<input type="checkbox"[^>]*>', known + unlisted)
         assert len(boxes) == 4

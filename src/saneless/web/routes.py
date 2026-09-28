@@ -34,7 +34,7 @@ from saneless.checks import (
 from saneless.config import PaperlessId, is_placeholder_token, resolve_job_title
 from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
-from saneless.scan_metadata import resolve_scan_metadata
+from saneless.scan_metadata import metadata_ids, resolve_scan_metadata
 from saneless.scanner.base import SourceKind, classify_source
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
@@ -62,6 +62,10 @@ from saneless.vocabulary import (
     local_time,
     pass_prompt_copy,
     progress_label,
+    stale_default_correspondent_label,
+    stale_default_tag_label,
+    unlisted_correspondent_label,
+    unlisted_tag_label,
     worker_health_detail,
 )
 from saneless.web.errors import TITLE_CONTROL_TYPE, RequestRejected
@@ -69,6 +73,8 @@ from saneless.web.job_view import build_job_view, owns_detail, scrub_for_owner
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.datastructures import State
 
     from saneless.config import ProfileConfig, Settings
@@ -540,6 +546,49 @@ def _checks_fallback_context() -> dict[str, object]:
 # exception text can carry a URL, a header or a token.  Tracebacks remain only
 # for failures of saneless's own store and templates, which never receive a
 # client exception.
+def _cached_list_or_none(
+    cache: MetadataCache,
+    paperless: PaperlessClient,
+    resource: MetadataResource,
+) -> list[dict[str, object]] | None:
+    """
+    Retrieve metadata from cache or paperless-ngx, or None when it is unknown.
+
+    The fetch goes through the cache's single-flight ``get_or_fetch``, so
+    concurrent requests for the same resource make one Paperless call.  When
+    a refresh fails, the cache serves the last list fetched successfully;
+    only when there has never been one does the error reach this function,
+    which logs its cause and answers None.  None and an empty list are
+    different facts: paperless-ngx that has no tags can prove a ticked id
+    gone, and one that could not be asked cannot.
+
+    Args:
+        cache: Metadata cache instance.
+        paperless: Paperless-ngx API client.
+        resource: Resource name ('tags' or 'correspondents').
+
+    Returns:
+        The list, fresh or the last good one, or None when neither exists.
+
+    """
+    fetch = paperless.get_tags if resource == "tags" else paperless.get_correspondents
+    try:
+        return cache.get_or_fetch(resource, fetch)
+    except (PaperlessError, ConfigError) as exc:
+        logger.warning(
+            "Failed to fetch %s from paperless-ngx, using empty list: %s",
+            resource,
+            describe(exc),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to fetch %s from paperless-ngx, using empty list: %s",
+            resource,
+            type(exc).__name__,
+        )
+    return None
+
+
 def _get_cached_or_fetch(
     cache: MetadataCache,
     paperless: PaperlessClient,
@@ -548,12 +597,9 @@ def _get_cached_or_fetch(
     """
     Retrieve metadata from cache or fetch from paperless-ngx.
 
-    The fetch goes through the cache's single-flight ``get_or_fetch``, so
-    concurrent requests for the same resource make one Paperless call.  When
-    a refresh fails, the cache serves the last list fetched successfully;
-    only when there has never been one does the error reach this function,
-    which logs its cause and falls back to an empty list, so the UI always
-    loads even when paperless-ngx is down.
+    ``_cached_list_or_none`` with an unknown list read as an empty one, for
+    the callers that only need rows to render, so the UI always loads even
+    when paperless-ngx is down.
 
     Args:
         cache: Metadata cache instance.
@@ -564,24 +610,44 @@ def _get_cached_or_fetch(
         List of metadata dicts: fresh, the last good list, or empty.
 
     """
-    fetch = paperless.get_tags if resource == "tags" else paperless.get_correspondents
-    try:
-        data = cache.get_or_fetch(resource, fetch)
-    except (PaperlessError, ConfigError) as exc:
-        logger.warning(
-            "Failed to fetch %s from paperless-ngx, using empty list: %s",
-            resource,
-            describe(exc),
-        )
-        data = []
-    except Exception as exc:
-        logger.warning(
-            "Failed to fetch %s from paperless-ngx, using empty list: %s",
-            resource,
-            type(exc).__name__,
-        )
-        data = []
-    return data
+    data = _cached_list_or_none(cache, paperless, resource)
+    return [] if data is None else data
+
+
+def _unnamed_rows(
+    ticked: list[int],
+    known_ids: frozenset[int] | None,
+    *,
+    stale_label: Callable[[int], str],
+    unlisted_label: Callable[[int], str],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """
+    Split the ticked ids the list does not name into stale and unlisted rows.
+
+    A list that was read and lacks an id proves it gone, so that id is stale
+    and its label says it will be skipped.  With no list at all nothing is
+    proved, so every ticked id is unlisted and labelled by number alone.
+    Either way the row stays ticked: the untouched submit has to carry what
+    the form shows, and the scan decides what to drop.
+
+    Args:
+        ticked: The ticked ids, in order and without repeats.
+        known_ids: The ids the list holds, or None when it is unknown.
+        stale_label: Labels an id the known list lacks.
+        unlisted_label: Labels an id when the list is unknown.
+
+    Returns:
+        The stale rows and the unlisted rows, each ``{"id", "label"}``.
+
+    """
+    if known_ids is None:
+        return [], [{"id": item, "label": unlisted_label(item)} for item in ticked]
+    stale: list[dict[str, object]] = [
+        {"id": item, "label": stale_label(item)}
+        for item in ticked
+        if item not in known_ids
+    ]
+    return stale, []
 
 
 def _tag_list_context(
@@ -599,6 +665,11 @@ def _tag_list_context(
     next submit.  A tag that is both ticked and matched is rendered by the
     filtered loop alone, so it appears once rather than twice.
 
+    A ticked id the list does not name is kept the same way, as a stale or an
+    unlisted row pinned first (see ``_unnamed_rows``).  That is what lets the
+    page open on a profile's default tags even when one of them has since
+    been deleted, or paperless-ngx cannot be reached.
+
     ``q`` is a Python-side substring test over the already-cached list and
     nothing else (ASVS V5).  It is never interpolated into a paperless-ngx
     query URL -- the cache holds the whole list, so there is nothing to ask
@@ -613,29 +684,42 @@ def _tag_list_context(
         selected: The tag ids the request reports as currently ticked.
 
     Returns:
-        The context ``partials/tags.html`` renders: the pinned ticks, the
-        filtered list, the ticked ids, and whether any tag exists at all.
+        The context ``partials/tags.html`` renders: the stale and unlisted
+        ticks, the pinned ticks, the filtered list, the ticked ids, and
+        whether any tag exists at all.
 
     """
     # With ``[web] show_tags`` off the tag markup is never emitted, so
     # a fetch here buys nothing and costs a paperless-ngx round trip on every
     # cold-cache page load -- and the flag that would hide the list is the same
     # flag that decides whether the data can ever be seen.  The guard sits in
-    # this function rather than in ``index`` so it covers all three call sites,
-    # including the filter and refresh routes, which have the same reason to
-    # skip.  The key set below is the normal path's, emptied: ``index`` spreads
-    # this with ``**``, so a missing key would leave an undefined name in a
-    # template that has nothing to do with tags.
+    # this function rather than in ``index`` so it covers every call site,
+    # including the filter, refresh and profile-change routes, which have the
+    # same reason to skip.  The key set below is the normal path's, emptied:
+    # ``index`` spreads this with ``**``, so a missing key would leave an
+    # undefined name in a template that has nothing to do with tags.
     if not state.settings.web.show_tags:
         return {
+            "stale": [],
+            "unlisted": [],
             "pinned": [],
             "tags": [],
             "selected_tags": set(),
             "any_tags": False,
         }
-    everything = _get_cached_or_fetch(state.cache, state.paperless, "tags")
+    listed = _cached_list_or_none(state.cache, state.paperless, "tags")
+    # The same rule the pre-scan check applies, so the page and the scan
+    # agree on which ids paperless-ngx still has.
+    known_ids = metadata_ids(listed)
+    everything = listed if listed is not None and known_ids is not None else []
+    ticked = list(dict.fromkeys(selected))
+    stale, unlisted = _unnamed_rows(
+        ticked,
+        known_ids,
+        stale_label=stale_default_tag_label,
+        unlisted_label=unlisted_tag_label,
+    )
     needle = q.casefold()
-    ticked = set(selected)
     matched = [
         tag for tag in everything if needle in str(tag.get("name", "")).casefold()
     ]
@@ -646,16 +730,58 @@ def _tag_list_context(
         if tag.get("id") in ticked and tag.get("id") not in matched_ids
     ]
     return {
+        "stale": stale,
+        "unlisted": unlisted,
         "pinned": pinned,
         "tags": matched,
         # Not ``selected``: the index context already uses that name for the
         # profile the page opens on, and an include shares its parent's
         # context, so the two would collide on the full-page render.
-        "selected_tags": ticked,
+        "selected_tags": set(ticked),
         # Which empty state to render when both lists are empty: "paperless-ngx
         # has no tags" and "your filter matched none of them" are different
         # facts and only one of them is the reader's to fix.
         "any_tags": bool(everything),
+    }
+
+
+def _correspondent_options_context(
+    state: State, selected: int | None
+) -> dict[str, object]:
+    """
+    Build the correspondent options' context, with one of them chosen.
+
+    The full page, the profile-change swap and the refresh all render the
+    options through this, so each shows the same choice the same way.  A
+    chosen id the list does not name becomes one extra option, selected,
+    labelled stale or unlisted by the rule the tag list uses: the untouched
+    submit carries it, and the scan decides whether it is dropped.
+
+    Args:
+        state: Application state, for the metadata cache and Paperless client.
+        selected: The correspondent id to show chosen, or None for none.
+
+    Returns:
+        The context ``partials/correspondents.html`` renders: the list, the
+        chosen id, and the extra option or None.
+
+    """
+    listed = _cached_list_or_none(state.cache, state.paperless, "correspondents")
+    known_ids = metadata_ids(listed)
+    correspondents = listed if listed is not None and known_ids is not None else []
+    extra_option: dict[str, object] | None = None
+    if selected is not None:
+        stale, unlisted = _unnamed_rows(
+            [selected],
+            known_ids,
+            stale_label=stale_default_correspondent_label,
+            unlisted_label=unlisted_correspondent_label,
+        )
+        extra_option = next(iter(stale + unlisted), None)
+    return {
+        "correspondents": correspondents,
+        "selected_correspondent": selected,
+        "extra_option": extra_option,
     }
 
 
@@ -2150,13 +2276,10 @@ def get_correspondents(request: Request) -> Response:
     successfully, or empty options if there has never been one.
     """
     state = request.app.state
-    correspondents = _get_cached_or_fetch(
-        state.cache, state.paperless, "correspondents"
-    )
     return state.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
-        {"correspondents": correspondents},
+        _correspondent_options_context(state, None),
     )
 
 
@@ -2293,13 +2416,10 @@ def invalidate_cache(
             _tag_list_context(state, q=q, selected=tags),
         )
 
-    correspondents = _get_cached_or_fetch(
-        state.cache, state.paperless, "correspondents"
-    )
     return state.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
-        {"correspondents": correspondents},
+        _correspondent_options_context(state, None),
     )
 
 

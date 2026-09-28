@@ -1,2 +1,12 @@
+{# The options alone, never the select: the refresh swaps them innerHTML, and
+   the select that holds them is the profile-change swap's own target.
+   selected_correspondent is the choice to show: the profile's default on a
+   page load or profile change, and the current choice on a refresh.
+   extra_option is that choice when the list does not name it, labelled stale
+   or unlisted by the context, and selected so an untouched submit carries
+   it.  With no choice nothing is marked, and the browser selects the first
+   option, which is the one that means none.  Names and labels stay
+   autoescaped; nothing here is marked safe. #}
 <option value="">No correspondent</option>
-{% for c in correspondents %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+{% if extra_option %}<option value="{{ extra_option.id }}" selected>{{ extra_option.label }}</option>{% endif %}
+{% for c in correspondents %}<option value="{{ c.id }}"{% if c.id == selected_correspondent %} selected{% endif %}>{{ c.name }}</option>{% endfor %}

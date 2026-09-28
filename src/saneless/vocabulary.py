@@ -141,9 +141,13 @@ __all__ = [
     "scan_page_description",
     "sixteen_bit_error",
     "source_not_offered_error",
+    "stale_default_correspondent_label",
+    "stale_default_tag_label",
     "state_label",
     "substituted_source_warning",
     "timeout_finish_warning",
+    "unlisted_correspondent_label",
+    "unlisted_tag_label",
     "worker_health_detail",
 ]
 
@@ -883,6 +887,87 @@ def dropped_ids_warning(tags: Sequence[int], correspondent: int | None) -> str |
         else "no longer exist in paperless-ngx and were not applied."
     )
     return f"{subject} {predicate}"
+
+
+# The note on a ticked id the form shows but paperless-ngx's list, read just
+# now, does not hold.  It sits in the row's own label rather than on a line
+# below, so it is announced with the checkbox and leaves with it when the box
+# is unticked.  Only the id is interpolated.
+_STALE_DEFAULT_NOTE: Final = "(no longer in paperless-ngx; will be skipped)"
+
+
+def unlisted_tag_label(tag_id: int) -> str:
+    """
+    Return the label of a ticked tag the form has no name for.
+
+    Used when paperless-ngx's tag list could not be read: the row stays
+    ticked so an untouched submit still carries it, and it claims nothing
+    about paperless-ngx beyond the id, because without the list nothing more
+    is known.
+
+    Args:
+        tag_id: The ticked tag id.
+
+    Returns:
+        The id as a tag, for example "tag 7".
+
+    """
+    return f"tag {tag_id}"
+
+
+def unlisted_correspondent_label(correspondent_id: int) -> str:
+    """
+    Return the label of a chosen correspondent the form has no name for.
+
+    The correspondent twin of ``unlisted_tag_label``.
+
+    Args:
+        correspondent_id: The chosen correspondent id.
+
+    Returns:
+        The id as a correspondent, for example "correspondent 12".
+
+    """
+    return f"correspondent {correspondent_id}"
+
+
+def stale_default_tag_label(tag_id: int) -> str:
+    """
+    Return the label of a ticked tag that paperless-ngx no longer has.
+
+    A profile's default tag missing from a list that was actually read is
+    shown ticked, labelled with this note, before Scan is pressed.  Left
+    ticked, the scan drops it and the job carries ``dropped_ids_warning``;
+    unticked, neither happens.
+
+    Args:
+        tag_id: The ticked tag id.
+
+    Returns:
+        The id and the note, for example
+        "tag 7 (no longer in paperless-ngx; will be skipped)".
+
+    """
+    return f"{unlisted_tag_label(tag_id)} {_STALE_DEFAULT_NOTE}"
+
+
+def stale_default_correspondent_label(correspondent_id: int) -> str:
+    """
+    Return the label of a chosen correspondent that paperless-ngx no longer has.
+
+    The correspondent twin of ``stale_default_tag_label``: the option stays
+    selected, and the scan drops it with the same warning unless another is
+    chosen.
+
+    Args:
+        correspondent_id: The chosen correspondent id.
+
+    Returns:
+        The id and the note, for example
+        "correspondent 12 (no longer in paperless-ngx; will be skipped)".
+
+    """
+    return f"{unlisted_correspondent_label(correspondent_id)} {_STALE_DEFAULT_NOTE}"
 
 
 def duplicate_warning(

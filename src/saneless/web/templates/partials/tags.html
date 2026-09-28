@@ -4,15 +4,31 @@
    target, and a partial that rendered only the rows would put them where the
    wrapper was and lose both on the first refresh.
 
-   Two loops, not one.  The first holds the ticks the filter excludes, pinned
-   above the list so a tick can never leave the DOM and therefore can never be
-   dropped from the next submit.  The second is the filtered list; a tag that is
-   both ticked and matched is rendered by that loop alone, so it appears once
-   rather than twice.
+   Four row kinds, in this order, and every ticked id lands in exactly one:
+   1. Stale: ticked, but missing from a tag list that was read just now -- a
+      profile default deleted in paperless-ngx.  It stays ticked, labelled
+      with the note that says it will be skipped, so the untouched submit
+      still carries it and the finished job names the drop; unticking it is
+      how the operator clears both.
+   2. Unlisted: ticked while the tag list could not be read at all.  The row
+      is the bare id, with no note, because "no longer in paperless-ngx"
+      cannot be claimed without the list; it stays ticked for the same
+      reason as a stale one.
+   3. Pinned: ticked and in the list, but excluded by the filter.  Pinned
+      above the list so a tick can never leave the DOM and therefore can
+      never be dropped from the next submit.
+   4. The filtered list.  A tag that is both ticked and matched is rendered
+      by this loop alone, so it appears once rather than twice.
+   The empty-state lines render only when there is no row of any kind.
+
+   Every box turns autocomplete off: a browser that restores form state on
+   reload would otherwise re-tick or untick boxes over what the server
+   rendered, and the page's ticks are a profile's defaults.
 
    The filter text itself appears nowhere in this file.  It is a filter, not a
    label, and nothing the client typed is rendered back (ASVS V5).  The tag
-   names are upstream text and stay autoescaped; nothing here is marked safe.
+   names are upstream text and the notes come from the context; both stay
+   autoescaped, and nothing here is marked safe.
 
    The label is the tap target, not the box: app.css gives every row the full
    width and a finger-sized height.
@@ -20,13 +36,19 @@
    The wrapper carries no request of its own: the list is server-rendered, and
    the filter box, the refresh button and the filter form each carry theirs. #}
 <div id="tags-list" class="tag-list">
+    {%- for row in stale %}
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
+    {%- endfor %}
+    {%- for row in unlisted %}
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
+    {%- endfor %}
     {%- for tag in pinned %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" checked> {{ tag.name }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" autocomplete="off" checked> {{ tag.name }}</label>
     {%- endfor %}
     {%- for tag in tags %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}"{% if tag.id in selected_tags %} checked{% endif %}> {{ tag.name }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" autocomplete="off"{% if tag.id in selected_tags %} checked{% endif %}> {{ tag.name }}</label>
     {%- endfor %}
-    {%- if not pinned and not tags %}
+    {%- if not stale and not unlisted and not pinned and not tags %}
     {% if any_tags %}<small>No tags match that filter.</small>{% else %}<small>No tags in paperless-ngx yet.</small>{% endif %}
     {%- endif %}
 </div>
