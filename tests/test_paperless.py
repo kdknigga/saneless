@@ -2758,15 +2758,19 @@ _TRASH_NOTE = " Note: existing document is in the trash."
 class TestPollTaskDuplicate:
     """A duplicate refusal names the document paperless-ngx already holds."""
 
-    @pytest.mark.parametrize("build_payload", _API_SHAPES)
+    @pytest.mark.parametrize(
+        ("build_payload", "status"),
+        [
+            pytest.param(_v9_payload, "SUCCESS", id="v9"),
+            pytest.param(_v10_payload, "success", id="v10"),
+        ],
+    )
     def test_success_is_a_filed_task_not_a_duplicate(
-        self, build_payload: Callable[[str, str | None], object]
+        self, build_payload: Callable[[str, str | None], object], status: str
     ) -> None:
         """A SUCCESS task comes back whole, wrapped as filed."""
-        payload = build_payload("success", None)
-        outcome = _poll_outcome(payload)
-        (task,) = payload["results"] if isinstance(payload, dict) else payload
-        assert outcome == TaskFiled(task=task)
+        outcome = _poll_outcome(build_payload("success", None))
+        assert outcome == TaskFiled(task={"task_id": "t1", "status": status})
 
     @pytest.mark.parametrize("in_trash", [False, True])
     def test_v10_duplicate_is_read_from_result_data(self, *, in_trash: bool) -> None:

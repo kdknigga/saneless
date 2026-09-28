@@ -47,6 +47,9 @@ __all__ = [
     "FolderDelivery",
     "PaperlessClient",
     "PaperlessTiming",
+    "TaskDuplicate",
+    "TaskFiled",
+    "TaskOutcome",
     "UploadResult",
 ]
 
@@ -102,9 +105,18 @@ _METADATA_MAX_PAGES: Final = 1000
 # terminal escape sequences, and the message becomes job.error.
 _TASK_ID_LOG_LIMIT: Final = 64
 
-_DUPLICATE_HINT = (
-    "the document may already be in Paperless; check before scanning again"
-)
+# How the existing document is named in a duplicate refusal's text, for a
+# server whose answer carries no structured id.  Each is searched in linear
+# time (see ``_duplicate_id_in_text``).  ``[0-9]``, not ``\d``, which also
+# matches digits from other scripts that ``int()`` accepts.
+_DUPLICATE_OF: Final = re.compile(r"duplicate of ", re.IGNORECASE)
+_BRACKETED_ID: Final = re.compile(r"\(#([0-9]+)\)")
+_DOCUMENT_ID: Final = re.compile(r"document #([0-9]+)", re.IGNORECASE)
+# A document id: one to eighteen ASCII digits, the whole value, so a longer
+# one never reaches ``int()`` or a message.
+_DOCUMENT_ID_TEXT: Final = re.compile(r"[0-9]{1,18}")
+# paperless-ngx 2.x appends this when the existing document is in the trash.
+_TRASH_NOTE: Final = "existing document is in the trash"
 
 # How long an upload keeps trying while each failure proves the request never
 # reached paperless-ngx whole.  Long enough to ride out a paperless-ngx or
@@ -341,12 +353,10 @@ def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
     of <title> (#id).``, and API v10 carries only ``result_data`` =
     ``{"duplicate_of": N, "duplicate_in_trash": bool}`` with no message at all.
 
-    The accepted risk of retrying an upload, set out on ``PaperlessClient``,
-    is why this is worth recognising: an upload retried after its response
-    was lost usually makes current paperless-ngx store a silent second copy.
-    Only with ``CONSUMER_DELETE_DUPLICATES`` is the duplicate reported as a
-    failure, and then the user is told the document may already be there,
-    rather than being left to scan it again.
+    A duplicate refusal is not a failure: paperless-ngx already holds the
+    file, so "scan it again" would be wrong advice.  ``poll_task`` returns it
+    as a ``TaskDuplicate`` instead of raising, and the job ends delivered,
+    with a warning naming the existing document.
 
     Args:
         task: A task dict whose status is FAILURE or REVOKED.
@@ -361,6 +371,106 @@ def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
         return True
     data = task.get("result_data")
     return isinstance(data, dict) and "duplicate_of" in data
+
+
+def _document_id(value: object) -> int | None:
+    """
+    Read a document id from a field of a task payload.
+
+    The payload is third-party data, and the id ends up in the job's warning,
+    so only a plain positive number is taken.  A bool is refused although
+    Python counts it as an int: v10's ``duplicate_of: true`` is not
+    document #1.
+
+    Args:
+        value: The field's value.
+
+    Returns:
+        A positive int, from an int or from a string of one to eighteen
+        ASCII digits, or None for anything else.
+
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and _DOCUMENT_ID_TEXT.fullmatch(value):
+        number = int(value)
+    else:
+        return None
+    return number if 0 < number < 10**18 else None
+
+
+def _duplicate_id_in_text(text: str) -> int | None:
+    """
+    Find the existing document's id in a duplicate refusal's text.
+
+    paperless-ngx 2.x says ``It is a duplicate of <title> (#N).``, and the
+    title is the user's own text, so it can hold a ``(#5)`` of its own.  The
+    id is therefore the **last** ``(#N)`` after the first "duplicate of",
+    which is what paperless-ngx's own greedy "duplicate of", any text, then
+    "(#N)" pattern takes.  It is found without such a pattern, whose
+    backtracking is quadratic, because the text is a server's, of any length.  After that comes v9's
+    ``duplicate of document #N``.
+
+    Args:
+        text: The whole failure text, token struck, before any cut.
+
+    Returns:
+        The id, or None when the text names none.
+
+    """
+    start = _DUPLICATE_OF.search(text)
+    if start is not None:
+        ids = [found.group(1) for found in _BRACKETED_ID.finditer(text, start.end())]
+        if ids:
+            return _document_id(ids[-1])
+    found = _DOCUMENT_ID.search(text)
+    return _document_id(found.group(1)) if found is not None else None
+
+
+def _duplicate_of(task: dict[str, object], full_failure: str) -> TaskDuplicate:
+    """
+    Say which document a duplicate refusal names, and whether it is in the trash.
+
+    Each server shape is read in turn, the first to name an id winning:
+
+    1. API v10: ``result_data`` = ``{"duplicate_of": N, "duplicate_in_trash":
+       bool}``.
+    2. v9 on paperless-ngx 3.x: ``duplicate_documents[0]["id"]``; a
+       non-null ``deleted_at`` means it is in the trash.
+    3. v9 on 2.x: ``related_document``, a string of digits, which is null
+       when the document is in the trash; the text then ends "Note:
+       existing document is in the trash."
+    4. The failure text itself (``_duplicate_id_in_text``).
+
+    Args:
+        task: A task dict that ``_is_duplicate_failure`` recognised.
+        full_failure: Its whole failure text, token struck, before any cut.
+
+    Returns:
+        The duplicate, with ``document_id`` None when nothing names it.
+
+    """
+    data = task.get("result_data")
+    flagged = isinstance(data, dict) and data.get("duplicate_in_trash") is True
+    if isinstance(data, dict):
+        document_id = _document_id(data.get("duplicate_of"))
+        if document_id is not None:
+            return TaskDuplicate(document_id, in_trash=flagged)
+    documents = task.get("duplicate_documents")
+    if isinstance(documents, list) and documents and isinstance(documents[0], dict):
+        first = documents[0]
+        document_id = _document_id(first.get("id"))
+        if document_id is not None:
+            return TaskDuplicate(
+                document_id, in_trash=first.get("deleted_at") is not None
+            )
+    in_trash = flagged or _TRASH_NOTE in full_failure.casefold()
+    document_id = _document_id(task.get("related_document"))
+    if document_id is None:
+        document_id = _duplicate_id_in_text(full_failure)
+    return TaskDuplicate(document_id, in_trash=in_trash)
 
 
 def _strike(text: str, token: str) -> str:
@@ -819,6 +929,44 @@ class FolderDelivery:
 # Each class carries only its own destination, so no result can claim both, or
 # claim one without saying where; callers dispatch with ``match``.
 UploadResult = ApiDelivery | FolderDelivery
+
+
+@dataclass(frozen=True, slots=True)
+class TaskFiled:
+    """
+    paperless-ngx finished the consume task and filed the document.
+
+    Attributes:
+        task: The SUCCESS task, as paperless-ngx answered it.
+
+    """
+
+    task: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDuplicate:
+    """
+    paperless-ngx refused the upload because it already holds the file.
+
+    The document is there, so this is not a failure: nothing was stored
+    again, and this upload's title and tags were not applied to the copy
+    paperless-ngx already had.
+
+    Attributes:
+        document_id: The existing document's id, or None when the answer did
+            not name one.
+        in_trash: Whether that document is in paperless-ngx's trash.
+
+    """
+
+    document_id: int | None
+    in_trash: bool
+
+
+# How a consume task that finished without failing ended.  A plain union like
+# ``UploadResult``; callers dispatch with ``match``.
+TaskOutcome = TaskFiled | TaskDuplicate
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1581,9 +1729,9 @@ class PaperlessClient:
             staged.unlink(missing_ok=True)
             raise
 
-    def poll_task(self, task_id: str, *, timeout: float) -> dict[str, object]:
+    def poll_task(self, task_id: str, *, timeout: float) -> TaskOutcome:
         """
-        Poll the task endpoint with exponential backoff until the task succeeds.
+        Poll the task endpoint with exponential backoff until the task finishes.
 
         Two wire shapes are tolerated. API v9 answers ``GET /api/tasks/``
         with a bare list of tasks whose ``status`` is uppercase and whose
@@ -1628,13 +1776,17 @@ class PaperlessClient:
                 the only source.
 
         Returns:
-            The task dict, only when the task reached SUCCESS.
+            ``TaskFiled`` carrying the task when it reached SUCCESS, or
+            ``TaskDuplicate`` when it ended FAILURE because paperless-ngx
+            already holds the file: that is a document delivered, not lost,
+            so it is an answer rather than an error.  The duplicate names the
+            existing document when the answer does (see ``_duplicate_of``).
 
         Raises:
-            PaperlessUnconfirmedError: If the task ends FAILURE, carrying the
-                message paperless-ngx supplied (plus a check-before-
-                rescanning hint when it was a duplicate), or REVOKED, saying
-                paperless-ngx cancelled it; if a poll is answered 406, in the
+            PaperlessUnconfirmedError: If the task ends FAILURE for any other
+                reason, carrying the message paperless-ngx supplied, or
+                REVOKED, saying paperless-ngx cancelled it; if a poll is
+                answered 406, in the
                 incompatible-version wording; if a poll gets any other
                 non-200 but a 5xx or 429, carrying the status code, the
                 reason phrase and the body reduced to one bounded line by
@@ -1714,7 +1866,7 @@ class PaperlessClient:
 
     def _finished_task(
         self, task_id: str, response: httpx2.Response
-    ) -> dict[str, object] | _PollTransient | None:
+    ) -> TaskOutcome | _PollTransient | None:
         """
         Read one task poll response.
 
@@ -1724,7 +1876,8 @@ class PaperlessClient:
             response: The response to ``GET /api/tasks/``.
 
         Returns:
-            The task dict when it reached SUCCESS; a ``_PollTransient`` for a
+            ``TaskFiled`` when the task reached SUCCESS; ``TaskDuplicate``
+            when it ended FAILURE as a duplicate; a ``_PollTransient`` for a
             5xx or a 429, which may clear; None when the task is not visible
             yet or has not reached a terminal status.  The caller keeps
             polling on either of the last two.
@@ -1732,7 +1885,8 @@ class PaperlessClient:
         Raises:
             PaperlessUnconfirmedError: If the response is a 406 or any other
                 non-200, if its body is not JSON, or if the task ended
-                FAILURE or REVOKED.  Every message is one line.
+                REVOKED or FAILURE other than as a duplicate.  Every message
+                is one line.
 
         """
         shown = _loggable_task_id(task_id)
@@ -1767,7 +1921,7 @@ class PaperlessClient:
         status = _task_status(task)
         if status == "SUCCESS":
             logger.info("Task %r completed: %s", shown, status)
-            return task
+            return TaskFiled(task=task)
         if status == "REVOKED":
             msg = (
                 f"paperless-ngx cancelled task {shown} before it finished; "
@@ -1778,14 +1932,21 @@ class PaperlessClient:
             full_failure = " ".join(
                 _strike(_failure_message(task), self._token).split()
             )
+            # The duplicate check and its id read the whole text, so a
+            # duplicate named past the cut below is not lost.
+            if _is_duplicate_failure(task, full_failure):
+                duplicate = _duplicate_of(task, full_failure)
+                logger.info(
+                    "Task %r was refused as a duplicate of document %s",
+                    shown,
+                    duplicate.document_id,
+                )
+                return duplicate
             # Bounded like an error body: a failure result can embed a whole
             # OCR or consumer traceback, and this text becomes job.error and
-            # the CLI line.  The duplicate check reads the
-            # whole text, so a hint past the cut is not lost.
+            # the CLI line.
             failure = _bounded_line(full_failure) or _NO_FAILURE_MESSAGE
             msg = f"Paperless task {shown} ended {status}: {failure}"
-            if _is_duplicate_failure(task, full_failure):
-                msg = f"{msg}; {_DUPLICATE_HINT}"
             raise PaperlessUnconfirmedError(msg)
         return None
 
