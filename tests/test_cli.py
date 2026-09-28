@@ -48,6 +48,7 @@ from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
     FeederEmptyError,
+    NoScannerFoundError,
     PaperlessError,
     PdfError,
     SanelessError,
@@ -3875,16 +3876,17 @@ class TestAutoProfiles:
 
     def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """
-        auto-profiles with no scanners is a setup error: exit 2, as on scan.
+        auto-profiles with no scanners is a scanner condition: exit 1, as on scan.
 
-        D-07 files "No scanner found" under exit 2 on every command where it
-        can occur (WR-06); ``scan`` already exits 2 for it.
+        Finding no scanner means the scanner is off, unplugged or out of
+        reach, not that the configuration is wrong, so both commands that can
+        find none exit 1: an exit code means the same thing in every command.
         """
         scanner_cls = self._make_auto_scanner(devices=[])
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
 
         result = runner.invoke(cli, ["auto-profiles"])
-        assert result.exit_code == 2
+        assert result.exit_code == 1
         lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith("No scanner found: ")
@@ -4790,20 +4792,56 @@ class TestExitCodes:
         assert "1 spooled page file(s) were preserved at" in lines[0]
         assert "Traceback" not in result.output
 
-    def test_mid_scan_config_error_exits_2_with_one_line(
+    def test_mid_scan_no_scanner_error_exits_1_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A ConfigError raised by the scanner mid-command is exit 2, as rendered."""
+        """A NoScannerFoundError from the scanner is one ``Scan error:`` line, exit 1."""
         runner, _ = _patch_cli(
             monkeypatch,
             settings=_tmp_settings(tmp_path),
-            scanner_cls=_raising_scanner(ConfigError("No scanner found")),
+            scanner_cls=_raising_scanner(NoScannerFoundError("No scanner found")),
         )
 
         result = runner.invoke(cli, ["scan"])
 
-        assert result.exit_code == 2
-        assert _failure_lines(result) == ["No scanner found"]
+        assert result.exit_code == 1
+        assert _failure_lines(result) == ["Scan error: No scanner found"]
+
+    def test_scan_with_no_scanner_found_exits_1_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        ``scan`` with no device set and none discovered is a scanner error, exit 1.
+
+        The advice is the scanner's, to check it is switched on and connected,
+        not the configuration's: nothing in the file is wrong.
+        """
+
+        class _NoDeviceScanner(StubScannerBackend):
+            """A SANE that answers discovery with an empty list."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Find no scanner."""
+                return []
+
+        settings = _tmp_settings(tmp_path)
+        settings.scanner.device = ""
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, scanner_cls=_NoDeviceScanner
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 1
+        lines = _failure_lines(result)
+        assert len(lines) == 1
+        assert lines[0].startswith("Scan error: No scanner found: ")
+        advice = result.stderr.splitlines()[-1]
+        assert advice == f"Try: {error_next_step(ErrorCategory.SCANNER)}"
+        assert "Traceback" not in result.output
 
     def test_scan_cancelled_exits_130_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

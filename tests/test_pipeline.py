@@ -35,6 +35,7 @@ from saneless.exceptions import (
     ConfigError,
     DiskSpaceError,
     FeederEmptyError,
+    NoScannerFoundError,
     PaperlessError,
     PaperlessTimeoutError,
     PdfError,
@@ -87,6 +88,7 @@ from saneless.vocabulary import (
     backs_pass_cap_note,
     backs_pass_cap_warning,
     classify_error,
+    error_advice,
     exit_code_for,
     pass_cap_note,
     pass_cap_warning,
@@ -2287,6 +2289,55 @@ class TestResolveDeviceChange:
             for record in _pipeline_records(caplog)
             if record.levelno == logging.WARNING
         )
+
+
+class TestNoScannerFound:
+    """
+    Finding no scanner is a scanner condition, never a configuration one.
+
+    An empty ``scanner.device`` is a valid setting that asks for discovery;
+    discovery finding nothing means the scanner is off, unplugged or out of
+    reach.  So the failure is a ``ScanError``, classified SCANNER, exit 1,
+    with the advice to check the scanner rather than the file.
+    """
+
+    def test_no_scanner_found_raises_no_scanner_found_error(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """No device set and none discovered is ``NoScannerFoundError``."""
+        default_settings.scanner.device = ""
+        scanner = _scanner_listing()
+
+        with pytest.raises(NoScannerFoundError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Nothing"),
+            )
+
+        assert failure_text(excinfo.value).startswith("No scanner found: ")
+        scanner.scan_pages.assert_not_called()
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_no_scanner_found_is_classified_as_a_scanner_error(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """The category is SCANNER, the exit code 1, the advice the scanner's."""
+        default_settings.scanner.device = ""
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_scanner_listing(),
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Nothing"),
+            )
+
+        category = classify_error(excinfo.value)
+        assert category is ErrorCategory.SCANNER
+        assert exit_code_for(category) is ExitCode.SCAN
+        assert "switched on and connected" in error_advice(category).next_step
 
 
 class TestDuplexStrategy:
