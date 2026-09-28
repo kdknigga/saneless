@@ -59,9 +59,9 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow. `"hardware"` scans both sides through the source: most scanners do that because of the source's name, and on scanners with a separate ADF mode option (`adf-mode`) saneless sets it to `Duplex`; see [ADF Hardware Duplex](set-up-adf-duplex.md#adf-hardware-duplex) |
 | `resolution` | integer | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `"Color"`, `"Gray"`, or `"Lineart"` |
-| `title` | string | `""` | Default document title, used as written when you leave the title blank in the web UI or omit `--title` on the CLI. A title you type always wins; with neither, the title is `Scan <date time>`, rendered in the server's local timezone with the zone named -- for example `Scan 2026-03-22 09:30 CDT` |
-| `default_tags` | list of int | `[]` | Paperless-ngx tag IDs to apply automatically |
-| `default_correspondent` | int or null | `null` | Paperless-ngx correspondent ID |
+| `title` | string | `""` | Default document title, used as written when you leave the title blank in the web UI or omit `--title` on the CLI. A title you type always wins; with neither, the title is `Scan <date time>`, rendered in the server's local timezone with the zone named -- for example `Scan 2026-03-22 09:30 CDT`. At most 118 characters; a longer one stops the config from loading |
+| `default_tags` | list of int | `[]` | Paperless-ngx tag IDs to apply automatically, each from 1 to 2147483647. The web form shows them pre-ticked; see [Setting default metadata](#setting-default-metadata) |
+| `default_correspondent` | int or null | `null` | Paperless-ngx correspondent ID, from 1 to 2147483647. The web form shows it pre-selected |
 | `enable_empty_page_detection` | bool | `true` | Remove blank pages from scans |
 | `empty_page_coverage_threshold` | float | `0.001` | The most ink a page may carry and still be removed as blank, as a percentage (0 to 100) of the page inside a 3% margin. Lower keeps more pages; `0` removes only pages with no ink at all |
 | `auto_source_mode` | string | `"flatbed"` | When source is `"Auto"`: `"flatbed"` for single-page or `"adf"` for multi-page feeder |
@@ -255,7 +255,17 @@ default_tags = [3, 7]
 default_correspondent = 12
 ```
 
-Tag and correspondent IDs match the IDs in your paperless-ngx instance. Find them in the paperless-ngx admin interface or via its API.
+Tag and correspondent IDs match the IDs in your paperless-ngx instance. Find them in the paperless-ngx admin interface or via its API. Each id must be from 1 to 2147483647, or the config does not load; an id listed twice counts once.
+
+The web UI and `saneless scan --profile receipts` apply these defaults the same way:
+
+- **The web form shows them pre-ticked.** When the page opens, and again whenever you choose another profile, the Tags list shows the profile's `default_tags` ticked and the Correspondent dropdown shows its `default_correspondent` selected, replacing whatever was ticked before. Scan without touching them and the document gets the defaults; clear the ticks, or choose no correspondent, and it gets none.
+- **A hidden control still applies them.** With `show_tags = false` or `show_correspondent = false` in [`[web]`](../reference/configuration.md#web), every scan from the profile gets its defaults.
+- **`saneless scan` applies them too.** The CLI has no tag or correspondent option, so a CLI scan always gets the profile's defaults.
+
+**A default that no longer exists in paperless-ngx is skipped with a warning.** If a tag or correspondent was deleted in paperless-ngx, saneless finds out before it scans, asks paperless-ngx once more to be sure, and then files the document without it. The scan ends **Uploaded with a warning** (exit 7 from `saneless scan`), naming the id: *"tag 7 no longer exists in paperless-ngx and was not applied."* When saneless can read paperless-ngx's lists, the web form marks such a default in advance, still ticked, with a note that it will be skipped. Remove the id from the profile to stop the warning.
+
+paperless-ngx lists only the tags and correspondents the API token's user may see, so a tag the token cannot see counts as missing and is skipped the same way, even though it exists. Give the token's user permission to view it if it should apply. If paperless-ngx cannot be asked at all -- it is down, or takes more than 5 seconds to answer -- the ids are sent unchecked and paperless-ngx decides.
 
 ## Empty page detection tuning
 
