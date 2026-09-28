@@ -2830,6 +2830,49 @@ class TestResolveSourceForManualDuplex:
 
         assert "'Flatbed'" in str(excinfo.value)
 
+    def test_an_unreadable_list_assigns_a_named_single_sided_feeder(self) -> None:
+        """
+        A source list that cannot be read still lets a named feeder through.
+
+        The device has a ``source`` option, so the name is assigned, trimmed,
+        and the device accepts or refuses it, as on the simplex path.
+        """
+        raw = [_option(1, "source", _STRING_OPTION, None)]
+
+        choice = sane_backend_mod._resolve_source(raw, " ADF ", resolve_feeder=True)
+
+        assert (choice.effective, choice.has_option) == ("ADF", True)
+        assert choice.substituted_from is None
+
+    @pytest.mark.parametrize(
+        "requested",
+        [
+            pytest.param("Flatbed", id="flatbed"),
+            pytest.param("ADF Duplex", id="both-sides-feeder"),
+            pytest.param("Manual Duplex", id="legacy-name"),
+        ],
+    )
+    def test_an_unreadable_list_refuses_anything_but_a_single_sided_feeder(
+        self, requested: str
+    ) -> None:
+        """
+        With the list unreadable, the refusal says so rather than "reports none".
+
+        The both-sides check cannot run on a list that cannot be read, so only
+        a name that classifies as a single-sided feeder is accepted, and the
+        message does not claim the device reported no feeder.
+        """
+        raw = [_option(1, "source", _STRING_OPTION, None)]
+
+        with pytest.raises(ScanError) as excinfo:
+            sane_backend_mod._resolve_source(raw, requested, resolve_feeder=True)
+
+        message = str(excinfo.value)
+        assert "could not be read" in message
+        assert "reports none" not in message
+        assert "Available: []" not in message
+        assert repr(requested) in message
+
     def test_without_the_flag_a_missing_feeder_is_refused_not_auto(self) -> None:
         """
         The simplex path no longer swaps ``Auto`` in for a feeder it lacks.

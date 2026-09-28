@@ -2602,8 +2602,8 @@ def _choose_feeder_source(available_sources: list[str], requested: str) -> str:
     before any page.
 
     Args:
-        available_sources: The source names the device reports. Empty when
-            the device's ``source`` constraint cannot be read.
+        available_sources: The source names the device reports, from a
+            ``source`` constraint that could be read.
         requested: The source name the profile asked for.
 
     Returns:
@@ -2648,6 +2648,66 @@ def _choose_feeder_source(available_sources: list[str], requested: str) -> str:
     raise ScanError(msg)
 
 
+def _resolve_manual_duplex_source(
+    reported: _OptionConstraint, requested: str
+) -> _SourceChoice:
+    """
+    Decide the feeder a manual-duplex pass scans through, or refuse.
+
+    A device with no source option at all feeds without being told and
+    nothing is assigned to it, so the both-sides concern cannot arise; the
+    simplex path already trusts the classifier on the configured name for such
+    a device, and manual duplex does the same, which keeps a legacy
+    "Manual Duplex" profile working there.
+
+    A device whose ``source`` list cannot be read has the option, so a name is
+    assigned and the device validates it, as on the simplex path. Which of its
+    sources feed, and which scan both sides, cannot be checked, so only a name
+    that classifies as a single-sided feeder is accepted.
+
+    Otherwise the feeder is resolved from the device's own list by
+    ``_choose_feeder_source``.
+
+    Args:
+        reported: What the device reports for ``source``.
+        requested: The source name the profile asked for.
+
+    Returns:
+        The source to assign, and whether the device has a source option.
+        Nothing is ever substituted on this path.
+
+    Raises:
+        ScanError: If the device has no source option and ``requested`` does
+            not name a feeder, if its source list cannot be read and
+            ``requested`` does not name a single-sided feeder, if every feeder
+            it reports scans both sides, or if it reports no source that feeds.
+
+    """
+    if not reported.present:
+        if classify_source(requested).uses_feeder:
+            return _SourceChoice(requested, has_option=False, substituted_from=None)
+        msg = (
+            "Manual duplex needs a feeder source, and this device "
+            "exposes no source option to choose one; set source to the "
+            f"name of its feeder (got {requested!r})"
+        )
+        raise ScanError(msg)
+    if reported.values is None:
+        if classify_source(requested) is SourceKind.FEEDER:
+            return _SourceChoice(
+                requested.strip(), has_option=True, substituted_from=None
+            )
+        msg = (
+            "Manual duplex needs a single-sided document feeder, and this "
+            "device's list of sources could not be read to find one; set "
+            "source to the name of its single-sided feeder "
+            f"(got {requested!r})"
+        )
+        raise ScanError(msg)
+    feeder = _choose_feeder_source([str(s) for s in reported.values], requested)
+    return _SourceChoice(feeder, has_option=True, substituted_from=None)
+
+
 def _resolve_source(
     raw_options: list[tuple], requested: str, *, resolve_feeder: bool = False
 ) -> _SourceChoice:
@@ -2682,8 +2742,8 @@ def _resolve_source(
         raw_options: The device's option tuples, as ``get_options()`` returns
             them.
         requested: The source name the caller asked for.
-        resolve_feeder: Manual duplex. Resolve a feeder from the device's own
-            list via ``_choose_feeder_source`` instead of validating
+        resolve_feeder: Manual duplex. Resolve a feeder by
+            ``_resolve_manual_duplex_source`` instead of validating
             ``requested`` alone.
 
     Returns:
@@ -2695,8 +2755,9 @@ def _resolve_source(
             request, unless the request is a flatbed and the device offers
             ``Auto``; or if the request matches several of them. For manual
             duplex: if the device has no source option and ``requested`` does
-            not name a feeder, if every feeder it reports scans both sides, or
-            if it reports no source that feeds.
+            not name a feeder, if its source list cannot be read and
+            ``requested`` does not name a single-sided feeder, if every feeder
+            it reports scans both sides, or if it reports no source that feeds.
 
     """
     reported = _constraint(raw_options, "source")
@@ -2705,24 +2766,9 @@ def _resolve_source(
     # A disjoint early branch, not a guard inside the flow below: returning
     # here makes the Auto substitution structurally unreachable for manual
     # duplex rather than merely conditioned off, and that substitution is what
-    # turned each pass into one platen snapshot reported as success. A device
-    # with no source option at all feeds without
-    # being told and nothing is assigned to it, so the both-sides concern
-    # cannot arise; the simplex path already trusts the classifier on the
-    # configured name for such a device, and manual duplex does the same,
-    # which keeps a legacy "Manual Duplex" profile working there.
+    # turned each pass into one platen snapshot reported as success.
     if resolve_feeder:
-        if not reported.present:
-            if classify_source(requested).uses_feeder:
-                return _SourceChoice(requested, has_option=False, substituted_from=None)
-            msg = (
-                "Manual duplex needs a feeder source, and this device "
-                "exposes no source option to choose one; set source to the "
-                f"name of its feeder (got {requested!r})"
-            )
-            raise ScanError(msg)
-        feeder = _choose_feeder_source(available_sources, requested)
-        return _SourceChoice(feeder, has_option=True, substituted_from=None)
+        return _resolve_manual_duplex_source(reported, requested)
 
     if not reported.present:
         return _SourceChoice(requested, has_option=False, substituted_from=None)

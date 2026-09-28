@@ -150,6 +150,12 @@ Some scanners expose no `source` option at all, so saneless has no source to sel
 Manual duplex needs a feeder source, and this device exposes no source option to choose one; set source to the name of its feeder (got 'Flatbed')
 ```
 
+Other scanners have a `source` option but report its list in a form saneless cannot read. saneless then selects the source your profile names and leaves the scanner to accept or refuse it, as it does for a one-sided scan. Because it cannot see which sources scan both sides, manual duplex runs only when `source` names a single-sided feeder, such as `ADF`. Any other source, including a both-sides feeder such as `ADF Duplex`, is refused before any page is fed:
+
+```
+Manual duplex needs a single-sided document feeder, and this device's list of sources could not be read to find one; set source to the name of its single-sided feeder (got 'ADF Duplex')
+```
+
 !!! info "Auto source scanners"
     If your scanner reports only an `Auto` source instead of `ADF` or `ADF Duplex`, you can
     route it to multi-page ADF behavior by setting `auto_source_mode = "adf"` in your profile.
