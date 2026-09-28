@@ -25,6 +25,7 @@ reuse it.
 
 from __future__ import annotations
 
+import dataclasses
 import html
 import re
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.paperless import PaperlessClient
+from saneless.scanner.base import PassCapReached
 from saneless.vocabulary import (
     TERMINAL_STATES,
     JobState,
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
     from click.testing import Result
 
     from saneless.job import Job, JobStore
+    from saneless.scanner.base import PageSink, ScanBatch, ScanSettings
     from saneless.vocabulary import PassPrompt
     from saneless.worker import ScanWorker
 
@@ -768,6 +771,35 @@ def test_cli_skipped_sheet_is_reported_and_exits_7(
     assert "Warning:" not in run.result.stdout
     assert _warning_lines(run.result.stderr) == [f"Warning: {_SKIPPED_SHEET}"]
     assert len(run.recorder.uploads()) == 1
+
+
+def test_cli_pass_cap_is_reported_and_exits_7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan that stopped at its per-pass cap uploads its pages, warned."""
+    original = DistinctPageScanner.scan_pages
+
+    def capped(
+        self: DistinctPageScanner,
+        device_id: str,
+        settings: ScanSettings,
+        sink: PageSink,
+    ) -> ScanBatch:
+        batch = original(self, device_id, settings, sink)
+        return dataclasses.replace(
+            batch, cap_reached=PassCapReached(500, 501, auto_source=False)
+        )
+
+    monkeypatch.setattr(DistinctPageScanner, "scan_pages", capped)
+
+    run = _run_cli(tmp_path, monkeypatch, _SIMPLEX_RUN)
+
+    assert run.result.exit_code == 7, run.result.output
+    assert len(run.recorder.uploads()) == 1
+    assert _WARNED_LINE in run.result.stdout
+    assert "Done:" not in run.result.stdout
+    (line,) = _warning_lines(run.result.stderr)
+    assert "sheet 501 was fed but not kept" in line
 
 
 def test_cli_duplex_count_mismatch_is_reported_and_exits_7(

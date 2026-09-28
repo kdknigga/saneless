@@ -105,6 +105,7 @@ __all__ = [
     "page_timeout_error",
     "pages_phrase",
     "pass_answer_label",
+    "pass_cap_warning",
     "pass_prompt_copy",
     "pass_wait_state",
     "progress_label",
@@ -116,6 +117,7 @@ __all__ = [
     "sixteen_bit_error",
     "source_not_offered_error",
     "state_label",
+    "substituted_source_warning",
     "timeout_finish_warning",
     "worker_health_detail",
 ]
@@ -1434,6 +1436,74 @@ def cap_finish_warning(pages_kept: int, cap: int) -> str:
         f"Finished at {pages_phrase(pages_kept)}: no new scan starts once a "
         f"document has {pages_phrase(cap)}. Scan any remaining pages as a new "
         "document."
+    )
+
+
+def pass_cap_warning(
+    pages_kept: int, cap: int, sheet_not_kept: int, *, auto_source: bool
+) -> str:
+    """
+    Return the warning for a scan that stopped at its per-pass sheet cap.
+
+    A feeder can only tell a full hopper from a runaway by feeding one more
+    sheet, so the sheet past the cap was fed and thrown away. The sentence
+    names that sheet, so the operator knows where to resume, and shares
+    ``cap_finish_warning``'s lead and tail so both caps read as one family.
+    An Auto source sent through the feeder has a lower cap because a platen
+    rescanned as a feeder never reports the end of its feed; its sentence
+    also says how to keep that source on the glass. Only counts are
+    interpolated.
+
+    Args:
+        pages_kept: How many pages the finished document holds.
+        cap: The sheet count at which one scan stops.
+        sheet_not_kept: The sheet that was fed but not kept.
+        auto_source: Whether the capped scan was an Auto source sent through
+            the feeder rather than a source named as a feeder.
+
+    Returns:
+        The warning sentence.
+
+    """
+    lead = f"Finished at {pages_phrase(pages_kept)}: "
+    stopped = (
+        f"stops after {_counted(cap, 'sheet')}, so sheet {sheet_not_kept} was "
+        "fed but not kept."
+    )
+    resume = f"sheet {sheet_not_kept} and any remaining pages as a new document."
+    if auto_source:
+        return (
+            f"{lead}a scan from an Auto source through the feeder {stopped} If "
+            "the feeder was already empty, the scanner was scanning its glass "
+            'again; set auto_source_mode = "flatbed" for this profile. Otherwise '
+            f"scan {resume}"
+        )
+    return f"{lead}one scan {stopped} Scan {resume}"
+
+
+def substituted_source_warning(requested: str) -> str:
+    """
+    Return the warning for a flatbed request scanned through the feeder instead.
+
+    A scanner that lists no source matching a flatbed request may still offer
+    Auto, and a profile whose ``auto_source_mode`` is ``"adf"`` sends Auto
+    through the feeder. The scan then did something other than what the
+    profile named, so the job finishes with this warning rather than as a
+    clean success. The name is shown with ``repr`` so an empty or padded name
+    is visible. The caller neutralises the requested name before passing it
+    in.
+
+    Args:
+        requested: The source the profile asked for.
+
+    Returns:
+        The warning sentence.
+
+    """
+    return (
+        f"The scanner has no source named {requested!r}, so its Auto source was "
+        "scanned through the feeder, because this profile's auto_source_mode is "
+        '"adf". Set the profile\'s source to one the scanner lists.'
     )
 
 

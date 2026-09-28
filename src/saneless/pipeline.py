@@ -35,6 +35,7 @@ from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
+from saneless.text_safety import neutralise_controls
 from saneless.vocabulary import (
     ErrorCategory,
     FlipOutcome,
@@ -46,7 +47,9 @@ from saneless.vocabulary import (
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
+    pass_cap_warning,
     pass_wait_state,
+    substituted_source_warning,
     timeout_finish_warning,
 )
 from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace, has_pages_left
@@ -57,7 +60,7 @@ if TYPE_CHECKING:
 
     from saneless.config import ProfileConfig, Settings
     from saneless.paperless import PaperlessClient, UploadResult
-    from saneless.scanner.base import PageRecord, ScannerBackend
+    from saneless.scanner.base import PageRecord, PassCapReached, ScannerBackend
 
 __all__ = [
     "MAX_DOCUMENT_PAGES",
@@ -1130,6 +1133,10 @@ class _AcceptedPass:
             skipped together: the last ``pages`` records are this pass's.
         kept: How many of them were kept.
         rejected: How many fed sheets the pass could not read.
+        cap: The per-pass cap the pass stopped at, or None when it ended on
+            its own.  Kept here so a pass thrown away takes it along.
+        substituted: The source the pass asked for when the scanner's Auto
+            source took it through the feeder instead, or None.
 
     """
 
@@ -1137,6 +1144,8 @@ class _AcceptedPass:
     pages: int
     kept: int
     rejected: int
+    cap: PassCapReached | None
+    substituted: str | None
 
 
 @dataclass
@@ -1189,6 +1198,22 @@ class _MultiPageDocument:
                 if position not in removed
             ),
             None,
+        )
+
+    def substituted(self) -> str | None:
+        """
+        Return the source a pass asked for when Auto took it through the feeder.
+
+        Every pass of a document scans from the same profile, so the first
+        accepted pass that carries a substitution speaks for all of them, and
+        the warning built from it is said once however many carried it.
+
+        Returns:
+            The requested source, or None when no accepted pass carries one.
+
+        """
+        return next(
+            (p.substituted for p in self.passes if p.substituted is not None), None
         )
 
     @property
@@ -1284,6 +1309,56 @@ def _rejected_pages_warning(count: int) -> str | None:
     warning = (
         f"{count} page(s) could not be read by the scanner and were skipped. "
         f"They were not removed for being blank; rescan those sheets."
+    )
+    logger.warning(warning)
+    return warning
+
+
+def _substitution_warning(requested: str | None) -> str | None:
+    """
+    Say that a flatbed request was scanned through the feeder, and log it.
+
+    The backend records the requested source only when the scanner's Auto
+    source stood in for it on the feeder path, so a substitution that stayed
+    on the glass reaches here as None and the job stays a plain success. The
+    name comes from the profile and was matched against the device's list, so
+    it is neutralised before it reaches a log line, the web UI or a terminal.
+
+    Args:
+        requested: The source the profile asked for, or None when nothing was
+            substituted on the feeder path.
+
+    Returns:
+        The warning text, or None when there was no such substitution.
+
+    """
+    if requested is None:
+        return None
+    warning = substituted_source_warning(neutralise_controls(requested))
+    logger.warning(warning)
+    return warning
+
+
+def _pass_cap_warning(cap: PassCapReached | None, pages_kept: int) -> str | None:
+    """
+    Say that a pass stopped at its per-pass cap, and log it, if one did.
+
+    The pages before the cap were kept and are delivered; the sheet past it
+    was fed and thrown away, so the warning names it for the operator to
+    resume from.
+
+    Args:
+        cap: The cap the pass reached, or None when it ended on its own.
+        pages_kept: How many pages the finished document holds.
+
+    Returns:
+        The warning text, or None when no cap was reached.
+
+    """
+    if cap is None:
+        return None
+    warning = pass_cap_warning(
+        pages_kept, cap.cap, cap.sheet_not_kept, auto_source=cap.auto_source
     )
     logger.warning(warning)
     return warning
@@ -2289,8 +2364,8 @@ class _PipelineRun:
         Returns:
             The prompt after a failed pass, the next-pass prompt after an
             accepted one, or None when the document is finished: nobody
-            answered about the pass's blank pages, or the pass took the
-            document to the page cap.
+            answered about the pass's blank pages, the pass stopped at its
+            own cap, or the pass took the document to the page cap.
 
         Raises:
             ScanInterrupted: If saneless began stopping after the answer
@@ -2313,7 +2388,15 @@ class _PipelineRun:
             decision = self._settle_blanks(context, document, *scanned)
             if decision is not PassAnswer.RESCAN:
                 break
-        if decision is PassAnswer.TIMED_OUT:
+        # A pass that stopped at its own cap left a sheet in the feeder that
+        # was fed and thrown away, so the document ends here.  Its sentence
+        # already says to scan the rest as a new document, so the document
+        # cap below would only say that again and is not checked.  The pass
+        # just accepted is the last one: Re-scan at the blank prompt never
+        # accepts it, and no next-pass prompt follows a capped one.
+        pass_cap = _pass_cap_warning(document.passes[-1].cap, document.kept)
+        if decision is PassAnswer.TIMED_OUT or pass_cap is not None:
+            document.warning = _join_warnings(document.warning, pass_cap)
             return None
         # Read at call time rather than bound at import, and checked here,
         # between passes, only: the pass that crossed the cap is kept whole.
@@ -2578,6 +2661,8 @@ class _PipelineRun:
                 pages=pages,
                 kept=pages - len(skipped),
                 rejected=batch.pages_rejected,
+                cap=batch.cap_reached,
+                substituted=batch.substituted_source,
             )
         )
         document.unreadable += batch.pages_rejected
@@ -2773,6 +2858,13 @@ class _PipelineRun:
         self.artefacts.stage = preservation.RunStage.FILTERING
         self.artefacts.document = tuple(records)
         rejected_warning = _rejected_pages_warning(batch.pages_rejected)
+        # What the backend measured about the pass, each worded once: a
+        # flatbed request the scanner's Auto source took through the feeder,
+        # and a pass that stopped at its cap with the pages before it kept.
+        # Blank removal is reported apart, so the pages kept are every page
+        # the pass delivered.
+        substitution_warning = _substitution_warning(batch.substituted_source)
+        cap_warning = _pass_cap_warning(batch.cap_reached, len(records))
 
         # There is no per-page EXIF strip here, and one would have nothing to
         # act on.  python-sane builds each page with ``Image.frombuffer``,
@@ -2800,7 +2892,9 @@ class _PipelineRun:
             # this number to users as pages removed for being blank.
             pages_removed=len(filtered.removed_positions),
             pages_uploaded=len(filtered.kept),
-            warning=_join_warnings(warning, rejected_warning),
+            warning=_join_warnings(
+                warning, rejected_warning, substitution_warning, cap_warning
+            ),
             # Information beside the count, never folded into the warning:
             # removing blank pages leaves a plain success.
             removed_positions=filtered.removed_positions,
@@ -2823,8 +2917,8 @@ class _PipelineRun:
 
         Returns:
             How the run resolved.  Its warning says why the document finished
-            without the operator pressing Finish, beside any delivery or
-            unreadable-sheet warning.
+            without the operator pressing Finish, beside any delivery,
+            unreadable-sheet or source-substitution warning.
 
         Raises:
             AllPagesBlankError: If no page is kept; the guard keeps the
@@ -2853,6 +2947,7 @@ class _PipelineRun:
             if position not in skipped
         ]
         rejected_warning = _rejected_pages_warning(document.unreadable)
+        substitution_warning = _substitution_warning(document.substituted())
         pdf_path = self._assemble(kept)
         outcome, warning = self._deliver_document(pdf_path)
         result = ScanResult(
@@ -2860,7 +2955,9 @@ class _PipelineRun:
             pages_scanned=len(records),
             pages_removed=len(removed),
             pages_uploaded=len(kept),
-            warning=_join_warnings(warning, rejected_warning, document.warning),
+            warning=_join_warnings(
+                warning, rejected_warning, document.warning, substitution_warning
+            ),
             removed_positions=removed,
         )
         self._notify(PipelineEvent.DONE)

@@ -63,7 +63,7 @@ from saneless.pipeline import (
     run_pipeline,
 )
 from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
-from saneless.scanner.base import DeviceInfo, ScannerBackend
+from saneless.scanner.base import DeviceInfo, PassCapReached, ScannerBackend
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import (
@@ -72,6 +72,8 @@ from saneless.vocabulary import (
     JobState,
     ScanOutcome,
     classify_error,
+    pass_cap_warning,
+    substituted_source_warning,
 )
 from saneless.workspace import SPOOL_DIR_NAME, find_orphans, sweep_orphans
 from tests.blank_fixtures import (
@@ -5973,6 +5975,148 @@ class TestRejectedPagesAreNotBlankPages:
 
         assert result.pages_removed == 0
         assert result.warning is None
+
+
+class TestBatchFactWarnings:
+    """
+    What the backend measured about a pass finishes the job warned.
+
+    A flatbed request the scanner's Auto source took through the feeder, and a
+    pass that stopped at its per-pass cap, both upload the pages kept and end
+    as a warned DONE, each worded once beside any unreadable-sheet warning.
+    """
+
+    def _run(
+        self,
+        scanner: MagicMock,
+        paperless: MagicMock,
+        settings: Settings,
+        tmp_path: Path,
+    ) -> ScanResult:
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+            return run_pipeline(
+                scanner=scanner,
+                paperless=paperless,
+                settings=settings,
+                request=PipelineRequest(profile_name="default", title="Facts"),
+            )
+
+    def test_a_substitution_through_the_feeder_is_a_warned_done(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The requested source and the feeder routing are in the warning."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(2)], substituted_source="Flatbed"
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        assert substituted_source_warning("Flatbed") in result.warning
+        mock_paperless.upload_document.assert_called_once()
+
+    def test_no_substitution_fact_is_a_plain_done(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A substitution kept on the glass reaches the pipeline as no fact."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(2)]
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+
+    def test_a_named_feeder_cap_uploads_the_pages_kept_and_warns(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The kept pages go up, and the warning names the sheet not kept."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(3)],
+            cap_reached=PassCapReached(500, 501, auto_source=False),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_uploaded == 3
+        mock_paperless.upload_document.assert_called_once()
+        assert result.warning == pass_cap_warning(3, 500, 501, auto_source=False)
+
+    def test_an_auto_source_cap_carries_the_auto_sentence(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The lower Auto cap is worded with its own advice."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(3)],
+            cap_reached=PassCapReached(50, 51, auto_source=True),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.warning == pass_cap_warning(3, 50, 51, auto_source=True)
+
+    def test_every_fact_is_joined_once(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Substitution, cap and unreadable sheets share one warning."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(3)],
+            rejected=2,
+            substituted_source="Flatbed",
+            cap_reached=PassCapReached(50, 51, auto_source=True),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.warning is not None
+        substitution = substituted_source_warning("Flatbed")
+        cap = pass_cap_warning(3, 50, 51, auto_source=True)
+        assert result.warning.count(substitution) == 1
+        assert result.warning.count(cap) == 1
+        assert result.warning.count("2 page(s) could not be read") == 1
+
+    def test_a_control_character_in_the_requested_name_is_neutralised(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """An escape sequence in the name never reaches the warning raw."""
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image()], substituted_source="Flat\x1b[2Jbed"
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.warning is not None
+        assert "\x1b" not in result.warning
+        assert "Flat" in result.warning
 
 
 class TestTitleLogEscaping:
