@@ -47,7 +47,7 @@ from tests.fake_sane import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from PIL import Image
 
@@ -60,6 +60,8 @@ _INT_TYPE_ERROR = "SANE_INT and SANE_BOOL require an integer"
 _FIXED_TYPE_ERROR = "SANE_FIXED requires a floating point number"
 _CANCELLED = "Operation was canceled"
 _JAMMED = "Document feeder jammed"
+_CLOSED = "SaneDev object is closed"
+_FEEDER = "Automatic Document Feeder"
 
 # Option names the rows assign that the ``SaneDevice`` protocol does not
 # declare, so they are reached through ``setattr`` and ``getattr``.
@@ -67,6 +69,9 @@ _DEPTH = "depth"
 _PPL_LOSS = "ppl_loss"
 _READ_RETURN_VALUE = "read_return_value"
 _UNKNOWN_NAME = "no_such_option"
+# A method name, assigned to spy on it: python-sane stores any name that is not
+# an option on the handle itself, which shadows the method of that name.
+_CANCEL = "cancel"
 
 # The options the rows below assign on the real device, in the order they are
 # put back.  Read once before the first row touches them and written back
@@ -613,6 +618,125 @@ class TestReads:
         assert list(handle.multi_scan()) == []
 
 
+def _write_mode(handle: SaneDevice) -> None:
+    """
+    Assign an option, as configuring a scan does.
+
+    Args:
+        handle: The handle to write through.
+
+    """
+    handle.mode = "Gray"
+
+
+def _next_page(handle: SaneDevice) -> Image.Image:
+    """
+    Ask a fresh feeder iterator for its first page.
+
+    Args:
+        handle: The handle to scan through.
+
+    Returns:
+        The page, if the read succeeds.
+
+    """
+    return next(handle.multi_scan())
+
+
+# Every call a closed handle refuses, named for the row id.  ``close()`` is the
+# one call left out: closing again is allowed and does nothing.
+_CALLS_AFTER_CLOSE: list[tuple[str, Callable[[SaneDevice], object]]] = [
+    ("cancel", lambda handle: handle.cancel()),
+    ("get_options", lambda handle: handle.get_options()),
+    ("option_read", lambda handle: handle.mode),
+    ("option_write", _write_mode),
+    ("start", lambda handle: handle.start()),
+    ("snap", lambda handle: handle.snap()),
+    ("next_page", _next_page),
+]
+
+
+class TestHandles:
+    """
+    What a handle is: a new one per open, closed for good, cancelled when dropped.
+
+    ``test:0`` also refuses a second open while one handle is still open, with
+    "Device busy".  That is the test backend's rule, and typically a USB
+    backend's, not one libsane imposes on every device, so the double does not
+    model it and no row asserts it.
+    """
+
+    def test_dropping_a_feeder_iterator_cancels_its_handle(
+        self, target: ContractTarget
+    ) -> None:
+        """
+        The iterator's finaliser calls ``cancel()`` on the handle that made it.
+
+        So an iterator let go of after a timeout sends a cancel of its own,
+        on whichever thread drops the last reference to it.
+        """
+        handle = target.open()
+        handle.source = _FEEDER
+        cancels: list[str] = []
+
+        def spy() -> None:
+            cancels.append(_CANCEL)
+
+        setattr(handle, _CANCEL, spy)
+        iterator = handle.multi_scan()
+
+        del iterator
+
+        assert cancels == [_CANCEL]
+
+    @pytest.mark.parametrize(
+        "call",
+        [pytest.param(call, id=name) for name, call in _CALLS_AFTER_CLOSE],
+    )
+    def test_a_closed_handle_refuses_every_call(
+        self, target: ContractTarget, call: Callable[[SaneDevice], object]
+    ) -> None:
+        """Once closed, a handle raises the SANE error for anything but close."""
+        handle = target.open()
+        handle.close()
+
+        with pytest.raises(target.error_type) as raised:
+            call(handle)
+
+        assert str(raised.value) == _CLOSED
+
+    def test_a_second_close_is_harmless_and_does_not_reopen(
+        self, target: ContractTarget
+    ) -> None:
+        """Closing twice raises nothing, and the handle stays closed."""
+        handle = target.open()
+        handle.close()
+
+        handle.close()
+
+        with pytest.raises(target.error_type) as raised:
+            handle.cancel()
+        assert str(raised.value) == _CLOSED
+
+    def test_each_open_is_a_new_handle_and_option_values_carry_over(
+        self, target: ContractTarget
+    ) -> None:
+        """
+        ``open()`` makes a new handle, but the device keeps its option values.
+
+        So a value one scan left behind is still set when the next scan opens
+        the device, unless that scan sets it again.
+        """
+        first = target.open()
+        first.mode = "Color"
+        first.close()
+
+        second = target.open()
+
+        assert second is not first
+        assert second.mode == "Color"
+
+
 class TestInit:
     """What ``init()`` returns."""
 
@@ -749,12 +873,28 @@ class TestTheDoubleItself:
             dev.mode = "Lineart"
         assert str(raised.value) == _INVALID_ARGUMENT
 
-    def test_module_open_returns_the_shared_device(self) -> None:
-        """``open()`` hands back one device, so a test can configure it."""
+    def test_a_closed_handle_refuses_before_the_device_counts_anything(
+        self,
+    ) -> None:
+        """
+        A refused call reaches nothing, and only the first close is counted.
+
+        The C layer checks for a closed handle before it makes any SANE call,
+        so the double's counters must not move either: a test counting
+        cancels would otherwise count one the device never received.
+        """
         module = FakeSaneModule()
-        module.init()
-        assert module.init_call_count == 1
-        assert module.open(_DEVICE) is module.open(_DEVICE)
+        handle = module.open(_DEVICE)
+        handle.close()
+        handle.close()
+
+        for call in (handle.start, handle.snap, handle.cancel):
+            with pytest.raises(FakeSaneError):
+                call()
+
+        assert module.device.calls == []
+        assert module.device.cancel_calls == 0
+        assert module.device.close_calls == 1
 
     def test_module_init_reports_the_version_libsane_1_0_32_returned(self) -> None:
         """
