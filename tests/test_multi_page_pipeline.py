@@ -47,7 +47,7 @@ from saneless.exceptions import (
     failure_text,
 )
 from saneless.pages import generate_thumbnail, is_blank
-from saneless.paperless import ApiDelivery, PaperlessClient, UploadResult
+from saneless.paperless import ApiDelivery, PaperlessClient, TaskFiled, UploadResult
 from saneless.pipeline import (
     AnswerSlot,
     FlipAnswerSlot,
@@ -530,7 +530,7 @@ def _uploading_paperless(uploads: list[bytes]) -> MagicMock:
         return ApiDelivery(task_id=f"task-{len(uploads)}")
 
     paperless.upload_document.side_effect = _upload
-    paperless.poll_task.return_value = None
+    paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
     return paperless
 
 

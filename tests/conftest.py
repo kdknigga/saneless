@@ -29,7 +29,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.paperless import ApiDelivery, PaperlessClient, PaperlessTiming
+from saneless.paperless import ApiDelivery, PaperlessClient, PaperlessTiming, TaskFiled
 from saneless.pipeline import FlipCoordinator
 from saneless.scanner import _listing_child
 from saneless.scanner import listing as listing_mod
@@ -1000,11 +1000,9 @@ def mock_paperless() -> MagicMock:
     """Return a mock PaperlessClient that succeeds."""
     paperless = MagicMock(spec=PaperlessClient)
     paperless.upload_document.return_value = ApiDelivery(task_id="mock-task-uuid")
-    # poll_task's return value is not part of its contract: after OUTC-01 a
-    # successful poll is "it returned" and a failed one is "it raised", so a
-    # stub that hands back a status dict would encode a contract that no longer
-    # exists.  None keeps this fixture honest about what success means.
-    paperless.poll_task.return_value = None
+    # A poll that filed the document; a failed one raises, and a duplicate
+    # refusal returns a TaskDuplicate, which a test sets for itself.
+    paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
     return paperless
 
 

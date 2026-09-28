@@ -38,6 +38,7 @@ from saneless.exceptions import (
     NoScannerFoundError,
     PaperlessError,
     PaperlessTimeoutError,
+    PaperlessUnconfirmedError,
     PdfError,
     ScanCancelledError,
     ScanError,
@@ -52,6 +53,8 @@ from saneless.paperless import (
     FolderDelivery,
     PaperlessClient,
     PaperlessTiming,
+    TaskDuplicate,
+    TaskFiled,
     UploadResult,
 )
 from saneless.pdf import assemble_pdf
@@ -88,8 +91,10 @@ from saneless.vocabulary import (
     backs_pass_cap_note,
     backs_pass_cap_warning,
     classify_error,
+    duplicate_warning,
     error_advice,
     exit_code_for,
+    exit_code_for_outcome,
     pass_cap_note,
     pass_cap_warning,
     substituted_source_warning,
@@ -239,7 +244,7 @@ class TestRunPipeline:
         mock_paperless.upload_document.return_value = ApiDelivery(
             task_id="task-uuid-123"
         )
-        mock_paperless.poll_task.return_value = {"status": "SUCCESS"}
+        mock_paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
 
         request = PipelineRequest(profile_name="default", title="Poll Doc")
         run_pipeline(
@@ -3331,7 +3336,7 @@ def _delivering_to_api(task_id: str = "task-uuid-1") -> MagicMock:
     """Return a paperless client whose upload reaches the API and polls clean."""
     paperless = MagicMock()
     paperless.upload_document.return_value = ApiDelivery(task_id=task_id)
-    paperless.poll_task.return_value = None
+    paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
     return paperless
 
 
@@ -5445,7 +5450,7 @@ def _both_halves_delivered() -> MagicMock:
         ApiDelivery(task_id="fronts-task"),
         ApiDelivery(task_id="backs-task"),
     ]
-    paperless.poll_task.return_value = None
+    paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
     return paperless
 
 
@@ -5551,7 +5556,7 @@ class TestDuplexMismatchDelivery:
         default_settings.profiles["default"].duplex = "manual"
         paperless = _both_halves_delivered()
         paperless.poll_task.side_effect = [
-            None,
+            TaskFiled(task={"status": "SUCCESS"}),
             PaperlessError("Paperless reported FAILURE"),
         ]
 
@@ -5858,7 +5863,7 @@ class TestDuplexMismatchDelivery:
             ApiDelivery(task_id="fronts-task"),
             FolderDelivery(path=tmp_path / "consume" / "backs.pdf"),
         ]
-        paperless.poll_task.return_value = None
+        paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
 
         result = run_pipeline(
             scanner=_mismatched_duplex_scanner(),
@@ -5874,6 +5879,283 @@ class TestDuplexMismatchDelivery:
 
         assert result.outcome is ScanOutcome.FALLBACK
         assert paperless.poll_task.call_count == 1
+
+
+def _mismatch_request(title: str) -> PipelineRequest:
+    """Return the request for a manual duplex run that ends in a mismatch."""
+    return PipelineRequest(
+        profile_name="default",
+        title=title,
+        job_id="job-dx-half",
+        flip_coordinator=AlwaysContinueFlipCoordinator(),
+    )
+
+
+def _manual_duplex(settings: Settings, tmp_path: Path) -> Path:
+    """Set the default profile to manual duplex and return the failed dir."""
+    failed_dir = _isolate_dirs(settings, tmp_path)
+    settings.profiles["default"].source = "ADF"
+    settings.profiles["default"].duplex = "manual"
+    return failed_dir
+
+
+def _kept_pdfs(failed_dir: Path) -> list[str]:
+    """Return the names of the PDFs kept in failed/, sorted."""
+    return sorted(path.name for path in failed_dir.glob("*.pdf"))
+
+
+class TestDuplicateIsAWarnedDelivery:
+    """paperless-ngx already holding the file is a delivered scan, not a failure."""
+
+    def test_duplicate_single_document_is_done_with_a_warning(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The scan succeeds, names the document, exits 7 and keeps nothing."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.return_value = TaskDuplicate(document_id=42, in_trash=False)
+
+        result = run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(profile_name="default", title="Twice"),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == duplicate_warning(42, in_trash=False)
+        assert "#42" in result.warning
+        assert (
+            exit_code_for_outcome(result.outcome, result.warning)
+            is ExitCode.UPLOADED_WITH_WARNING
+        )
+        assert _kept_pdfs(failed_dir) == []
+
+    def test_duplicate_in_the_trash_says_so(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The trash note reaches the job's warning."""
+        _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.return_value = TaskDuplicate(
+            document_id=None, in_trash=True
+        )
+
+        result = run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(profile_name="default", title="Trashed"),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == duplicate_warning(None, in_trash=True)
+
+    def test_filed_task_carries_no_duplicate_warning(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A filed task stays a plain success."""
+        _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
+
+        result = run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(profile_name="default", title="Once"),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+
+    def test_duplicate_backs_half_joins_the_mismatch_warning(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A duplicate half is still delivered; both sentences are kept."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = [
+            TaskFiled(task={"status": "SUCCESS"}),
+            TaskDuplicate(document_id=42, in_trash=False),
+        ]
+
+        result = run_pipeline(
+            scanner=_mismatched_duplex_scanner(fronts=3, backs=2),
+            paperless=paperless,
+            settings=default_settings,
+            request=_mismatch_request("Half Twice"),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        assert "Page count mismatch: 3 fronts, 2 backs" in result.warning
+        assert (
+            duplicate_warning(42, in_trash=False, half=preservation_module.BACKS_SUFFIX)
+            in result.warning
+        )
+        assert _kept_pdfs(failed_dir) == []
+
+    def test_duplicate_on_both_halves_names_each(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Each half's duplicate sentence names that half."""
+        _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = [
+            TaskDuplicate(document_id=7, in_trash=False),
+            TaskDuplicate(document_id=8, in_trash=True),
+        ]
+
+        result = run_pipeline(
+            scanner=_mismatched_duplex_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=_mismatch_request("Both Twice"),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        fronts = duplicate_warning(
+            7, in_trash=False, half=preservation_module.FRONTS_SUFFIX
+        )
+        backs = duplicate_warning(
+            8, in_trash=True, half=preservation_module.BACKS_SUFFIX
+        )
+        assert fronts in result.warning
+        assert backs in result.warning
+        assert result.warning.index(fronts) < result.warning.index(backs)
+
+
+class TestPerHalfDelivery:
+    """Once one half of a mismatch is in paperless-ngx, a failure is unconfirmed."""
+
+    def test_per_half_backs_upload_refused_after_the_fronts_were_accepted(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The headline names the delivered half, and a rescan is not invited."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        refused = PaperlessError("refused 400")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = [
+            ApiDelivery(task_id="fronts-task"),
+            refused,
+        ]
+
+        with pytest.raises(PaperlessUnconfirmedError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Half Refused"),
+            )
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            "The (fronts) half reached paperless-ngx; the (backs) half failed: "
+            "refused 400"
+        )
+        assert excinfo.value.__cause__ is refused
+        assert classify_error(excinfo.value) is ErrorCategory.UNCONFIRMED_FILING
+        assert exit_code_for(classify_error(excinfo.value)) is ExitCode.UNCONFIRMED
+        (fronts,) = failed_dir.glob("*-fronts.pdf")
+        (backs,) = failed_dir.glob("*-backs.pdf")
+        text = failure_text(excinfo.value)
+        assert f"{fronts.name} had already been accepted by paperless-ngx" in text
+        assert f"{backs.name} had already" not in text
+        paperless.poll_task.assert_not_called()
+
+    def test_per_half_fronts_upload_failure_propagates_unchanged(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Nothing reached paperless-ngx, so the error is the upload's own."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        refused = PaperlessError("fronts refused 400")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = refused
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Nothing Sent"),
+            )
+
+        assert excinfo.value is refused
+        assert type(excinfo.value) is PaperlessError
+        assert paperless.upload_document.call_count == 1
+        assert len(_kept_pdfs(failed_dir)) == 2
+
+    def test_per_half_fronts_poll_failure_names_the_backs_as_delivered(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """Both were accepted; the fronts task is the half that failed."""
+        _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        failure = PaperlessUnconfirmedError("Paperless task fronts-task ended FAILURE")
+        paperless.poll_task.side_effect = failure
+
+        with pytest.raises(PaperlessUnconfirmedError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Fronts Poll"),
+            )
+
+        assert str(excinfo.value).startswith(
+            "The (backs) half reached paperless-ngx; the (fronts) half failed: "
+            "Paperless task fronts-task ended FAILURE"
+        )
+        assert excinfo.value.__cause__ is failure
+
+    def test_per_half_backs_poll_failure_names_the_fronts_as_delivered(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """The fronts were filed; the backs task never confirmed."""
+        failed_dir = _manual_duplex(default_settings, tmp_path)
+        paperless = _both_halves_delivered()
+        timeout = PaperlessTimeoutError("Paperless task backs-task did not finish")
+        paperless.poll_task.side_effect = [TaskFiled(task={}), timeout]
+
+        with pytest.raises(PaperlessUnconfirmedError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Backs Poll"),
+            )
+
+        assert str(excinfo.value).startswith(
+            "The (fronts) half reached paperless-ngx; the (backs) half failed: "
+            "Paperless task backs-task did not finish"
+        )
+        assert excinfo.value.__cause__ is timeout
+        assert classify_error(excinfo.value) is ErrorCategory.UNCONFIRMED_FILING
+        assert len(_kept_pdfs(failed_dir)) == 2
+
+    def test_per_half_interruption_passes_through_unchanged(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """A stop during the backs upload is still a stop, not a failed half."""
+        _manual_duplex(default_settings, tmp_path)
+        stop = ScanInterrupted("server stopping")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = [
+            ApiDelivery(task_id="fronts-task"),
+            stop,
+        ]
+
+        with pytest.raises(ScanInterrupted) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=_mismatch_request("Stopped"),
+            )
+
+        assert excinfo.value is stop
 
 
 class TestTheDpiTheDeviceActuallyChose:

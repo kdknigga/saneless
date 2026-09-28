@@ -78,6 +78,7 @@ from saneless.vocabulary import (
     cap_finish_warning,
     classify_error,
     connection_status_message,
+    duplicate_warning,
     duration_phrase,
     error_advice,
     error_message,
@@ -86,6 +87,7 @@ from saneless.vocabulary import (
     exit_code_for_outcome,
     exit_code_for_signal,
     flip_answer_label,
+    half_delivery_error,
     is_amber_category,
     job_label,
     job_state_for,
@@ -1927,6 +1929,63 @@ class TestRestartWording:
         bad = cast("JobState", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             restart_category(bad)
+
+
+class TestDuplicateWarning:
+    """A duplicate refusal is a delivered scan, worded as such."""
+
+    def test_duplicate_warning_names_the_document(self) -> None:
+        """The id, what did not happen, and nothing that invites a rescan."""
+        warning = duplicate_warning(42, in_trash=False)
+        assert warning == (
+            "paperless-ngx already holds this file as document #42; it was not "
+            "stored again, and this scan's title and tags were not applied to it."
+        )
+
+    def test_duplicate_warning_without_an_id_says_an_existing_document(
+        self,
+    ) -> None:
+        """No id in the answer is never "document #None"."""
+        warning = duplicate_warning(None, in_trash=False)
+        assert "an existing document" in warning
+        assert "#" not in warning
+        assert "None" not in warning
+        assert "was not stored again" in warning
+
+    @pytest.mark.parametrize("document_id", [42, None])
+    def test_duplicate_warning_in_the_trash_says_so(
+        self, document_id: int | None
+    ) -> None:
+        """A trashed original is where the user must look for it."""
+        warning = duplicate_warning(document_id, in_trash=True)
+        assert warning.startswith(duplicate_warning(document_id, in_trash=False))
+        assert warning.endswith("That document is in paperless-ngx's trash.")
+
+    def test_duplicate_warning_can_name_the_half(self) -> None:
+        """A split duplex job says which of its two PDFs was the duplicate."""
+        warning = duplicate_warning(42, in_trash=False, half="(backs)")
+        assert warning.startswith(
+            "paperless-ngx already holds the (backs) half as document #42;"
+        )
+
+    def test_duplicate_warning_never_says_scan_again(self) -> None:
+        """The document is there: the warning must not send the user to rescan."""
+        for document_id in (42, None):
+            for in_trash in (False, True):
+                warning = duplicate_warning(document_id, in_trash=in_trash).casefold()
+                assert "scan again" not in warning
+                assert "start the scan" not in warning
+
+
+class TestHalfDeliveryError:
+    """A split duplex job names the half that reached paperless-ngx."""
+
+    def test_per_half_error_names_both_halves_and_the_reason(self) -> None:
+        """Which half is in paperless-ngx, which is not, and why."""
+        assert half_delivery_error("(fronts)", "(backs)", "refused 400") == (
+            "The (fronts) half reached paperless-ngx; the (backs) half failed: "
+            "refused 400"
+        )
 
 
 class TestConnectionStatus:

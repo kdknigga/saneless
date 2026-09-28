@@ -59,7 +59,7 @@ from saneless.exceptions import (
 )
 from saneless.job import Job, JobResult, JobStore
 from saneless.logging_config import configure_logging
-from saneless.paperless import ApiDelivery, UploadResult
+from saneless.paperless import ApiDelivery, TaskFiled, UploadResult
 from saneless.pipeline import PipelineEvent, PipelineRequest, ScanResult
 from saneless.scanner import sane_backend
 from saneless.scanner.base import (
@@ -273,9 +273,9 @@ def _patch_cli(
                 """Return a delivered upload result carrying a fake task UUID."""
                 return ApiDelivery(task_id="mock-task-uuid")
 
-            def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
+            def poll_task(self, *_args: object, **_kwargs: object) -> TaskFiled:
                 """Return a successful task result."""
-                return {"status": "SUCCESS"}
+                return TaskFiled(task={"status": "SUCCESS"})
 
             def close(self) -> None:
                 """No-op close."""
@@ -952,9 +952,9 @@ def _recording_paperless(uploads: list[str]) -> type:
             uploads.append("uploaded")
             return ApiDelivery(task_id="mock-task-uuid")
 
-        def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
+        def poll_task(self, *_args: object, **_kwargs: object) -> TaskFiled:
             """Return a successful task result."""
-            return {"status": "SUCCESS"}
+            return TaskFiled(task={"status": "SUCCESS"})
 
         def close(self) -> None:
             """No-op close."""

@@ -92,7 +92,7 @@ from saneless.config import (
     discover_config,
 )
 from saneless.job import JobResult
-from saneless.paperless import ApiDelivery, UploadResult
+from saneless.paperless import ApiDelivery, TaskFiled, UploadResult
 from saneless.scanner.base import DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
@@ -634,8 +634,8 @@ def delivering_paperless(
     patching its methods affects real scans. Without this the upload goes to
     ``localhost:9999``, spends about 3 s in retry backoff and ends ERROR, which is
     neither the outcome under test nor fast enough to wait for. ``poll_task``
-    returning None is what success means since plan 23-04 (it raises on
-    failure). ``monkeypatch`` restores both methods at teardown.
+    returns a filed task, as a real one does when paperless-ngx files the
+    document. ``monkeypatch`` restores both methods at teardown.
     """
     _make_paperless_deliver(browser_server.app, monkeypatch)
 
@@ -647,8 +647,8 @@ def _make_paperless_deliver(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> No
     def _upload_document(*_args: object, **_kwargs: object) -> UploadResult:
         return ApiDelivery(task_id="browser-test-task")
 
-    def _poll_task(*_args: object, **_kwargs: object) -> None:
-        return None
+    def _poll_task(*_args: object, **_kwargs: object) -> TaskFiled:
+        return TaskFiled(task={"status": "SUCCESS"})
 
     monkeypatch.setattr(paperless, "upload_document", _upload_document)
     monkeypatch.setattr(paperless, "poll_task", _poll_task)

@@ -39,7 +39,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.job import JobStore
-from saneless.paperless import ApiDelivery
+from saneless.paperless import ApiDelivery, TaskFiled
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     RESTART_REASON,
@@ -1462,7 +1462,9 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     app.state.paperless.upload_document = lambda *_a, **_k: ApiDelivery(
         task_id="d-19-proof"
     )
-    app.state.paperless.poll_task = lambda *_a, **_k: {"status": "SUCCESS"}
+    app.state.paperless.poll_task = lambda *_a, **_k: TaskFiled(
+        task={"status": "SUCCESS"}
+    )
     store: JobStore = app.state.job_store
     # Every SANE start and stop from here on, by thread.  The constructor's
     # init above is already counted by the fake.
