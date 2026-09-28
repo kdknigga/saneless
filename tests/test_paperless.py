@@ -30,6 +30,7 @@ from saneless.paperless import (
     ApiDelivery,
     FolderDelivery,
     PaperlessClient,
+    PaperlessTiming,
     UploadResult,
     _not_accepted_message,
     _one_line_reason,
@@ -234,10 +235,11 @@ class TestClientSignature:
 
     def test_before_send_budget_seams_are_keyword_only(self) -> None:
         """
-        The send budget, its clock and its sleep are keyword-only seams.
+        The send budget, its clock, its sleep and the timeout are one seam.
 
         The budget is a time, not a count of attempts, so there is no attempt
-        count to pass any more.
+        count to pass any more.  The four travel together as ``timing``, which
+        is keyword-only and defaults to the production values.
         """
         parameters = inspect.signature(PaperlessClient.__init__).parameters
         assert list(parameters) == [
@@ -246,19 +248,22 @@ class TestClientSignature:
             "token",
             "consume_dir",
             "transport",
-            "send_budget",
-            "clock",
-            "sleep",
-            "upload_timeout",
+            "timing",
         ]
-        for name in ("send_budget", "clock", "sleep", "upload_timeout"):
-            assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
-        assert parameters["send_budget"].default == 60.0
-        assert parameters["clock"].default is time.monotonic
-        sleep = parameters["sleep"].default
+        assert parameters["timing"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameters["timing"].default == PaperlessTiming()
+        fields = inspect.signature(PaperlessTiming).parameters
+        assert list(fields) == ["send_budget", "clock", "sleep", "upload_timeout"]
+        assert all(
+            field.kind is inspect.Parameter.KEYWORD_ONLY for field in fields.values()
+        )
+        timing = PaperlessTiming()
+        assert timing.send_budget == 60.0
+        assert timing.clock is time.monotonic
         # Named rather than compared, since tests may not touch the real sleep.
-        assert (sleep.__module__, sleep.__qualname__) == ("time", "sleep")
-        assert parameters["upload_timeout"].default is _upload_timeout
+        assert timing.sleep.__module__ == "time"
+        assert repr(timing.sleep) == "<built-in function sleep>"
+        assert timing.upload_timeout is _upload_timeout
 
 
 def _uploaded_fields(
@@ -394,8 +399,7 @@ class TestUploadDocument:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             transport=_make_transport(handler),
-            clock=clock.now,
-            sleep=clock.sleep,
+            timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
         )
         result = client.upload_document(sample_pdf, title="Retry Test")
         assert result == ApiDelivery(task_id="task-id-ok")
@@ -583,9 +587,9 @@ def _upload_client(
         token=_MOCK_AUTH,
         consume_dir=consume_dir,
         transport=_make_transport(handler),
-        send_budget=send_budget,
-        clock=fake.now,
-        sleep=fake.sleep,
+        timing=PaperlessTiming(
+            send_budget=send_budget, clock=fake.now, sleep=fake.sleep
+        ),
     )
 
 
@@ -786,8 +790,7 @@ class TestUrlCredentialsNeverShown:
         client = PaperlessClient(
             url=f"scanner:{_URL_SECRET}@paperless:8000",
             token=_MOCK_AUTH,
-            clock=upload_clock.now,
-            sleep=upload_clock.sleep,
+            timing=PaperlessTiming(clock=upload_clock.now, sleep=upload_clock.sleep),
         )
         try:
             with pytest.raises(ConfigError) as exc_info:
@@ -1328,8 +1331,7 @@ class TestUploadFailureTranslation:
             url="",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            clock=upload_clock.now,
-            sleep=upload_clock.sleep,
+            timing=PaperlessTiming(clock=upload_clock.now, sleep=upload_clock.sleep),
         )
         try:
             with pytest.raises(ConfigError) as exc_info:
@@ -1373,9 +1375,9 @@ class TestUploadFailureTranslation:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=token,
-            send_budget=3.0,
-            clock=upload_clock.now,
-            sleep=upload_clock.sleep,
+            timing=PaperlessTiming(
+                send_budget=3.0, clock=upload_clock.now, sleep=upload_clock.sleep
+            ),
             transport=_make_transport(handler),
         )
         try:
@@ -1735,7 +1737,7 @@ class TestUploadReadTimeout:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             transport=_make_transport(handler),
-            upload_timeout=tiny,
+            timing=PaperlessTiming(upload_timeout=tiny),
         )
         try:
             client.upload_document(sample_pdf, title="Seam")
@@ -2649,8 +2651,9 @@ class TestLoopbackClientSideProtocolErrors:
                 url=server.url,
                 token=token,
                 consume_dir=consume_dir,
-                clock=upload_clock.now,
-                sleep=upload_clock.sleep,
+                timing=PaperlessTiming(
+                    clock=upload_clock.now, sleep=upload_clock.sleep
+                ),
             )
             try:
                 with pytest.raises(ConfigError) as exc_info:
@@ -2971,7 +2974,7 @@ class TestResponseTextIsRedacted:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=token,
-            send_budget=0.0,
+            timing=PaperlessTiming(send_budget=0.0),
             transport=_make_transport(answer),
         )
         try:
@@ -3108,9 +3111,9 @@ class TestChainedCausesCarryNoToken:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=token,
-            send_budget=1.0,
-            clock=upload_clock.now,
-            sleep=upload_clock.sleep,
+            timing=PaperlessTiming(
+                send_budget=1.0, clock=upload_clock.now, sleep=upload_clock.sleep
+            ),
             transport=_make_transport(handler),
         )
         try:
@@ -3177,9 +3180,9 @@ class TestChainedCausesCarryNoToken:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            send_budget=1.0,
-            clock=upload_clock.now,
-            sleep=upload_clock.sleep,
+            timing=PaperlessTiming(
+                send_budget=1.0, clock=upload_clock.now, sleep=upload_clock.sleep
+            ),
             transport=_make_transport(handler),
         )
         try:
@@ -3838,7 +3841,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=transport,
-            send_budget=0.0,
+            timing=PaperlessTiming(send_budget=0.0),
         )
         result = client.upload_document(sample_pdf, title="Existing dir test")
         copied = list(consume_dir.iterdir())
@@ -3864,7 +3867,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            send_budget=0.0,
+            timing=PaperlessTiming(send_budget=0.0),
         )
         result = client.upload_document(sample_pdf, title="Atomic test")
         client.close()
@@ -3900,7 +3903,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            send_budget=0.0,
+            timing=PaperlessTiming(send_budget=0.0),
         )
         try:
             with pytest.raises(
@@ -3935,7 +3938,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            send_budget=0.0,
+            timing=PaperlessTiming(send_budget=0.0),
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -3963,7 +3966,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            send_budget=0.0,
+            timing=PaperlessTiming(send_budget=0.0),
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -4191,7 +4194,7 @@ def _deliver_to_consume_dir(sample_pdf: Path, consume_dir: Path) -> UploadResult
         token=_MOCK_AUTH,
         consume_dir=consume_dir,
         transport=_make_transport(_always_refused),
-        send_budget=0.0,
+        timing=PaperlessTiming(send_budget=0.0),
     )
     try:
         return client.upload_document(sample_pdf, title="Mode test")
