@@ -215,6 +215,9 @@ _UNKNOWN_LENGTH_MM: Final = PAPER_SIZES_MM["legal"][1]
 # frames, one per channel, each described by the same parameters.
 _THREE_PASS_FORMATS: Final = frozenset({"red", "green", "blue"})
 
+# Every frame format of a colour page, sent as one frame or as three.
+_COLOUR_FORMATS: Final = _THREE_PASS_FORMATS | {"color"}
+
 # How long the timeout path waits for a cancelled read to come back before it
 # gives up on the handle entirely.
 #
@@ -3037,11 +3040,11 @@ def _describe_page(parameters: _ScanParameters, resolution: int) -> str:
         The page's description.
 
     """
-    colour = parameters.frame_format == "color" or (
-        parameters.frame_format in _THREE_PASS_FORMATS
-    )
     return scan_page_description(
-        parameters.pixels_per_line, parameters.lines, colour=colour, dpi=resolution
+        parameters.pixels_per_line,
+        parameters.lines,
+        colour=parameters.frame_format in _COLOUR_FORMATS,
+        dpi=resolution,
     )
 
 
