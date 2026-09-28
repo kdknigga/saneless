@@ -2557,6 +2557,251 @@ class TestTagFilter:
         assert job_store.list_recent(limit=1)[0].title == "Stray Filter"
 
 
+# A tag list paperless-ngx is known to hold, for the stale-default tests: 3 is
+# in it, 99 never is, and 7 is the row nobody ticks.
+_KNOWN_TAG_ROWS: list[dict[str, object]] = [
+    {"id": 3, "name": "Recipes"},
+    {"id": 7, "name": "taxes"},
+]
+_KNOWN_CORRESPONDENT_ROWS: list[dict[str, object]] = [
+    {"id": 12, "name": "Acme Water"},
+]
+_STALE_NOTE = "no longer in paperless-ngx"
+
+
+def _fail_fetch() -> NoReturn:
+    """Stand in for a paperless-ngx that cannot be reached."""
+    msg = "paperless unreachable"
+    raise ConnectionError(msg)
+
+
+def _serve_known_lists(client: TestClient) -> FastAPI:
+    """
+    Make the two known lists the ones the app sees, caches cleared.
+
+    Args:
+        client: The client whose app is being wired.
+
+    Returns:
+        The app, for tests that reach into its state.
+
+    """
+    app = _app(client)
+    app.state.paperless.get_tags = lambda: list(_KNOWN_TAG_ROWS)
+    app.state.paperless.get_correspondents = lambda: list(_KNOWN_CORRESPONDENT_ROWS)
+    app.state.cache.invalidate("tags")
+    app.state.cache.invalidate("correspondents")
+    return app
+
+
+def _serve_nothing(client: TestClient) -> FastAPI:
+    """
+    Make both lists unavailable: every fetch fails and nothing is cached.
+
+    Args:
+        client: The client whose app is being wired.
+
+    Returns:
+        The app, for tests that reach into its state.
+
+    """
+    app = _app(client)
+    app.state.paperless.get_tags = _fail_fetch
+    app.state.paperless.get_correspondents = _fail_fetch
+    app.state.cache.invalidate("tags")
+    app.state.cache.invalidate("correspondents")
+    return app
+
+
+def _tag_row(markup: str, tag_id: int) -> str:
+    """
+    Return one tag's whole label row, checkbox and text, or an empty string.
+
+    Args:
+        markup: The rendered tag list.
+        tag_id: The paperless-ngx tag id to look for.
+
+    Returns:
+        The matching ``<label>`` element, or ``""``.
+
+    """
+    match = re.search(
+        rf'<label class="tag-option"><input type="checkbox" name="tags" '
+        rf'value="{tag_id}"[^>]*>[^<]*</label>',
+        markup,
+    )
+    return match.group(0) if match else ""
+
+
+def _option(markup: str, value: int) -> str:
+    """
+    Return one rendered ``<option>``, tag and text, or an empty string.
+
+    Args:
+        markup: The rendered options.
+        value: The option value to look for.
+
+    Returns:
+        The matching ``<option>`` element, or ``""``.
+
+    """
+    match = re.search(rf'<option value="{value}"[^>]*>[^<]*</option>', markup)
+    return match.group(0) if match else ""
+
+
+def _render_correspondent_options(client: TestClient, selected: int | None) -> str:
+    """
+    Render the correspondent options partial from the route's own context.
+
+    Args:
+        client: The client whose app renders.
+        selected: The correspondent id the control should show chosen.
+
+    Returns:
+        The rendered options.
+
+    """
+    app = _app(client)
+    context = routes_module._correspondent_options_context(app.state, selected)
+    template = app.state.templates.get_template("partials/correspondents.html")
+    return template.render(context)
+
+
+class TestStaleDefaultAndUnlistedRows:
+    """
+    A ticked id is never dropped from the form, and a stale one says why.
+
+    The form's untouched submit has to carry every id it shows ticked, so an
+    id the list does not name still renders as a ticked row.  Only a list
+    that was actually read can prove the id gone, so the note appears then
+    and only then; without the list the row is just the id.
+    """
+
+    def test_stale_default_tag_renders_checked_pinned_and_labelled(
+        self, client: TestClient
+    ) -> None:
+        """99 is not in a list that was read: ticked, first, with the note."""
+        _serve_known_lists(client)
+
+        response = client.get("/api/tags", params={"tags": [3, 99]})
+
+        assert response.status_code == 200
+        assert "checked" in _checkbox(response.text, 3)
+        assert "Recipes" in _tag_row(response.text, 3)
+        stale = _tag_row(response.text, 99)
+        assert "checked" in _checkbox(response.text, 99)
+        assert "tag 99 (no longer in paperless-ngx; will be skipped)" in stale
+        assert response.text.index('value="99"') < response.text.index('value="3"')
+        assert "checked" not in _checkbox(response.text, 7)
+
+    def test_stale_default_tag_stays_pinned_under_a_filter(
+        self, client: TestClient
+    ) -> None:
+        """A filter that matches nothing still leaves the stale row ticked."""
+        _serve_known_lists(client)
+
+        response = client.get("/api/tags", params={"q": "zzz", "tags": [99]})
+
+        assert "checked" in _checkbox(response.text, 99)
+        assert "No tags match that filter." not in response.text
+
+    def test_unlisted_tags_render_checked_by_number_without_a_note(
+        self, client: TestClient
+    ) -> None:
+        """With no list, 3 and 99 are both just ids, and both stay ticked."""
+        _serve_nothing(client)
+
+        response = client.get("/api/tags", params={"tags": [3, 99]})
+
+        assert response.status_code == 200
+        assert "checked" in _checkbox(response.text, 3)
+        assert "checked" in _checkbox(response.text, 99)
+        assert "> tag 3</label>" in _tag_row(response.text, 3)
+        assert "> tag 99</label>" in _tag_row(response.text, 99)
+        assert _STALE_NOTE not in response.text
+        assert "No tags" not in response.text
+
+    def test_unlisted_nothing_ticked_keeps_today_s_empty_line(
+        self, client: TestClient
+    ) -> None:
+        """With nothing ticked and no list, the empty line is what it was."""
+        _serve_nothing(client)
+
+        response = client.get("/api/tags")
+
+        assert "No tags in paperless-ngx yet." in response.text
+        assert 'type="checkbox"' not in response.text
+
+    def test_every_tag_checkbox_opts_out_of_form_state_restore_stale_default(
+        self, client: TestClient
+    ) -> None:
+        """Pinned, filtered, stale and unlisted rows all carry the attribute."""
+        _serve_known_lists(client)
+        known = client.get("/api/tags", params={"q": "tax", "tags": [3, 99]}).text
+        _serve_nothing(client)
+        unlisted = client.get("/api/tags", params={"tags": [5]}).text
+
+        boxes = re.findall(r'<input type="checkbox"[^>]*>', known + unlisted)
+        assert len(boxes) == 4
+        for box in boxes:
+            assert 'autocomplete="off"' in box, box
+
+    def test_stale_default_template_marks_nothing_safe(self) -> None:
+        """Names and notes are autoescaped text; the partials mark none safe."""
+        for name in ("tags.html", "correspondents.html"):
+            source = _web_asset("templates", "partials", name)
+            assert "|safe" not in source.replace(" ", ""), name
+
+    def test_stale_default_correspondent_known_selection_is_selected(
+        self, client: TestClient
+    ) -> None:
+        """12 is in the list: its own option is the selected one."""
+        _serve_known_lists(client)
+
+        markup = _render_correspondent_options(client, 12)
+
+        assert "selected" in _option(markup, 12)
+        assert markup.count("selected") == 1
+        assert _STALE_NOTE not in markup
+
+    def test_stale_default_correspondent_is_a_selected_option_with_the_note(
+        self, client: TestClient
+    ) -> None:
+        """99 is not in a list that was read: one extra option, selected."""
+        _serve_known_lists(client)
+
+        markup = _render_correspondent_options(client, 99)
+
+        stale = _option(markup, 99)
+        assert "selected" in stale
+        assert "correspondent 99 (no longer in paperless-ngx; will be skipped)" in stale
+        assert "selected" not in _option(markup, 12)
+        assert markup.count('value="99"') == 1
+
+    def test_unlisted_correspondent_is_selected_by_number(
+        self, client: TestClient
+    ) -> None:
+        """Without the list, 99 is selected and called what it is."""
+        _serve_nothing(client)
+
+        markup = _render_correspondent_options(client, 99)
+
+        assert "selected" in _option(markup, 99)
+        assert ">correspondent 99</option>" in _option(markup, 99)
+        assert _STALE_NOTE not in markup
+
+    def test_unlisted_no_selection_selects_no_correspondent(
+        self, client: TestClient
+    ) -> None:
+        """Nothing chosen adds no option and marks none selected."""
+        _serve_known_lists(client)
+
+        markup = _render_correspondent_options(client, None)
+
+        assert "selected" not in markup
+        assert markup.count("<option") == 2
+
+
 # The profile defaults the D-29 regression tests drive, chosen so neither can
 # be produced by accident: no fixture tag or correspondent uses these ids.
 _PROFILE_DEFAULT_TAGS = [41, 42]

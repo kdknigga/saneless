@@ -118,9 +118,13 @@ from saneless.vocabulary import (
     scan_page_description,
     sixteen_bit_error,
     source_not_offered_error,
+    stale_default_correspondent_label,
+    stale_default_tag_label,
     state_label,
     substituted_source_warning,
     timeout_finish_warning,
+    unlisted_correspondent_label,
+    unlisted_tag_label,
     worker_health_detail,
 )
 
@@ -2011,6 +2015,29 @@ class TestDroppedIdsWarning:
     def test_nothing_dropped_is_no_warning(self) -> None:
         """Nothing dropped: no warning at all, so the DONE stays clean."""
         assert dropped_ids_warning((), None) is None
+
+
+class TestStaleDefaultAndUnlistedLabels:
+    """The labels the form puts on a ticked id it cannot name from the list."""
+
+    def test_stale_default_tag_label_says_it_will_be_skipped(self) -> None:
+        """A tag missing from a list that was read is named with the note."""
+        assert stale_default_tag_label(7) == (
+            "tag 7 (no longer in paperless-ngx; will be skipped)"
+        )
+
+    def test_stale_default_correspondent_label_is_the_tag_label_s_twin(
+        self,
+    ) -> None:
+        """The correspondent reads the same way, with its own noun."""
+        assert stale_default_correspondent_label(12) == (
+            "correspondent 12 (no longer in paperless-ngx; will be skipped)"
+        )
+
+    def test_unlisted_labels_claim_nothing_about_paperless(self) -> None:
+        """Without a list, the id is all the page can honestly say."""
+        assert unlisted_tag_label(7) == "tag 7"
+        assert unlisted_correspondent_label(12) == "correspondent 12"
 
 
 class TestDuplicateWarning:
