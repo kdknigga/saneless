@@ -80,6 +80,7 @@ __all__ = [
     "WorkerHealth",
     "abort_question",
     "ambiguous_source_error",
+    "backs_not_scanned_warning",
     "blank_timeout_finish_warning",
     "busy_line",
     "cap_finish_warning",
@@ -1479,6 +1480,32 @@ def pass_cap_warning(
             f"scan {resume}"
         )
     return f"{lead}one scan {stopped} Scan {resume}"
+
+
+def backs_not_scanned_warning(sheet_not_kept: int) -> str:
+    """
+    Return the warning for a manual duplex job whose fronts pass hit its cap.
+
+    The sheet past the cap was fed and thrown away, so it lies in the output
+    tray with the fronts. Pairing the backs by position needs the flipped stack
+    to hold exactly the sheets whose fronts were kept; with that extra sheet on
+    it, the first back fed belongs to no kept front, and every later back
+    would land one page off. The job therefore ends with the fronts, and this
+    sentence follows ``pass_cap_warning`` to say why the backs are missing.
+    Only a count is interpolated.
+
+    Args:
+        sheet_not_kept: The sheet that was fed but not kept.
+
+    Returns:
+        The warning sentence.
+
+    """
+    return (
+        f"The backs were not scanned: sheet {sheet_not_kept} is already in the "
+        "output tray, so turning the stack over would pair every back with the "
+        "wrong front."
+    )
 
 
 def substituted_source_warning(requested: str) -> str:

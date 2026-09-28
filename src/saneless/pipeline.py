@@ -44,6 +44,7 @@ from saneless.vocabulary import (
     PassPrompt,
     PassWait,
     ScanOutcome,
+    backs_not_scanned_warning,
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
@@ -1098,10 +1099,12 @@ class _DuplexMismatch:
     """
     The two passes of a manual duplex run that cannot be paired by position.
 
-    Either the page counts disagreed, or a pass could not read a sheet. After a
-    lost sheet, equal counts prove nothing: when each pass loses a different
-    sheet, the counts match and the interleave pairs fronts with the wrong
-    backs.
+    Either the page counts disagreed, a pass could not read a sheet, or the
+    backs pass stopped at its cap. After a lost sheet, equal counts prove
+    nothing: when each pass loses a different sheet, the counts match and the
+    interleave pairs fronts with the wrong backs. A cap is the same kind of
+    evidence: the backs pass fed a sheet it threw away, and the fronts pass
+    never fed that sheet, so the stack was not the one pass A saw.
 
     A named record rather than the bare ``(fronts, backs)`` tuple this used to
     be. The recovery path also needs the sheets the device could not read, and
@@ -1113,13 +1116,21 @@ class _DuplexMismatch:
         backs: Page records produced by pass B, in pass order.
         unreadable_sheets: Sheets skipped across both passes for failing their
             integrity checks. Nonzero is the reason the run was split. Zero
-            means the split is a count difference alone.
+            means the split is a count difference or a cap.
+        backs_cap: The cap the backs pass stopped at, or None when it ended on
+            its own. A capped fronts pass never gets here: no backs pass is
+            scanned after it.
+        substituted_source: The flatbed source the profile asked for when the
+            scanner's Auto source took both passes through the feeder
+            instead, or None.
 
     """
 
     fronts: Sequence[PageRecord]
     backs: Sequence[PageRecord]
     unreadable_sheets: int
+    backs_cap: PassCapReached | None = None
+    substituted_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1392,23 +1403,34 @@ def _duplex_mismatch_warning(mismatch: _DuplexMismatch) -> str:
     different sheet the counts agree, and a "page count mismatch" sentence
     quoting two equal numbers would be false. It is the only sentence that
     mentions the lost sheets, so the generic unreadable-sheet warning is not
-    added on top of it.
+    added on top of it. A capped backs pass comes next for the same reason:
+    its counts may agree too. The pass-cap sentence that names the sheet
+    thrown away is joined after this one by the caller.
 
     Args:
         mismatch: Both passes, and the sheets the scanner could not read.
 
     Returns:
-        The warning, naming the unreadable sheets when there were any and
-        otherwise the two page counts.
+        The warning, naming the unreadable sheets when there were any, else
+        the cap when the backs pass reached it, and otherwise the two page
+        counts.
 
     """
+    halves = (
+        f"they were uploaded as two PDFs, {preservation.FRONTS_SUFFIX} and "
+        f"{preservation.BACKS_SUFFIX}, for manual review."
+    )
     count = mismatch.unreadable_sheets
     if count > 0:
         sheets = "1 sheet" if count == 1 else f"{count} sheets"
         return (
             f"The scanner could not read {sheets}, so the fronts and backs "
-            f"could not be paired reliably; they were uploaded as two PDFs, "
-            f"{preservation.FRONTS_SUFFIX} and {preservation.BACKS_SUFFIX}, for manual review."
+            f"could not be paired reliably; {halves}"
+        )
+    if mismatch.backs_cap is not None:
+        return (
+            "The scan of the backs stopped at its sheet cap, so the fronts and "
+            f"backs could not be paired reliably; {halves}"
         )
     return (
         f"Page count mismatch: {len(mismatch.fronts)} fronts, "
@@ -2095,8 +2117,10 @@ class _PipelineRun:
         Returns:
             A ScanBatch of interleaved pages when the two passes agree on count,
             carrying the device's resolution and the rejections from both passes;
-            or a _DuplexMismatch holding both passes when the counts disagree or
-            either pass could not read a sheet.
+            pass A's own ScanBatch, fronts only, when pass A stopped at its cap,
+            with no flip asked for and no pass B; or a _DuplexMismatch holding
+            both passes when the counts disagree, either pass could not read a
+            sheet, or pass B stopped at its cap.
 
         Raises:
             ScanCancelledError: If the operator aborts at the flip prompt.  Raised
@@ -2136,6 +2160,22 @@ class _PipelineRun:
         # re-renders on either of those events must already hold the number, or the
         # render it triggers shows the count one transition late.
         _note_pass_count(self.request, SCAN_LABEL_FRONT, len(front_pages))
+
+        # A capped fronts pass ends the job here, with the fronts, and nobody is
+        # asked to flip. The feeder took one sheet past the cap and threw it
+        # away, so that sheet already lies in the output tray on the fronts.
+        # Turned over, the stack would feed that sheet's back first: it belongs
+        # to no kept front, and every back after it would pair with the front
+        # one sheet away. The fronts go out as the document, and
+        # _finish_document adds the sentence saying the backs were not scanned.
+        if front_batch.cap_reached is not None:
+            logger.warning(
+                "Pass A stopped at its %d-sheet cap; not asking for a flip, "
+                "because sheet %d is already in the output tray",
+                front_batch.cap_reached.cap,
+                front_batch.cap_reached.sheet_not_kept,
+            )
+            return front_batch
 
         self._notify(PipelineEvent.AWAITING_FLIP)
         outcome = flip.coordinator.wait_for_flip(flip.timeout)
@@ -2223,22 +2263,34 @@ class _PipelineRun:
         # tries to pair the pages by physical sheet instead: the scanner reports
         # that a sheet was skipped, not which one.
         #
+        # A capped backs pass is split for the same reason, counts or not: it
+        # fed a sheet past the cap that the fronts pass never fed, so the stack
+        # it scanned is not the one pass A saw. Only the backs pass can be
+        # capped here; a capped fronts pass returned before the flip.
+        #
         # Compare the raw counts BEFORE empty-page detection: filtering first
         # could drop a blank back and turn two matching passes into a mismatch.
         lost_a_sheet = bool(front_batch.pages_rejected or back_batch.pages_rejected)
-        if lost_a_sheet or len(front_pages) != len(back_pages):
+        capped = back_batch.cap_reached is not None
+        if lost_a_sheet or capped or len(front_pages) != len(back_pages):
             return _DuplexMismatch(
                 fronts=front_pages,
                 backs=back_pages,
                 unreadable_sheets=rejected,
+                backs_cap=back_batch.cap_reached,
+                substituted_source=front_batch.substituted_source,
             )
 
         interleaved = _interleave_duplex(front_pages, back_pages)
         logger.info("Interleaved %d total pages", len(interleaved))
+        # Both passes run with the same settings against the same device, so
+        # a substitution on one is a substitution on both; pass A's is the
+        # one reported.
         return ScanBatch(
             pages=tuple(interleaved),
             actual_resolution=resolution,
             pages_rejected=rejected,
+            substituted_source=front_batch.substituted_source,
         )
 
     def _scan_multi_page(self, context: _MultiPageContext) -> _MultiPageDocument:
@@ -2836,6 +2888,31 @@ class _PipelineRun:
             raise ScanInterrupted(msg)
         return answer
 
+    def _backs_not_scanned(self, cap: PassCapReached | None) -> str | None:
+        """
+        Say that a manual duplex job's backs were not scanned, if they were not.
+
+        Decided here, from the run and the batch, rather than carried on a
+        field of its own: on a manual duplex run the one batch that reaches
+        ``_finish_document`` with a cap is the fronts pass, because a capped
+        backs pass is always delivered as two halves. A field on the run or
+        the batch would be a second record of what the flip context and the
+        cap already say.
+
+        Args:
+            cap: The cap the delivered batch reached, or None.
+
+        Returns:
+            The warning text on a manual duplex run whose fronts pass was
+            capped, otherwise None.
+
+        """
+        if self.flip is None or cap is None:
+            return None
+        warning = backs_not_scanned_warning(cap.sheet_not_kept)
+        logger.warning(warning)
+        return warning
+
     def _finish_document(self, batch: ScanBatch) -> ScanResult:
         """
         Filter, assemble and deliver one document.
@@ -2864,7 +2941,10 @@ class _PipelineRun:
         # Blank removal is reported apart, so the pages kept are every page
         # the pass delivered.
         substitution_warning = _substitution_warning(batch.substituted_source)
-        cap_warning = _pass_cap_warning(batch.cap_reached, len(records))
+        cap_warning = _join_warnings(
+            _pass_cap_warning(batch.cap_reached, len(records)),
+            self._backs_not_scanned(batch.cap_reached),
+        )
 
         # There is no per-page EXIF strip here, and one would have nothing to
         # act on.  python-sane builds each page with ``Image.frombuffer``,
@@ -3167,8 +3247,18 @@ class _PipelineRun:
         self._delivered()
         delivered = fronts_result.delivered_to_api and backs_result.delivered_to_api
 
-        warning = _duplex_mismatch_warning(mismatch)
-        logger.warning(warning)
+        mismatch_warning = _duplex_mismatch_warning(mismatch)
+        logger.warning(mismatch_warning)
+        # A cap and a substitution are events of their own, not the reason
+        # the halves were split, so each is joined in its own sentence: the
+        # cap names the sheet that was fed but not kept, which is where the
+        # operator resumes. The backs pass is the only one a mismatch can
+        # carry a cap from, so its pages are the ones the cap kept.
+        warning = _join_warnings(
+            mismatch_warning,
+            _substitution_warning(mismatch.substituted_source),
+            _pass_cap_warning(mismatch.backs_cap, len(mismatch.backs)),
+        )
         self._notify(PipelineEvent.DONE)
         logger.info(
             "Pipeline complete for %r (duplex mismatch recovery)", self.request.title
@@ -3182,8 +3272,9 @@ class _PipelineRun:
             pages_removed=0,
             pages_uploaded=mismatch_pages,
             # Not joined with _rejected_pages_warning: a lost sheet is already the
-            # reason this warning gives, and saying the count twice in one message
-            # reads as two separate losses.
+            # reason the mismatch sentence gives, and saying the count twice in
+            # one message reads as two separate losses. The cap and the
+            # substitution above are joined because they are not that reason.
             warning=warning,
         )
 
