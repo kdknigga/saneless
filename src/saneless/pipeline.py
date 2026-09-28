@@ -73,6 +73,7 @@ if TYPE_CHECKING:
 
     from saneless.config import ProfileConfig, Settings
     from saneless.paperless import PaperlessClient, UploadResult
+    from saneless.scan_metadata import ScanMetadata
     from saneless.scanner.base import PageRecord, PassCapReached, ScannerBackend
 
 __all__ = [
@@ -85,8 +86,10 @@ __all__ = [
     "PassCoordinator",
     "PipelineEvent",
     "PipelineRequest",
+    "RequestHooks",
     "ScanResult",
     "Settled",
+    "build_pipeline_request",
     "run_pipeline",
 ]
 
@@ -659,6 +662,79 @@ class PipelineRequest:
     # ``threading.Event``, because a signal can land inside the call that
     # sets it.
     settled: Settled | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestHooks:
+    """
+    The part of a pipeline request that belongs to the surface running it.
+
+    The web worker and ``saneless scan`` watch a run and answer its questions
+    differently -- the worker writes progress to the job store and waits on the
+    web routes, the CLI prints lines and prompts in the terminal -- so each
+    passes its own hooks.  Everything else about the request, what is scanned
+    and what it is filed with, is built the same way for both by
+    :func:`build_pipeline_request`.
+
+    Every field is one of :class:`PipelineRequest`'s, with the same meaning and
+    the same default; a surface leaves out what it has no use for.
+    """
+
+    status_callback: Callable[[PipelineEvent], None] | None = None
+    thumbnail_callback: Callable[[str], None] | None = None
+    pass_count_callback: Callable[[str, int], None] | None = None
+    flip_coordinator: FlipCoordinator | None = None
+    multi_page: bool = False
+    pass_coordinator: PassCoordinator | None = None
+    device_memory: DeviceMemory | None = None
+    preserving: threading.Event | None = None
+    settled: Settled | None = None
+
+
+def build_pipeline_request(
+    *,
+    profile_name: str,
+    title: str,
+    job_id: str,
+    metadata: ScanMetadata,
+    hooks: RequestHooks,
+) -> PipelineRequest:
+    """
+    Build the request for one scan, the one way both surfaces build it.
+
+    The web worker calls this with the metadata its job row holds, which the
+    scan route already resolved; ``saneless scan`` calls it with the metadata
+    :func:`saneless.scan_metadata.resolve_scan_metadata` gives for its
+    profile.  Neither constructs a :class:`PipelineRequest` itself, so the
+    same metadata reaches paperless-ngx the same way from both.
+
+    Args:
+        profile_name: The profile to scan with.
+        title: The resolved document title.
+        job_id: The id the assembled PDF is named from.
+        metadata: The tags and correspondent to file the document with.
+        hooks: The surface's callbacks, coordinators and run-scoped state.
+
+    Returns:
+        The request, with no tags given as ``None``.
+
+    """
+    return PipelineRequest(
+        profile_name=profile_name,
+        title=title,
+        job_id=job_id,
+        tags=list(metadata.tags) or None,
+        correspondent=metadata.correspondent,
+        status_callback=hooks.status_callback,
+        thumbnail_callback=hooks.thumbnail_callback,
+        pass_count_callback=hooks.pass_count_callback,
+        flip_coordinator=hooks.flip_coordinator,
+        multi_page=hooks.multi_page,
+        pass_coordinator=hooks.pass_coordinator,
+        device_memory=hooks.device_memory,
+        preserving=hooks.preserving,
+        settled=hooks.settled,
+    )
 
 
 @dataclass
