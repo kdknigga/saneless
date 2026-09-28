@@ -3685,6 +3685,63 @@ class TestSaneBackendCancelSequence:
             assert sane_backend_mod._WEDGE.stuck is False
 
         assert fake_device.close_while_blocked is False
+
+    def test_an_interrupt_while_the_cancel_is_prepared_leaves_the_wedge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+    ) -> None:
+        """
+        Ctrl-C landing as the cancel thread is built finds the wedge recorded.
+
+        The record has to come before any other work of the cancel tail. An
+        interrupt landing before it would leave no wedge, and the device
+        context would then cancel and close the handle while the read was
+        still inside it. With the record standing, the handle is left alone
+        until the read returns, and the reader closes it then.
+        """
+
+        class _InterruptTheCancelAsItIsBuilt(threading.Thread):
+            """A Thread whose construction is interrupted for the canceller."""
+
+            def __init__(
+                self,
+                *,
+                target: Callable[..., object],
+                name: str,
+                daemon: bool,
+                args: tuple[object, ...] = (),
+            ) -> None:
+                """Raise for the cancel thread, construct any other."""
+                if name == _CANCEL_THREAD_NAME:
+                    raise KeyboardInterrupt
+                super().__init__(target=target, name=name, daemon=daemon, args=args)
+
+        fake_device.block_read(ReadBlockMode.NEVER)
+        monkeypatch.setattr(
+            sane_backend_mod.threading, "Thread", _InterruptTheCancelAsItIsBuilt
+        )
+
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            with pytest.raises(KeyboardInterrupt):
+                sane_backend_mod._acquire_with_timeout(
+                    dev,
+                    fake_device.snap,
+                    sane_backend_mod._page_label(0),
+                    sane_backend_mod._PageBudget(timeout=0.05),
+                )
+
+            assert _wedged()
+
+        assert fake_device.close_while_blocked is False
+        assert fake_device.close_calls == 0
+
+        fake_device.release_read()
+        _join_sane_reader_threads()
+
+        assert not _wedged()
+        assert fake_device.close_calls == 1
         assert fake_device.close_calls == 1
         assert fake_device.close_while_cancelling is False
 

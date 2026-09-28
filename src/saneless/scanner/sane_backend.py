@@ -1931,7 +1931,10 @@ def _begin_settle(dev: SaneDevice, done: threading.Event, label: str) -> bool:
 
 
 def _end_settle(
-    done: threading.Event, canceller: threading.Thread, *, cancel_started: bool
+    done: threading.Event,
+    canceller: threading.Thread | None,
+    *,
+    cancel_started: bool,
 ) -> bool:
     """
     Stop waiting: clear the wedge if nothing is left inside SANE, else keep it.
@@ -1939,14 +1942,15 @@ def _end_settle(
     The reader counts as finished once ``done`` is set, because its work is
     over by then and all it has left is to give up its token.  The cancel
     thread counts as finished once it has given up its own, or if it never
-    started, which is what an interrupt landing before or inside its
-    ``start()`` can leave behind.  ``cancel_started`` and ``is_alive()`` are
+    started, which is what an interrupt landing before it was built, or
+    before or inside its ``start()``, can leave behind.  ``cancel_started`` and ``is_alive()`` are
     both consulted for the reason ``_acquire_with_timeout`` gives for the
     reader.
 
     Args:
         done: The event identifying this acquisition.
-        canceller: The cancel thread, started or not.
+        canceller: The cancel thread, started or not, or None if it was
+            never built.
         cancel_started: Whether its ``start()`` returned.
 
     Returns:
@@ -1961,7 +1965,8 @@ def _end_settle(
             return True
         if done.is_set():
             _WEDGE.outstanding.discard(_READER)
-        if not (cancel_started or canceller.is_alive()):
+        cancel_running = canceller is not None and canceller.is_alive()
+        if not (cancel_started or cancel_running):
             _WEDGE.outstanding.discard(_CANCELLER)
         if not _WEDGE.outstanding:
             _clear_wedge()
@@ -2120,13 +2125,15 @@ def _settle_or_wedge(
     out leaves the handle wedged even if the read has returned, since closing
     under a cancel is no safer than closing under a read.
 
-    The decision is taken in a ``finally``, so an interrupt landing during the
-    wait -- a second Ctrl-C, say -- still ends it.  The wedge was written
-    before the cancel fired, so the interrupt leaves it standing, and the
-    device context then leaves the handle alone.  A signal can still land in
-    the few instructions of that ``finally`` itself; the record then stays
-    settling and is never cleared, which refuses later scans until a restart
-    but never closes a handle under a running call.
+    The wedge is recorded first, before the clock is read or the cancel
+    thread is built, so an interrupt landing in any of that work finds it
+    standing and the device context leaves the handle alone.  The decision is
+    taken in a ``finally``, so an interrupt landing during the wait -- a
+    second Ctrl-C, say -- still ends it.  A signal can still land in the few
+    instructions between the record and the ``try``, or in that ``finally``
+    itself; the record then stays settling and is never cleared, which
+    refuses later scans until a restart but never closes a handle under a
+    running call.
 
     Args:
         dev: The handle the blocked read is inside.
@@ -2141,15 +2148,21 @@ def _settle_or_wedge(
         if not, in which case the handle is wedged and nothing may touch it.
 
     """
+    # The wedge is recorded before anything else, so that an interrupt
+    # landing in the work that follows finds it standing.
+    if not _begin_settle(dev, done, label):
+        return True
     began = time.monotonic()
-    deadline = began + grace
-    canceller = threading.Thread(
-        target=_cancel_read, args=(dev, done), name=_CANCEL_THREAD_NAME, daemon=True
-    )
+    canceller: threading.Thread | None = None
     started = False
     try:
-        if not _begin_settle(dev, done, label):
-            return True
+        deadline = began + grace
+        canceller = threading.Thread(
+            target=_cancel_read,
+            args=(dev, done),
+            name=_CANCEL_THREAD_NAME,
+            daemon=True,
+        )
         # Noted before the cancel goes out, so no later cleanup can race it
         # into sending a second one (``_OpenHandles``).
         _note_cancel_issued(dev)
