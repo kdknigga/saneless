@@ -658,9 +658,11 @@ class ProfileConfig(BaseModel):
     mode: str = "color"
     auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
     # How the profile scans both sides of a sheet. "manual" drives the two-pass
-    # flip workflow. Nothing reads "hardware": the device decides duplexing
-    # from the source name it is handed, so the value only records operator
-    # intent and makes a profile self-describing. It is deliberately not
+    # flip workflow. "hardware" is read by the scanner: on a scanner with a
+    # separate ADF-mode option (epson2, kodakaio, magicolor) it sets that
+    # option to Duplex, and refuses the scan if the option is inactive; on the
+    # others the source name selects duplex, and a one-sided feeder name gets
+    # a warning that only one side is scanned. It is deliberately not
     # cross-validated against a FEEDER_DUPLEX source -- profile fields have
     # never been cross-checked (auto_source_mode is not checked against Auto).
     duplex: Literal["none", "hardware", "manual"] = "none"

@@ -2513,6 +2513,110 @@ def _assign(dev: SaneDevice, name: str, value: object, device_id: str) -> None:
         raise ScanError(set_msg) from exc
 
 
+_ADF_MODE = "adf-mode"
+
+
+def _adf_mode_entry(entries: list[str], word: str) -> str | None:
+    """
+    Find the entry of an ``adf-mode`` list that names a mode, in its spelling.
+
+    Args:
+        entries: The entries the device lists for ``adf-mode``.
+        word: The mode wanted, casefolded: ``"duplex"`` or ``"simplex"``.
+
+    Returns:
+        The device's own entry, or None if it lists no such entry.
+
+    """
+    return next((entry for entry in entries if entry.strip().casefold() == word), None)
+
+
+def _adf_mode_value(raw_options: list[tuple], settings: ScanSettings) -> str | None:
+    """
+    Decide what to write to ``adf-mode``, if anything.
+
+    epson2, kodakaio and magicolor list one feeder source and choose between
+    one side and both sides of each sheet with this separate string option,
+    ``["Simplex", "Duplex"]``. On epson2 it is active only once the feeder is
+    selected, and only on hardware that can duplex.
+
+    Hardware duplex asks for the device's ``Duplex`` entry whenever the option
+    is reported, active or not. An inactive option then refuses the
+    assignment, and the scan fails naming it before any paper moves, which is
+    the honest answer for a feeder that cannot scan both sides. Any other scan
+    writes ``Simplex`` when the option is active and lists it, because the
+    value persists across handles: a hardware-duplex scan earlier would
+    otherwise leave the next one-sided scan scanning both sides.
+
+    Args:
+        raw_options: The device's option tuples, as reported for the source
+            already selected.
+        settings: The requested scan settings, for ``duplex``.
+
+    Returns:
+        The entry to assign, or None to leave the option alone. For hardware
+        duplex on a list that cannot be read, ``"Duplex"``, the name all three
+        drivers use.
+
+    """
+    found = _constraint(raw_options, _ADF_MODE)
+    if not found.present:
+        return None
+    entries = [str(entry) for entry in found.values or []]
+    if settings.duplex == "hardware":
+        return _adf_mode_entry(entries, "duplex") or "Duplex"
+    if not _option_is_writable(raw_options, _ADF_MODE):
+        return None
+    return _adf_mode_entry(entries, "simplex")
+
+
+def _set_adf_mode(
+    dev: SaneDevice,
+    settings: ScanSettings,
+    choice: _SourceChoice,
+    *,
+    options: list[tuple],
+    device_id: str,
+) -> None:
+    """
+    Write ``adf-mode`` for this scan, or say when hardware duplex cannot happen.
+
+    Most scanners select duplex by the source name, and
+    ``classify_source`` recognises a both-sides feeder by it. A scanner that
+    reports ``adf-mode`` is told by that option instead; see
+    ``_adf_mode_value``. One with neither, handed a one-sided feeder under a
+    hardware-duplex profile, has nothing saneless can set: the scan goes ahead,
+    as it always has, with a WARNING that only one side of each sheet is
+    scanned.
+
+    Args:
+        dev: Open SANE device handle.
+        settings: The requested scan settings.
+        choice: The source ``_resolve_source`` chose.
+        options: The option list read after the source was assigned.
+        device_id: The SANE device name, for the error message.
+
+    Raises:
+        ScanError: If the device refuses the value, naming the option.
+
+    """
+    value = _adf_mode_value(options, settings)
+    if value is not None:
+        _assign(dev, _ADF_MODE.replace("-", "_"), value, device_id)
+        return
+    if (
+        settings.duplex == "hardware"
+        and not _constraint(options, _ADF_MODE).present
+        and classify_source(choice.effective) is SourceKind.FEEDER
+    ):
+        logger.warning(
+            'The profile asks for duplex = "hardware", but this scanner selects '
+            "duplex neither by an ADF-mode option nor by the source name %r, so "
+            "only one side of each sheet is scanned",
+            choice.effective,
+        )
+
+
 def _configure_device(
     dev: SaneDevice,
     settings: ScanSettings,
@@ -2532,12 +2636,16 @@ def _configure_device(
     telling it *how* removes that whole class of failure.  The paper size is
     applied afterwards, by ``_apply_paper_size`` in the caller.
 
-    The order is source, mode, depth, resolution. After the source, the option
-    list is read again, once: the reload may have changed which options the
-    device offers and what they accept, and the list read before the source
-    was set describes a source no longer selected. ``depth`` is decided from
-    the re-read list, and so is everything the caller decides after this
-    returns, which is why the list is handed back.
+    The order is source, adf-mode, mode, depth, resolution. After the source,
+    the option list is read again, once: the reload may have changed which
+    options the device offers and what they accept, and the list read before
+    the source was set describes a source no longer selected. ``adf-mode`` and
+    ``depth`` are decided from the re-read list, and so is everything the
+    caller decides after this returns, which is why the list is handed back.
+
+    ``adf-mode`` is how some scanners choose between one side and both sides
+    of a fed sheet; ``_set_adf_mode`` decides it, straight after the source
+    whose reload is what makes it active.
 
     ``depth`` is set to 8 when the device offers 8, after ``mode`` (which can
     change what ``depth`` accepts) and before ``resolution``. It is set
@@ -2575,6 +2683,7 @@ def _configure_device(
     if choice.has_option:
         _assign(dev, "source", choice.effective, device_id)
         options = _read_options(dev, device_id)
+    _set_adf_mode(dev, settings, choice, options=options, device_id=device_id)
     _assign(dev, "mode", settings.mode, device_id)
     depth = _eight_bit_depth(options)
     if depth is not None:

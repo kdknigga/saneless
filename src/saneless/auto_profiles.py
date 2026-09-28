@@ -402,11 +402,17 @@ def _duplex(source: str) -> Literal["none", "hardware"]:
     manual duplex is not a device source at all, so auto-profiles has no
     evidence for it and those profiles are always written by hand.
 
-    Nothing reads ``"hardware"``. It records operator intent and makes a
-    generated profile self-describing. The double-sided feeder wording the scan
-    page shows comes from ``_profile_label`` and ``_profile_description``
-    below, which classify the same source rather than reading this value.
-    ``config.py`` states the same fact; it is repeated here because this is
+    ``"hardware"`` is read by the scanner, which sets a separate ADF-mode
+    option to ``Duplex`` on a scanner that has one; on the others the source
+    name selects duplex. Here it is still derived only from a
+    ``FEEDER_DUPLEX`` source name. No hardware-duplex profile is generated
+    from an ADF-mode option, because the capabilities are read at the default
+    source and cannot prove the feeder duplexes: epson2 reports the option
+    inactive until its feeder is selected, and reports it on hardware that
+    cannot duplex at all. The double-sided feeder wording the scan page shows
+    comes from ``_profile_label`` and ``_profile_description`` below, which
+    classify the same source rather than reading this value. ``config.py``
+    states what the scanner does with it; it is repeated here because this is
     where the value is produced, and a reader here will ask what consumes it.
 
     The value is always passed explicitly, never left to the field default:
@@ -827,8 +833,8 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     if profile.auto_source_mode != "flatbed":
         values["auto_source_mode"] = profile.auto_source_mode
     # Written only when non-default, like auto_source_mode. In a generated set
-    # that means "hardware" on a FEEDER_DUPLEX source; see _duplex for why
-    # nothing reads it yet. Omitting "none" cannot let the loader's legacy
+    # that means "hardware" on a FEEDER_DUPLEX source; see _duplex for what
+    # reads it. Omitting "none" cannot let the loader's legacy
     # translation turn a profile manual on reload: a "none" source classified
     # as something other than FEEDER_DUPLEX, so its name does not contain
     # "duplex".
@@ -1146,7 +1152,7 @@ def write_profiles_to_config(
     """
     doc, original_text = _read_config(config_path)
 
-    # Before the profiles, so a file created from nothing reads [scanner]
+    # Before the profiles, so a file created from scratch has [scanner]
     # first, as the example config does.
     pinned = _pin_device(doc, config_path, device) if device is not None else None
 
