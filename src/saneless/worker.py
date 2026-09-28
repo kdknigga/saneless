@@ -1889,7 +1889,7 @@ class ScanWorker:
                 if self._recovered_texts:
                     self._job_store.fail_recovered_jobs(self._recovered_texts)
                     self._recovered_texts = {}
-                self._job_store.fail_active_jobs(RESTART_REASON)
+                self._job_store.fail_active_jobs()
                 self._restart_recovery_pending = False
         except Exception:
             logger.debug(

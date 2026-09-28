@@ -350,7 +350,7 @@ def _recover_interrupted_jobs(
         failed = 0
         if recovered_texts:
             failed = job_store.fail_recovered_jobs(recovered_texts)
-        failed += job_store.fail_active_jobs(RESTART_REASON)
+        failed += job_store.fail_active_jobs()
     except Exception:
         # logger.exception is an ERROR record with the traceback attached.
         logger.exception(

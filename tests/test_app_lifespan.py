@@ -233,9 +233,9 @@ def test_startup_order_is_recover_then_prune_then_start(
     original_prune = store.prune
     original_start = worker.start
 
-    def recording_fail(reason: str) -> int:
+    def recording_fail() -> int:
         calls.append("fail_active_jobs")
-        return original_fail(reason)
+        return original_fail()
 
     def recording_prune(max_age_days: int, max_rows: int) -> int:
         calls.append("prune")
@@ -314,8 +314,8 @@ def test_recovery_failure_starts_the_worker_degraded(
     app = _build_app(settings)
     store: JobStore = app.state.job_store
 
-    def failing_fail_active_jobs(reason: str) -> int:
-        msg = f"attempt to write a readonly database ({reason})"
+    def failing_fail_active_jobs() -> int:
+        msg = "attempt to write a readonly database"
         raise sqlite3.OperationalError(msg)
 
     monkeypatch.setattr(store, "fail_active_jobs", failing_fail_active_jobs)
