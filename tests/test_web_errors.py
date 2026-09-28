@@ -928,6 +928,49 @@ def test_scan_title_at_the_cap_is_not_422(client: TestClient) -> None:
     assert 'id="status-area"' in response.text
 
 
+# What paperless-ngx keeps of a title (127) less the longest suffix a split
+# duplex job appends (" (fronts)").  Spelled out rather than imported, so the
+# tests pin the number the operator is told.
+_TITLE_CAP = 118
+
+
+def test_scan_title_one_over_what_paperless_keeps_is_422_naming_the_cap(
+    client: TestClient,
+) -> None:
+    """A 119-character title is TITLE_TOO_LONG, and the sentence names 118."""
+    before = _job_store(client).list_recent(limit=50)
+    response = client.post(
+        "/api/scan", data={"profile": "default", "title": "t" * (_TITLE_CAP + 1)}
+    )
+    _assert_json_error(response, RequestRejection.TITLE_TOO_LONG, 422)
+    assert f"{_TITLE_CAP} characters or fewer" in response.json()["detail"]
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_scan_title_of_what_paperless_keeps_is_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 118-character title is offered to the worker exactly as typed."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    title = "t" * _TITLE_CAP
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": title},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert [job.title for job in offered] == [title]
+
+
+def test_scan_form_title_maxlength_is_what_paperless_keeps(
+    client: TestClient,
+) -> None:
+    """The title input's maxlength is the same 118 the server enforces."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert f'maxlength="{_TITLE_CAP}"' in response.text
+
+
 # One control character from each part of the refused set: a tab, which a
 # person can type into a text input; ESC, which starts a terminal escape
 # sequence; NEL, a C1 control; and DEL, the one control outside both blocks.

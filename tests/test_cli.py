@@ -595,6 +595,46 @@ class TestScanCommand:
         assert "Unknown profile" in result.output
         assert request is None
 
+    def test_scan_title_longer_than_paperless_keeps_is_a_usage_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A 119-character ``--title`` exits 2 naming the option and 118.
+
+        It is refused before the scanner exists, so no paper moves, and the
+        title is never cut to fit.
+        """
+        constructed: list[str] = []
+
+        class RecordingScanner(StubScannerBackend):
+            """Record that the CLI built a scanner at all."""
+
+            def __init__(self, host: str = "") -> None:
+                """Note the construction."""
+                constructed.append(host)
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=RecordingScanner)
+
+        result = runner.invoke(cli, ["scan", "--title", "x" * 119])
+
+        assert result.exit_code == 2, result.output
+        assert "--title" in result.output
+        assert "118 characters or fewer" in result.output
+        assert constructed == []
+
+    def test_scan_title_of_what_paperless_keeps_runs_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A 118-character ``--title`` reaches the pipeline exactly as typed."""
+        title = "x" * 118
+        result, request = self._capture_title_run(
+            monkeypatch, tmp_path, ["scan", "--title", title]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert request is not None
+        assert request.title == title
+
     def test_scan_happy_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan with --title succeeds and shows Done message."""
         runner, _ = _patch_cli(monkeypatch)

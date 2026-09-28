@@ -730,6 +730,27 @@ class TestTomlStructureErrors:
         title = "x" * TITLE_MAX_LENGTH
         assert ProfileConfig(title=title).default_title == title
 
+    def test_title_longer_than_paperless_keeps_fails_to_load(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A 119-character profile title is a load-time ConfigError naming the key.
+
+        paperless-ngx keeps 127 characters of a title and a split duplex job
+        appends " (fronts)", so 118 is the longest title that arrives whole.
+        """
+        toml_content = f'[profiles.default]\ntitle = "{"x" * 119}"\n'
+        err = _load_error(tmp_config_dir / "long_title.toml", toml_content)
+        assert "profiles.default.title" in str(err)
+
+    def test_title_of_what_paperless_keeps_loads(self, tmp_config_dir: Path) -> None:
+        """A 118-character profile title loads unchanged."""
+        title = "x" * 118
+        config_file = tmp_config_dir / "cap_title.toml"
+        config_file.write_text(f'[profiles.default]\ntitle = "{title}"\n')
+        settings = load_settings(config_path=str(config_file))
+        assert settings.profiles["default"].default_title == title
+
 
 def _load_error(config_file: Path, toml_content: str) -> ConfigError:
     """

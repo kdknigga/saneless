@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 import saneless.job
+from saneless import preservation
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
@@ -39,15 +40,20 @@ from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
     _BUSY_SEPARATOR,
     ACTIVE_STATES,
+    BACKS_SUFFIX,
     BUSY_STATES,
     FALLBACK_NOT_UPLOADED_LINE,
+    FRONTS_SUFFIX,
     LOCAL_TIME_FORMAT,
+    PAPERLESS_TITLE_LIMIT,
+    PARTIAL_SUFFIX,
     PASS_WAIT_STATES,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     RESTART_UPLOADING_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
+    TITLE_SUFFIX_SEPARATOR,
     TOKEN_UNSET_JOB_ERROR,
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
@@ -88,6 +94,7 @@ from saneless.vocabulary import (
     exit_code_for_signal,
     flip_answer_label,
     half_delivery_error,
+    half_title,
     is_amber_category,
     job_label,
     job_state_for,
@@ -1839,9 +1846,46 @@ class TestRequestRejection:
         with pytest.raises(AssertionError):
             rejection_status_code(bad)
 
-    def test_title_max_length(self) -> None:
-        """The title cap is 256 characters (ROBU-08)."""
-        assert TITLE_MAX_LENGTH == 256
+    def test_title_max_length_is_what_paperless_keeps_after_a_half_suffix(
+        self,
+    ) -> None:
+        """
+        The title cap is 118: paperless-ngx keeps 127 characters of a title.
+
+        A split duplex job appends " (fronts)" or " (backs)" to the title it
+        sends, so the cap leaves room for the longer of the two, and a title at
+        the cap still reaches paperless-ngx whole.
+        """
+        assert TITLE_MAX_LENGTH == 118
+        assert PAPERLESS_TITLE_LIMIT == 127
+        longest_suffix = max(
+            len(half_title("", suffix)) for suffix in (FRONTS_SUFFIX, BACKS_SUFFIX)
+        )
+        assert PAPERLESS_TITLE_LIMIT - longest_suffix == TITLE_MAX_LENGTH
+
+    def test_half_title_joins_the_title_and_the_suffix(self) -> None:
+        """A half's title is the operator's title, a space, then the suffix."""
+        assert TITLE_SUFFIX_SEPARATOR == " "
+        assert half_title("T", FRONTS_SUFFIX) == "T (fronts)"
+        assert half_title("T", BACKS_SUFFIX) == "T (backs)"
+
+    def test_half_title_at_the_cap_fits_what_paperless_keeps(self) -> None:
+        """The longest half title a capped title can make is exactly 127 long."""
+        title = "x" * TITLE_MAX_LENGTH
+        assert len(half_title(title, FRONTS_SUFFIX)) == PAPERLESS_TITLE_LIMIT
+        assert len(half_title(title, BACKS_SUFFIX)) < PAPERLESS_TITLE_LIMIT
+
+    def test_title_suffixes_are_spelled_once(self) -> None:
+        """The three suffixes live in vocabulary; preservation re-exports them."""
+        assert PARTIAL_SUFFIX == "(partial)"
+        assert FRONTS_SUFFIX == "(fronts)"
+        assert BACKS_SUFFIX == "(backs)"
+        assert preservation.FRONTS_SUFFIX is FRONTS_SUFFIX
+        assert preservation.BACKS_SUFFIX is BACKS_SUFFIX
+        assert preservation.PARTIAL_SUFFIX is PARTIAL_SUFFIX
+        assert {"FRONTS_SUFFIX", "BACKS_SUFFIX", "PARTIAL_SUFFIX"} <= set(
+            preservation.__all__
+        )
 
     def test_title_too_long_message_reads_the_cap(self) -> None:
         """The TITLE_TOO_LONG message names the same cap the form enforces (ROBU-08)."""
