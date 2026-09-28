@@ -4,8 +4,9 @@ Paperless-ngx REST API client with retry, polling, and connection test.
 Uploads PDFs with metadata (title, tags, correspondent) but no document
 date, which paperless-ngx chooses itself; polls the task endpoint with
 exponential backoff until a terminal state and raises when that state is
-not success; and probes connections, reporting one of the five
-ConnectionStatus outcomes.
+not success; and probes connections, reporting one of the six
+ConnectionStatus outcomes.  Every request names API version 9 or 10, the
+highest the server has announced (see ``PaperlessClient.api_version``).
 """
 
 from __future__ import annotations
@@ -1721,12 +1722,14 @@ class PaperlessClient:
         self, *, timeout: httpx2.Timeout | None = None
     ) -> ConnectionStatus:
         """
-        Probe paperless-ngx and report which of five outcomes occurred.
+        Probe paperless-ngx and report which of six outcomes occurred.
 
         CONNECTED means a 2xx and nothing else.  A 404 says the API is not
         where the configured URL points -- a different thing to fix than a
         500, which says paperless-ngx itself is unwell, and both used to be
-        reported as CONNECTED.
+        reported as CONNECTED.  A 406 is INCOMPATIBLE: paperless-ngx refused
+        the API version, so it is older than 2.16 or newer than this client
+        knows.  It is not tried again with another version.
 
         The classification is an ordered chain of integer comparisons rather
         than a ``match`` with ``assert_never``, for the same reason
@@ -1777,7 +1780,7 @@ class PaperlessClient:
             # The base class of ConnectError, ConnectTimeout and ReadTimeout.
             # Catching only ConnectError let the timeout siblings escape to
             # routes.py's blanket handler, which answers HTTP 502
-            # {"status": "error"} -- none of the five outcomes.
+            # {"status": "error"} -- none of the outcomes.
             logger.warning("Paperless is unreachable")
             return ConnectionStatus.UNREACHABLE
 
@@ -1787,6 +1790,8 @@ class PaperlessClient:
             return ConnectionStatus.TOKEN_REJECTED
         if response.status_code == 404:
             return ConnectionStatus.NOT_FOUND
+        if response.status_code == 406:
+            return ConnectionStatus.INCOMPATIBLE
         logger.warning("Unexpected paperless status %s", response.status_code)
         return ConnectionStatus.SERVER_ERROR
 

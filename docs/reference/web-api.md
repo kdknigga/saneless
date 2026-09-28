@@ -67,11 +67,17 @@ Tests the connection to the configured paperless-ngx instance.
 | 200 | `{"status": "not_found"}` | Server reachable, but the paperless-ngx API is not at the configured URL (404) |
 | 200 | `{"status": "server_error"}` | Server reachable, but answered 5xx or any other unclassified non-2xx |
 | 200 | `{"status": "unreachable"}` | Server is not reachable (connection refused, DNS failure, connect or read timeout) |
+| 200 | `{"status": "incompatible_version"}` | Server reachable, but refused the API version (406): saneless needs paperless-ngx 2.16 or later, which allows API version 9 or 10 |
 | 502 | `{"status": "error", "detail": "..."}` | Unexpected failure inside saneless while running the test |
 
-The five 200 values are the complete set, and each is a stable wire contract: `connected`
+The six 200 values are the complete set, and each is a stable wire contract: `connected`
 is returned for a 2xx and nothing else, so a 404 or a 500 is now reported as its own
 outcome rather than as a working connection.
+
+saneless asks for API version 9 on its first request, which every paperless-ngx from 2.16
+on allows, and for version 10 once an answer has said the server allows it (paperless-ngx
+3.x does). A paperless-ngx before 2.16 allows only versions up to 7, so it answers `406`,
+reported here as `incompatible_version`.
 
 The result is shared and reused for 2 seconds; concurrent calls do not each contact
 paperless-ngx. A call inside that window gets the same status code and body as the call

@@ -603,6 +603,10 @@ class ConnectionStatus(StrEnum):
     ``assert_never`` does not apply and a trailing fallback is the correct
     total answer.  This module imports no HTTP client and never maps a
     response status to a connection outcome.
+
+    INCOMPATIBLE is a paperless-ngx that answered 406 Not Acceptable: it does
+    not allow API version 9 or 10, so it is older than 2.16 or newer than
+    this saneless knows.  Its wire value is ``incompatible_version``.
     """
 
     CONNECTED = "connected"
@@ -610,6 +614,7 @@ class ConnectionStatus(StrEnum):
     NOT_FOUND = "not_found"
     SERVER_ERROR = "server_error"
     UNREACHABLE = "unreachable"
+    INCOMPATIBLE = "incompatible_version"
 
 
 class WorkerHealth(StrEnum):
@@ -2828,6 +2833,10 @@ def connection_status_message(status: ConnectionStatus) -> str:
             message = "Paperless-ngx returned a server error."
         case ConnectionStatus.UNREACHABLE:
             message = "Could not reach paperless-ngx."
+        case ConnectionStatus.INCOMPATIBLE:
+            message = (
+                "This paperless-ngx does not speak an API version saneless supports."
+            )
         case _:
             assert_never(status)
     return message

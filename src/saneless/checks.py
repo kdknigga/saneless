@@ -2930,6 +2930,11 @@ def _paperless_next_step(status: ConnectionStatus) -> str:
                 "Check paperless-ngx is running and on the network, "
                 "then press Check again."
             )
+        case ConnectionStatus.INCOMPATIBLE:
+            next_step = (
+                "saneless needs paperless-ngx 2.16 or later (API version 9 or 10); "
+                "upgrade paperless-ngx, then press Check again."
+            )
         case _:
             assert_never(status)
     return next_step
@@ -2950,13 +2955,13 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     fails inside httpx2 before anything is sent, and ``test_connection``
     would report that as UNREACHABLE -- a network fault, when the fix is a
     setting.  ``ConnectionStatus`` is a public JSON contract, so the unset URL
-    gets its own row here rather than a sixth status.
+    gets its own row here rather than a new status.
 
     A ``None`` client means one could not be constructed.
     ``PaperlessClient.__init__`` refuses a URL httpx2 will not parse or that
     carries a user name or password, a token an HTTP header cannot carry, and
     a TLS trust store it cannot read; every one of them is shown as the "not
-    found at that URL" row, not a sixth sentence.  Load-time validation of
+    found at that URL" row, not a new sentence.  Load-time validation of
     ``paperless.url`` and ``paperless.token`` rejects the first three before a
     client is ever built, so in practice the row is reached by the last.
 
