@@ -58,6 +58,7 @@ from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     HIDDEN_PRESERVED_ERROR,
     RESTART_REASON,
+    RESTART_UPLOADING_REASON,
     TERMINAL_STATES,
     FlipOutcome,
     ProfileStorage,
@@ -3975,6 +3976,52 @@ class TestWorkerDegradedHealth:
             RESTART_REASON,
         )
 
+    def test_recovery_replay_restart_words_an_uploading_row_as_maybe_delivered(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The deferred recovery words each row by its state, as startup would.
+
+        An uploading row, with or without kept pages, is the amber after-send
+        category; a scanning row keeps the plain restart text.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        kept_upload = store.create_job("default", "Uploading, Pages Kept")
+        store.update_state(kept_upload.id, JobState.UPLOADING)
+        bare_upload = store.create_job("default", "Uploading, Nothing Kept")
+        store.update_state(bare_upload.id, JobState.UPLOADING)
+        scanning = store.create_job("default", "Scanning")
+        store.update_state(scanning.id, JobState.SCANNING)
+        kept = "The scan was preserved at /data/failed/c.pdf"
+        probes = _StoreFault(store.probe)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.mark_recovery_pending({kept_upload.id: kept})
+            worker.start()
+            probes.heal()
+            recovered = poll_until(
+                lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
+            )
+            rows = [_get(store, job.id) for job in (kept_upload, bare_upload, scanning)]
+        finally:
+            worker.stop()
+            store.close()
+
+        assert recovered
+        assert [(row.state, row.error, row.error_category) for row in rows] == [
+            (
+                JobState.ERROR,
+                f"{RESTART_UPLOADING_REASON}. {kept}",
+                ErrorCategory.UNCONFIRMED_SEND,
+            ),
+            (JobState.ERROR, RESTART_UPLOADING_REASON, ErrorCategory.UNCONFIRMED_SEND),
+            (JobState.ERROR, RESTART_REASON, None),
+        ]
+
     def test_recovered_workspace_texts_survive_a_failed_write(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
@@ -5567,6 +5614,33 @@ def _raising_pipeline(error: BaseException) -> Callable[..., ScanResult]:
     return failing
 
 
+def _interrupted_after(
+    events: tuple[PipelineEvent, ...], interruption: ScanInterrupted
+) -> Callable[..., ScanResult]:
+    """
+    Build a ``run_pipeline`` stand-in that announces ``events``, then is stopped.
+
+    Returns:
+        A callable taking ``run_pipeline``'s arguments, calling the request's
+        status callback with each event in turn and then raising
+        ``interruption``.
+
+    """
+
+    def interrupted(
+        _scanner: object,
+        _paperless: object,
+        _settings: object,
+        request: PipelineRequest,
+    ) -> ScanResult:
+        if request.status_callback:
+            for event in events:
+                request.status_callback(event)
+        raise interruption
+
+    return interrupted
+
+
 def _finish_one_job(
     worker: ScanWorker,
     store: JobStore,
@@ -5759,6 +5833,112 @@ class TestWorkerJobEndings:
 
         assert finished.state is JobState.ERROR
         assert finished.error == RESTART_REASON
+        assert finished.error_category is None
+
+    def test_a_restart_while_uploading_is_recorded_as_maybe_delivered(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A stop during the upload may have left the document in paperless-ngx.
+
+        The row is the amber after-send category, and its text says the
+        upload may have arrived, followed by the kept file, rather than
+        "before this scan finished".
+        """
+        note = "The 2 page(s) scanned were preserved at /x.pdf"
+        interruption = ScanInterrupted("The server is stopping")
+        interruption.add_note(note)
+        events = (PipelineEvent.ASSEMBLING, PipelineEvent.UPLOADING)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline", _interrupted_after(events, interruption)
+        )
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == f"{RESTART_UPLOADING_REASON}. {note}"
+        assert finished.error_category is ErrorCategory.UNCONFIRMED_SEND
+
+    def test_a_restart_while_uploading_that_kept_nothing_is_still_amber(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """With no note, the row carries the uploading reason alone."""
+        interruption = ScanInterrupted("The server is stopping")
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _interrupted_after((PipelineEvent.UPLOADING,), interruption),
+        )
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == RESTART_UPLOADING_REASON
+        assert finished.error_category is ErrorCategory.UNCONFIRMED_SEND
+
+    def test_a_restart_while_uploading_is_amber_when_the_state_write_failed(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        What the run announced decides the wording, not what reached the row.
+
+        The UPLOADING progress write fails and is logged, so the row still
+        reads ASSEMBLING when the stop arrives; the upload had begun all the
+        same, so the ending is still the amber one.
+        """
+        store = JobStore()
+        original_update = store.update_state
+
+        def refusing_uploading(
+            job_id: str,
+            state: JobState,
+            error: str | None = None,
+            error_category: ErrorCategory | None = None,
+        ) -> None:
+            if state is JobState.UPLOADING:
+                msg = "database is locked"
+                raise sqlite3.OperationalError(msg)
+            original_update(job_id, state, error=error, error_category=error_category)
+
+        monkeypatch.setattr(store, "update_state", refusing_uploading)
+        events = (PipelineEvent.ASSEMBLING, PipelineEvent.UPLOADING)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _interrupted_after(events, ScanInterrupted("The server is stopping")),
+        )
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == RESTART_UPLOADING_REASON
+        assert finished.error_category is ErrorCategory.UNCONFIRMED_SEND
+
+    def test_a_restart_before_the_upload_keeps_the_restart_reason(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A stop while assembling never reached paperless-ngx, so no category."""
+        note = "The 2 page(s) scanned were preserved at /x.pdf"
+        interruption = ScanInterrupted("The server is stopping")
+        interruption.add_note(note)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _interrupted_after((PipelineEvent.ASSEMBLING,), interruption),
+        )
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == f"{RESTART_REASON}. {note}"
         assert finished.error_category is None
 
     def test_the_worker_thread_survives_an_interruption(

@@ -43,7 +43,9 @@ from saneless.paperless import ApiDelivery
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     RESTART_REASON,
+    RESTART_UPLOADING_REASON,
     TERMINAL_STATES,
+    ErrorCategory,
     JobState,
     WorkerHealth,
 )
@@ -378,6 +380,7 @@ def test_an_orphaned_workspace_is_named_in_its_jobs_restart_error(
     assert scanning.state is JobState.ERROR
     assert scanning.error is not None
     assert scanning.error.startswith(f"{RESTART_REASON}. ")
+    assert scanning.error.count(RESTART_REASON) == 1
     assert f"preserved at {pdf}" in scanning.error
     assert scanning.error_category is None
     for other in others:
@@ -466,6 +469,155 @@ def test_an_orphan_text_the_store_refused_is_written_once_it_recovers(
         and record.levelno == logging.ERROR
         and "Crash recovery" in record.getMessage()
         for record in caplog.records
+    )
+
+
+# --- A restart while uploading -----------------------------------------------
+
+# The title the crashed UPLOADING row carries, which its workspace records too.
+_UPLOADING_TITLE = "uploading when the process died"
+
+
+@dataclass(frozen=True)
+class _SeededUpload:
+    """The ids of an uploading row and a scanning row a crashed process left."""
+
+    uploading: str
+    scanning: str
+
+
+def _seed_crashed_upload(settings: Settings) -> _SeededUpload:
+    """
+    Write an UPLOADING row and a SCANNING row, as a killed process leaves them.
+
+    Returns:
+        The two rows' ids.
+
+    """
+    store = JobStore(db_path=settings.output.db_path)
+    try:
+        uploading = store.create_job(
+            "default", _UPLOADING_TITLE, owner_token=_SEEDING_BROWSER
+        )
+        store.update_state(uploading.id, JobState.UPLOADING)
+        scanning = store.create_job(
+            "default", _SCANNING_TITLE, owner_token=_SEEDING_BROWSER
+        )
+        store.update_state(scanning.id, JobState.SCANNING)
+    finally:
+        store.close()
+    return _SeededUpload(uploading=uploading.id, scanning=scanning.id)
+
+
+def _orphan_the_uploading_job(settings: Settings, seeded: _SeededUpload) -> Path:
+    """
+    Leave the workspace a SIGKILLed upload of the UPLOADING row would leave.
+
+    Returns:
+        The orphaned workspace, holding two spooled pages.
+
+    """
+    return leave_killed_workspace(
+        settings.output.tmp_dir, job_id=seeded.uploading, title=_UPLOADING_TITLE
+    )
+
+
+def test_startup_restart_words_an_uploading_row_as_maybe_delivered(
+    settings: Settings,
+) -> None:
+    """An uploading row may have reached paperless-ngx; a scanning row did not."""
+    seeded = _seed_crashed_upload(settings)
+    app = _build_app(settings)
+    with TestClient(app):
+        store: JobStore = app.state.job_store
+        uploading = store.get_job(seeded.uploading)
+        scanning = store.get_job(seeded.scanning)
+
+    assert uploading is not None
+    assert uploading.state is JobState.ERROR
+    assert uploading.error == RESTART_UPLOADING_REASON
+    assert uploading.error_category is ErrorCategory.UNCONFIRMED_SEND
+    assert scanning is not None
+    assert scanning.state is JobState.ERROR
+    assert scanning.error == RESTART_REASON
+    assert scanning.error_category is None
+
+
+def test_startup_restart_names_the_kept_pages_of_an_uploading_job(
+    settings: Settings,
+) -> None:
+    """The kept-file sentence follows the uploading reason, said once."""
+    seeded = _seed_crashed_upload(settings)
+    _orphan_the_uploading_job(settings, seeded)
+    app = _build_app(settings)
+    with TestClient(app):
+        store: JobStore = app.state.job_store
+        uploading = store.get_job(seeded.uploading)
+        scanning = store.get_job(seeded.scanning)
+
+    (pdf,) = _preserved_pdfs(settings)
+    assert uploading is not None
+    assert uploading.state is JobState.ERROR
+    assert uploading.error is not None
+    assert uploading.error.startswith(f"{RESTART_UPLOADING_REASON}. ")
+    assert RESTART_REASON not in uploading.error
+    assert uploading.error.count(RESTART_UPLOADING_REASON) == 1
+    assert f"preserved at {pdf}" in uploading.error
+    assert uploading.error_category is ErrorCategory.UNCONFIRMED_SEND
+    assert scanning is not None
+    assert (scanning.state, scanning.error, scanning.error_category) == (
+        JobState.ERROR,
+        RESTART_REASON,
+        None,
+    )
+
+
+def test_a_refused_restart_of_an_uploading_job_is_worded_once_the_store_recovers(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker's replay words and categorises the rows as startup would have."""
+    monkeypatch.setattr(worker_module, "_IDLE_TICK_SECONDS", _FAST_TICK)
+    seeded = _seed_crashed_upload(settings)
+    _orphan_the_uploading_job(settings, seeded)
+    app = _build_app(settings)
+    store: JobStore = app.state.job_store
+    original = store.fail_recovered_jobs
+    calls: list[dict[str, str]] = []
+
+    def failing_once(kept: Mapping[str, str]) -> int:
+        calls.append(dict(kept))
+        if len(calls) == 1:
+            msg = "attempt to write a readonly database"
+            raise sqlite3.OperationalError(msg)
+        return original(kept)
+
+    monkeypatch.setattr(store, "fail_recovered_jobs", failing_once)
+    with TestClient(app):
+        healed = poll_until(
+            lambda: app.state.worker.health is WorkerHealth.HEALTHY, _HEAL_BUDGET
+        )
+        uploading = store.get_job(seeded.uploading)
+        scanning = store.get_job(seeded.scanning)
+
+    (pdf,) = _preserved_pdfs(settings)
+    assert healed
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    # The mapping carries only where the pages went: the store words the
+    # restart by the row's state.
+    assert all(RESTART_REASON not in text for text in calls[0].values())
+    assert uploading is not None
+    assert uploading.state is JobState.ERROR
+    assert uploading.error is not None
+    assert uploading.error.startswith(f"{RESTART_UPLOADING_REASON}. ")
+    assert f"preserved at {pdf}" in uploading.error
+    assert uploading.error_category is ErrorCategory.UNCONFIRMED_SEND
+    assert scanning is not None
+    assert (scanning.state, scanning.error, scanning.error_category) == (
+        JobState.ERROR,
+        RESTART_REASON,
+        None,
     )
 
 
