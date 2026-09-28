@@ -24,11 +24,13 @@ from saneless import preservation
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
+    DiskSpaceError,
     ScanCancelledError,
     ScanError,
     ScanInterrupted,
     SpoolError,
     describe,
+    is_out_of_space,
 )
 from saneless.pages import BlankFilterResult, filter_blank_pages, generate_thumbnail
 from saneless.paperless import ApiDelivery, FolderDelivery
@@ -747,7 +749,7 @@ def _note_pass_count(request: PipelineRequest, label: str, count: int) -> None:
 
 def _check_disk_space(tmp_dir: Path, min_free_mb: int) -> None:
     """
-    Raise ScanError if insufficient disk space in tmp_dir.
+    Raise DiskSpaceError if there is too little free space in tmp_dir.
 
     This only measures: ``_open_workspace`` creates the directory first.
 
@@ -756,7 +758,8 @@ def _check_disk_space(tmp_dir: Path, min_free_mb: int) -> None:
         min_free_mb: Minimum free space required in megabytes.
 
     Raises:
-        ScanError: If free space is below the required threshold.
+        DiskSpaceError: If free space is below the required threshold.  A
+            full disk, not a scanner fault, so it is not a ``ScanError``.
         OSError: If the directory cannot be measured; the caller translates
             it.
 
@@ -768,7 +771,7 @@ def _check_disk_space(tmp_dir: Path, min_free_mb: int) -> None:
             f"Insufficient disk space: {free_mb} MB free in {tmp_dir}, "
             f"{min_free_mb} MB required (configure min_free_space_mb to adjust)"
         )
-        raise ScanError(msg)
+        raise DiskSpaceError(msg)
 
 
 @contextlib.contextmanager
@@ -787,9 +790,12 @@ def _open_workspace(
     ``tmp_dir`` is created 0700 when missing and refused when it is not
     private (see ``saneless.private_dirs``); both failures are a
     ``ConfigError`` naming ``output.tmp_dir``.  The other two steps can raise a
-    raw ``OSError`` -- a full disk, say.  That is the setup problem
-    ``validate_settings_dirs`` reports at start-up, so it is a ``ConfigError``
-    here too, not an UNKNOWN error the CLI would call a saneless bug.
+    raw ``OSError`` -- a permission refused, or ``tmp_dir`` removed since
+    start-up.  That is the setup problem ``validate_settings_dirs`` reports at
+    start-up, so it is a ``ConfigError`` here too, not an UNKNOWN error the CLI
+    would call a saneless bug.  A full disk is the exception: an ``ENOSPC`` or
+    ``EDQUOT`` from any of the three steps, including creating ``tmp_dir``,
+    is a ``DiskSpaceError``, because nothing in the settings is wrong.
     Only the workspace's creation is guarded: an ``OSError`` from the scan run
     inside it keeps its own type.
 
@@ -805,8 +811,10 @@ def _open_workspace(
 
     Raises:
         ConfigError: If ``tmp_dir`` cannot be created or measured, or the
-            workspace cannot be created in it; names ``tmp_dir``.
-        ScanError: If free space is below ``min_free_mb``.
+            workspace cannot be created in it, for any reason but a full
+            disk; names ``tmp_dir``.
+        DiskSpaceError: If free space is below ``min_free_mb``, or preparing
+            the workspace ran out of space or quota; names ``tmp_dir``.
 
     """
     with contextlib.ExitStack() as stack:
@@ -825,10 +833,39 @@ def _open_workspace(
                 profile=request.profile_name,
             )
             stack.enter_context(workspace)
+        except ConfigError as exc:
+            # Creating a missing tmp_dir is the private-directory helper's,
+            # and it reports every OSError as a ConfigError.  A full disk is
+            # still a full disk.
+            if is_out_of_space(exc):
+                raise _workspace_out_of_space(tmp_dir, exc) from exc
+            raise
         except OSError as exc:
+            if is_out_of_space(exc):
+                raise _workspace_out_of_space(tmp_dir, exc) from exc
             msg = f"Could not prepare the working directory {tmp_dir}: {describe(exc)}"
             raise ConfigError(msg) from exc
         yield workspace
+
+
+def _workspace_out_of_space(tmp_dir: Path, exc: Exception) -> DiskSpaceError:
+    """
+    Build the failure for a workspace the disk had no room for.
+
+    Args:
+        tmp_dir: The configured directory for temporary files.
+        exc: What preparing the workspace raised: the ``OSError`` itself, or
+            the ``ConfigError`` raised from it.
+
+    Returns:
+        The ``DiskSpaceError`` to raise, naming ``tmp_dir`` and the
+        ``OSError``'s own reason.
+
+    """
+    cause = exc.__cause__ if isinstance(exc, ConfigError) else None
+    reason = describe(cause if isinstance(cause, OSError) else exc)
+    msg = f"Could not prepare the working directory {tmp_dir}: {reason}"
+    return DiskSpaceError(msg)
 
 
 def _require_pages(batch: ScanBatch) -> None:
@@ -1623,9 +1660,11 @@ def _returns_to_prompt(exc: Exception) -> bool:
     True for ``ErrorCategory.SCANNER`` and ``ErrorCategory.FEEDER`` only, and
     never for a ``SpoolError``.  A device fault or an empty feeder is one the
     operator can put right -- clear a jam, close a cover, load the next sheet
-    -- and then try the pass again.  A ``SpoolError`` is a full disk, raised
-    as a ``ScanError``, and the same pass would fail the same way at once.
-    The other categories -- configuration, assembly, upload, and anything
+    -- and then try the pass again.  A full disk is a ``DiskSpaceError``,
+    filed as ``ErrorCategory.DISK_SPACE``, and a ``SpoolError`` is a spool
+    that could not be written or measured, raised as a ``ScanError``; either
+    way the same pass would fail the same way at once.  The other categories
+    -- configuration, disk space, assembly, upload, and anything
     unclassified, a bug among them -- are not the scanner's, so trying the
     pass again cannot help.
 
@@ -3402,8 +3441,13 @@ def run_pipeline(
             duplex profile is run with no flip coordinator, a multi-page scan
             is asked for on a manual duplex profile or with no pass
             coordinator, or the working directory under ``tmp_dir`` cannot be
-            created or measured. Nothing has been scanned yet, so nothing is
-            kept.
+            created or measured for a reason other than a full disk. Nothing
+            has been scanned yet, so nothing is kept.
+        DiskSpaceError: If the disk runs out of room: free space in
+            ``tmp_dir`` below ``min_free_space_mb`` before scanning, an
+            ``ENOSPC`` or ``EDQUOT`` while preparing the working directory,
+            or a page the spool has no room for or runs out of space writing.
+            What was scanned before it is kept, like any failure.
         ScanCancelledError: If the operator aborts a manual duplex scan at the
             flip prompt, or a multi-page scan at any of its prompts. Nothing
             is kept.

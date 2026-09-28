@@ -98,13 +98,18 @@ class ListingTimedOutError(ScanError):
 
 class SpoolError(ScanError):
     """
-    The spool refused or failed to write a page (disk space or a write error).
+    The spool could not write a page, or could not measure its free space.
+
+    A write error other than a full disk, or a spool directory whose free
+    space cannot be read -- one removed, or whose mount went away.  A full
+    disk is not this: a shortfall, or a write that runs out of space or
+    quota, is a ``DiskSpaceError``.
 
     A ``ScanError`` subclass, so ``classify_error`` still files it as
     ``ErrorCategory.SCANNER`` and every exit code and message stays what it
-    was.  It exists so a caller that must treat a full or failing disk
-    differently from a device fault can test for it exactly: a jammed feeder
-    is worth trying again, a disk with no room is not.
+    was.  It exists so a caller that must treat a failing disk differently
+    from a device fault can test for it exactly: a jammed feeder is worth
+    trying again, a disk that cannot be written is not.
     """
 
 
