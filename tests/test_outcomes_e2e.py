@@ -632,12 +632,17 @@ def _build_settings(
     # sqlite3.connect does not create parent directories and db_path creates
     # nothing, so the store would fail to open without this.
     data_dir.mkdir(parents=True, exist_ok=True)
+    consume_dir = tmp_path / "consume"
+    # The fallback never creates its folder, as paperless-ngx's volume would
+    # already be mounted there.
+    if case.with_consume_dir:
+        consume_dir.mkdir()
     return Settings(
         scanner=ScannerConfig(device=_DEVICE),
         paperless=PaperlessConfig(
             url=paperless_url,
             token=_TOKEN,
-            consume_dir=tmp_path / "consume" if case.with_consume_dir else None,
+            consume_dir=consume_dir if case.with_consume_dir else None,
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_path / "scratch"),
@@ -708,8 +713,8 @@ def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) ->
         case: The expectations for this run.
         job: The finished job row, for its error message.
         failed_dir: ``<data_dir>/failed/``, created only by a preservation.
-        consume_dir: The paperless-ngx consume directory, created only by a
-            fallback.
+        consume_dir: The paperless-ngx consume directory, which exists only
+            when the case configures one.
 
     """
     preserved = sorted(failed_dir.glob("*.pdf")) if failed_dir.exists() else []

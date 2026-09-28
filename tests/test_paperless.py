@@ -892,6 +892,7 @@ class TestUploadFailureTranslation:
     ) -> None:
         """With a consume directory the exhausted retries take the fallback."""
         consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
         handler = _CountingHandler(_raising(exc_type("upstream went away")))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:
@@ -1264,6 +1265,7 @@ class TestUploadFailureTranslation:
     ) -> None:
         """A 503 on every attempt takes the fallback when one is configured."""
         consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
         handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:

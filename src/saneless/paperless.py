@@ -15,11 +15,13 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Final, assert_never
+from pathlib import Path
+from typing import Final, assert_never
 
 import httpx2
 
@@ -27,9 +29,6 @@ from .atomic_write import refused_mode_change
 from .exceptions import ConfigError, PaperlessError, PaperlessTimeoutError, describe
 from .text_safety import neutralise_bounded, neutralise_controls
 from .vocabulary import ConnectionStatus
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 __all__ = ["PaperlessClient", "UploadResult"]
 
@@ -1107,6 +1106,10 @@ class PaperlessClient:
         """
         Copy the PDF into the consume directory after the upload did not land.
 
+        The directory is never created.  A missing one almost always means
+        the paperless-ngx volume is not mounted, and a directory made in its
+        place is one nothing watches: the copy would sit there unseen.
+
         Args:
             pdf_path: The PDF that could not be uploaded.
             dest_dir: The configured consume directory.
@@ -1115,15 +1118,18 @@ class PaperlessClient:
             An UploadResult naming the file the PDF was copied to.
 
         Raises:
-            PaperlessError: If the directory cannot be created or the copy
-                fails, chained to the OSError.
+            PaperlessError: If the directory does not exist (or is not a
+                directory), or, chained to the OSError, if the copy fails.
 
         """
+        if not dest_dir.is_dir():
+            msg = (
+                f"consume directory {dest_dir} does not exist — "
+                "is the paperless-ngx volume mounted?"
+            )
+            raise PaperlessError(msg)
         dest = dest_dir / pdf_path.name
         try:
-            if not dest_dir.exists():
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                logger.warning("Created consume directory %s", dest_dir)
             self._deliver_to_consume_dir(pdf_path, dest_dir, dest)
         except OSError as exc:
             msg = (
@@ -1145,11 +1151,14 @@ class PaperlessClient:
         staging file, are flushed and fsynced, and only then take their final
         name in one ``rename(2)``.
 
-        Two details are load-bearing:
+        Three details are load-bearing:
 
-        * The staging file is a **dotfile**, which the consumer skips
-          outright.  Relying instead on it merely ignoring an unknown
-          ``.part`` extension would trade log spam for atomicity.
+        * The staging file is a unique hidden ``.part`` file created
+          exclusively by ``mkstemp`` (``O_EXCL``, mode 0600), so
+          nothing planted at a predictable name -- a symlink, or a leftover
+          from a crash -- can be written through or collide with it.
+          paperless-ngx 2.x logs it as an unknown file extension and 3.x
+          skips it by extension; neither consumes it.
         * The staging file lives **inside the consume directory**, not in
           the caller's temporary directory.  ``rename(2)`` is atomic only
           within one filesystem, and the consume directory is typically a
@@ -1177,12 +1186,14 @@ class PaperlessClient:
                 truncated remnant for a retry or the consumer to find.
 
         """
-        staged = dest_dir / f".{pdf_path.name}.part"
+        # Created owner-only and exclusively, so under no umask can anyone
+        # else write to it, even for an instant: the consume folder is often
+        # shared with a group.
+        descriptor, staged_name = tempfile.mkstemp(
+            dir=dest_dir, prefix=f".{pdf_path.name}.", suffix=".part"
+        )
+        staged = Path(staged_name)
         try:
-            # Created owner-only, so under no umask can anyone else write to
-            # it, even for an instant: the consume folder is often shared
-            # with a group.
-            descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with (
                 os.fdopen(descriptor, "wb") as staged_file,
                 pdf_path.open("rb") as source,
