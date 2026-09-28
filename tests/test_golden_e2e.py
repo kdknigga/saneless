@@ -29,7 +29,9 @@ import dataclasses
 import html
 import re
 import threading
+from collections import Counter
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import TYPE_CHECKING, NoReturn
 
 import httpx2
@@ -1212,3 +1214,153 @@ def test_web_stale_tag_is_dropped_and_the_job_is_warned(
     fields = run.recorder.upload_fields(0)
     assert _values(fields, "tags") == ["3"]
     assert _values(fields, "correspondent") == [_CORRESPONDENT]
+
+
+# --------------------------------------------------------------------------
+# The twin: an untouched web form and ``saneless scan --profile`` agree.
+# --------------------------------------------------------------------------
+
+
+class _UntouchedForm(HTMLParser):
+    """
+    Read the metadata an untouched scan form submits, as a browser would.
+
+    A ticked ``tags`` box submits its value.  A select submits the option
+    marked ``selected`` (the last one, if several are), and the first option
+    when none is marked.
+
+    Attributes:
+        tags: Every ticked ``tags`` value, in document order.
+
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing read."""
+        super().__init__()
+        self.tags: list[str] = []
+        self._select: str | None = None
+        self._first: dict[str, str] = {}
+        self._selected: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """
+        Note a ticked tag box, an open select, or one of its options.
+
+        Args:
+            tag: The element name.
+            attrs: Its attributes; a bare attribute's value is None.
+
+        """
+        found = dict(attrs)
+        if tag == "input" and found.get("name") == "tags" and "checked" in found:
+            self.tags.append(found.get("value") or "")
+        elif tag == "select":
+            self._select = found.get("name")
+        elif tag == "option" and self._select is not None:
+            value = found.get("value") or ""
+            self._first.setdefault(self._select, value)
+            if "selected" in found:
+                self._selected[self._select] = value
+
+    def handle_endtag(self, tag: str) -> None:
+        """
+        Close the open select.
+
+        Args:
+            tag: The element name.
+
+        """
+        if tag == "select":
+            self._select = None
+
+    def choice(self, name: str) -> str:
+        """
+        Return the value a select submits untouched.
+
+        Args:
+            name: The select's ``name``.
+
+        Returns:
+            The selected option's value, or the first option's.
+
+        """
+        return self._selected.get(name, self._first[name])
+
+
+def _untouched_web_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[RecordingPaperless, dict[str, str | list[str]]]:
+    """
+    Scan once through the web app, submitting the form exactly as it opened.
+
+    The simplex profile, with the golden defaults, is the first profile, so it
+    is the one the page opens on.  Only the title is typed; the profile, the
+    ticked tags and the chosen correspondent are read from the rendered page.
+
+    Args:
+        tmp_path: The directory this run keeps its files under.
+        monkeypatch: Swaps the app's ``PaperlessClient`` for the recording one.
+
+    Returns:
+        The in-memory paperless-ngx, and the form that was posted.
+
+    """
+    recorder = RecordingPaperless()
+    settings = _settings(tmp_path, profile_metadata=True)
+    opening = {_SIMPLEX: settings.profiles[_SIMPLEX]}
+    settings = settings.model_copy(
+        update={"profiles": opening | settings.profiles}, deep=True
+    )
+    scanner = DistinctPageScanner(passes=_SIMPLEX_RUN.passes, rejected=())
+    monkeypatch.setattr(
+        "saneless.web.app.PaperlessClient", web_client_builder(recorder)
+    )
+    app = create_app(settings, scanner)
+    with TestClient(app) as client:
+        page = client.get("/")
+        assert page.status_code == 200, page.text
+        form_state = _UntouchedForm()
+        form_state.feed(page.text)
+        form: dict[str, str | list[str]] = {
+            "profile": form_state.choice("profile"),
+            "title": _TITLE,
+            "tags": form_state.tags,
+            "correspondent": form_state.choice("correspondent"),
+        }
+        submitted = client.post("/api/scan", data=form)
+        assert submitted.status_code == 200, submitted.text
+        store: JobStore = app.state.job_store
+        job_id = store.list_recent(limit=1)[0].id
+        job = wait_for_state(store, job_id, TERMINAL_STATES, _BUDGET)
+    assert job.state is JobState.DONE, job
+    return recorder, form
+
+
+def test_twin_metadata_untouched_form_matches_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The form as it opens sends what ``saneless scan --profile`` sends.
+
+    The profile's ``default_tags`` and ``default_correspondent`` reach the
+    web upload only if the page renders them ticked and selected; the command
+    line takes them from the profile.  Everything but the document itself is
+    the same, part for part.
+    """
+    web, form = _untouched_web_upload(tmp_path / "web", monkeypatch)
+    cli_run = _run_cli(tmp_path / "cli", monkeypatch, _SIMPLEX_RUN)
+
+    assert cli_run.result.exit_code == 0, cli_run.result.output
+    assert form["profile"] == _SIMPLEX
+    assert len(web.uploads()) == 1
+    assert len(cli_run.recorder.uploads()) == 1
+    web_fields = Counter(
+        field for field in web.upload_fields(0) if field[0] != "document"
+    )
+    cli_fields = Counter(
+        field for field in cli_run.recorder.upload_fields(0) if field[0] != "document"
+    )
+    assert web_fields == cli_fields
+    assert web_fields == Counter(
+        [("title", _TITLE), ("tags", "3"), ("tags", "7"), ("correspondent", "12")]
+    )
