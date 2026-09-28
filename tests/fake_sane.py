@@ -41,6 +41,15 @@ What the double models:
 7. A cancelled read raises with SANE's own status text, ``Operation was
    canceled``, and ``init()`` returns python-sane's 4-tuple: the packed version
    code, then its major, minor and build.
+8. ``FakeSaneModule.open()`` returns a **new handle** every time, and every
+   handle shares the one device, so an option value set through one handle is
+   still set on the next.  A closed handle refuses every call but ``close()``
+   with ``SaneDev object is closed`` before the device counts anything, and
+   closing it again does nothing.  The feeder iterator cancels the handle that
+   made it when it is finalised, swallowing any error, so dropping one is a
+   cancel.  A test arranges and inspects the device itself through
+   ``FakeSaneModule.device``; a ``FakeSaneDev`` used directly behaves as a
+   handle that is always open.
 
 One deliberate, documented divergence: the real ``__load_option_dict`` filters
 ``TYPE_GROUP`` options out of ``opt``, which makes the library's own "Groups
@@ -62,6 +71,7 @@ rather than discovered there.
 
 from __future__ import annotations
 
+import contextlib
 import operator
 import threading
 import weakref
@@ -76,6 +86,7 @@ if TYPE_CHECKING:
 __all__ = [
     "FakeSaneDev",
     "FakeSaneError",
+    "FakeSaneHandle",
     "FakeSaneModule",
     "ReadBlockMode",
     "build_option_table",
@@ -170,6 +181,10 @@ _READ_GATE_CEILING_SECONDS = 30.0
 # Modelling the truncation this way is what makes the backend's discard rule
 # testable instead of incidental.
 _TRUNCATED_PAGE_DIVISOR = 4
+
+# What python-sane raises for any call on a handle after ``close()``; the C
+# layer checks for it before it makes a SANE call.
+_CLOSED_MESSAGE = "SaneDev object is closed"
 
 # The message a real cancelled read raises with when it raises at all: SANE's
 # ``SANE_STATUS_CANCELLED`` renders as this string through ``sane_strstatus``.
@@ -906,21 +921,31 @@ class _FakeSaneIterator:
     It calls ``start()`` then ``snap()`` once per page.  A double that returns
     ``iter(list)`` instead cannot show the per-page call pattern, which is
     where the backend's per-page error handling lives.
+
+    Like the real one it cancels the handle that made it when it is
+    finalised, and swallows whatever that cancel raises -- on a closed handle,
+    "SaneDev object is closed".  So dropping an iterator is itself a cancel,
+    sent from whichever thread lets go of the last reference.
     """
 
-    def __init__(self, device: FakeSaneDev) -> None:
+    def __init__(self, handle: FakeSaneDev | FakeSaneHandle) -> None:
         """
-        Wrap a device.
+        Wrap the handle that made the iterator.
 
         Args:
-            device: The device to drive.
+            handle: The handle to drive, and to cancel when finalised.
 
         """
-        self._device = device
+        self._handle = handle
 
     def __iter__(self) -> _FakeSaneIterator:
         """Return self, as the real iterator does."""
         return self
+
+    def __del__(self) -> None:
+        """Cancel the handle, swallowing any error, as ``sane.py`` does."""
+        with contextlib.suppress(Exception):
+            self._handle.cancel()
 
     def __next__(self) -> Image.Image:
         """
@@ -934,8 +959,8 @@ class _FakeSaneIterator:
 
         """
         try:
-            self._device.start()
-            return self._device.snap(no_cancel=True)
+            self._handle.start()
+            return self._handle.snap(no_cancel=True)
         except Exception as exc:
             if str(exc) == _FEEDER_EMPTY_MESSAGE:
                 raise StopIteration from None
@@ -944,9 +969,10 @@ class _FakeSaneIterator:
 
 class FakeSaneDev:
     """
-    A SANE device handle that behaves like the real one.
+    A SANE device that behaves like the real one, and the state its handles share.
 
-    Configure it through the constructor rather than by subclassing, so that a
+    ``FakeSaneModule.open()`` wraps it in a :class:`FakeSaneHandle`; a test
+    can also drive it directly, as a handle that is never closed.  Configure it through the constructor rather than by subclassing, so that a
     later plan can narrow a constraint or arm an error without creating a
     fourth divergent double.
     """
@@ -1635,6 +1661,196 @@ class FakeSaneDev:
             raise error
 
 
+class FakeSaneHandle:
+    """
+    One open handle to a :class:`FakeSaneDev`, as ``FakeSaneModule.open()`` makes.
+
+    python-sane's ``open()`` returns a new ``SaneDev`` every time, and the
+    device keeps its option values from one handle to the next.  So the state
+    lives on the device -- options, feeder, armed errors, block mode and every
+    counter a test inspects -- and a handle only forwards to it and owns one
+    thing of its own: whether it is closed.
+
+    Once closed, every call but ``close()`` raises the SANE error "SaneDev
+    object is closed" before it reaches the device, so nothing is counted or
+    changed; closing again does nothing.  A name that is not one of the
+    device's options is stored on the handle itself, as python-sane stores it,
+    so assigning ``cancel`` shadows the method on this handle alone.
+    """
+
+    # The options the default table serves, declared for the ``SaneDevice``
+    # protocol exactly as on ``FakeSaneDev``: annotations only, so reads and
+    # writes still go through __getattr__ and __setattr__.
+    mode: str
+    resolution: float
+    source: str
+    tl_x: float
+    tl_y: float
+    br_x: float
+    br_y: float
+
+    _device: FakeSaneDev
+    _closed: bool
+
+    def __init__(self, device: FakeSaneDev) -> None:
+        """
+        Open a handle to a device.
+
+        Args:
+            device: The device the handle forwards to.
+
+        """
+        self.__dict__["_device"] = device
+        self.__dict__["_closed"] = False
+
+    def _refuse_if_closed(self) -> None:
+        """
+        Raise the SANE error for a call on a closed handle.
+
+        Raises:
+            FakeSaneError: If the handle has been closed.
+
+        """
+        if self._closed:
+            raise FakeSaneError(_CLOSED_MESSAGE)
+
+    def __setattr__(self, key: str, value: object) -> None:
+        """
+        Assign an option through the device, following ``sane.py:188-213``.
+
+        Args:
+            key: The attribute or option name.
+            value: The value assigned.
+
+        Raises:
+            AttributeError: For a read-only attribute, or an option that
+                cannot be set.
+            FakeSaneError: For an option assigned on a closed handle.
+
+        """
+        if key in _READ_ONLY_ATTRIBUTES:
+            msg = f"Read-only attribute: {key}"
+            raise AttributeError(msg)
+        option = self._device.opt.get(key)
+        if option is None:
+            # No device call at all, so a closed handle stores it too.
+            self.__dict__[key] = value
+            return
+        if self._closed:
+            _reject_unsettable(option, key)
+            raise FakeSaneError(_CLOSED_MESSAGE)
+        setattr(self._device, key, value)
+
+    def __getattr__(self, key: str) -> object:
+        """
+        Read an option, or anything else, from the device.
+
+        Reached only for names the handle does not hold itself.  An option
+        read on a closed handle raises; the double's own instrumentation
+        (``calls``, ``cancel_calls`` and the rest) reads through regardless,
+        because reading it is not a SANE call.
+
+        Args:
+            key: The option or attribute name.
+
+        Returns:
+            What the device holds under that name.
+
+        Raises:
+            FakeSaneError: For an option read on a closed handle.
+
+        """
+        device = self._device
+        option = device.opt.get(key)
+        if option is not None and self._closed:
+            _reject_unreadable(option, key)
+            raise FakeSaneError(_CLOSED_MESSAGE)
+        return getattr(device, key)
+
+    @property
+    def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The scan area, composed from option reads as ``sane.py:220`` does."""
+        return (
+            (self.tl_x, self.tl_y),
+            (self.br_x, self.br_y),
+        )
+
+    @property
+    def optlist(self) -> list[str]:
+        """The option names; python-sane reads these without a device call."""
+        return self._device.optlist
+
+    @property
+    def sane_signature(self) -> tuple[str, str, str, str]:
+        """The ``(devname, brand, name, type)`` tuple."""
+        return self._device.sane_signature
+
+    @property
+    def scanner_model(self) -> tuple[str, str]:
+        """The ``(brand, name)`` pair."""
+        return self._device.scanner_model
+
+    def get_options(self) -> list[tuple]:
+        """
+        Return the device's option tuples.
+
+        Returns:
+            Nine-element tuples whose names are hyphenated.
+
+        """
+        self._refuse_if_closed()
+        return self._device.get_options()
+
+    def start(self) -> None:
+        """Begin one page on the device."""
+        self._refuse_if_closed()
+        self._device.start()
+
+    def snap(self, *, no_cancel: bool = False) -> Image.Image:
+        """
+        Read the current page from the device.
+
+        Args:
+            no_cancel: Passed through to the device.
+
+        Returns:
+            The page image.
+
+        """
+        self._refuse_if_closed()
+        return self._device.snap(no_cancel=no_cancel)
+
+    def multi_scan(self) -> Iterator[Image.Image]:
+        """
+        Return the ADF iterator, bound to this handle.
+
+        This cannot raise, even on a closed handle: the refusal comes from
+        the iterator's first ``next()``.
+
+        Returns:
+            An iterator over the feeder's pages.
+
+        """
+        return _FakeSaneIterator(self)
+
+    def cancel(self) -> None:
+        """Cancel through the device."""
+        self._refuse_if_closed()
+        self._device.cancel()
+
+    def close(self) -> None:
+        """
+        Close the handle; a second close does nothing.
+
+        The handle counts as closed even when the device's ``close()`` raises,
+        as python-sane drops its SANE handle either way.
+        """
+        if self._closed:
+            return
+        self.__dict__["_closed"] = True
+        self._device.close()
+
+
 class FakeSaneModule:
     """
     A stand-in for the ``sane`` module, for ``monkeypatch.setattr`` seams.
@@ -1656,7 +1872,7 @@ class FakeSaneModule:
         Create the module double.
 
         Args:
-            device: The shared device handle ``open()`` returns.
+            device: The device every handle ``open()`` returns shares.
             devices: The four-element device tuples ``get_devices()`` returns.
             init_error: An exception ``init()`` raises after counting the call,
                 as a SANE that cannot start (``_sane.error``) would.
@@ -1728,16 +1944,17 @@ class FakeSaneModule:
             raise self._get_devices_error
         return list(self._devices)
 
-    def open(self, device_id: str) -> FakeSaneDev:
+    def open(self, device_id: str) -> FakeSaneHandle:
         """
-        Open a device.
+        Open a new handle to the device.
 
         Args:
-            device_id: Ignored; one shared handle is returned so a test can
-                configure the device before the code under test opens it.
+            device_id: Ignored; there is one device, and every handle opened
+                on it shares its state, so a value one handle set is still set
+                on the next.
 
         Returns:
-            The shared device handle.
+            A new handle, as the real ``open()`` returns a new ``SaneDev``.
 
         Raises:
             BaseException: The configured ``open_error``.
@@ -1745,7 +1962,7 @@ class FakeSaneModule:
         """
         if self._open_error is not None:
             raise self._open_error
-        return self._device
+        return FakeSaneHandle(self._device)
 
     def exit(self) -> None:
         """

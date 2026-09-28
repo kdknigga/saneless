@@ -90,7 +90,7 @@ from saneless.vocabulary import (
     connection_status_message,
 )
 from tests.conftest import StubScannerBackend
-from tests.fake_sane import FakeSaneDev, FakeSaneModule
+from tests.fake_sane import FakeSaneDev, FakeSaneHandle, FakeSaneModule
 from tests.fake_saned import EXIT_REQUEST, INIT_REQUEST, SanedBehaviour, fake_saned
 
 if TYPE_CHECKING:
@@ -7158,10 +7158,10 @@ class _OpenCountingSaneModule(FakeSaneModule):
 
     def __init__(self, device: FakeSaneDev) -> None:
         """
-        List one fake device and hand out ``device`` on open.
+        List one fake device and open handles to ``device``.
 
         Args:
-            device: The shared handle ``open()`` returns.
+            device: The device every handle ``open()`` returns shares.
 
         """
         super().__init__(
@@ -7169,7 +7169,7 @@ class _OpenCountingSaneModule(FakeSaneModule):
         )
         self.opened: list[str] = []
 
-    def open(self, device_id: str) -> FakeSaneDev:
+    def open(self, device_id: str) -> FakeSaneHandle:
         """
         Record the open, then open the way the plain fake does.
 
@@ -7177,7 +7177,7 @@ class _OpenCountingSaneModule(FakeSaneModule):
             device_id: The device being opened.
 
         Returns:
-            The shared device handle.
+            A new handle to the device.
 
         """
         self.opened.append(device_id)
