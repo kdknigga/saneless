@@ -20,6 +20,7 @@ operator answer comes from a script.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import io
 import logging
@@ -55,7 +56,12 @@ from saneless.pipeline import (
     _wait_event,
     run_pipeline,
 )
-from saneless.scanner.base import MAX_PAGES_PER_PASS, ScannerBackend, ScanSettings
+from saneless.scanner.base import (
+    MAX_PAGES_PER_PASS,
+    PassCapReached,
+    ScannerBackend,
+    ScanSettings,
+)
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import (
     ErrorCategory,
@@ -68,7 +74,9 @@ from saneless.vocabulary import (
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
+    pass_cap_warning,
     pass_wait_state,
+    substituted_source_warning,
     timeout_finish_warning,
 )
 from tests.conftest import AlwaysContinueFlipCoordinator
@@ -80,7 +88,7 @@ from tests.multi_page_support import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from enum import StrEnum
     from pathlib import Path
 
@@ -1897,3 +1905,161 @@ class TestMultiPageStopAfterAnAnswer:
         (kept,) = rig.kept_pdfs()
         assert embedded_streams(kept) == _pages(scanner, [0])
         rig.paperless.upload_document.assert_not_called()
+
+
+class _FactScanner(DistinctPageScanner):
+    """
+    A scanner whose passes also report what the backend measured about them.
+
+    Keyed by the 1-based number of the ``scan_pages`` call, the way
+    ``fail_on`` is: a substituted source, a per-pass cap reached, or both.
+    """
+
+    def __init__(
+        self,
+        *,
+        passes: Sequence[Sequence[int]],
+        substituted: Mapping[int, str] | None = None,
+        caps: Mapping[int, PassCapReached] | None = None,
+        blank: frozenset[int] = frozenset(),
+    ) -> None:
+        """
+        Prepare the passes and the facts each one reports.
+
+        Args:
+            passes: The page indices each successive call feeds, in order.
+            substituted: The requested source a call's Auto stood in for.
+            caps: The per-pass cap a call reached.
+            blank: The page indices to spool as blank paper.
+
+        """
+        super().__init__(passes=passes, blank=blank)
+        self.substituted = dict(substituted or {})
+        self.caps = dict(caps or {})
+
+    @override
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Feed the next pass, then attach that call's facts to its batch.
+
+        Args:
+            device_id: Ignored.
+            settings: Passed through.
+            sink: The pipeline's sink.
+
+        Returns:
+            The pass's batch, carrying this call's facts.
+
+        """
+        batch = super().scan_pages(device_id, settings, sink)
+        return dataclasses.replace(
+            batch,
+            substituted_source=self.substituted.get(self.calls),
+            cap_reached=self.caps.get(self.calls),
+        )
+
+
+_AUTO_CAP = PassCapReached(50, 51, auto_source=True)
+
+
+class TestMultiPagePassFacts:
+    """
+    A pass's backend facts finish the document warned, each worded once.
+
+    A pass that reached its own cap left a sheet in the feeder, so the
+    document finishes after it; a substitution is said once however many
+    passes carried it; and a pass thrown away takes its facts with it.
+    """
+
+    def test_a_capped_pass_finishes_the_document_without_another_prompt(
+        self, rig: _Rig
+    ) -> None:
+        """Pass 2 stops at the Auto cap: no next-pass prompt, and the pages upload."""
+        scanner = _FactScanner(passes=((0,), (1, 2)), caps={2: _AUTO_CAP})
+        coordinator = ScriptedPassCoordinator([_NEXT])
+
+        result = rig.run(scanner, coordinator)
+
+        assert len(coordinator.prompts) == 1
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == pass_cap_warning(3, 50, 51, auto_source=True)
+        (document,) = rig.uploads
+        assert embedded_streams(document) == _pages(scanner, [0, 1, 2])
+
+    def test_the_pass_cap_sentence_replaces_the_document_cap_sentence(
+        self, rig: _Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When both caps fire, the warning says to start a new document once."""
+        monkeypatch.setattr(pipeline_module, "MAX_DOCUMENT_PAGES", 3)
+        cap = PassCapReached(2, 3, auto_source=False)
+        scanner = _FactScanner(passes=((0, 1), (2, 3)), caps={2: cap})
+        coordinator = ScriptedPassCoordinator([_NEXT])
+
+        result = rig.run(scanner, coordinator)
+
+        assert result.warning is not None
+        assert result.warning == pass_cap_warning(4, 2, 3, auto_source=False)
+        assert cap_finish_warning(4, 3) not in result.warning
+        assert result.pages_uploaded == 4
+
+    def test_a_substitution_on_every_pass_is_said_once(self, rig: _Rig) -> None:
+        """Two passes through a substituted Auto: one substitution sentence."""
+        scanner = _FactScanner(
+            passes=((0,), (1,)), substituted={1: "Flatbed", 2: "Flatbed"}
+        )
+        coordinator = ScriptedPassCoordinator([_NEXT, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == substituted_source_warning("Flatbed")
+
+    def test_a_capped_pass_thrown_away_at_the_blank_prompt_takes_its_cap(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Re-scan of a capped pass, then a clean pass and Finish: a plain DONE."""
+        scanner = _FactScanner(
+            passes=((0,), (1,), (2,)), blank=frozenset({1}), caps={2: _AUTO_CAP}
+        )
+        coordinator = ScriptedPassCoordinator([_NEXT, _RESCAN, _FINISH])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert [prompt.wait for prompt in coordinator.prompts] == [
+            PassWait.NEXT_PASS,
+            PassWait.BLANK_DECISION,
+            PassWait.NEXT_PASS,
+        ]
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+        assert result.pages_uploaded == 2
+
+    def test_a_substituted_pass_thrown_away_by_rescan_takes_its_fact(
+        self, rig: _Rig
+    ) -> None:
+        """Re-scan of the one substituted pass leaves nothing to warn about."""
+        scanner = _FactScanner(passes=((0,), (1,), (2,)), substituted={2: "Flatbed"})
+        coordinator = ScriptedPassCoordinator([_NEXT, _RESCAN, _FINISH])
+
+        result = rig.run(scanner, coordinator)
+
+        assert result.warning is None
+        assert result.pages_uploaded == 2
+
+    def test_a_blank_prompt_timeout_keeps_the_pass_cap_sentence(
+        self, blank_rig: _Rig
+    ) -> None:
+        """Nobody answered about a capped pass's blank page: both reasons are said."""
+        scanner = _FactScanner(
+            passes=((0,), (1, 2)), blank=frozenset({1}), caps={2: _AUTO_CAP}
+        )
+        coordinator = ScriptedPassCoordinator([_NEXT, PassAnswer.TIMED_OUT])
+
+        result = blank_rig.run(scanner, coordinator)
+
+        assert len(coordinator.prompts) == 2
+        assert result.warning is not None
+        assert blank_timeout_finish_warning(2, _TIMEOUT) in result.warning
+        assert pass_cap_warning(2, 50, 51, auto_source=True) in result.warning
