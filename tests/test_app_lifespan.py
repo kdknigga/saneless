@@ -40,6 +40,7 @@ from saneless.config import (
 )
 from saneless.job import JobStore
 from saneless.paperless import ApiDelivery, TaskFiled
+from saneless.pipeline import PipelineRequest, ScanResult
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     RESTART_REASON,
@@ -47,11 +48,13 @@ from saneless.vocabulary import (
     TERMINAL_STATES,
     ErrorCategory,
     JobState,
+    ScanOutcome,
     WorkerHealth,
 )
 from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web.app import create_app
+from saneless.web.cache import CachedMetadataLookup
 from saneless.worker import STOP_JOIN_SECONDS
 from tests.conftest import (
     StubScannerBackend,
@@ -1702,3 +1705,61 @@ def test_create_app_vacuum_failure_is_a_warning_not_a_refusal(
     assert warnings[0].exc_info is not None
     with TestClient(app) as client:
         assert client.get("/").status_code == 200
+
+
+# --- The worker checks ids through the page's metadata cache ------------------
+
+
+def test_the_worker_lookup_reads_the_page_cache_first(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A job's lookup reads the cache the pickers use, and refetches from the client.
+
+    The pipeline is replaced by one that records its request, so the test
+    reads the lookup the app gave the worker without scanning anything.
+    """
+    captured: list[PipelineRequest] = []
+
+    def capturing_pipeline(
+        _scanner: object,
+        _paperless: object,
+        _settings: object,
+        request: PipelineRequest,
+    ) -> ScanResult:
+        """Record the request and report a clean upload."""
+        captured.append(request)
+        return ScanResult(
+            outcome=ScanOutcome.SUCCESS,
+            pages_scanned=1,
+            pages_removed=0,
+            pages_uploaded=1,
+        )
+
+    fetched: list[float | None] = []
+
+    def listing_tags(*, timeout: float | None = None) -> list[dict[str, object]]:
+        """Answer tag 3 only, noting the budget each fetch was given."""
+        fetched.append(timeout)
+        return [{"id": 3}]
+
+    monkeypatch.setattr("saneless.worker.run_pipeline", capturing_pipeline)
+    app = _build_app(settings)
+    app.state.paperless.get_tags = listing_tags
+    with TestClient(app) as client:
+        app.state.cache.set("tags", [{"id": 3}, {"id": 7}])
+        response = client.post(
+            "/api/scan", data={"profile": "default", "title": "Wired", "tags": ["3"]}
+        )
+        assert response.status_code == 200, response.text
+        store: JobStore = app.state.job_store
+        job_id = store.list_recent(limit=1)[0].id
+        wait_for_state(store, job_id, TERMINAL_STATES, timeout=5.0)
+
+    assert len(captured) == 1
+    lookup = captured[0].metadata_lookup
+    assert isinstance(lookup, CachedMetadataLookup)
+    assert lookup.tag_ids(fresh=False) == frozenset({3, 7})
+    assert fetched == []
+    assert lookup.tag_ids(fresh=True) == frozenset({3})
+    assert fetched == [5.0]

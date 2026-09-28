@@ -95,6 +95,7 @@ from saneless.vocabulary import (
     backs_pass_cap_note,
     backs_pass_cap_warning,
     classify_error,
+    dropped_ids_warning,
     duplicate_warning,
     error_advice,
     exit_code_for,
@@ -117,6 +118,8 @@ from tests.conftest import (
 )
 from tests.fake_sane import FakeSaneDev, FakeSaneModule
 from tests.golden_support import (
+    CORRESPONDENTS_PATH,
+    TAGS_PATH,
     DistinctPageScanner,
     RecordingPaperless,
     distinct_page,
@@ -8029,3 +8032,221 @@ class TestBuildPipelineRequest:
         identity = {"profile_name", "title", "job_id", "tags", "correspondent"}
 
         assert request_fields == identity | hook_fields
+
+    def test_the_metadata_lookup_reaches_the_request(self) -> None:
+        """The surface's lookup is the one the run checks ids with."""
+        lookup = _FixedLookup(tags=frozenset(), correspondents=frozenset())
+
+        request = build_pipeline_request(
+            profile_name="default",
+            title="Looked up",
+            job_id="job-4",
+            metadata=ScanMetadata(tags=(3,), correspondent=None),
+            hooks=RequestHooks(metadata_lookup=lookup),
+        )
+
+        assert request.metadata_lookup is lookup
+
+
+class _FixedLookup:
+    """
+    A metadata lookup with fixed answers that notes the scanner's state at each call.
+
+    Attributes:
+        calls: Each call's list and ``fresh`` flag, in order.
+        devices_listed: How many times ``scanner.get_devices`` had been called
+            when each lookup call was made, when a scanner mock is watched.
+
+    """
+
+    def __init__(
+        self,
+        *,
+        tags: frozenset[int] | None,
+        correspondents: frozenset[int] | None,
+        scanner: MagicMock | None = None,
+    ) -> None:
+        """Answer every call for a list with the same ids, or None."""
+        self._tags = tags
+        self._correspondents = correspondents
+        self._scanner = scanner
+        self.calls: list[tuple[str, bool]] = []
+        self.devices_listed: list[int] = []
+
+    def _note(self, what: str, *, fresh: bool) -> None:
+        """Record the call and how far the scanner had been touched."""
+        self.calls.append((what, fresh))
+        if self._scanner is not None:
+            self.devices_listed.append(self._scanner.get_devices.call_count)
+
+    def tag_ids(self, *, fresh: bool) -> frozenset[int] | None:
+        """Answer the tag list."""
+        self._note("tags", fresh=fresh)
+        return self._tags
+
+    def correspondent_ids(self, *, fresh: bool) -> frozenset[int] | None:
+        """Answer the correspondent list."""
+        self._note("correspondents", fresh=fresh)
+        return self._correspondents
+
+
+def _metadata_gets(recorder: RecordingPaperless) -> list[str]:
+    """
+    Return the path of every tag or correspondent list request, in order.
+
+    Args:
+        recorder: The in-memory paperless-ngx.
+
+    Returns:
+        One path per metadata list request.
+
+    """
+    return [
+        request.url.path
+        for request in recorder.requests
+        if request.method == "GET"
+        and request.url.path in {TAGS_PATH, CORRESPONDENTS_PATH}
+    ]
+
+
+class TestStaleIdsAreDroppedBeforeScanning:
+    """
+    Tag and correspondent ids are checked before any paper moves.
+
+    The check runs in ``run_pipeline`` itself, so the web and the CLI behave
+    the same: an id paperless-ngx does not list is dropped and the upload is
+    a warned success, and an unreachable paperless-ngx lets the ids through.
+    """
+
+    def test_stale_ids_are_checked_before_the_scanner_is_touched(
+        self, mock_paperless: MagicMock, default_settings: Settings
+    ) -> None:
+        """Both lookups run before device discovery, the first scanner contact."""
+        default_settings.scanner.device = ""
+        scanner = _scanner_listing()
+        lookup = _FixedLookup(
+            tags=frozenset({3, 9}), correspondents=frozenset({12}), scanner=scanner
+        )
+
+        with pytest.raises(NoScannerFoundError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Checked",
+                    tags=[3, 9],
+                    correspondent=12,
+                    metadata_lookup=lookup,
+                ),
+            )
+
+        assert lookup.calls == [("tags", False), ("correspondents", False)]
+        assert lookup.devices_listed == [0, 0]
+        scanner.get_devices.assert_called_once()
+
+    def test_a_stale_tag_is_dropped_and_the_upload_is_warned(
+        self, default_settings: Settings
+    ) -> None:
+        """Tag 9 is gone: the upload carries tag 3 only, and the run exits 7."""
+        recorder = RecordingPaperless(tags=(3,))
+        paperless = _recording_client(default_settings, recorder)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Stale", tags=[3, 9]
+                ),
+            )
+        finally:
+            paperless.close()
+
+        dropped = dropped_ids_warning((9,), None)
+        assert dropped is not None
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning == dropped
+        assert (
+            exit_code_for_outcome(result.outcome, result.warning)
+            is ExitCode.UPLOADED_WITH_WARNING
+        )
+        assert len(recorder.uploads()) == 1
+        tags = [value for name, value in recorder.upload_fields(0) if name == "tags"]
+        assert tags == ["3"]
+        # The client's own fetch is already fresh, so it is not asked twice.
+        assert _metadata_gets(recorder) == [TAGS_PATH]
+
+    def test_a_stale_correspondent_is_dropped_before_the_other_warnings(
+        self, default_settings: Settings
+    ) -> None:
+        """The dropped-id sentence comes first, then what the scan itself says."""
+        recorder = RecordingPaperless(correspondents=())
+        paperless = _recording_client(default_settings, recorder)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES, rejected=(1,)),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Stale", correspondent=12
+                ),
+            )
+        finally:
+            paperless.close()
+
+        dropped = dropped_ids_warning((), 12)
+        assert dropped is not None
+        assert result.warning is not None
+        assert result.warning.startswith(f"{dropped} ")
+        assert len(result.warning) > len(dropped) + 1
+        fields = recorder.upload_fields(0)
+        assert [name for name, _ in fields if name == "correspondent"] == []
+
+    def test_a_scan_with_no_ids_makes_no_metadata_request(
+        self, default_settings: Settings
+    ) -> None:
+        """Nothing to check: paperless-ngx's lists are never asked for."""
+        recorder = RecordingPaperless()
+        paperless = _recording_client(default_settings, recorder)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Bare"),
+            )
+        finally:
+            paperless.close()
+
+        assert result.warning is None
+        assert _metadata_gets(recorder) == []
+
+    def test_an_unreachable_lookup_sends_the_ids_unchecked(
+        self, default_settings: Settings
+    ) -> None:
+        """Cannot tell: every id is uploaded as asked and nothing is warned."""
+        recorder = RecordingPaperless(tags=(3,))
+        paperless = _recording_client(default_settings, recorder)
+        lookup = _FixedLookup(tags=None, correspondents=None)
+        try:
+            result = run_pipeline(
+                scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Unchecked",
+                    tags=[3, 9],
+                    metadata_lookup=lookup,
+                ),
+            )
+        finally:
+            paperless.close()
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
+        tags = [value for name, value in recorder.upload_fields(0) if name == "tags"]
+        assert tags == ["3", "9"]
+        assert lookup.calls == [("tags", False)]

@@ -76,6 +76,7 @@ from tests.golden_support import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from click.testing import Result
@@ -388,6 +389,7 @@ def _run_web(
     scenario: _Scenario,
     *,
     recorder: RecordingPaperless | None = None,
+    tags: list[str] | None = None,
 ) -> _WebRun:
     """
     Scan once through the web app, exactly as a browser would.
@@ -400,6 +402,7 @@ def _run_web(
             upload.  One whose uploads fail also gives the run a consume
             folder.  Only a before-send failure -- the request never reached
             paperless-ngx -- may fall back to the folder.
+        tags: The tag ids the form ticks; None ticks the golden ones.
 
     Returns:
         What the run left behind.
@@ -420,7 +423,7 @@ def _run_web(
     form: dict[str, str | list[str]] = {
         "profile": scenario.profile,
         "title": _TITLE,
-        "tags": _TAGS,
+        "tags": _TAGS if tags is None else tags,
         "correspondent": _CORRESPONDENT,
     }
     if scenario.multi_page:
@@ -687,7 +690,7 @@ def _run_cli(
     scenario: _Scenario,
     *,
     recorder: RecordingPaperless | None = None,
-    coverage_threshold: float | None = None,
+    profile_fields: Mapping[str, object] | None = None,
 ) -> _CliRun:
     """
     Run ``saneless scan --title "Quarterly Report"`` against the golden fakes.
@@ -704,8 +707,9 @@ def _run_cli(
             upload.  One whose uploads fail also gives the run a consume
             folder.  Only a before-send failure -- the request never reached
             paperless-ngx -- may fall back to the folder.
-        coverage_threshold: The scenario profile's blank-page threshold, when
-            the run is not to use the shipped default.
+        profile_fields: Settings to change on the scenario's profile, by
+            field name, such as a blank-page threshold other than the
+            shipped default or other default tags.
 
     Returns:
         What the run left behind.
@@ -718,9 +722,9 @@ def _run_cli(
     if consume_dir is not None:
         consume_dir.mkdir()
     settings = _settings(tmp_path, profile_metadata=True, consume_dir=consume_dir)
-    if coverage_threshold is not None:
-        profile = settings.profiles[scenario.profile]
-        profile.empty_page_coverage_threshold = coverage_threshold
+    profile = settings.profiles[scenario.profile]
+    for name, value in (profile_fields or {}).items():
+        setattr(profile, name, value)
     scanner = DistinctPageScanner(passes=scenario.passes, rejected=scenario.rejected)
 
     def load_settings(config_path: str | None = None) -> Settings:
@@ -1106,7 +1110,12 @@ def test_cli_the_coverage_knob_decides_the_all_blank_failure(
     fails as all-blank: nothing uploaded, the unfiltered pages kept as one
     PDF, and exit 8.
     """
-    run = _run_cli(tmp_path, monkeypatch, _SIMPLEX_RUN, coverage_threshold=100.0)
+    run = _run_cli(
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        profile_fields={"empty_page_coverage_threshold": 100.0},
+    )
 
     assert run.result.exit_code == 8, run.result.output
     kept = sorted((tmp_path / "data" / "failed").glob("*.pdf"))
@@ -1151,3 +1160,55 @@ def test_cli_coding_error_in_the_upload_exits_5_with_the_pdf_kept(
     assert f"preserved at {kept[0]}" in unexpected[0]
     assert run.recorder.uploads() == []
     assert run.scratch == []
+
+
+# --------------------------------------------------------------------------
+# A tag paperless-ngx no longer has: dropped before scanning, on both surfaces.
+# --------------------------------------------------------------------------
+
+# Tag 9 is asked for and paperless-ngx lists only tag 3.  The sentence is
+# spelled out rather than imported: the test states what the operator reads.
+_STALE_TAG_IDS = (3, 9)
+_STALE_TAG_SENTENCE = "tag 9 no longer exists in paperless-ngx and was not applied."
+
+
+def test_cli_stale_tag_is_dropped_and_exits_7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile tag paperless-ngx lost is skipped, named, and exits 7."""
+    run = _run_cli(
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(tags=(3,)),
+        profile_fields={"default_tags": list(_STALE_TAG_IDS)},
+    )
+
+    assert run.result.exit_code == 7, run.result.output
+    assert _WARNED_LINE in run.result.stdout
+    assert _warning_lines(run.result.stderr) == [f"Warning: {_STALE_TAG_SENTENCE}"]
+    assert len(run.recorder.uploads()) == 1
+    fields = run.recorder.upload_fields(0)
+    assert _values(fields, "tags") == ["3"]
+    assert _values(fields, "correspondent") == [_CORRESPONDENT]
+
+
+def test_web_stale_tag_is_dropped_and_the_job_is_warned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same ids through the form end the same way: DONE, warned, tag 3 only."""
+    run = _run_web(
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(tags=(3,)),
+        tags=[str(tag) for tag in _STALE_TAG_IDS],
+    )
+
+    assert run.job.state is JobState.DONE
+    assert run.job.warning == _STALE_TAG_SENTENCE
+    assert _WARNED_LINE in run.status_html
+    assert len(run.recorder.uploads()) == 1
+    fields = run.recorder.upload_fields(0)
+    assert _values(fields, "tags") == ["3"]
+    assert _values(fields, "correspondent") == [_CORRESPONDENT]
