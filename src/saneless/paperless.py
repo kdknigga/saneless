@@ -307,12 +307,19 @@ class _RetryDecision(Enum):
     In memory only: never persisted and never shown.
 
     Attributes:
-        RETRY: Transient.  Back off and try again; once the attempts are
-            exhausted, fall back to the consume directory when one is
-            configured.
-        REFUSED: The server answered with a non-2xx that is not a 5xx.  It
-            would answer the same way again, so this is final: no retry and no
-            fallback.
+        BEFORE_SEND: Nothing can have arrived: no connection was made, or the
+            body provably never finished leaving.  Back off and try again
+            within the send budget; once it is spent, fall back to the consume
+            directory when one is configured.
+        AFTER_SEND: The body may have been read, so the document may already
+            be stored.  Never sent again and never copied to the consume
+            directory: either could make a second document of one scan.
+        INCOMPATIBLE: A 406: this server does not accept the API version
+            asked for.  It refuses before it reads the request, so nothing was
+            stored; final, with no retry and no copy.
+        REFUSED: The server answered with a non-2xx that is neither a 5xx nor
+            a 406.  It would answer the same way again, so this is final: no
+            retry and no fallback.
         MISCONFIGURED: The request could not be sent at all.  No retry can
             succeed and no copy is made.  ``PaperlessClient._unsendable_error``
             reports it as a configuration error when the configured
@@ -322,7 +329,9 @@ class _RetryDecision(Enum):
 
     """
 
-    RETRY = auto()
+    BEFORE_SEND = auto()
+    AFTER_SEND = auto()
+    INCOMPATIBLE = auto()
     REFUSED = auto()
     MISCONFIGURED = auto()
     UNEXPECTED = auto()
@@ -333,9 +342,23 @@ def _retry_decision(exc: httpx2.HTTPError) -> _RetryDecision:
     Classify an httpx2 error: the one place the client decides what to do.
 
     Every upload and metadata-fetch error goes through here, so a change of
-    policy for those is a change to this function alone.  Separating a failure
-    before the request was sent from one after it -- where a retry may store a
-    second copy -- would split RETRY and leave the other decisions as they are.
+    policy for those is a change to this function alone.  An upload is not
+    idempotent, so the question it answers is whether the body can have
+    reached paperless-ngx:
+
+    * A refused or timed-out connection, no free pool slot, and a proxy that
+      refused the tunnel all fail before a byte of the request is sent.  A
+      body write that stalls past its timeout leaves the body incomplete, and
+      paperless-ngx cannot build a document from a truncated upload.  These
+      are safe to send again.
+    * Any answer at all -- a 5xx included, since a proxy's 502 or 504 can
+      follow a body paperless-ngx read in full -- and any failure while
+      reading the answer may come after the body arrived.  The HTTP library
+      does not report a failed body write: it goes on to read whatever the
+      server says, so a cut connection shows up as one of these.  None of
+      them is sent again.
+    * A 406 is paperless-ngx refusing the API version before it looks at the
+      request, so nothing was stored.
 
     Two paths decide without it, because neither retries, copies or raises
     anything a policy could change.  ``test_connection`` reports every
@@ -356,17 +379,42 @@ def _retry_decision(exc: httpx2.HTTPError) -> _RetryDecision:
 
     """
     if isinstance(exc, httpx2.HTTPStatusError):
-        if exc.response.is_server_error:
-            return _RetryDecision.RETRY
-        return _RetryDecision.REFUSED
+        return _status_decision(exc.response)
     # Both are TransportError subclasses, so this test must come before the
     # TransportError one: h11 refusing a header value, or a URL with no usable
     # scheme, fails the same way on every attempt.
     if isinstance(exc, httpx2.LocalProtocolError | httpx2.UnsupportedProtocol):
         return _RetryDecision.MISCONFIGURED
-    if isinstance(exc, httpx2.TransportError):
-        return _RetryDecision.RETRY
+    if isinstance(
+        exc,
+        httpx2.ConnectError
+        | httpx2.ConnectTimeout
+        | httpx2.PoolTimeout
+        | httpx2.ProxyError
+        | httpx2.WriteTimeout,
+    ):
+        return _RetryDecision.BEFORE_SEND
+    if isinstance(exc, httpx2.TransportError | httpx2.DecodingError):
+        return _RetryDecision.AFTER_SEND
     return _RetryDecision.UNEXPECTED
+
+
+def _status_decision(response: httpx2.Response) -> _RetryDecision:
+    """
+    Classify a non-2xx answer for ``_retry_decision``.
+
+    Args:
+        response: The response ``raise_for_status`` refused.
+
+    Returns:
+        INCOMPATIBLE for a 406, AFTER_SEND for a 5xx, else REFUSED.
+
+    """
+    if response.status_code == httpx2.codes.NOT_ACCEPTABLE:
+        return _RetryDecision.INCOMPATIBLE
+    if response.is_server_error:
+        return _RetryDecision.AFTER_SEND
+    return _RetryDecision.REFUSED
 
 
 # The fixed problems a MISCONFIGURED error is reported as.  Fixed, never the
@@ -882,9 +930,15 @@ class PaperlessClient:
                         # answered the same way again: no retry, no fallback.
                         msg = _not_accepted_message(exc.response, self._token)
                         raise PaperlessError(msg) from self._cause(exc)
-                    case _RetryDecision.RETRY:
+                    case _RetryDecision.BEFORE_SEND:
                         last_error = exc
                         self._back_off(attempt, exc)
+                    case _RetryDecision.AFTER_SEND | _RetryDecision.INCOMPATIBLE:
+                        msg = (
+                            f"Could not upload to Paperless{self._at_url}: "
+                            f"{self._reason(exc)}"
+                        )
+                        raise PaperlessError(msg) from self._cause(exc)
                     case _RetryDecision.MISCONFIGURED:
                         error = self._unsendable_error(exc, "Uploading to Paperless")
                         # from None, not from exc: the worker logs a failed job
