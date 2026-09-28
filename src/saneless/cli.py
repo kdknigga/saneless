@@ -884,12 +884,19 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
         case ErrorCategory.CONFIG:
             notes = note_text(exc)
             return f"{exc} {neutralise_controls(notes)}" if notes else str(exc)
-        case ErrorCategory.UPLOAD:
+        case (
+            ErrorCategory.UPLOAD
+            | ErrorCategory.UNCONFIRMED_SEND
+            | ErrorCategory.UNCONFIRMED_FILING
+            | ErrorCategory.PAPERLESS_VERSION
+        ):
             line = f"Paperless error: {failure_text(exc)}"
         case ErrorCategory.ASSEMBLY:
             line = f"PDF error: {failure_text(exc)}"
         case ErrorCategory.ALL_BLANK:
             line = f"Empty-page detection: {failure_text(exc)}"
+        case ErrorCategory.DISK_SPACE:
+            line = f"Disk space: {failure_text(exc)}"
         case ErrorCategory.UNKNOWN | ErrorCategory.REJECTED:
             line = _unexpected_line(exc)
         case _:

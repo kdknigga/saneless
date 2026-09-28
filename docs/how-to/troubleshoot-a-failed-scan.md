@@ -21,6 +21,8 @@ In a shell, `echo $?` right after the command prints its exit code.
 | 6 | The scan was saved to the consume folder, not uploaded: its title, tags and correspondent were not applied | [Saved to the consume folder](#saved-to-the-consume-folder-exit-6) |
 | 7 | The scan was uploaded, but with a warning | [Uploaded with a warning](#uploaded-with-a-warning-exit-7) |
 | 8 | Every page looked blank to empty-page detection, so nothing was uploaded | [Every page looked blank](#every-page-looked-blank-exit-8) |
+| 9 | The document may already be in paperless-ngx: check before scanning again | [The document may already be in paperless-ngx](#the-document-may-already-be-in-paperless-ngx-exit-9) |
+| 10 | The server ran out of disk space | [Out of disk space](#out-of-disk-space-exit-10) |
 | 129 | A SIGHUP interrupted the command, for example a dropped SSH session | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
 | 130 | You cancelled the scan | [Cancelled scans](#cancelled-scans-exit-130) |
 | 143 | A SIGTERM interrupted the command | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
@@ -440,6 +442,50 @@ holds no page because every page so far was skipped as blank. The skipped pages 
 
 [When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank)
 explains how detection decides.
+
+## The document may already be in paperless-ngx (exit 9)
+
+The line starts with `Paperless error:`, but this is not a failed upload. saneless cannot tell
+whether paperless-ngx has the document, so scanning the stack again could store it twice. Do not
+rescan until you have checked. A script should treat 9 the same way: never rescan on it.
+
+It means one of two things, and the error says which:
+
+- **The upload may have reached paperless-ngx.** saneless sent the whole document, and then the
+  connection dropped or timed out before paperless-ngx answered. The document may have arrived.
+  saneless does not send it again and does not save it to the consume folder, because either
+  could make a second copy.
+- **paperless-ngx received the document but did not confirm filing it.** paperless-ngx accepted
+  the upload, and then its processing task did not finish within `paperless_task_timeout`, or it
+  failed for a reason other than being a duplicate. A long document with OCR can take longer
+  than the timeout, and paperless-ngx may still be working on it.
+
+To check, open paperless-ngx's document list and sort it by the date added. Look for the scan's
+title, or for a document with its pages. When paperless-ngx received the document, give it a few
+minutes to finish before you decide it is not there.
+
+- **If the document is in paperless-ngx**, there is nothing to do. Delete the copy in `failed/`.
+- **If it is not**, a copy is kept in `failed/` in saneless's data directory, and the line names
+  it. Import that copy into paperless-ngx yourself, or scan the stack again. Import it only if
+  the document is not in paperless-ngx: the copy is the same document, and importing it next to
+  one that arrived makes a duplicate.
+
+## Out of disk space (exit 10)
+
+The line starts with `Disk space:`. The server ran out of room while scanning, while writing a
+page, or while assembling the PDF. The scanner and the pages are fine, so neither is the thing to
+check.
+
+The line names the folder that is full and how much space the scan needs. Free that much space on
+the filesystem holding the folder, or point the folder at a filesystem with room: `tmp_dir` for
+the scan in progress, or `data_dir` for the job database and `failed/`. Then scan again.
+
+saneless keeps `min_free_space_mb` (500 MB by default) free for assembling the PDF. It checks that
+reserve before a scan starts and again before each page is written, so a scan that would fill the
+disk stops early with this exit code instead of failing halfway through. Lower the setting only
+if the server really has less room to give; assembling a PDF needs about twice the size of the
+scanned pages on top of it. If the scan had pages when it stopped, the line says whether and where
+they were kept.
 
 ## Interrupted by a signal (exit 129 and 143)
 

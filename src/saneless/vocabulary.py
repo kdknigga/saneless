@@ -17,8 +17,12 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol, assert_never
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
+    DiskSpaceError,
     FeederEmptyError,
     PaperlessError,
+    PaperlessIncompatibleError,
+    PaperlessUncertainSendError,
+    PaperlessUnconfirmedError,
     PdfError,
     ScanError,
 )
@@ -184,6 +188,33 @@ class ErrorCategory(StrEnum):
     so nothing was uploaded.  The scanner did its job, so this is its own
     category and is never reported as a scanner fault: the advice is to tune
     detection, not to check the scanner.
+
+    ``UNCONFIRMED_SEND`` means the upload was sent but no usable answer came
+    back, so paperless-ngx may hold the document.  ``UNCONFIRMED_FILING``
+    means paperless-ngx accepted the upload -- it answered with a task id --
+    but did not confirm filing it: the task failed for a reason other than a
+    duplicate, or it did not finish while saneless waited.  Both are amber,
+    not red, and neither advice says to start the scan again: the document
+    may already be in paperless-ngx, so the reader checks its document list
+    first, and imports the copy kept in ``failed/`` only if it is not there.
+    They are two members rather than one because "received" is the stronger
+    statement, and it is what the reader needs to judge whether a rescan is
+    safe.
+
+    ``PAPERLESS_VERSION`` means paperless-ngx refused every API version
+    saneless speaks.  It is not ``UPLOAD``, whose advice to check the token
+    would send the reader the wrong way; the fix is to upgrade paperless-ngx.
+
+    ``DISK_SPACE`` means the server ran out of disk space for the scan, while
+    scanning or while assembling the PDF.  It is its own category so a full
+    disk is never reported as a scanner or PDF failure.  The error beside it
+    names the folder and the space needed; the advice names neither.
+
+    The values are persisted in the job store's ``error_category`` column,
+    which is plain text with no constraint on its values.  Rows written
+    before a member was added keep the category they were written with, and
+    nothing is rewritten when one is added.  Every older value is still a
+    member, so every older row still reads back.
     """
 
     FEEDER = "FEEDER"
@@ -194,6 +225,10 @@ class ErrorCategory(StrEnum):
     REJECTED = "REJECTED"
     ASSEMBLY = "ASSEMBLY"
     ALL_BLANK = "ALL_BLANK"
+    UNCONFIRMED_SEND = "UNCONFIRMED_SEND"
+    UNCONFIRMED_FILING = "UNCONFIRMED_FILING"
+    PAPERLESS_VERSION = "PAPERLESS_VERSION"
+    DISK_SPACE = "DISK_SPACE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +385,20 @@ class ExitCode(IntEnum):
     is kept apart from ``SCAN`` because the scanner worked, and a script that
     checks the scanner on exit 1 would be sent the wrong way.
 
+    ``UNCONFIRMED`` (9) means the document may already be in paperless-ngx:
+    the upload was sent and no usable answer came back, or paperless-ngx
+    received it and did not confirm filing it.  A copy is kept in
+    ``failed/``.  It is kept apart from ``PAPERLESS`` because a script that
+    retries on 3 is right to, and a script that retried on 9 could store the
+    document twice: a script must never rescan on 9, and must check
+    paperless-ngx's document list first.
+
+    ``DISK_SPACE`` (10) means the server ran out of disk space for the scan,
+    while scanning or while assembling the PDF.  The error line names the
+    folder and how much space is needed.  It is kept apart from ``SCAN`` and
+    ``PDF`` because neither the scanner nor the images were at fault, and
+    freeing space is the fix.
+
     ``HANGUP`` (129) and ``TERMINATED`` (143) follow the shell's convention of
     128 plus the signal number, for a SIGHUP or a SIGTERM to a one-shot
     command.  They are an interruption rather than a cancel: nobody chose to
@@ -375,6 +424,8 @@ class ExitCode(IntEnum):
     SAVED_TO_FOLDER = 6
     UPLOADED_WITH_WARNING = 7
     ALL_BLANK = 8
+    UNCONFIRMED = 9
+    DISK_SPACE = 10
     HANGUP = 129
     CANCELLED = 130
     TERMINATED = 143
@@ -2376,6 +2427,51 @@ def job_state_for(outcome: ScanOutcome) -> JobState:
     return state
 
 
+type _UnconfirmedCategory = Literal[
+    ErrorCategory.UNCONFIRMED_SEND,
+    ErrorCategory.UNCONFIRMED_FILING,
+]
+
+
+def _unconfirmed_advice(category: _UnconfirmedCategory) -> ErrorAdvice:
+    """
+    Return the advice for an upload that may already be in paperless-ngx.
+
+    The two messages differ, because "received" is the stronger statement,
+    but the next step is one: it never says to start the scan again, since a
+    blind rescan could store the document twice.
+
+    Args:
+        category: One of the two unconfirmed categories.
+
+    Returns:
+        The message for the category and the shared next step, paired.
+
+    Raises:
+        AssertionError: If the value is not one of the two.
+
+    """
+    match category:
+        case ErrorCategory.UNCONFIRMED_SEND:
+            message = (
+                "The upload may have reached paperless-ngx, but no answer came back."
+            )
+        case ErrorCategory.UNCONFIRMED_FILING:
+            message = (
+                "paperless-ngx received the document but did not confirm filing it."
+            )
+        case _:
+            assert_never(category)
+    return ErrorAdvice(
+        message=message,
+        next_step=(
+            "Check paperless-ngx's document list before scanning again. A copy "
+            "is kept in failed/; import it only if the document is not in "
+            "paperless-ngx."
+        ),
+    )
+
+
 def error_advice(category: ErrorCategory) -> ErrorAdvice:
     """
     Return what to tell a reader about an error category, and what to do next.
@@ -2392,7 +2488,15 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
 
     Every string is a developer-authored constant.  None of them interpolates
     exception text, request input, a URL, a token or a filesystem path, so
-    nothing internal can reach a screen through this path (ASVS V7).
+    nothing internal can reach a screen through this path (ASVS V7).  None
+    carries a number either, except the paperless-ngx release and API
+    versions saneless supports, which are facts about saneless rather than
+    about the job.
+
+    The two unconfirmed categories share a next step that never says to
+    start the scan again: the document may already be in paperless-ngx, so a
+    blind rescan could store it twice.  ``_unconfirmed_advice`` words the
+    pair, as ``_pass_wait_state_label`` does for the multi-page waits.
 
     Args:
         category: The error category to describe.
@@ -2464,6 +2568,29 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
                     "If the pages are not blank, lower "
                     "empty_page_coverage_threshold for this profile or turn "
                     "empty-page detection off, then scan again."
+                ),
+            )
+        case ErrorCategory.UNCONFIRMED_SEND | ErrorCategory.UNCONFIRMED_FILING:
+            advice = _unconfirmed_advice(category)
+        case ErrorCategory.PAPERLESS_VERSION:
+            advice = ErrorAdvice(
+                message=(
+                    "This paperless-ngx does not speak an API version saneless "
+                    "supports (9 or 10)."
+                ),
+                next_step=(
+                    "saneless needs paperless-ngx 2.16 or later: upgrade "
+                    "paperless-ngx, then start the scan again."
+                ),
+            )
+        case ErrorCategory.DISK_SPACE:
+            advice = ErrorAdvice(
+                # Path-free and number-free: the error beside it names the
+                # folder and how much space is needed.
+                message="The server ran out of disk space for this scan.",
+                next_step=(
+                    "Free space on the server (the error names the folder and "
+                    "how much is needed), then start the scan again."
                 ),
             )
         case ErrorCategory.REJECTED:
@@ -2854,6 +2981,11 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
     A scan that delivered its document is not an error at all, even when it
     was degraded on the way; ``exit_code_for_outcome`` gives those their codes.
 
+    ``PAPERLESS_VERSION`` shares ``PAPERLESS`` with ``UPLOAD``: a refused API
+    version stores nothing, so a script that retries on 3 duplicates
+    nothing.  The two unconfirmed categories share ``UNCONFIRMED`` (9), which
+    a script must never retry on.
+
     Args:
         category: The error category to map.
 
@@ -2869,12 +3001,16 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
             exit_code = ExitCode.SCAN
         case ErrorCategory.CONFIG:
             exit_code = ExitCode.CONFIG
-        case ErrorCategory.UPLOAD:
+        case ErrorCategory.UPLOAD | ErrorCategory.PAPERLESS_VERSION:
             exit_code = ExitCode.PAPERLESS
+        case ErrorCategory.UNCONFIRMED_SEND | ErrorCategory.UNCONFIRMED_FILING:
+            exit_code = ExitCode.UNCONFIRMED
         case ErrorCategory.ASSEMBLY:
             exit_code = ExitCode.PDF
         case ErrorCategory.ALL_BLANK:
             exit_code = ExitCode.ALL_BLANK
+        case ErrorCategory.DISK_SPACE:
+            exit_code = ExitCode.DISK_SPACE
         case ErrorCategory.UNKNOWN | ErrorCategory.REJECTED:
             exit_code = ExitCode.UNEXPECTED
         case _:
@@ -2950,7 +3086,15 @@ def classify_error(exc: Exception) -> ErrorCategory:
     Map an exception to its error category.
 
     The checks are ordered, not matched: ``FeederEmptyError`` subclasses
-    ``ScanError``, so the narrower class has to be tested first.  This is an
+    ``ScanError``, so the narrower class has to be tested first.  For the same
+    reason the three narrower paperless classes are tested before
+    ``PaperlessError``: an upload that may have arrived, an accepted upload
+    that was never confirmed filed (a poll timeout among them, since
+    ``PaperlessTimeoutError`` subclasses ``PaperlessUnconfirmedError``), and a
+    refused API version each need advice of their own, and the
+    ``PaperlessError`` arm would otherwise file all three as ``UPLOAD``.
+    ``DiskSpaceError`` is a sibling of every other class here, so its place
+    in the order does not matter.  This is an
     ``isinstance`` chain rather than a ``match`` because it dispatches on
     exception type instead of on an enum, so ``assert_never`` does not apply
     and the trailing ``UNKNOWN`` is the correct total fallback.
@@ -2972,8 +3116,16 @@ def classify_error(exc: Exception) -> ErrorCategory:
         category = ErrorCategory.FEEDER
     elif isinstance(exc, ConfigError):
         category = ErrorCategory.CONFIG
+    elif isinstance(exc, DiskSpaceError):
+        category = ErrorCategory.DISK_SPACE
     elif isinstance(exc, ScanError):
         category = ErrorCategory.SCANNER
+    elif isinstance(exc, PaperlessUncertainSendError):
+        category = ErrorCategory.UNCONFIRMED_SEND
+    elif isinstance(exc, PaperlessUnconfirmedError):
+        category = ErrorCategory.UNCONFIRMED_FILING
+    elif isinstance(exc, PaperlessIncompatibleError):
+        category = ErrorCategory.PAPERLESS_VERSION
     elif isinstance(exc, PaperlessError):
         category = ErrorCategory.UPLOAD
     elif isinstance(exc, PdfError):

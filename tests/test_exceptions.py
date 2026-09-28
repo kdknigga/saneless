@@ -7,11 +7,14 @@ own), N-08 (a deliberate cancel at the flip prompt is not a failure) and D-08
 
 Also covers the all-blank failure's own type, the "interrupted, not cancelled"
 signal exception, and ``failure_text``, which renders an exception together
-with the notes ``add_note`` attached to it.
+with the notes ``add_note`` attached to it.  The delivery-uncertainty, API
+version, disk-space and no-scanner types, and ``is_out_of_space``, which finds
+a full disk anywhere in an exception's cause chain, are covered too.
 """
 
 from __future__ import annotations
 
+import errno
 import signal
 
 import httpx2
@@ -19,6 +22,14 @@ import pytest
 
 from saneless.exceptions import (
     AllPagesBlankError,
+    ConfigError,
+    DiskSpaceError,
+    NoScannerFoundError,
+    PaperlessError,
+    PaperlessIncompatibleError,
+    PaperlessTimeoutError,
+    PaperlessUncertainSendError,
+    PaperlessUnconfirmedError,
     PdfError,
     SanelessError,
     ScanCancelledError,
@@ -27,6 +38,7 @@ from saneless.exceptions import (
     describe,
     describe_text,
     failure_text,
+    is_out_of_space,
     note_text,
 )
 
@@ -80,6 +92,131 @@ class TestHierarchy:
         """
         rebuilt = exc_type("rebuilt")
         assert str(rebuilt) == "rebuilt"
+
+
+class TestDeliveryAndDiskTypes:
+    """Placement of the delivery-uncertainty, version and disk-space types."""
+
+    @pytest.mark.parametrize(
+        "exc_type",
+        [
+            PaperlessUncertainSendError,
+            PaperlessUnconfirmedError,
+            PaperlessIncompatibleError,
+        ],
+    )
+    def test_narrower_paperless_types_are_paperless_errors(
+        self, exc_type: type[Exception]
+    ) -> None:
+        """Every ``except PaperlessError`` still catches the narrower types."""
+        assert issubclass(exc_type, PaperlessError)
+
+    def test_poll_timeout_is_an_unconfirmed_filing(self) -> None:
+        """
+        A poll that ran out after acceptance is an unconfirmed filing.
+
+        paperless-ngx held a task id, so it had the document; the timeout
+        only means it never confirmed filing it.
+        """
+        assert issubclass(PaperlessTimeoutError, PaperlessUnconfirmedError)
+
+    def test_uncertain_send_is_not_an_unconfirmed_filing(self) -> None:
+        """A send with no answer is weaker than a received upload: kept apart."""
+        assert not issubclass(PaperlessUncertainSendError, PaperlessUnconfirmedError)
+        assert not issubclass(PaperlessUnconfirmedError, PaperlessUncertainSendError)
+
+    def test_disk_space_error_is_neither_a_scan_nor_a_pdf_error(self) -> None:
+        """
+        A full disk is never blamed on the scanner or on the PDF writer.
+
+        A sibling of ``ScanError`` and ``PdfError``, like
+        ``AllPagesBlankError``, so no ``except ScanError`` can absorb it.
+        """
+        assert issubclass(DiskSpaceError, SanelessError)
+        assert not issubclass(DiskSpaceError, ScanError)
+        assert not issubclass(DiskSpaceError, PdfError)
+
+    def test_no_scanner_found_error_is_a_scan_error_not_a_config_error(
+        self,
+    ) -> None:
+        """Finding no scanner is a scanner condition, not a load-time problem."""
+        assert issubclass(NoScannerFoundError, ScanError)
+        assert not issubclass(NoScannerFoundError, ConfigError)
+
+    @pytest.mark.parametrize(
+        "exc_type",
+        [
+            PaperlessUncertainSendError,
+            PaperlessUnconfirmedError,
+            PaperlessIncompatibleError,
+            DiskSpaceError,
+            NoScannerFoundError,
+        ],
+    )
+    def test_single_message_constructor(self, exc_type: type[Exception]) -> None:
+        """Each type builds from one message, like every other saneless type."""
+        assert str(exc_type("rebuilt")) == "rebuilt"
+
+
+class TestIsOutOfSpace:
+    """is_out_of_space() finds a full disk anywhere in the cause chain."""
+
+    @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EDQUOT])
+    def test_a_full_disk_or_quota_is_out_of_space(self, code: int) -> None:
+        """No space left on the device, or a quota reached, is out of space."""
+        assert is_out_of_space(OSError(code, "x"))
+
+    def test_another_os_error_is_not_out_of_space(self) -> None:
+        """A permission error is a setup problem, not a full disk."""
+        assert not is_out_of_space(OSError(errno.EACCES, "x"))
+
+    def test_an_os_error_with_no_errno_is_not_out_of_space(self) -> None:
+        """An OSError built from a message alone carries no errno."""
+        assert not is_out_of_space(OSError("x"))
+
+    def test_a_non_os_error_is_not_out_of_space(self) -> None:
+        """Only an OSError can report a full disk."""
+        assert not is_out_of_space(RuntimeError("no space left"))
+
+    def test_an_explicit_cause_is_followed(self) -> None:
+        """A wrapper raised ``from`` an ENOSPC is out of space."""
+        wrapper = RuntimeError("wrapped")
+        wrapper.__cause__ = OSError(errno.ENOSPC, "x")
+        assert is_out_of_space(wrapper)
+
+    def test_an_implicit_context_is_followed(self) -> None:
+        """A wrapper raised while handling an ENOSPC is out of space."""
+        wrapper = RuntimeError("wrapped")
+        wrapper.__context__ = OSError(errno.ENOSPC, "x")
+        assert is_out_of_space(wrapper)
+
+    def test_a_deep_chain_is_followed(self) -> None:
+        """The full disk may sit several links down."""
+        inner = ValueError("middle")
+        inner.__cause__ = OSError(errno.EDQUOT, "x")
+        outer = RuntimeError("outer")
+        outer.__cause__ = inner
+        assert is_out_of_space(outer)
+
+    def test_a_chain_without_a_full_disk_is_not_out_of_space(self) -> None:
+        """A chain of unrelated errors is not out of space."""
+        wrapper = RuntimeError("wrapped")
+        wrapper.__cause__ = OSError(errno.EACCES, "x")
+        assert not is_out_of_space(wrapper)
+
+    def test_a_self_referencing_chain_ends(self) -> None:
+        """A cycle in the cause chain is walked once and ends."""
+        first = RuntimeError("first")
+        second = ValueError("second")
+        first.__cause__ = second
+        second.__cause__ = first
+        assert not is_out_of_space(first)
+
+    def test_an_exception_that_is_its_own_cause_ends(self) -> None:
+        """An exception whose cause is itself does not loop."""
+        looped = RuntimeError("looped")
+        looped.__context__ = looped
+        assert not is_out_of_space(looped)
 
 
 class TestDescribe:

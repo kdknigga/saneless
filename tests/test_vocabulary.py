@@ -7,6 +7,7 @@ Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
 from __future__ import annotations
 
 import json
+import re
 import signal
 import time
 from dataclasses import FrozenInstanceError, fields
@@ -19,9 +20,14 @@ import saneless.job
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
+    DiskSpaceError,
     FeederEmptyError,
+    NoScannerFoundError,
     PaperlessError,
+    PaperlessIncompatibleError,
     PaperlessTimeoutError,
+    PaperlessUncertainSendError,
+    PaperlessUnconfirmedError,
     PdfError,
     ScanCancelledError,
     ScanError,
@@ -135,7 +141,10 @@ class TestErrorCategoryMembers:
         The documented categories include REJECTED for a submit that never
         ran (D-06), ASSEMBLY for a PDF that could not be built (D-04) and
         ALL_BLANK for a scan whose every page empty-page detection judged
-        blank, which is not a scanner fault.
+        blank, which is not a scanner fault.  UNCONFIRMED_SEND and
+        UNCONFIRMED_FILING mark an upload that may already be in
+        paperless-ngx, PAPERLESS_VERSION a paperless-ngx whose API version
+        saneless cannot speak, and DISK_SPACE a server that ran out of room.
         Compared as a set: declaration order is not part of any contract, and
         pinning it would fail a harmless reordering.
         """
@@ -148,6 +157,10 @@ class TestErrorCategoryMembers:
             "REJECTED",
             "ASSEMBLY",
             "ALL_BLANK",
+            "UNCONFIRMED_SEND",
+            "UNCONFIRMED_FILING",
+            "PAPERLESS_VERSION",
+            "DISK_SPACE",
         }
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
@@ -987,6 +1000,69 @@ class TestErrorAdvice:
         assert "were kept as a PDF" not in advice.message
         assert "normally" in advice.message
         assert "error says what was kept" in advice.message
+
+    @pytest.mark.parametrize(
+        "category",
+        [ErrorCategory.UNCONFIRMED_SEND, ErrorCategory.UNCONFIRMED_FILING],
+    )
+    def test_unconfirmed_advice_never_says_to_rescan_unchecked(
+        self, category: ErrorCategory
+    ) -> None:
+        """
+        The document may already be in paperless-ngx, so check before rescanning.
+
+        A plain "start the scan again" would store the document twice.  The
+        next step sends the reader to paperless-ngx's document list first, and
+        says a copy is kept in failed/ to import only if it is not there.
+        """
+        advice = error_advice(category)
+        for text in (advice.message.lower(), advice.next_step.lower()):
+            assert "start the scan again" not in text
+            assert "scan again" not in text
+        assert "document list" in advice.next_step
+        assert "failed/" in advice.next_step
+        assert "only if the document is not in paperless-ngx" in advice.next_step
+
+    def test_unconfirmed_messages_say_which_situation_it_is(self) -> None:
+        """The received statement is stronger, so the two messages differ."""
+        send = error_advice(ErrorCategory.UNCONFIRMED_SEND)
+        filing = error_advice(ErrorCategory.UNCONFIRMED_FILING)
+        assert "may have reached paperless-ngx" in send.message
+        assert "received the document" in filing.message
+        assert send.message != filing.message
+
+    def test_paperless_version_advice_names_the_supported_release(self) -> None:
+        """A refused API version is fixed by upgrading, not by a new token."""
+        advice = error_advice(ErrorCategory.PAPERLESS_VERSION)
+        assert "2.16 or later" in advice.next_step
+        assert "9 or 10" in advice.message
+        assert "token" not in advice.next_step
+
+    def test_disk_space_advice_says_to_free_space(self) -> None:
+        """A full disk is advised to free space, never to check the scanner."""
+        advice = error_advice(ErrorCategory.DISK_SPACE)
+        assert "disk space" in advice.message
+        assert "Free space" in advice.next_step
+        assert "scanner" not in advice.message.lower()
+        assert "scanner" not in advice.next_step.lower()
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_advice_carries_no_numbers(self, category: ErrorCategory) -> None:
+        """
+        Advice is constant copy: the numbers belong to the error beside it.
+
+        The one exception is the version advice, which names the paperless-ngx
+        release and API versions saneless supports; those are facts about
+        saneless, not about this job.
+        """
+        advice = error_advice(category)
+        numbers = set(re.findall(r"\d+(?:\.\d+)?", advice.message + advice.next_step))
+        allowed = (
+            {"9", "10", "2.16"}
+            if category is ErrorCategory.PAPERLESS_VERSION
+            else set()
+        )
+        assert numbers <= allowed
 
     def test_rejected_error_message(self) -> None:
         """REJECTED explains that the scan never started (D-05, D-06)."""
@@ -1965,18 +2041,70 @@ class TestClassifyError:
         """PaperlessTimeoutError narrows PaperlessError rather than SanelessError (OUTC-08)."""
         assert issubclass(PaperlessTimeoutError, PaperlessError)
 
-    def test_paperless_timeout_error_is_upload(self) -> None:
+    def test_paperless_timeout_error_is_unconfirmed_filing(self) -> None:
         """
-        PaperlessTimeoutError classifies as UPLOAD with no new arm (OUTC-08).
+        A poll that ran out after acceptance is unconfirmed, not a failed upload.
 
-        The point of subclassing PaperlessError is that the existing
-        ``isinstance(exc, PaperlessError)`` check already covers it: adding an
-        arm for the subclass would be dead code, and forgetting one would be a
-        silent reclassification to UNKNOWN.
+        paperless-ngx answered the upload with a task id, so it holds the
+        document; only the confirmation that it was filed never came.  A
+        40-page OCR can outlast the task timeout.  Reported as a plain upload
+        failure, it would tell the reader to scan again and store the document
+        twice.  ``PaperlessTimeoutError`` subclasses
+        ``PaperlessUnconfirmedError``, so the arm for that class covers it with
+        no arm of its own.
         """
+        assert issubclass(PaperlessTimeoutError, PaperlessUnconfirmedError)
         assert (
-            classify_error(PaperlessTimeoutError("timed out")) is ErrorCategory.UPLOAD
+            classify_error(PaperlessTimeoutError("timed out"))
+            is ErrorCategory.UNCONFIRMED_FILING
         )
+
+    def test_uncertain_send_is_unconfirmed_send(self) -> None:
+        """An upload whose answer never came back may be in paperless-ngx."""
+        assert (
+            classify_error(PaperlessUncertainSendError("x"))
+            is ErrorCategory.UNCONFIRMED_SEND
+        )
+
+    def test_unconfirmed_is_unconfirmed_filing(self) -> None:
+        """An accepted upload that was never confirmed filed is amber, not red."""
+        assert (
+            classify_error(PaperlessUnconfirmedError("x"))
+            is ErrorCategory.UNCONFIRMED_FILING
+        )
+
+    def test_incompatible_is_paperless_version(self) -> None:
+        """A refused API version gets its own advice, not the token advice."""
+        assert (
+            classify_error(PaperlessIncompatibleError("x"))
+            is ErrorCategory.PAPERLESS_VERSION
+        )
+
+    @pytest.mark.parametrize(
+        "exc_type",
+        [
+            PaperlessUncertainSendError,
+            PaperlessUnconfirmedError,
+            PaperlessIncompatibleError,
+        ],
+    )
+    def test_narrower_paperless_types_subclass_paperless_error(
+        self, exc_type: type[PaperlessError]
+    ) -> None:
+        """Every narrower paperless failure is still caught as a PaperlessError."""
+        assert issubclass(exc_type, PaperlessError)
+
+    def test_plain_paperless_error_is_still_upload(self) -> None:
+        """The narrower arms leave the base class where it was."""
+        assert classify_error(PaperlessError("x")) is ErrorCategory.UPLOAD
+
+    def test_disk_space_error_is_disk_space(self) -> None:
+        """A full disk is its own category, never SCANNER or ASSEMBLY."""
+        assert classify_error(DiskSpaceError("x")) is ErrorCategory.DISK_SPACE
+
+    def test_no_scanner_found_error_is_scanner(self) -> None:
+        """Finding no scanner is a scanner condition, not a configuration one."""
+        assert classify_error(NoScannerFoundError("x")) is ErrorCategory.SCANNER
 
     def test_feeder_empty_wins_over_its_scan_error_base(self) -> None:
         """FeederEmptyError is checked before its ScanError base class (CTR-05)."""
@@ -2022,6 +2150,10 @@ _EXIT_CODES_FOR_CATEGORIES: list[tuple[ErrorCategory, ExitCode]] = [
     (ErrorCategory.UNKNOWN, ExitCode.UNEXPECTED),
     (ErrorCategory.REJECTED, ExitCode.UNEXPECTED),
     (ErrorCategory.ALL_BLANK, ExitCode.ALL_BLANK),
+    (ErrorCategory.UNCONFIRMED_SEND, ExitCode.UNCONFIRMED),
+    (ErrorCategory.UNCONFIRMED_FILING, ExitCode.UNCONFIRMED),
+    (ErrorCategory.PAPERLESS_VERSION, ExitCode.PAPERLESS),
+    (ErrorCategory.DISK_SPACE, ExitCode.DISK_SPACE),
 ]
 
 
@@ -2033,8 +2165,9 @@ class TestExitCode:
         ExitCode is the one definition of the CLI exit codes (EXC-02, D-07).
 
         Rewritten when the all-blank failure (8) and the two signal
-        interruptions (129 for SIGHUP, 143 for SIGTERM) joined the enum, so
-        the pinned set lists all twelve members.
+        interruptions (129 for SIGHUP, 143 for SIGTERM) joined the enum, and
+        again for the upload that may already be in paperless-ngx (9) and the
+        full disk (10), so the pinned set lists all fourteen members.
         """
         assert {(member.name, int(member)) for member in ExitCode} == {
             ("SUCCESS", 0),
@@ -2046,6 +2179,8 @@ class TestExitCode:
             ("SAVED_TO_FOLDER", 6),
             ("UPLOADED_WITH_WARNING", 7),
             ("ALL_BLANK", 8),
+            ("UNCONFIRMED", 9),
+            ("DISK_SPACE", 10),
             ("HANGUP", 129),
             ("CANCELLED", 130),
             ("TERMINATED", 143),
