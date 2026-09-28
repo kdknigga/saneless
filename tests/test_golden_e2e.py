@@ -28,9 +28,11 @@ from __future__ import annotations
 import dataclasses
 import html
 import re
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn
 
+import httpx2
 import pikepdf
 import pytest
 from click.testing import CliRunner
@@ -45,10 +47,12 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.paperless import PaperlessClient
+from saneless.exceptions import PaperlessUncertainSendError
+from saneless.paperless import PaperlessClient, PaperlessTiming
 from saneless.scanner.base import PassCapReached
 from saneless.vocabulary import (
     TERMINAL_STATES,
+    ErrorCategory,
     JobState,
     PassAnswer,
     PassWait,
@@ -57,6 +61,7 @@ from saneless.vocabulary import (
 from saneless.web.app import create_app
 from tests.conftest import poll_until, wait_for_state
 from tests.golden_support import (
+    DOCUMENTS_PATH,
     GOLDEN_CORRESPONDENT_IDS,
     GOLDEN_TAG_IDS,
     DistinctPageScanner,
@@ -64,6 +69,7 @@ from tests.golden_support import (
     UploadFailure,
     cli_client_builder,
     embedded_streams,
+    loopback_paperless,
     png_idat,
     web_client_builder,
 )
@@ -540,6 +546,28 @@ def test_web_consume_folder_fallback_is_reported(
     assert "Complete" not in run.history_html
 
 
+def test_web_after_send_failure_is_unconfirmed_sent_once_and_not_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A 500 on the upload ends the job as "may have reached paperless-ngx".
+
+    paperless-ngx answered, so it may have read and stored the body: the scan
+    is sent once, never copied to the consume folder that is configured, and
+    kept in ``failed/`` for the operator to import only if it is missing.
+    """
+    run = _run_web(
+        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.AFTER_SEND
+    )
+
+    assert run.job.state is JobState.ERROR
+    assert run.job.error_category is ErrorCategory.UNCONFIRMED_SEND
+    assert len(run.recorder.uploads()) == 1
+    assert run.recorder.polls() == []
+    assert list((tmp_path / "consume").iterdir()) == []
+    assert len(sorted((tmp_path / "data" / "failed").glob("*.pdf"))) == 1
+
+
 def test_multi_page_web_job_uploads_every_pass_in_scan_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -878,6 +906,67 @@ def test_cli_fallback_with_a_skipped_sheet_exits_6(
     assert _CONSUME_FOLDER_SENTENCE in warned
     assert _SKIPPED_SHEET in warned
     assert len(run.consumed) == 1
+
+
+def test_cli_upload_read_timeout_exits_9_sent_once_and_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An upload that is never answered in time exits 9, the "check first" code.
+
+    The body went out, so paperless-ngx may hold the document: one upload, no
+    copy in the consume folder that is configured, and the PDF in ``failed/``.
+    """
+    run = _run_cli(
+        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.READ_TIMEOUT
+    )
+
+    assert run.result.exit_code == 9, run.result.output
+    errors = [
+        line
+        for line in run.result.stderr.splitlines()
+        if line.startswith("Paperless error: ")
+    ]
+    assert len(errors) == 1
+    assert "may have reached paperless-ngx" in errors[0]
+    assert len(run.recorder.uploads()) == 1
+    assert run.consumed == []
+    assert len(sorted((tmp_path / "data" / "failed").glob("*.pdf"))) == 1
+
+
+def test_upload_late_answer_is_sent_once_and_not_copied(tmp_path: Path) -> None:
+    """
+    A server that reads the whole upload and answers late gets it exactly once.
+
+    Over a real socket: the loopback server reads every byte of the body, then
+    holds its answer past the client's read timeout.  The document may be
+    stored, so it is neither sent again nor copied to the consume folder, and
+    the error says it may already be in paperless-ngx.
+    """
+    consume = tmp_path / "consume"
+    consume.mkdir()
+    pdf = tmp_path / "late.pdf"
+    pdf.write_bytes(b"%PDF-1.4 answered too late")
+    gate = threading.Event()
+    with loopback_paperless(answer_gate=gate) as server:
+        client = PaperlessClient(
+            url=server.url,
+            token="loopback-token",
+            consume_dir=consume,
+            timing=PaperlessTiming(
+                upload_timeout=lambda _size: httpx2.Timeout(5.0, read=0.3)
+            ),
+        )
+        try:
+            with pytest.raises(PaperlessUncertainSendError) as exc_info:
+                client.upload_document(pdf, title="Late")
+        finally:
+            client.close()
+        hits = list(server.hits)
+
+    assert [hit.path for hit in hits if hit.method == "POST"] == [DOCUMENTS_PATH]
+    assert list(consume.iterdir()) == []
+    assert str(exc_info.value).endswith("; it may have reached paperless-ngx")
 
 
 def _blank_page(_index: int) -> Image.Image:

@@ -60,7 +60,7 @@ import pikepdf
 from PIL import Image, ImageDraw
 
 from saneless.logging_config import configure_logging
-from saneless.paperless import PaperlessClient
+from saneless.paperless import PaperlessClient, PaperlessTiming
 from tests.blank_fixtures import tinted_blank
 from tests.conftest import StubScannerBackend, scan_batch
 
@@ -673,10 +673,11 @@ def web_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
 
     ``create_app`` builds its client with keyword arguments, so the stand-in
     takes the same keywords and returns a real client over ``recorder``.  The
-    client keeps the production retry count, so "uploaded exactly once" is
-    proved at the count a real appliance runs with.  Only when ``recorder``
-    fails every upload does it get one attempt: the failure is handled
-    exactly as at any retry count, and no backoff pause is ever reached.
+    client keeps the production send budget, so "uploaded exactly once" is
+    proved with the retries a real appliance runs with.  Only when
+    ``recorder`` fails every upload does it get a zero budget, and so one
+    attempt: the failure is handled exactly as when a real budget runs out,
+    and no backoff pause is ever reached.
 
     Args:
         recorder: The in-memory paperless-ngx every request goes to.
@@ -701,8 +702,8 @@ def web_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
                 url=url,
                 token=token,
                 consume_dir=consume_dir,
-                max_retries=1,
                 transport=httpx2.MockTransport(recorder),
+                timing=PaperlessTiming(send_budget=0.0),
             )
         return PaperlessClient(
             url=url,
@@ -720,7 +721,7 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
 
     The ``scan`` command passes its arguments positionally, so this stand-in
     takes them positionally; otherwise it is ``web_client_builder``'s client,
-    with the production retry count unless ``recorder`` fails every upload.
+    with the production send budget unless ``recorder`` fails every upload.
 
     Args:
         recorder: The in-memory paperless-ngx every request goes to.
@@ -745,8 +746,8 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
                 url,
                 token,
                 consume_dir,
-                max_retries=1,
                 transport=httpx2.MockTransport(recorder),
+                timing=PaperlessTiming(send_budget=0.0),
             )
         return PaperlessClient(
             url, token, consume_dir, transport=httpx2.MockTransport(recorder)

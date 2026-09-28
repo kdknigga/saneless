@@ -21,16 +21,32 @@ import traceback
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Final, assert_never
+from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx2
 
 from .atomic_write import refused_mode_change
-from .exceptions import ConfigError, PaperlessError, PaperlessTimeoutError, describe
+from .exceptions import (
+    ConfigError,
+    PaperlessError,
+    PaperlessIncompatibleError,
+    PaperlessTimeoutError,
+    PaperlessUncertainSendError,
+    describe,
+)
 from .text_safety import neutralise_bounded, neutralise_controls
 from .vocabulary import ConnectionStatus
 
-__all__ = ["ApiDelivery", "FolderDelivery", "PaperlessClient", "UploadResult"]
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+__all__ = [
+    "ApiDelivery",
+    "FolderDelivery",
+    "PaperlessClient",
+    "PaperlessTiming",
+    "UploadResult",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +95,75 @@ _TASK_ID_LOG_LIMIT: Final = 64
 _DUPLICATE_HINT = (
     "the document may already be in Paperless; check before scanning again"
 )
+
+# How long an upload keeps trying while each failure proves the request never
+# reached paperless-ngx whole.  Long enough to ride out a paperless-ngx or
+# container restart; after it the consume-folder fallback, if any, takes over.
+_SEND_BUDGET_SECONDS: Final = 60.0
+
+# The longest single wait between those attempts.  The waits double from 1 s up
+# to this, so a server that comes back is found within a few seconds of it.
+_MAX_BACKOFF_SECONDS: Final = 5.0
+
+# The upload's connect timeout.  Shorter than the client-wide 30 s, so a host
+# that drops packets still gets several attempts within the send budget.
+_UPLOAD_CONNECT_SECONDS: Final = 10.0
+
+# The upload's read timeout: a floor, a rate per MiB of the PDF and a cap.
+# paperless-ngx answers the upload only after it has parsed the body, read the
+# file into memory and written it to its scratch directory, so a large PDF on a
+# slow disk takes longer to answer.  The cap matches paperless-ngx's default
+# task timeout.
+_UPLOAD_READ_FLOOR_SECONDS: Final = 30.0
+_UPLOAD_READ_SECONDS_PER_MIB: Final = 1.0
+_UPLOAD_READ_CAP_SECONDS: Final = 300.0
+
+# The client-wide timeout: metadata fetches, the connection test, task polls,
+# and the write and pool phases of an upload.
+_CLIENT_TIMEOUT_SECONDS: Final = 30.0
+
+# How every after-send failure ends, so the reader knows not to scan again
+# before checking paperless-ngx.
+_MAY_HAVE_REACHED: Final = "; it may have reached paperless-ngx"
+
+
+def _upload_timeout(size_bytes: int) -> httpx2.Timeout:
+    """
+    Build the upload request's timeout for a PDF of ``size_bytes``.
+
+    Args:
+        size_bytes: The size of the PDF being uploaded.
+
+    Returns:
+        A 10 s connect timeout and a read timeout of 30 s plus 1 s per MiB,
+        capped at 300 s; writes and the pool keep the client-wide 30 s.
+
+    """
+    read = min(
+        _UPLOAD_READ_CAP_SECONDS,
+        _UPLOAD_READ_FLOOR_SECONDS + _UPLOAD_READ_SECONDS_PER_MIB * size_bytes / 2**20,
+    )
+    return httpx2.Timeout(
+        _CLIENT_TIMEOUT_SECONDS, connect=_UPLOAD_CONNECT_SECONDS, read=read
+    )
+
+
+def _unreadable_pdf(pdf_path: Path, exc: OSError) -> PaperlessError:
+    """
+    Build the error for a PDF that cannot be read to upload it.
+
+    Args:
+        pdf_path: The PDF.
+        exc: What reading it raised.
+
+    Returns:
+        The error, for the caller to chain to ``exc``.
+
+    """
+    return PaperlessError(
+        f"Could not read the PDF {pdf_path} to upload it: "
+        f"{exc.strerror or describe(exc)}"
+    )
 
 
 def _extract_task(payload: object) -> dict[str, object] | None:
@@ -307,12 +392,19 @@ class _RetryDecision(Enum):
     In memory only: never persisted and never shown.
 
     Attributes:
-        RETRY: Transient.  Back off and try again; once the attempts are
-            exhausted, fall back to the consume directory when one is
-            configured.
-        REFUSED: The server answered with a non-2xx that is not a 5xx.  It
-            would answer the same way again, so this is final: no retry and no
-            fallback.
+        BEFORE_SEND: Nothing can have arrived: no connection was made, or the
+            body provably never finished leaving.  Back off and try again
+            within the send budget; once it is spent, fall back to the consume
+            directory when one is configured.
+        AFTER_SEND: The body may have been read, so the document may already
+            be stored.  Never sent again and never copied to the consume
+            directory: either could make a second document of one scan.
+        INCOMPATIBLE: A 406: this server does not accept the API version
+            asked for.  It refuses before it reads the request, so nothing was
+            stored; final, with no retry and no copy.
+        REFUSED: The server answered with a non-2xx that is neither a 5xx nor
+            a 406.  It would answer the same way again, so this is final: no
+            retry and no fallback.
         MISCONFIGURED: The request could not be sent at all.  No retry can
             succeed and no copy is made.  ``PaperlessClient._unsendable_error``
             reports it as a configuration error when the configured
@@ -322,7 +414,9 @@ class _RetryDecision(Enum):
 
     """
 
-    RETRY = auto()
+    BEFORE_SEND = auto()
+    AFTER_SEND = auto()
+    INCOMPATIBLE = auto()
     REFUSED = auto()
     MISCONFIGURED = auto()
     UNEXPECTED = auto()
@@ -333,9 +427,23 @@ def _retry_decision(exc: httpx2.HTTPError) -> _RetryDecision:
     Classify an httpx2 error: the one place the client decides what to do.
 
     Every upload and metadata-fetch error goes through here, so a change of
-    policy for those is a change to this function alone.  Separating a failure
-    before the request was sent from one after it -- where a retry may store a
-    second copy -- would split RETRY and leave the other decisions as they are.
+    policy for those is a change to this function alone.  An upload is not
+    idempotent, so the question it answers is whether the body can have
+    reached paperless-ngx:
+
+    * A refused or timed-out connection, no free pool slot, and a proxy that
+      refused the tunnel all fail before a byte of the request is sent.  A
+      body write that stalls past its timeout leaves the body incomplete, and
+      paperless-ngx cannot build a document from a truncated upload.  These
+      are safe to send again.
+    * Any answer at all -- a 5xx included, since a proxy's 502 or 504 can
+      follow a body paperless-ngx read in full -- and any failure while
+      reading the answer may come after the body arrived.  The HTTP library
+      does not report a failed body write: it goes on to read whatever the
+      server says, so a cut connection shows up as one of these.  None of
+      them is sent again.
+    * A 406 is paperless-ngx refusing the API version before it looks at the
+      request, so nothing was stored.
 
     Two paths decide without it, because neither retries, copies or raises
     anything a policy could change.  ``test_connection`` reports every
@@ -356,17 +464,42 @@ def _retry_decision(exc: httpx2.HTTPError) -> _RetryDecision:
 
     """
     if isinstance(exc, httpx2.HTTPStatusError):
-        if exc.response.is_server_error:
-            return _RetryDecision.RETRY
-        return _RetryDecision.REFUSED
+        return _status_decision(exc.response)
     # Both are TransportError subclasses, so this test must come before the
     # TransportError one: h11 refusing a header value, or a URL with no usable
     # scheme, fails the same way on every attempt.
     if isinstance(exc, httpx2.LocalProtocolError | httpx2.UnsupportedProtocol):
         return _RetryDecision.MISCONFIGURED
-    if isinstance(exc, httpx2.TransportError):
-        return _RetryDecision.RETRY
+    if isinstance(
+        exc,
+        httpx2.ConnectError
+        | httpx2.ConnectTimeout
+        | httpx2.PoolTimeout
+        | httpx2.ProxyError
+        | httpx2.WriteTimeout,
+    ):
+        return _RetryDecision.BEFORE_SEND
+    if isinstance(exc, httpx2.TransportError | httpx2.DecodingError):
+        return _RetryDecision.AFTER_SEND
     return _RetryDecision.UNEXPECTED
+
+
+def _status_decision(response: httpx2.Response) -> _RetryDecision:
+    """
+    Classify a non-2xx answer for ``_retry_decision``.
+
+    Args:
+        response: The response ``raise_for_status`` refused.
+
+    Returns:
+        INCOMPATIBLE for a 406, AFTER_SEND for a 5xx, else REFUSED.
+
+    """
+    if response.status_code == httpx2.codes.NOT_ACCEPTABLE:
+        return _RetryDecision.INCOMPATIBLE
+    if response.is_server_error:
+        return _RetryDecision.AFTER_SEND
+    return _RetryDecision.REFUSED
 
 
 # The fixed problems a MISCONFIGURED error is reported as.  Fixed, never the
@@ -652,6 +785,36 @@ class FolderDelivery:
 UploadResult = ApiDelivery | FolderDelivery
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PaperlessTiming:
+    """
+    How long the client keeps trying, and the clock it measures that on.
+
+    One argument rather than four, so the client's constructor stays within
+    ruff's five-parameter limit.  The defaults are the production values;
+    a test replaces ``clock`` and ``sleep`` with a fake clock, so no wait is
+    real and a 60 s budget runs in no time.
+
+    Attributes:
+        send_budget: How many seconds an upload keeps retrying failures that
+            prove nothing arrived, counted from its first attempt on
+            ``clock``.  0 makes exactly one attempt.
+        clock: The monotonic clock the send budget is measured on.
+        sleep: How the upload waits between those attempts.
+        upload_timeout: Builds the upload request's timeout from the PDF's
+            size in bytes.
+
+    """
+
+    send_budget: float = _SEND_BUDGET_SECONDS
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    upload_timeout: Callable[[int], httpx2.Timeout] = _upload_timeout
+
+
+_DEFAULT_TIMING: Final = PaperlessTiming()
+
+
 class PaperlessClient:
     """
     Client for the paperless-ngx REST API.
@@ -667,18 +830,27 @@ class PaperlessClient:
     token the constructor refuses is a ``PaperlessError`` with fixed text and
     no cause.
 
-    ``_retry_decision`` sorts every httpx2 error, and upload failures fall
-    into three groups:
+    ``_retry_decision`` sorts every httpx2 error by whether the upload can
+    have reached paperless-ngx, and upload failures fall into four groups:
 
-    * **Retried** with exponential backoff, for ``max_retries`` attempts in
-      total: every transient ``httpx2.TransportError`` -- ConnectError, the
-      timeouts, ReadError, WriteError, RemoteProtocolError (a proxy in
-      front of paperless-ngx closing the connection), ProxyError -- and any
-      5xx response.
+    * **Retried before send**, with waits that double from 1 s up to 5 s, for
+      the send budget (60 s unless ``timing`` says otherwise) in total: a
+      refused or timed-out connection, no
+      free connection in the pool, a proxy that refused the tunnel
+      (ProxyError), and a body write that stalled (WriteTimeout).  None of
+      them can have delivered the whole body.
+    * **After send**, never resent and never copied: a failure while reading
+      the answer -- ReadTimeout, ReadError, RemoteProtocolError (a proxy in
+      front of paperless-ngx closing the connection), CloseError and the
+      rest -- any 5xx, and a 200 whose body is not JSON or carries no task id.
+      paperless-ngx may already hold the document, so each is a
+      ``PaperlessUncertainSendError``.
     * **Fail fast**, with no further attempt: a 4xx rejection, any other
       non-2xx that is not a server error (a redirect, which names its target
-      so ``paperless.url`` can be corrected), any other ``httpx2.HTTPError``,
-      and a 200 whose body is not JSON.
+      so ``paperless.url`` can be corrected), and any other ``httpx2.HTTPError``.
+      A 406 is a server that does not accept API version 9 or 10, reported as
+      a ``PaperlessIncompatibleError``; it refuses before it reads the upload,
+      so nothing was stored.
     * **Not sendable**, with no further attempt: a ``paperless.url`` that is
       unset or has no usable scheme (``httpx2.UnsupportedProtocol``), and a
       request the transport refused to put on the wire
@@ -690,16 +862,16 @@ class PaperlessClient:
       naming only the exception's class when they pass the load rules and so
       cannot be (see ``_unsendable_error``).
 
-    When a consume directory is configured it is the fallback only for
-    exhausted retries: a scan must never be lost to an outage.  A 4xx, a
-    redirect and a misconfiguration are final and are not copied; a
-    misconfiguration would otherwise send every scan to the folder without
-    its metadata, and the caller keeps the PDF instead.
+    When a consume directory is configured it is the fallback only once the
+    before-send budget is spent: a scan must never be lost to an outage.
+    Nothing else is copied.  An after-send failure may already be a document,
+    so a copy could make it two; a 4xx, a 406, a redirect and a
+    misconfiguration are final, and a misconfiguration would otherwise send
+    every scan to the folder without its metadata.  The caller keeps the PDF
+    instead.
 
-    Accepted risk: a retry after a response that was lost
-    in transit can make paperless-ngx v3, with its default settings, store a
-    second copy of the document.  A duplicate is easy to delete; a lost scan
-    is not.
+    A request is resent only when it provably did not reach paperless-ngx, so
+    one scan cannot become two documents through a retry.
 
     Args:
         url: Base URL of the paperless-ngx instance.
@@ -708,13 +880,14 @@ class PaperlessClient:
             the client keeps it only to strike it out of library text it
             quotes.  It is the only credential sent: a ``url`` carrying a
             user name or password is refused, never sent in its place.
-        consume_dir: Optional fallback directory for PDF upload failures;
-            None disables the fallback copy.
-        max_retries: Maximum number of upload attempts, including the first.
+        consume_dir: Optional fallback directory for an upload whose
+            before-send budget ran out; None disables the fallback copy.
         transport: The httpx2 transport requests go through, handed straight
             to ``httpx2.Client(transport=...)``. None uses httpx2's default
             network transport. This is the injection seam for tests (an
             ``httpx2.MockTransport``) and for custom transports.
+        timing: The upload's send budget, the clock and sleep it runs on, and
+            how its timeout is built; see ``PaperlessTiming``.
 
     Raises:
         PaperlessError: If ``url`` is not a valid URL (``httpx2.InvalidURL``)
@@ -731,9 +904,9 @@ class PaperlessClient:
         url: str,
         token: str,
         consume_dir: Path | None = None,
-        max_retries: int = 3,
         *,
         transport: httpx2.BaseTransport | None = None,
+        timing: PaperlessTiming = _DEFAULT_TIMING,
     ) -> None:
         """Initialize the paperless-ngx API client."""
         base_url = url.rstrip("/")
@@ -768,7 +941,7 @@ class PaperlessClient:
                     "Authorization": f"Token {token}",
                     "Accept": _API_VERSION_ACCEPT,
                 },
-                timeout=30.0,
+                timeout=_CLIENT_TIMEOUT_SECONDS,
                 transport=transport,
             )
         except httpx2.InvalidURL:
@@ -804,7 +977,10 @@ class PaperlessClient:
             )
             raise PaperlessError(msg) from exc
         self._consume_dir = consume_dir
-        self._max_retries = max_retries
+        self._send_budget = timing.send_budget
+        self._clock = timing.clock
+        self._sleep = timing.sleep
+        self._upload_timeout = timing.upload_timeout
         # Kept only to strike it out of third-party text; see _strike.
         self._token = token
 
@@ -820,15 +996,12 @@ class PaperlessClient:
 
         Builds multipart form data with title and optional metadata.
         Tags are submitted as repeated form fields.  No document date is
-        sent: paperless-ngx dates the document itself.  Every transient
-        transport failure and every 5xx is retried with exponential backoff
-        for ``max_retries`` attempts; a 4xx, a redirect or any other non-2xx
-        that is not a 5xx, a request that cannot be sent from the configured
-        URL and token, any other httpx2 error and a non-JSON 200 end the
-        attempts at once.  When the retries are exhausted and a consume
-        directory is configured, the PDF is copied there instead; nothing
-        else is copied.  See the class docstring for the accepted
-        duplicate-document risk of retrying.
+        sent: paperless-ngx dates the document itself.  A failure that proves
+        the request never reached paperless-ngx whole is retried, with waits
+        doubling from 1 s up to 5 s, until the send budget is spent; the
+        consume directory, when one is configured, then gets the PDF instead.
+        Every other failure ends the upload at once and copies nothing; see
+        the class docstring for how each is reported.
 
         Args:
             pdf_path: Path to the PDF file to upload.
@@ -838,7 +1011,7 @@ class PaperlessClient:
 
         Returns:
             An ApiDelivery carrying the paperless-ngx task id on success.
-            When the retries are exhausted and a consume directory is
+            When the send budget is spent and a consume directory is
             configured, a FolderDelivery naming the file the PDF was copied
             to.
 
@@ -850,30 +1023,69 @@ class PaperlessClient:
                 ``Uploading to Paperless:`` and naming the setting, and the
                 error carries no cause, so no traceback can print the refused
                 header value.  Nothing is retried or copied.
+            PaperlessUncertainSendError: If the upload may have reached
+                paperless-ngx without a usable answer: a failure while reading
+                the answer, a 5xx, or a 200 whose body is not JSON or is not a
+                non-empty string task id.  A read timeout names the time
+                allowed and the file size.  Nothing is resent or copied.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
+                not accept API version 9 or 10.  Fixed text, no cause, nothing
+                retried or copied.
             PaperlessError: If the server rejects the upload with a 4xx
                 (``Paperless rejected the upload (<status> <reason>): <line>``)
                 or answers with a redirect (``Paperless redirected the upload
                 (<status> <reason>) to <location>; check paperless.url``);
-                if the retries are exhausted and no consume directory is
-                configured (``failed after N attempts``); if the transport
+                if the send budget is spent and no consume directory is
+                configured (``could not connect for <N>s``); if the transport
                 refuses to send a request built from a sendable URL and token
                 (fixed text, no cause, nothing retried or copied); if any
-                other httpx2 error occurs; if the PDF cannot be opened; if a
-                200 body is
-                not JSON or carries no task id; or if copying into the consume
-                directory fails.  Any library or server text it quotes has the
-                token struck out, and it is chained to its cause only when no
-                link of the cause's chain quotes the token.
+                other httpx2 error occurs; if the PDF cannot be read; or if
+                copying into the consume directory fails.  Any library or
+                server text it quotes has the token struck out, and it is
+                chained to its cause only when no link of the cause's chain
+                quotes the token.
 
         """
         data = self._form_fields(title, tags, correspondent)
-        last_error: httpx2.HTTPError | None = None
-
-        for attempt in range(self._max_retries):
+        try:
+            size_bytes = pdf_path.stat().st_size
+        except OSError as exc:
+            raise _unreadable_pdf(pdf_path, exc) from exc
+        timeout = self._upload_timeout(size_bytes)
+        deadline = self._clock() + self._send_budget
+        attempt = 0
+        while True:
+            attempt += 1
             try:
-                task_id = self._post_document(pdf_path, data)
+                task_id = self._post_document(pdf_path, data, timeout)
             except httpx2.HTTPError as exc:
                 match _retry_decision(exc):
+                    case _RetryDecision.BEFORE_SEND:
+                        remaining = deadline - self._clock()
+                        if remaining <= 0:
+                            return self._send_budget_spent(pdf_path, exc)
+                        # _reason, not describe: library text may quote the
+                        # token.
+                        logger.warning(
+                            "Upload attempt %d failed; retrying for up to %.0fs "
+                            "more: %s",
+                            attempt,
+                            remaining,
+                            self._reason(exc),
+                        )
+                        wait = min(2 ** (attempt - 1), _MAX_BACKOFF_SECONDS)
+                        self._sleep(min(wait, remaining))
+                    case _RetryDecision.AFTER_SEND:
+                        # The body may have been read: a resend or a copy
+                        # could make a second document of this scan.
+                        msg = self._uncertain_send_message(exc, size_bytes, timeout)
+                        raise PaperlessUncertainSendError(msg) from self._cause(exc)
+                    case _RetryDecision.INCOMPATIBLE:
+                        msg = (
+                            f"Paperless{self._at_url} does not accept API version "
+                            "9 or 10; saneless needs paperless-ngx 2.16 or later"
+                        )
+                        raise PaperlessIncompatibleError(msg) from None
                     case _RetryDecision.REFUSED if isinstance(
                         exc, httpx2.HTTPStatusError
                     ):
@@ -882,9 +1094,6 @@ class PaperlessClient:
                         # answered the same way again: no retry, no fallback.
                         msg = _not_accepted_message(exc.response, self._token)
                         raise PaperlessError(msg) from self._cause(exc)
-                    case _RetryDecision.RETRY:
-                        last_error = exc
-                        self._back_off(attempt, exc)
                     case _RetryDecision.MISCONFIGURED:
                         error = self._unsendable_error(exc, "Uploading to Paperless")
                         # from None, not from exc: the worker logs a failed job
@@ -905,19 +1114,6 @@ class PaperlessClient:
             else:
                 logger.info("Upload succeeded, task ID: %r", _loggable_task_id(task_id))
                 return ApiDelivery(task_id=task_id)
-
-        if self._consume_dir is not None:
-            return self._fall_back_to_consume_dir(pdf_path, self._consume_dir)
-
-        reason = (
-            "no attempt was made" if last_error is None else self._reason(last_error)
-        )
-        msg = (
-            f"Upload to Paperless{self._at_url} failed after "
-            f"{self._max_retries} attempts: {reason}"
-        )
-        cause = None if last_error is None else self._cause(last_error)
-        raise PaperlessError(msg) from cause
 
     @staticmethod
     def _form_fields(
@@ -944,20 +1140,28 @@ class PaperlessClient:
             data["tags"] = [str(tag_id) for tag_id in tags]
         return data
 
-    def _post_document(self, pdf_path: Path, data: dict[str, str | list[str]]) -> str:
+    def _post_document(
+        self,
+        pdf_path: Path,
+        data: dict[str, str | list[str]],
+        timeout: httpx2.Timeout,
+    ) -> str:
         """
         Make one upload attempt and return the task id Paperless assigned.
 
         Args:
             pdf_path: Path to the PDF file to upload.
             data: The multipart form fields.
+            timeout: The request's timeout, scaled to the PDF's size.
 
         Returns:
-            The task id, as a string.
+            The task id: a non-empty string, returned as sent.
 
         Raises:
-            PaperlessError: If the PDF cannot be opened, or a 200 body is not
-                JSON or is a JSON null.
+            PaperlessError: If the PDF cannot be opened.
+            PaperlessUncertainSendError: If a 200 body is not JSON, or is not
+                a non-empty string.  paperless-ngx answered 200, so the
+                document may be stored; the message names what came back.
 
         Any ``httpx2.HTTPError`` from the request or from ``raise_for_status``
         propagates: ``upload_document`` decides which of those to retry.
@@ -969,32 +1173,47 @@ class PaperlessClient:
         try:
             pdf_file = pdf_path.open("rb")
         except OSError as exc:
-            msg = (
-                f"Could not read the PDF {pdf_path} to upload it: "
-                f"{exc.strerror or describe(exc)}"
-            )
-            raise PaperlessError(msg) from exc
+            raise _unreadable_pdf(pdf_path, exc) from exc
         with pdf_file as f:
             response = self._client.post(
                 "/api/documents/post_document/",
                 data=data,
                 files={"document": (pdf_path.name, f, "application/pdf")},
+                timeout=timeout,
             )
         response.raise_for_status()
         try:
             task_id = response.json()
         except ValueError as exc:
             msg = (
-                f"Paperless{self._at_url} returned a response that is "
-                f"not JSON: {self._reason(exc)}"
+                f"Paperless{self._at_url} answered the upload with a body that is "
+                f"not JSON: {self._answer_text(response)}{_MAY_HAVE_REACHED}"
             )
-            raise PaperlessError(msg) from self._cause(exc)
-        if task_id is None:
-            # A JSON null body would otherwise become the string
-            # "None" -- truthy, not None, and polled as a real task id.
-            msg = "Paperless accepted the upload but returned no task ID"
-            raise PaperlessError(msg)
-        return str(task_id)
+            raise PaperlessUncertainSendError(msg) from self._cause(exc)
+        # Only a non-empty string is a task id.  A number, a bool, an object
+        # or null would otherwise become a string and be polled as one.
+        if not isinstance(task_id, str) or not task_id.strip():
+            msg = (
+                f"Paperless{self._at_url} answered the upload with "
+                f"{self._answer_text(response)}, which is not a task ID"
+                f"{_MAY_HAVE_REACHED}"
+            )
+            raise PaperlessUncertainSendError(msg)
+        return task_id
+
+    def _answer_text(self, response: httpx2.Response) -> str:
+        """
+        Quote a 200 upload answer that is not a task id, safely.
+
+        Args:
+            response: The answer.
+
+        Returns:
+            Its body on one bounded line with the token struck out, or
+            ``(empty response body)``.
+
+        """
+        return _bounded_line(_strike(response.text, self._token)) or _EMPTY_BODY
 
     def _reason(self, exc: BaseException) -> str:
         """
@@ -1070,27 +1289,61 @@ class PaperlessClient:
             f"it ({type(exc).__name__})"
         )
 
-    def _back_off(self, attempt: int, exc: httpx2.HTTPError) -> None:
+    def _send_budget_spent(
+        self, pdf_path: Path, exc: httpx2.HTTPError
+    ) -> FolderDelivery:
         """
-        Log a failed retryable attempt and sleep before the next one.
-
-        No sleep follows the last attempt: nothing is waiting for it.
+        End an upload whose before-send budget ran out.
 
         Args:
-            attempt: The zero-based attempt that just failed.
-            exc: What it failed with.
+            pdf_path: The PDF that could not be sent.
+            exc: The last attempt's error.
+
+        Returns:
+            The consume-folder copy, when a consume directory is configured.
+
+        Raises:
+            PaperlessError: Naming the budget and the last error when there is
+                no consume directory, or from the copy itself.
 
         """
-        # _reason, not describe: httpx2's text for a status error spans lines
-        # and names the full request URL, and library text may quote the token.
-        logger.warning(
-            "Upload attempt %d/%d failed: %s",
-            attempt + 1,
-            self._max_retries,
-            self._reason(exc),
+        if self._consume_dir is not None:
+            return self._fall_back_to_consume_dir(pdf_path, self._consume_dir)
+        msg = (
+            f"Upload to Paperless{self._at_url} could not connect for "
+            f"{self._send_budget:.0f}s: {self._reason(exc)}"
         )
-        if attempt < self._max_retries - 1:
-            time.sleep(2**attempt)
+        raise PaperlessError(msg) from self._cause(exc)
+
+    def _uncertain_send_message(
+        self, exc: httpx2.HTTPError, size_bytes: int, timeout: httpx2.Timeout
+    ) -> str:
+        """
+        Say why an upload may have reached paperless-ngx without an answer.
+
+        Args:
+            exc: The after-send error.
+            size_bytes: The PDF's size.
+            timeout: The timeout the request was sent with.
+
+        Returns:
+            One line naming the address and the struck reason, ending with the
+            warning that the document may already be there.  A read timeout
+            names the time allowed and the file size instead, since a larger
+            file is given longer.
+
+        """
+        reason = self._reason(exc)
+        if isinstance(exc, httpx2.ReadTimeout) and timeout.read is not None:
+            return (
+                f"Upload to Paperless{self._at_url} got no answer within "
+                f"{timeout.read:.0f}s, the time allowed for a "
+                f"{size_bytes / 1_000_000:.1f} MB PDF ({reason}){_MAY_HAVE_REACHED}"
+            )
+        return (
+            f"Upload to Paperless{self._at_url} got no usable answer: "
+            f"{reason}{_MAY_HAVE_REACHED}"
+        )
 
     def _fall_back_to_consume_dir(
         self, pdf_path: Path, dest_dir: Path

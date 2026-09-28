@@ -36,9 +36,11 @@ jobs`` actually render (T-23-38).
 **On speed.**  Apart from the one-second flip timeout below, all the cases
 together sleep for well under a second, using only seams that already exist:
 
-* ``max_retries=1`` makes both exponential-backoff pauses in
-  ``upload_document`` unreachable (measured 3.00 s at 3 retries, 1.00 s at 2,
-  0.00 s at 1).  The consume-directory case is the one that needs it.
+* ``PaperlessTiming(send_budget=0.0)`` gives ``upload_document`` exactly one
+  attempt, so no before-send backoff pause is ever reached; at the default
+  60 s budget a refused connection would wait it out.  The consume-directory
+  case is the one that needs it.  The two misconfiguration cases keep the
+  default budget on a ``FakeClock`` instead, and assert that it never waited.
 * ``paperless_task_timeout`` is 0 for the poll-timeout case, so ``poll_task``'s
   monotonic deadline has already passed when the first poll comes back without
   a terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
@@ -54,9 +56,10 @@ The sleep primitive itself is **not** patched anywhere here, and no flat
 pause appears in this module -- an acceptance grep enforces both.  Patching it
 in ``saneless.paperless`` would disable the ``min(delay, remaining)`` deadline
 clamp that plan 23-04 added, which is part of what these cases prove; Phase 32
-(M-34) owns that sweep.  No ``sleep_fn`` parameter and no configurable backoff
-base were added either: those would be production seams existing only for
-tests, for a problem two existing constructor parameters already solve.
+owns that sweep.  The upload's own waits go through the client's
+``PaperlessTiming`` seam, which exists because a 60 s budget cannot be waited
+out under pytest's 60 s timeout; where a case needs no retry it simply gets a
+zero budget.
 """
 
 from __future__ import annotations
@@ -81,7 +84,7 @@ from saneless.config import (
 )
 from saneless.exceptions import ScanError
 from saneless.job import JobStore
-from saneless.paperless import PaperlessClient
+from saneless.paperless import PaperlessClient, PaperlessTiming
 from saneless.scanner.base import ScannerBackend
 from saneless.vocabulary import (
     RESTART_REASON,
@@ -97,6 +100,7 @@ from saneless.vocabulary import (
 )
 from saneless.worker import ScanOptions, ScanWorker
 from tests.conftest import poll_until, spooling_in_turn
+from tests.fake_clock import FakeClock
 from tests.golden_support import (
     DistinctPageScanner,
     RecordingPaperless,
@@ -364,6 +368,28 @@ def _refused_connection_handler() -> Callable[[httpx2.Request], httpx2.Response]
     return handler
 
 
+def _after_send_error_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Answer every upload with a 500, as a paperless-ngx that read it might.
+
+    An answer means the body may have been read and stored, so the client must
+    neither resend it nor copy it to the consume folder.  A poll reaching this
+    handler would mean the client invented a task id, so the tasks path is left
+    to ``_unexpected``.
+
+    Returns:
+        A handler answering 500 on the upload path.
+
+    """
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == _DOCUMENTS_PATH:
+            return httpx2.Response(500, text="paperless-ngx is restarting")
+        return _unexpected(request)
+
+    return handler
+
+
 @dataclass(frozen=True)
 class _Case:
     """
@@ -402,6 +428,8 @@ class _Case:
             means the warning column must be NULL.
         error_contains: Fragments the persisted error must contain; empty means
             the error column must be NULL.
+        expected_category: The persisted ErrorCategory the row must carry;
+            None leaves the category unchecked.
 
     """
 
@@ -422,6 +450,7 @@ class _Case:
     operator_flips: bool = True
     warning_contains: str | None = None
     error_contains: tuple[str, ...] = ()
+    expected_category: ErrorCategory | None = None
 
 
 _CASES = [
@@ -454,6 +483,19 @@ _CASES = [
         expected_consume_pdfs=0,
         task_timeout=_TIMEOUT_BUDGET,
         error_contains=(_PENDING_TASK, "did not finish"),
+        expected_category=ErrorCategory.UNCONFIRMED_FILING,
+    ),
+    _Case(
+        label="after-send-500",
+        handler_factory=_after_send_error_handler,
+        expected_state=JobState.ERROR,
+        expected_outcome=None,
+        expected_pages=(None, None, None),
+        expected_failed_pdfs=1,
+        expected_consume_pdfs=0,
+        with_consume_dir=True,
+        error_contains=("500", "may have reached paperless-ngx"),
+        expected_category=ErrorCategory.UNCONFIRMED_SEND,
     ),
     _Case(
         label="consume-dir-fallback",
@@ -708,6 +750,9 @@ def _assert_persisted_row(case: _Case, job: Job) -> None:
         assert job.warning is not None
         assert case.warning_contains in job.warning
 
+    if case.expected_category is not None:
+        assert job.error_category is case.expected_category
+
 
 def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) -> None:
     """
@@ -761,13 +806,11 @@ class TestFiveOutcomesEndToEnd:
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
-            # The measured zero-sleep lever: at 1 attempt neither
-            # exponential-backoff pause in upload_document is reachable, taking
-            # the fallback case from 3.00 s to 0.00 s.  The fallback behaviour
-            # is identical at any retry count -- exhausting them is what
-            # triggers it.
-            max_retries=1,
+            # One attempt, so no before-send backoff pause is reachable.  The
+            # fallback behaviour is identical at any budget -- spending it is
+            # what triggers it.
             transport=httpx2.MockTransport(case.handler_factory()),
+            timing=PaperlessTiming(send_budget=0.0),
         )
         worker = ScanWorker(
             _build_scanner(case.scan_passes),
@@ -829,8 +872,8 @@ class TestAPartialScanSurvivesTheWorker:
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
-            max_retries=1,
             transport=httpx2.MockTransport(_accepting_handler()),
+            timing=PaperlessTiming(send_budget=0.0),
         )
         worker = ScanWorker(
             _jamming_scanner(3, _SCANNER_FAILURE), paperless, settings, store
@@ -895,8 +938,8 @@ class TestFlipTimeoutReleasesTheWorker:
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
-            max_retries=1,
             transport=httpx2.MockTransport(_accepting_handler()),
+            timing=PaperlessTiming(send_budget=0.0),
         )
         # Pass A of the timed-out job, then the single pass of the simplex job
         # that follows it.  No third batch: the timed-out job must never reach
@@ -985,7 +1028,8 @@ class TestClientSideMisconfigurationEndToEnd:
     a refused header value is refused by h11, below where ``MockTransport``
     plugs in, and an unset URL is refused by the real transport's scheme check.
     So each runs the production transport -- the first against a real socket
-    on 127.0.0.1 -- with the production retry count.
+    on 127.0.0.1 -- with the production send budget, on a fake clock that
+    proves no attempt was retried.
     """
 
     def test_padded_token_fails_as_configuration_without_leaking(
@@ -1002,6 +1046,7 @@ class TestClientSideMisconfigurationEndToEnd:
         # caplog before the production configuration, so the root level it
         # restores at teardown is the one from before that lowered it.
         caplog.set_level(logging.DEBUG)
+        clock = FakeClock()
         with production_debug_logging(), loopback_paperless() as server:
             finished = _scan_once(
                 settings,
@@ -1009,11 +1054,12 @@ class TestClientSideMisconfigurationEndToEnd:
                     url=server.url,
                     token=token,
                     consume_dir=settings.paperless.consume_dir,
-                    max_retries=3,
+                    timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
                 ),
                 wait_for_state,
             )
         assert server.hits == []
+        assert clock.waits == []
         assert finished.error_category is ErrorCategory.CONFIG
         assert finished.error is not None
         assert "paperless.token" in finished.error
@@ -1037,6 +1083,7 @@ class TestClientSideMisconfigurationEndToEnd:
         """``paperless.url = ""`` is not a consume-folder setup: ERROR/CONFIG."""
         settings = _build_settings(tmp_path, _MISCONFIGURED, paperless_url="")
         caplog.set_level(logging.DEBUG)
+        clock = FakeClock()
         with production_debug_logging():
             finished = _scan_once(
                 settings,
@@ -1044,10 +1091,11 @@ class TestClientSideMisconfigurationEndToEnd:
                     url=settings.paperless.url,
                     token=settings.paperless.token.get_secret_value(),
                     consume_dir=settings.paperless.consume_dir,
-                    max_retries=3,
+                    timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
                 ),
                 wait_for_state,
             )
+        assert clock.waits == []
         assert finished.error_category is ErrorCategory.CONFIG
         assert finished.error is not None
         assert _TOKEN not in finished.error
@@ -1103,8 +1151,8 @@ def _multi_page_worker(
         url=settings.paperless.url,
         token=settings.paperless.token.get_secret_value(),
         consume_dir=settings.paperless.consume_dir,
-        max_retries=1,
         transport=httpx2.MockTransport(recorder),
+        timing=PaperlessTiming(send_budget=0.0),
     )
     worker = ScanWorker(scanner, paperless, settings, store)
     try:
