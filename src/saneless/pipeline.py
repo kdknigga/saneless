@@ -3446,8 +3446,11 @@ def run_pipeline(
         DiskSpaceError: If the disk runs out of room: free space in
             ``tmp_dir`` below ``min_free_space_mb`` before scanning, an
             ``ENOSPC`` or ``EDQUOT`` while preparing the working directory,
-            or a page the spool has no room for or runs out of space writing.
-            What was scanned before it is kept, like any failure.
+            a page the spool has no room for or runs out of space writing,
+            free space under twice the spooled pages plus
+            ``min_free_space_mb`` (checked before assembly starts), or an
+            assembly that runs out of space.  What was scanned before it is
+            kept, like any failure.
         ScanCancelledError: If the operator aborts a manual duplex scan at the
             flip prompt, or a multi-page scan at any of its prompts. Nothing
             is kept.
@@ -3461,9 +3464,8 @@ def run_pipeline(
             returned no pages; if a manual duplex flip prompt fails or its
             wait times out; or if a multi-page prompt fails or is answered
             with something it did not offer.
-        PdfError: If the PDF cannot be assembled, or the free space is under
-            twice the spooled pages plus ``min_free_space_mb``, which is
-            checked before assembly starts.
+        PdfError: If the PDF cannot be assembled for a reason other than a
+            full disk.
         PaperlessError: If upload or polling fails, in whichever subtype the
             client raised.
         Exception: Any other failure, re-raised as itself. After the workspace

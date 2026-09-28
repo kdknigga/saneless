@@ -312,11 +312,11 @@ which failures retry, when the consume directory is used, and where a kept PDF g
 ## PDF assembly errors (exit 4)
 
 The line starts with `PDF error:`. saneless scanned the pages but could not write them as a PDF.
+A full disk is not this error: it is [exit 10](#out-of-disk-space-exit-10).
 
-- Check the free disk space where saneless writes its working files (`tmp_dir` in
-  [`[output]`](../reference/configuration.md#output)).
-- Check that saneless can write to that directory.
-- If both are fine, the PDF library refused one of the scanned images, and the line gives its
+- Check that saneless can write to the directory where it writes its working files (`tmp_dir`
+  in [`[output]`](../reference/configuration.md#output)).
+- If it can, the PDF library refused one of the scanned images, and the line gives its
   reason. Try the scan again with a different `mode` or `resolution` in the profile.
 
 The scanned pages are not lost when this fails. saneless writes each page to disk as it arrives,
