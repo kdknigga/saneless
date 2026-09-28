@@ -80,11 +80,13 @@ from .pipeline import (
     FlipCoordinator,
     PassCoordinator,
     PipelineEvent,
-    PipelineRequest,
+    RequestHooks,
     Settled,
+    build_pipeline_request,
     run_pipeline,
 )
 from .private_dirs import make_private_dir
+from .scan_metadata import resolve_scan_metadata
 from .scanner.sane_backend import SaneBackend, require_sane
 from .text_safety import neutralise_controls
 from .vocabulary import (
@@ -1518,7 +1520,7 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
             click.echo(progress_label(event.job_state))
 
     try:
-        request = PipelineRequest(
+        request = build_pipeline_request(
             profile_name=profile,
             title=resolved_title,
             # A uuid4, exactly as the worker supplies for a web job.  Without
@@ -1532,19 +1534,29 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
             # Four kinds of artefact land there, and every mid-scan fault can
             # reach it.
             job_id=str(uuid4()),
-            tags=settings.profiles[profile].default_tags or None,
-            correspondent=settings.profiles[profile].default_correspondent,
-            status_callback=status_callback,
-            # run_pipeline is synchronous, so the flip wait holds this thread;
-            # only the click.confirm read itself moves to the prompt thread.
-            flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
-            # The same holds for every multi-page question: the run waits on
-            # this thread, and only each click.prompt read moves off it.
-            multi_page=multi_page,
-            pass_coordinator=ClickPassCoordinator() if multi_page else None,
-            # The run sets it once its outcome is fixed, and from then on
-            # _interrupt_handler defers a signal instead of raising it.
-            settled=_INTERRUPTION.settled,
+            # The command line has no tag or correspondent option, so neither
+            # control is answered and the profile's defaults apply -- the same
+            # rule, through the same function, as a web form nobody touched.
+            metadata=resolve_scan_metadata(
+                settings.profiles[profile],
+                tags=None,
+                correspondent=None,
+                correspondent_given=False,
+            ),
+            hooks=RequestHooks(
+                status_callback=status_callback,
+                # run_pipeline is synchronous, so the flip wait holds this
+                # thread; only the click.confirm read itself moves to the
+                # prompt thread.
+                flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
+                # The same holds for every multi-page question: the run waits
+                # on this thread, and only each click.prompt read moves off it.
+                multi_page=multi_page,
+                pass_coordinator=ClickPassCoordinator() if multi_page else None,
+                # The run sets it once its outcome is fixed, and from then on
+                # _interrupt_handler defers a signal instead of raising it.
+                settled=_INTERRUPTION.settled,
+            ),
         )
         result = run_pipeline(
             scanner,

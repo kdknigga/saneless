@@ -43,9 +43,11 @@ from .pipeline import (
     FlipCoordinator,
     PassCoordinator,
     PipelineEvent,
-    PipelineRequest,
+    RequestHooks,
+    build_pipeline_request,
     run_pipeline,
 )
+from .scan_metadata import ScanMetadata
 from .vocabulary import (
     ACTIVE_STATES,
     PASS_WAIT_STATES,
@@ -2137,23 +2139,29 @@ class ScanWorker:
             if self._store_progress_state(_jid, state):
                 persisted_state = state
 
-        request = PipelineRequest(
+        request = build_pipeline_request(
             profile_name=job.profile,
             title=job.title,
             # The assembled PDF is named from this id, which is what makes two
             # same-second scans of the same title two files rather than one
             # overwriting the other.
             job_id=job.id,
-            tags=job.tags or None,
-            correspondent=job.correspondent,
-            status_callback=_status_cb,
-            thumbnail_callback=_thumbnail_cb,
-            pass_count_callback=self._record_front_count,
-            flip_coordinator=coordinator,
-            multi_page=options.multi_page,
-            pass_coordinator=pass_coordinator,
-            device_memory=self._device_memory,
-            preserving=self._preserving,
+            # The row holds the metadata the scan route resolved, the profile's
+            # defaults already applied or answered away, so it is the answer
+            # as it stands: resolving again would re-tag a cleared submit.
+            metadata=ScanMetadata(
+                tags=tuple(job.tags or ()), correspondent=job.correspondent
+            ),
+            hooks=RequestHooks(
+                status_callback=_status_cb,
+                thumbnail_callback=_thumbnail_cb,
+                pass_count_callback=self._record_front_count,
+                flip_coordinator=coordinator,
+                multi_page=options.multi_page,
+                pass_coordinator=pass_coordinator,
+                device_memory=self._device_memory,
+                preserving=self._preserving,
+            ),
         )
         try:
             # The gate covers the whole pipeline call, which is the whole of

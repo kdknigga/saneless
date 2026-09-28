@@ -34,6 +34,7 @@ from saneless.checks import (
 from saneless.config import PaperlessId, is_placeholder_token, resolve_job_title
 from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
+from saneless.scan_metadata import resolve_scan_metadata
 from saneless.scanner.base import SourceKind, classify_source
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
@@ -1712,32 +1713,32 @@ def start_scan(
     if choice.multi_page and _is_manual_duplex(found):
         raise RequestRejected(RequestRejection.MULTI_PAGE_MANUAL_DUPLEX)
     title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
-    # Hiding a control changes the form, never the scan: with
-    # ``[web] show_tags`` or ``show_correspondent`` off, the submit carries
-    # nothing for that field and the profile's own default is what applies, exactly as a
-    # blank title already falls back to the profile's title on the line above.
-    # An operator who turns a control off gets the profile's answer rather than
-    # none at all, and the CLI, which has always applied these defaults, stops
-    # being the odd one out.
+    # The form shows the profile's default tags and correspondent already
+    # chosen, so a submit from a shown control is the operator's whole answer:
+    # the defaults when nobody touched it, none when every box was unticked.
+    # A control ``[web] show_tags`` or ``show_correspondent`` hides was never
+    # answered, and the profile's default applies, exactly as a blank title
+    # falls back to the profile's title on the line above.  One policy decides
+    # both, the same one ``saneless scan`` uses, so the same profile files the
+    # same metadata from either surface.
     #
     # The gate is the config key and never the submitted value, because the
-    # submitted value cannot carry the distinction this needs: an empty tag
-    # list and an absent correspondent arrive here identically whether the
-    # control was never rendered or was rendered and the user cleared it.  Only
-    # the setting that decided which page was served knows which happened.
-    # Reading the value instead took away an ability the appliance had -- the
-    # web path once applied no profile defaults at all, so
-    # ``tags or found.default_tags`` silently re-tagged a submit from somebody
-    # who had deliberately unticked every box.  With the control on the page
-    # the submit is now the whole answer, cleared list included; with it off
-    # the submit's value for that field is meaningless, which is why the
-    # assignment inside each gate is unconditional rather than a fallback.
-    if not state.settings.web.show_tags:
-        tags = found.default_tags
-    if not state.settings.web.show_correspondent:
-        correspondent = found.default_correspondent
+    # value cannot carry the distinction: an empty tag list and an absent
+    # correspondent arrive identically whether the control was never rendered
+    # or was rendered and cleared.  Only the setting that decided which page
+    # was served knows which happened, and with the control hidden the
+    # submitted value for that field is ignored rather than merged.
+    metadata = resolve_scan_metadata(
+        found,
+        tags=tags if state.settings.web.show_tags else None,
+        correspondent=correspondent,
+        correspondent_given=state.settings.web.show_correspondent,
+    )
     form = _ScanForm(
-        profile=choice.profile, title=title, tags=tags, correspondent=correspondent
+        profile=choice.profile,
+        title=title,
+        tags=list(metadata.tags),
+        correspondent=metadata.correspondent,
     )
 
     # The route guard is the enforcement and the disabled Scan button is
