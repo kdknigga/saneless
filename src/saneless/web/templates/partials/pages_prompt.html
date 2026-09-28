@@ -8,7 +8,9 @@
    every second while the job waits, and htmx puts keyboard focus back after a
    swap only on an element with the same id, so without these a keyboard user
    would lose their place once a second.  Only one question renders at a time,
-   so each id is unique on the page.
+   so each id is unique on the page.  Scan next's id is keyed on the question,
+   not the job row: the row can lag the open question when a progress write
+   fails, and the buttons are the question's.
 
    The button row is a plain wrapping flex row, not Pico's button group: that
    is a joined row that never wraps, and four buttons overflow a narrow phone.
@@ -34,7 +36,7 @@
    again on every poll.  Nothing here is marked busy either: the job is waiting
    for a person. #}
 {% set button_ids = {
-  "NEXT": "mp-retry" if job.state == JobState.AWAITING_RETRY else "mp-next",
+  "NEXT": "mp-retry" if pass_prompt.wait == "RETRY" else "mp-next",
   "FINISH": "mp-finish",
   "RESCAN": "mp-rescan",
   "ABORT": "mp-abort",

@@ -789,6 +789,27 @@ class TestThePromptTheOwnerSees:
         assert "mp-rescan" not in area
         assert "<details" not in area
 
+    def test_the_retry_button_id_follows_the_question_not_the_row(
+        self, served: _Served, stager: _Stager
+    ) -> None:
+        """
+        A row that lags the open question still gives Scan again its own id.
+
+        A waiting-state write the worker could not make leaves the row on the
+        previous question.  The buttons are the open question's, so their ids
+        must be too, or keyboard focus is lost across the next swap.
+        """
+        waiting = stager.prompt(_retry(_DEVICE_ERROR))
+        served.job_store.update_state(waiting.job_id, JobState.AWAITING_NEXT_PASS)
+
+        area = _status_area(_status(served))
+
+        assert [_button_id(attrs) for attrs, _ in _buttons(area)] == [
+            "mp-retry",
+            "mp-finish",
+            "mp-abort",
+        ]
+
     @pytest.mark.parametrize("state", sorted(PASS_WAIT_STATES))
     def test_an_owner_before_the_prompt_opens_sees_the_waiting_line(
         self, served: _Served, stager: _Stager, state: JobState
