@@ -2735,10 +2735,9 @@ class _Configured:
     Attributes:
         resolution: The resolution the device reports after the assignment,
             in whole dpi; it may not be the one requested.
-        options: The option list read after the source was assigned, or the
-            list the caller passed in when no source was assigned. A source
-            change reloads the device's option descriptors, so this is the
-            list that describes the source actually selected, and every later
+        options: The option list read after the mode was assigned. A source
+            or mode change reloads the device's option descriptors, so this is
+            the list that describes the device as configured, and every later
             decision about the device's options is made from it.
 
     """
@@ -2898,20 +2897,21 @@ def _configure_device(
     telling it *how* removes that whole class of failure.  The paper size is
     applied afterwards, by ``_apply_paper_size`` in the caller.
 
-    The order is source, adf-mode, mode, depth, resolution. After the source,
-    the option list is read again, once: the reload may have changed which
-    options the device offers and what they accept, and the list read before
-    the source was set describes a source no longer selected. ``adf-mode`` and
-    ``depth`` are decided from the re-read list, and so is everything the
-    caller decides after this returns, which is why the list is handed back.
+    The order is source, adf-mode, mode, depth, resolution. The option list
+    is read again after the source and again after the mode, because both
+    assignments reload the descriptors: the reload may change which options
+    the device offers, whether they are active, and what they accept.
+    ``adf-mode`` is decided from the list read after the source. ``depth`` is
+    decided from the list read after the mode, and so is everything the caller
+    decides after this returns, which is why that list is handed back.
 
     ``adf-mode`` is how some scanners choose between one side and both sides
     of a fed sheet; ``_set_adf_mode`` decides it, straight after the source
     whose reload is what makes it active.
 
     ``depth`` is set to 8 when the device offers 8, after ``mode`` (which can
-    change what ``depth`` accepts) and before ``resolution``. It is set
-    silently: saneless's pages are 8-bit whatever the device scans at, and
+    change what ``depth`` accepts, or switch it off, as epson2 does in its
+    1-bit modes) and before ``resolution``. It is set silently: saneless's pages are 8-bit whatever the device scans at, and
     python-sane cannot read a 16-bit frame correctly, so nothing the operator
     chose is lost.
 
@@ -2928,13 +2928,13 @@ def _configure_device(
         choice: The source ``_resolve_source`` chose. Its name is assigned
             only when the device exposes a ``source`` option at all.
         options: The option list the caller read before resolving the source.
-            It stands when no source is assigned, since nothing reloads it.
+            It stands for ``adf-mode`` when no source is assigned.
         device_id: The SANE device name, for the error messages.
 
     Returns:
         The resolution the device actually reports, as an ``int`` (the device
         returns a float; callers downstream want whole dpi), and the option
-        list that describes the selected source.
+        list read after the mode, which describes the configured device.
 
     Raises:
         ScanError: If the device refuses an assignment, if the option list
@@ -2947,6 +2947,9 @@ def _configure_device(
         options = _read_options(dev, device_id)
     _set_adf_mode(dev, settings, choice, options=options, device_id=device_id)
     _assign(dev, "mode", settings.mode, device_id)
+    # A mode change reloads the descriptors too: a 1-bit mode can switch
+    # ``depth`` off, or change what it accepts.
+    options = _read_options(dev, device_id)
     depth = _eight_bit_depth(options)
     if depth is not None:
         _assign(dev, "depth", depth, device_id)
@@ -3789,10 +3792,10 @@ class SaneBackend(ScannerBackend):
         _refuse_if_wedged(device_id, "scan from")
         with self._open_device(device_id) as dev:
             # Read once here to match the source against.  Assigning the
-            # source reloads the device's option descriptors, so
-            # _configure_device reads the list once more after it and hands
-            # that list back; everything decided after the source is set is
-            # decided from the list for the source actually selected.
+            # source or the mode reloads the device's option descriptors, so
+            # _configure_device reads the list again after each and hands the
+            # last one back; everything decided after configuration is
+            # decided from the list for the device as configured.
             raw_options = _read_options(dev, device_id)
 
             # Match the requested source against the device's list, or

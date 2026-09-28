@@ -1018,6 +1018,31 @@ class TestTheDoubleItself:
         assert getattr(dev, _DEPTH) == 16
         assert dev.get_parameters()[3] == 16
 
+    def test_a_mode_can_switch_depth_off_and_on_again(self) -> None:
+        """
+        ``deactivate_depth_in_modes`` makes ``depth`` follow each ``mode`` set.
+
+        In a listed mode the option is reported inactive and an assignment is
+        refused as inactive; in any other mode it is active again.
+        """
+        dev = FakeSaneDev()
+        dev.offer_depth()
+        dev.deactivate_depth_in_modes(("Lineart",))
+
+        dev.mode = "Lineart"
+
+        option = {opt[1]: opt for opt in dev.get_options()}["depth"]
+        assert option[7] & 32
+        with pytest.raises(AttributeError, match="Inactive option: depth"):
+            setattr(dev, _DEPTH, 8)
+
+        dev.mode = "Color"
+
+        option = {opt[1]: opt for opt in dev.get_options()}["depth"]
+        assert not option[7] & 32
+        setattr(dev, _DEPTH, 8)
+        assert getattr(dev, _DEPTH) == 8
+
     def test_set_parameters_overrides_what_is_reported(self) -> None:
         """
         A knob reports a 16-bit or very large frame without building one.

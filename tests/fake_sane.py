@@ -1095,6 +1095,7 @@ class FakeSaneDev:
     _read_errors: dict[str, BaseException]
     _parameter_overrides: dict[str, int | str]
     _adf_mode_activates: bool
+    _depth_inactive_modes: frozenset[str]
 
     def __init__(
         self,
@@ -1143,6 +1144,7 @@ class FakeSaneDev:
         state["_read_errors"] = {}
         state["_parameter_overrides"] = {}
         state["_adf_mode_activates"] = False
+        state["_depth_inactive_modes"] = frozenset()
         state["calls"] = []
         state["assignments"] = []
         state["cancel_calls"] = 0
@@ -1197,6 +1199,8 @@ class FakeSaneDev:
         self.__dict__["assignments"].append(key)
         if key == "source":
             self._reload_for_source(str(value))
+        elif key == "mode":
+            self._follow_mode_with_depth()
 
     def narrow_resolution_for_source(
         self, source: str, constraint: tuple[float, float, float]
@@ -1532,6 +1536,49 @@ class FakeSaneDev:
         self.__dict__["opt"]["depth"] = option
         if values:
             self.__dict__["_values"]["depth"] = values[0]
+
+    def deactivate_depth_in_modes(self, modes: tuple[str, ...] = ("Lineart",)) -> None:
+        """
+        Make ``depth`` inactive while one of ``modes`` is selected.
+
+        Modelled on epson2, which switches ``depth`` off for its 1-bit modes.
+        A mode change reloads every option descriptor (``sane.py:188-213``),
+        so after ``mode = "Lineart"`` the device refuses a ``depth``
+        assignment as inactive even though a list read before the mode was
+        set reported it active.  Each ``mode`` assignment makes ``depth``
+        inactive for a listed mode, compared against the spelling stored, and
+        active for any other; its activity also starts out following the mode
+        currently stored.  Call it after ``offer_depth``: a table without
+        ``depth`` is left alone.
+
+        Args:
+            modes: The modes, in the device's spelling, that switch ``depth``
+                off.
+
+        """
+        self.__dict__["_depth_inactive_modes"] = frozenset(modes)
+        self._follow_mode_with_depth()
+
+    def _follow_mode_with_depth(self) -> None:
+        """
+        Make ``depth`` inactive in the armed modes and active in any other.
+
+        Does nothing until ``deactivate_depth_in_modes`` has armed some modes,
+        so a table built with an inactive ``depth`` keeps it inactive.
+
+        """
+        modes = self.__dict__["_depth_inactive_modes"]
+        if not modes:
+            return
+        mode = self.__dict__["_values"].get("mode")
+        cap = _CAP_INACTIVE_OPTION if mode in modes else _CAP_SETTABLE
+        options = self.__dict__["_options"]
+        for index, option in enumerate(options):
+            if option[1] == "depth":
+                reloaded = (*option[:7], cap, option[8])
+                options[index] = reloaded
+                self.__dict__["opt"]["depth"] = reloaded
+                break
 
     def offer_page_size_options(
         self,

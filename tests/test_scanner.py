@@ -5941,6 +5941,47 @@ class TestSixteenBitDepth:
         assert dev.assignments == ["source", "mode", "resolution"]
         assert len(batch.pages) == 1
 
+    def test_a_depth_the_mode_switches_off_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        A ``depth`` that goes inactive when ``Lineart`` is set is not written.
+
+        epson2 switches ``depth`` off for its 1-bit modes. The list read after
+        the source still reports it active and offering 8, but the mode change
+        reloads the descriptors, so writing 8 then would fail the scan before
+        any page. The decision has to come from the list read after ``mode``.
+        """
+        dev = FakeSaneDev(pages=1)
+        dev.offer_depth()
+        dev.deactivate_depth_in_modes(("Lineart",))
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Lineart")
+
+        batch = _backend_with(dev, monkeypatch).scan_pages(
+            _TEST_DEVICE, settings, page_sink
+        )
+
+        assert dev.assignments == ["source", "mode", "resolution"]
+        assert len(batch.pages) == 1
+
+    def test_a_depth_the_mode_leaves_on_is_still_set_to_eight(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        The same device in ``Color`` keeps ``depth`` active, and it is set to 8.
+
+        Deciding from the list read after ``mode`` must not lose the depth on a
+        mode that leaves it on.
+        """
+        dev = FakeSaneDev(pages=1)
+        dev.offer_depth()
+        dev.deactivate_depth_in_modes(("Lineart",))
+
+        self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.assignments == ["source", "mode", "depth", "resolution"]
+        assert getattr(dev, _DEPTH) == 8
+
     def test_a_device_offering_only_sixteen_is_refused_before_start(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
@@ -6017,21 +6058,22 @@ class TestSixteenBitDepth:
         assert _TEST_DEVICE in str(excinfo.value)
         assert "I/O error" in str(excinfo.value)
 
-    def test_the_options_are_read_again_after_the_source_is_set(
+    def test_the_options_are_read_again_after_the_source_and_the_mode(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """
-        A source change reloads the option descriptors, so they are read twice.
+        A source or mode change reloads the descriptors, so they are read thrice.
 
-        Once to match the source, and once after assigning it, so that depth
-        -- and anything else that depends on the source -- is decided from
-        the list the device reports for the source actually selected.
+        Once to match the source, once after assigning it so that ``adf-mode``
+        is decided for the source actually selected, and once after ``mode``
+        so that ``depth`` -- and everything decided after configuration -- is
+        decided from the list that describes the configured device.
         """
         dev = FakeSaneDev(pages=1)
 
         self._scan(dev, monkeypatch, page_sink)
 
-        assert dev.get_options_calls == 2
+        assert dev.get_options_calls == 3
 
     def test_depth_is_decided_from_the_list_read_after_the_source(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
