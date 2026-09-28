@@ -275,24 +275,21 @@ class ScanBatch:
     """
     The pages one acquisition produced, and what the device actually did.
 
-    Three fields, and the per-page structure is now ``pages`` itself: the
-    ordered page records are that design, and every
-    per-page fact -- which file a sheet landed in, what was measured about it,
-    where it sat in the pass -- belongs on ``PageRecord`` rather than here.
-    What survives at batch level is exactly the two things the device reports
-    about the pass as a whole, so this stays the one channel carrying
-    ``actual_resolution`` and ``pages_rejected`` alongside the records and
-    there is no second route out of the backend. Do not extend this casually:
-    a fact that is per-page belongs on the record. It deliberately carries no
-    geometry either, because a scan area the device clamped falls back to the
-    existing crop rather than being reported back out.
+    Four fields, and the per-page structure is ``pages`` itself: the ordered
+    page records are that design, and every per-page fact -- which file a
+    sheet landed in, what was measured about it, where it sat in the pass --
+    belongs on ``PageRecord`` rather than here. What survives at batch level
+    is what the backend knows about the pass as a whole: the two things the
+    device reports (``actual_resolution`` and ``pages_rejected``) and one
+    thing its own source resolution produced (``substituted_source``). This
+    is the one channel carrying them alongside the records, and there is no
+    second route out of the backend. Do not extend this casually: a fact that
+    is per-page belongs on the record. It deliberately carries no geometry
+    either, because a scan area the device clamped falls back to the existing
+    crop rather than being reported back out.
 
-    ``frozen=True`` is a departure from the plain ``@dataclass`` used by
-    ``DeviceInfo``, ``DeviceCapabilities``, ``ScanSettings`` and
-    ``pipeline.ScanResult``. There is no frozen precedent in this codebase, so
-    the choice is stated rather than inherited: this is a report of what a
-    device has already done, and nothing downstream has any business rewriting
-    it afterwards.
+    ``frozen=True`` because this is a report of what a device has already
+    done, and nothing downstream has any business rewriting it afterwards.
 
     Attributes:
         pages: The page records the sink produced, in document order. The
@@ -311,12 +308,19 @@ class ScanBatch:
             removal count: that one is empty-page detection and is rendered to
             users as pages removed for being blank, so reporting a sheet the
             device could not read through it would be a new small lie.
+        substituted_source: The source the profile asked for, when the device
+            offered no such source and its ``Auto`` source was used in its
+            place *and* ``auto_source_mode`` sent that ``Auto`` through the
+            document feeder. None otherwise, including when ``Auto`` stood in
+            for a flatbed and scanned the glass as asked: nothing was lost
+            then, so there is nothing for the job to report.
 
     """
 
     pages: tuple[PageRecord, ...]
     actual_resolution: int
     pages_rejected: int
+    substituted_source: str | None = None
 
 
 @dataclass(frozen=True)

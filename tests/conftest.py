@@ -682,6 +682,7 @@ def scan_batch(
     *,
     resolution: int = 300,
     rejected: int = 0,
+    substituted_source: str | None = None,
 ) -> ScanBatch:
     """
     Build a ScanBatch for a stubbed scanner.
@@ -697,21 +698,27 @@ def scan_batch(
     and the records come back from there, so the spooled files behind them
     actually exist.
 
-    The two extra facts default to "nothing surprising happened": the device
-    honoured the resolution it was asked for and rejected no sheets. A test that
-    cares about either passes it explicitly.
+    The extra facts default to "nothing surprising happened": the device
+    honoured the resolution it was asked for, rejected no sheets, and scanned
+    from the source the profile named. A test that cares about any of them
+    passes it explicitly.
 
     Args:
         pages: The records the stubbed scan produced, in document order.
         resolution: The resolution the device reports having actually used.
         rejected: How many fed sheets failed their integrity checks.
+        substituted_source: The requested source the device's Auto stood in
+            for on the feeder path, or None.
 
     Returns:
-        A ScanBatch carrying those records and both facts.
+        A ScanBatch carrying those records and every fact.
 
     """
     return ScanBatch(
-        pages=tuple(pages), actual_resolution=resolution, pages_rejected=rejected
+        pages=tuple(pages),
+        actual_resolution=resolution,
+        pages_rejected=rejected,
+        substituted_source=substituted_source,
     )
 
 
@@ -720,6 +727,7 @@ def spooling(
     *,
     resolution: int = 300,
     rejected: int = 0,
+    substituted_source: str | None = None,
 ) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
     """
     Build the ``side_effect`` a stubbed ``scan_pages`` needs (D-01).
@@ -741,6 +749,8 @@ def spooling(
         pages: The pages the stubbed scan hands to the sink, in order.
         resolution: The resolution the device reports having actually used.
         rejected: How many fed sheets failed their integrity checks.
+        substituted_source: The requested source the device's Auto stood in
+            for on the feeder path, or None.
 
     Returns:
         One callable with ``scan_pages``' own ``(device_id, settings, sink)``
@@ -753,7 +763,12 @@ def spooling(
     ) -> ScanBatch:
         """Spool every page into the sink the caller supplied."""
         records = [sink.add(page, dpi=resolution) for page in pages]
-        return scan_batch(records, resolution=resolution, rejected=rejected)
+        return scan_batch(
+            records,
+            resolution=resolution,
+            rejected=rejected,
+            substituted_source=substituted_source,
+        )
 
     return _spool_pages
 

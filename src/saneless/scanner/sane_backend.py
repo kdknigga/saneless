@@ -71,6 +71,7 @@ from saneless.scanner.net_hosts import (
     exported_sane_net_hosts,
 )
 from saneless.text_safety import neutralise_controls
+from saneless.vocabulary import ambiguous_source_error, source_not_offered_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -419,6 +420,79 @@ def _constraint(raw_options: list[tuple], name: str) -> _OptionConstraint:
                 present=True, values=None, span=_as_span(constraint)
             )
     return _OptionConstraint(present=False, values=None, span=None)
+
+
+@dataclass(frozen=True)
+class _SourceChoice:
+    """
+    Which source to assign, and what resolving it found out along the way.
+
+    A record rather than a tuple partly because ``_configure_device`` takes it
+    whole: passing its fields one by one would put that function over ruff's
+    five-parameter limit. It also keeps the three facts from being confused
+    with each other at the one call site that unpacks them.
+
+    Attributes:
+        effective: The name to assign to the device: the device's own
+            spelling of a matched entry, the device's ``Auto`` entry standing
+            in for a flatbed, the trimmed request when the device's list
+            cannot be read, or the request as given when the device has no
+            source option at all.
+        has_option: Whether the device reports a ``source`` option. It is a
+            different fact from whether its constraint could be read; see
+            :class:`_OptionConstraint`.
+        substituted_from: The source the profile asked for when the device's
+            ``Auto`` entry was chosen in its place, otherwise None. Whether
+            that substitution matters depends on routing, which is decided
+            later, so this only records that it happened.
+
+    """
+
+    effective: str
+    has_option: bool
+    substituted_from: str | None
+
+
+def _match_source(available: list[str], requested: str) -> str | None:
+    """
+    Find the device's entry a profile's source names, ignoring case and padding.
+
+    An entry equal to ``requested`` wins outright. Otherwise the entries are
+    compared with surrounding whitespace removed and case folded on both
+    sides, and a single such match is returned in the device's spelling:
+    libsane strips nothing, so the name assigned has to be the one it listed.
+
+    Nothing is matched by prefix, although libsane itself would take a unique
+    prefix: ``"ADF"`` is a prefix of ``"ADF Duplex"`` as well, and a request
+    that names neither exactly is a guess saneless will not make on the
+    operator's behalf. For the same reason, two entries that differ only in
+    case refuse rather than one being picked.
+
+    Args:
+        available: The source names the device reports, in its order.
+        requested: The source the profile asked for.
+
+    Returns:
+        The device's entry, or None if no entry matches.
+
+    Raises:
+        ScanError: If more than one entry matches once case and surrounding
+            whitespace are ignored.
+
+    """
+    if requested in available:
+        return requested
+    folded = requested.strip().casefold()
+    matches = [entry for entry in available if entry.strip().casefold() == folded]
+    if len(matches) > 1:
+        # The entries are device-supplied text, and this message reaches the
+        # terminal, the log and the job's error as it is built.
+        ambiguous_msg = ambiguous_source_error(
+            neutralise_controls(requested),
+            [neutralise_controls(entry) for entry in matches],
+        )
+        raise ScanError(ambiguous_msg)
+    return matches[0] if matches else None
 
 
 class GeometryUnit(IntEnum):
@@ -1866,7 +1940,10 @@ def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
 
     The operator's ``requested`` source wins when the device reports it and it
     is a single-sided feeder, so someone who deliberately chose one of two
-    feeders gets that one. Otherwise the first reported single-sided feeder is
+    feeders gets that one. "Reports it" means what it means for every other
+    source: ``_match_source`` ignores case and surrounding whitespace and
+    returns the device's spelling, so ``"adf"`` picks a listed ``"ADF"``
+    rather than merely the first feeder. Otherwise the first reported single-sided feeder is
     used -- read from the device, never guessed. Hardcoding the short feeder
     name was declined: consumer feeders report ``"Automatic Document
     Feeder"``, and a name the device does not list would fail on exactly the
@@ -1901,24 +1978,26 @@ def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
         The single-sided feeder source name to assign to the device.
 
     Raises:
-        ScanError: If every feeder the device reports scans both sides, or
-            if the device reports no source that feeds.
+        ScanError: If every feeder the device reports scans both sides, if
+            the device reports no source that feeds, or if ``requested``
+            matches several of the device's sources.
 
     """
     kinds = {source: classify_source(source) for source in available_sources}
-    if kinds.get(requested) is SourceKind.FEEDER:
-        return requested
+    named = _match_source(available_sources, requested)
+    if named is not None and kinds[named] is SourceKind.FEEDER:
+        return named
     feeder = next(
         (source for source, kind in kinds.items() if kind is SourceKind.FEEDER),
         None,
     )
     if feeder is not None:
-        if kinds.get(requested) is SourceKind.FEEDER_DUPLEX:
+        if named is not None and kinds[named] is SourceKind.FEEDER_DUPLEX:
             logger.warning(
                 "Source %r scans both sides of each sheet, so a manual duplex "
                 "pass through it would return every page twice; using the "
                 "single-sided feeder %r instead",
-                requested,
+                named,
                 feeder,
             )
         return feeder
@@ -1939,25 +2018,33 @@ def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
 
 def _resolve_source(
     raw_options: list[tuple], requested: str, *, resolve_feeder: bool = False
-) -> tuple[str, bool]:
+) -> _SourceChoice:
     """
-    Decide which source name to use, and whether the device has the option.
+    Decide which source name to assign, or refuse before anything is scanned.
 
-    The two return values answer genuinely different questions and both are
-    load-bearing.  ``has_source_option`` records the *presence* of a ``source``
-    option, independently of whether its constraint is a list: a device may
-    expose ``source`` with a constraint this code cannot read, and it must
-    still be assigned.  A helper returning only the parsed constraint would
-    collapse the two and silently stop setting the source on such a device.
+    Whether the device *has* a ``source`` option is recorded independently of
+    whether its constraint is a list: a device may expose ``source`` with a
+    constraint this code cannot read, and it must still be assigned. The
+    requested name is then handed over with its surrounding whitespace
+    removed, and the device accepts or refuses it itself.
 
-    The ``Auto`` substitution is a WARNING rather than an INFO because it can
-    change how many pages come back.  ``scan_pages`` classifies the *effective*
-    source, so once this returns ``"Auto"`` the routing is decided by the
-    profile's ``auto_source_mode``, which defaults to ``"flatbed"``: a profile
-    asking for ``"ADF Duplex"`` on a device offering only ``Flatbed`` and
-    ``Auto`` quietly returns one page from a whole stack.  The comparable
-    resolution substitution is already logged as a WARNING, and a substitution
-    that silently drops pages cannot be the quieter of the two.
+    When the list can be read, the request is matched against it by
+    ``_match_source``: exactly, or ignoring case and surrounding whitespace,
+    and never by prefix. The device's own spelling is what gets assigned.
+
+    A request that matches nothing is refused here, before any ``start()``,
+    naming the sources the device offers -- with one exception. A request the
+    classifier calls a flatbed may use the device's ``Auto`` source instead,
+    because some scanners reach their glass only through ``Auto`` (they list
+    ``Auto`` and a feeder, and no ``Flatbed``). Any other request is never
+    swapped for ``Auto``: ``Auto`` is routed by ``auto_source_mode``, which
+    defaults to the flatbed, so a feeder request swapped for it would bring a
+    whole stack back as one page.
+
+    The substitution is recorded on the returned choice rather than logged
+    here. Whether it matters depends on whether ``auto_source_mode`` then
+    sends ``Auto`` through the feeder, and that is only decided once routing
+    is, in ``scan_pages``.
 
     Args:
         raw_options: The device's option tuples, as ``get_options()`` returns
@@ -1965,21 +2052,22 @@ def _resolve_source(
         requested: The source name the caller asked for.
         resolve_feeder: Manual duplex. Resolve a feeder from the device's own
             list via ``_resolve_feeder_source`` instead of validating
-            ``requested`` verbatim.
+            ``requested`` alone.
 
     Returns:
-        A ``(effective_source, has_source_option)`` pair.
+        The source to assign, whether the device has a source option, and the
+        requested name if the device's ``Auto`` was chosen in its place.
 
     Raises:
-        ScanError: If the device exposes a source list that contains neither
-            the requested name nor ``"Auto"`` to fall back to. For manual
+        ScanError: If the device lists its sources and none matches the
+            request, unless the request is a flatbed and the device offers
+            ``Auto``; or if the request matches several of them. For manual
             duplex: if the device has no source option and ``requested`` does
             not name a feeder, if every feeder it reports scans both sides, or
             if it reports no source that feeds.
 
     """
     reported = _constraint(raw_options, "source")
-    has_source_option = reported.present
     available_sources = [str(s) for s in reported.values or []]
 
     # A disjoint early branch, not a guard inside the flow below: returning
@@ -1992,43 +2080,49 @@ def _resolve_source(
     # configured name for such a device, and manual duplex does the same,
     # which keeps a legacy "Manual Duplex" profile working there.
     if resolve_feeder:
-        if not has_source_option:
+        if not reported.present:
             if classify_source(requested).uses_feeder:
-                return requested, False
+                return _SourceChoice(requested, has_option=False, substituted_from=None)
             msg = (
                 "Manual duplex needs a feeder source, and this device "
                 "exposes no source option to choose one; set source to the "
                 f"name of its feeder (got {requested!r})"
             )
             raise ScanError(msg)
-        return _resolve_feeder_source(available_sources, requested), True
+        feeder = _resolve_feeder_source(available_sources, requested)
+        return _SourceChoice(feeder, has_option=True, substituted_from=None)
 
-    effective_source = requested
-    if has_source_option and effective_source not in available_sources:
-        if "Auto" in available_sources:
-            logger.warning(
-                "Source '%s' not available; falling back to 'Auto', whose "
-                "routing is decided by the profile's auto_source_mode and may "
-                "not be multi-page -- a whole stack can come back as one page",
-                effective_source,
-            )
-            effective_source = "Auto"
-        else:
-            msg = (
-                f"Device does not support source '{effective_source}'. "
-                f"Available: {available_sources}"
-            )
-            raise ScanError(msg)
+    if not reported.present:
+        return _SourceChoice(requested, has_option=False, substituted_from=None)
+    if reported.values is None:
+        return _SourceChoice(requested.strip(), has_option=True, substituted_from=None)
 
-    return effective_source, has_source_option
+    matched = _match_source(available_sources, requested)
+    if matched is not None:
+        return _SourceChoice(matched, has_option=True, substituted_from=None)
+
+    if classify_source(requested) is SourceKind.FLATBED:
+        auto = next(
+            (s for s in available_sources if classify_source(s) is SourceKind.AUTO),
+            None,
+        )
+        if auto is not None:
+            return _SourceChoice(auto, has_option=True, substituted_from=requested)
+
+    # The names are device-supplied text, and this message reaches the
+    # terminal, the log and the job's error as it is built.
+    not_offered_msg = source_not_offered_error(
+        neutralise_controls(requested),
+        [neutralise_controls(source) for source in available_sources],
+    )
+    raise ScanError(not_offered_msg)
 
 
 def _configure_device(
     dev: SaneDevice,
     settings: ScanSettings,
-    effective_source: str,
+    choice: _SourceChoice,
     *,
-    has_source_option: bool,
     device_id: str,
 ) -> int:
     """
@@ -2052,10 +2146,8 @@ def _configure_device(
     Args:
         dev: Open SANE device handle.
         settings: The requested scan settings.
-        effective_source: The source name resolved by ``_resolve_source``.
-        has_source_option: Whether the device exposes a ``source`` option at
-            all.  Keyword-only, because a positional boolean is not allowed by
-            this project's lint rules.
+        choice: The source ``_resolve_source`` chose. Its name is assigned
+            only when the device exposes a ``source`` option at all.
         device_id: The SANE device name, for the error messages.
 
     Returns:
@@ -2073,8 +2165,8 @@ def _configure_device(
     # One try per assignment, in order, so the message names the option that
     # failed.  The order itself is the load-bearing part described above.
     assignments: list[tuple[str, str | int]] = []
-    if has_source_option:
-        assignments.append(("source", effective_source))
+    if choice.has_option:
+        assignments.append(("source", choice.effective))
     assignments.append(("mode", settings.mode))
     assignments.append(("resolution", settings.resolution))
     for name, value in assignments:
@@ -2102,6 +2194,65 @@ def _configure_device(
             actual_resolution,
         )
     return actual_resolution
+
+
+def _route(choice: _SourceChoice, settings: ScanSettings) -> bool:
+    """
+    Decide whether this pass reads from the document feeder.
+
+    The *effective* source is classified, by ``classify_source`` and nothing
+    else. An ``Auto`` source says nothing about what is actually loaded, so
+    the operator's ``auto_source_mode`` decides for it. That decision stays
+    config-driven; only the *recognition* of an ``Auto`` source belongs to the
+    classifier, which also recognises a device's lowercase ``auto`` -- an
+    equality test against the one spelling ``Auto`` used to miss it, so
+    ``auto_source_mode = "adf"`` was silently ignored and a whole stack came
+    back as one page.
+
+    This is also where an ``Auto`` that stood in for a flatbed request is
+    reported, because only here is it known whether the substitution changed
+    anything. Sent through the feeder, the operator asked for the glass and
+    got a stack, which is a WARNING (and a fact on the batch, set by the
+    caller). Left on the glass, the scan did what was asked, so it is INFO:
+    it is the everyday case of the default profile on a scanner that lists
+    only ``Auto`` and a feeder, and a warning there would be noise.
+
+    Args:
+        choice: The source ``_resolve_source`` chose.
+        settings: The requested scan settings, for ``auto_source_mode``.
+
+    Returns:
+        True if the pass reads from the feeder.
+
+    """
+    source_kind = classify_source(choice.effective)
+    use_adf = source_kind.uses_feeder
+    if source_kind is SourceKind.AUTO:
+        use_adf = settings.auto_source_mode == "adf"
+        logger.info(
+            "Auto source routing: auto_source_mode='%s', use_adf=%s",
+            settings.auto_source_mode,
+            use_adf,
+        )
+    if choice.substituted_from is not None:
+        if use_adf:
+            logger.warning(
+                "Source %r is not offered, so the scanner's %r source was used "
+                "instead, and auto_source_mode=%r sends it through the document "
+                "feeder",
+                choice.substituted_from,
+                choice.effective,
+                settings.auto_source_mode,
+            )
+        else:
+            logger.info(
+                "Source %r is not offered, so the scanner's %r source was used "
+                "instead; auto_source_mode=%r keeps it on the glass",
+                choice.substituted_from,
+                choice.effective,
+                settings.auto_source_mode,
+            )
+    return use_adf
 
 
 def _read_options(dev: SaneDevice, device_id: str) -> list:
@@ -2711,9 +2862,9 @@ class SaneBackend(ScannerBackend):
         """
         Acquire pages from scanner, handing each one to the sink.
 
-        Opens the device, validates the requested source against
-        available options, sets scan parameters, and returns the finished
-        batch. Uses multi_scan() for ADF sources, snap() for flatbed.
+        Opens the device, matches the requested source against the ones it
+        offers (refusing before anything is started when none matches), sets
+        scan parameters, and returns the finished batch. Uses multi_scan() for ADF sources, snap() for flatbed.
         Does NOT pass a progress callback to snap(): python-sane does not
         validate callbacks, and a bad one segfaults the process.
 
@@ -2743,13 +2894,14 @@ class SaneBackend(ScannerBackend):
 
         Returns:
             A ScanBatch carrying the records the sink returned, the resolution
-            the device actually used, and how many fed sheets failed their
-            integrity checks.
+            the device actually used, how many fed sheets failed their
+            integrity checks, and the requested source when the device's
+            ``Auto`` stood in for it and fed.
 
         Raises:
             ScanError: If a previous read has not returned, in which case no
-                SANE call is made at all; if the device does not
-                support the requested source; if a page times out; if a
+                SANE call is made at all; if the requested source matches
+                none the device offers, or several; if a page times out; if a
                 flatbed scan returns a page that fails its integrity checks --
                 unlike a fed sheet, there is no next page to skip to -- or if
                 the sink could not take a page.
@@ -2764,8 +2916,9 @@ class SaneBackend(ScannerBackend):
             # trip for a list that cannot have changed in between.
             raw_options = _read_options(dev, device_id)
 
-            # Validate source option against device capabilities
-            effective_source, has_source_option = _resolve_source(
+            # Match the requested source against the device's list, or
+            # refuse here, before anything is started.
+            choice = _resolve_source(
                 raw_options,
                 settings.source,
                 resolve_feeder=settings.resolve_feeder_source,
@@ -2774,11 +2927,7 @@ class SaneBackend(ScannerBackend):
             # Set device options.  The return value is the resolution the
             # device actually chose, which may not be the one requested.
             actual_resolution = _configure_device(
-                dev,
-                settings,
-                effective_source,
-                has_source_option=has_source_option,
-                device_id=device_id,
+                dev, settings, choice, device_id=device_id
             )
 
             # Constrain the scan area to the paper size, if the device reports
@@ -2788,27 +2937,7 @@ class SaneBackend(ScannerBackend):
                 dev, settings.paper_size, raw_options, actual_resolution
             )
 
-            source_kind = classify_source(effective_source)
-            use_adf = source_kind.uses_feeder
-
-            # An Auto source says nothing about what is actually loaded, so the
-            # operator's auto_source_mode decides. That decision stays
-            # config-driven; only the *recognition* of an Auto source moved
-            # here, to the single classifier.
-            #
-            # The previous test compared the source string for equality against
-            # the one exact spelling ``Auto``, so it was case- and
-            # whitespace-sensitive: a device reporting its source as
-            # lowercase ``auto`` classifies as AUTO, so it took the single-page
-            # path and skipped this override entirely. auto_source_mode = "adf"
-            # was then silently ignored and a whole stack came back as one page.
-            if source_kind is SourceKind.AUTO:
-                use_adf = settings.auto_source_mode == "adf"
-                logger.info(
-                    "Auto source routing: auto_source_mode='%s', use_adf=%s",
-                    settings.auto_source_mode,
-                    use_adf,
-                )
+            use_adf = _route(choice, settings)
 
             # Built once here and handed down, so both acquisition paths crop
             # the same way and hand the sink the same read-back dpi, and
@@ -2835,8 +2964,11 @@ class SaneBackend(ScannerBackend):
 
         # Assembled inside the device context but returned outside it, so the
         # handle is released before the caller ever sees the batch.
+        # An Auto that stood in for a flatbed is only worth reporting when it
+        # fed: on the glass it scanned what was asked for.
         return ScanBatch(
             pages=tuple(records),
             actual_resolution=actual_resolution,
             pages_rejected=pages_rejected,
+            substituted_source=choice.substituted_from if use_adf else None,
         )

@@ -5310,20 +5310,29 @@ class TestScanBatch:
     them past it.
     """
 
-    def test_the_batch_carries_exactly_three_fields(self) -> None:
+    def test_the_batch_carries_exactly_four_fields(self) -> None:
         """
-        Three fields, in order, and the per-page detail lives in ``pages``.
+        Four fields, in order, and the per-page detail lives in ``pages``.
 
         The object is still deliberately minimal.  HARD-01's ordered per-page
         record design landed as ``pages: tuple[PageRecord, ...]`` rather than as
         extra fields here, so anything measured about one page belongs on that
-        record and a fourth field on the batch would be a second channel for it.
+        record.  The fourth field is about the pass as a whole -- the source
+        the device's Auto stood in for when it fed -- and so is not a second
+        channel for a per-page fact.
         """
         assert [field.name for field in dataclasses.fields(ScanBatch)] == [
             "pages",
             "actual_resolution",
             "pages_rejected",
+            "substituted_source",
         ]
+
+    def test_the_substitution_defaults_to_none(self) -> None:
+        """A batch built without the new fact reports no substitution."""
+        batch = ScanBatch(pages=(), actual_resolution=300, pages_rejected=0)
+
+        assert batch.substituted_source is None
 
     def test_the_batch_is_not_an_iterator(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink

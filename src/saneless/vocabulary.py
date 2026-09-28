@@ -79,6 +79,7 @@ __all__ = [
     "SubmitResult",
     "WorkerHealth",
     "abort_question",
+    "ambiguous_source_error",
     "blank_timeout_finish_warning",
     "busy_line",
     "cap_finish_warning",
@@ -110,6 +111,7 @@ __all__ = [
     "rejection_status_code",
     "removed_pages",
     "removed_pages_note",
+    "source_not_offered_error",
     "state_label",
     "timeout_finish_warning",
     "worker_health_detail",
@@ -1429,6 +1431,60 @@ def cap_finish_warning(pages_kept: int, cap: int) -> str:
         f"Finished at {pages_phrase(pages_kept)}: no new scan starts once a "
         f"document has {pages_phrase(cap)}. Scan any remaining pages as a new "
         "document."
+    )
+
+
+def source_not_offered_error(requested: str, available: Sequence[str]) -> str:
+    """
+    Return the refusal for a profile source the scanner does not offer.
+
+    Nothing has been scanned when this is raised, so the sentence only has to
+    say what was asked for, what the scanner offers instead, and what to
+    change. Every name is shown with ``repr`` so an empty or padded name is
+    visible. The caller neutralises device-supplied text before passing it in.
+
+    Args:
+        requested: The source the profile asked for.
+        available: The source names the scanner reports, in its order.
+
+    Returns:
+        The error sentence.
+
+    """
+    if not available:
+        return (
+            f"The scanner has no source named {requested!r}, and it lists no "
+            "sources to choose from."
+        )
+    offered = ", ".join(repr(name) for name in available)
+    return (
+        f"The scanner has no source named {requested!r}. It offers {offered}; "
+        "set the profile's source to one of those names."
+    )
+
+
+def ambiguous_source_error(requested: str, matches: Sequence[str]) -> str:
+    """
+    Return the refusal for a profile source that matches several scanner sources.
+
+    A scanner listing two names that differ only in case leaves no way to tell
+    which one a differently cased request meant, so saneless refuses rather
+    than guess. The caller neutralises device-supplied text before passing it
+    in.
+
+    Args:
+        requested: The source the profile asked for.
+        matches: Every scanner source the request matched.
+
+    Returns:
+        The error sentence.
+
+    """
+    listed = ", ".join(repr(name) for name in matches)
+    return (
+        f"The source {requested!r} matches more than one of the scanner's "
+        f"sources when case and surrounding spaces are ignored: {listed}. Set "
+        "the profile's source to one of those names exactly."
     )
 
 
