@@ -48,6 +48,8 @@ from saneless.vocabulary import (
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
+    UNCONFIRMED_FILING_LABEL,
+    UNCONFIRMED_SEND_LABEL,
     URL_UNSET_JOB_ERROR,
     WAITING_STATES,
     WARNED_UPLOAD_LABEL,
@@ -83,8 +85,10 @@ from saneless.vocabulary import (
     exit_code_for_outcome,
     exit_code_for_signal,
     flip_answer_label,
+    is_amber_category,
     job_label,
     job_state_for,
+    job_status_class,
     local_time,
     outcome_line,
     page_counts,
@@ -109,6 +113,14 @@ from saneless.vocabulary import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+
+
+# The two failures that may already be in paperless-ngx, written out here
+# rather than read from ``is_amber_category`` so the tests pin the set instead
+# of repeating whatever the function says.
+_AMBER_CATEGORIES = frozenset(
+    {ErrorCategory.UNCONFIRMED_SEND, ErrorCategory.UNCONFIRMED_FILING}
+)
 
 
 class TestJobStateMembers:
@@ -2341,6 +2353,136 @@ class TestJobLabel:
         bad = cast("JobState", "UNKNOWN")
         with pytest.raises(AssertionError):
             job_label(bad, None)
+
+    @pytest.mark.parametrize(
+        ("category", "label"),
+        [
+            (ErrorCategory.UNCONFIRMED_SEND, UNCONFIRMED_SEND_LABEL),
+            (ErrorCategory.UNCONFIRMED_FILING, UNCONFIRMED_FILING_LABEL),
+        ],
+    )
+    def test_job_label_amber_error_names_its_category(
+        self, category: ErrorCategory, label: str
+    ) -> None:
+        """A failure that may have reached paperless-ngx is never "Failed"."""
+        assert job_label(JobState.ERROR, None, category) == label
+
+    def test_job_label_amber_labels_pin_their_words(self) -> None:
+        """
+        The two amber labels read as the outcome, not as a failure.
+
+        Neither is wider than the widest state label, so the status column
+        of `saneless jobs` -- sized so a row fits 80 columns -- holds both.
+        """
+        assert UNCONFIRMED_SEND_LABEL == "May be in paperless-ngx"
+        assert UNCONFIRMED_FILING_LABEL == "Received, not confirmed"
+        widest_state = max(len(state_label(state)) for state in JobState)
+        assert len(UNCONFIRMED_SEND_LABEL) <= widest_state
+        assert len(UNCONFIRMED_FILING_LABEL) <= widest_state
+
+    @pytest.mark.parametrize(
+        "category", [c for c in ErrorCategory if c not in _AMBER_CATEGORIES]
+    )
+    def test_job_label_red_error_is_failed_not_amber(
+        self, category: ErrorCategory
+    ) -> None:
+        """Every other categorised failure keeps the "Failed" label."""
+        assert job_label(JobState.ERROR, None, category) == "Failed"
+
+    @pytest.mark.parametrize(
+        "state", [state for state in JobState if state is not JobState.ERROR]
+    )
+    @pytest.mark.parametrize("category", sorted(_AMBER_CATEGORIES))
+    def test_job_label_amber_category_only_speaks_for_an_error(
+        self, state: JobState, category: ErrorCategory
+    ) -> None:
+        """A category on a row that did not fail changes nothing about its label."""
+        assert job_label(state, "w", category) == job_label(state, "w")
+
+
+class TestIsAmberCategory:
+    """is_amber_category: which failures wear the amber look."""
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_amber_exactly_for_the_two_maybe_delivered_categories(
+        self, category: ErrorCategory
+    ) -> None:
+        """
+        Only a failure that may already be in paperless-ngx is amber.
+
+        Parametrised over the whole enum, so a new category is checked here
+        the moment it exists.
+        """
+        assert is_amber_category(category) is (category in _AMBER_CATEGORIES)
+
+    def test_amber_raises_on_unrecognised_value(self) -> None:
+        """A value outside ErrorCategory is refused, not silently red."""
+        bad = cast("ErrorCategory", "NOT_A_CATEGORY")
+        with pytest.raises(AssertionError):
+            is_amber_category(bad)
+
+
+class TestJobStatusClass:
+    """job_status_class: the one place a job row's colour is chosen."""
+
+    @pytest.mark.parametrize(
+        ("state", "warning", "category", "expected"),
+        [
+            (JobState.DONE, None, None, "status-done"),
+            (JobState.DONE, "", None, "status-done"),
+            (JobState.DONE, "w", None, "status-fallback"),
+            (JobState.DONE, None, ErrorCategory.UNCONFIRMED_SEND, "status-done"),
+            (JobState.FALLBACK, None, None, "status-fallback"),
+            (JobState.FALLBACK, "w", None, "status-fallback"),
+            (JobState.ERROR, None, ErrorCategory.UPLOAD, "status-error"),
+            (JobState.ERROR, None, ErrorCategory.UNCONFIRMED_SEND, "status-fallback"),
+            (
+                JobState.ERROR,
+                None,
+                ErrorCategory.UNCONFIRMED_FILING,
+                "status-fallback",
+            ),
+            (JobState.ERROR, None, None, "status-error"),
+            (JobState.ERROR, "w", ErrorCategory.SCANNER, "status-error"),
+            (JobState.CANCELLED, None, None, "status-cancelled"),
+            (
+                JobState.CANCELLED,
+                "w",
+                ErrorCategory.UNCONFIRMED_SEND,
+                "status-cancelled",
+            ),
+        ],
+    )
+    def test_terminal_rows_amber_red_green_or_grey(
+        self,
+        state: JobState,
+        warning: str | None,
+        category: ErrorCategory | None,
+        expected: str,
+    ) -> None:
+        """Each terminal row gets the class its outcome deserves."""
+        assert job_status_class(state, warning, category) == expected
+
+    @pytest.mark.parametrize(
+        "category", [c for c in ErrorCategory if c not in _AMBER_CATEGORIES]
+    )
+    def test_every_red_category_is_status_error(self, category: ErrorCategory) -> None:
+        """Only the two amber categories escape the red failure look."""
+        assert job_status_class(JobState.ERROR, None, category) == "status-error"
+
+    @pytest.mark.parametrize("state", sorted(ACTIVE_STATES))
+    @pytest.mark.parametrize("category", [None, ErrorCategory.UNCONFIRMED_SEND])
+    def test_active_rows_carry_no_status_class(
+        self, state: JobState, category: ErrorCategory | None
+    ) -> None:
+        """A job still in flight is not coloured at all."""
+        assert job_status_class(state, "w", category) == ""
+
+    def test_job_status_class_raises_on_unrecognised_value(self) -> None:
+        """A value outside JobState is refused, as state_label refuses it."""
+        bad = cast("JobState", "UNKNOWN")
+        with pytest.raises(AssertionError):
+            job_status_class(bad, None, None)
 
 
 _DELIVERED_OUTCOME_LINES: list[tuple[JobState, str | None, str]] = [

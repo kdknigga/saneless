@@ -68,6 +68,8 @@ from saneless.scanner.base import (
     ScannerBackend,
 )
 from saneless.vocabulary import (
+    UNCONFIRMED_FILING_LABEL,
+    UNCONFIRMED_SEND_LABEL,
     WARNED_UPLOAD_LABEL,
     ErrorCategory,
     FlipOutcome,
@@ -2595,6 +2597,47 @@ class TestJobsCommand:
         lines = [line for line in result.output.strip().split("\n") if line.strip()]
         row = lines[2]
         assert row.endswith(job_label(JobState.DONE, _WARNED_SENTENCE))
+        assert all(len(line) <= 80 for line in lines)
+
+    @pytest.mark.parametrize(
+        ("category", "label"),
+        [
+            (ErrorCategory.UNCONFIRMED_SEND, UNCONFIRMED_SEND_LABEL),
+            (ErrorCategory.UNCONFIRMED_FILING, UNCONFIRMED_FILING_LABEL),
+        ],
+    )
+    def test_jobs_table_labels_an_amber_failure_by_its_category(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        category: ErrorCategory,
+        label: str,
+    ) -> None:
+        """
+        A failure that may be in paperless-ngx is not listed as "Failed".
+
+        The label is the one the web history cell shows for the same row, and
+        it fits beside a title that fills its column at 80 columns.
+        """
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        store = JobStore(db_path=settings.output.db_path)
+        job = store.create_job(profile="default", title="W" * 120)
+        store.update_state(
+            job.id,
+            JobState.ERROR,
+            error="the poll ran out",
+            error_category=category,
+        )
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        assert len(lines) == 3
+        assert lines[2].endswith(label)
+        assert state_label(JobState.ERROR) not in result.output
         assert all(len(line) <= 80 for line in lines)
 
     def test_jobs_json_keeps_done_and_the_warning_for_a_warned_upload(

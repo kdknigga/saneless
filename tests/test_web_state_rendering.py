@@ -45,6 +45,8 @@ from saneless.vocabulary import (
     PASS_WAIT_STATES,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
+    UNCONFIRMED_FILING_LABEL,
+    UNCONFIRMED_SEND_LABEL,
     ErrorCategory,
     JobState,
     RequestRejection,
@@ -103,6 +105,14 @@ _LOG_FILE_NAME = "render-test-do-not-render-me.log"
 # classifies (`worker.py`) -- so this, not NULL, is the shape the status area's
 # main path renders. REJECTED is avoided because D-06 gives it its own routing.
 _DEFAULT_ERROR_CATEGORY = ErrorCategory.SCANNER
+
+# The two failures that may already be in paperless-ngx.  They render amber
+# with no alert, so the red-alert tests below cover every other category, and
+# the amber ones are pinned by their own class.  Written out rather than read
+# from ``is_amber_category`` so the set is pinned, not echoed.
+_AMBER_CATEGORIES = frozenset(
+    {ErrorCategory.UNCONFIRMED_SEND, ErrorCategory.UNCONFIRMED_FILING}
+)
 
 # The browser the rendering tests look through, and the owner every row they
 # stage records.  A job's title, preview and detail text reach only the
@@ -434,7 +444,9 @@ class TestStatusAreaError:
         """
         return client.get("/api/jobs/current/status").text
 
-    @pytest.mark.parametrize("category", list(ErrorCategory))
+    @pytest.mark.parametrize(
+        "category", [c for c in ErrorCategory if c not in _AMBER_CATEGORIES]
+    )
     def test_one_alert_covers_the_sentence_and_the_next_step(
         self, client: TestClient, category: ErrorCategory
     ) -> None:
@@ -443,8 +455,9 @@ class TestStatusAreaError:
 
         The next step is the most actionable content on the page; leaving it
         outside the alert would mean a screen-reader user never hears it.
-        Parametrised over ``list(ErrorCategory)`` so an eighth member cannot be
-        added without forcing a decision here.
+        Parametrised over every red ``ErrorCategory`` so a new member cannot be
+        added without forcing a decision here; the two amber ones, which are
+        deliberately not alerts, are pinned in ``TestAmberErrorRendering``.
         """
         _job_in_state(client, JobState.ERROR, error_category=category)
         text = self._status(client)
@@ -590,6 +603,114 @@ class TestStatusAreaError:
         css = _APP_CSS.read_text(encoding="utf-8")
         assert "details.tech-details > summary {" in css
         assert "min-height: 2.75rem;" in css
+
+
+class TestAmberErrorRendering:
+    """
+    A failure that may already be in paperless-ngx wears amber, not red.
+
+    Red reads as "do it again", and scanning again is exactly what these two
+    categories must not prompt before the reader has checked the document
+    list.  The status area, the history cell and its label all follow the
+    category, so the three cannot disagree about one row.
+    """
+
+    @staticmethod
+    def _status(client: TestClient) -> str:
+        """
+        Render the status area for the current job.
+
+        Returns:
+            The status poll's body.
+
+        """
+        return client.get("/api/jobs/current/status").text
+
+    @pytest.mark.parametrize("category", sorted(_AMBER_CATEGORIES))
+    def test_amber_status_is_a_warning_not_an_alert(
+        self, client: TestClient, category: ErrorCategory
+    ) -> None:
+        """The message and next step render in amber, with no alert role."""
+        _job_in_state(client, JobState.ERROR, error_category=category)
+        text = self._status(client)
+
+        sentence = escape(error_message(category))
+        next_step = escape(error_next_step(category))
+        assert f'<p class="status-fallback">&#9888; {sentence}</p>' in text
+        assert f"<p>{next_step}</p>" in text
+        assert 'role="alert"' not in text
+        assert "status-error" not in text
+        assert "&#10007;" not in text
+
+    @pytest.mark.parametrize("category", sorted(_AMBER_CATEGORIES))
+    def test_amber_status_keeps_the_technical_details(
+        self, client: TestClient, category: ErrorCategory
+    ) -> None:
+        """The disclosure is still there, shut, holding the specific message."""
+        job_id = _job_in_state(client, JobState.ERROR, error_category=category)
+        details = _TECH_DETAILS.search(self._status(client))
+        assert details is not None, "the amber branch renders no disclosure"
+        assert "open" not in details.group("attrs")
+        body = details.group("body")
+        assert "<summary>Technical details</summary>" in body
+        assert "disk on fire" in body
+        assert f"Category: {category.value}" in body
+        assert f"Job: {job_id}" in body
+
+    def test_an_upload_failure_beside_the_amber_ones_stays_a_red_alert(
+        self, client: TestClient
+    ) -> None:
+        """A plain upload failure keeps the red alert markup."""
+        _job_in_state(client, JobState.ERROR, error_category=ErrorCategory.UPLOAD)
+        text = self._status(client)
+
+        sentence = escape(error_message(ErrorCategory.UPLOAD))
+        assert text.count('role="alert"') == 1
+        assert f'<p class="status-error">&#10007; {sentence}</p>' in text
+        assert "status-fallback" not in text
+
+    @pytest.mark.parametrize(
+        ("category", "label"),
+        [
+            (ErrorCategory.UNCONFIRMED_SEND, UNCONFIRMED_SEND_LABEL),
+            (ErrorCategory.UNCONFIRMED_FILING, UNCONFIRMED_FILING_LABEL),
+        ],
+    )
+    def test_amber_history_cell_names_the_category(
+        self, client: TestClient, category: ErrorCategory, label: str
+    ) -> None:
+        """The history row is amber and says what happened, never "Failed"."""
+        _job_in_state(client, JobState.ERROR, error_category=category)
+        text = client.get("/api/jobs/history").text
+
+        assert f'<td class="status-fallback">\n    {label}\n  </td>' in text
+        assert "status-error" not in text
+        assert state_label(JobState.ERROR) not in text
+
+    def test_an_upload_failure_history_cell_stays_red_beside_amber(
+        self, client: TestClient
+    ) -> None:
+        """An upload failure's history row keeps the red "Failed" cell."""
+        _job_in_state(client, JobState.ERROR, error_category=ErrorCategory.UPLOAD)
+        text = client.get("/api/jobs/history").text
+
+        failed = state_label(JobState.ERROR)
+        assert f'<td class="status-error">\n    {failed}\n  </td>' in text
+        assert "status-fallback" not in text
+
+    def test_no_template_chooses_a_row_colour_from_the_state(self) -> None:
+        """
+        The history cell's class comes from one vocabulary function.
+
+        An inline chain of state comparisons in the template was how a warned
+        upload once reached green, and it would be how an amber failure
+        reached red.
+        """
+        history = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
+            encoding="utf-8"
+        )
+        assert "job_status_class(job.warning, job.error_category)" in history
+        assert "job.state == JobState" not in history
 
 
 @pytest.mark.parametrize("state", list(JobState))
