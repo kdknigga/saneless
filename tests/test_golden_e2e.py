@@ -56,6 +56,7 @@ from saneless.vocabulary import (
     JobState,
     PassAnswer,
     PassWait,
+    ScanOutcome,
     pass_wait_state,
 )
 from saneless.web.app import create_app
@@ -113,6 +114,16 @@ _NOT_UPLOADED_LINE = (
     "Not uploaded: saved to the consume folder without its title, tags or correspondent"
 )
 _CONSUME_FOLDER_SENTENCE = "Saved to the paperless-ngx consume directory"
+
+# The document the recording paperless-ngx says it already holds, and the
+# warning a scan refused as its duplicate must end with, spelled out rather
+# than imported: the test states what the operator must read.
+_EXISTING_DOCUMENT = 42
+_DUPLICATE_SENTENCE = (
+    f"paperless-ngx already holds this file as document #{_EXISTING_DOCUMENT}; "
+    "it was not stored again, and this scan's title and tags were not applied "
+    "to it."
+)
 
 # Generous next to a run that takes a fraction of a second, and far below
 # pytest-timeout's ceiling, so a stuck run fails naming the job and its state.
@@ -376,7 +387,7 @@ def _run_web(
     monkeypatch: pytest.MonkeyPatch,
     scenario: _Scenario,
     *,
-    upload_failure: UploadFailure | None = None,
+    recorder: RecordingPaperless | None = None,
 ) -> _WebRun:
     """
     Scan once through the web app, exactly as a browser would.
@@ -385,20 +396,22 @@ def _run_web(
         tmp_path: pytest's per-test directory.
         monkeypatch: Swaps the app's ``PaperlessClient`` for the recording one.
         scenario: What the scanner feeds.
-        upload_failure: How every upload fails, which also gives the run a
-            consume folder; None uploads normally.  Only a before-send
-            failure -- the request never reached paperless-ngx -- may fall
-            back to the folder.
+        recorder: The in-memory paperless-ngx; None is one that files every
+            upload.  One whose uploads fail also gives the run a consume
+            folder.  Only a before-send failure -- the request never reached
+            paperless-ngx -- may fall back to the folder.
 
     Returns:
         What the run left behind.
 
     """
-    consume_dir = tmp_path / "consume" if upload_failure is not None else None
+    if recorder is None:
+        recorder = RecordingPaperless()
+    failing = recorder.upload_failure is not None
+    consume_dir = tmp_path / "consume" if failing else None
     if consume_dir is not None:
         consume_dir.mkdir()
     settings = _settings(tmp_path, profile_metadata=False, consume_dir=consume_dir)
-    recorder = RecordingPaperless(upload_failure=upload_failure)
     scanner = DistinctPageScanner(passes=scenario.passes, rejected=scenario.rejected)
     monkeypatch.setattr(
         "saneless.web.app.PaperlessClient", web_client_builder(recorder)
@@ -518,7 +531,10 @@ def test_web_consume_folder_fallback_is_reported(
 ) -> None:
     """A scan saved to the consume folder says so on every web surface."""
     run = _run_web(
-        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.BEFORE_SEND
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(upload_failure=UploadFailure.BEFORE_SEND),
     )
 
     assert run.job.state is JobState.FALLBACK
@@ -557,7 +573,10 @@ def test_web_after_send_failure_is_unconfirmed_sent_once_and_not_copied(
     kept in ``failed/`` for the operator to import only if it is missing.
     """
     run = _run_web(
-        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.AFTER_SEND
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(upload_failure=UploadFailure.AFTER_SEND),
     )
 
     assert run.job.state is JobState.ERROR
@@ -566,6 +585,40 @@ def test_web_after_send_failure_is_unconfirmed_sent_once_and_not_copied(
     assert run.recorder.polls() == []
     assert list((tmp_path / "consume").iterdir()) == []
     assert len(sorted((tmp_path / "data" / "failed").glob("*.pdf"))) == 1
+
+
+def test_web_duplicate_is_done_with_a_warning_and_nothing_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A scan paperless-ngx refuses as a duplicate ends delivered, not failed.
+
+    paperless-ngx already holds the file, so the job is DONE with the warning
+    naming the document, amber on every surface, and nothing goes to
+    ``failed/``: there is nothing to import.
+    """
+    run = _run_web(
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(duplicate_of=_EXISTING_DOCUMENT),
+    )
+
+    assert run.job.state is JobState.DONE
+    assert run.job.outcome is ScanOutcome.SUCCESS
+    assert run.job.error is None
+    assert run.job.warning == _DUPLICATE_SENTENCE
+    assert len(run.recorder.uploads()) == 1
+    assert _task_ids(run.recorder) == ["golden-task-1"]
+    assert not (tmp_path / "data" / "failed").exists()
+    for page in (run.status_html, run.index_html):
+        assert _WARNED_LINE in page
+        assert _DUPLICATE_SENTENCE in page
+        assert _DONE_LINE not in page
+    assert re.search(
+        r'<td class="status-fallback">\s*Uploaded with a warning\s*</td>',
+        run.history_html,
+    )
 
 
 def test_multi_page_web_job_uploads_every_pass_in_scan_order(
@@ -633,7 +686,7 @@ def _run_cli(
     monkeypatch: pytest.MonkeyPatch,
     scenario: _Scenario,
     *,
-    upload_failure: UploadFailure | None = None,
+    recorder: RecordingPaperless | None = None,
     coverage_threshold: float | None = None,
 ) -> _CliRun:
     """
@@ -647,10 +700,10 @@ def _run_cli(
         tmp_path: pytest's per-test directory.
         monkeypatch: Replaces those five names in ``saneless.cli``.
         scenario: What the scanner feeds.
-        upload_failure: How every upload fails, which also gives the run a
-            consume folder; None uploads normally.  Only a before-send
-            failure -- the request never reached paperless-ngx -- may fall
-            back to the folder.
+        recorder: The in-memory paperless-ngx; None is one that files every
+            upload.  One whose uploads fail also gives the run a consume
+            folder.  Only a before-send failure -- the request never reached
+            paperless-ngx -- may fall back to the folder.
         coverage_threshold: The scenario profile's blank-page threshold, when
             the run is not to use the shipped default.
 
@@ -658,14 +711,16 @@ def _run_cli(
         What the run left behind.
 
     """
-    consume_dir = tmp_path / "consume" if upload_failure is not None else None
+    if recorder is None:
+        recorder = RecordingPaperless()
+    failing = recorder.upload_failure is not None
+    consume_dir = tmp_path / "consume" if failing else None
     if consume_dir is not None:
         consume_dir.mkdir()
     settings = _settings(tmp_path, profile_metadata=True, consume_dir=consume_dir)
     if coverage_threshold is not None:
         profile = settings.profiles[scenario.profile]
         profile.empty_page_coverage_threshold = coverage_threshold
-    recorder = RecordingPaperless(upload_failure=upload_failure)
     scanner = DistinctPageScanner(passes=scenario.passes, rejected=scenario.rejected)
 
     def load_settings(config_path: str | None = None) -> Settings:
@@ -868,12 +923,36 @@ def test_cli_duplex_count_mismatch_is_reported_and_exits_7(
     )
 
 
+def test_cli_duplicate_is_reported_and_exits_7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicate refusal is an upload with a warning: exit 7, nothing kept."""
+    run = _run_cli(
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(duplicate_of=_EXISTING_DOCUMENT),
+    )
+
+    assert run.result.exit_code == 7, run.result.output
+    assert _WARNED_LINE in run.result.stdout
+    assert "Done:" not in run.result.stdout
+    assert _warning_lines(run.result.stderr) == [f"Warning: {_DUPLICATE_SENTENCE}"]
+    assert "Paperless error" not in run.result.stderr
+    assert len(run.recorder.uploads()) == 1
+    assert not (tmp_path / "data" / "failed").exists()
+    assert run.scratch == []
+
+
 def test_cli_consume_folder_fallback_is_reported_and_exits_6(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A scan saved to the consume folder says so, and says what it lost."""
     run = _run_cli(
-        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.BEFORE_SEND
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(upload_failure=UploadFailure.BEFORE_SEND),
     )
 
     assert run.result.exit_code == 6, run.result.output
@@ -893,7 +972,10 @@ def test_cli_fallback_with_a_skipped_sheet_exits_6(
 ) -> None:
     """The fallback outranks the warning, and neither sentence is dropped."""
     run = _run_cli(
-        tmp_path, monkeypatch, _WARNED_RUN, upload_failure=UploadFailure.BEFORE_SEND
+        tmp_path,
+        monkeypatch,
+        _WARNED_RUN,
+        recorder=RecordingPaperless(upload_failure=UploadFailure.BEFORE_SEND),
     )
 
     assert run.result.exit_code == 6, run.result.output
@@ -918,7 +1000,10 @@ def test_cli_upload_read_timeout_exits_9_sent_once_and_kept(
     copy in the consume folder that is configured, and the PDF in ``failed/``.
     """
     run = _run_cli(
-        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.READ_TIMEOUT
+        tmp_path,
+        monkeypatch,
+        _SIMPLEX_RUN,
+        recorder=RecordingPaperless(upload_failure=UploadFailure.READ_TIMEOUT),
     )
 
     assert run.result.exit_code == 9, run.result.output

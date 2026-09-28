@@ -186,6 +186,9 @@ _FLIP_TIMEOUT_BUDGET = 1
 _FAILURE_TASK = "e2e-task-failure"
 _PENDING_TASK = "e2e-task-never-finishes"
 _BLIP_TASK = "e2e-task-after-a-proxy-blip"
+_DUPLICATE_TASK = "e2e-task-duplicate"
+# The document paperless-ngx already holds, in every duplicate case.
+_EXISTING_DOCUMENT = 42
 _PAPERLESS_MESSAGE = "Document consumption failed: unsupported PDF producer"
 
 # The mid-batch fault HARD-02 is about, shaped like the SANE backend's own
@@ -424,6 +427,107 @@ def _after_send_error_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     return handler
 
 
+def _duplicate_answer(shape: str) -> object:
+    """
+    Build the poll answer of a task paperless-ngx refused as a duplicate.
+
+    Args:
+        shape: ``v9-2x`` for paperless-ngx 2.x, whose failure text names the
+            title and ``(#N)`` and whose ``related_document`` is a string;
+            ``v9-3x`` for 3.x speaking v9, which lists ``duplicate_documents``;
+            ``v10`` for the paginated ``result_data`` shape with no text.
+
+    Returns:
+        The decoded body, ready to hand to ``httpx2.Response(json=...)``.
+
+    """
+    existing = _EXISTING_DOCUMENT
+    if shape == "v9-2x":
+        return [
+            {
+                "task_id": _DUPLICATE_TASK,
+                "status": "FAILURE",
+                "result": (
+                    f"Not consuming {_TITLE}.pdf: It is a duplicate of "
+                    f"{_TITLE} (#{existing})."
+                ),
+                "related_document": str(existing),
+            }
+        ]
+    if shape == "v9-3x":
+        return [
+            {
+                "task_id": _DUPLICATE_TASK,
+                "status": "FAILURE",
+                "result": f"Not consuming: It is a duplicate of document #{existing}",
+                "duplicate_documents": [
+                    {"id": existing, "title": _TITLE, "deleted_at": None}
+                ],
+            }
+        ]
+    task = {
+        "task_id": _DUPLICATE_TASK,
+        "status": "failure",
+        "result_data": {"duplicate_of": existing, "duplicate_in_trash": False},
+    }
+    return {"count": 1, "next": None, "previous": None, "results": [task]}
+
+
+def _duplicate_handler(
+    shape: str,
+) -> Callable[[], Callable[[httpx2.Request], httpx2.Response]]:
+    """
+    Accept the upload, then refuse its task as a duplicate in one wire shape.
+
+    Args:
+        shape: The shape ``_duplicate_answer`` builds.
+
+    Returns:
+        A handler factory, as ``_Case.handler_factory`` takes one.
+
+    """
+
+    def factory() -> Callable[[httpx2.Request], httpx2.Response]:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.url.path == _DOCUMENTS_PATH:
+                return httpx2.Response(200, json=_DUPLICATE_TASK)
+            if request.url.path == _TASKS_PATH:
+                if request.url.params.get("task_id") != _DUPLICATE_TASK:
+                    return _unexpected(request)
+                return httpx2.Response(200, json=_duplicate_answer(shape))
+            return _unexpected(request)
+
+        return handler
+
+    return factory
+
+
+def _backs_refused_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Accept the (fronts) upload, then refuse the (backs) upload with a 400.
+
+    The fronts are in paperless-ngx by then, so the run must not end as a
+    plain failed upload that invites a rescan.  No task is polled: the backs
+    upload fails before either poll, so the tasks path is left to
+    ``_unexpected``.
+
+    Returns:
+        A fresh handler with its own upload counter.
+
+    """
+    uploads: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == _DOCUMENTS_PATH:
+            uploads.append(request.method)
+            if len(uploads) == 1:
+                return httpx2.Response(200, json="e2e-task-fronts")
+            return httpx2.Response(400, json={"document": ["refused the backs"]})
+        return _unexpected(request)
+
+    return handler
+
+
 @dataclass(frozen=True)
 class _Case:
     """
@@ -565,6 +669,38 @@ _CASES = [
         scan_passes=(3, 2),
         awaits_flip=True,
         warning_contains="Page count mismatch: 3 fronts, 2 backs",
+    ),
+    *(
+        _Case(
+            label=f"duplicate-{shape}",
+            handler_factory=_duplicate_handler(shape),
+            expected_state=JobState.DONE,
+            expected_outcome=ScanOutcome.SUCCESS,
+            expected_pages=(2, 0, 2),
+            expected_failed_pdfs=0,
+            expected_consume_pdfs=0,
+            warning_contains=f"#{_EXISTING_DOCUMENT}",
+        )
+        for shape in ("v9-2x", "v9-3x", "v10")
+    ),
+    _Case(
+        label="duplex-mismatch-per-half-backs-refused",
+        handler_factory=_backs_refused_handler,
+        expected_state=JobState.ERROR,
+        expected_outcome=None,
+        expected_pages=(None, None, None),
+        expected_failed_pdfs=2,
+        expected_consume_pdfs=0,
+        source=_DUPLEX_SOURCE,
+        duplex="manual",
+        scan_passes=(3, 2),
+        awaits_flip=True,
+        error_contains=(
+            "The (fronts) half reached paperless-ngx",
+            "the (backs) half failed",
+            "400",
+        ),
+        expected_category=ErrorCategory.UNCONFIRMED_FILING,
     ),
     _Case(
         label="legacy-duplex-source",
