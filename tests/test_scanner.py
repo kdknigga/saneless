@@ -3443,15 +3443,21 @@ class TestSaneBackendCancelSequence:
 
         The interrupt is delivered deterministically, without a sleep and
         without polling.  ``read_started`` is set by the reader thread from
-        inside the blocked read, so by the time the signal is raised the
+        inside the blocked read, so by the time the signal is sent the
         waiting thread is provably past ``reader.start()`` and inside the
-        block that handles the interrupt.
+        block that handles the interrupt.  The signal goes to the main thread
+        with ``pthread_kill``, which is where that wait runs: sent to the
+        interrupter's own thread with ``raise_signal``, it would only take
+        effect once the wait ended on its own, after the page timeout, and
+        the test would prove the timeout path instead of the interrupt.
         """
         fake_device.block_read(ReadBlockMode.PARTIAL)
+        main_thread = threading.main_thread().ident
+        assert main_thread is not None
 
         def interrupt_once_the_read_blocks() -> None:
             if fake_device.read_started.wait(_READER_JOIN_SECONDS):
-                signal.raise_signal(signum)
+                signal.pthread_kill(main_thread, signum)
 
         interrupter = threading.Thread(
             target=interrupt_once_the_read_blocks, name="interrupter", daemon=True
