@@ -88,6 +88,7 @@ from saneless.vocabulary import (
     rejection_status_code,
     removed_pages,
     removed_pages_note,
+    sixteen_bit_error,
     source_not_offered_error,
     state_label,
     timeout_finish_warning,
@@ -674,6 +675,13 @@ class TestFinishWarnings:
             "The source 'Adf' matches more than one of the scanner's sources "
             "when case and surrounding spaces are ignored: 'ADF', 'adf'. Set "
             "the profile's source to one of those names exactly."
+        )
+
+    def test_sixteen_bit_error(self) -> None:
+        """The refusal names the device, the two depths and the fix."""
+        assert sixteen_bit_error("test:0") == (
+            "The scanner test:0 is set to 16 bits per sample, and saneless scans "
+            "at 8. Choose an 8-bit mode, such as Gray or Color, in the profile."
         )
 
     def test_blank_timeout_finish_warning(self) -> None:

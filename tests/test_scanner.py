@@ -4807,6 +4807,274 @@ class TestResolutionConstraintShapes:
         assert found.present is False
 
 
+# The SANE value-type code for an INT option, beside the two above.
+_INT_OPTION = 1
+
+# The option python-sane reaches through ``getattr``, as the protocol does not
+# declare it.
+_DEPTH = "depth"
+
+_FEEDER_SOURCE = "Automatic Document Feeder"
+
+
+def _device_with_depth(value_type: int, constraint: object) -> FakeSaneDev:
+    """
+    Build the default device with a ``depth`` option of a given shape.
+
+    Args:
+        value_type: The SANE value type code for the option.
+        constraint: The word list or ``(min, max, step)`` the device reports.
+
+    Returns:
+        A one-sheet device whose table ends with that ``depth`` option.
+
+    """
+    return FakeSaneDev(
+        options=[*build_option_table(), _option(12, "depth", value_type, constraint)],
+        pages=1,
+    )
+
+
+class TestSixteenBitDepth:
+    """
+    A scan runs at 8 bits per sample, or is refused before paper moves.
+
+    python-sane misreads a 16-bit frame -- the page comes back twice as tall --
+    and saneless writes 8-bit output anyway. So ``depth`` is set to 8 whenever
+    the device offers 8, silently, and any frame still reported as 16-bit is
+    refused before ``start()``.
+    """
+
+    def _scan(
+        self,
+        dev: FakeSaneDev,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        source: str = "Flatbed",
+    ) -> ScanBatch:
+        """
+        Scan once from ``dev`` in colour at 300 dpi.
+
+        Args:
+            dev: The device to scan from.
+            monkeypatch: Fixture used to wire the device into the backend.
+            page_sink: Where the pages go.
+            source: The profile's source.
+
+        Returns:
+            The batch the scan returned.
+
+        """
+        settings = ScanSettings(source=source, resolution=300, mode="Color")
+        return _backend_with(dev, monkeypatch).scan_pages(
+            _TEST_DEVICE, settings, page_sink
+        )
+
+    def test_depth_is_set_to_eight_after_mode_and_before_resolution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A device offering [1, 8, 16] is set to the int 8, and nothing is logged.
+
+        After ``mode``, because a mode change can reload the depth constraint;
+        before ``resolution``, which is read back afterwards. An int, because
+        ``depth`` is an INT option and python-sane refuses ``8.0`` for one.
+        """
+        dev = FakeSaneDev(pages=1)
+        dev.offer_depth()
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+
+        batch = self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.assignments == ["source", "mode", "depth", "resolution"]
+        depth = getattr(dev, _DEPTH)
+        assert depth == 8
+        assert type(depth) is int
+        assert len(batch.pages) == 1
+        assert _guard_warnings(caplog) == []
+
+    @pytest.mark.parametrize(
+        ("value_type", "constraint", "expected"),
+        [
+            pytest.param(_INT_OPTION, (1, 16, 1), 8, id="int-range"),
+            pytest.param(_INT_OPTION, (0, 16, 4), 8, id="int-range-on-grid"),
+            pytest.param(_FIXED_OPTION, (1.0, 16.0, 1.0), 8.0, id="fixed-range"),
+            pytest.param(_FIXED_OPTION, (1.0, 16.0, 0.0), 8.0, id="fixed-no-step"),
+        ],
+    )
+    def test_a_range_that_includes_eight_is_set_to_eight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        value_type: int,
+        constraint: tuple[float, float, float],
+        expected: float,
+    ) -> None:
+        """
+        A range includes 8 when 8 lies within it on its step grid.
+
+        The value is written in the option's own type: an int for INT, a float
+        for FIXED, since python-sane refuses the other one.
+        """
+        dev = _device_with_depth(value_type, constraint)
+
+        self._scan(dev, monkeypatch, page_sink)
+
+        assert "depth" in dev.assignments
+        depth = getattr(dev, _DEPTH)
+        assert depth == expected
+        assert type(depth) is type(expected)
+
+    @pytest.mark.parametrize(
+        "constraint",
+        [
+            pytest.param([1, 16], id="list-without-eight"),
+            pytest.param((1, 16, 5), id="range-grid-misses-eight"),
+            pytest.param((10, 16, 1), id="range-above-eight"),
+        ],
+    )
+    def test_a_constraint_without_eight_is_left_alone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        constraint: object,
+    ) -> None:
+        """
+        No depth is written when 8 is not one the device can take.
+
+        The device keeps its own depth; none of these starts at 16, so the scan
+        goes ahead.
+        """
+        dev = _device_with_depth(_INT_OPTION, constraint)
+
+        batch = self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.assignments == ["source", "mode", "resolution"]
+        assert len(batch.pages) == 1
+
+    def test_a_device_offering_only_sixteen_is_refused_before_start(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        With 16 the only depth, nothing is assigned and the frame is refused.
+
+        The refusal comes from the device's own parameters, read after the
+        options are set, and names the device; nothing is started.
+        """
+        dev = FakeSaneDev(pages=1)
+        dev.offer_depth([16])
+
+        with pytest.raises(ScanError) as excinfo:
+            self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.assignments == ["source", "mode", "resolution"]
+        assert dev.get_parameters()[3] == 16
+        assert "start" not in dev.calls
+        assert _TEST_DEVICE in str(excinfo.value)
+        assert "16 bits" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("Flatbed", id="flatbed"),
+            pytest.param(_FEEDER_SOURCE, id="feeder"),
+        ],
+    )
+    def test_a_mode_implying_sixteen_bits_is_refused_before_start(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        source: str,
+    ) -> None:
+        """
+        A device with no ``depth`` option can still report a 16-bit frame.
+
+        A mode such as "Color (48 bits)" implies 16 bits per sample without
+        any depth option to set, so the parameters are what is checked, and on
+        both acquisition paths.
+        """
+        dev = FakeSaneDev(pages=1)
+        dev.set_parameters(depth=16)
+
+        with pytest.raises(ScanError) as excinfo:
+            self._scan(dev, monkeypatch, page_sink, source=source)
+
+        assert "start" not in dev.calls
+        assert _TEST_DEVICE in str(excinfo.value)
+
+    def test_a_default_device_is_configured_as_before_and_scans(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """No ``depth`` option means no depth assignment, and an 8-bit scan."""
+        dev = FakeSaneDev(pages=1)
+
+        batch = self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.assignments == ["source", "mode", "resolution"]
+        assert len(batch.pages) == 1
+        assert dev.get_parameters_calls == 1
+
+    def test_a_failed_parameter_read_is_a_scan_error_before_start(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """A device that cannot report its parameters is refused, naming it."""
+        dev = FakeSaneDev(pages=1)
+        dev.fail_call("get_parameters", FakeSaneError("I/O error"))
+
+        with pytest.raises(ScanError) as excinfo:
+            self._scan(dev, monkeypatch, page_sink)
+
+        assert "start" not in dev.calls
+        assert _TEST_DEVICE in str(excinfo.value)
+        assert "I/O error" in str(excinfo.value)
+
+    def test_the_options_are_read_again_after_the_source_is_set(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        A source change reloads the option descriptors, so they are read twice.
+
+        Once to match the source, and once after assigning it, so that depth
+        -- and anything else that depends on the source -- is decided from
+        the list the device reports for the source actually selected.
+        """
+        dev = FakeSaneDev(pages=1)
+
+        self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.get_options_calls == 2
+
+    def test_depth_is_decided_from_the_list_read_after_the_source(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        A depth option that appears only once the source is set is still used.
+
+        The first read offers no ``depth``; the device adds it when the
+        source is assigned, as a reload would. Deciding from the first list
+        would skip it and leave the device at 16.
+        """
+        dev = FakeSaneDev(pages=1)
+        original = dev.get_options
+
+        def reveal_depth_after_source() -> list[tuple]:
+            if "source" in dev.assignments and _DEPTH not in dev.opt:
+                dev.offer_depth([16, 8])
+            return original()
+
+        # The device stores a name that is not one of its options on itself,
+        # as python-sane does, so this shadows get_options for this device.
+        monkeypatch.setattr(dev, "get_options", reveal_depth_after_source)
+
+        self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.assignments == ["source", "mode", "depth", "resolution"]
+        assert getattr(dev, _DEPTH) == 8
+
+
 class TestSourceOptionPresence:
     """
     Whether a device HAS a source option is a different fact from its constraint.

@@ -30,6 +30,7 @@ from tests.conftest import images_of
 from tests.fake_saned import SanedBehaviour, fake_saned
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from PIL import Image
@@ -331,6 +332,90 @@ class TestRealSaneTestBackend:
         assert all(
             image.convert("L").getextrema() == (0, 0) for image in images_of(batch)
         )
+
+
+# What ``test:0`` reports for a 75 dpi gray frame over its default 80 x 100 mm
+# scan area: 236 pixels by 295 lines, at 8 bits and at 16 alike.  python-sane
+# hands back a 16-bit frame as an image twice as tall, 236 x 590.
+_DEFAULT_AREA = (("tl_x", 0.0), ("tl_y", 0.0), ("br_x", 80.0), ("br_y", 100.0))
+_EIGHT_BIT_PAGE = (236, 295)
+
+# The option python-sane reaches through ``getattr``, as the protocol does not
+# declare it.
+_DEPTH = "depth"
+
+
+@pytest.mark.sane_hardware
+class TestRealSaneDepth:
+    """
+    A device left at 16 bits per sample scans at 8, and a 16-bit frame is refused.
+
+    ``test:0`` keeps its ``depth`` from one handle to the next, so setting 16 on
+    a raw handle and closing it leaves the device exactly as an earlier program
+    might have.  ``test:0`` always offers 8, so a scan through ``scan_pages``
+    never reaches the refusal; the refusal helper is called on a real handle
+    instead, and the refusal through ``scan_pages`` is proven on the double.
+    """
+
+    @pytest.fixture
+    def left_at_sixteen_bits(self) -> Iterator[None]:
+        """
+        Leave ``test:0`` at depth 16 over its default scan area, then put 8 back.
+
+        Yields:
+            None, while the device is at depth 16.
+
+        """
+        assert SaneBackend() is not None  # the constructor runs sane.init()
+        sane = sane_backend_mod._ensure_sane()
+        handle = sane.open("test:0")
+        try:
+            for name, value in _DEFAULT_AREA:
+                setattr(handle, name, value)
+            setattr(handle, _DEPTH, 16)
+        finally:
+            handle.close()
+        try:
+            yield
+        finally:
+            restorer = sane.open("test:0")
+            try:
+                setattr(restorer, _DEPTH, 8)
+            finally:
+                restorer.close()
+
+    @pytest.mark.usefixtures("left_at_sixteen_bits")
+    def test_a_device_left_at_sixteen_bits_scans_an_eight_bit_page(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The page is 236 x 295, never the double-height 236 x 590.
+
+        Args:
+            tmp_path: Where the page is spooled.
+
+        """
+        settings = ScanSettings(source="Flatbed", resolution=75, mode="Gray")
+
+        batch = SaneBackend().scan_pages("test:0", settings, _page_sink_for(tmp_path))
+
+        assert [image.size for image in images_of(batch)] == [_EIGHT_BIT_PAGE]
+
+    @pytest.mark.usefixtures("left_at_sixteen_bits")
+    def test_the_refusal_helper_refuses_a_real_sixteen_bit_frame(self) -> None:
+        """The parameters a real 16-bit handle reports are refused."""
+        handle = sane_backend_mod._ensure_sane().open("test:0")
+        try:
+            handle.mode = "Gray"
+            parameters = sane_backend_mod._read_parameters(handle, "test:0")
+
+            assert parameters.depth == 16
+            assert (parameters.pixels_per_line, parameters.lines) == _EIGHT_BIT_PAGE
+            with pytest.raises(ScanError) as raised:
+                sane_backend_mod._refuse_sixteen_bit(parameters, "test:0")
+            assert "test:0" in str(raised.value)
+        finally:
+            handle.close()
 
 
 @pytest.mark.sane_hardware
