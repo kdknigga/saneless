@@ -25,6 +25,7 @@ from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
     DiskSpaceError,
+    NoScannerFoundError,
     ScanCancelledError,
     ScanError,
     ScanInterrupted,
@@ -1730,7 +1731,10 @@ def _resolve_device(
         SANE device identifier string.
 
     Raises:
-        ConfigError: If no device is configured and auto-detection finds none.
+        NoScannerFoundError: If no device is configured and auto-detection
+            finds none.  An empty ``scanner.device`` is a valid setting that
+            asks for discovery, so finding nothing is a scanner condition, not
+            a configuration error.
 
     """
     device_id = settings.scanner.device
@@ -1739,7 +1743,7 @@ def _resolve_device(
     devices = scanner.get_devices()
     if not devices:
         msg = "No scanner found: settings.scanner.device is empty and auto-detection found no devices"
-        raise ConfigError(msg)
+        raise NoScannerFoundError(msg)
     chosen = devices[0].name
     previous = memory.last_id if memory is not None else None
     if previous is not None and previous != chosen:
@@ -3437,9 +3441,9 @@ def run_pipeline(
         scanned, dropped as empty, and uploaded.
 
     Raises:
-        ConfigError: If the profile or device is not configured, a manual
-            duplex profile is run with no flip coordinator, a multi-page scan
-            is asked for on a manual duplex profile or with no pass
+        ConfigError: If the profile is not configured, a manual duplex
+            profile is run with no flip coordinator, a multi-page scan is
+            asked for on a manual duplex profile or with no pass
             coordinator, or the working directory under ``tmp_dir`` cannot be
             created or measured for a reason other than a full disk. Nothing
             has been scanned yet, so nothing is kept.
@@ -3460,7 +3464,9 @@ def run_pipeline(
         ScanInterrupted: If a signal or a server shutdown interrupted the run,
             a multi-page prompt included. What it had is kept, like any
             failure.
-        ScanError: If scanning fails; ``No pages were scanned`` if a scan pass
+        ScanError: If no device is configured and auto-detection finds none
+            (``NoScannerFoundError``, before anything is scanned, so nothing
+            is kept); if scanning fails; ``No pages were scanned`` if a scan pass
             returned no pages; if a manual duplex flip prompt fails or its
             wait times out; or if a multi-page prompt fails or is answered
             with something it did not offer.

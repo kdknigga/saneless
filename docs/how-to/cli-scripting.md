@@ -167,7 +167,7 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 | Exit Code | Meaning | Example |
 |---|---|---|
 | 0 | Success | Scan completed and uploaded |
-| 1 | Scan error | Scanner disconnected mid-scan, empty feeder, no pages scanned, flip wait timed out |
+| 1 | Scan error | No scanner found, scanner disconnected mid-scan, empty feeder, no pages scanned, flip wait timed out |
 | 2 | Configuration, profile or setup error | Unknown profile name, a `--config` file that does not exist, a TOML syntax error, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `saneless scan --multi-page` without an interactive terminal or with a manual duplex profile, python-sane not installed, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set (a scan is refused before the scanner is opened) |
 | 3 | Paperless upload error | paperless-ngx unreachable, invalid API token |
 | 4 | PDF assembly error | The scanned pages could not be written as a PDF: a page image the PDF library refused, or an unwritable output directory. A full disk is exit 10 |
@@ -254,7 +254,7 @@ saneless scan --profile default --title "Automated Scan"
 exit_code=$?
 case $exit_code in
   0) echo "Scan uploaded successfully" ;;
-  1) echo "Scan failed -- check scanner connection" ;;
+  1) echo "Scan failed -- check the scanner is switched on and connected" ;;
   2) echo "Configuration error -- check the profile name and the config" ;;
   3) echo "Upload failed -- check paperless-ngx connection" ;;
   4) echo "PDF assembly failed -- check disk space and the output directory" ;;
@@ -294,6 +294,21 @@ if saneless devices --json | grep -q '"name"'; then
 else
   echo "No scanner found, skipping"
 fi
+```
+
+Without the check, a scan that finds no scanner exits 1, the same code as any other scanner
+failure, and so does `saneless auto-profiles`. The first stderr line then starts
+`Scan error: No scanner found`, so a script that must tell the two apart can match on it:
+
+```bash
+#!/bin/bash
+saneless scan --profile adf --title "Batch $(date +%Y-%m-%d)" 2>scan.err
+exit_code=$?
+if [ "$exit_code" -eq 1 ] && grep -q '^Scan error: No scanner found' scan.err; then
+  echo "No scanner found, skipping"
+  exit 0
+fi
+exit $exit_code
 ```
 
 ### Scheduled scanning with cron

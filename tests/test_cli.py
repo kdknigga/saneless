@@ -3881,6 +3881,8 @@ class TestAutoProfiles:
         Finding no scanner means the scanner is off, unplugged or out of
         reach, not that the configuration is wrong, so both commands that can
         find none exit 1: an exit code means the same thing in every command.
+        The line carries the ``Scan error:`` prefix every scanner failure has,
+        and the advice is the scanner's.
         """
         scanner_cls = self._make_auto_scanner(devices=[])
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
@@ -3889,7 +3891,9 @@ class TestAutoProfiles:
         assert result.exit_code == 1
         lines = _failure_lines(result)
         assert len(lines) == 1
-        assert lines[0].startswith("No scanner found: ")
+        assert lines[0].startswith("Scan error: No scanner found: ")
+        advice = result.stderr.splitlines()[-1]
+        assert advice == f"Try: {error_next_step(ErrorCategory.SCANNER)}"
 
     def test_auto_profiles_force_flag(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

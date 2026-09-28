@@ -60,6 +60,7 @@ from .config import (
 )
 from .exceptions import (
     ConfigError,
+    NoScannerFoundError,
     PaperlessError,
     SanelessError,
     ScanCancelledError,
@@ -2199,7 +2200,7 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         # rename the old one would go green, and the appliance would keep
         # running on defaults with nothing left saying why.  Refusing costs a
         # rename; writing costs the evidence.  Exit 2 through the group guard,
-        # exactly as the no-scanner refusal below does.
+        # as a configuration error.
         row = configuration_check(settings, absolute_paths=True)
         msg = f"{row.message} {row.next_step}"
         raise ConfigError(msg)
@@ -2213,13 +2214,14 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     ctx.call_on_close(scanner.close)
     device_list = scanner.get_devices()
     if not device_list:
-        # A setup problem, exit 2 through the guard, exactly as `scan` reports
-        # the same finding: an exit code means the same thing in every command.
+        # A scanner condition, exit 1 through the guard, exactly as `scan`
+        # reports the same finding: an exit code means the same thing in every
+        # command.
         msg = (
             "No scanner found: auto-detection found no devices. "
             "Check what SANE can see with `saneless devices`"
         )
-        raise ConfigError(msg)
+        raise NoScannerFoundError(msg)
 
     # Use configured device or first discovered device.  A discovered one is
     # also pinned below, so later scans do not follow whichever scanner SANE

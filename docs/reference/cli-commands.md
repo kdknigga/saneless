@@ -20,7 +20,7 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Scan error: the scanner failed, the feeder was empty, no pages were scanned, or the flip wait timed out |
+| 1 | Scan error: no scanner was found, the scanner failed, the feeder was empty, no pages were scanned, or the flip wait timed out |
 | 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan is started |
 | 3 | Paperless-ngx error: unreachable after retries, or upload rejected |
 | 4 | PDF assembly error: the scanned pages could not be written as a PDF |
@@ -57,8 +57,8 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME] [--multi-page
 | Code | Meaning |
 |------|---------|
 | 0 | Scan and upload completed successfully |
-| 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt or a multi-page question) |
-| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `--multi-page` without an interactive terminal or with a manual duplex profile, an unset or placeholder paperless-ngx API token, no scanner found, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
+| 1 | Scan error (no scanner found, scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt or a multi-page question) |
+| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `--multi-page` without an interactive terminal or with a manual duplex profile, an unset or placeholder paperless-ngx API token, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
 | 3 | Paperless-ngx upload error (unreachable after retries, or upload rejected) |
 | 4 | PDF assembly error: the scanned pages could not be written as a PDF (a full disk is exit 10) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
@@ -314,8 +314,8 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 | Code | Meaning |
 |------|---------|
 | 0 | Profiles generated successfully |
-| 1 | Scan error (SANE failed while listing devices, or could not open or read the scanner's capabilities) |
-| 2 | Configuration or setup error: the config could not be loaded, no scanner found, python-sane is not installed, an old `config.toml` was the only config file the search found (see below), or the config file could not be rewritten (for example `saneless.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
+| 1 | Scan error (no scanner found, SANE failed while listing devices, or could not open or read the scanner's capabilities) |
+| 2 | Configuration or setup error: the config could not be loaded, python-sane is not installed, an old `config.toml` was the only config file the search found (see below), or the config file could not be rewritten (for example `saneless.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |

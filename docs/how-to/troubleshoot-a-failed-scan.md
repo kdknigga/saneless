@@ -13,7 +13,7 @@ In a shell, `echo $?` right after the command prints its exit code.
 | Exit code | What happened | Where to look |
 |---|---|---|
 | 0 | The command succeeded | -- |
-| 1 | The scanner failed, or the scan produced no usable pages | [Scanner errors](#scanner-errors-exit-1) |
+| 1 | No scanner was found, the scanner failed, or the scan produced no usable pages | [Scanner errors](#scanner-errors-exit-1) |
 | 2 | saneless could not start: configuration, profile or setup; or `paperless.url` is not set when a scan is started | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
 | 3 | paperless-ngx could not be reached or rejected the upload | [Paperless errors](#paperless-errors-exit-3) |
 | 4 | The scanned pages could not be written as a PDF | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
@@ -39,6 +39,11 @@ to search for in your scanner's documentation.
 
 What the common cases mean:
 
+- **No scanner found.** saneless looked for a scanner and found none: `scan` with
+  `scanner.device` empty, or `auto-profiles`. The configuration is not what is wrong. Check that
+  the scanner is switched on and connected, or reachable over the network, then run
+  `saneless devices` to see what SANE can find; see
+  [Scanner Host Discovery](scanner-host-discovery.md) when the scanner is on another machine.
 - **No paper detected in the feeder.** The document feeder was empty when the scan started, or
   the source is set to the feeder on a scanner that has nothing loaded. Load the stack and scan
   again, or pick a flatbed profile.
@@ -170,8 +175,6 @@ Other causes of exit 2, each on one line:
   after every scan whether there is another page, so it is refused when stdin is not a terminal.
   It is refused for a `duplex = "manual"` profile too, because the two flows cannot be combined:
   scan without `--multi-page`, or choose another profile.
-- **No scanner found.** saneless discovered no scanner to use: `scan` with `scanner.device` empty,
-  or `auto-profiles`. Set `scanner.device`, or fix discovery with `saneless devices`.
 - **`serve` cannot start.** The port is already in use, SANE could not be initialised, or the web
   server failed to start. Stop whatever holds the port or pass `--port`; when SANE failed, the line
   gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)); when the web server
