@@ -618,6 +618,70 @@ class TestReads:
         assert list(handle.multi_scan()) == []
 
 
+class TestScanParameters:
+    """What ``get_parameters()`` reports for the frame the handle is set up for."""
+
+    @pytest.mark.parametrize(
+        ("mode", "depth", "frame_format", "bytes_per_pixel"),
+        [
+            pytest.param("Gray", 8, "gray", 1, id="gray-8"),
+            pytest.param("Gray", 16, "gray", 2, id="gray-16"),
+            pytest.param("Color", 8, "color", 3, id="color-8"),
+        ],
+    )
+    def test_the_parameters_describe_the_configured_frame(
+        self,
+        target: ContractTarget,
+        mode: str,
+        depth: int,
+        frame_format: str,
+        bytes_per_pixel: int,
+    ) -> None:
+        """
+        A five-tuple: format, last frame, (pixels, lines), depth, bytes per line.
+
+        A line is ``pixels_per_line`` samples of ``depth`` bits for each of the
+        format's channels, so a 16-bit gray line is twice an 8-bit one and an
+        8-bit colour line three times.
+        """
+        handle = target.open()
+        handle.source = "Flatbed"
+        handle.resolution = 75
+        handle.mode = mode
+        setattr(handle, _DEPTH, depth)
+
+        parameters = handle.get_parameters()
+
+        reported_format, last_frame, size, reported_depth, bytes_per_line = parameters
+        pixels_per_line, lines = size
+        assert reported_format == frame_format
+        assert last_frame
+        assert type(pixels_per_line) is int
+        assert type(lines) is int
+        assert pixels_per_line > 0
+        assert lines > 0
+        assert reported_depth == depth
+        assert bytes_per_line == bytes_per_pixel * pixels_per_line
+
+    def test_depth_does_not_change_the_frame_size(self, target: ContractTarget) -> None:
+        """
+        A 16-bit frame reports the same pixels and lines as an 8-bit one.
+
+        So a 16-bit page that comes back twice as tall has been misread, and
+        the device's own parameters are what shows it was 16-bit to begin with.
+        """
+        handle = target.open()
+        handle.source = "Flatbed"
+        handle.resolution = 75
+        handle.mode = "Gray"
+        setattr(handle, _DEPTH, 8)
+        eight_bit = handle.get_parameters()[2]
+
+        setattr(handle, _DEPTH, 16)
+
+        assert handle.get_parameters()[2] == eight_bit
+
+
 def _write_mode(handle: SaneDevice) -> None:
     """
     Assign an option, as configuring a scan does.
@@ -648,6 +712,7 @@ def _next_page(handle: SaneDevice) -> Image.Image:
 _CALLS_AFTER_CLOSE: list[tuple[str, Callable[[SaneDevice], object]]] = [
     ("cancel", lambda handle: handle.cancel()),
     ("get_options", lambda handle: handle.get_options()),
+    ("get_parameters", lambda handle: handle.get_parameters()),
     ("option_read", lambda handle: handle.mode),
     ("option_write", _write_mode),
     ("start", lambda handle: handle.start()),
@@ -911,3 +976,95 @@ class TestTheDoubleItself:
         assert devices
         for entry in devices:
             assert len(entry) == 4
+
+    def test_the_default_table_has_no_depth_option_and_reports_eight_bits(
+        self,
+    ) -> None:
+        """
+        Without the opt-in, there is no ``depth`` option and a frame is 8-bit.
+
+        Most scanner tests use the default table, so offering ``depth`` there
+        would add an assignment to every one of their expected sequences.
+        """
+        dev = FakeSaneDev()
+
+        assert "depth" not in [opt[1] for opt in dev.get_options()]
+        assert dev.get_parameters()[3] == 8
+
+    def test_offer_depth_adds_an_int_word_list_the_parameters_follow(self) -> None:
+        """
+        ``offer_depth`` adds ``test:0``'s INT word list, and the frame follows it.
+
+        The value stored is the list's first entry, as a device powered on at
+        that depth would report it.
+        """
+        dev = FakeSaneDev()
+
+        dev.offer_depth()
+
+        option = {opt[1]: opt for opt in dev.get_options()}["depth"]
+        assert option[4] == 1
+        assert option[8] == [1, 8, 16]
+        setattr(dev, _DEPTH, 16)
+        assert dev.get_parameters()[3] == 16
+
+    def test_offer_depth_takes_the_values_a_device_lists(self) -> None:
+        """A device that only lists 16 reports 16 from the start."""
+        dev = FakeSaneDev()
+
+        dev.offer_depth([16])
+
+        assert {opt[1]: opt[8] for opt in dev.get_options()}["depth"] == [16]
+        assert getattr(dev, _DEPTH) == 16
+        assert dev.get_parameters()[3] == 16
+
+    def test_set_parameters_overrides_what_is_reported(self) -> None:
+        """
+        A knob reports a 16-bit or very large frame without building one.
+
+        Bytes per line are derived from whatever was overridden, unless they
+        were overridden too.
+        """
+        dev = FakeSaneDev()
+        dev.mode = "Gray"
+
+        dev.set_parameters(depth=16, pixels_per_line=5000, lines=7000)
+
+        assert dev.get_parameters() == ("gray", 1, (5000, 7000), 16, 10000)
+
+        dev.set_parameters(bytes_per_line=3)
+
+        assert dev.get_parameters()[4] == 3
+
+    def test_an_armed_get_parameters_failure_raises(self) -> None:
+        """``fail_call`` reaches ``get_parameters`` like any other device method."""
+        dev = FakeSaneDev()
+        dev.fail_call("get_parameters", FakeSaneError("I/O error"))
+
+        with pytest.raises(FakeSaneError, match="I/O error"):
+            dev.get_parameters()
+
+    def test_option_and_parameter_reads_are_counted_through_every_handle(
+        self,
+    ) -> None:
+        """
+        Each ``get_options()`` and ``get_parameters()`` a handle makes is counted.
+
+        A closed handle refuses both before the device counts anything.
+        """
+        module = FakeSaneModule()
+        first = module.open(_DEVICE)
+        first.get_options()
+        first.get_parameters()
+        first.close()
+        second = module.open(_DEVICE)
+        second.get_options()
+        second.close()
+
+        with pytest.raises(FakeSaneError):
+            second.get_options()
+        with pytest.raises(FakeSaneError):
+            second.get_parameters()
+
+        assert module.device.get_options_calls == 2
+        assert module.device.get_parameters_calls == 1
