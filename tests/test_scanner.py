@@ -1841,8 +1841,10 @@ def _feeder_settings() -> ScanSettings:
     """
     Build settings that route to the ADF through the shared fake's options.
 
-    The mode is ``"Color"`` and not ``"color"`` because the fake carries the
-    real device's list constraint, which rejects an unlisted value.
+    The mode is the device's own spelling, ``"Color"``.  The fake would also
+    take ``"color"``, as libsane does, by matching a case-differing unique
+    prefix and storing the listed entry; using the listed spelling keeps these
+    tests about feeder routing rather than about that matching.
 
     Returns:
         Settings whose source classifies as a feeder.
@@ -3412,7 +3414,7 @@ class TestReinitialise:
             order.append("exit")
             real_exit()
 
-        def recording_init() -> tuple[int, int, int]:
+        def recording_init() -> tuple[int, int, int, int]:
             """
             Record the start, then make it.
 
@@ -3581,7 +3583,7 @@ class TestReinitialise:
         rather than assuming a SANE that is not there.
         """
 
-        def failing_init() -> tuple[int, int, int]:
+        def failing_init() -> tuple[int, int, int, int]:
             """
             Count the call and fail, as a SANE that cannot start does.
 
@@ -3608,7 +3610,7 @@ class TestReinitialise:
         assert fake_sane_module.init_call_count == inits_before + 1
         # The version, not ``done``: a type checker still holds ``done`` at the
         # False asserted above.  Only a successful init records a version.
-        assert sane_backend_mod._INIT.version == (1, 0, 3)
+        assert sane_backend_mod._INIT.version == (16777248, 1, 0, 32)
 
 
 # The child process the exit proof runs, and the bound it is given.
@@ -3907,20 +3909,22 @@ class TestPaperSizeGeometry:
         fake_sane_module: FakeSaneModule,
         page_sink: SpooledPageSink,
     ) -> None:
-        """When paper_size='letter', dev.br_x=215.9 and dev.br_y=279.4."""
+        """
+        When paper_size='letter', 215.9 x 279.4 mm is written to the device.
+
+        This asserts the quantised value.  The default table's geometry range
+        has a 1 mm step, as real devices' ranges do, so the device stores the
+        nearest whole millimetre: 216.0 x 279.0.  The fixed-point tolerance
+        with no step at all is proven by ``TestClampedScanArea``.
+        """
         mock_dev = fake_sane_module.open(_TEST_DEVICE)
         mock_dev.load_feeder([Image.new("RGB", (2600, 3400), "white")])
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", paper_size="letter"
         )
         sane_backend.scan_pages("test:device:001", settings, page_sink)
-        # SANE_Fixed is a 16.16 fixed-point integer, so letter's 215.9 mm is not
-        # exactly representable and reads back differing in the low bits without
-        # the device having clamped anything. The deleted double stored floats
-        # verbatim and hid that entirely -- which is precisely why D-19 compares
-        # scan areas with a tolerance instead of for equality.
-        assert mock_dev.br_x == pytest.approx(215.9, abs=1e-4)
-        assert mock_dev.br_y == pytest.approx(279.4, abs=1e-4)
+        assert mock_dev.br_x == 216.0
+        assert mock_dev.br_y == 279.0
 
     # A geometry-less device's scan is asserted, crop size included, by
     # TestPaperSizeCropFallback.test_crop_fallback_when_geometry_fails below.
@@ -4200,6 +4204,10 @@ class TestGeometryUnit:
         5000 dpi is clamped by the device to 1200.  Converting with the
         requested value would reintroduce the very substitution bug D-11 cures,
         one layer further down.
+
+        This asserts the quantised value: A4 at 1200 dpi is 9921.26 x 14031.50
+        pixels, which the range's 1-pixel step stores as 9921.0 x 14031.0.  At
+        the requested 5000 dpi it would have been over 41,000 pixels wide.
         """
         dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
         backend = _backend_with(dev, monkeypatch)
@@ -4209,8 +4217,8 @@ class TestGeometryUnit:
 
         backend.scan_pages("test:0", settings, page_sink)
 
-        assert dev.br_x == pytest.approx(210.0 * 1200 / 25.4)
-        assert dev.br_y == pytest.approx(297.0 * 1200 / 25.4)
+        assert dev.br_x == 9921.0
+        assert dev.br_y == 14031.0
 
     @pytest.mark.parametrize("unit", sorted(set(GeometryUnit) - _CONVERTIBLE_UNITS))
     def test_an_unconvertible_unit_falls_through_to_the_crop(
@@ -4388,8 +4396,11 @@ class TestClampedScanArea:
         Letter's 215.9 mm is not representable in SANE's 16.16 fixed point, so
         it reads back inexact on a device that clamped nothing.  Comparing for
         equality would send this perfectly good scan down the crop path.
+
+        The device's range has no step (quant 0), so nothing is quantised and
+        the fixed-point representation is the only difference left to see.
         """
-        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 1.0))
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 0.0))
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", paper_size="letter"

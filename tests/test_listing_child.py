@@ -219,7 +219,7 @@ class _OrderedFakeSane(FakeSaneModule):
         super().__init__(devices=devices, init_error=init_error)
         self.events = events
 
-    def init(self) -> tuple[int, int, int]:
+    def init(self) -> tuple[int, int, int, int]:
         """
         Record the call in the shared list, then behave as the parent does.
 

@@ -1,38 +1,46 @@
 """
 One faithful double for python-sane 2.9.2, shared by every test that needs one.
 
-This module exists because three hand-written doubles disagreed with the real
-library and with each other, and each disagreement let a shipped defect earn a
-green test (M-32).  The rules below are not invented: every one was executed
-against python-sane 2.9.2 and recorded in ``24-RESEARCH.md`` Finding 7.  The
-specification is ``.venv/lib/python3.14/site-packages/sane.py`` -- lines
-107-134 for the ADF iterator and 188-236 for attribute access -- not this
-docstring.
+This module exists because hand-written doubles disagreed with the real library
+and with each other, and each disagreement let a shipped defect earn a green
+test.  The specification is not this docstring: it is
+``tests/test_fake_sane_contract.py``, which runs each rule below against this
+double and against the real SANE ``test:0`` backend in the same parametrised
+row, so a rule the double gets wrong turns red there.  python-sane's own
+``sane.py`` and ``_sane.c``, and libsane's ``sanei_constrain_value``, are what
+the rules are ported from.
 
-The five behaviours a double gets wrong, and which this one gets right:
+What the double models:
 
 1. Assigning an **unknown** option name stores it silently in ``__dict__``.
-   There is no device call, no validation and no raise.  The geometry-less
-   double this replaced *raised* here, the exact inverse, and that is why
-   ``_set_geometry`` could always return True while the crop fallback it
-   guarded was unreachable.  That double is deleted (D-09).
-2. Assigning a **bad value** to a known option raises the local error type
-   (the real ``_sane.error: Invalid argument``) -- but only for a *list*
-   constraint.  A *range* constraint clamps silently and reports success.
-3. Assigning the **wrong Python type** raises a plain ``TypeError`` from the C
-   layer before SANE is reached.  This is the row CONTEXT.md does not name.
-4. Buttons, groups, inactive options and the read-only attributes raise
+   There is no device call, no validation and no raise, so code cannot learn
+   that a device lacks an option by catching an error; it has to read the
+   option list.
+2. A **string** value is first cut to the option's size less one, as
+   python-sane copies it into a buffer of that size.  A string list then takes
+   a case-insensitive unique prefix and stores the listed spelling: ``"gray"``
+   and ``"G"`` both become ``"Gray"``.  An exact match of any case wins at
+   once; no match, or several, raises the local error type (the real
+   ``_sane.error: Invalid argument``).  Nothing is stripped.
+3. A **number** is compared as a SANE word.  A word list snaps to its nearest
+   member, a tie keeping the earlier entry.  A range clamps, then quantises to
+   its step, rounding half up.  Neither ever raises.  ``TYPE_FIXED`` values go
+   through SANE's 16.16 fixed-point representation, truncated toward zero, so
+   a length like letter's 215.9 mm does not read back exactly as written even
+   where a range has no step.
+4. Assigning the **wrong Python type** raises a plain ``TypeError`` from the C
+   layer before SANE is reached: a ``TYPE_INT`` option refuses a float, even a
+   whole one, and a ``TYPE_FIXED`` option refuses a string.  ``TYPE_INT``
+   values are stored and read back as ``int``, ``True`` as ``1``.
+5. Buttons, groups, inactive options and the read-only attributes raise
    ``AttributeError`` with a specific message.
-5. ``multi_scan()`` **cannot raise** -- it only constructs the iterator.  The
+6. ``multi_scan()`` **cannot raise** -- it only constructs the iterator.  The
    iterator calls ``start()`` then ``snap()`` once per page, and converts
    exactly one message, ``Document feeder out of documents``, to
    ``StopIteration``.
-
-A sixth behaviour, from the SANE specification rather than from an execution:
-``TYPE_FIXED`` values round-trip through SANE's 16.16 fixed-point
-representation, so a length like letter's 215.9 mm does not read back exactly
-as written.  D-19's clamp detection therefore has to compare with a tolerance;
-an equality test would send every such scan down the crop path.
+7. A cancelled read raises with SANE's own status text, ``Operation was
+   canceled``, and ``init()`` returns python-sane's 4-tuple: the packed version
+   code, then its major, minor and build.
 
 One deliberate, documented divergence: the real ``__load_option_dict`` filters
 ``TYPE_GROUP`` options out of ``opt``, which makes the library's own "Groups
@@ -41,19 +49,20 @@ that branch is exercisable.  Either way a group raises ``AttributeError``; only
 the message differs.
 
 ``narrow_resolution_for_source`` models the option-reload *hazard* rather than
-a measured device.  ``sane.py:188-213`` reloads every option descriptor when a
+a measured device.  ``sane.py`` reloads every option descriptor when a
 ``set_option`` reports ``INFO_RELOAD_OPTIONS``, which a source change does, so a
 resolution accepted against the platen's range can be left standing against a
 feeder's narrower one.  The knob swaps in the narrower range on a source
 assignment and deliberately does **not** re-validate the value already stored,
-which is precisely what makes assignment ordering observable.  Measured caveat
-(assumption A5): the SANE ``test`` backend does **not** behave this way, so this
-hazard cannot be reproduced against real hardware and is modelled here on
-purpose rather than discovered there.
+which is precisely what makes assignment ordering observable.  The SANE
+``test`` backend was measured **not** to behave this way, so this hazard
+cannot be reproduced against real hardware and is modelled here on purpose
+rather than discovered there.
 """
 
 from __future__ import annotations
 
+import operator
 import threading
 import weakref
 from enum import StrEnum
@@ -109,15 +118,20 @@ _SANE_FIXED_SCALE = 65536
 
 _INVALID_ARGUMENT = "Invalid argument"
 _SANE_FIXED_TYPE_ERROR = "SANE_FIXED requires a floating point number"
+_SANE_INT_TYPE_ERROR = "SANE_INT and SANE_BOOL require an integer"
 
-# Realistic constraints.  The long feeder name is the one C-06 mishandled, and
-# resolution is a range because N-01 shipped against a list-only double.
+# Realistic constraints.  The long feeder name is one a real device reports and
+# code has mishandled, and resolution is a range because code has shipped that
+# only understood a list.
 _DEFAULT_SOURCES = ["Flatbed", "Automatic Document Feeder", "ADF Duplex"]
 _DEFAULT_MODES = ["Color", "Gray", "Lineart"]
 _DEFAULT_RESOLUTION_RANGE = (1.0, 1200.0, 1.0)
 _DEFAULT_GEOMETRY_RANGE = (0.0, 300.0, 1.0)
 
 _DEVICE_TUPLE = ("test:0", "TestVendor", "TestModel", "scanner")
+
+# The (major, minor, build) libsane 1.0.32 reports from sane_init.
+_SANE_VERSION = (1, 0, 32)
 
 _GEOMETRY_OPTIONS = (
     ("tl-x", "Top-left x"),
@@ -143,12 +157,12 @@ _DEFAULT_PAGE_SIZE = (200, 300)
 # of after it, and comfortably above the backend's 10 s cancel grace, so it is
 # always the gate -- never this ceiling -- that decides when a blocked read
 # comes back.  It is a bounded wait and not a sleep: nothing waits it out on a
-# passing test, which is what TEST-02 forbids.
+# passing test, which this suite does not allow.
 _READ_GATE_CEILING_SECONDS = 30.0
 
 # The denominator that makes a post-cancel page truncated rather than absent.
 #
-# Measured on real libsane (29-RESEARCH.md Finding 2): a cancelled ``snap()``
+# Measured on real libsane: a cancelled ``snap()``
 # returns a *truncated image* rather than raising -- 3779x242 of a full page,
 # which clears the backend's 10 KB floor and would be spooled by any code that
 # used a late value.  A quarter of the default 200x300 page is 200x75, i.e.
@@ -159,7 +173,7 @@ _TRUNCATED_PAGE_DIVISOR = 4
 
 # The message a real cancelled read raises with when it raises at all: SANE's
 # ``SANE_STATUS_CANCELLED`` renders as this string through ``sane_strstatus``.
-_CANCELLED_MESSAGE = "Operation was cancelled"
+_CANCELLED_MESSAGE = "Operation was canceled"
 
 
 class ReadBlockMode(StrEnum):
@@ -193,6 +207,20 @@ def _option_is_settable(cap: int) -> bool:
     return bool(cap & _CAP_SOFT_SELECT)
 
 
+def _string_size(entries: list[str]) -> int:
+    """
+    Size a string option the way a backend does: its longest entry plus a NUL.
+
+    Args:
+        entries: The option's string list.
+
+    Returns:
+        The byte size SANE reports at index 6 of the option tuple.
+
+    """
+    return max((len(entry) for entry in entries), default=0) + 1
+
+
 def _build_option_table(
     *,
     sources: list[str] | None = None,
@@ -205,9 +233,9 @@ def _build_option_table(
 
     The layout is ``(index, name, title, desc, type, unit, size, cap,
     constraint)``.  Note that names here are **hyphenated** (``tl-x``) while
-    attribute access uses underscores (``dev.tl_x``); D-09's presence check
-    reads the first spelling and the assignment uses the second, so both are
-    load-bearing.
+    attribute access uses underscores (``dev.tl_x``); the backend's presence
+    check reads the first spelling and the assignment uses the second, so both
+    are load-bearing.
 
     Args:
         sources: Source names for the ``source`` list constraint.
@@ -220,6 +248,8 @@ def _build_option_table(
         The option table, ready to hand to :class:`FakeSaneDev`.
 
     """
+    source_list = list(_DEFAULT_SOURCES if sources is None else sources)
+    mode_list = list(_DEFAULT_MODES if modes is None else modes)
     geometry = [
         (
             index,
@@ -242,9 +272,9 @@ def _build_option_table(
             "Selects the scan source",
             _TYPE_STRING,
             _UNIT_NONE,
-            1,
+            _string_size(source_list),
             _CAP_SETTABLE,
-            list(_DEFAULT_SOURCES if sources is None else sources),
+            source_list,
         ),
         (
             2,
@@ -253,9 +283,9 @@ def _build_option_table(
             "Selects the scan mode",
             _TYPE_STRING,
             _UNIT_NONE,
-            1,
+            _string_size(mode_list),
             _CAP_SETTABLE,
-            list(_DEFAULT_MODES if modes is None else modes),
+            mode_list,
         ),
         (
             3,
@@ -298,7 +328,7 @@ def _build_option_table(
             "An option the device currently reports as inactive",
             _TYPE_STRING,
             _UNIT_NONE,
-            1,
+            _string_size(["x"]),
             _CAP_INACTIVE_OPTION,
             ["x"],
         ),
@@ -309,7 +339,7 @@ def _build_option_table(
             "An option the device reports but will not let software set",
             _TYPE_STRING,
             _UNIT_NONE,
-            1,
+            _string_size(["x"]),
             _CAP_NOT_SETTABLE,
             ["x"],
         ),
@@ -330,17 +360,17 @@ def build_option_table(
     reach: ``FakeSaneDev.__init__`` already carries ruff's maximum of five
     arguments (``PLR0913``), and this project forbids suppressing the rule.
 
-    ``omit`` exists for D-09.  A device whose option list simply does not
+    ``omit`` exists for the crop fallback.  A device whose option list does not
     mention the geometry options is the case the old geometry-less double
     claimed to model and got backwards: the real library *stores* ``dev.br_y``
     on such a device rather than raising, so an omitted option table is the
     only way to reproduce the condition that makes the crop fallback
     reachable.
 
-    ``geometry_unit`` exists for D-10.  The unit lives at index 5 of the option
-    tuple, and a backend is free to report its scan area in something other
-    than millimetres, which the geometry arithmetic has to scale by rather than
-    assume away (N-03).
+    ``geometry_unit`` exists for the unit conversion.  The unit lives at index
+    5 of the option tuple, and a backend is free to report its scan area in
+    something other than millimetres, which the geometry arithmetic has to
+    scale by rather than assume away.
 
     Args:
         geometry_range: The ``(min, max, step)`` constraint shared by the four
@@ -366,20 +396,6 @@ def build_option_table(
         for option in _build_option_table(geometry_range=geometry_range)
         if option[1] not in omit
     ]
-
-
-def _string_size(entries: list[str]) -> int:
-    """
-    Size a string option the way a backend does: its longest entry plus a NUL.
-
-    Args:
-        entries: The option's string list.
-
-    Returns:
-        The byte size SANE reports at index 6 of the option tuple.
-
-    """
-    return max((len(entry) for entry in entries), default=0) + 1
 
 
 def build_test0_option_table() -> list[tuple]:
@@ -523,13 +539,16 @@ def _default_values(table: list[tuple]) -> dict[str, Any]:
         if isinstance(constraint, list) and constraint:
             values[key] = constraint[0]
         elif isinstance(constraint, tuple):
-            low, high = float(constraint[0]), float(constraint[1])
+            number = int if value_type in {_TYPE_INT, _TYPE_BOOL} else float
+            low, high = number(constraint[0]), number(constraint[1])
             if key.startswith("br_"):
                 values[key] = high
             elif key == "resolution":
-                values[key] = min(max(300.0, low), high)
+                values[key] = min(max(number(300), low), high)
             else:
                 values[key] = low
+        elif value_type in {_TYPE_INT, _TYPE_BOOL}:
+            values[key] = 0
         elif value_type == _TYPE_FIXED:
             values[key] = 0.0
         else:
@@ -557,6 +576,32 @@ def _as_float(value: object) -> float:
     return float(value)
 
 
+def _as_int(value: object) -> int:
+    """
+    Coerce a value for a ``TYPE_INT`` or ``TYPE_BOOL`` option, or raise.
+
+    python-sane takes any Python ``int`` here, and ``bool`` is one, so
+    ``True`` is stored as ``1``.  Anything else -- a whole-number float
+    included -- is refused by the C layer before SANE sees it.
+
+    Args:
+        value: The assigned value.
+
+    Returns:
+        The value as a plain ``int``.
+
+    Raises:
+        TypeError: If the value is not an ``int``, carrying the exact text the
+            C layer produces.
+
+    """
+    if not isinstance(value, int):
+        raise TypeError(_SANE_INT_TYPE_ERROR)
+    # operator.index always returns an exact int, so a bool is stored as 1 or 0
+    # and reads back as an int, as it does from the real device.
+    return operator.index(value)
+
+
 def _as_str(key: str, value: object) -> str:
     """
     Coerce a value for a ``TYPE_STRING`` option, or raise.
@@ -578,25 +623,157 @@ def _as_str(key: str, value: object) -> str:
     return value
 
 
-def _clamp(value: float, constraint: tuple[float, float, float]) -> float:
+def _sane_fix(value: float) -> int:
     """
-    Clamp to a range constraint silently, exactly as SANE was measured to.
+    Convert to a ``SANE_Fixed`` word, as the ``SANE_FIX`` macro does.
 
-    Measured: ``resolution = 5000`` reads back ``1200.0`` and ``resolution =
-    0`` reads back ``1.0``, with no error and no INFO_INEXACT visible to the
-    caller.  The step is deliberately not quantised -- every measured step is
-    ``1.0``, so quantising would encode a guess rather than an observation.
+    ``SANE_Fixed`` is a 16.16 integer, and the macro's C cast truncates toward
+    zero, so a length that is not a multiple of 1/65536 -- letter's 215.9 mm,
+    for instance -- loses its low bits on the way in.
 
     Args:
-        value: The requested value.
-        constraint: The ``(min, max, step)`` triple.
+        value: The number to convert.
 
     Returns:
-        The value the device would report on read-back.
+        The fixed-point word.
 
     """
-    low, high = float(constraint[0]), float(constraint[1])
-    return min(max(value, low), high)
+    return int(value * _SANE_FIXED_SCALE)
+
+
+def _sane_unfix(word: int) -> float:
+    """
+    Convert a ``SANE_Fixed`` word back to the float python-sane reads out.
+
+    Args:
+        word: The fixed-point word.
+
+    Returns:
+        The value as a float.
+
+    """
+    return word / _SANE_FIXED_SCALE
+
+
+def _match_string(entries: list[str], value: str) -> str:
+    """
+    Pick the list entry a string selects, as ``sanei_constrain_value`` does.
+
+    An entry matches when the value is a case-insensitive prefix of it.  An
+    entry the value matches in full wins at once, whatever its case; otherwise
+    exactly one prefix match wins.  Nothing is stripped, so a leading or
+    trailing space is part of the value, and an empty value prefixes every
+    entry.
+
+    Args:
+        entries: The option's string list.
+        value: The (already truncated) value assigned.
+
+    Returns:
+        The device's own spelling of the selected entry.
+
+    Raises:
+        FakeSaneError: When no entry, or more than one, matches.
+
+    """
+    length = len(value)
+    folded = value.casefold()
+    matches = [
+        entry
+        for entry in entries
+        if length <= len(entry) and entry[:length].casefold() == folded
+    ]
+    for entry in matches:
+        if len(entry) == length:
+            return entry
+    if len(matches) == 1:
+        return matches[0]
+    raise FakeSaneError(_INVALID_ARGUMENT)
+
+
+def _nearest_word(word: int, words: list[int]) -> int:
+    """
+    Snap a word to the nearest member of a word list.
+
+    Ties keep the earlier entry, because only a strictly smaller distance
+    replaces the best found so far.
+
+    Args:
+        word: The requested word.
+        words: The word list, in the order the device reports it.
+
+    Returns:
+        The member closest to ``word``.
+
+    """
+    best = words[0]
+    for member in words[1:]:
+        if abs(member - word) < abs(best - word):
+            best = member
+    return best
+
+
+def _quantise_word(word: int, low: int, high: int, quant: int) -> int:
+    """
+    Clamp a word to a range, then round it to the range's step.
+
+    Rounding is half up from the bottom of the range, and a step of zero
+    means none.  A range never raises: an out-of-range value is silently
+    brought inside it.
+
+    Args:
+        word: The requested word.
+        low: The range's minimum.
+        high: The range's maximum.
+        quant: The range's step, or 0.
+
+    Returns:
+        The word the device stores.
+
+    """
+    word = min(max(word, low), high)
+    if quant:
+        word = min((word - low + quant // 2) // quant * quant + low, high)
+    return word
+
+
+def _constrain_word(word: int, constraint: object) -> int:
+    """
+    Apply a word list or a range to a word; anything else leaves it alone.
+
+    Args:
+        word: The requested word.
+        constraint: The option's constraint, already in words.
+
+    Returns:
+        The word the device stores.
+
+    """
+    if isinstance(constraint, list) and constraint:
+        return _nearest_word(word, constraint)
+    if isinstance(constraint, tuple):
+        low, high, quant = constraint
+        return _quantise_word(word, low, high, quant)
+    return word
+
+
+def _fixed_words(constraint: object) -> object:
+    """
+    Express a ``TYPE_FIXED`` constraint in ``SANE_Fixed`` words.
+
+    Args:
+        constraint: A float word list, a float ``(min, max, step)`` range, or
+            no constraint.
+
+    Returns:
+        The same constraint in words, which is how libsane compares.
+
+    """
+    if isinstance(constraint, list):
+        return [_sane_fix(entry) for entry in constraint]
+    if isinstance(constraint, tuple):
+        return tuple(_sane_fix(bound) for bound in constraint)
+    return constraint
 
 
 def _reject_unsettable(option: tuple, key: str) -> None:
@@ -653,28 +830,17 @@ def _reject_unreadable(option: tuple, key: str) -> None:
         raise AttributeError(msg)
 
 
-def _to_sane_fixed(value: float) -> float:
-    """
-    Round to SANE's 16.16 fixed-point grid, as ``SANE_Fixed`` does.
-
-    A length that is not a multiple of 1/65536 -- letter's 215.9 mm, for
-    instance -- cannot be stored exactly, so it reads back differing in the low
-    bits without the device having clamped anything.  This is the reason D-19
-    compares areas with a tolerance instead of for equality.
-
-    Args:
-        value: The requested value.
-
-    Returns:
-        The nearest value SANE can actually represent.
-
-    """
-    return round(value * _SANE_FIXED_SCALE) / _SANE_FIXED_SCALE
-
-
 def _constrain(option: tuple, key: str, value: object) -> object:
     """
     Apply the option's type and constraint to an assigned value.
+
+    A port of what python-sane and ``sanei_constrain_value`` do between them.
+    Strings are cut to the option's size first, leaving room for the NUL,
+    because python-sane copies them into a buffer of that size before libsane
+    sees them; a string list then takes a case-insensitive unique prefix.  INT
+    and FIXED values are compared as SANE words: a word list snaps to its
+    nearest member and a range clamps and quantises.  Only a string list can
+    refuse a value; the numeric constraints always store something.
 
     Args:
         option: The nine-element option tuple.
@@ -685,21 +851,19 @@ def _constrain(option: tuple, key: str, value: object) -> object:
         The value the device would store.
 
     Raises:
-        FakeSaneError: If a list constraint rejects the value.
+        FakeSaneError: If a string list matches no entry, or several.
 
     """
-    value_type, constraint = option[4], option[8]
+    value_type, size, constraint = option[4], option[6], option[8]
+    if value_type in {_TYPE_INT, _TYPE_BOOL}:
+        return _constrain_word(_as_int(value), constraint)
     if value_type == _TYPE_FIXED:
-        number = _as_float(value)
-        if isinstance(constraint, tuple):
-            return _to_sane_fixed(_clamp(number, constraint))
-        if isinstance(constraint, list) and number not in constraint:
-            raise FakeSaneError(_INVALID_ARGUMENT)
-        return _to_sane_fixed(number)
+        word = _sane_fix(_as_float(value))
+        return _sane_unfix(_constrain_word(word, _fixed_words(constraint)))
     if value_type == _TYPE_STRING:
-        text = _as_str(key, value)
-        if isinstance(constraint, list) and text not in constraint:
-            raise FakeSaneError(_INVALID_ARGUMENT)
+        text = _as_str(key, value)[: max(size - 1, 0)]
+        if isinstance(constraint, list):
+            return _match_string(constraint, text)
         return text
     return value
 
@@ -741,7 +905,7 @@ class _FakeSaneIterator:
 
     It calls ``start()`` then ``snap()`` once per page.  A double that returns
     ``iter(list)`` instead cannot show the per-page call pattern, which is
-    where D-03 and D-04 live.
+    where the backend's per-page error handling lives.
     """
 
     def __init__(self, device: FakeSaneDev) -> None:
@@ -797,8 +961,8 @@ class FakeSaneDev:
     # python-sane object serves these through __getattr__ too, so a purely
     # structural check against it can never succeed -- and the three deleted
     # doubles satisfied the protocol only by declaring concrete attributes the
-    # real library does not have, which is M-32's "fake kinder than the library"
-    # in miniature.
+    # real library does not have: a fake kinder than the library, in
+    # miniature.
     mode: str
     resolution: float
     source: str
@@ -854,8 +1018,8 @@ class FakeSaneDev:
             start_error_page: The zero-based page index at which
                 ``start_error`` fires.
             geometry_range: The ``(min, max, step)`` constraint for the four
-                geometry options.  The default admits A4; plan 24-06 passes
-                ``(0.0, 200.0, 1.0)`` to reproduce D-19's measured clamp.
+                geometry options.  The default admits A4; pass
+                ``(0.0, 200.0, 1.0)`` to reproduce ``test:0``'s measured clamp.
 
         """
         state = self.__dict__
@@ -1038,7 +1202,7 @@ class FakeSaneDev:
         Full width, a fraction of the height, and still above the backend's
         byte floor -- see ``_TRUNCATED_PAGE_DIVISOR`` for the measurement this
         models.  Mode ``RGB``, like every other page this fake produces, so the
-        backend's byte-count arithmetic stays exact (Pitfall 7).
+        backend's byte-count arithmetic stays exact.
 
         Returns:
             A short page that would pass ``_validate_page_image``.
@@ -1086,14 +1250,14 @@ class FakeSaneDev:
         """
         Count the page images this device handed out that are still alive.
 
-        This is HARD-01's proof instrument (D-08).  Every page ``snap()``
-        returns is recorded in ``issued_pages`` as a ``weakref.ref``, and this
-        method calls each one: a reference whose referent has been collected
-        answers ``None``, so what is counted is exactly the pages something
-        else is still holding.
+        This is the proof instrument for bounded page memory.  Every page
+        ``snap()`` returns is recorded in ``issued_pages`` as a
+        ``weakref.ref``, and this method calls each one: a reference whose
+        referent has been collected answers ``None``, so what is counted is
+        exactly the pages something else is still holding.
 
         Two measured facts decided the mechanism, and neither is a style
-        preference (29-RESEARCH.md Finding 4 and Pitfall 6):
+        preference:
 
         1. ``weakref``'s hash-based *set* container cannot hold Pillow images.
            ``Image`` defines ``__eq__`` without ``__hash__``, so it is
@@ -1111,7 +1275,7 @@ class FakeSaneDev:
         three references to a page, and ``crop`` and ``convert("L")`` each
         produce one more decoded image downstream.  The real decoded ceiling is
         therefore roughly two to three pages -- but it is **constant in N**,
-        and that constancy is the claim HARD-01 actually defends.
+        and that constancy is the claim the memory tests actually defend.
 
         Returns:
             How many issued page images have not yet been collected.
@@ -1125,7 +1289,7 @@ class FakeSaneDev:
 
         python-sane raises ``_sane.error``, ``RuntimeError`` or
         ``AttributeError`` from its device methods with no shared base, and the
-        backend has to turn each into a saneless type naming the device (D-08).
+        backend has to turn each into a saneless type naming the device.
         A method rather than a constructor keyword for the usual reason:
         ``__init__`` already carries ruff's maximum of five arguments.
 
@@ -1150,7 +1314,7 @@ class FakeSaneDev:
         A real device refuses an assignment for reasons the table cannot always
         express -- ``_sane.error("Invalid argument")`` from the backend, or an
         option that went inactive after a reload.  The backend must name the
-        option and the value when that happens (D-08).
+        option and the value when that happens.
 
         Args:
             option: The underscore-spelled option name, e.g. ``"mode"``.
@@ -1178,7 +1342,7 @@ class FakeSaneDev:
         one outside them -- this project's "ADF Manual Duplex" pseudo-source, or
         a name chosen to exercise the classifier -- narrows the constraint here
         rather than by subclassing the fake, which would reintroduce exactly the
-        per-file drift D-17 exists to prevent.
+        per-file drift a single shared double exists to prevent.
 
         Args:
             sources: The source names the device should report.
@@ -1190,6 +1354,10 @@ class FakeSaneDev:
         """
         Swap one option's constraint, keeping the lookup table consistent.
 
+        A string option's size is recomputed from a new string list, as a
+        device reports it: a size left over from a shorter list would cut the
+        new names down before they were matched.
+
         Args:
             name: The hyphenated option name, as ``get_options()`` reports it.
             constraint: The constraint the device should report from now on.
@@ -1199,7 +1367,12 @@ class FakeSaneDev:
         key = name.replace("-", "_")
         for index, option in enumerate(options):
             if option[1] == name:
-                replaced = (*option[:8], constraint)
+                size = (
+                    _string_size(constraint)
+                    if option[4] == _TYPE_STRING and isinstance(constraint, list)
+                    else option[6]
+                )
+                replaced = (*option[:6], size, option[7], constraint)
                 options[index] = replaced
                 self.__dict__["opt"][key] = replaced
                 if isinstance(constraint, list) and constraint:
@@ -1402,7 +1575,7 @@ class FakeSaneDev:
         # page about to be returned is itself counted.  That is deliberate: it
         # is what makes 2 the honest high-water mark, because the backend's
         # loop variable still references page k-1 at the moment page k is
-        # handed over (D-08).  See live_page_images() for why a weakref list
+        # handed over.  See live_page_images() for why a weakref list
         # and not a weak-reference set, and why not tracemalloc.
         self.issued_pages.append(weakref.ref(page))
         live = self.live_page_images()
@@ -1441,12 +1614,13 @@ class FakeSaneDev:
         """
         Record that the device was closed, and whether a read was blocked.
 
-        ``close_while_blocked`` is the assertion HARD-03 turns on.  The SANE
-        standard forbids any other operation while a read is outstanding, and
-        ``sane_close`` additionally runs holding the GIL, so a close racing a
-        read is doubly unsafe.  The fake records it rather than refusing it:
-        a double that refused would turn the defect into an exception the
-        backend could catch, instead of the silent corruption it really is.
+        ``close_while_blocked`` is what the close-ordering tests assert on.
+        The SANE standard forbids any other operation while a read is
+        outstanding, and ``sane_close`` additionally runs holding the GIL, so a
+        close racing a read is doubly unsafe.  The fake records it rather than
+        refusing it: a double that refused would turn the defect into an
+        exception the backend could catch, instead of the silent corruption it
+        really is.
 
         Raises:
             BaseException: The error armed with ``fail_call("close", ...)``,
@@ -1494,7 +1668,7 @@ class FakeSaneModule:
         self.init_call_count = 0
         self.exit_call_count = 0
         # Counted for the same reason FakeSaneDev records its own calls: the
-        # wedge refusal (D-13) has to happen *before* any SANE traffic, and
+        # wedge refusal has to happen *before* any SANE traffic, and
         # "the call was never made" cannot be asserted on a return value.
         self.get_devices_call_count = 0
         self.exit_while_blocked = False
@@ -1508,12 +1682,15 @@ class FakeSaneModule:
             else list(devices)
         )
 
-    def init(self) -> tuple[int, int, int]:
+    def init(self) -> tuple[int, int, int, int]:
         """
         Record the call and report a SANE version.
 
+        The shape is python-sane's: the packed version code, then its major,
+        minor and build.  The numbers are the ones libsane 1.0.32 returns.
+
         Returns:
-            The version tuple the real ``sane.init()`` returns.
+            ``(version_code, major, minor, build)``.
 
         Raises:
             BaseException: The configured ``init_error``.
@@ -1522,7 +1699,8 @@ class FakeSaneModule:
         self.init_call_count += 1
         if self._init_error is not None:
             raise self._init_error
-        return (1, 0, 3)
+        major, minor, build = _SANE_VERSION
+        return (major << 24 | minor << 16 | build, major, minor, build)
 
     def get_devices(self) -> list[tuple[str, str, str, str]]:
         """
@@ -1566,8 +1744,8 @@ class FakeSaneModule:
         ``sane_exit`` closes every handle that is still open **and** runs
         holding the GIL, so calling it while a read is outstanding is the same
         hazard as ``close()`` and then some.  ``exit_while_blocked`` records
-        it; ``exit_call_count`` keeps the meaning D-19's assertions already
-        read it with, unchanged.
+        it; ``exit_call_count`` keeps the meaning the shutdown assertions
+        already read it with, unchanged.
         """
         if self._device.read_is_blocked():
             self.exit_while_blocked = True

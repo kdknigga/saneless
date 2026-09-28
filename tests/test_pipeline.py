@@ -2533,8 +2533,8 @@ class TestManualDuplexOverTheSharedFake:
         profile = default_settings.profiles["default"]
         profile.source = "ADF"
         profile.duplex = "manual"
-        # The fake carries the real device's list constraints, which reject an
-        # unlisted value -- so the mode is the device's own spelling.
+        # The device's own spelling.  Like libsane, the fake would also take a
+        # case-differing unique prefix such as "color" and store "Color".
         profile.mode = "Color"
 
         dev = FakeSaneDev()

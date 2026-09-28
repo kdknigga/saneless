@@ -1233,7 +1233,7 @@ class _SaneCallsByThread:
         real_init = fake.init
         real_exit = fake.exit
 
-        def recording_init() -> tuple[int, int, int]:
+        def recording_init() -> tuple[int, int, int, int]:
             self._record("init")
             return real_init()
 
