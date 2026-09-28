@@ -12,7 +12,7 @@ from __future__ import annotations
 import signal
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
-from typing import TYPE_CHECKING, Final, Literal, Protocol, assert_never
+from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeIs, assert_never
 
 from saneless.exceptions import (
     AllPagesBlankError,
@@ -57,6 +57,8 @@ __all__ = [
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
     "TOKEN_UNSET_JOB_ERROR",
+    "UNCONFIRMED_FILING_LABEL",
+    "UNCONFIRMED_SEND_LABEL",
     "URL_UNSET_JOB_ERROR",
     "WAITING_STATES",
     "WARNED_UPLOAD_LABEL",
@@ -103,8 +105,10 @@ __all__ = [
     "exit_code_for_outcome",
     "exit_code_for_signal",
     "flip_answer_label",
+    "is_amber_category",
     "job_label",
     "job_state_for",
+    "job_status_class",
     "local_time",
     "multi_page_manual_duplex_refusal",
     "outcome_line",
@@ -745,6 +749,17 @@ RESTART_REASON: Final = "The server restarted before this scan finished"
 # ``state_label``, so the CLI outcome line, the web status area and the
 # history row cannot drift apart.  Neither carries a configured value.
 WARNED_UPLOAD_LABEL: Final = "Uploaded with a warning"
+
+# The words for a failure that may already be in paperless-ngx, in place of
+# "Failed".  The job is an ERROR, but "Failed" -- like the red it is drawn in --
+# reads as "scan it again", and a rescan here can file the document twice.  The
+# first is for an upload that was sent with no usable answer back; the second,
+# the stronger statement, for one paperless-ngx accepted but did not confirm
+# filing.  ``job_label`` picks them from the category, so the history row and
+# ``saneless jobs`` cannot drift apart.  Both fit the status column of
+# ``saneless jobs``, which is sized from the widest state label.
+UNCONFIRMED_SEND_LABEL: Final = "May be in paperless-ngx"
+UNCONFIRMED_FILING_LABEL: Final = "Received, not confirmed"
 FALLBACK_NOT_UPLOADED_LINE: Final = (
     "Not uploaded: saved to the consume folder without its title, tags or correspondent"
 )
@@ -978,20 +993,26 @@ def state_label(state: JobState) -> str:
     return label
 
 
-def job_label(state: JobState, warning: str | None) -> str:
+def job_label(
+    state: JobState, warning: str | None, category: ErrorCategory | None = None
+) -> str:
     """
     Return the history-row label for a job, taking its warning into account.
 
     A DONE job that carries a warning -- a sheet the scanner skipped, or
     manual-duplex front and back counts that differed -- was uploaded, but
     calling it "Complete" would hide the warning from anyone skimming the
-    history.  It gets ``WARNED_UPLOAD_LABEL`` instead.  Every other case,
+    history.  It gets ``WARNED_UPLOAD_LABEL`` instead.  An ERROR whose category
+    is amber (``is_amber_category``) may already be in paperless-ngx, so it
+    gets that category's label rather than "Failed".  Every other case,
     including a FALLBACK with a warning, is exactly ``state_label``: there is no
-    ``JobState`` member for a warned upload, only a DONE plus a warning.
+    ``JobState`` member for a warned upload, only a DONE plus a warning, and no
+    member for a maybe-delivered one, only an ERROR plus its category.
 
     Args:
         state: The job state to label.
         warning: The job's warning, if any.  An empty string is no warning.
+        category: The job's error category, if any.  Only an ERROR reads it.
 
     Returns:
         The user-facing label, e.g. ``"Uploaded with a warning"``.
@@ -1002,7 +1023,131 @@ def job_label(state: JobState, warning: str | None) -> str:
     """
     if state is JobState.DONE and warning:
         return WARNED_UPLOAD_LABEL
+    if state is JobState.ERROR and category is not None and is_amber_category(category):
+        return _unconfirmed_label(category)
     return state_label(state)
+
+
+def _unconfirmed_label(category: _UnconfirmedCategory) -> str:
+    """
+    Return the history-row label for a failure that may be in paperless-ngx.
+
+    Args:
+        category: One of the two amber categories.
+
+    Returns:
+        ``UNCONFIRMED_SEND_LABEL`` or ``UNCONFIRMED_FILING_LABEL``.
+
+    Raises:
+        AssertionError: If the value is not one of the two amber categories.
+
+    """
+    match category:
+        case ErrorCategory.UNCONFIRMED_SEND:
+            label = UNCONFIRMED_SEND_LABEL
+        case ErrorCategory.UNCONFIRMED_FILING:
+            label = UNCONFIRMED_FILING_LABEL
+        case _:
+            assert_never(category)
+    return label
+
+
+def is_amber_category(category: ErrorCategory) -> TypeIs[_UnconfirmedCategory]:
+    """
+    Return whether a failure in this category is drawn amber rather than red.
+
+    Red reads as "scan it again".  A failure that may already be in
+    paperless-ngx -- sent with no usable answer, or accepted and not confirmed
+    -- must not say that before the reader has checked the document list, so
+    it wears the amber of a warned upload instead.  Every other failure did
+    not deliver the scan, and is red.
+
+    The match is exhaustive, so a new category has to choose its tone here.
+    A True answer also narrows the category to the two amber members, so a
+    caller can go on to pick the amber label or advice without a second list.
+
+    Args:
+        category: The failed job's error category.
+
+    Returns:
+        True for ``UNCONFIRMED_SEND`` and ``UNCONFIRMED_FILING``, else False.
+
+    Raises:
+        AssertionError: If the value is not an ErrorCategory member.
+
+    """
+    match category:
+        case ErrorCategory.UNCONFIRMED_SEND | ErrorCategory.UNCONFIRMED_FILING:
+            amber = True
+        case (
+            ErrorCategory.FEEDER
+            | ErrorCategory.CONFIG
+            | ErrorCategory.SCANNER
+            | ErrorCategory.UPLOAD
+            | ErrorCategory.UNKNOWN
+            | ErrorCategory.REJECTED
+            | ErrorCategory.ASSEMBLY
+            | ErrorCategory.ALL_BLANK
+            | ErrorCategory.PAPERLESS_VERSION
+            | ErrorCategory.DISK_SPACE
+        ):
+            amber = False
+        case _:
+            assert_never(category)
+    return amber
+
+
+def job_status_class(
+    state: JobState, warning: str | None, category: ErrorCategory | None
+) -> str:
+    """
+    Return the CSS class that colours a job's status wherever it is listed.
+
+    The one place a row's tone is decided, so no template compares states to
+    pick a class.  A clean DONE is green.  A warned DONE and a FALLBACK are
+    amber: delivered, but not cleanly.  An ERROR is red unless its category is
+    amber (``is_amber_category``), and an ERROR recorded before categories
+    existed is red.  A cancel is its own muted colour.  A job still in flight
+    gets no class at all.
+
+    Args:
+        state: The job state.
+        warning: The job's warning, if any.  An empty string is no warning.
+        category: The job's error category, if any.  Only an ERROR reads it.
+
+    Returns:
+        ``"status-done"``, ``"status-fallback"``, ``"status-error"``,
+        ``"status-cancelled"``, or ``""`` for an active job.
+
+    Raises:
+        AssertionError: If the value is not a JobState member.
+
+    """
+    match state:
+        case JobState.DONE:
+            css = "status-fallback" if warning else "status-done"
+        case JobState.FALLBACK:
+            css = "status-fallback"
+        case JobState.ERROR:
+            amber = category is not None and is_amber_category(category)
+            css = "status-fallback" if amber else "status-error"
+        case JobState.CANCELLED:
+            css = "status-cancelled"
+        case (
+            JobState.PENDING
+            | JobState.SCANNING
+            | JobState.AWAITING_FLIP
+            | JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+            | JobState.SCANNING_REVERSE
+            | JobState.ASSEMBLING
+            | JobState.UPLOADING
+        ):
+            css = ""
+        case _:
+            assert_never(state)
+    return css
 
 
 def outcome_line(state: JobState, warning: str | None, title: str) -> str:

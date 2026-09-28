@@ -91,6 +91,8 @@ from .vocabulary import (
     MULTI_PAGE_NEEDS_TERMINAL,
     MULTI_PAGE_OPTION_HELP,
     NOTHING_TO_FINISH,
+    UNCONFIRMED_FILING_LABEL,
+    UNCONFIRMED_SEND_LABEL,
     WARNED_UPLOAD_LABEL,
     ConfigFileState,
     ErrorCategory,
@@ -146,9 +148,14 @@ _LISTEN_BACKLOG: Final = 2048
 # and a new JobState member must not be able to overflow an 80-column
 # terminal without anyone noticing. A DONE row that carries a warning is
 # labelled from the state and the warning together rather than by a state of
-# its own, so its label joins the max explicitly.
+# its own, so its label joins the max explicitly, and so do the labels of the
+# two failures that may already be in paperless-ngx, which come from the
+# category rather than the state.
 _STATUS_COL_WIDTH = max(
-    *(len(state_label(state)) for state in JobState), len(WARNED_UPLOAD_LABEL)
+    *(len(state_label(state)) for state in JobState),
+    len(WARNED_UPLOAD_LABEL),
+    len(UNCONFIRMED_SEND_LABEL),
+    len(UNCONFIRMED_FILING_LABEL),
 )
 
 # Width of the Profile column in `saneless jobs`, and the floor the Title
@@ -1883,7 +1890,7 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                     f"{local_time(j.created_at):<{ts_w}} "
                     f"{profile:<{profile_w}} "
                     f"{title:<{title_w}} "
-                    f"{job_label(j.state, j.warning)}"
+                    f"{job_label(j.state, j.warning, j.error_category)}"
                 )
     finally:
         store.close()

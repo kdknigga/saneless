@@ -160,12 +160,24 @@
          A NULL error_category is a row written before categories were
          recorded.  It renders today's shape verbatim: substituting UNKNOWN would
          print "Something went wrong." over a row that still holds a truthful
-         specific message. #}
+         specific message.
+
+         A failure whose category is amber may already be in paperless-ngx.  It
+         reads in the fallback amber with the warning sign, and like a warned
+         upload it is not announced as an alert: red and an alert both say
+         "scan it again", which is the one thing its next step asks the reader
+         not to do before checking the document list.  The disclosure is the
+         same in both arms. #}
       {% if job.error_category %}
+      {% if job.error_category | is_amber_category %}
+      <p class="status-fallback">&#9888; {{ job.error_category | error_message }}</p>
+      <p>{{ job.error_category | error_next_step }}</p>
+      {% else %}
       <div role="alert">
         <p class="status-error">&#10007; {{ job.error_category | error_message }}</p>
         <p>{{ job.error_category | error_next_step }}</p>
       </div>
+      {% endif %}
       <details class="tech-details">
         <summary>Technical details</summary>
         <p>{{ job.error }}</p>

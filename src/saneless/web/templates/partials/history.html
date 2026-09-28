@@ -19,10 +19,13 @@
      The guard is the filter returning None, never truthiness.  The pages
      removed as blank are a further line of the same kind, not a warning. #}
   <td>{{ job.title }}{% set counts = job | page_counts %}{% if counts %}<span class="page-counts">{{ counts }}</span>{% endif %}{% set removed = job | removed_pages %}{% if removed %}<span class="page-counts">{{ removed }}</span>{% endif %}</td>
-  {# A warned upload is checked first and wears the fallback amber: it was
-     uploaded, but it is not the clean success the green would claim. #}
-  <td class="{% if job.state == JobState.DONE and job.warning %}status-fallback{% elif job.state == JobState.DONE %}status-done{% elif job.state == JobState.FALLBACK %}status-fallback{% elif job.state == JobState.ERROR %}status-error{% elif job.state == JobState.CANCELLED %}status-cancelled{% endif %}">
-    {{ job.state | job_label(job.warning) }}
+  {# The colour and the label both come from vocabulary, never from a state
+     comparison here.  A warned upload wears the fallback amber: it was
+     uploaded, but it is not the clean success the green would claim.  A
+     failure that may already be in paperless-ngx wears it too, labelled by
+     its category, because the red "Failed" reads as "scan it again". #}
+  <td class="{{ job.state | job_status_class(job.warning, job.error_category) }}">
+    {{ job.state | job_label(job.warning, job.error_category) }}
   </td>
 </tr>
 {% endfor %}

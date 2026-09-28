@@ -31,7 +31,9 @@ from saneless.vocabulary import (
     error_message,
     error_next_step,
     flip_answer_label,
+    is_amber_category,
     job_label,
+    job_status_class,
     local_time,
     outcome_line,
     page_counts,
@@ -99,6 +101,12 @@ def _build_templates() -> Jinja2Templates:
     # and so calls a warned upload "Complete", and a template that reached for
     # it would bring that label back.
     templates.env.filters["job_label"] = job_label
+    # A row's colour is chosen by the same kind of function as its label, from
+    # the state, the warning and the category, so no template compares states
+    # to pick a class.  The status area asks whether an ERROR's category is
+    # amber on its own, to drop the alert role as well as the red.
+    templates.env.filters["job_status_class"] = job_status_class
+    templates.env.filters["is_amber_category"] = is_amber_category
     templates.env.filters["outcome_line"] = outcome_line
     templates.env.filters["progress_label"] = progress_label
     templates.env.filters["flip_answer_label"] = flip_answer_label
