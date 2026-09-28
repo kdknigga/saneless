@@ -3251,6 +3251,71 @@ class TestSaneBackendCancelSequence:
         assert fake_device.close_while_blocked is False
         assert page_sink.records == ()
 
+    def test_a_timed_out_feeder_page_sends_one_cancel_in_all(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        After a feeder page times out, the only cancel is the one the timeout sent.
+
+        Three things used to send one each: the timeout's own canceller, the
+        feeder iterator's finaliser when it was dropped, and the device
+        context's routine cancel before close.  On the ``net`` backend each is
+        a request to a host that may have stopped answering, and the last two
+        ran on the worker thread with no bound.  Counted after the context has
+        exited and after a collection, so an iterator released late by a
+        reference cycle would still be counted if it cancelled an open handle.
+        """
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        # The device context is the outer one, so the timeout is caught, and
+        # its traceback let go of, while the handle is still open.
+        with (
+            sane_backend._open_device(_TEST_DEVICE) as dev,
+            pytest.raises(ScanError, match="timed out"),
+        ):
+            sane_backend._scan_adf_pages(
+                dev, page_sink, _UNCROPPED, timeout_per_page=0.05
+            )
+        gc.collect()
+
+        assert fake_device.cancel_calls == 1
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_blocked is False
+
+    def test_a_timed_out_flatbed_page_sends_one_cancel_in_all(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        After a flatbed page times out, the device context sends no second cancel.
+
+        The flatbed has no iterator, so the one extra cancel it could send is
+        the routine one before close.
+        """
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        with (
+            sane_backend._open_device(_TEST_DEVICE) as dev,
+            pytest.raises(ScanError, match="timed out"),
+        ):
+            sane_backend_mod._snap_flatbed(
+                dev,
+                _TEST_DEVICE,
+                page_sink,
+                _UNCROPPED,
+                sane_backend_mod._PageBudget(timeout=0.05),
+            )
+        gc.collect()
+
+        assert fake_device.cancel_calls == 1
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_blocked is False
+
     @pytest.mark.parametrize(
         "interruption",
         [
