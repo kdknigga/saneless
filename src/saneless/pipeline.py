@@ -2361,11 +2361,14 @@ class _PipelineRun:
             # nothing, and a stop at the prompt must not keep it as a pass in
             # flight.
             self.ledger.discard(sink)
+            # With its traceback: the operator is about to work around this
+            # fault, so this line is the only record of where it came from.
             logger.warning(
                 "Multi-page pass %d failed, %d page(s) kept: %r",
                 pass_number,
                 document.kept,
                 exc,
+                exc_info=exc,
             )
             return exc
         return sink, batch
@@ -2552,9 +2555,12 @@ class _PipelineRun:
         self.ledger.unreadable_sheets += batch.pages_rejected
         self.artefacts.document = tuple(document.records)
         self.ledger.forget(sink)
+        # Numbered as the pass was started, thrown-away passes included, the
+        # same way the failed-pass line and the spool label number it.  The
+        # pass accepted here is always the one started last.
         logger.info(
             "Multi-page pass %d: scanned %d page(s), skipped %d; %d kept so far",
-            len(document.passes),
+            document.started,
             pages,
             len(skipped),
             document.kept,

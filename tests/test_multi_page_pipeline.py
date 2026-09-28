@@ -1458,7 +1458,12 @@ class TestMultiPageScannerFault:
     def test_the_failure_is_logged_once(
         self, rig: _Rig, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The jam is logged at WARNING, once, as the exception's ``repr``."""
+        """
+        The jam is logged at WARNING, once, as the exception's ``repr``.
+
+        With its traceback: the operator worked around the fault, so this line
+        is the only record of where it came from.
+        """
         jam = ScanError(_JAM)
         scanner = DistinctPageScanner(passes=((0,), (1,)), fail_on={2: jam})
         coordinator = ScriptedPassCoordinator([_NEXT, _FINISH])
@@ -1472,6 +1477,31 @@ class TestMultiPageScannerFault:
             if record.levelno == logging.WARNING and repr(jam) in record.getMessage()
         ]
         assert len(logged) == 1
+        (record,) = logged
+        assert record.exc_info is not None
+        assert record.exc_info[1] is jam
+
+    def test_both_pass_log_lines_number_a_pass_the_same_way(
+        self, rig: _Rig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A pass after a failed one is logged under the number it was scanned as.
+
+        The failure line numbers passes as they were started, thrown-away ones
+        included, so the accepted line must too, or "pass 3 failed" and "pass
+        2: scanned" could name the same spool label.
+        """
+        scanner = _jams_on_pass_2()
+        coordinator = ScriptedPassCoordinator([_NEXT, _NEXT, _FINISH])
+        caplog.set_level(logging.INFO, logger="saneless.pipeline")
+
+        rig.run(scanner, coordinator)
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(m.startswith("Multi-page pass 1: scanned") for m in messages)
+        assert any(m.startswith("Multi-page pass 2 failed") for m in messages)
+        assert any(m.startswith("Multi-page pass 3: scanned") for m in messages)
+        assert not any(m.startswith("Multi-page pass 2: scanned") for m in messages)
 
 
 # The answers a blank-page prompt offers: throw the pass away, or take it
