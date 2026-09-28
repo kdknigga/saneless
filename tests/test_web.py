@@ -1931,9 +1931,7 @@ class TestProfileDescriptionRoute:
         """A byte-empty body is what lets the :empty CSS rule hide the slot."""
         _configure_profiles(client, {"bare": ProfileConfig()})
 
-        response = client.get(
-            "/api/profiles/description", params={"profile": "default"}
-        )
+        response = client.get("/api/profiles/description", params={"profile": "bare"})
 
         assert response.status_code == 200
         assert response.text == ""
@@ -3438,6 +3436,20 @@ class TestProfileDefaultsArePreTicked:
             )
 
         assert response.status_code == 422
+
+    def test_profile_defaults_refresh_with_no_correspondent_chosen(
+        self, tmp_path: Path
+    ) -> None:
+        """The "No correspondent" option sends an empty value, which means none."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.post(
+                "/api/cache/invalidate?resource=correspondents",
+                data={"correspondent": ""},
+            )
+
+        assert response.status_code == 200
+        assert _option(response.text, _RECEIPTS_CORRESPONDENT)
+        assert "selected" not in response.text
 
     def test_profile_defaults_route_answers_with_the_tag_control_hidden(
         self, tmp_path: Path

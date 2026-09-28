@@ -33,9 +33,20 @@
    The label is the tap target, not the box: app.css gives every row the full
    width and a finger-sized height.
 
-   The wrapper carries no request of its own: the list is server-rendered, and
-   the filter box, the refresh button and the filter form each carry theirs. #}
-<div id="tags-list" class="tag-list">
+   The wrapper carries one request of its own, the profile-change refresh,
+   and names its own hx-target and hx-swap so it never inherits the scan
+   form's status-area target.  The include is mandatory on a GET, and it
+   carries the profile alone: the response ticks that profile's defaults and
+   nothing else, replacing the earlier ticks on purpose, because the new
+   profile's defaults are what an untouched form now means.  The filter box,
+   the refresh button and the filter form each carry their own requests,
+   which do keep the ticks. #}
+<div id="tags-list" class="tag-list"
+     hx-get="/api/profiles/tags"
+     hx-trigger="change from:#profile-select"
+     hx-include="#profile-select"
+     hx-target="this"
+     hx-swap="outerHTML">
     {%- for row in stale %}
     <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
     {%- endfor %}

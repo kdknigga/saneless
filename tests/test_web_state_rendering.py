@@ -2463,40 +2463,51 @@ class TestFormHelpTextAndTagPicker:
         ):
             assert attribute in match.group("attrs"), attribute
 
-    def test_the_tag_list_wrapper_asks_for_nothing_on_the_full_page(
+    def test_the_tag_list_wrapper_asks_for_nothing_until_the_profile_changes(
         self, client: TestClient
     ) -> None:
         """
-        The page renders the list itself, so the wrapper carries no request.
+        The page renders the list itself; the wrapper asks only on a change.
 
         The list comes from the same cache ``/api/tags`` reads, so a load
-        trigger here would only fetch what the page already holds.  The filter
-        box, the refresh button and the filter form each keep their own.
+        trigger here would only fetch what the page already holds.  Its one
+        request is the profile-change refresh, which ticks the new profile's
+        defaults.  The filter box, the refresh button and the filter form each
+        keep their own.
         """
         page = client.get("/").text
         match = _TAGS_LIST.search(page)
 
         assert match is not None, "tag list wrapper not rendered"
-        assert match.group(0) == '<div id="tags-list" class="tag-list">'
+        wrapper = match.group(0)
+        assert re.findall(r'hx-trigger="([^"]*)"', wrapper) == [
+            "change from:#profile-select"
+        ]
+        assert re.findall(r'hx-get="([^"]*)"', wrapper) == ["/api/profiles/tags"]
         assert 'hx-post="/api/cache/invalidate?resource=tags"' in page
         assert 'hx-get="/api/tags" hx-target="#tags-list"' in page
 
-    def test_the_correspondent_select_asks_for_nothing_on_the_full_page(
+    def test_the_correspondent_select_asks_for_nothing_until_the_profile_changes(
         self, client: TestClient
     ) -> None:
         """
-        The options are server-rendered; only the refresh button fetches them.
+        The options are server-rendered; the select asks only on a change.
 
         The page reads the same cache ``/api/correspondents`` does, so asking
         for the options again once the select is parsed would repeat the page's
-        own work.
+        own work.  The select's one request is the profile-change refresh,
+        which selects the new profile's default.
         """
         _app(client).state.cache.set("correspondents", [{"id": 7, "name": "Acme"}])
         page = client.get("/").text
         match = _CORRESPONDENT_SELECT.search(page)
 
         assert match is not None, "correspondent select not rendered"
-        assert "hx-" not in match.group("attrs")
+        attrs = match.group("attrs")
+        assert re.findall(r'hx-trigger="([^"]*)"', attrs) == [
+            "change from:#profile-select"
+        ]
+        assert re.findall(r'hx-get="([^"]*)"', attrs) == ["/api/profiles/correspondent"]
         assert '<option value="7">Acme</option>' in page
         assert 'hx-post="/api/cache/invalidate?resource=correspondents"' in page
 

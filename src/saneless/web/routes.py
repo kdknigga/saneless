@@ -1320,7 +1320,10 @@ def index(request: Request) -> Response:
 
     Populates profile selector from the worker's profile set (read under its
     profile lock), fetches tags and correspondents from cache or
-    paperless-ngx, and loads recent job history from the database.
+    paperless-ngx, and loads recent job history from the database.  The tag
+    list and the correspondent select open on the first profile's defaults,
+    ticked and selected, so an untouched submit scans with exactly what
+    ``saneless scan --profile`` would.
     """
     state = request.app.state
     # The refresher only probes while a page says someone is looking, so
@@ -1329,20 +1332,36 @@ def index(request: Request) -> Response:
     # leaves its cold-start rows.
     state.refresher.note_watcher()
     profiles = _profile_options(state.worker)
-    # A full page render is the unfiltered, nothing-ticked case of the same
-    # context the filter route builds, so it goes through the same function
-    # rather than a second shape the two could drift apart on.
-    tag_list = _tag_list_context(state, q="", selected=[])
+    # The profile the page opens on, looked up once under the worker's lock as
+    # ``start_scan`` looks it up.  None when there is no profile, or when the
+    # set was rewritten between listing and reading it; the page then opens
+    # with nothing ticked, which is what a profile without defaults means too.
+    opening = state.worker.get_profile(profiles[0].name) if profiles else None
+    # A full page render is the unfiltered case of the same context the filter
+    # route builds, ticked with the opening profile's defaults, so it goes
+    # through the same function rather than a second shape the two could
+    # drift apart on.
+    tag_list = _tag_list_context(
+        state,
+        q="",
+        selected=list(opening.default_tags) if opening is not None else [],
+    )
     # The correspondent half of the same saving.  ``show_correspondent``
     # off means the select is left out of the markup, so this fetch would be a
-    # second cold-cache round trip for a list nobody can be shown.  The key
-    # stays in the context either way: the template reaches for it inside its
+    # second cold-cache round trip for a list nobody can be shown.  The keys
+    # stay in the context either way: the template reaches for them inside its
     # own ``{% if %}``, and an absent key would be a different kind of bug from
     # an empty one.
-    correspondents = (
-        _get_cached_or_fetch(state.cache, state.paperless, "correspondents")
+    correspondent_options = (
+        _correspondent_options_context(
+            state, opening.default_correspondent if opening is not None else None
+        )
         if state.settings.web.show_correspondent
-        else []
+        else {
+            "correspondents": [],
+            "selected_correspondent": None,
+            "extra_option": None,
+        }
     )
 
     status = _status_context(state.worker, state.job_store, _status_facts(request))
@@ -1371,7 +1390,7 @@ def index(request: Request) -> Response:
                 ticked=False,
             ),
             **tag_list,
-            "correspondents": correspondents,
+            **correspondent_options,
             **status,
             **_checks_context(state),
             "jobs": jobs,
@@ -1387,9 +1406,10 @@ def index(request: Request) -> Response:
             # configured key and not a per-browser toggle: one appliance, one
             # form shape, and the template renders the controls or leaves them
             # out of the markup entirely rather than hiding them with CSS.
-            # Turning one off changes the form and never the scan --
-            # ``start_scan`` falls back to the profile's defaults for exactly
-            # the control that is no longer on the page.
+            # Turning one off changes the form and never the scan: a shown
+            # control opens on the profile's defaults, and ``start_scan``
+            # applies the same defaults for exactly the control that is not
+            # on the page.
             "show_tags": state.settings.web.show_tags,
             "show_correspondent": state.settings.web.show_correspondent,
         },
@@ -1449,8 +1469,10 @@ def paperless_test(request: Request) -> JSONResponse:
     """
     Test paperless-ngx connection status.
 
-    Returns JSON with status: connected, token_rejected, unreachable,
-    or error with detail on unexpected failures.
+    Returns 200 with one ``ConnectionStatus`` value as its status:
+    connected, token_rejected, not_found, server_error, unreachable or
+    incompatible_version.  An unexpected failure is a 502 whose status is
+    error, with the exception's class name as its detail.
 
     The answer is shared and reused for ``MIN_MANUAL_REFRESH_SECONDS``, error
     included, so a loop against this unauthenticated endpoint costs one
@@ -2363,12 +2385,85 @@ def get_multi_page_field(
     )
 
 
+@router.get("/api/profiles/tags")
+def get_profile_tags(request: Request, profile: str) -> Response:
+    """
+    Re-render the tag list ticked with a newly chosen profile's default tags.
+
+    The profile select's change carries the profile alone, and the list comes
+    back ticked with that profile's defaults and nothing else.  Replacing the
+    earlier ticks is deliberate, and the opposite of the Multiple pages field,
+    which keeps its tick: a profile's defaults are what an untouched form has
+    to mean, so after a change the form must show the new profile's answer
+    rather than a mix of two.  A default paperless-ngx no longer has is
+    ticked with its note (see ``_tag_list_context``).
+
+    The profile is validated exactly as ``get_multi_page_field`` validates
+    it: one locked lookup, and an unknown name is a 422 before any fetch.
+    The list is its own swap target, wrapper and all, because the swap is
+    outerHTML.
+
+    Args:
+        request: The incoming HTTP request.
+        profile: The profile name now chosen.
+
+    Returns:
+        The tag list, wrapper and all.
+
+    Raises:
+        RequestRejected: The profile is not configured.
+
+    """
+    state = request.app.state
+    found = state.worker.get_profile(profile)
+    if found is None:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    return state.templates.TemplateResponse(
+        request,
+        "partials/tags.html",
+        _tag_list_context(state, q="", selected=list(found.default_tags)),
+    )
+
+
+@router.get("/api/profiles/correspondent")
+def get_profile_correspondent(request: Request, profile: str) -> Response:
+    """
+    Re-render the correspondent select with a newly chosen profile's default.
+
+    The correspondent twin of ``get_profile_tags``, and it replaces the
+    earlier choice for the same reason: the new profile's default, or none
+    when it has none, is what the untouched form now means.  The select is
+    its own swap target, so the response is the whole element.
+
+    Args:
+        request: The incoming HTTP request.
+        profile: The profile name now chosen.
+
+    Returns:
+        The correspondent select, options and all.
+
+    Raises:
+        RequestRejected: The profile is not configured.
+
+    """
+    state = request.app.state
+    found = state.worker.get_profile(profile)
+    if found is None:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    return state.templates.TemplateResponse(
+        request,
+        "partials/correspondent_select.html",
+        _correspondent_options_context(state, found.default_correspondent),
+    )
+
+
 @router.post("/api/cache/invalidate")
 def invalidate_cache(
     request: Request,
     resource: MetadataResource,
     q: Annotated[str, Form(max_length=TAG_FILTER_MAX_LENGTH)] = "",
     tags: list[PaperlessId] = _TAGS_FORM_DEFAULT,
+    correspondent: Annotated[PaperlessId | None, Form()] = None,
 ) -> Response:
     """
     Invalidate a specific cache entry and return fresh data.
@@ -2385,9 +2480,11 @@ def invalidate_cache(
 
     The tag refresh renders the same partial the filter does, from the same
     context, so a refresh mid-filter comes back filtered and still ticked.  The
-    two extra values arrive in the body rather than the query string only
-    because htmx sends an ``hx-include``'s values that way on a POST; they are
-    ignored for the correspondent resource, which includes nothing.
+    correspondent refresh carries the select's current value the same way and
+    renders it selected again, so a refresh changes the list and never the
+    choice.  The extra values arrive in the body rather than the query string
+    only because htmx sends an ``hx-include``'s values that way on a POST;
+    each resource ignores the other's.
 
     Each resource has a floor under it: at most one refetch every
     ``MIN_MANUAL_REFRESH_SECONDS``.  The endpoint is unauthenticated on a LAN
@@ -2403,6 +2500,8 @@ def invalidate_cache(
         resource: Resource name to invalidate ('tags' or 'correspondents').
         q: The tag filter currently in the box, if any.
         tags: The tag ids currently ticked, if any.
+        correspondent: The correspondent currently chosen, if any, bounded
+            the way the scan's is.
 
     """
     state = request.app.state
@@ -2419,7 +2518,7 @@ def invalidate_cache(
     return state.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
-        _correspondent_options_context(state, None),
+        _correspondent_options_context(state, correspondent),
     )
 
 

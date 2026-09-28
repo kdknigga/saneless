@@ -20,6 +20,8 @@ Direct calls, such as from `curl` or a script, work too, but only those two JSON
 | GET | `/api/correspondents` | Fetch paperless-ngx correspondents |
 | GET | `/api/profiles/description` | One profile's description sentence |
 | GET | `/api/profiles/multi-page` | The Multiple pages checkbox for one profile |
+| GET | `/api/profiles/tags` | The tag list ticked with one profile's default tags |
+| GET | `/api/profiles/correspondent` | The correspondent dropdown set to one profile's default |
 | POST | `/api/cache/invalidate` | Refresh cached metadata |
 | GET | `/api/jobs/history` | Job history table |
 | POST | `/api/flip/continue` | Continue manual duplex scan |
@@ -216,6 +218,11 @@ Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses ca
 
 **Response:** HTML partial (the whole tag block including its wrapper, for `outerHTML` swap).
 
+A ticked id that is not in the list still comes back ticked, so a submit never loses it. If
+the list was fetched and the id is missing from it, the row reads, for example,
+`tag 7 (no longer in paperless-ngx; will be skipped)`. If paperless-ngx could not be asked
+and there is no earlier list, the row reads `tag 7`, with no claim either way.
+
 ---
 
 ### `GET /api/correspondents`
@@ -262,6 +269,53 @@ The checkbox is never ticked when the page loads: Multiple pages is chosen for e
 
 ---
 
+### `GET /api/profiles/tags`
+
+Returns the tag list with one profile's `default_tags` ticked. The web UI fetches it when
+the profile selection changes, and it replaces whatever was ticked before: an untouched
+form scans with the chosen profile's defaults, and a form you cleared scans with none. The
+page itself opens with the first profile's defaults ticked in the same way.
+
+**Query parameter:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile` | string | yes | The profile name. Validated against the configured profiles before anything else happens; an unknown name is rejected with `422` |
+
+**Responses:**
+
+| Status Code | Meaning |
+|-------------|---------|
+| 200 | HTML partial: the whole tag list including its wrapper, which replaces the one on the page. A default tag that paperless-ngx no longer has is ticked and labelled with a note, as described under `GET /api/tags`; leave it ticked and the finished job carries a warning that it was skipped, or untick it |
+| 422 | The profile does not exist. |
+
+---
+
+### `GET /api/profiles/correspondent`
+
+Returns the correspondent dropdown with one profile's `default_correspondent` selected, or
+`No correspondent` when it has none. The web UI fetches it when the profile selection
+changes, and it replaces the earlier choice, for the same reason as
+`GET /api/profiles/tags`. A default correspondent that paperless-ngx no longer has is
+selected and labelled, for example, `correspondent 12 (no longer in paperless-ngx; will be
+skipped)`; one that cannot be checked because paperless-ngx is unreachable reads
+`correspondent 12`.
+
+**Query parameter:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile` | string | yes | The profile name. Validated against the configured profiles before anything else happens; an unknown name is rejected with `422` |
+
+**Responses:**
+
+| Status Code | Meaning |
+|-------------|---------|
+| 200 | HTML partial: the whole `<select>` element, which replaces the one on the page |
+| 422 | The profile does not exist. |
+
+---
+
 ### `POST /api/cache/invalidate`
 
 Invalidates a specific cache entry and returns fresh data from paperless-ngx.
@@ -274,7 +328,7 @@ If paperless-ngx cannot be reached, the response is built from the last list tha
 |-----------|------|-------------|
 | `resource` | string | Resource to invalidate: `tags` or `correspondents` |
 
-**Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched. So is a form body carrying more than 100 `tags`, or a tag id outside 1 to 2147483647, the ticked tag ids a tag refresh sends so it can keep the selection.
+**Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched. So is a form body carrying more than 100 `tags`, or a tag id outside 1 to 2147483647, the ticked tag ids a tag refresh sends so it can keep the selection. A correspondent refresh sends the chosen `correspondent` the same way, bounded the same way, and the refreshed options keep it selected.
 
 At most one refetch per resource every 2 seconds; a sooner call returns the cached list. It
 is answered with the same status code and the same partial as a call that refetched,

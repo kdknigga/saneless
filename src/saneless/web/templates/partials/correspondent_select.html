@@ -1,0 +1,34 @@
+{# The Correspondent select, the element itself: it is the swap target of its
+   own profile-change refresh, and an outerHTML swap replaces the element it is
+   aimed at, so the element carrying the id has to be rendered here -- the
+   shape the Multiple pages field and the tag list have for the same reason.
+   The select stays the element directly before its help line, so no wrapper
+   comes between them.
+
+   The select names its own hx-target and hx-swap, so it never inherits the
+   scan form's status-area target and nothing is added to the form element.
+   The include is mandatory on a GET, as it is for the tag filter: htmx does
+   not gather the enclosing form for one.  It carries the chosen profile, and
+   the response selects that profile's default correspondent, replacing the
+   earlier choice on purpose: the new profile's default is what an untouched
+   form now means.
+
+   The refresh button beside the label swaps this element's options
+   innerHTML and leaves the element, and these attributes, in place.
+
+   Turning autocomplete off is what stops a browser that restores form state
+   on reload from choosing something other than the server rendered: the page
+   opens on the profile's default.
+
+   The options come from partials/correspondents.html; this file composes no
+   prose. #}
+<select name="correspondent" id="correspondent-select"
+        aria-describedby="correspondent-help"
+        autocomplete="off"
+        hx-get="/api/profiles/correspondent"
+        hx-trigger="change from:#profile-select"
+        hx-include="#profile-select"
+        hx-target="this"
+        hx-swap="outerHTML">
+    {% include "partials/correspondents.html" %}
+</select>
