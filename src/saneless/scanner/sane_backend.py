@@ -39,6 +39,7 @@ import logging
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final, Protocol, assert_never
@@ -1341,6 +1342,29 @@ class _Wedge:
     ``done`` identifies *which* acquisition is wedged.  A reader that wakes up
     long afterwards compares against it, so a late wake-up belonging to an
     abandoned acquisition cannot clear a wedge that a later one recorded.
+
+    The record is written **before** a timed-out read is cancelled, not after
+    the grace runs out.  An interrupt landing while the worker waits out the
+    grace then cannot skip the write, and the handle is never closed under a
+    read that is still running.  ``settling`` and ``outstanding`` say who may
+    finish the job.  Every access holds ``_WEDGE_LOCK``.
+
+    - ``settling`` is True from the moment the record is written until the
+      worker stops waiting (``_settle_or_wedge``).  The worker sets it, and
+      the worker clears it.  While it is True the worker owns the outcome, so
+      neither the reader nor the cancel thread closes the handle, even as the
+      last to finish.  When the worker stops waiting it either clears the
+      whole record, because both have finished and the device context may
+      close the handle as usual, or sets ``settling`` to False, which makes
+      this a real wedge.
+    - ``outstanding`` holds a token for each thread still inside SANE on the
+      handle: the reader's and the cancel thread's.  The worker writes both
+      with the record, and each thread removes its own as it finishes
+      (``_release_wedge``).  Once ``settling`` is False, the thread that
+      removes the last token closes the handle and clears the record.  It
+      has to be the last one, because a close while SANE is still inside a
+      cancel on the handle is as unsafe as a close under a read: on ``net``
+      the cancel is a request that may be slow to come back.
     """
 
     stuck: bool = False
@@ -1349,6 +1373,8 @@ class _Wedge:
     iterator: object = None
     device_id: str = ""
     page_label: str = ""
+    settling: bool = False
+    outstanding: set[str] = field(default_factory=set)
 
 
 # Guards every read and write of _WEDGE.  Three threads reach it -- the worker
@@ -1357,6 +1383,11 @@ class _Wedge:
 # must not be split.
 _WEDGE_LOCK = threading.Lock()
 _WEDGE = _Wedge()
+
+# The two tokens ``_Wedge.outstanding`` holds: one for the thread reading the
+# page and one for the thread cancelling it.
+_READER: Final = "reader"
+_CANCELLER: Final = "canceller"
 
 
 @dataclass
@@ -1702,13 +1733,15 @@ def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
 
 def _read_outstanding() -> bool:
     """
-    Report whether any reader thread is still inside a SANE read.
+    Report whether any thread is still inside a SANE read or its cancel.
 
     The shutdown path has no handle to ask about, so it needs this
-    process-wide answer rather than one about a single device.
+    process-wide answer rather than one about a single device.  A read being
+    cancelled counts from the moment its cancel is decided on, because the
+    wedge is recorded before the cancel fires.
 
     Returns:
-        True if a read recorded in the wedge has not come back.
+        True if a read or cancel recorded in the wedge has not come back.
 
     """
     with _WEDGE_LOCK:
@@ -1795,68 +1828,82 @@ def _page_label(page_num: int) -> str:
     return f"Page {page_num + 1}"
 
 
-def _cancel_and_settle(dev: SaneDevice, done: threading.Event, grace: float) -> bool:
+def _cancel_read(dev: SaneDevice, done: threading.Event) -> None:
     """
-    Cancel a blocked read from a second thread, then wait for it to return.
+    Cancel a blocked read, on the thread ``_settle_or_wedge`` starts for it.
 
-    The cancel runs on a thread of its own and not on the caller's, and that
+    The cancel runs on a thread of its own and not on the worker's, and that
     is a correctness requirement rather than tidiness.  On the ``net`` backend
     ``sane_cancel`` is ``sanei_w_call(SANE_NET_CANCEL)`` -- a blocking RPC on
     the control wire, issued before the local data fd is closed -- so against a
     saned that has stopped answering it hangs whoever calls it.  Whoever calls
-    it here is the worker thread running the whole job, so the grace would
-    bound nothing at all (``backend/net.c``).
+    it here would be the worker thread running the whole job, so the grace
+    would bound nothing at all (``backend/net.c``).
 
     It is sound to call at all only because ``sane_cancel`` releases the GIL,
     as ``sane_read`` does, which is what lets one Python thread cancel what
-    another is blocked in (``_sane.c`` 2.9.2, verified).  The cancel thread is
-    a daemon for the same reason the reader is: if the RPC never returns, it
+    another is blocked in (``_sane.c`` 2.9.2, verified).  The thread is a
+    daemon for the same reason the reader is: if the RPC never returns, it
     must not keep the process alive.
 
     A failing cancel is logged and swallowed.  There is nothing else to do
-    with it -- the read is already lost -- and raising here would replace the
-    timeout the operator actually needs to see.
+    with it -- the read is already lost -- and an exception here would reach
+    ``threading.excepthook`` and nobody else.  Either way the thread gives up
+    its token on the wedge as it ends, and closes the handle if it is the last
+    one out (``_release_wedge``).
 
     Args:
         dev: The device handle the blocked read is inside.
-        done: The event the reader sets when it returns, however it returns.
-        grace: Seconds to wait for the reader after the cancel is fired.
-
-    Returns:
-        True if the reader returned within the grace, False if it did not.
+        done: The event identifying the acquisition being cancelled.
 
     """
-
-    def fire() -> None:
-        try:
-            dev.cancel()
-        except Exception:
-            logger.warning("Cancelling the blocked read failed", exc_info=True)
-
-    # Noted before the cancel goes out, so no later cleanup can race it into
-    # sending a second one (``_OpenHandles``).
-    _note_cancel_issued(dev)
-    canceller = threading.Thread(target=fire, name="sane-cancel", daemon=True)
-    canceller.start()
-    return done.wait(grace)
+    try:
+        dev.cancel()
+    except Exception:
+        logger.warning("Cancelling the blocked read failed", exc_info=True)
+    finally:
+        _release_wedge(dev, done, _CANCELLER)
 
 
-def _mark_wedged(dev: SaneDevice, done: threading.Event, label: str) -> bool:
+def _clear_wedge() -> None:
     """
-    Record that a read never came back, unless it just did.
+    Forget the wedge record.  The caller holds ``_WEDGE_LOCK``.
+
+    Dropping the retained iterator here runs its finaliser's cancel, which is
+    harmless only because every caller has either closed the handle first or
+    never retained one.
+    """
+    _WEDGE.stuck = False
+    _WEDGE.done = None
+    _WEDGE.device = None
+    _WEDGE.iterator = None
+    _WEDGE.device_id = ""
+    _WEDGE.page_label = ""
+    _WEDGE.settling = False
+    _WEDGE.outstanding.clear()
+
+
+def _begin_settle(dev: SaneDevice, done: threading.Event, label: str) -> bool:
+    """
+    Record the wedge before the cancel fires, unless the read just returned.
 
     The check and the write are one critical section because the reader may
-    return in the instant between the grace expiring and this call.  Reading
-    ``done`` under the same lock the reader takes *after* setting it is what
-    makes that window closed rather than merely narrow.
+    return in the instant between the timeout and this call.  Reading ``done``
+    under the same lock the reader takes *after* setting it is what makes that
+    window closed rather than merely narrow.
+
+    Written first, and not once the grace has run out, so that nothing the
+    worker is interrupted by while it waits can leave the handle unrecorded
+    and closable under a read that is still running.
 
     Args:
-        dev: The handle the reader is still inside.
+        dev: The handle the reader is inside.
         done: The event identifying this acquisition.
         label: The page label, for the refusal message.
 
     Returns:
-        True if the backend is now wedged, False if the reader beat the call.
+        True if the wedge is now recorded and settling, False if the reader
+        had already returned and there is nothing to cancel.
 
     """
     with _WEDGE_LOCK:
@@ -1866,17 +1913,63 @@ def _mark_wedged(dev: SaneDevice, done: threading.Event, label: str) -> bool:
         _WEDGE.done = done
         _WEDGE.device = dev
         _WEDGE.page_label = label
+        _WEDGE.settling = True
+        _WEDGE.outstanding.clear()
+        _WEDGE.outstanding.update((_READER, _CANCELLER))
         return True
 
 
-def _release_wedge(dev: SaneDevice, done: threading.Event) -> None:
+def _end_settle(
+    done: threading.Event, canceller: threading.Thread, *, cancel_started: bool
+) -> bool:
     """
-    Close the handle and clear the wedge, from the reader thread itself.
+    Stop waiting: clear the wedge if nothing is left inside SANE, else keep it.
 
-    The reader closes rather than the thread that gave up on it, because by
-    then the thread that gave up has long since raised -- and the reader is
-    the only thread that knows the read is over, which is the one fact SANE
-    requires before any other operation may run on the handle.
+    The reader counts as finished once ``done`` is set, because its work is
+    over by then and all it has left is to give up its token.  The cancel
+    thread counts as finished once it has given up its own, or if it never
+    started, which is what an interrupt landing before or inside its
+    ``start()`` can leave behind.  ``cancel_started`` and ``is_alive()`` are
+    both consulted for the reason ``_acquire_with_timeout`` gives for the
+    reader.
+
+    Args:
+        done: The event identifying this acquisition.
+        canceller: The cancel thread, started or not.
+        cancel_started: Whether its ``start()`` returned.
+
+    Returns:
+        True if both threads are out of SANE, so the device context may close
+        the handle as usual.  False if one is still inside, in which case the
+        wedge stands and the last of them to finish closes the handle.
+
+    """
+    with _WEDGE_LOCK:
+        if not (_WEDGE.stuck and _WEDGE.done is done):
+            # Nothing was recorded: the read returned before the cancel.
+            return True
+        if done.is_set():
+            _WEDGE.outstanding.discard(_READER)
+        if not (cancel_started or canceller.is_alive()):
+            _WEDGE.outstanding.discard(_CANCELLER)
+        if not _WEDGE.outstanding:
+            _clear_wedge()
+            return True
+        _WEDGE.settling = False
+        return False
+
+
+def _release_wedge(dev: SaneDevice, done: threading.Event, holder: str) -> None:
+    """
+    Give up one thread's token, and close the handle if it was the last.
+
+    Called by the reader as it returns and by the cancel thread as it ends.
+    The last of them closes, rather than the thread that gave up on them,
+    because by then the thread that gave up has long since raised -- and only
+    the last one out knows that nothing is left inside SANE on the handle,
+    which is the one fact SANE requires before any other operation may run on
+    it.  While the worker is still waiting out the grace (``settling``) it
+    owns the outcome, so nothing closes here.
 
     A close failure is logged and never raised: this runs in a daemon thread
     whose exception nobody would see, and an unhandled one would surface in a
@@ -1885,16 +1978,21 @@ def _release_wedge(dev: SaneDevice, done: threading.Event) -> None:
 
     Args:
         dev: The handle to release.
-        done: The event identifying this acquisition; a reader belonging to
+        done: The event identifying this acquisition; a thread belonging to
             some earlier, already-forgotten acquisition matches nothing here
             and does nothing.
+        holder: Which token to give up: the reader's or the cancel thread's.
 
     """
     with _WEDGE_LOCK:
         if not (_WEDGE.stuck and _WEDGE.done is done):
             return
+        _WEDGE.outstanding.discard(holder)
+        if _WEDGE.settling or _WEDGE.outstanding:
+            return
         logger.warning(
-            "The read on %s returned at last (%s); closing the handle",
+            "The %s on %s returned at last (%s); closing the handle",
+            "read" if holder == _READER else "cancel",
             _WEDGE.device_id or "the scanner",
             _WEDGE.page_label,
         )
@@ -1906,12 +2004,7 @@ def _release_wedge(dev: SaneDevice, done: threading.Event) -> None:
         # attempted, and counting the handle open forever would refuse every
         # later scan job's SANE restart until saneless itself was restarted.
         _handle_closed(dev)
-        _WEDGE.stuck = False
-        _WEDGE.done = None
-        _WEDGE.device = None
-        _WEDGE.iterator = None
-        _WEDGE.device_id = ""
-        _WEDGE.page_label = ""
+        _clear_wedge()
 
 
 def _retain_iterator(dev: SaneDevice, iterator: object) -> bool:
@@ -2007,32 +2100,77 @@ def _settle_or_wedge(
     dev: SaneDevice, done: threading.Event, grace: float, label: str
 ) -> bool:
     """
-    Run the cancel tail: cancel, wait out the grace, then close or wedge.
+    Run the cancel tail: record the wedge, cancel, wait out the grace, decide.
+
+    The wait is for both threads that may be inside SANE on the handle: the
+    reader, and the thread sending the cancel (``_cancel_read``).  Both come
+    out of one grace, so a scanner slow to answer the cancel holds the worker
+    for the grace and no longer.  A cancel still in flight when the grace runs
+    out leaves the handle wedged even if the read has returned, since closing
+    under a cancel is no safer than closing under a read.
+
+    The decision is taken in a ``finally``, so an interrupt landing during the
+    wait -- a second Ctrl-C, say -- still ends it.  The wedge was written
+    before the cancel fired, so the interrupt leaves it standing, and the
+    device context then leaves the handle alone.  A signal can still land in
+    the few instructions of that ``finally`` itself; the record then stays
+    settling and is never cleared, which refuses later scans until a restart
+    but never closes a handle under a running call.
 
     Args:
         dev: The handle the blocked read is inside.
         done: The event identifying this acquisition.
-        grace: Seconds to wait for the reader after the cancel.
+        grace: Seconds to wait, after the cancel is fired, for the read to
+            return and the cancel to come back.
         label: The page label, for the log and the later refusal.
 
     Returns:
-        True if the read returned, so the caller's device context may close
-        the handle normally.  False if it did not, in which case the handle is
-        wedged and nothing may touch it.
+        True if the read returned and the cancel, if one was sent, came back,
+        so the caller's device context may close the handle normally.  False
+        if not, in which case the handle is wedged and nothing may touch it.
 
     """
-    if _cancel_and_settle(dev, done, grace):
-        return True
-    if not _mark_wedged(dev, done, label):
-        return True
-    logger.critical(
-        "%s: the scanner did not respond to the cancel within %.0fs. The "
-        "device handle is being left open because a read is still inside "
-        "SANE; no further scan can run until it returns.",
-        label,
-        grace,
+    began = time.monotonic()
+    deadline = began + grace
+    canceller = threading.Thread(
+        target=_cancel_read, args=(dev, done), name="sane-cancel", daemon=True
     )
-    return False
+    started = False
+    try:
+        if not _begin_settle(dev, done, label):
+            return True
+        # Noted before the cancel goes out, so no later cleanup can race it
+        # into sending a second one (``_OpenHandles``).
+        _note_cancel_issued(dev)
+        canceller.start()
+        started = True
+        done.wait(_remaining(deadline))
+        canceller.join(_remaining(deadline))
+    finally:
+        settled = _end_settle(done, canceller, cancel_started=started)
+        if not settled:
+            logger.critical(
+                "%s: the scanner did not respond to the cancel within %.0fs. "
+                "The device handle is being left open because SANE is still "
+                "inside a call on it; no further scan can run until it returns.",
+                label,
+                time.monotonic() - began,
+            )
+    return settled
+
+
+def _remaining(deadline: float) -> float:
+    """
+    Report how much of a wait is left.
+
+    Args:
+        deadline: The ``time.monotonic()`` reading the wait ends at.
+
+    Returns:
+        The seconds left, never negative.
+
+    """
+    return max(0.0, deadline - time.monotonic())
 
 
 def _acquire_with_timeout(
@@ -2060,9 +2198,10 @@ def _acquire_with_timeout(
     costs nothing beside a multi-second scan, and -- unlike a shared pool --
     one stuck read cannot poison the next job.
 
-    On timeout the sequence is cancel, wait, then close only if the read
-    returned, and the cancel goes out on a thread of its own
-    (``_cancel_and_settle``).  **The late value is discarded unconditionally.**
+    On timeout the sequence is record the wedge, cancel, wait, then close
+    only if the read returned and the cancel came back.  The cancel goes out
+    on a thread of its own, and the wait for both is bounded by one grace
+    (``_settle_or_wedge``).  **The late value is discarded unconditionally.**
     Only whether the reader *returned* is consulted, never what it returned:
     measured on real libsane, a cancelled ``snap()`` hands back a truncated
     image rather than raising -- 3779x242 of a full page -- and that image
@@ -2071,7 +2210,9 @@ def _acquire_with_timeout(
 
     A ``KeyboardInterrupt`` arriving while this waits takes the identical path
     and is then re-raised, so Ctrl-C during a read leaves the device in the
-    same state a timeout does.
+    same state a timeout does.  A second one arriving during the grace ends
+    the wait early and replaces the first, but the wedge written before the
+    cancel still stands, so the handle is not closed under the read.
 
     ``reader.start()`` is inside the guarded block, so an interrupt landing
     once the thread exists cannot abandon it with no cancel ever fired.  The
@@ -2125,7 +2266,7 @@ def _acquire_with_timeout(
             slot.error = exc
         finally:
             done.set()
-            _release_wedge(dev, done)
+            _release_wedge(dev, done, _READER)
 
     reader = threading.Thread(
         target=read, name=f"{_READER_THREAD_PREFIX}{page_label}", daemon=True

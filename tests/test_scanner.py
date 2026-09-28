@@ -410,6 +410,21 @@ def _join_sane_reader_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
             thread.join(timeout)
 
 
+def _wedged() -> bool:
+    """
+    Report whether the backend has a wedge recorded.
+
+    A call rather than a read of the field, so a test can assert it before and
+    after the wedge clears without a type checker holding it to the first
+    answer.
+
+    Returns:
+        The wedge record's ``stuck`` flag.
+
+    """
+    return sane_backend_mod._WEDGE.stuck
+
+
 # The name the backend gives the thread that cancels a timed-out read.
 _CANCEL_THREAD_NAME = "sane-cancel"
 
@@ -3685,9 +3700,9 @@ class TestSaneBackendCancelSequence:
             assert "did not respond" in str(raised.value)
             assert fake_device.cancel_calls == 1
             assert fake_device.cancels_in_flight_max == 1
+            # No close at all, so none under the cancel either.
             assert fake_device.close_calls == 0
-            assert fake_device.close_while_cancelling is False
-            assert sane_backend_mod._WEDGE.stuck is True
+            assert _wedged() is True
             with pytest.raises(ScanError, match="Restart saneless"):
                 sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
         finally:
@@ -3698,7 +3713,7 @@ class TestSaneBackendCancelSequence:
         assert fake_device.close_while_cancelling is False
         assert fake_device.close_while_blocked is False
         assert fake_device.cancels_in_flight_max == 1
-        assert sane_backend_mod._WEDGE.stuck is False
+        assert _wedged() is False
 
     @pytest.mark.parametrize(
         ("signum", "expected"),
@@ -3768,9 +3783,9 @@ class TestSaneBackendCancelSequence:
             )
         interrupter.join(_READER_JOIN_SECONDS)
 
-        assert sane_backend_mod._WEDGE.stuck is True
+        assert _wedged() is True
         assert fake_device.cancel_calls == 1
-        assert fake_device.close_while_blocked is False
+        # No close at all, so none under the read either.
         assert fake_device.close_calls == 0
         with pytest.raises(ScanError, match="Restart saneless"):
             sane_backend.scan_pages(_TEST_DEVICE, settings, page_sink)
@@ -3780,7 +3795,7 @@ class TestSaneBackendCancelSequence:
 
         assert fake_device.close_calls == 1
         assert fake_device.close_while_blocked is False
-        assert sane_backend_mod._WEDGE.stuck is False
+        assert _wedged() is False
 
 
 class TestReinitialise:
