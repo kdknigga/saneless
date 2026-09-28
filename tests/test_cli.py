@@ -249,19 +249,7 @@ def _patch_cli(
                     sources=["Flatbed", "ADF"],
                     resolutions=[150, 300, 600],
                     modes=["color", "gray"],
-                    raw_options=[
-                        (
-                            0,
-                            "source",
-                            "Source",
-                            "desc",
-                            3,
-                            0,
-                            1,
-                            0,
-                            ["Flatbed", "ADF"],
-                        ),
-                    ],
+                    option_names=("source",),
                 )
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
@@ -1731,13 +1719,20 @@ class TestDevicesCommand:
         assert result.stderr.splitlines() == stderr
 
     def test_devices_capabilities(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Devices --capabilities -> raw option names shown."""
+        """
+        Devices --capabilities -> raw option names shown.
+
+        The "Raw options:" label and one indented name per line are the text
+        the documentation shows, so they stay whatever shape the backend hands
+        the names over in.
+        """
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["devices", "--capabilities"])
         assert result.exit_code == 0
         assert "Flatbed" in result.output
         assert "ADF" in result.output
+        assert "  Raw options:\n    source\n" in result.stdout
 
     def test_devices_capabilities_prints_a_reported_word_list(
         self, monkeypatch: pytest.MonkeyPatch
@@ -6375,9 +6370,7 @@ class _HostileScanner(StubScannerBackend):
             sources=["Flat\x1b[2Jbed"],
             resolutions=[300],
             modes=["co\x9blor"],
-            raw_options=[
-                (0, "src\x1bopt", "Source", "desc", 3, 0, 1, 0, ["Flatbed"]),
-            ],
+            option_names=("src\x1bopt",),
         )
 
 

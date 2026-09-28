@@ -1677,7 +1677,23 @@ class TestSaneBackendGetCapabilities:
         # the two are different facts and neither is derived from the other.
         assert caps.resolution_range == (1.0, 1200.0, 1.0)
         assert caps.resolutions == []
-        assert len(caps.raw_options) > 0
+        assert len(caps.option_names) > 0
+
+    def test_get_capabilities_reports_option_names_in_device_order(
+        self, sane_backend: SaneBackend
+    ) -> None:
+        """
+        The option names come out as plain strings, in the device's order.
+
+        The backend-agnostic value object carries names, not SANE's
+        nine-element option tuples, so nothing outside the SANE backend has to
+        know where in a tuple the name sits.
+        """
+        caps = sane_backend.get_capabilities("test:device:001")
+
+        expected = tuple(str(opt[1]) for opt in build_option_table())
+        assert caps.option_names == expected
+        assert all(type(name) is str for name in caps.option_names)
 
 
 # ---------------------------------------------------------------------------
@@ -2666,7 +2682,7 @@ class TestResolveSourceForManualDuplex:
         """Every existing simplex construction keeps today's behaviour."""
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        assert settings.resolve_feeder_source is False
+        assert settings.duplex == "none"
 
     def test_scan_pages_feeds_through_the_resolved_feeder(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
@@ -2678,7 +2694,7 @@ class TestResolveSourceForManualDuplex:
             source="ADF",
             resolution=300,
             mode="Color",
-            resolve_feeder_source=True,
+            duplex="manual",
         )
 
         pages = SaneBackend().scan_pages(_TEST_DEVICE, settings, page_sink).pages
@@ -2697,7 +2713,7 @@ class TestResolveSourceForManualDuplex:
             source="ADF",
             resolution=300,
             mode="Color",
-            resolve_feeder_source=True,
+            duplex="manual",
         )
 
         pages = backend.scan_pages(_TEST_DEVICE, settings, page_sink).pages
@@ -2717,7 +2733,7 @@ class TestResolveSourceForManualDuplex:
             resolution=300,
             mode="Color",
             auto_source_mode="flatbed",
-            resolve_feeder_source=True,
+            duplex="manual",
         )
 
         with pytest.raises(ScanError, match="feeder"):
@@ -5790,7 +5806,7 @@ class TestSourceMatching:
     ) -> None:
         """'adf' picks the device's 'ADF', not merely its first feeder."""
         settings = ScanSettings(
-            source="adf", resolution=300, mode="Color", resolve_feeder_source=True
+            source="adf", resolution=300, mode="Color", duplex="manual"
         )
 
         dev, batch = self._scan(
@@ -5804,31 +5820,46 @@ class TestSourceMatching:
         assert len(batch.pages) == 3
 
 
-class TestDeviceCapabilitiesShape:
-    """The value object's field order, which existing call sites depend on."""
+class TestScannerInterfaceShape:
+    """The backend-agnostic value objects are keyword-only, and settings frozen."""
 
-    def test_resolution_range_is_defaulted_and_sits_after_the_required_fields(
-        self,
-    ) -> None:
-        """
-        A defaulted field must stay in the defaulted block.
+    def test_scan_settings_cannot_be_changed_after_construction(self) -> None:
+        """Assigning a field raises, so settings cannot drift mid-scan."""
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+        # Through setattr with the name in a variable, because a plain
+        # ``settings.source = "ADF"`` is a static error both type checkers
+        # report once the class is frozen, and the point is the runtime refusal.
+        attribute = "source"
 
-        ``PipelineRequest`` records the same trap in its own docstring: moving a
-        defaulted field up into the non-default block reorders the dataclass and
-        breaks positional construction, which call sites across the suite rely
-        on.
-        """
-        fields = dataclasses.fields(DeviceCapabilities)
-        defaulted = [
-            f.name
-            for f in fields
-            if f.default is not dataclasses.MISSING
-            or f.default_factory is not dataclasses.MISSING
-        ]
-        required = [f.name for f in fields if f.name not in defaulted]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(settings, attribute, "ADF")
 
-        assert required == ["sources", "resolutions", "modes"]
-        assert defaulted == ["raw_options", "resolution_range"]
+        assert settings.source == "Flatbed"
+
+    def test_scan_settings_refuses_positional_construction(self) -> None:
+        """Every field is named at the call site."""
+        construct = cast("Callable[..., object]", ScanSettings)
+
+        with pytest.raises(TypeError):
+            construct("Flatbed", 300, "Color")
+
+    def test_device_capabilities_takes_option_names(self) -> None:
+        """The option names are a tuple of strings, named at the call site."""
+        caps = DeviceCapabilities(
+            sources=["Flatbed"], resolutions=[], modes=[], option_names=("source",)
+        )
+
+        assert caps.option_names == ("source",)
+        assert (
+            DeviceCapabilities(sources=[], resolutions=[], modes=[]).option_names == ()
+        )
+
+    def test_device_capabilities_refuses_positional_construction(self) -> None:
+        """Keyword-only construction makes the field order nobody's dependency."""
+        construct = cast("Callable[..., object]", DeviceCapabilities)
+
+        with pytest.raises(TypeError):
+            construct(["Flatbed"], [], [])
 
 
 class TestResolutionReadBack:
