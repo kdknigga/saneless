@@ -25,7 +25,6 @@ import httpx2
 import pikepdf
 import pytest
 from PIL import Image, ImageColor, ImageDraw
-from saneless.scan_metadata import ScanMetadata
 
 import saneless.pipeline as pipeline_module
 import saneless.preservation as preservation_module
@@ -82,6 +81,7 @@ from saneless.pipeline import (
     run_pipeline,
 )
 from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
+from saneless.scan_metadata import ScanMetadata
 from saneless.scanner.base import DeviceInfo, PassCapReached, ScannerBackend
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.spool import SpooledPageSink

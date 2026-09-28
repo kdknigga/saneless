@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from saneless.scan_metadata import ScanMetadata, resolve_scan_metadata
-
 from saneless.config import ProfileConfig
+from saneless.scan_metadata import ScanMetadata, resolve_scan_metadata
 
 _RECEIPTS = ProfileConfig.model_validate(
     {"default_tags": [3, 7], "default_correspondent": 12}
