@@ -795,6 +795,7 @@ def _status_error(status_code: int) -> httpx2.HTTPStatusError:
 
 
 _RETRY_DECISION_CASES = [
+    # The request could not be sent at all, on any attempt.
     pytest.param(
         httpx2.LocalProtocolError("Illegal header value"),
         _RetryDecision.MISCONFIGURED,
@@ -805,26 +806,67 @@ _RETRY_DECISION_CASES = [
         _RetryDecision.MISCONFIGURED,
         id="unsupported-protocol",
     ),
-    pytest.param(httpx2.ConnectError("refused"), _RetryDecision.RETRY, id="connect"),
+    # Nothing, or never the whole body, can have reached paperless-ngx.
     pytest.param(
-        httpx2.ConnectTimeout("slow"), _RetryDecision.RETRY, id="connect-timeout"
+        httpx2.ConnectError("refused"), _RetryDecision.BEFORE_SEND, id="connect"
     ),
-    pytest.param(httpx2.ReadTimeout("slow"), _RetryDecision.RETRY, id="read-timeout"),
-    pytest.param(httpx2.ReadError("reset"), _RetryDecision.RETRY, id="read-error"),
-    pytest.param(httpx2.WriteError("pipe"), _RetryDecision.RETRY, id="write-error"),
+    pytest.param(
+        httpx2.ConnectTimeout("slow"),
+        _RetryDecision.BEFORE_SEND,
+        id="connect-timeout",
+    ),
+    pytest.param(
+        httpx2.PoolTimeout("no free connection"),
+        _RetryDecision.BEFORE_SEND,
+        id="pool-timeout",
+    ),
+    pytest.param(
+        httpx2.ProxyError("tunnel refused"),
+        _RetryDecision.BEFORE_SEND,
+        id="proxy-error",
+    ),
+    pytest.param(
+        httpx2.WriteTimeout("body stalled"),
+        _RetryDecision.BEFORE_SEND,
+        id="write-timeout",
+    ),
+    # The whole body may have been read, so the document may be stored.
+    pytest.param(
+        httpx2.ReadTimeout("slow"), _RetryDecision.AFTER_SEND, id="read-timeout"
+    ),
+    pytest.param(httpx2.ReadError("reset"), _RetryDecision.AFTER_SEND, id="read-error"),
+    pytest.param(
+        httpx2.WriteError("pipe"), _RetryDecision.AFTER_SEND, id="write-error"
+    ),
     pytest.param(
         httpx2.RemoteProtocolError("server hung up"),
-        _RetryDecision.RETRY,
+        _RetryDecision.AFTER_SEND,
         id="remote-protocol-error",
     ),
-    pytest.param(_status_error(503), _RetryDecision.RETRY, id="503"),
-    pytest.param(_status_error(500), _RetryDecision.RETRY, id="500"),
-    pytest.param(_status_error(404), _RetryDecision.REFUSED, id="404"),
-    pytest.param(_status_error(302), _RetryDecision.REFUSED, id="302"),
+    pytest.param(
+        httpx2.CloseError("close failed"), _RetryDecision.AFTER_SEND, id="close-error"
+    ),
     pytest.param(
         httpx2.DecodingError("corrupt gzip", request=_CLASSIFIED_REQUEST),
-        _RetryDecision.UNEXPECTED,
+        _RetryDecision.AFTER_SEND,
         id="decoding-error",
+    ),
+    pytest.param(_status_error(500), _RetryDecision.AFTER_SEND, id="500"),
+    pytest.param(_status_error(502), _RetryDecision.AFTER_SEND, id="502"),
+    pytest.param(_status_error(503), _RetryDecision.AFTER_SEND, id="503"),
+    pytest.param(_status_error(504), _RetryDecision.AFTER_SEND, id="504"),
+    # This server does not accept the API version asked for; nothing is stored.
+    pytest.param(_status_error(406), _RetryDecision.INCOMPATIBLE, id="406"),
+    # An answer that would be the same on every attempt.
+    pytest.param(_status_error(400), _RetryDecision.REFUSED, id="400"),
+    pytest.param(_status_error(401), _RetryDecision.REFUSED, id="401"),
+    pytest.param(_status_error(404), _RetryDecision.REFUSED, id="404"),
+    pytest.param(_status_error(302), _RetryDecision.REFUSED, id="302"),
+    # Anything else httpx2 raises.
+    pytest.param(
+        httpx2.TooManyRedirects("Exceeded maximum allowed redirects."),
+        _RetryDecision.UNEXPECTED,
+        id="too-many-redirects",
     ),
 ]
 
@@ -837,11 +879,13 @@ class TestRetryDecision:
         self, exc: httpx2.HTTPError, expected: _RetryDecision
     ) -> None:
         """
-        Client-side protocol errors are configuration, never transient.
+        Each error is sorted by whether the upload can have arrived.
 
-        ``LocalProtocolError`` and ``UnsupportedProtocol`` are both
-        ``TransportError`` subclasses, so a classifier that tests for
-        ``TransportError`` first would retry them.
+        Only an error that proves the body never fully left is sent again; any
+        answer, and any failure once the body may have been read, is not, since
+        a resend could store the document twice.  ``LocalProtocolError`` and
+        ``UnsupportedProtocol`` are both ``TransportError`` subclasses, so a
+        classifier that tests for ``TransportError`` first would retry them.
         """
         assert _retry_decision(exc) is expected
 
