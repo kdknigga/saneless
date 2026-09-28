@@ -364,6 +364,28 @@ def _refused_connection_handler() -> Callable[[httpx2.Request], httpx2.Response]
     return handler
 
 
+def _after_send_error_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Answer every upload with a 500, as a paperless-ngx that read it might.
+
+    An answer means the body may have been read and stored, so the client must
+    neither resend it nor copy it to the consume folder.  A poll reaching this
+    handler would mean the client invented a task id, so the tasks path is left
+    to ``_unexpected``.
+
+    Returns:
+        A handler answering 500 on the upload path.
+
+    """
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == _DOCUMENTS_PATH:
+            return httpx2.Response(500, text="paperless-ngx is restarting")
+        return _unexpected(request)
+
+    return handler
+
+
 @dataclass(frozen=True)
 class _Case:
     """
@@ -402,6 +424,8 @@ class _Case:
             means the warning column must be NULL.
         error_contains: Fragments the persisted error must contain; empty means
             the error column must be NULL.
+        expected_category: The persisted ErrorCategory the row must carry;
+            None leaves the category unchecked.
 
     """
 
@@ -422,6 +446,7 @@ class _Case:
     operator_flips: bool = True
     warning_contains: str | None = None
     error_contains: tuple[str, ...] = ()
+    expected_category: ErrorCategory | None = None
 
 
 _CASES = [
@@ -454,6 +479,19 @@ _CASES = [
         expected_consume_pdfs=0,
         task_timeout=_TIMEOUT_BUDGET,
         error_contains=(_PENDING_TASK, "did not finish"),
+        expected_category=ErrorCategory.UNCONFIRMED_FILING,
+    ),
+    _Case(
+        label="after-send-500",
+        handler_factory=_after_send_error_handler,
+        expected_state=JobState.ERROR,
+        expected_outcome=None,
+        expected_pages=(None, None, None),
+        expected_failed_pdfs=1,
+        expected_consume_pdfs=0,
+        with_consume_dir=True,
+        error_contains=("500", "may have reached paperless-ngx"),
+        expected_category=ErrorCategory.UNCONFIRMED_SEND,
     ),
     _Case(
         label="consume-dir-fallback",
@@ -707,6 +745,9 @@ def _assert_persisted_row(case: _Case, job: Job) -> None:
     else:
         assert job.warning is not None
         assert case.warning_contains in job.warning
+
+    if case.expected_category is not None:
+        assert job.error_category is case.expected_category
 
 
 def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) -> None:
