@@ -4784,7 +4784,7 @@ class TestGeometryUnit:
         arm leaves the scale unbound and fails here at runtime, as well as
         failing ``assert_never`` under both type checkers at edit time.
         """
-        scale = sane_backend_mod._units_per_mm(unit, 300)
+        scale = sane_backend_mod._units_per_mm(unit, 300, fallback="will crop")
 
         if unit in _CONVERTIBLE_UNITS:
             assert scale is not None
@@ -4906,7 +4906,12 @@ class TestNonPositiveGeometryScale:
 
     def test_a_sub_one_dpi_read_back_yields_a_zero_scale(self) -> None:
         """The arithmetic really does produce 0.0 -- the premise, measured."""
-        assert sane_backend_mod._units_per_mm(GeometryUnit.UNIT_PIXEL, 0) == 0.0
+        assert (
+            sane_backend_mod._units_per_mm(
+                GeometryUnit.UNIT_PIXEL, 0, fallback="will crop"
+            )
+            == 0.0
+        )
 
     def test_a_zero_scale_falls_back_to_the_crop(self) -> None:
         """``_set_geometry`` declines, which is what makes the crop run."""
@@ -5306,6 +5311,38 @@ class TestFeederPaperSize:
         # 148 mm and 210 mm at 300 dpi, rounded to the nearest pixel.
         assert dev.page_width == round(148 / 25.4 * 300) == 1748
         assert dev.page_height == round(210 / 25.4 * 300) == 2480
+
+    def test_an_unconvertible_page_size_unit_says_the_full_window_is_scanned(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        The WARNING names what happens on this path, not the scan-area one.
+
+        A feeder whose page-size options are in a unit saneless cannot convert
+        is left to scan its full window, uncropped, so a WARNING saying the
+        page will be cropped would describe something that does not happen.
+        """
+        dev = _feeder_device(page_size_options=False)
+        dev.offer_page_size_options(unit=GeometryUnit.UNIT_DPI)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="ADF", resolution=300, mode="Color", paper_size="a5"
+        )
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+
+        backend.scan_pages("test:0", settings, page_sink)
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == _BACKEND_LOGGER and "UNIT_DPI" in record.getMessage()
+        ]
+        assert messages
+        assert all("will scan the full window" in message for message in messages)
+        assert not any("will crop" in message for message in messages)
 
 
 class TestIntegerGeometry:

@@ -723,13 +723,22 @@ class GeometryUnit(IntEnum):
     UNIT_MICROSECOND = 6
 
 
-def _units_per_mm(unit: GeometryUnit, resolution: int) -> float | None:
+# What each path does when the device's unit cannot be converted, as the
+# WARNING says it: the scan-area path crops the page afterwards, and the feeder
+# page-size path scans the full window, uncropped.
+_GEOMETRY_FALLBACK: Final = "will crop after scanning"
+_PAGE_SIZE_FALLBACK: Final = "will scan the full window"
+
+
+def _units_per_mm(
+    unit: GeometryUnit, resolution: int, *, fallback: str
+) -> float | None:
     """
     Return how many device units one millimetre is, or None if unconvertible.
 
     One factor serves both jobs the geometry path has: scaling a paper size
     into the device's own units, and expressing the read-back tolerance in
-    those same units.
+    those same units. The page-size path uses it too, for its own options.
 
     Args:
         unit: The unit the device reports for its scan-area options.
@@ -737,10 +746,12 @@ def _units_per_mm(unit: GeometryUnit, resolution: int) -> float | None:
             back from the device, never the requested value -- converting with
             a resolution the device silently refused would reintroduce the
             silent resolution substitution one layer further down.
+        fallback: What the scan does instead, for the WARNING an
+            unconvertible unit logs, e.g. ``"will crop after scanning"``.
 
     Returns:
         The number of device units in one millimetre, or None when saneless
-        cannot convert the unit and the caller should crop instead.
+        cannot convert the unit and the caller should fall back instead.
 
     """
     match unit:
@@ -757,8 +768,9 @@ def _units_per_mm(unit: GeometryUnit, resolution: int) -> float | None:
         ):
             logger.warning(
                 "Scanner reports its scan area in %s, which saneless cannot "
-                "convert to a paper size, will crop after scanning",
+                "convert to a paper size, %s",
                 unit.name,
+                fallback,
             )
             scale = None
         case _:
@@ -820,7 +832,7 @@ def _geometry_unit(raw_options: list[tuple]) -> GeometryUnit | None:
         a SANE unit at all.
 
     """
-    return _option_unit(raw_options, "br-x", fallback="will crop after scanning")
+    return _option_unit(raw_options, "br-x", fallback=_GEOMETRY_FALLBACK)
 
 
 def _missing_geometry_options(raw_options: list[tuple]) -> list[str]:
@@ -870,7 +882,7 @@ def _geometry_scale(raw_options: list[tuple], resolution: int) -> float | None:
     unit = _geometry_unit(raw_options)
     if unit is None:
         return None
-    return _units_per_mm(unit, resolution)
+    return _units_per_mm(unit, resolution, fallback=_GEOMETRY_FALLBACK)
 
 
 def _area_matches(
@@ -1093,8 +1105,12 @@ def _set_page_size(
     """
     lengths: dict[str, float] = {}
     for name, length_mm in zip(_PAGE_SIZE_OPTIONS, dims, strict=True):
-        unit = _option_unit(raw_options, name, fallback="will scan the full window")
-        scale = None if unit is None else _units_per_mm(unit, resolution)
+        unit = _option_unit(raw_options, name, fallback=_PAGE_SIZE_FALLBACK)
+        scale = (
+            None
+            if unit is None
+            else _units_per_mm(unit, resolution, fallback=_PAGE_SIZE_FALLBACK)
+        )
         if scale is None or scale <= 0.0:
             return False
         lengths[name] = length_mm * scale
