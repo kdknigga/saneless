@@ -752,6 +752,68 @@ class TestTomlStructureErrors:
         assert settings.profiles["default"].default_title == title
 
 
+_MALFORMED_ID_NAMES = ["zero", "negative", "22-digit", "one-over"]
+
+
+class TestProfileIds:
+    """
+    A profile's default ids are bounded to what paperless-ngx can hold.
+
+    paperless-ngx keys are 32-bit auto-increment integers, so an id outside
+    1..2147483647 cannot name anything; it is refused when the config loads.
+    Repeated tag ids collapse to one, in the order first written.
+    """
+
+    @pytest.mark.parametrize(
+        "value", ["0", "-5", str(10**22), "2147483648"], ids=_MALFORMED_ID_NAMES
+    )
+    def test_malformed_default_tag_fails_to_load(
+        self, tmp_config_dir: Path, value: str
+    ) -> None:
+        """A default tag id no paperless-ngx can have is a load-time error."""
+        err = _load_error(
+            tmp_config_dir / "bad_tag.toml",
+            f"[profiles.default]\ndefault_tags = [3, {value}]\n",
+        )
+        assert "[profiles.default] default_tags" in str(err)
+
+    @pytest.mark.parametrize(
+        "value", ["0", "-5", str(10**22), "2147483648"], ids=_MALFORMED_ID_NAMES
+    )
+    def test_malformed_default_correspondent_fails_to_load(
+        self, tmp_config_dir: Path, value: str
+    ) -> None:
+        """A default correspondent id no paperless-ngx can have is a load error."""
+        err = _load_error(
+            tmp_config_dir / "bad_correspondent.toml",
+            f"[profiles.default]\ndefault_correspondent = {value}\n",
+        )
+        assert "[profiles.default] default_correspondent" in str(err)
+
+    def test_largest_paperless_id_loads(self, tmp_config_dir: Path) -> None:
+        """The largest id a paperless-ngx key can hold loads unchanged."""
+        config_file = tmp_config_dir / "largest_id.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            "default_tags = [1, 2147483647]\n"
+            "default_correspondent = 2147483647\n"
+        )
+        profile = load_settings(config_path=str(config_file)).profiles["default"]
+        assert profile.default_tags == [1, 2_147_483_647]
+        assert profile.default_correspondent == 2_147_483_647
+
+    def test_repeated_default_tags_dedupe_in_order(self, tmp_config_dir: Path) -> None:
+        """Repeated default tag ids collapse to one, first occurrence kept."""
+        config_file = tmp_config_dir / "repeated_tags.toml"
+        config_file.write_text("[profiles.default]\ndefault_tags = [3, 7, 3, 7, 1]\n")
+        profile = load_settings(config_path=str(config_file)).profiles["default"]
+        assert profile.default_tags == [3, 7, 1]
+
+    def test_repeated_default_tags_dedupe_on_construction(self) -> None:
+        """A profile built in code collapses repeats the same way."""
+        assert ProfileConfig(default_tags=[3, 7, 3]).default_tags == [3, 7]
+
+
 def _load_error(config_file: Path, toml_content: str) -> ConfigError:
     """
     Write ``toml_content`` to ``config_file`` and return the load's ConfigError.

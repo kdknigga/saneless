@@ -1104,6 +1104,96 @@ def test_tag_refresh_tags_cap_refuses_one_over(client: TestClient) -> None:
     _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
 
 
+# A paperless-ngx id is a 32-bit auto-increment key: 1 to 2147483647.  Spelled
+# out rather than imported, so the tests pin the documented range.
+_MAX_ID = 2_147_483_647
+_MALFORMED_IDS = ["0", "-5", str(10**22), str(_MAX_ID + 1)]
+_MALFORMED_ID_NAMES = ["zero", "negative", "22-digit", "one-over"]
+
+
+@pytest.mark.parametrize("field", ["tags", "correspondent"])
+@pytest.mark.parametrize("value", _MALFORMED_IDS, ids=_MALFORMED_ID_NAMES)
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_malformed_id_is_422_without_a_row(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+    *,
+    htmx: bool,
+) -> None:
+    """An id no paperless-ngx can have is INVALID_REQUEST before any job row."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Malformed Id", field: value},
+        headers=headers,
+    )
+    rejection = RequestRejection.INVALID_REQUEST
+    if htmx:
+        _assert_htmx_error(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert offered == []
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_scan_malformed_tag_among_good_ones_is_422(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One malformed id refuses the whole submit; nothing is dropped quietly."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Mixed", "tags": ["3", "0", "7"]},
+        headers=HTMX_HEADERS,
+    )
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+    assert offered == []
+
+
+def test_scan_largest_paperless_id_is_accepted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The largest id a paperless-ngx key can hold is offered unchanged."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    response = client.post(
+        "/api/scan",
+        data={
+            "profile": "default",
+            "title": "Largest Id",
+            "tags": [str(_MAX_ID)],
+            "correspondent": str(_MAX_ID),
+        },
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert len(offered) == 1
+    assert offered[0].tags == [_MAX_ID]
+    assert offered[0].correspondent == _MAX_ID
+
+
+@pytest.mark.parametrize("value", _MALFORMED_IDS, ids=_MALFORMED_ID_NAMES)
+def test_tag_list_malformed_tag_is_422(client: TestClient, value: str) -> None:
+    """The tag list refuses a ticked id no paperless-ngx can have."""
+    response = client.get("/api/tags", params={"tags": [value]}, headers=HTMX_HEADERS)
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
+@pytest.mark.parametrize("value", _MALFORMED_IDS, ids=_MALFORMED_ID_NAMES)
+def test_tag_refresh_malformed_tag_is_422(client: TestClient, value: str) -> None:
+    """The tag refresh refuses a ticked id no paperless-ngx can have."""
+    response = client.post(
+        "/api/cache/invalidate",
+        params={"resource": "tags"},
+        data={"tags": [value]},
+        headers=HTMX_HEADERS,
+    )
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
 def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
