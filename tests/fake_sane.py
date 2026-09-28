@@ -50,6 +50,13 @@ What the double models:
    cancel.  A test arranges and inspects the device itself through
    ``FakeSaneModule.device``; a ``FakeSaneDev`` used directly behaves as a
    handle that is always open.
+9. ``get_parameters()`` returns python-sane's five-tuple ``(format,
+   last_frame, (pixels_per_line, lines), depth, bytes_per_line)``.  The format
+   is ``"color"`` for a colour mode and ``"gray"`` otherwise, the size is the
+   page size, the depth is the ``depth`` option's value when the table has one
+   and 8 when it does not, and a line is ``pixels_per_line`` samples of
+   ``depth`` bits per channel, rounded up to whole bytes.  Changing the depth
+   changes the bytes per line, never the frame's size.
 
 One deliberate, documented divergence: the real ``__load_option_dict`` filters
 ``TYPE_GROUP`` options out of ``opt``, which makes the library's own "Groups
@@ -181,6 +188,31 @@ _READ_GATE_CEILING_SECONDS = 30.0
 # Modelling the truncation this way is what makes the backend's discard rule
 # testable instead of incidental.
 _TRUNCATED_PAGE_DIVISOR = 4
+
+# The bit depths ``test:0`` lists for its ``depth`` option, which is what
+# ``offer_depth()`` offers unless told otherwise.
+_TEST0_DEPTHS = (1, 8, 16)
+
+# The depth a frame reports when the table has no ``depth`` option: a device
+# without one scans at 8 bits per sample unless its mode says otherwise, which
+# is what ``set_parameters(depth=...)`` models.
+_DEFAULT_DEPTH = 8
+
+# Samples per pixel in a colour frame; a gray frame has one.
+_COLOR_SAMPLES = 3
+
+# The names ``set_parameters()`` accepts, one per element of the tuple
+# ``get_parameters()`` returns.
+_PARAMETER_FIELDS = frozenset(
+    {
+        "frame_format",
+        "last_frame",
+        "pixels_per_line",
+        "lines",
+        "depth",
+        "bytes_per_line",
+    }
+)
 
 # What python-sane raises for any call on a handle after ``close()``; the C
 # layer checks for it before it makes a SANE call.
@@ -1002,6 +1034,8 @@ class FakeSaneDev:
     assignments: list[str]
     cancel_calls: int
     close_calls: int
+    get_options_calls: int
+    get_parameters_calls: int
     issued_pages: list[weakref.ref[Image.Image]]
     high_water_live_pages: int
     read_gate: threading.Event
@@ -1021,6 +1055,7 @@ class FakeSaneDev:
     _call_errors: dict[str, BaseException]
     _assignment_errors: dict[str, BaseException]
     _read_errors: dict[str, BaseException]
+    _parameter_overrides: dict[str, int | str]
 
     def __init__(
         self,
@@ -1067,10 +1102,13 @@ class FakeSaneDev:
         state["_call_errors"] = {}
         state["_assignment_errors"] = {}
         state["_read_errors"] = {}
+        state["_parameter_overrides"] = {}
         state["calls"] = []
         state["assignments"] = []
         state["cancel_calls"] = 0
         state["close_calls"] = 0
+        state["get_options_calls"] = 0
+        state["get_parameters_calls"] = 0
         state["issued_pages"] = []
         state["high_water_live_pages"] = 0
         state["read_gate"] = threading.Event()
@@ -1322,12 +1360,14 @@ class FakeSaneDev:
         ``snap`` and ``close`` record their call before raising, as they do when
         they succeed, so a test can still assert the call pattern -- and for
         ``close``, that the handle was released and that the close failure did
-        not mask anything.  ``get_options`` is not a recorded call at all.
+        not mask anything.  ``get_options`` and ``get_parameters`` are not
+        recorded in ``calls`` at all; each has a counter of its own.
 
         Args:
-            method: The device method to fail: ``"get_options"``, ``"snap"`` or
-                ``"close"``.  A ``start()`` failure keeps its own constructor
-                keyword, because it needs a page index.
+            method: The device method to fail: ``"get_options"``,
+                ``"get_parameters"``, ``"snap"`` or ``"close"``.  A ``start()``
+                failure keeps its own constructor keyword, because it needs a
+                page index.
             error: The exception that method raises.
 
         """
@@ -1375,6 +1415,46 @@ class FakeSaneDev:
 
         """
         self._replace_constraint("source", list(sources))
+
+    def offer_depth(self, depths: list[int] | None = None) -> None:
+        """
+        Offer a ``depth`` option: an INT word list, as ``test:0`` reports it.
+
+        Opt-in, because most scanner tests use the default table and a
+        ``depth`` option there would add an assignment to every sequence they
+        expect.  The stored value is the list's first entry, as a device left
+        at that depth would report it, so ``offer_depth([16])`` is a device
+        that can only scan at 16 bits.
+
+        A method rather than a constructor keyword for the usual reason:
+        ``__init__`` already carries ruff's maximum of five arguments.
+
+        Args:
+            depths: The bit depths the device lists.  Defaults to ``test:0``'s
+                ``[1, 8, 16]``.
+
+        """
+        values = list(_TEST0_DEPTHS if depths is None else depths)
+        options = self.__dict__["_options"]
+        if any(option[1] == "depth" for option in options):
+            self._replace_constraint("depth", values)
+            return
+        index = max((option[0] for option in options), default=0) + 1
+        option = (
+            index,
+            "depth",
+            "Bit depth",
+            "Number of bits per sample.",
+            _TYPE_INT,
+            _UNIT_NONE,
+            4,
+            _CAP_SETTABLE,
+            values,
+        )
+        options.append(option)
+        self.__dict__["opt"]["depth"] = option
+        if values:
+            self.__dict__["_values"]["depth"] = values[0]
 
     def _replace_constraint(self, name: str, constraint: object) -> None:
         """
@@ -1425,6 +1505,35 @@ class FakeSaneDev:
 
         """
         self.__dict__["_page_size"] = (width, height)
+
+    def set_parameters(self, **fields: int | str) -> None:
+        """
+        Override what ``get_parameters()`` reports, without building that page.
+
+        A test can then report a 16-bit frame from a device with no ``depth``
+        option -- a mode that implies 16 bits -- or a page too large to build,
+        and the code reading the parameters sees it.  Overrides accumulate
+        across calls.  Bytes per line are derived from the overridden format,
+        width and depth unless they are overridden as well.
+
+        Keyword arguments rather than a parameter each, because six would put
+        this over ruff's five-argument maximum.
+
+        Args:
+            **fields: Any of ``frame_format``, ``last_frame``,
+                ``pixels_per_line``, ``lines``, ``depth`` and
+                ``bytes_per_line``.
+
+        Raises:
+            TypeError: For a name that is not one of those, so a misspelt
+                override cannot pass silently.
+
+        """
+        unknown = sorted(set(fields) - _PARAMETER_FIELDS)
+        if unknown:
+            msg = f"Not a scan parameter: {', '.join(unknown)}"
+            raise TypeError(msg)
+        self.__dict__["_parameter_overrides"].update(fields)
 
     def _reload_for_source(self, source: str) -> None:
         """
@@ -1525,13 +1634,59 @@ class FakeSaneDev:
             Nine-element tuples whose names are hyphenated.
 
         Raises:
-            BaseException: The error armed with ``fail_call("get_options", ...)``.
+            BaseException: The error armed with ``fail_call("get_options", ...)``,
+                after the call has been counted.
 
         """
+        self.__dict__["get_options_calls"] += 1
         error = self._call_errors.get("get_options")
         if error is not None:
             raise error
         return list(self._options)
+
+    def get_parameters(self) -> tuple[str, int, tuple[int, int], int, int]:
+        """
+        Report the frame the device is set up to scan, as ``sane.py`` does.
+
+        Derived from the mode, the page size and the ``depth`` option (8 when
+        the table has none), then overridden by whatever ``set_parameters()``
+        set.  See the module docstring, rule 9, for how each element is
+        derived; the contract table checks them against ``test:0``.
+
+        Returns:
+            ``(format, last_frame, (pixels_per_line, lines), depth,
+            bytes_per_line)``.
+
+        Raises:
+            BaseException: The error armed with
+                ``fail_call("get_parameters", ...)``, after the call has been
+                counted.
+
+        """
+        self.__dict__["get_parameters_calls"] += 1
+        error = self._call_errors.get("get_parameters")
+        if error is not None:
+            raise error
+        overrides = self._parameter_overrides
+        values = self._values
+        default_format = (
+            "color" if "color" in str(values.get("mode", "")).casefold() else "gray"
+        )
+        width, height = self._page_size
+        frame_format = str(overrides.get("frame_format", default_format))
+        pixels_per_line = int(overrides.get("pixels_per_line", width))
+        depth = int(overrides.get("depth", values.get("depth", _DEFAULT_DEPTH)))
+        samples = _COLOR_SAMPLES if frame_format == "color" else 1
+        # Rounded up to whole bytes: ``test:0`` reports 30 for a 236-pixel
+        # line at 1 bit.
+        derived_bytes = -(-pixels_per_line * samples * depth // 8)
+        return (
+            frame_format,
+            int(overrides.get("last_frame", 1)),
+            (pixels_per_line, int(overrides.get("lines", height))),
+            depth,
+            int(overrides.get("bytes_per_line", derived_bytes)),
+        )
 
     def start(self) -> None:
         """
@@ -1800,6 +1955,18 @@ class FakeSaneHandle:
         """
         self._refuse_if_closed()
         return self._device.get_options()
+
+    def get_parameters(self) -> tuple[str, int, tuple[int, int], int, int]:
+        """
+        Report the frame the device is set up to scan.
+
+        Returns:
+            ``(format, last_frame, (pixels_per_line, lines), depth,
+            bytes_per_line)``.
+
+        """
+        self._refuse_if_closed()
+        return self._device.get_parameters()
 
     def start(self) -> None:
         """Begin one page on the device."""
