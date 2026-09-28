@@ -56,7 +56,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | `label` | string | `""` | The name shown in the web UI's profile dropdown. `auto-profiles` fills this in -- `Feeder, single-sided`, `Feeder, double-sided` or `Glass (flatbed)` -- and owns it; see [Auto-generated profiles](#auto-generated-profiles). A profile with an empty label is listed under its profile name |
 | `description` | string | `""` | The sentence shown beneath the profile dropdown, such as `Scans both sides of every page using the document feeder.`. Also filled in and owned by `auto-profiles` |
 | `source` | string | `"Flatbed"` | Paper source: `"Flatbed"`, `"ADF"`, or `"ADF Duplex"` |
-| `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow; `"hardware"` only records that the source scans both sides and does not change the scan |
+| `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow. `"hardware"` scans both sides through the source: most scanners do that because of the source's name, and on scanners with a separate ADF mode option (`adf-mode`) saneless sets it to `Duplex`; see [ADF Hardware Duplex](set-up-adf-duplex.md#adf-hardware-duplex) |
 | `resolution` | integer | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `"Color"`, `"Gray"`, or `"Lineart"` |
 | `title` | string | `""` | Default document title, used as written when you leave the title blank in the web UI or omit `--title` on the CLI. A title you type always wins; with neither, the title is `Scan <date time>`, rendered in the server's local timezone with the zone named -- for example `Scan 2026-03-22 09:30 CDT` |
@@ -65,7 +65,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | `enable_empty_page_detection` | bool | `true` | Remove blank pages from scans |
 | `empty_page_coverage_threshold` | float | `0.001` | The most ink a page may carry and still be removed as blank, as a percentage (0 to 100) of the page inside a 3% margin. Lower keeps more pages; `0` removes only pages with no ink at all |
 | `auto_source_mode` | string | `"flatbed"` | When source is `"Auto"`: `"flatbed"` for single-page or `"adf"` for multi-page feeder |
-| `paper_size` | string | `"full"` | Constrain scan area: `"full"`, `"a3"`, `"a4"`, `"a5"`, `"letter"`, `"legal"` |
+| `paper_size` | string | `"full"` | Constrain scan area: `"full"`, `"a3"`, `"a4"`, `"a5"`, `"letter"`, `"legal"`. Applied on the flatbed, and on a feeder only when the scanner reports `page-width` and `page-height`; see [Paper size](#paper-size) |
 | `auto_generated` | bool | `false` | Set by `auto-profiles`; marks machine-generated profiles |
 
 ## Source values
@@ -87,6 +87,8 @@ mode = "Color"
 ```
 
 See [Set Up ADF Duplex Scanning](set-up-adf-duplex.md#manual-duplex) for the full flow.
+
+The names above are common, but the scanner decides what its sources are called: run `saneless devices --capabilities` to list them. A profile's `source` is matched against that list ignoring case and surrounding spaces, and the scan uses the scanner's own spelling, so `source = "adf"` finds `ADF`. A name the scanner does not list is refused before any paper moves, with an error naming the sources it does list. The one exception is a flatbed name on a scanner that has no flatbed source but has `Auto`: the scan falls back to `Auto`, and when the profile's `auto_source_mode` then sends it through the feeder, the job finishes with a warning saying so.
 
 **Multiple pages** is a choice made for each scan, not a profile setting, so no profile key turns it on. It works with every source above, and on a feeder it lets you hand-feed a document a sheet or a few sheets at a time. It is not available with a `duplex = "manual"` profile.
 
@@ -132,16 +134,22 @@ supply. Some scanners also show a panel message such as "Memory is low" when thi
 happens. Set `auto_source_mode = "flatbed"`, or re-run `saneless auto-profiles
 --force` to regenerate the value.
 
+Other scanners scan their glass again for every sheet asked for, as if it were a
+feeder that never runs out. saneless stops an `Auto` source sent through the feeder
+after 50 sheets, uploads what it kept, and finishes the job with a warning that says
+to set `auto_source_mode = "flatbed"` if the feeder was already empty. A source named
+as a feeder stops after 500 sheets instead.
+
 See [Configuration reference](../reference/configuration.md) for all profile fields.
 
 ## Paper size
 
 By default, saneless scans the entire scanner bed. If your documents are a standard size,
-set `paper_size` to crop the scan area automatically:
+set `paper_size` to limit the scan area to that size:
 
 ```toml
 [profiles.letters]
-source = "ADF"
+source = "Flatbed"
 resolution = 300
 mode = "Color"
 paper_size = "letter"
@@ -157,6 +165,19 @@ report all four scan-area options, it may report them in a unit saneless cannot 
 length, or it may silently shrink the area to something smaller than you asked for. In any of
 those cases saneless crops the image after scanning instead, and logs which of the three
 happened.
+
+The scan area and the crop are measured from the top-left corner of the bed, which is where a
+sheet lies on the glass. A feeder may guide the sheet against one side or centre it, and
+saneless cannot see which, so on a scan through the feeder:
+
+- If the scanner reports `page-width` and `page-height` for the selected source, saneless sets
+  them to the paper size, the scanner places its own window over the sheet, and the scan area
+  is set inside that window as on the glass.
+- Otherwise the paper size is not applied. The page is scanned at the full window and not
+  cropped, so a centred sheet keeps both edges, and the log says at INFO that `paper_size` was
+  not applied and why.
+
+See [Paper size on a feeder](set-up-adf-duplex.md#paper-size-on-a-feeder).
 
 See [Configuration reference](../reference/configuration.md) for all profile fields.
 

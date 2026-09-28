@@ -42,7 +42,19 @@ mode = "Color"
 saneless scan --profile duplex --title "Contract"
 ```
 
-The scanner decides to scan both sides from the source name it is given, so `source = "ADF Duplex"` is what makes this a duplex scan. `duplex = "hardware"` is optional and changes nothing about how the scan runs: it records what the scanner does, so the profile describes itself. `saneless auto-profiles` writes it for hardware duplex sources.
+Most scanners select duplex by source name, so on them `source = "ADF Duplex"` is what makes this a duplex scan, and `duplex = "hardware"` records what the source does. `saneless auto-profiles` writes it for sources whose name says they scan both sides.
+
+Some scanners have no duplex source. The epson2, kodakaio and magicolor drivers, and older epsonds ones, list a single feeder source and a separate ADF mode option, `adf-mode`, that switches it between `Simplex` and `Duplex`. On those, `duplex = "hardware"` is what makes the scan double-sided: saneless sets `adf-mode` to `Duplex` right after selecting the source. On every other scan where the option is in use it sets `Simplex`, so a `Duplex` left behind by an earlier scan does not carry over. `auto-profiles` does not generate this profile, because such a scanner may not report the option as usable until its feeder is selected, so write it yourself:
+
+```toml
+[profiles.duplex]
+source = "ADF"
+duplex = "hardware"
+resolution = 300
+mode = "Color"
+```
+
+If the scanner lists `adf-mode` but has it switched off for that source -- a feeder with no duplex unit, for example -- the scan is refused before any sheet is fed, with an error naming `adf_mode` and `'Duplex'`. If the scanner has neither a duplex source nor an ADF mode and the profile names a single-sided feeder, saneless logs a warning that only one side of each sheet is scanned, and scans one side.
 
 ### Manual Duplex
 
@@ -143,6 +155,13 @@ Manual duplex needs a feeder source, and this device exposes no source option to
     route it to multi-page ADF behavior by setting `auto_source_mode = "adf"` in your profile.
     See [Configure Scan Profiles](configure-scan-profiles.md#auto-source) for details.
 
+## Paper size on a feeder
+
+`paper_size` works differently on a feeder than on the flatbed. On the glass, the sheet lies in the top-left corner, so saneless sets the scan area from that corner. In a feeder, the sheet sits wherever the feeder guides it -- against one side on some models, in the middle on others -- and saneless cannot see which. So on a scan through the feeder:
+
+- If the scanner reports `page-width` and `page-height` options for the selected source, saneless sets them to the paper size, the scanner places its own window over the sheet, and the scan area is set inside that window.
+- Otherwise the paper size is not applied: the page is scanned at the full width of the feeder window and is not cropped, so nothing is cut off a sheet the feeder centred. The log says, at INFO, that `paper_size` was not applied and why.
+
 ## Empty page detection
 
 When scanning duplex documents, blank back sides are common. saneless detects and removes empty pages by default, by measuring how much of each page is ink. This is controlled per profile:
@@ -172,7 +191,14 @@ If the job fails instead -- a fault during pass B, a pass B that fed nothing, a 
 
 Empty page detection is deliberately skipped for these two partial PDFs, even when the profile has `enable_empty_page_detection = true`. When the passes disagree, a blank back side is evidence about why -- a sheet that double-fed, or one that did not feed at all -- and the partial PDFs exist so you can see exactly what each pass picked up. Removing blank pages would throw that evidence away. Every scan that does not hit a mismatch still has its blank pages removed as usual.
 
-The feeder page cap applies to each pass separately, not to the whole job: each pass can feed up to 500 sheets.
+### When a pass reaches its sheet cap
+
+One scan through the feeder keeps at most 500 sheets, or 50 for an Auto source that `auto_source_mode = "adf"` sends through the feeder. The cap applies to each pass separately, not to the whole job. Reaching it is not a failure: a feeder can only tell that the stack goes on by feeding one more sheet, so that sheet is fed but not kept, the pages kept are uploaded, and the job finishes as **Uploaded with a warning** that names the sheet, so you know where to resume. A simplex or hardware duplex scan uploads its pages as one document.
+
+In manual duplex, what happens depends on which pass reached the cap:
+
+- **The fronts pass (pass A).** saneless uploads the fronts it kept, as one document, and ends the job without asking you to flip the stack. The sheet it fed but did not keep is already in the output tray with the fronts, so turning the stack over would pair every back with the wrong front. The warning says so: *"The backs were not scanned: sheet 501 is already in the output tray, so turning the stack over would pair every back with the wrong front."* Scan the backs, and the sheets that were not fed, as new documents.
+- **The backs pass (pass B).** The fronts and backs are never interleaved, even when their counts agree, because pass B fed a sheet pass A never did. They are uploaded as `(fronts)` and `(backs)`, as for a page-count mismatch, and the warning says that the scan of the backs stopped at its sheet cap and names the sheet that was fed but not kept.
 
 !!! tip
     Always test with a few pages first to confirm page ordering before scanning a large batch. This helps verify that your scanner feeds pages in the expected direction.

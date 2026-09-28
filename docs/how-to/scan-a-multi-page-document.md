@@ -133,6 +133,8 @@ To give yourself longer at the scanner, raise the setting; see [Configuration](.
 
 No new scan starts once a document holds 500 pages or more. A scan that is already running is not cut short, and one feeder scan can add up to 500 sheets, so a document can reach 999 pages: 499 pages kept, then one more full feeder scan. When the limit stops the loop, the document is uploaded as **Uploaded with a warning**, for example *"Finished at 512 pages: no new scan starts once a document has 500 pages. Scan any remaining pages as a new document."* `saneless scan` exits with code 7. Scan the rest as a second document.
 
+A feeder scan that itself reaches its own limit -- 500 sheets, or 50 for an Auto source sent through the feeder -- finishes the document at once, with no question about another page, and the warning names the sheet that was fed but not kept, for example *"Finished at 520 pages: one scan stops after 500 sheets, so sheet 501 was fed but not kept. Scan sheet 501 and any remaining pages as a new document."*
+
 ## Stopping saneless during a scan
 
 Stopping saneless is not an abort. If the server stops or restarts while a document waits for your answer -- `docker compose restart`, an upgrade, a host shutdown -- or `saneless scan --multi-page` receives SIGTERM, or the hangup a closing terminal or SSH session sends:

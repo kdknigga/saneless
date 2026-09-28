@@ -164,6 +164,8 @@ QUICK_START = DOCS_DIR / "getting-started" / "quick-start.md"
 PROFILE_HOWTO = DOCS_DIR / "how-to" / "configure-scan-profiles.md"
 
 CONFIG_REFERENCE = DOCS_DIR / "reference" / "configuration.md"
+MULTI_PAGE_HOWTO = DOCS_DIR / "how-to" / "scan-a-multi-page-document.md"
+ADF_DUPLEX_HOWTO = DOCS_DIR / "how-to" / "set-up-adf-duplex.md"
 ENV_REFERENCE = DOCS_DIR / "reference" / "environment-variables.md"
 ARCHITECTURE = DOCS_DIR / "explanation" / "architecture.md"
 FIRST_CLI_SCAN = DOCS_DIR / "getting-started" / "first-cli-scan.md"
@@ -1046,6 +1048,51 @@ SCANNER_DOC_CLAIMS: tuple[tuple[Path, str, tuple[str, ...]], ...] = (
         "a 16-bit mode is refused before any page",
         ("16 bits per sample",),
     ),
+    (
+        ADF_DUPLEX_HOWTO,
+        "hardware duplex sets the ADF mode on the scanners that select duplex that way",
+        ("adf-mode", "epson2"),
+    ),
+    (
+        PROFILE_HOWTO,
+        "hardware duplex sets the ADF mode on the scanners that select duplex that way",
+        ("adf-mode",),
+    ),
+    (
+        CONFIG_REFERENCE,
+        "hardware duplex sets the ADF mode on the scanners that select duplex that way",
+        ("adf-mode",),
+    ),
+    (
+        ADF_DUPLEX_HOWTO,
+        "paper_size on a feeder needs page-width/page-height",
+        ("page-width",),
+    ),
+    (
+        PROFILE_HOWTO,
+        "paper_size on a feeder needs page-width/page-height",
+        ("page-width",),
+    ),
+    (
+        CONFIG_REFERENCE,
+        "paper_size on a feeder needs page-width/page-height",
+        ("page-width",),
+    ),
+    (
+        PROFILE_HOWTO,
+        "a profile's source is matched ignoring case and surrounding spaces",
+        ("ignoring case",),
+    ),
+    (
+        ADF_DUPLEX_HOWTO,
+        "a pass that reaches its sheet cap uploads the pages kept, naming the sheet",
+        ("fed but not kept",),
+    ),
+    (
+        MULTI_PAGE_HOWTO,
+        "a scan that reaches its per-scan limit finishes the document",
+        ("fed but not kept",),
+    ),
 )
 
 # Sentences those pages used to carry that are no longer true, each with why.
@@ -1055,6 +1102,26 @@ SCANNER_DOC_RETRACTED: tuple[tuple[Path, str, str], ...] = (
         "usually means the link dropped",
         "the limit grows with the page, so a slow link or a high resolution "
         "can reach it too",
+    ),
+    (
+        ADF_DUPLEX_HOWTO,
+        "The scanner decides to scan both sides from the source name it is given",
+        'scanners that select duplex by an ADF mode need duplex = "hardware"',
+    ),
+    (
+        PROFILE_HOWTO,
+        "only records that the source scans both sides and does not change the scan",
+        'duplex = "hardware" sets the ADF mode where the scanner has one',
+    ),
+    (
+        CONFIG_REFERENCE,
+        "nothing reads it",
+        'duplex = "hardware" sets the ADF mode where the scanner has one',
+    ),
+    (
+        CONFIG_REFERENCE,
+        "falls back to post-scan crop otherwise",
+        "a feeder without page-width/page-height scans the full window uncropped",
     ),
 )
 
@@ -7028,8 +7095,6 @@ def test_proxy_docs_require_the_original_host_header() -> None:
 # ---------------------------------------------------------------------------
 # Multi-page scanning: every documented state list, and the honest page ceiling
 # ---------------------------------------------------------------------------
-
-MULTI_PAGE_HOWTO = DOCS_DIR / "how-to" / "scan-a-multi-page-document.md"
 
 # A backticked upper-case enum value inside a documented list, e.g. `DONE`.
 DOCUMENTED_ENUM_VALUE = re.compile(r"`([A-Z][A-Z_]*)`")

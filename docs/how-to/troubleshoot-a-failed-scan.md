@@ -377,7 +377,7 @@ again. The warning is one of these:
 - **Finished at N pages: one scan stops after 500 sheets, so sheet 501 was fed but not kept.**
   One scan through the feeder keeps at most 500 sheets. A feeder can only tell that the stack
   goes on by feeding one more sheet, so sheet 501 went through the feeder and was thrown away.
-  The 500 pages before it were uploaded. Take sheet 501 and everything after it from the output
+  The pages before it were uploaded. Take sheet 501 and everything after it from the output
   tray and the feeder, and scan them as a new document. In a multi-page scan the document is
   finished at that scan, and the warning counts the document's pages.
 - **Finished at N pages: a scan from an Auto source through the feeder stops after 50 sheets, so
@@ -400,7 +400,7 @@ again. The warning is one of these:
   document, and did not ask you to flip the stack: the sheet it fed but did not keep would have
   paired every back with the wrong front. The warning before it names that sheet. Scan the backs
   of the uploaded sheets, and the remaining sheets, as new documents. See
-  [When a manual duplex scan does not come out whole](set-up-adf-duplex.md#when-a-manual-duplex-scan-does-not-come-out-whole).
+  [When a pass reaches its sheet cap](set-up-adf-duplex.md#when-a-pass-reaches-its-sheet-cap).
 - **The scan of the backs stopped at its sheet cap, so the fronts and backs could not be paired
   reliably.** A manual duplex scan reached its sheet cap on the backs pass. The fronts and backs
   were uploaded as two documents, `(fronts)` and `(backs)`, even when the counts agree, because
