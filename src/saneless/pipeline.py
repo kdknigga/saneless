@@ -954,17 +954,20 @@ class _SpoolLedger:
 
     def discard(self, sink: SpooledPageSink) -> None:
         """
-        Delete a thrown-away pass's page files, then stop tracking it.
+        Stop tracking a thrown-away pass, then delete its page files.
 
-        The files go through ``_unlink_pages``, which says why none may be
-        left behind.
+        In that order, as ``_discard_last_pass`` does: a signal raises on the
+        main thread wherever it is, and landing in between it can then leave
+        at worst orphan files, never an entry the guard would try to keep
+        from pages that are already gone.  The files go through
+        ``_unlink_pages``, which says why none may be left behind.
 
         Args:
             sink: The sink the discarded pass spooled into.
 
         """
-        _unlink_pages(sink.records)
         self.forget(sink)
+        _unlink_pages(sink.records)
 
     def spooled(self) -> list[tuple[str, tuple[PageRecord, ...]]]:
         """

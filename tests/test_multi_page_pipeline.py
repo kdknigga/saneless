@@ -313,6 +313,35 @@ class TestSpoolLedgerAcceptAndDiscard:
         assert ledger.spooled() == [("(partial)", other.records)]
         assert all(path.exists() for path in other_paths)
 
+    def test_a_signal_while_discarding_never_leaves_a_pass_without_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The ledger lets go of the pass before its files are deleted.
+
+        A signal raises wherever the main thread is; landing as the files go,
+        it must leave at worst orphan files, never a ledger entry the guard
+        would try to preserve from pages that no longer exist.
+        """
+        sink = _sink_with_pages(tmp_path, "a", 2)
+        ledger = _SpoolLedger()
+        ledger.register("(partial)", sink)
+        tracked_while_deleting: list[bool] = []
+
+        def _interrupted_unlink(records: Sequence[object]) -> None:
+            del records
+            tracked_while_deleting.append(bool(ledger.spooled()))
+            msg = "signal"
+            raise ScanInterrupted(msg)
+
+        monkeypatch.setattr(pipeline_module, "_unlink_pages", _interrupted_unlink)
+
+        with pytest.raises(ScanInterrupted):
+            ledger.discard(sink)
+
+        assert tracked_while_deleting == [False]
+        assert ledger.spooled() == []
+
     def test_discard_tolerates_a_page_already_gone(self, tmp_path: Path) -> None:
         """A page file that is already missing does not stop the rest going."""
         sink = _sink_with_pages(tmp_path, "a", 2)
