@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import inspect
 import logging
@@ -24,6 +25,8 @@ from saneless.exceptions import (
     describe,
 )
 from saneless.paperless import (
+    ApiDelivery,
+    FolderDelivery,
     PaperlessClient,
     UploadResult,
     _not_accepted_message,
@@ -3668,53 +3671,57 @@ class TestAuthHeader:
 
 
 class TestUploadResultContract:
-    """UploadResult cannot represent a destination it did not reach (CTR-03)."""
+    """The upload result names exactly one destination, and only a real one."""
 
-    def test_api_delivery_carries_a_task_uuid(self) -> None:
-        """A result claiming API delivery must carry the task id (CTR-03)."""
-        result = UploadResult(delivered_to_api=True, task_uuid="task-123")
-        assert result.task_uuid == "task-123"
-        assert result.consume_dir_path is None
+    def test_api_delivery_carries_the_task_id(self) -> None:
+        """An API delivery is its task id and nothing else."""
+        result = ApiDelivery(task_id="task-123")
+        assert result.task_id == "task-123"
+        assert [field.name for field in dataclasses.fields(result)] == ["task_id"]
 
-    def test_consume_dir_delivery_carries_a_path(self, tmp_path: Path) -> None:
-        """A result claiming consume-dir delivery must carry the path (CTR-03)."""
+    def test_folder_delivery_carries_the_path(self, tmp_path: Path) -> None:
+        """A consume-folder delivery is its path and nothing else."""
         dest = tmp_path / "consume" / "doc.pdf"
-        result = UploadResult(delivered_to_api=False, consume_dir_path=dest)
-        assert result.consume_dir_path == dest
-        assert result.task_uuid is None
+        result = FolderDelivery(path=dest)
+        assert result.path == dest
+        assert [field.name for field in dataclasses.fields(result)] == ["path"]
 
-    def test_api_delivery_without_task_uuid_is_rejected(self) -> None:
-        """
-        delivered_to_api=True with no task id is unconstructible (CTR-03).
+    def test_both_deliveries_are_frozen_and_slotted(self, tmp_path: Path) -> None:
+        """A delivery cannot be changed after the fact or grow a field."""
+        for result in (ApiDelivery(task_id="t"), FolderDelivery(path=tmp_path / "x")):
+            for field in dataclasses.fields(result):
+                with pytest.raises(dataclasses.FrozenInstanceError):
+                    setattr(result, field.name, getattr(result, field.name))
+            assert not hasattr(result, "__dict__")
 
-        This is the state the old "fallback" sentinel could not express and the
-        typed result must not silently allow: run_pipeline reads the presence of
-        a task id to decide SUCCESS vs FALLBACK, so such a result would report a
-        document that reached paperless-ngx as a consume-directory fallback.
-        """
-        with pytest.raises(ValueError, match="requires a task_uuid"):
-            UploadResult(delivered_to_api=True)
+    def test_upload_result_is_the_union_of_the_two(self, tmp_path: Path) -> None:
+        """The alias is a plain union, so ``isinstance`` accepts it."""
+        assert UploadResult == ApiDelivery | FolderDelivery
+        assert isinstance(ApiDelivery(task_id="t"), UploadResult)
+        assert isinstance(FolderDelivery(path=tmp_path / "x"), UploadResult)
+        assert not isinstance("t", UploadResult)
 
-    def test_consume_dir_delivery_without_path_is_rejected(self) -> None:
-        """delivered_to_api=False with no path is unconstructible (CTR-03)."""
-        with pytest.raises(ValueError, match="requires a consume_dir_path"):
-            UploadResult(delivered_to_api=False)
+    def test_upload_document_returns_an_api_delivery(self, sample_pdf: Path) -> None:
+        """An accepted upload is an ApiDelivery carrying the task id."""
 
-    def test_the_two_destinations_are_mutually_exclusive(self, tmp_path: Path) -> None:
-        """A result cannot claim both destinations at once (CTR-03)."""
-        dest = tmp_path / "consume" / "doc.pdf"
-        with pytest.raises(ValueError, match="cannot carry a consume_dir_path"):
-            UploadResult(
-                delivered_to_api=True,
-                task_uuid="task-123",
-                consume_dir_path=dest,
-            )
-        with pytest.raises(ValueError, match="cannot carry a task_uuid"):
-            UploadResult(
-                delivered_to_api=False,
-                task_uuid="task-123",
-                consume_dir_path=dest,
-            )
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json="task-abc")
+
+        client = _poll_client(handler)
+        try:
+            result = client.upload_document(sample_pdf, title="Accepted")
+        finally:
+            client.close()
+        assert result == ApiDelivery(task_id="task-abc")
+
+    def test_upload_document_returns_a_folder_delivery(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """A consume-folder fallback is a FolderDelivery carrying the path."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        result = _deliver_to_consume_dir(sample_pdf, consume_dir)
+        assert result == FolderDelivery(path=consume_dir / sample_pdf.name)
 
     def test_null_task_id_from_paperless_is_rejected(self, sample_pdf: Path) -> None:
         """
