@@ -44,6 +44,7 @@ from saneless.vocabulary import (
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
+    pass_wait_state,
     timeout_finish_warning,
 )
 from saneless.workspace import SPOOL_DIR_NAME, JobWorkspace, has_pages_left
@@ -149,26 +150,23 @@ def _wait_event(wait: PassWait) -> PipelineEvent:
     """
     Return the event a multi-page run emits when it opens ``wait``.
 
+    Derived from ``vocabulary.pass_wait_state``, the one mapping from a
+    question to the job state that names it, rather than kept as a second
+    ``match`` to be updated in step with it.  The event is that state's twin:
+    every event's value is its name, and ``PipelineEvent.job_state`` projects
+    each event onto the state of the same name, so the event with the state's
+    value is the one whose projection is that state.  A new ``PassWait``
+    member is still caught at edit time, by ``pass_wait_state``'s own
+    ``match``.
+
     Args:
         wait: The question the run is about to ask.
 
     Returns:
         The waiting event whose job state names that question.
 
-    Raises:
-        AssertionError: If the value is not a PassWait member.
-
     """
-    match wait:
-        case PassWait.NEXT_PASS:
-            event = PipelineEvent.AWAITING_NEXT_PASS
-        case PassWait.BLANK_DECISION:
-            event = PipelineEvent.AWAITING_BLANK_DECISION
-        case PassWait.RETRY:
-            event = PipelineEvent.AWAITING_RETRY
-        case _:
-            assert_never(wait)
-    return event
+    return PipelineEvent(pass_wait_state(wait).value)
 
 
 logger = logging.getLogger(__name__)

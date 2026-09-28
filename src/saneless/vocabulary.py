@@ -1259,6 +1259,9 @@ def pass_wait_state(wait: PassWait) -> JobState:
     """
     Return the job state a multi-page question puts its job in.
 
+    The one mapping from a question to its state: the pipeline derives the
+    waiting event it announces from this, so the two cannot drift apart.
+
     Args:
         wait: The question that is open.
 
