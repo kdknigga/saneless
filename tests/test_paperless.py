@@ -32,6 +32,9 @@ from saneless.paperless import (
     FolderDelivery,
     PaperlessClient,
     PaperlessTiming,
+    TaskDuplicate,
+    TaskFiled,
+    TaskOutcome,
     UploadResult,
     _not_accepted_message,
     _one_line_reason,
@@ -152,6 +155,21 @@ def _poll_client(
         transport=_make_transport(handler),
         timing=PaperlessTiming(clock=fake.now, sleep=fake.sleep),
     )
+
+
+def _filed(outcome: TaskOutcome) -> dict[str, object]:
+    """
+    Return the task of a poll that filed its document.
+
+    Args:
+        outcome: What ``poll_task`` returned.
+
+    Returns:
+        The SUCCESS task paperless-ngx answered with.
+
+    """
+    assert isinstance(outcome, TaskFiled), outcome
+    return outcome.task
 
 
 def _connection_result_for_status(status_code: int) -> ConnectionStatus:
@@ -1958,7 +1976,7 @@ class TestPollTask:
 
         client = _poll_client(handler)
         try:
-            result = client.poll_task("t1", timeout=10)
+            result = _filed(client.poll_task("t1", timeout=10))
             assert str(result["status"]).upper() == "SUCCESS"
         finally:
             client.close()
@@ -2031,7 +2049,7 @@ class TestPollTask:
 
         client = _poll_client(handler)
         try:
-            result = client.poll_task("t1", timeout=30)
+            result = _filed(client.poll_task("t1", timeout=30))
             assert str(result["status"]).upper() == "SUCCESS"
             assert call_count["n"] >= 2
         finally:
@@ -2279,7 +2297,7 @@ class TestPollTaskSelectsItsOwnTask:
         handler = _CountingHandler(respond)
         client = _poll_client(handler, clock=poll_clock)
         try:
-            result = client.poll_task("t1", timeout=30)
+            result = _filed(client.poll_task("t1", timeout=30))
         finally:
             client.close()
         assert result["task_id"] == "t1"
@@ -2321,7 +2339,7 @@ class TestPollTaskSelectsItsOwnTask:
 
         client = _poll_client(handler)
         try:
-            result = client.poll_task("t1", timeout=10)
+            result = _filed(client.poll_task("t1", timeout=10))
         finally:
             client.close()
         assert result == {"task_id": "t1", "status": "SUCCESS"}
@@ -2357,7 +2375,7 @@ class TestPollTaskRidesOutTransientAnswers:
         handler = _CountingHandler(respond)
         client = _poll_client(handler, clock=poll_clock)
         try:
-            result = client.poll_task("t1", timeout=30)
+            result = _filed(client.poll_task("t1", timeout=30))
         finally:
             client.close()
         assert result["status"] == "SUCCESS"
@@ -2458,10 +2476,6 @@ _POLL_TRANSPORT_CASES = [
     ),
 ]
 
-_DUPLICATE_SENTENCE = (
-    "the document may already be in Paperless; check before scanning again"
-)
-
 
 def _task_answer(task: dict[str, object]) -> Callable[[int], httpx2.Response]:
     """Build a script that answers every poll with a v9 list holding ``task``."""
@@ -2507,7 +2521,7 @@ class TestPollTaskFailureTranslation:
         handler = _CountingHandler(respond)
         client = _poll_client(handler, clock=poll_clock)
         try:
-            result = client.poll_task("t1", timeout=5)
+            result = _filed(client.poll_task("t1", timeout=5))
         finally:
             client.close()
         assert result["status"] == "SUCCESS"
@@ -2565,7 +2579,7 @@ class TestPollTaskFailureTranslation:
         handler = _CountingHandler(respond)
         client = _poll_client(handler, clock=poll_clock)
         try:
-            result = client.poll_task("t1", timeout=5)
+            result = _filed(client.poll_task("t1", timeout=5))
         finally:
             client.close()
         assert result["status"] == "SUCCESS"
@@ -2648,45 +2662,6 @@ class TestPollTaskFailureTranslation:
         assert handler.calls == 1
         assert poll_clock.waits == []
 
-    def test_duplicate_v9_failure_says_check_before_rescanning(self) -> None:
-        """D-10: the v9 duplicate text gets the check-first sentence."""
-        text = "Not consuming: It is a duplicate of document #42"
-        message = _failed_poll_message(
-            _task_answer({"task_id": "t1", "status": "FAILURE", "result": text})
-        )
-        assert (
-            message == f"Paperless task t1 ended FAILURE: {text}; {_DUPLICATE_SENTENCE}"
-        )
-
-    def test_duplicate_v2_failure_matches_case_insensitively(self) -> None:
-        """D-10: the paperless-ngx 2.x spelling capitalises "Duplicate"."""
-        text = "Not consuming scan.pdf: It is a Duplicate of Invoice (#7)."
-        message = _failed_poll_message(
-            _task_answer({"task_id": "t1", "status": "FAILURE", "result": text})
-        )
-        assert text in message
-        assert message.endswith(f"; {_DUPLICATE_SENTENCE}")
-
-    def test_duplicate_v10_result_data_without_message(self) -> None:
-        """D-10: v10 reports a duplicate only as ``result_data.duplicate_of``."""
-        payload = {
-            "count": 1,
-            "next": None,
-            "previous": None,
-            "results": [
-                {
-                    "task_id": "t1",
-                    "status": "failure",
-                    "result_data": {"duplicate_of": 42, "duplicate_in_trash": False},
-                }
-            ],
-        }
-        message = _failed_poll_message(_answering(httpx2.Response(200, json=payload)))
-        assert message == (
-            "Paperless task t1 ended FAILURE: Paperless reported a failure but "
-            f"supplied no message; {_DUPLICATE_SENTENCE}"
-        )
-
     def test_non_duplicate_failure_has_no_duplicate_sentence(self) -> None:
         """D-10: an ordinary failure is not dressed up as a duplicate."""
         message = _failed_poll_message(
@@ -2733,15 +2708,6 @@ class TestPollTaskFailureTranslation:
         )
         assert message == f"Paperless task t1 ended FAILURE: {'x' * 200}…"
 
-    def test_duplicate_past_the_cut_still_says_check_before_rescanning(self) -> None:
-        """The duplicate check reads the whole failure text, not the cut one."""
-        text = f"{'consumer output ' * 20}It is a duplicate of document #42"
-        message = _failed_poll_message(
-            _task_answer({"task_id": "t1", "status": "FAILURE", "result": text})
-        )
-        assert "duplicate of document" not in message
-        assert message.endswith(f"…; {_DUPLICATE_SENTENCE}")
-
     def test_whitespace_only_failure_text_still_says_something(self) -> None:
         """A failure text of only whitespace is as empty as none."""
         message = _failed_poll_message(
@@ -2751,6 +2717,199 @@ class TestPollTaskFailureTranslation:
             "Paperless task t1 ended FAILURE: Paperless reported a failure but "
             "supplied no message"
         )
+
+
+def _poll_outcome(payload: object) -> TaskOutcome:
+    """
+    Poll ``t1`` against a server answering every poll with ``payload``.
+
+    Args:
+        payload: The JSON body of each 200 answer.
+
+    Returns:
+        What ``poll_task`` returned.
+
+    """
+    client = _poll_client(
+        _CountingHandler(_answering(httpx2.Response(200, json=payload)))
+    )
+    try:
+        return client.poll_task("t1", timeout=10)
+    finally:
+        client.close()
+
+
+def _v10_duplicate(result_data: dict[str, object]) -> object:
+    """Build a v10 ``/api/tasks/`` body whose task failed with ``result_data``."""
+    task = {"task_id": "t1", "status": "failure", "result_data": result_data}
+    return {"count": 1, "next": None, "previous": None, "results": [task]}
+
+
+def _v9_failure(**fields: object) -> object:
+    """Build a v9 ``/api/tasks/`` body whose task failed with ``fields``."""
+    return [{"task_id": "t1", "status": "FAILURE", **fields}]
+
+
+# The 2.x wording for an existing document that is in the trash, appended to
+# the duplicate text.
+_TRASH_NOTE = " Note: existing document is in the trash."
+
+
+class TestPollTaskDuplicate:
+    """A duplicate refusal names the document paperless-ngx already holds."""
+
+    @pytest.mark.parametrize("build_payload", _API_SHAPES)
+    def test_success_is_a_filed_task_not_a_duplicate(
+        self, build_payload: Callable[[str, str | None], object]
+    ) -> None:
+        """A SUCCESS task comes back whole, wrapped as filed."""
+        payload = build_payload("success", None)
+        outcome = _poll_outcome(payload)
+        (task,) = payload["results"] if isinstance(payload, dict) else payload
+        assert outcome == TaskFiled(task=task)
+
+    @pytest.mark.parametrize("in_trash", [False, True])
+    def test_v10_duplicate_is_read_from_result_data(self, *, in_trash: bool) -> None:
+        """API v10 carries the id and the trash flag in ``result_data``."""
+        outcome = _poll_outcome(
+            _v10_duplicate({"duplicate_of": 42, "duplicate_in_trash": in_trash})
+        )
+        assert outcome == TaskDuplicate(document_id=42, in_trash=in_trash)
+
+    def test_v10_duplicate_of_true_is_not_a_document_id(self) -> None:
+        """A bool is an int to Python, but ``True`` is not document #1."""
+        outcome = _poll_outcome(
+            _v10_duplicate({"duplicate_of": True, "duplicate_in_trash": False})
+        )
+        assert outcome == TaskDuplicate(document_id=None, in_trash=False)
+
+    @pytest.mark.parametrize(
+        ("deleted_at", "in_trash"),
+        [
+            pytest.param(None, False, id="kept"),
+            pytest.param("2026-01-01T00:00:00Z", True, id="trashed"),
+        ],
+    )
+    def test_v9_on_3x_duplicate_is_read_from_duplicate_documents(
+        self, deleted_at: str | None, *, in_trash: bool
+    ) -> None:
+        """paperless-ngx 3.x on v9 lists the duplicate; ``deleted_at`` is the trash."""
+        outcome = _poll_outcome(
+            _v9_failure(
+                result="Not consuming: It is a duplicate of document #42",
+                duplicate_documents=[
+                    {"id": 42, "title": "Invoice", "deleted_at": deleted_at}
+                ],
+            )
+        )
+        assert outcome == TaskDuplicate(document_id=42, in_trash=in_trash)
+
+    def test_v9_on_2x_duplicate_is_read_from_related_document(self) -> None:
+        """paperless-ngx 2.x names the document as a string of digits."""
+        outcome = _poll_outcome(
+            _v9_failure(
+                result="Not consuming scan.pdf: It is a Duplicate of Invoice (#42).",
+                related_document="42",
+            )
+        )
+        assert outcome == TaskDuplicate(document_id=42, in_trash=False)
+
+    def test_v9_on_2x_duplicate_in_the_trash_is_read_from_the_text(self) -> None:
+        """In the trash, 2.x sends no related document and appends a note."""
+        outcome = _poll_outcome(
+            _v9_failure(
+                result="Not consuming scan.pdf: It is a duplicate of Invoice (#42)."
+                + _TRASH_NOTE,
+                related_document=None,
+            )
+        )
+        assert outcome == TaskDuplicate(document_id=42, in_trash=True)
+
+    def test_duplicate_title_holding_a_number_cannot_spoof_the_id(self) -> None:
+        """The last ``(#N)`` is the document; one in the title is not."""
+        outcome = _poll_outcome(
+            _v9_failure(
+                result="Not consuming x: It is a duplicate of Invoice #5 (#42)."
+            )
+        )
+        assert outcome == TaskDuplicate(document_id=42, in_trash=False)
+
+    def test_duplicate_title_with_a_bracketed_number_cannot_spoof_the_id(
+        self,
+    ) -> None:
+        """A title that itself ends ``(#5)`` still yields the real, last id."""
+        outcome = _poll_outcome(
+            _v9_failure(
+                result="Not consuming x: It is a duplicate of Bill (#5) copy (#42)."
+            )
+        )
+        assert outcome == TaskDuplicate(document_id=42, in_trash=False)
+
+    def test_duplicate_of_document_text_names_the_id(self) -> None:
+        """The v9 wording, with no structured field, still names the document."""
+        outcome = _poll_outcome(
+            _v9_failure(result="Not consuming: It is a duplicate of document #42")
+        )
+        assert outcome == TaskDuplicate(document_id=42, in_trash=False)
+
+    def test_duplicate_past_the_cut_still_names_the_id(self) -> None:
+        """The id is read from the whole failure text, not the bounded one."""
+        text = f"{'consumer output ' * 20}It is a duplicate of document #42"
+        outcome = _poll_outcome(_v9_failure(result=text))
+        assert outcome == TaskDuplicate(document_id=42, in_trash=False)
+
+    def test_duplicate_with_no_id_anywhere_is_still_a_duplicate(self) -> None:
+        """A duplicate the payload does not identify says "an existing document"."""
+        outcome = _poll_outcome(
+            _v9_failure(result="Not consuming: It is a duplicate of something")
+        )
+        assert outcome == TaskDuplicate(document_id=None, in_trash=False)
+
+    @pytest.mark.parametrize(
+        "related",
+        [
+            pytest.param(True, id="bool"),
+            pytest.param(0, id="zero"),
+            pytest.param(-3, id="negative"),
+            pytest.param("0", id="zero-text"),
+            pytest.param("4x", id="not-digits"),
+            pytest.param("", id="empty"),
+            pytest.param(" 42", id="padded"),
+            pytest.param("٤٢", id="non-ascii-digits"),
+            pytest.param("9" * 40, id="overlong"),
+            pytest.param([42], id="list"),
+        ],
+    )
+    def test_duplicate_refuses_an_id_that_is_not_a_positive_integer(
+        self, related: object
+    ) -> None:
+        """Only a positive integer, or a string of ASCII digits, is an id."""
+        outcome = _poll_outcome(
+            _v9_failure(result="It is a duplicate of Invoice", related_document=related)
+        )
+        assert outcome == TaskDuplicate(document_id=None, in_trash=False)
+
+    @pytest.mark.parametrize(
+        "result_data",
+        [
+            pytest.param({"duplicate_of": "42"}, id="v10-digit-text"),
+            pytest.param({"duplicate_of": 42}, id="v10-int"),
+        ],
+    )
+    def test_duplicate_accepts_an_id_as_digits_or_an_int(
+        self, result_data: dict[str, object]
+    ) -> None:
+        """A digit string and an int name the same document."""
+        assert _poll_outcome(_v10_duplicate(result_data)) == TaskDuplicate(
+            document_id=42, in_trash=False
+        )
+
+    def test_non_duplicate_failure_still_raises_unconfirmed(self) -> None:
+        """A task that failed for another reason is not a duplicate result."""
+        message = _failed_poll_message(
+            _task_answer({"task_id": "t1", "status": "FAILURE", "result": "OCR died"})
+        )
+        assert message == "Paperless task t1 ended FAILURE: OCR died"
 
 
 # ---------------------------------------------------------------------------
@@ -3016,7 +3175,7 @@ class TestLoopbackClientSideProtocolErrors:
             client = PaperlessClient(url=server.url, token=_MOCK_AUTH)
             try:
                 result = client.upload_document(sample_pdf, title="Control")
-                task = client.poll_task(LOOPBACK_TASK_ID, timeout=5)
+                task = _filed(client.poll_task(LOOPBACK_TASK_ID, timeout=5))
             finally:
                 client.close()
         assert result == ApiDelivery(task_id=LOOPBACK_TASK_ID)
@@ -4718,7 +4877,7 @@ class TestApiVersionNegotiation:
             tags = client.get_tags()
             correspondents = client.get_correspondents()
             delivery = client.upload_document(sample_pdf, title="Versioned")
-            task = client.poll_task("t1", timeout=10)
+            task = _filed(client.poll_task("t1", timeout=10))
         finally:
             client.close()
         assert tags == [{"id": 1, "name": "one"}]
@@ -4771,11 +4930,10 @@ class TestApiVersionNegotiation:
         try:
             delivery = client.upload_document(sample_pdf, title="Twice")
             assert isinstance(delivery, ApiDelivery)
-            with pytest.raises(PaperlessError) as exc_info:
-                client.poll_task(delivery.task_id, timeout=10)
+            outcome = client.poll_task(delivery.task_id, timeout=10)
         finally:
             client.close()
-        assert str(exc_info.value).endswith(f"; {_DUPLICATE_SENTENCE}")
+        assert outcome == TaskDuplicate(document_id=42, in_trash=False)
         (poll,) = recorder.polls()
         assert poll.headers["accept"] == spoken
 
