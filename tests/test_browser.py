@@ -102,6 +102,7 @@ from saneless.vocabulary import (
     MULTI_PAGE_LABEL,
     NOTHING_TO_FINISH,
     TERMINAL_STATES,
+    UNCONFIRMED_FILING_LABEL,
     ErrorCategory,
     FlipOutcome,
     JobState,
@@ -4406,6 +4407,102 @@ class TestErrorRenderingInChromium:
         finally:
             worker._current_job_id = None
             job_store.delete_job(job.id)
+
+
+@pytest.mark.browser
+class TestAmberErrorRenderingInChromium:
+    """
+    A failure that may already be in paperless-ngx, proven amber in a browser.
+
+    The template tests prove which class and role the markup carries; only a
+    resolved cascade proves the headline reads as the fallback amber and not
+    the failure red, and only the built DOM proves no live region announces it.
+    An upload failure staged beside it is still a red alert, so the amber is
+    the category's doing and not a change to every failure.
+    """
+
+    @staticmethod
+    def _finish_error(
+        job_store: JobStore, owner: str, title: str, category: ErrorCategory
+    ) -> str:
+        """
+        Stage a finished ERROR row in `category`.
+
+        Returns:
+            The row's id.
+
+        """
+        job = job_store.create_job(profile="default", title=title, owner_token=owner)
+        job_store.finish_job(
+            job.id, JobState.ERROR, error=_ERROR_DETAIL, error_category=category
+        )
+        return job.id
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_amber_failure_is_amber_unannounced_and_labelled_by_category(
+        self,
+        page: Page,
+        empty_history_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        The amber row reads amber with no alert; the upload failure stays red.
+
+        Run under both colour schemes, because an amber that turned red in one
+        of them would tell half the operators to scan a filed document again.
+        """
+        server = empty_history_server
+        job_store: JobStore = server.app.state.job_store
+        worker = server.app.state.worker
+        owner = _as_owner(page, server.url)
+        upload_id = self._finish_error(
+            job_store, owner, "Refused Doc", ErrorCategory.UPLOAD
+        )
+        amber_id = self._finish_error(
+            job_store, owner, "Unconfirmed Doc", ErrorCategory.UNCONFIRMED_FILING
+        )
+        page.emulate_media(color_scheme=scheme)
+        try:
+            worker._current_job_id = amber_id
+            page.goto(server.url)
+            page.wait_for_selector("#status-area p.status-fallback")
+
+            expect(page.locator('#status-area [role="alert"]')).to_have_count(0)
+            expect(page.locator("#status-area .status-error")).to_have_count(0)
+            status = page.locator("#status-area")
+            expect(status).to_contain_text(
+                error_message(ErrorCategory.UNCONFIRMED_FILING)
+            )
+            expect(status).to_contain_text(
+                error_next_step(ErrorCategory.UNCONFIRMED_FILING)
+            )
+            expect(page.locator("#status-area details.tech-details")).to_have_count(1)
+
+            colours = page.evaluate(_PROBE_STATUS_COLOURS)
+            assert colours["status-fallback"] == _AMBER[scheme], colours
+            headline = page.evaluate(
+                "() => getComputedStyle(document.querySelector('#status-area p')).color"
+            )
+            assert headline == colours["status-fallback"]
+            assert headline != colours["status-error"]
+
+            amber_cell = page.locator("#history-body td.status-fallback")
+            expect(amber_cell).to_have_count(1)
+            assert amber_cell.inner_text().strip() == UNCONFIRMED_FILING_LABEL
+            red_cell = page.locator("#history-body td.status-error")
+            expect(red_cell).to_have_count(1)
+            assert red_cell.inner_text().strip() == job_label(JobState.ERROR, None)
+
+            worker._current_job_id = upload_id
+            page.goto(server.url)
+            alert = page.locator('#status-area [role="alert"]')
+            expect(alert).to_have_count(1)
+            expect(alert).to_contain_text(error_message(ErrorCategory.UPLOAD))
+            expect(page.locator("#status-area .status-fallback")).to_have_count(0)
+        finally:
+            worker._current_job_id = None
+            job_store.delete_job(amber_id)
+            job_store.delete_job(upload_id)
 
 
 @pytest.mark.browser
