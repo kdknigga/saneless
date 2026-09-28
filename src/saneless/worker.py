@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     from .config import ProfileConfig, Settings
     from .job import Job, JobStore
     from .paperless import PaperlessClient
+    from .scan_metadata import MetadataLookup
     from .scanner.base import ScannerBackend
     from .vocabulary import PassPrompt
 
@@ -648,16 +649,21 @@ class ScanWorker:
         paperless: PaperlessClient,
         settings: Settings,
         job_store: JobStore,
+        *,
+        metadata_lookup: MetadataLookup | None = None,
     ) -> None:
         """
         Store the worker's dependencies and create its job queue.
 
         The worker thread is created here but not started; ``start()`` launches it.
+        ``metadata_lookup`` is where every job checks its tag and correspondent
+        ids before scanning; None asks the client directly.
         """
         self._scanner = scanner
         self._paperless = paperless
         self._settings = settings
         self._job_store: JobStore = job_store
+        self._metadata_lookup = metadata_lookup
         self._queue: queue.Queue[_Queued] = queue.Queue(maxsize=_QUEUE_DEPTH)
         self._thread = threading.Thread(target=self._run, daemon=True)
         # Set once by stop(); read by the loop, submit() and the flip callback.
@@ -2161,6 +2167,7 @@ class ScanWorker:
                 pass_coordinator=pass_coordinator,
                 device_memory=self._device_memory,
                 preserving=self._preserving,
+                metadata_lookup=self._metadata_lookup,
             ),
         )
         try:

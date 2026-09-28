@@ -14,7 +14,7 @@ import logging
 import shutil
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, assert_never
 
@@ -39,6 +39,11 @@ from saneless.pages import BlankFilterResult, filter_blank_pages, generate_thumb
 from saneless.paperless import ApiDelivery, FolderDelivery, TaskDuplicate, TaskFiled
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import ensure_private_dir
+from saneless.scan_metadata import (
+    ClientMetadataLookup,
+    ScanMetadata,
+    check_scan_metadata,
+)
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import neutralise_controls
@@ -73,7 +78,7 @@ if TYPE_CHECKING:
 
     from saneless.config import ProfileConfig, Settings
     from saneless.paperless import PaperlessClient, UploadResult
-    from saneless.scan_metadata import ScanMetadata
+    from saneless.scan_metadata import MetadataLookup
     from saneless.scanner.base import PageRecord, PassCapReached, ScannerBackend
 
 __all__ = [
@@ -662,6 +667,10 @@ class PipelineRequest:
     # ``threading.Event``, because a signal can land inside the call that
     # sets it.
     settled: Settled | None = None
+    # Where the run learns which tag and correspondent ids paperless-ngx still
+    # has, before it touches the scanner.  The web worker passes one that reads
+    # the pickers' cache first; None, as the CLI passes, reads the client once.
+    metadata_lookup: MetadataLookup | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -689,6 +698,7 @@ class RequestHooks:
     device_memory: DeviceMemory | None = None
     preserving: threading.Event | None = None
     settled: Settled | None = None
+    metadata_lookup: MetadataLookup | None = None
 
 
 def build_pipeline_request(
@@ -734,6 +744,7 @@ def build_pipeline_request(
         device_memory=hooks.device_memory,
         preserving=hooks.preserving,
         settled=hooks.settled,
+        metadata_lookup=hooks.metadata_lookup,
     )
 
 
@@ -3538,7 +3549,15 @@ def run_pipeline(
     """
     Run the full scan-to-upload pipeline.
 
-    Scans pages from the configured device, assembles them into a PDF,
+    First, before the scanner is touched, checks the request's tag and
+    correspondent ids against paperless-ngx
+    (:func:`saneless.scan_metadata.check_scan_metadata`): an id missing from
+    its lists even after one refetch is dropped, and the run's warning names
+    it, so the delivered scan is a warned success.  When paperless-ngx cannot
+    be asked, the ids go unchecked and the upload decides.  A request with no
+    ids asks nothing.
+
+    Then scans pages from the configured device, assembles them into a PDF,
     uploads to paperless-ngx, and polls for task completion. The run works in
     its own locked workspace under ``output.tmp_dir``, named after the job,
     which is removed when the run ends, however it ends.
@@ -3565,7 +3584,8 @@ def run_pipeline(
 
     Returns:
         A ScanResult naming how the run resolved and how many pages were
-        scanned, dropped as empty, and uploaded.
+        scanned, dropped as empty, and uploaded.  Its warning starts with the
+        sentence naming any id that was dropped.
 
     Raises:
         ConfigError: If the profile is not configured, a manual duplex
@@ -3625,6 +3645,22 @@ def run_pipeline(
     manual_duplex = profile.duplex == "manual"
     flip = _flip_context(request, settings) if manual_duplex else None
 
+    # After the refusals, which need no network, and before _resolve_device,
+    # the first scanner contact: an id paperless-ngx no longer has is dropped
+    # before any paper moves, and the run files the document without it.  The
+    # web worker's lookup reads the pickers' cache first; the CLI's reads the
+    # client once.
+    checked, dropped = check_scan_metadata(
+        ScanMetadata(tuple(request.tags or ()), request.correspondent),
+        request.metadata_lookup or ClientMetadataLookup(paperless),
+    )
+    if dropped is not None:
+        request = replace(
+            request,
+            tags=list(checked.tags) or None,
+            correspondent=checked.correspondent,
+        )
+
     device_id = _resolve_device(scanner, settings, request.device_memory)
 
     scan_settings = ScanSettings(
@@ -3660,4 +3696,8 @@ def run_pipeline(
             workspace=workspace.path,
             keep_workspace=workspace.keep,
         )
-        return run.execute()
+        result = run.execute()
+    if dropped is None:
+        return result
+    # Joined here, once, so every delivery route carries it, and first.
+    return replace(result, warning=_join_warnings(dropped, result.warning))

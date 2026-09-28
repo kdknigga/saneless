@@ -43,7 +43,7 @@ from saneless.vocabulary import (
 from saneless.worker import PRESERVATION_JOIN_SECONDS, STOP_JOIN_SECONDS, ScanWorker
 from saneless.workspace import sweep_orphans
 
-from .cache import MetadataCache
+from .cache import CachedMetadataLookup, MetadataCache
 from .checks_cache import CheckCache
 from .cross_origin import CrossOriginGuard
 from .errors import install_error_handlers
@@ -420,7 +420,15 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         consume_dir=settings.paperless.consume_dir,
     )
     cache = MetadataCache(ttl=settings.output.paperless_cache_ttl_seconds)
-    worker = ScanWorker(scanner, paperless, settings, job_store)
+    # Each job checks its ids against the lists the pickers were served from,
+    # asking paperless-ngx again only for an id they do not hold.
+    worker = ScanWorker(
+        scanner,
+        paperless,
+        settings,
+        job_store,
+        metadata_lookup=CachedMetadataLookup(cache, paperless),
+    )
     checks_cache, refresher = _build_check_machinery(
         settings, scanner, paperless, worker
     )
