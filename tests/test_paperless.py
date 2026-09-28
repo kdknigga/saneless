@@ -21,7 +21,9 @@ import pytest
 from saneless.exceptions import (
     ConfigError,
     PaperlessError,
+    PaperlessIncompatibleError,
     PaperlessTimeoutError,
+    PaperlessUncertainSendError,
     describe,
 )
 from saneless.paperless import (
@@ -34,10 +36,12 @@ from saneless.paperless import (
     _render_error_body,
     _retry_decision,
     _RetryDecision,
+    _upload_timeout,
     _without_userinfo,
 )
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import ConnectionStatus
+from tests.fake_clock import FakeClock
 from tests.golden_support import (
     DOCUMENTS_PATH,
     LOOPBACK_SESSION_COOKIE,
@@ -228,6 +232,34 @@ class TestClientSignature:
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
         assert parameter.default is inspect.Parameter.empty
 
+    def test_before_send_budget_seams_are_keyword_only(self) -> None:
+        """
+        The send budget, its clock and its sleep are keyword-only seams.
+
+        The budget is a time, not a count of attempts, so there is no attempt
+        count to pass any more.
+        """
+        parameters = inspect.signature(PaperlessClient.__init__).parameters
+        assert list(parameters) == [
+            "self",
+            "url",
+            "token",
+            "consume_dir",
+            "transport",
+            "send_budget",
+            "clock",
+            "sleep",
+            "upload_timeout",
+        ]
+        for name in ("send_budget", "clock", "sleep", "upload_timeout"):
+            assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert parameters["send_budget"].default == 60.0
+        assert parameters["clock"].default is time.monotonic
+        sleep = parameters["sleep"].default
+        # Named rather than compared, since tests may not touch the real sleep.
+        assert (sleep.__module__, sleep.__qualname__) == ("time", "sleep")
+        assert parameters["upload_timeout"].default is _upload_timeout
+
 
 def _uploaded_fields(
     pdf: Path,
@@ -346,9 +378,7 @@ class TestUploadDocument:
             ]
         )
 
-    def test_upload_retry_on_network_error(
-        self, sample_pdf: Path, sleeps: list[float]
-    ) -> None:
+    def test_upload_retry_on_network_error(self, sample_pdf: Path) -> None:
         """Upload retries on ConnectError and eventually succeeds."""
         call_count = {"n": 0}
 
@@ -359,17 +389,18 @@ class TestUploadDocument:
                 raise httpx2.ConnectError(msg)
             return httpx2.Response(200, json="task-id-ok")
 
-        transport = _make_transport(handler)
+        clock = FakeClock()
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            transport=transport,
-            max_retries=3,
+            transport=_make_transport(handler),
+            clock=clock.now,
+            sleep=clock.sleep,
         )
         result = client.upload_document(sample_pdf, title="Retry Test")
         assert result == ApiDelivery(task_id="task-id-ok")
         assert call_count["n"] == 3
-        assert sleeps == [1, 2]
+        assert clock.waits == [1, 2]
         client.close()
 
     def test_upload_no_retry_on_4xx(self, sample_pdf: Path) -> None:
@@ -391,46 +422,35 @@ class TestUploadDocument:
         assert call_count["n"] == 1
         client.close()
 
-    def test_upload_retry_exhausted_no_fallback(
-        self, sample_pdf: Path, sleeps: list[float]
+    def test_upload_before_send_budget_spent_no_fallback(
+        self, sample_pdf: Path
     ) -> None:
-        """Upload raises PaperlessError when retries are exhausted without fallback."""
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            msg = "connection refused"
-            raise httpx2.ConnectError(msg)
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
-            max_retries=3,
+        """A refused connection for the whole budget fails, naming the budget."""
+        handler = _CountingHandler(_raising(httpx2.ConnectError("connection refused")))
+        clock = FakeClock()
+        client = _upload_client(handler, clock=clock)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Fail")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Upload to Paperless at http://paperless:8000 could not connect for "
+            "60s: connection refused"
         )
-        with pytest.raises(PaperlessError, match="attempts"):
-            client.upload_document(sample_pdf, title="Fail")
-        assert sleeps == [1, 2]
-        client.close()
+        assert type(exc_info.value) is PaperlessError
+        assert clock.now() == 60
+        assert sum(clock.waits) == 60
 
-    def test_upload_retry_exhausted_with_fallback(
-        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+    def test_upload_before_send_budget_spent_with_fallback(
+        self, sample_pdf: Path, tmp_path: Path
     ) -> None:
-        """Upload falls back to consume directory when retries are exhausted."""
+        """Upload falls back to the consume directory once the budget is spent."""
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            msg = "connection refused"
-            raise httpx2.ConnectError(msg)
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            consume_dir=consume_dir,
-            transport=transport,
-            max_retries=3,
-        )
+        handler = _CountingHandler(_raising(httpx2.ConnectError("connection refused")))
+        clock = FakeClock()
+        client = _upload_client(handler, consume_dir=consume_dir, clock=clock)
         result = client.upload_document(sample_pdf, title="Fallback")
         # PDF should have been copied to consume dir
         copied = list(consume_dir.iterdir())
@@ -441,7 +461,7 @@ class TestUploadDocument:
         # The result names the exact file the PDF was copied to -- something
         # the old magic-string sentinel could not carry.
         assert result == FolderDelivery(path=copied[0])
-        assert sleeps == [1, 2]
+        assert clock.now() == 60
         client.close()
 
 
@@ -450,13 +470,22 @@ class TestUploadDocument:
 # ---------------------------------------------------------------------------
 
 
-_TRANSIENT_TRANSPORT_CASES = [
-    pytest.param(httpx2.ReadError, id="read-error"),
-    pytest.param(httpx2.WriteError, id="write-error"),
-    pytest.param(httpx2.RemoteProtocolError, id="remote-protocol-error"),
+# Errors that prove the upload never reached paperless-ngx whole.
+_BEFORE_SEND_CASES = [
     pytest.param(httpx2.ConnectError, id="connect-error"),
     pytest.param(httpx2.ConnectTimeout, id="connect-timeout"),
+    pytest.param(httpx2.PoolTimeout, id="pool-timeout"),
+    pytest.param(httpx2.ProxyError, id="proxy-error"),
+    pytest.param(httpx2.WriteTimeout, id="write-timeout"),
+]
+
+# Errors after which paperless-ngx may hold the document.
+_AFTER_SEND_TRANSPORT_CASES = [
     pytest.param(httpx2.ReadTimeout, id="read-timeout"),
+    pytest.param(httpx2.ReadError, id="read-error"),
+    pytest.param(httpx2.RemoteProtocolError, id="remote-protocol-error"),
+    pytest.param(httpx2.WriteError, id="write-error"),
+    pytest.param(httpx2.CloseError, id="close-error"),
 ]
 
 _UNSUPPORTED_PROTOCOL_TEXT = (
@@ -528,21 +557,47 @@ def _answering(response: httpx2.Response) -> Callable[[int], httpx2.Response]:
 
 
 def _upload_client(
-    handler: _CountingHandler, consume_dir: Path | None = None
+    handler: _CountingHandler,
+    consume_dir: Path | None = None,
+    *,
+    clock: FakeClock | None = None,
+    send_budget: float = 60.0,
 ) -> PaperlessClient:
-    """Build a three-attempt upload client wired to the counting handler."""
+    """
+    Build an upload client wired to the counting handler and a fake clock.
+
+    Args:
+        handler: The transport handler.
+        consume_dir: The fallback folder, or None for none.
+        clock: The clock the before-send waits run on; a fresh one when None,
+            so no test ever waits the real budget out.
+        send_budget: How long before-send failures are retried for.
+
+    Returns:
+        The client.
+
+    """
+    fake = FakeClock() if clock is None else clock
     return PaperlessClient(
         url="http://paperless:8000",
         token=_MOCK_AUTH,
         consume_dir=consume_dir,
         transport=_make_transport(handler),
-        max_retries=3,
+        send_budget=send_budget,
+        clock=fake.now,
+        sleep=fake.sleep,
     )
 
 
 @pytest.fixture
+def upload_clock() -> FakeClock:
+    """Provide a fake clock for the upload's before-send waits, so none pauses."""
+    return FakeClock()
+
+
+@pytest.fixture
 def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record upload backoff sleeps instead of really sleeping."""
+    """Record task-poll backoff sleeps instead of really sleeping."""
     recorded: list[float] = []
     monkeypatch.setattr("saneless.paperless.time.sleep", recorded.append)
     return recorded
@@ -721,12 +776,18 @@ class TestUrlCredentialsNeverShown:
         assert exc_info.value.__cause__ is None
 
     def test_scheme_less_url_message_strips_the_password(
-        self, sample_pdf: Path, sleeps: list[float], caplog: pytest.LogCaptureFixture
+        self,
+        sample_pdf: Path,
+        upload_clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A URL with no scheme, which httpx2 cannot parse as userinfo, is cut too."""
         caplog.set_level(logging.WARNING, logger="saneless.paperless")
         client = PaperlessClient(
-            url=f"scanner:{_URL_SECRET}@paperless:8000", token=_MOCK_AUTH
+            url=f"scanner:{_URL_SECRET}@paperless:8000",
+            token=_MOCK_AUTH,
+            clock=upload_clock.now,
+            sleep=upload_clock.sleep,
         )
         try:
             with pytest.raises(ConfigError) as exc_info:
@@ -736,7 +797,7 @@ class TestUrlCredentialsNeverShown:
         assert str(exc_info.value) == _UNSET_URL_UPLOAD_MESSAGE
         assert exc_info.value.__cause__ is None
         assert all(_URL_SECRET not in message for message in caplog.messages)
-        assert sleeps == []
+        assert upload_clock.waits == []
 
     @pytest.mark.parametrize(
         ("url", "shown"),
@@ -754,14 +815,14 @@ class TestUrlCredentialsNeverShown:
         assert _without_userinfo(url) == shown
 
     def test_redirect_target_is_shown_without_credentials(
-        self, sample_pdf: Path, sleeps: list[float]
+        self, sample_pdf: Path, upload_clock: FakeClock
     ) -> None:
         """A redirect target carrying userinfo is redacted like the base URL."""
         target = f"https://scanner:{_URL_SECRET}@paperless.example/api/"
         handler = _CountingHandler(
             _answering(httpx2.Response(302, headers={"location": target}))
         )
-        client = _upload_client(handler)
+        client = _upload_client(handler, clock=upload_clock)
         try:
             with pytest.raises(PaperlessError) as exc_info:
                 client.upload_document(sample_pdf, title="Redirected")
@@ -771,7 +832,7 @@ class TestUrlCredentialsNeverShown:
             "Paperless redirected the upload (302 Found) to "
             "https://paperless.example/api/; check paperless.url"
         )
-        assert sleeps == []
+        assert upload_clock.waits == []
 
 
 _CLASSIFIED_REQUEST = httpx2.Request("POST", "http://paperless:8000/api/documents/")
@@ -893,96 +954,285 @@ class TestRetryDecision:
 class TestUploadFailureTranslation:
     """EXC-01 / D-10 / M-17: every upload failure ends as a PaperlessError."""
 
-    @pytest.mark.parametrize("exc_type", _TRANSIENT_TRANSPORT_CASES)
-    def test_transient_transport_failure_is_retried_then_raises(
+    @pytest.mark.parametrize("exc_type", _BEFORE_SEND_CASES)
+    def test_before_send_budget_retries_then_raises(
         self,
         exc_type: type[httpx2.TransportError],
         sample_pdf: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
     ) -> None:
         """
-        Every transient TransportError retries for max_retries attempts.
+        A failure that proves nothing arrived is retried for the whole budget.
 
-        M-17: a reverse proxy closing the connection (ReadError,
-        RemoteProtocolError) used to escape raw instead of retrying.
+        The waits double up to a cap of 5 s, and the last one is cut to what is
+        left, so the attempts stop exactly when the budget runs out.
         """
         failure = exc_type("upstream went away")
         handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler)
+        client = _upload_client(handler, clock=upload_clock)
         try:
-            with pytest.raises(
-                PaperlessError,
-                match=(
-                    "Upload to Paperless at http://paperless:8000 failed after "
-                    "3 attempts: upstream went away"
-                ),
-            ) as exc_info:
+            with pytest.raises(PaperlessError) as exc_info:
                 client.upload_document(sample_pdf, title="Transient")
         finally:
             client.close()
-        assert handler.calls == 3
+        assert str(exc_info.value) == (
+            "Upload to Paperless at http://paperless:8000 could not connect for "
+            "60s: upstream went away"
+        )
+        assert type(exc_info.value) is PaperlessError
         assert exc_info.value.__cause__ is failure
-        assert sleeps == [1, 2]
+        assert upload_clock.waits == [1, 2, 4, *[5] * 10, 3]
+        assert handler.calls == len(upload_clock.waits) + 1
+        assert upload_clock.now() == 60
 
-    @pytest.mark.parametrize("exc_type", _TRANSIENT_TRANSPORT_CASES)
-    def test_transient_transport_failure_falls_back_after_retries(
+    @pytest.mark.parametrize("exc_type", _BEFORE_SEND_CASES)
+    def test_before_send_budget_spent_falls_back(
         self,
         exc_type: type[httpx2.TransportError],
         sample_pdf: Path,
         tmp_path: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
     ) -> None:
-        """With a consume directory the exhausted retries take the fallback."""
+        """With a consume directory the spent budget takes the fallback."""
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
         handler = _CountingHandler(_raising(exc_type("upstream went away")))
-        client = _upload_client(handler, consume_dir=consume_dir)
+        client = _upload_client(handler, consume_dir=consume_dir, clock=upload_clock)
         try:
             result = client.upload_document(sample_pdf, title="Transient")
         finally:
             client.close()
-        assert handler.calls == 3
         assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
-        assert sleeps == [1, 2]
+        assert upload_clock.now() == 60
 
-    def test_remote_protocol_error_then_success_is_delivered(
-        self, sample_pdf: Path, sleeps: list[float]
+    def test_before_send_budget_rides_out_a_restart(
+        self, sample_pdf: Path, upload_clock: FakeClock
     ) -> None:
-        """Two dropped connections then a 200 deliver to the API on attempt 3."""
+        """
+        A paperless-ngx that refuses connections for 59 s still gets the scan.
+
+        The restart outlasts every wait but the budget, so exactly one
+        document is accepted and nothing waits past 60 s.
+        """
+        accepted: list[int] = []
 
         def respond(call: int) -> httpx2.Response:
-            if call <= 2:
+            if upload_clock.now() < 59:
+                msg = "connection refused"
+                raise httpx2.ConnectError(msg)
+            accepted.append(call)
+            return httpx2.Response(200, json="task-after-restart")
+
+        handler = _CountingHandler(respond)
+        client = _upload_client(handler, clock=upload_clock)
+        try:
+            result = client.upload_document(sample_pdf, title="Restart")
+        finally:
+            client.close()
+        assert result == ApiDelivery(task_id="task-after-restart")
+        assert accepted == [handler.calls]
+        assert upload_clock.waits[:4] == [1, 2, 4, 5]
+        assert max(upload_clock.waits) <= 5
+        assert sum(upload_clock.waits) <= 60
+
+    def test_before_send_budget_counts_the_time_attempts_take(
+        self, sample_pdf: Path, upload_clock: FakeClock
+    ) -> None:
+        """
+        Time spent inside an attempt comes out of the budget as well.
+
+        Each attempt here stalls 10 s before its connection is refused, the
+        way a connect timeout does, so the budget is spent after five.
+        """
+
+        def respond(_call: int) -> httpx2.Response:
+            upload_clock.advance(10)
+            msg = "timed out"
+            raise httpx2.ConnectTimeout(msg)
+
+        handler = _CountingHandler(respond)
+        client = _upload_client(handler, clock=upload_clock)
+        try:
+            with pytest.raises(PaperlessError, match="could not connect for 60s"):
+                client.upload_document(sample_pdf, title="Black hole")
+        finally:
+            client.close()
+        assert handler.calls == 5
+        assert upload_clock.waits == [1, 2, 4, 5]
+
+    def test_before_send_budget_zero_makes_one_attempt(
+        self, sample_pdf: Path, upload_clock: FakeClock
+    ) -> None:
+        """A zero budget tries once and neither waits nor retries."""
+        handler = _CountingHandler(_raising(httpx2.ConnectError("connection refused")))
+        client = _upload_client(handler, clock=upload_clock, send_budget=0.0)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Once")
+        finally:
+            client.close()
+        assert handler.calls == 1
+        assert upload_clock.waits == []
+        assert str(exc_info.value) == (
+            "Upload to Paperless at http://paperless:8000 could not connect for "
+            "0s: connection refused"
+        )
+
+    @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
+    @pytest.mark.parametrize("exc_type", _AFTER_SEND_TRANSPORT_CASES)
+    def test_after_send_transport_failure_is_never_resent_or_copied(
+        self,
+        exc_type: type[httpx2.TransportError],
+        consume_name: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        upload_clock: FakeClock,
+    ) -> None:
+        """
+        A failure once the body may have been read is sent once and not copied.
+
+        A resend or a consume-folder copy could make a second document of the
+        scan; the error says it may already be in paperless-ngx instead.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        failure = exc_type("upstream went away")
+        handler = _CountingHandler(_raising(failure))
+        client = _upload_client(
+            handler,
+            consume_dir=tmp_path / consume_name if consume_name else None,
+            clock=upload_clock,
+        )
+        try:
+            with pytest.raises(PaperlessUncertainSendError) as exc_info:
+                client.upload_document(sample_pdf, title="Maybe")
+        finally:
+            client.close()
+        assert handler.calls == 1
+        assert upload_clock.waits == []
+        assert list(consume_dir.iterdir()) == []
+        message = str(exc_info.value)
+        assert message.startswith("Upload to Paperless at http://paperless:8000 ")
+        assert "upstream went away" in message
+        assert message.endswith("; it may have reached paperless-ngx")
+        assert exc_info.value.__cause__ is failure
+
+    @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_after_send_5xx_is_never_resent_or_copied(
+        self,
+        status: int,
+        consume_name: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        upload_clock: FakeClock,
+    ) -> None:
+        """
+        Any 5xx on the upload is an answer, so the body may have been read.
+
+        A proxy's 502 or 504 can follow a body paperless-ngx stored, and
+        nothing on the wire tells it apart from one that did not.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        handler = _CountingHandler(_answering(httpx2.Response(status, text="down\n")))
+        client = _upload_client(
+            handler,
+            consume_dir=tmp_path / consume_name if consume_name else None,
+            clock=upload_clock,
+        )
+        try:
+            with pytest.raises(PaperlessUncertainSendError) as exc_info:
+                client.upload_document(sample_pdf, title="Down")
+        finally:
+            client.close()
+        reason = httpx2.codes.get_reason_phrase(status)
+        assert str(exc_info.value) == (
+            "Upload to Paperless at http://paperless:8000 got no usable answer: "
+            f"{status} {reason}: down; it may have reached paperless-ngx"
+        )
+        assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
+        assert handler.calls == 1
+        assert upload_clock.waits == []
+        assert list(consume_dir.iterdir()) == []
+
+    def test_after_send_drop_is_not_resent_even_if_a_resend_would_succeed(
+        self, sample_pdf: Path, upload_clock: FakeClock
+    ) -> None:
+        """A dropped connection after the body is final, not a first attempt."""
+
+        def respond(call: int) -> httpx2.Response:
+            if call == 1:
                 msg = "Server disconnected without sending a response."
                 raise httpx2.RemoteProtocolError(msg)
             return httpx2.Response(200, json="task-id")
 
         handler = _CountingHandler(respond)
-        client = _upload_client(handler)
+        client = _upload_client(handler, clock=upload_clock)
         try:
-            result = client.upload_document(sample_pdf, title="Flaky proxy")
+            with pytest.raises(PaperlessUncertainSendError):
+                client.upload_document(sample_pdf, title="Flaky proxy")
         finally:
             client.close()
-        assert result == ApiDelivery(task_id="task-id")
-        assert handler.calls == 3
-        assert sleeps == [1, 2]
+        assert handler.calls == 1
 
-    def test_empty_read_timeout_names_its_class(
-        self, sample_pdf: Path, sleeps: list[float]
+    def test_after_send_empty_read_timeout_names_its_class(
+        self, sample_pdf: Path, upload_clock: FakeClock
     ) -> None:
         """An empty ``ReadTimeout("")`` still says what happened (describe rule)."""
         handler = _CountingHandler(_raising(httpx2.ReadTimeout("")))
-        client = _upload_client(handler)
+        client = _upload_client(handler, clock=upload_clock)
         try:
-            with pytest.raises(PaperlessError) as exc_info:
+            with pytest.raises(PaperlessUncertainSendError) as exc_info:
                 client.upload_document(sample_pdf, title="Silent timeout")
         finally:
             client.close()
-        assert str(exc_info.value).endswith(": ReadTimeout")
-        assert len(sleeps) == 2
+        assert "(ReadTimeout)" in str(exc_info.value)
+        assert upload_clock.waits == []
+
+    @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
+    def test_406_is_incompatible_final_and_never_copied(
+        self,
+        consume_name: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        upload_clock: FakeClock,
+    ) -> None:
+        """
+        A 406 is a server that does not speak API 9 or 10: one POST, no copy.
+
+        paperless-ngx refuses the version before it reads the upload, so
+        nothing was stored and a copy would land without its metadata.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        handler = _CountingHandler(
+            _answering(
+                httpx2.Response(406, json={"detail": 'Invalid version in "Accept".'})
+            )
+        )
+        client = _upload_client(
+            handler,
+            consume_dir=tmp_path / consume_name if consume_name else None,
+            clock=upload_clock,
+        )
+        try:
+            with pytest.raises(PaperlessIncompatibleError) as exc_info:
+                client.upload_document(sample_pdf, title="Too old")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Paperless at http://paperless:8000 does not accept API version 9 or "
+            "10; saneless needs paperless-ngx 2.16 or later"
+        )
+        assert exc_info.value.__cause__ is None
+        assert handler.calls == 1
+        assert upload_clock.waits == []
+        assert list(consume_dir.iterdir()) == []
 
     def test_unsupported_protocol_url_fails_fast_without_fallback(
-        self, sample_pdf: Path, sleeps: list[float]
+        self, sample_pdf: Path, upload_clock: FakeClock
     ) -> None:
         """
         A URL with no usable scheme is a configuration error, never retried.
@@ -994,7 +1244,7 @@ class TestUploadFailureTranslation:
         """
         failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler)
+        client = _upload_client(handler, clock=upload_clock)
         try:
             with pytest.raises(ConfigError) as exc_info:
                 client.upload_document(sample_pdf, title="No scheme")
@@ -1005,10 +1255,10 @@ class TestUploadFailureTranslation:
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__suppress_context__
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
 
     def test_unsupported_protocol_url_never_takes_the_fallback(
-        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+        self, sample_pdf: Path, tmp_path: Path, upload_clock: FakeClock
     ) -> None:
         """
         A configured consume directory does not turn it into a fallback.
@@ -1021,21 +1271,21 @@ class TestUploadFailureTranslation:
         consume_dir.mkdir()
         failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler, consume_dir=consume_dir)
+        client = _upload_client(handler, consume_dir=consume_dir, clock=upload_clock)
         try:
             with pytest.raises(ConfigError):
                 client.upload_document(sample_pdf, title="No scheme")
         finally:
             client.close()
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
         assert list(consume_dir.iterdir()) == []
 
     def test_unsupported_protocol_logs_no_attempt_and_copies_nothing(
         self,
         sample_pdf: Path,
         tmp_path: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
@@ -1049,13 +1299,13 @@ class TestUploadFailureTranslation:
         consume_dir = tmp_path / "consume"
         failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler, consume_dir=consume_dir)
+        client = _upload_client(handler, consume_dir=consume_dir, clock=upload_clock)
         try:
             with pytest.raises(ConfigError):
                 client.upload_document(sample_pdf, title="No scheme")
         finally:
             client.close()
-        assert sleeps == []
+        assert upload_clock.waits == []
         assert not consume_dir.exists()
         assert [
             record.getMessage()
@@ -1064,7 +1314,7 @@ class TestUploadFailureTranslation:
         ] == []
 
     def test_empty_url_is_a_configuration_error_through_the_real_transport(
-        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+        self, sample_pdf: Path, tmp_path: Path, upload_clock: FakeClock
     ) -> None:
         """
         An unset paperless.url fails at once, names the setting, copies nothing.
@@ -1075,7 +1325,11 @@ class TestUploadFailureTranslation:
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
         client = PaperlessClient(
-            url="", token=_MOCK_AUTH, consume_dir=consume_dir, max_retries=3
+            url="",
+            token=_MOCK_AUTH,
+            consume_dir=consume_dir,
+            clock=upload_clock.now,
+            sleep=upload_clock.sleep,
         )
         try:
             with pytest.raises(ConfigError) as exc_info:
@@ -1087,7 +1341,7 @@ class TestUploadFailureTranslation:
         assert _MOCK_AUTH not in str(exc_info.value)
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__suppress_context__
-        assert sleeps == []
+        assert upload_clock.waits == []
         assert list(consume_dir.iterdir()) == []
 
     @pytest.mark.parametrize(
@@ -1101,16 +1355,17 @@ class TestUploadFailureTranslation:
         self,
         token: str,
         sample_pdf: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
         Third-party text naming the token is struck before it is interpolated.
 
         A transport error whose own text carries the token -- as h11's refusal
-        of a header value does -- is still retried when it is transient, and
-        neither the retry warnings nor the final message may repeat it.  The
-        rest of the text survives, so the line still says what happened.
+        of a header value does -- is still retried when it proves nothing was
+        sent, and neither the retry warnings nor the final message may repeat
+        it.  The rest of the text survives, so the line still says what
+        happened.
         """
         caplog.set_level(logging.WARNING, logger="saneless.paperless")
         failure = httpx2.ConnectError(f"refused: Token {token} user:pass@h")
@@ -1118,7 +1373,9 @@ class TestUploadFailureTranslation:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=token,
-            max_retries=3,
+            send_budget=3.0,
+            clock=upload_clock.now,
+            sleep=upload_clock.sleep,
             transport=_make_transport(handler),
         )
         try:
@@ -1131,7 +1388,7 @@ class TestUploadFailureTranslation:
             for record in caplog.records
             if record.levelno == logging.WARNING
         ]
-        assert len(warnings) == 3
+        assert len(warnings) == 2
         assert "refused: Token" in str(exc_info.value)
         for text in [str(exc_info.value), *warnings]:
             _assert_token_absent(token, text)
@@ -1142,7 +1399,7 @@ class TestUploadFailureTranslation:
         consume_name: str,
         sample_pdf: Path,
         tmp_path: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
     ) -> None:
         """
         D-09: a 4xx names status, reason and the first field error.
@@ -1157,7 +1414,9 @@ class TestUploadFailureTranslation:
             )
         )
         client = _upload_client(
-            handler, consume_dir=tmp_path / consume_name if consume_name else None
+            handler,
+            consume_dir=tmp_path / consume_name if consume_name else None,
+            clock=upload_clock,
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -1170,7 +1429,7 @@ class TestUploadFailureTranslation:
         )
         assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
         assert not consume_dir.exists()
 
     @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
@@ -1179,7 +1438,7 @@ class TestUploadFailureTranslation:
         consume_name: str,
         sample_pdf: Path,
         tmp_path: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
     ) -> None:
         """
         WR-03: a redirect is not transient, so it is never retried or copied.
@@ -1194,7 +1453,9 @@ class TestUploadFailureTranslation:
             _answering(httpx2.Response(301, headers={"location": target}))
         )
         client = _upload_client(
-            handler, consume_dir=tmp_path / consume_name if consume_name else None
+            handler,
+            consume_dir=tmp_path / consume_name if consume_name else None,
+            clock=upload_clock,
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -1207,15 +1468,15 @@ class TestUploadFailureTranslation:
         )
         assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
         assert not consume_dir.exists()
 
     def test_non_redirect_3xx_fails_fast_by_its_status(
-        self, sample_pdf: Path, sleeps: list[float]
+        self, sample_pdf: Path, upload_clock: FakeClock
     ) -> None:
         """A 3xx with no target is final too, reported by status and body."""
         handler = _CountingHandler(_answering(httpx2.Response(304)))
-        client = _upload_client(handler)
+        client = _upload_client(handler, clock=upload_clock)
         try:
             with pytest.raises(PaperlessError) as exc_info:
                 client.upload_document(sample_pdf, title="Not modified")
@@ -1226,23 +1487,24 @@ class TestUploadFailureTranslation:
             "(empty response body)"
         )
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
 
-    def test_retry_log_line_is_one_line_without_the_url(
+    def test_before_send_retry_log_line_is_one_line(
         self,
         sample_pdf: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        WR-03: the attempt log renders a 5xx as status and body, on one line.
+        Each retry is logged on one line, with the time left in the budget.
 
-        httpx2's own text for a status error spans three lines and names the
-        full request URL.
+        Library text can span lines; a log line that did too could be read as
+        two records.  No line is logged for the last attempt: the error it
+        raises says what happened.
         """
         caplog.set_level(logging.WARNING, logger="saneless.paperless")
-        handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
-        client = _upload_client(handler)
+        handler = _CountingHandler(_raising(httpx2.ConnectError("refused\n  by peer")))
+        client = _upload_client(handler, clock=upload_clock, send_budget=3.0)
         try:
             with pytest.raises(PaperlessError):
                 client.upload_document(sample_pdf, title="Down")
@@ -1254,92 +1516,102 @@ class TestUploadFailureTranslation:
             if record.getMessage().startswith("Upload attempt")
         ]
         assert attempts == [
-            f"Upload attempt {n}/3 failed: 503 Service Unavailable: down"
-            for n in (1, 2, 3)
+            "Upload attempt 1 failed; retrying for up to 3s more: refused by peer",
+            "Upload attempt 2 failed; retrying for up to 2s more: refused by peer",
         ]
-        assert len(sleeps) == 2
+        assert upload_clock.waits == [1, 2]
 
-    def test_5xx_is_retried_then_raises(
-        self, sample_pdf: Path, sleeps: list[float]
-    ) -> None:
-        """A 503 on every attempt exhausts the retries and names the status."""
-        handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
-        client = _upload_client(handler)
-        try:
-            with pytest.raises(
-                PaperlessError, match=r"failed after 3 attempts: .*503"
-            ) as exc_info:
-                client.upload_document(sample_pdf, title="Down")
-        finally:
-            client.close()
-        assert handler.calls == 3
-        assert sleeps == [1, 2]
-        assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
-
-    def test_5xx_exhausted_message_is_one_line(
-        self, sample_pdf: Path, sleeps: list[float]
+    @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
+    def test_after_send_non_json_200_is_uncertain_and_not_copied(
+        self,
+        consume_name: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        upload_clock: FakeClock,
     ) -> None:
         """
-        EXC-02: httpx2's two-line 5xx text never reaches the message.
+        A 200 that is not JSON may still be a stored document.
 
-        ``str(HTTPStatusError)`` is ``Server error '503 ...' for url '...'``
-        followed by a second ``For more information check:`` line, so the
-        cause is rendered as status, reason and the one-line body instead.
+        A login page served with 200 is the usual cause, but paperless-ngx
+        answered 200 and so may have read the body: nothing is resent or
+        copied.
         """
-        handler = _CountingHandler(_answering(httpx2.Response(503, text="down\n")))
-        client = _upload_client(handler)
-        try:
-            with pytest.raises(PaperlessError) as exc_info:
-                client.upload_document(sample_pdf, title="Down")
-        finally:
-            client.close()
-        assert str(exc_info.value) == (
-            "Upload to Paperless at http://paperless:8000 failed after 3 attempts: "
-            "503 Service Unavailable: down"
-        )
-        assert sleeps == [1, 2]
-
-    def test_5xx_is_retried_then_falls_back(
-        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
-    ) -> None:
-        """A 503 on every attempt takes the fallback when one is configured."""
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
-        handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
-        client = _upload_client(handler, consume_dir=consume_dir)
-        try:
-            result = client.upload_document(sample_pdf, title="Down")
-        finally:
-            client.close()
-        assert handler.calls == 3
-        assert sleeps == [1, 2]
-        assert result == FolderDelivery(path=consume_dir / "test.pdf")
-
-    def test_non_json_200_raises_without_retry(
-        self, sample_pdf: Path, sleeps: list[float]
-    ) -> None:
-        """A login page served with 200 is a PaperlessError, not a raw ValueError."""
         handler = _CountingHandler(
             _answering(httpx2.Response(200, text="<html>login</html>"))
         )
-        client = _upload_client(handler)
+        client = _upload_client(
+            handler,
+            consume_dir=tmp_path / consume_name if consume_name else None,
+            clock=upload_clock,
+        )
         try:
-            with pytest.raises(
-                PaperlessError,
-                match=(
-                    "Paperless at http://paperless:8000 returned a response "
-                    "that is not JSON"
-                ),
-            ) as exc_info:
+            with pytest.raises(PaperlessUncertainSendError) as exc_info:
                 client.upload_document(sample_pdf, title="Login page")
         finally:
             client.close()
+        assert str(exc_info.value) == (
+            "Paperless at http://paperless:8000 answered the upload with a body "
+            "that is not JSON: <html>login</html>; it may have reached "
+            "paperless-ngx"
+        )
         assert isinstance(exc_info.value.__cause__, ValueError)
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
+        assert list(consume_dir.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("body", "shown"),
+        [
+            pytest.param(b"42", "42", id="number"),
+            pytest.param(b"true", "true", id="bool"),
+            pytest.param(b"{}", "{}", id="object"),
+            pytest.param(b'""', '""', id="empty-string"),
+            pytest.param(b'"   "', '" "', id="blank-string"),
+            pytest.param(b"null", "null", id="null"),
+        ],
+    )
+    def test_after_send_task_id_that_is_not_a_string_is_uncertain(
+        self,
+        body: bytes,
+        shown: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        upload_clock: FakeClock,
+    ) -> None:
+        """
+        Only a non-empty string is a task id; anything else is never polled.
+
+        The server answered 200, so the document may be stored: the answer is
+        named, nothing is resent and nothing is copied, though a consume
+        directory is configured.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        handler = _CountingHandler(
+            _answering(
+                httpx2.Response(
+                    200, content=body, headers={"content-type": "application/json"}
+                )
+            )
+        )
+        client = _upload_client(handler, consume_dir=consume_dir, clock=upload_clock)
+        try:
+            with pytest.raises(PaperlessUncertainSendError) as exc_info:
+                client.upload_document(sample_pdf, title="Odd answer")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            f"Paperless at http://paperless:8000 answered the upload with {shown}, "
+            "which is not a task ID; it may have reached paperless-ngx"
+        )
+        assert handler.calls == 1
+        assert upload_clock.waits == []
+        assert list(consume_dir.iterdir()) == []
 
     def test_unreadable_pdf_is_a_paperless_error(
-        self, tmp_path: Path, sleeps: list[float]
+        self, tmp_path: Path, upload_clock: FakeClock
     ) -> None:
         """
         IN-08: an OSError opening the PDF leaves as a PaperlessError, too.
@@ -1350,7 +1622,9 @@ class TestUploadFailureTranslation:
         """
         missing = tmp_path / "gone.pdf"
         handler = _CountingHandler(_answering(httpx2.Response(200, json="task-id")))
-        client = _upload_client(handler, consume_dir=tmp_path / "consume")
+        client = _upload_client(
+            handler, consume_dir=tmp_path / "consume", clock=upload_clock
+        )
         try:
             with pytest.raises(PaperlessError) as exc_info:
                 client.upload_document(missing, title="Gone")
@@ -1361,15 +1635,15 @@ class TestUploadFailureTranslation:
         )
         assert isinstance(exc_info.value.__cause__, FileNotFoundError)
         assert handler.calls == 0
-        assert sleeps == []
+        assert upload_clock.waits == []
 
     def test_other_http_error_raises_at_once(
-        self, sample_pdf: Path, sleeps: list[float]
+        self, sample_pdf: Path, upload_clock: FakeClock
     ) -> None:
         """Any remaining httpx2.HTTPError (TooManyRedirects) is wrapped and chained."""
         failure = httpx2.TooManyRedirects("Exceeded maximum allowed redirects.")
         handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler)
+        client = _upload_client(handler, clock=upload_clock)
         try:
             with pytest.raises(
                 PaperlessError,
@@ -1383,7 +1657,112 @@ class TestUploadFailureTranslation:
             client.close()
         assert exc_info.value.__cause__ is failure
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
+
+
+class TestUploadReadTimeout:
+    """The upload's read timeout grows with the PDF, since the answer waits on it."""
+
+    @pytest.mark.parametrize(
+        ("size_bytes", "read"),
+        [
+            pytest.param(0, 30.0, id="empty"),
+            pytest.param(50 * 2**20, 80.0, id="50-mib"),
+            pytest.param(270 * 2**20, 300.0, id="at-the-cap"),
+            pytest.param(400 * 2**20, 300.0, id="400-mib"),
+        ],
+    )
+    def test_upload_read_timeout_scales_with_the_size(
+        self, size_bytes: int, read: float
+    ) -> None:
+        """30 s plus 1 s per MiB, capped at 300 s; the connect stays at 10 s."""
+        timeout = _upload_timeout(size_bytes)
+        assert timeout.read == read
+        assert timeout.connect == 10.0
+        assert timeout.write == 30.0
+        assert timeout.pool == 30.0
+
+    def test_upload_read_timeout_is_sent_on_the_post(self, sample_pdf: Path) -> None:
+        """The POST carries the size-scaled timeout; nothing else does."""
+        timeouts: dict[str, object] = {}
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            timeouts[request.url.path] = request.extensions["timeout"]
+            if request.url.path == DOCUMENTS_PATH:
+                return httpx2.Response(200, json="task-id")
+            return httpx2.Response(200, json={"count": 0, "results": []})
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            transport=_make_transport(handler),
+        )
+        try:
+            client.upload_document(sample_pdf, title="Timed")
+            client.get_tags()
+        finally:
+            client.close()
+        size = sample_pdf.stat().st_size
+        assert timeouts[DOCUMENTS_PATH] == {
+            "connect": 10.0,
+            "read": 30.0 + size / 2**20,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+        assert timeouts["/api/tags/"] == {
+            "connect": 30.0,
+            "read": 30.0,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+
+    def test_upload_read_timeout_seam_is_given_the_file_size(
+        self, sample_pdf: Path
+    ) -> None:
+        """An injected ``upload_timeout`` is asked once, with the PDF's size."""
+        sizes: list[int] = []
+        reads: list[object] = []
+
+        def tiny(size_bytes: int) -> httpx2.Timeout:
+            sizes.append(size_bytes)
+            return httpx2.Timeout(5.0, read=1.5)
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            reads.append(request.extensions["timeout"]["read"])
+            return httpx2.Response(200, json="task-id")
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            transport=_make_transport(handler),
+            upload_timeout=tiny,
+        )
+        try:
+            client.upload_document(sample_pdf, title="Seam")
+        finally:
+            client.close()
+        assert sizes == [sample_pdf.stat().st_size]
+        assert reads == [1.5]
+
+    def test_upload_read_timeout_message_names_the_budget_and_size(
+        self, tmp_path: Path, upload_clock: FakeClock
+    ) -> None:
+        """A read timeout says how long it waited and for how large a file."""
+        pdf = tmp_path / "large.pdf"
+        pdf.write_bytes(b"%PDF-1.4 " + b"0" * (3_000_000 - 9))
+        handler = _CountingHandler(_raising(httpx2.ReadTimeout("timed out")))
+        client = _upload_client(handler, clock=upload_clock)
+        try:
+            with pytest.raises(PaperlessUncertainSendError) as exc_info:
+                client.upload_document(pdf, title="Large")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Upload to Paperless at http://paperless:8000 got no answer within "
+            "33s, the time allowed for a 3.0 MB PDF (timed out); it may have "
+            "reached paperless-ngx"
+        )
+        assert handler.calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2259,7 +2638,7 @@ class TestLoopbackClientSideProtocolErrors:
         token: str,
         sample_pdf: Path,
         tmp_path: Path,
-        sleeps: list[float],
+        upload_clock: FakeClock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Nothing reaches the server, nothing is retried, copied or echoed."""
@@ -2267,7 +2646,11 @@ class TestLoopbackClientSideProtocolErrors:
         consume_dir.mkdir()
         with loopback_paperless() as server:
             client = PaperlessClient(
-                url=server.url, token=token, consume_dir=consume_dir, max_retries=3
+                url=server.url,
+                token=token,
+                consume_dir=consume_dir,
+                clock=upload_clock.now,
+                sleep=upload_clock.sleep,
             )
             try:
                 with pytest.raises(ConfigError) as exc_info:
@@ -2281,7 +2664,7 @@ class TestLoopbackClientSideProtocolErrors:
         assert error.__cause__ is None
         assert error.__suppress_context__
         assert server.hits == []
-        assert sleeps == []
+        assert upload_clock.waits == []
         assert list(consume_dir.iterdir()) == []
         for text in (str(error), repr(error), caplog.text):
             _assert_token_absent(token, text)
@@ -2369,7 +2752,7 @@ class TestUnsendableRequestWithASendableConfiguration:
     """
 
     def test_upload_is_a_paperless_error_without_retry_or_copy(
-        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+        self, sample_pdf: Path, tmp_path: Path, upload_clock: FakeClock
     ) -> None:
         """No retry, no consume-folder copy, and no configuration named."""
         consume_dir = tmp_path / "consume"
@@ -2377,7 +2760,7 @@ class TestUnsendableRequestWithASendableConfiguration:
         handler = _CountingHandler(
             _raising(httpx2.LocalProtocolError(_LENGTH_MISMATCH))
         )
-        client = _upload_client(handler, consume_dir=consume_dir)
+        client = _upload_client(handler, consume_dir=consume_dir, clock=upload_clock)
         try:
             with pytest.raises(PaperlessError) as exc_info:
                 client.upload_document(sample_pdf, title="Length")
@@ -2389,7 +2772,7 @@ class TestUnsendableRequestWithASendableConfiguration:
         )
         assert "paperless.url" not in str(exc_info.value)
         assert handler.calls == 1
-        assert sleeps == []
+        assert upload_clock.waits == []
         assert list(consume_dir.iterdir()) == []
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
@@ -2588,7 +2971,7 @@ class TestResponseTextIsRedacted:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=token,
-            max_retries=1,
+            send_budget=0.0,
             transport=_make_transport(answer),
         )
         try:
@@ -2713,19 +3096,21 @@ class TestChainedCausesCarryNoToken:
 
     @pytest.mark.parametrize("token", _REDACTED_TOKENS)
     @pytest.mark.parametrize("build", _TOKEN_BEARING_CAUSES)
-    @pytest.mark.usefixtures("sleeps")
-    def test_upload_retries_exhausted(
+    def test_upload_before_send_budget_spent(
         self,
         build: Callable[[str], httpx2.ConnectError],
         token: str,
         sample_pdf: Path,
+        upload_clock: FakeClock,
     ) -> None:
-        """The failed-after-N-attempts error formats without the token."""
+        """The could-not-connect error formats without the token."""
         handler = _CountingHandler(_raising(build(token)))
         client = PaperlessClient(
             url="http://paperless:8000",
             token=token,
-            max_retries=2,
+            send_budget=1.0,
+            clock=upload_clock.now,
+            sleep=upload_clock.sleep,
             transport=_make_transport(handler),
         )
         try:
@@ -2734,7 +3119,7 @@ class TestChainedCausesCarryNoToken:
         finally:
             client.close()
         assert handler.calls == 2
-        assert "failed after 2 attempts" in str(exc_info.value)
+        assert "could not connect for 1s" in str(exc_info.value)
         _assert_token_absent(token, _formatted(exc_info.value))
 
     @pytest.mark.parametrize("token", _REDACTED_TOKENS)
@@ -2778,8 +3163,9 @@ class TestChainedCausesCarryNoToken:
         assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
         _assert_token_absent(token, _formatted(exc_info.value))
 
-    @pytest.mark.usefixtures("sleeps")
-    def test_a_clean_cause_is_still_chained(self, sample_pdf: Path) -> None:
+    def test_a_clean_cause_is_still_chained(
+        self, sample_pdf: Path, upload_clock: FakeClock
+    ) -> None:
         """
         The control: a cause that quotes nothing secret stays attached.
 
@@ -2791,7 +3177,9 @@ class TestChainedCausesCarryNoToken:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            max_retries=2,
+            send_budget=1.0,
+            clock=upload_clock.now,
+            sleep=upload_clock.sleep,
             transport=_make_transport(handler),
         )
         try:
@@ -3450,7 +3838,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=transport,
-            max_retries=1,
+            send_budget=0.0,
         )
         result = client.upload_document(sample_pdf, title="Existing dir test")
         copied = list(consume_dir.iterdir())
@@ -3476,7 +3864,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            max_retries=1,
+            send_budget=0.0,
         )
         result = client.upload_document(sample_pdf, title="Atomic test")
         client.close()
@@ -3512,7 +3900,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            max_retries=1,
+            send_budget=0.0,
         )
         try:
             with pytest.raises(
@@ -3547,7 +3935,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            max_retries=1,
+            send_budget=0.0,
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -3575,7 +3963,7 @@ class TestConsumeDir:
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
             transport=_make_transport(_always_refused),
-            max_retries=1,
+            send_budget=0.0,
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -3780,7 +4168,7 @@ class TestUploadResultContract:
             transport=transport,
         )
         try:
-            with pytest.raises(PaperlessError, match="no task ID"):
+            with pytest.raises(PaperlessUncertainSendError, match="not a task ID"):
                 client.upload_document(sample_pdf, "Null Task")
         finally:
             client.close()
@@ -3803,7 +4191,7 @@ def _deliver_to_consume_dir(sample_pdf: Path, consume_dir: Path) -> UploadResult
         token=_MOCK_AUTH,
         consume_dir=consume_dir,
         transport=_make_transport(_always_refused),
-        max_retries=1,
+        send_budget=0.0,
     )
     try:
         return client.upload_document(sample_pdf, title="Mode test")
