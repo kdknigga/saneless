@@ -25,6 +25,7 @@ import httpx2
 import pikepdf
 import pytest
 from PIL import Image, ImageColor, ImageDraw
+from saneless.scan_metadata import ScanMetadata
 
 import saneless.pipeline as pipeline_module
 import saneless.preservation as preservation_module
@@ -68,13 +69,16 @@ from saneless.pipeline import (
     FlipCoordinator,
     PipelineEvent,
     PipelineRequest,
+    RequestHooks,
     ScanResult,
+    Settled,
     _check_disk_space,
     _interleave_duplex,
     _note_pass_count,
     _open_workspace,
     _resolve_device,
     _returns_to_prompt,
+    build_pipeline_request,
     run_pipeline,
 )
 from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
@@ -119,6 +123,7 @@ from tests.golden_support import (
     embedded_streams,
     png_idat,
 )
+from tests.multi_page_support import ScriptedPassCoordinator
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -7933,3 +7938,94 @@ class TestJobWorkspace:
         assert names[0].startswith("job-4f2a9c1e-")
         assert claimed == []
         assert list(tmp_dir.iterdir()) == []
+
+
+class TestBuildPipelineRequest:
+    """The one builder the worker and the CLI both make their request with."""
+
+    def test_metadata_and_every_hook_reach_the_request(self) -> None:
+        """Tags, correspondent, callbacks and coordinators arrive unchanged."""
+
+        def on_status(_event: PipelineEvent) -> None:
+            """Observe nothing."""
+
+        def on_thumbnail(_data: str) -> None:
+            """Observe nothing."""
+
+        def on_pass_count(_job_id: str, _count: int) -> None:
+            """Observe nothing."""
+
+        hooks = RequestHooks(
+            status_callback=on_status,
+            thumbnail_callback=on_thumbnail,
+            pass_count_callback=on_pass_count,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
+            multi_page=True,
+            pass_coordinator=ScriptedPassCoordinator([]),
+            device_memory=DeviceMemory(),
+            preserving=threading.Event(),
+            settled=Settled(),
+        )
+
+        request = build_pipeline_request(
+            profile_name="receipts",
+            title="Receipt",
+            job_id="job-1",
+            metadata=ScanMetadata(tags=(3,), correspondent=12),
+            hooks=hooks,
+        )
+
+        assert request.profile_name == "receipts"
+        assert request.title == "Receipt"
+        assert request.job_id == "job-1"
+        assert request.tags == [3]
+        assert request.correspondent == 12
+        assert request.status_callback is on_status
+        assert request.thumbnail_callback is on_thumbnail
+        assert request.pass_count_callback is on_pass_count
+        assert request.flip_coordinator is hooks.flip_coordinator
+        assert request.multi_page is True
+        assert request.pass_coordinator is hooks.pass_coordinator
+        assert request.device_memory is hooks.device_memory
+        assert request.preserving is hooks.preserving
+        assert request.settled is hooks.settled
+
+    def test_no_tags_is_none_on_the_request(self) -> None:
+        """An empty tag tuple becomes the request's "no tags", ``None``."""
+        request = build_pipeline_request(
+            profile_name="default",
+            title="Bare",
+            job_id="job-2",
+            metadata=ScanMetadata(tags=(), correspondent=None),
+            hooks=RequestHooks(),
+        )
+
+        assert request.tags is None
+        assert request.correspondent is None
+
+    def test_default_hooks_leave_every_surface_field_unset(self) -> None:
+        """A bare ``RequestHooks`` matches a request built with no hooks at all."""
+        request = build_pipeline_request(
+            profile_name="default",
+            title="Bare",
+            job_id="job-3",
+            metadata=ScanMetadata(tags=(), correspondent=None),
+            hooks=RequestHooks(),
+        )
+
+        assert request == PipelineRequest(
+            profile_name="default", title="Bare", job_id="job-3"
+        )
+
+    def test_the_hooks_cover_every_surface_field_of_the_request(self) -> None:
+        """
+        A field added to the request is either metadata or a hook.
+
+        Otherwise the builder would silently leave it at its default for both
+        callers, and whichever surface needed it would have no way to set it.
+        """
+        request_fields = {field.name for field in dataclasses.fields(PipelineRequest)}
+        hook_fields = {field.name for field in dataclasses.fields(RequestHooks)}
+        identity = {"profile_name", "title", "job_id", "tags", "correspondent"}
+
+        assert request_fields == identity | hook_fields
