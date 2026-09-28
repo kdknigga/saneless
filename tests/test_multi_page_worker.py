@@ -295,6 +295,35 @@ class TestWorkerPassCoordinator:
         assert asker.result() is PassAnswer.FINISH
         assert coordinator.claimed == (second, PassAnswer.FINISH)
 
+    def test_the_next_question_announced_withdraws_the_acknowledgement(self) -> None:
+        """
+        From the next question's announcement to its prompt, nothing is acknowledged.
+
+        The run persists its next waiting state before it publishes that
+        question, so an answer to the previous one must not be shown against
+        the new state.  The claim itself stays, for the document count.
+        """
+        coordinator = WorkerPassCoordinator("job-1", stopping=threading.Event())
+        first = _prompt(1, timeout=_OPEN_PROMPT_TIMEOUT)
+        asker = _Asker(coordinator, first)
+        _wait_until_open(coordinator, 1)
+        assert coordinator.answer(1, PassAnswer.NEXT) is True
+        assert asker.result() is PassAnswer.NEXT
+        before = coordinator.acknowledged
+
+        coordinator.announce_next_question()
+        between = coordinator.acknowledged
+        claimed = coordinator.claimed
+        assert coordinator.ask(_prompt(2)) is PassAnswer.TIMED_OUT
+        after = coordinator.acknowledged
+
+        assert (before, between, after) == (
+            PassAnswer.NEXT,
+            None,
+            PassAnswer.TIMED_OUT,
+        )
+        assert claimed == (first, PassAnswer.NEXT)
+
     def test_a_second_prompt_unanswered_times_out_on_its_own(self) -> None:
         """A claimed first prompt leaves nothing behind for the second."""
         coordinator = WorkerPassCoordinator("job-1", stopping=threading.Event())
@@ -685,6 +714,55 @@ class TestScanWorkerMultiPage:
         assert stopped == [True]
         assert fake.answers == [PassAnswer.INTERRUPTED]
         assert fake.ask_seconds[0] < _OPEN_PROMPT_TIMEOUT / 2
+
+    def test_an_answer_is_not_acknowledged_once_the_next_question_is_announced(
+        self,
+        running: tuple[ScanWorker, JobStore],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A poll between the next wait's write and its prompt shows no stale answer."""
+        worker, store = running
+        first = _prompt(timeout=_OPEN_PROMPT_TIMEOUT)
+        announced = threading.Event()
+        hold = threading.Event()
+
+        def fake(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            callback = request.status_callback
+            coordinator = request.pass_coordinator
+            assert callback is not None
+            assert coordinator is not None
+            callback(PipelineEvent.AWAITING_NEXT_PASS)
+            coordinator.ask(first)
+            callback(PipelineEvent.SCANNING)
+            callback(PipelineEvent.AWAITING_RETRY)
+            announced.set()
+            hold.wait(_GATE_BOUND)
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", fake)
+        try:
+            job = store.create_job("default", "Moved On")
+            worker.submit(job, ScanOptions(multi_page=True))
+            assert poll_until(lambda: worker.pass_prompt(job.id) is not None, _BUDGET)
+            assert worker.answer_pass(job.id, 1, PassAnswer.NEXT) is True
+            assert announced.wait(_BUDGET)
+            row = store.get_job(job.id)
+            assert row is not None
+            state = row.state
+            answer = worker.pass_answer(job.id)
+            kept = worker.pages_kept
+        finally:
+            hold.set()
+        _finished(store, job.id)
+
+        assert state is JobState.AWAITING_RETRY
+        assert answer is None
+        assert kept == 1
 
     def test_a_finished_job_has_no_prompt_to_answer(
         self,

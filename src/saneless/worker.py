@@ -48,6 +48,7 @@ from .pipeline import (
 )
 from .vocabulary import (
     ACTIVE_STATES,
+    PASS_WAIT_STATES,
     RESTART_REASON,
     WAITING_STATES,
     ConfigFileState,
@@ -428,6 +429,10 @@ class WorkerPassCoordinator(PassCoordinator):
         self._lock = threading.Lock()
         self._prompt: PassPrompt | None = None
         self._slot: AnswerSlot[PassAnswer] | None = None
+        # Set once the run announces its next question, cleared when that
+        # question is published: in between, the latest claim answers a
+        # question the job has already moved past.
+        self._superseded = False
 
     @property
     def job_id(self) -> str:
@@ -456,6 +461,39 @@ class WorkerPassCoordinator(PassCoordinator):
         if prompt is None or slot is None or slot.answer is not None:
             return None
         return prompt
+
+    @property
+    def acknowledged(self) -> PassAnswer | None:
+        """
+        The claimed answer to the question the job is waiting on, or ``None``.
+
+        ``None`` while that question is unanswered, and also from the moment
+        the run announces its next question until it publishes it, because
+        the claim then answers a question the job has moved past.
+        ``claimed`` goes on reporting that claim, since the document's page
+        count still comes from it.
+
+        Returns:
+            The answer the status area may acknowledge, or ``None``.
+
+        """
+        with self._lock:
+            slot = None if self._superseded else self._slot
+        return None if slot is None else slot.answer
+
+    def announce_next_question(self) -> None:
+        """
+        Note that the run has announced its next question but not yet asked it.
+
+        The run persists its waiting state before it asks, so that the job
+        says what it waits on for the whole of the wait; for that moment the
+        job's row names the new question while the latest claim is still the
+        previous question's.  Until the new prompt is published,
+        ``acknowledged`` reports nothing, so a poll never shows an answer to a
+        question the job has moved past.
+        """
+        with self._lock:
+            self._superseded = True
 
     @property
     def claimed(self) -> tuple[PassPrompt, PassAnswer] | None:
@@ -487,6 +525,7 @@ class WorkerPassCoordinator(PassCoordinator):
         with self._lock:
             self._prompt = prompt
             self._slot = slot
+            self._superseded = False
         # Checked again once the prompt is published.  stop() sets the flag
         # before it interrupts, so a stop that the check above missed either
         # finds this slot or is seen here.
@@ -546,6 +585,26 @@ class WorkerPassCoordinator(PassCoordinator):
         """
         with self._lock:
             return self._prompt, self._slot
+
+
+def _announce_pass_wait(
+    state: JobState, coordinator: WorkerPassCoordinator | None
+) -> None:
+    """
+    Tell a multi-page job's coordinator that the run announced its next question.
+
+    Called from the status callback before the waiting state is written, so
+    ``WorkerPassCoordinator.acknowledged`` stops reporting the previous
+    question's answer before any poll can read the new state.
+
+    Args:
+        state: The state the run just announced.
+        coordinator: The running job's pass coordinator, or None when the job
+            is not a multi-page one.
+
+    """
+    if coordinator is not None and state in PASS_WAIT_STATES:
+        coordinator.announce_next_question()
 
 
 class ScanWorker:
@@ -1040,12 +1099,12 @@ class ScanWorker:
         Returns:
             The latest prompt's claimed answer when ``job_id`` is the running
             multi-page job, otherwise ``None`` -- including while the prompt
-            is unanswered.
+            is unanswered, and once the job has announced its next question
+            (``WorkerPassCoordinator.acknowledged``).
 
         """
         coordinator = self._pass_coordinator_for(job_id)
-        claimed = None if coordinator is None else coordinator.claimed
-        return None if claimed is None else claimed[1]
+        return None if coordinator is None else coordinator.acknowledged
 
     def _pass_coordinator_for(self, job_id: str) -> WorkerPassCoordinator | None:
         """
@@ -1988,6 +2047,9 @@ class ScanWorker:
                 # run_pipeline has returned and its temporary directory is
                 # gone -- never from in here.
                 return
+            # Before the write, and before the check below, so no poll can
+            # read the next question's state beside the previous answer.
+            _announce_pass_wait(state, pass_coordinator)
             if state is persisted_state:
                 # Already persisted; not a transition.
                 return
