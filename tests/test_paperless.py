@@ -24,6 +24,7 @@ from saneless.exceptions import (
     PaperlessIncompatibleError,
     PaperlessTimeoutError,
     PaperlessUncertainSendError,
+    PaperlessUnconfirmedError,
     describe,
 )
 from saneless.paperless import (
@@ -129,12 +130,27 @@ _API_NO_TASK_SHAPES = [
 
 def _poll_client(
     handler: Callable[[httpx2.Request], httpx2.Response],
+    *,
+    clock: FakeClock | None = None,
 ) -> PaperlessClient:
-    """Build a client wired to the given mock handler."""
+    """
+    Build a client wired to the given mock handler and a fake clock.
+
+    Args:
+        handler: The transport handler.
+        clock: The clock the poll's deadline and waits run on; a fresh one
+            when None, so no poll ever waits in real time.
+
+    Returns:
+        The client.
+
+    """
+    fake = FakeClock() if clock is None else clock
     return PaperlessClient(
         url="http://paperless:8000",
         token=_MOCK_AUTH,
         transport=_make_transport(handler),
+        timing=PaperlessTiming(clock=fake.now, sleep=fake.sleep),
     )
 
 
@@ -602,11 +618,9 @@ def upload_clock() -> FakeClock:
 
 
 @pytest.fixture
-def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record task-poll backoff sleeps instead of really sleeping."""
-    recorded: list[float] = []
-    monkeypatch.setattr("saneless.paperless.time.sleep", recorded.append)
-    return recorded
+def poll_clock() -> FakeClock:
+    """Provide a fake clock for the task poll's deadline and backoff waits."""
+    return FakeClock()
 
 
 class TestPaperlessUrlValidation:
@@ -1950,29 +1964,36 @@ class TestPollTask:
             client.close()
 
     @pytest.mark.parametrize("build_payload", _API_SHAPES)
-    def test_failure_raises_across_api_versions(
+    def test_failure_is_unconfirmed_across_api_versions(
         self,
         build_payload: Callable[[str, str | None], object],
     ) -> None:
-        """A failed task raises, carrying the message Paperless supplied."""
+        """
+        A failed task raises, carrying the message Paperless supplied.
+
+        paperless-ngx answered the upload with a task id, so it received the
+        document; a failure after that is "received, not confirmed", never a
+        plain failed upload that invites a rescan.
+        """
 
         def handler(_request: httpx2.Request) -> httpx2.Response:
             return httpx2.Response(200, json=build_payload("FAILURE", "disk on fire"))
 
         client = _poll_client(handler)
         try:
-            with pytest.raises(PaperlessError, match="disk on fire"):
+            with pytest.raises(PaperlessUnconfirmedError) as exc_info:
                 client.poll_task("t1", timeout=10)
         finally:
             client.close()
+        assert str(exc_info.value) == "Paperless task t1 ended FAILURE: disk on fire"
 
     @pytest.mark.parametrize("build_payload", _API_SHAPES)
-    def test_revoked_raises_across_api_versions(
+    def test_revoked_says_the_task_was_cancelled(
         self,
         build_payload: Callable[[str, str | None], object],
     ) -> None:
         """
-        REVOKED is terminal, not something to keep polling.
+        REVOKED is terminal, and reads as a cancellation, not a failure.
 
         It is one of paperless-ngx's COMPLETE_STATUSES, so looping on it
         would turn an administrative cancellation into a misattributed
@@ -1984,10 +2005,14 @@ class TestPollTask:
 
         client = _poll_client(handler)
         try:
-            with pytest.raises(PaperlessError, match="cancelled"):
+            with pytest.raises(PaperlessUnconfirmedError) as exc_info:
                 client.poll_task("t1", timeout=10)
         finally:
             client.close()
+        assert str(exc_info.value) == (
+            "paperless-ngx cancelled task t1 before it finished; "
+            "the document was not filed"
+        )
 
     @pytest.mark.parametrize(("build_payload", "build_no_task"), _API_NO_TASK_SHAPES)
     def test_no_task_yet_is_tolerated_across_api_versions(
@@ -2020,32 +2045,53 @@ class TestPollTask:
 
         client = _poll_client(handler)
         try:
-            with pytest.raises(PaperlessError, match="no message"):
+            with pytest.raises(PaperlessUnconfirmedError, match="no message"):
                 client.poll_task("t1", timeout=10)
         finally:
             client.close()
 
-    def test_non_200_raises_on_the_first_poll(self) -> None:
+    @pytest.mark.parametrize("status", [401, 403, 404])
+    def test_a_refusal_ends_the_poll_at_once(
+        self, status: int, poll_clock: FakeClock
+    ) -> None:
         """
-        D-12: any non-200 is a hard failure, reported immediately.
+        A refused token or a moved endpoint is reported immediately.
 
         The counter is the point of the test: a revoked token used to be
         silently re-polled for the full 300 s and then misreported as a
-        timeout.
+        timeout.  The upload was accepted before the poll began, so the error
+        is "received, not confirmed".
         """
-        call_count = {"n": 0}
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            call_count["n"] += 1
-            return httpx2.Response(401, text="Invalid token")
-
-        client = _poll_client(handler)
+        handler = _CountingHandler(_answering(httpx2.Response(status, text="no")))
+        client = _poll_client(handler, clock=poll_clock)
         try:
-            with pytest.raises(PaperlessError, match="401"):
+            with pytest.raises(PaperlessUnconfirmedError, match=str(status)):
                 client.poll_task("t1", timeout=30)
-            assert call_count["n"] == 1
         finally:
             client.close()
+        assert handler.calls == 1
+        assert poll_clock.waits == []
+
+    def test_a_406_ends_the_poll_with_the_version_wording(
+        self, poll_clock: FakeClock
+    ) -> None:
+        """A 406 names the versions saneless needs, and the task it held."""
+        handler = _CountingHandler(
+            _answering(httpx2.Response(406, json={"detail": "Invalid version"}))
+        )
+        client = _poll_client(handler, clock=poll_clock)
+        try:
+            with pytest.raises(PaperlessUnconfirmedError) as exc_info:
+                client.poll_task("t1", timeout=30)
+        finally:
+            client.close()
+        message = str(exc_info.value)
+        assert "2.16" in message
+        assert "API version 9 or 10" in message
+        assert "t1" in message
+        assert "Invalid version" not in message
+        assert handler.calls == 1
+        assert poll_clock.waits == []
 
     def test_non_200_body_is_rendered_as_one_line(self) -> None:
         """
@@ -2069,28 +2115,31 @@ class TestPollTask:
         finally:
             client.close()
 
-    def test_non_200_html_body_cannot_flood_the_message(self) -> None:
+    @pytest.mark.parametrize("status", [401, 404])
+    def test_an_immediate_failure_html_body_cannot_flood_the_message(
+        self, status: int
+    ) -> None:
         """
-        T-23-16 / M-17: a 5 KB proxy error page becomes one short line.
+        A 5 KB error page on a refusal becomes one short line.
 
         That message is recorded in the job store and shown in the web status
         area and on the terminal, so neither its length nor a newline may
         come from the upstream body.
         """
-        page = "<html>\n<body>\n" + ("<p>Bad Gateway</p>\n" * 260) + "</body></html>"
+        page = "<html>\n<body>\n" + ("<p>Refused</p>\n" * 330) + "</body></html>"
 
         def handler(_request: httpx2.Request) -> httpx2.Response:
-            return httpx2.Response(502, text=page)
+            return httpx2.Response(status, text=page)
 
         client = _poll_client(handler)
         try:
-            with pytest.raises(PaperlessError) as exc_info:
+            with pytest.raises(PaperlessUnconfirmedError) as exc_info:
                 client.poll_task("t1", timeout=30)
-            message = str(exc_info.value)
-            assert "\n" not in message
-            assert len(message) < 300
         finally:
             client.close()
+        message = str(exc_info.value)
+        assert "\n" not in message
+        assert len(message) < 300
 
     def test_timeout_raises_naming_the_task(self) -> None:
         """A deadline-expired poll raises and names the task id."""
@@ -2105,8 +2154,11 @@ class TestPollTask:
         finally:
             client.close()
 
-    def test_timeout_is_catchable_as_a_paperless_error(self) -> None:
+    def test_timeout_is_catchable_as_unconfirmed_and_as_a_paperless_error(
+        self,
+    ) -> None:
         """D-11: `except PaperlessError` catches the timeout subclass too."""
+        assert issubclass(PaperlessTimeoutError, PaperlessUnconfirmedError)
         assert issubclass(PaperlessTimeoutError, PaperlessError)
 
         def handler(_request: httpx2.Request) -> httpx2.Response:
@@ -2119,25 +2171,276 @@ class TestPollTask:
         finally:
             client.close()
 
-    def test_timeout_does_not_sleep_past_its_own_deadline(self) -> None:
+    def test_timeout_does_not_sleep_past_its_own_deadline(
+        self, poll_clock: FakeClock
+    ) -> None:
         """
         A 0.05 s budget costs 0.05 s, not the 0.5 s first sleep.
 
-        0.5 s is exactly what the unclamped first backoff sleep cost
-        unconditionally, so that threshold is the regression this asserts.
+        The one wait is cut to what remains of the deadline, and the poll
+        ends on the clock it was given, exactly at the deadline.
         """
 
         def handler(_request: httpx2.Request) -> httpx2.Response:
             return httpx2.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
 
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
-            start = time.monotonic()
             with pytest.raises(PaperlessTimeoutError):
                 client.poll_task("t1", timeout=0.05)
-            assert time.monotonic() - start < 0.5
         finally:
             client.close()
+        assert poll_clock.waits == [0.05]
+        assert poll_clock.now() == 0.05
+
+    def test_backoff_doubles_up_to_five_seconds(self, poll_clock: FakeClock) -> None:
+        """
+        The waits double from 0.5 s and never exceed 5 s.
+
+        A task that finishes just after a wait is then found within five
+        seconds, rather than up to thirty.  The last wait is cut to the time
+        that remains, so the poll ends on its deadline.
+        """
+
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+
+        client = _poll_client(handler, clock=poll_clock)
+        try:
+            with pytest.raises(PaperlessTimeoutError):
+                client.poll_task("t1", timeout=30)
+        finally:
+            client.close()
+        assert poll_clock.waits == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0, 2.5]
+        assert poll_clock.now() == 30.0
+
+    def test_the_deadline_runs_on_the_given_clock(self) -> None:
+        """
+        The deadline is measured on the client's clock, from where it stands.
+
+        A clock that starts far from zero proves the poll reads it rather
+        than a clock of its own: the waits and the end are the same.
+        """
+        clock = FakeClock(start=10_000.0)
+
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+
+        client = _poll_client(handler, clock=clock)
+        try:
+            with pytest.raises(PaperlessTimeoutError):
+                client.poll_task("t1", timeout=2)
+        finally:
+            client.close()
+        assert clock.waits == [0.5, 1.0, 0.5]
+        assert clock.now() == 10_002.0
+
+
+def _other_task_v9(status: str) -> object:
+    """Build a v9 answer that lists only another task."""
+    return [{"task_id": "other", "status": status.upper()}]
+
+
+def _other_task_v10(status: str) -> object:
+    """Build a v10 answer that lists only another task."""
+    task = {"task_id": "other", "status": status.lower()}
+    return {"count": 1, "next": None, "previous": None, "results": [task]}
+
+
+_OTHER_TASK_SHAPES = [
+    pytest.param(_other_task_v9, _v9_payload, id="v9"),
+    pytest.param(_other_task_v10, _v10_payload, id="v10"),
+]
+
+
+class TestPollTaskSelectsItsOwnTask:
+    """The poll follows only the task whose id it was given."""
+
+    @pytest.mark.parametrize(("build_other", "build_ours"), _OTHER_TASK_SHAPES)
+    def test_another_tasks_success_is_not_returned(
+        self,
+        build_other: Callable[[str], object],
+        build_ours: Callable[[str, str | None], object],
+        poll_clock: FakeClock,
+    ) -> None:
+        """
+        An answer holding only another task means ours is not visible yet.
+
+        paperless-ngx filters by ``task_id`` on the server, so another task
+        in the answer means something between saneless and paperless-ngx
+        dropped the filter.  Its SUCCESS says nothing about our document.
+        """
+
+        def respond(call: int) -> httpx2.Response:
+            if call <= 2:
+                return httpx2.Response(200, json=build_other("SUCCESS"))
+            return httpx2.Response(200, json=build_ours("SUCCESS", None))
+
+        handler = _CountingHandler(respond)
+        client = _poll_client(handler, clock=poll_clock)
+        try:
+            result = client.poll_task("t1", timeout=30)
+        finally:
+            client.close()
+        assert result["task_id"] == "t1"
+        assert handler.calls == 3
+        assert poll_clock.waits == [0.5, 1.0]
+
+    @pytest.mark.parametrize(
+        "build_other",
+        [
+            pytest.param(_other_task_v9, id="v9"),
+            pytest.param(_other_task_v10, id="v10"),
+        ],
+    )
+    def test_only_other_tasks_end_at_the_deadline(
+        self, build_other: Callable[[str], object]
+    ) -> None:
+        """A proxy that drops the filter for ever ends in a truthful timeout."""
+
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=build_other("FAILURE"))
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        assert str(exc_info.value) == "Paperless task t1 did not finish within 10s"
+
+    def test_our_task_is_found_behind_another(self) -> None:
+        """Our entry is chosen by its id, wherever it sits in the list."""
+        payload = [
+            {"task_id": "other", "status": "FAILURE", "result": "not ours"},
+            {"task_id": "t1", "status": "SUCCESS"},
+        ]
+
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=payload)
+
+        client = _poll_client(handler)
+        try:
+            result = client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        assert result == {"task_id": "t1", "status": "SUCCESS"}
+
+
+_TRANSIENT_STATUSES = [
+    pytest.param(502, id="5xx-502"),
+    pytest.param(503, id="5xx-503"),
+    pytest.param(504, id="5xx-504"),
+    pytest.param(429, id="429"),
+]
+
+
+class TestPollTaskRidesOutTransientAnswers:
+    """A proxy blip or a rate limit during the poll is waited out."""
+
+    @pytest.mark.parametrize("status", _TRANSIENT_STATUSES)
+    def test_a_transient_answer_then_success_is_filed(
+        self, status: int, poll_clock: FakeClock
+    ) -> None:
+        """
+        A 5xx or a 429 followed by SUCCESS ends as a filed document.
+
+        The upload was already accepted, so a reverse proxy's brief 502
+        while paperless-ngx restarts must not fail the job.
+        """
+
+        def respond(call: int) -> httpx2.Response:
+            if call == 1:
+                return httpx2.Response(status, text="try again")
+            return httpx2.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
+
+        handler = _CountingHandler(respond)
+        client = _poll_client(handler, clock=poll_clock)
+        try:
+            result = client.poll_task("t1", timeout=30)
+        finally:
+            client.close()
+        assert result["status"] == "SUCCESS"
+        assert handler.calls == 2
+        assert poll_clock.waits == [0.5]
+
+    def test_a_502_for_ever_names_it_in_one_bounded_line(
+        self, poll_clock: FakeClock
+    ) -> None:
+        """
+        The timeout names the last transient answer on one line.
+
+        A 5 KB proxy page quoting the token becomes one bounded line with the
+        token struck, so the job store, the web status area and the
+        terminal cannot be flooded, forged or handed the credential.
+        """
+        line = f"<p>Bad Gateway for Token {_MOCK_AUTH}</p>\n"
+        page = (line * (5000 // len(line) + 1))[:5000]
+        handler = _CountingHandler(_answering(httpx2.Response(502, text=page)))
+        client = _poll_client(handler, clock=poll_clock)
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        message = str(exc_info.value)
+        prefix = "Paperless task t1 did not finish within 10s; last error: "
+        assert message.startswith(f"{prefix}502 Bad Gateway: <p>Bad Gateway for")
+        body = message.removeprefix(f"{prefix}502 Bad Gateway: ")
+        assert len(body) <= 201
+        assert body.endswith("…")
+        assert "\n" not in message
+        assert "***" in message
+        _assert_token_absent(_MOCK_AUTH, message)
+        assert exc_info.value.__cause__ is None
+        assert handler.calls == len(poll_clock.waits) + 1
+
+    def test_an_answer_after_a_transient_one_clears_it(
+        self, poll_clock: FakeClock
+    ) -> None:
+        """
+        A 502 followed by answered polls is not the reason for the timeout.
+
+        The task simply stayed pending, so the message must not blame the
+        proxy.
+        """
+
+        def respond(call: int) -> httpx2.Response:
+            if call == 1:
+                return httpx2.Response(502, text="Bad Gateway")
+            return httpx2.Response(200, json=[{"task_id": "t1", "status": "PENDING"}])
+
+        client = _poll_client(_CountingHandler(respond), clock=poll_clock)
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        assert str(exc_info.value) == "Paperless task t1 did not finish within 10s"
+
+    def test_a_transient_answer_is_logged_as_a_retry(
+        self, poll_clock: FakeClock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Each transient answer leaves one warning naming it."""
+
+        def respond(call: int) -> httpx2.Response:
+            if call == 1:
+                return httpx2.Response(503, text="down\nfor maintenance")
+            return httpx2.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
+
+        client = _poll_client(_CountingHandler(respond), clock=poll_clock)
+        try:
+            with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert "503 Service Unavailable: down for maintenance" in warnings[0]
 
 
 _POLL_TRANSPORT_CASES = [
@@ -2166,10 +2469,15 @@ def _task_answer(task: dict[str, object]) -> Callable[[int], httpx2.Response]:
 
 
 def _failed_poll_message(respond: Callable[[int], httpx2.Response]) -> str:
-    """Poll ``t1`` against ``respond`` and return the PaperlessError text."""
+    """
+    Poll ``t1`` against ``respond`` and return the error's text.
+
+    Every failure once a task id is held is "received, not confirmed", so
+    the error must be a ``PaperlessUnconfirmedError``.
+    """
     client = _poll_client(_CountingHandler(respond))
     try:
-        with pytest.raises(PaperlessError) as exc_info:
+        with pytest.raises(PaperlessUnconfirmedError) as exc_info:
             client.poll_task("t1", timeout=10)
     finally:
         client.close()
@@ -2180,7 +2488,7 @@ class TestPollTaskFailureTranslation:
     """EXC-01 / D-10 / D-11 / M-17: the read side of an accepted upload."""
 
     def test_poll_continues_through_transport_errors_to_success(
-        self, sleeps: list[float]
+        self, poll_clock: FakeClock
     ) -> None:
         """
         D-11 / M-17: a network blip after the upload succeeded is not a failure.
@@ -2197,29 +2505,29 @@ class TestPollTaskFailureTranslation:
             return httpx2.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
 
         handler = _CountingHandler(respond)
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
             result = client.poll_task("t1", timeout=5)
         finally:
             client.close()
         assert result["status"] == "SUCCESS"
         assert handler.calls == 3
-        assert sleeps == [0.5, 1.0]
+        assert poll_clock.waits == [0.5, 1.0]
 
     @pytest.mark.parametrize("failure", _POLL_TRANSPORT_CASES)
     def test_poll_deadline_after_transport_errors_names_the_last_error(
-        self, failure: httpx2.RequestError, sleeps: list[float]
+        self, failure: httpx2.RequestError, poll_clock: FakeClock
     ) -> None:
         """
         D-11 / OUTC-07 / T-28-38: transport errors still end at the deadline.
 
-        The sleep recorder advances no time, so only the real monotonic
-        deadline can end the loop; a poll that skipped the deadline check on
-        a transport error would hang here.  The message names the task and
-        ``describe`` of the last error (the class name for an empty one).
+        Only the fake clock's waits move time on, so a poll that skipped the
+        deadline check on a transport error would never end here.  The
+        message names the task and ``describe`` of the last error (the class
+        name for an empty one).
         """
         handler = _CountingHandler(_raising(failure))
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
             with pytest.raises(PaperlessTimeoutError) as exc_info:
                 client.poll_task("t1", timeout=0.05)
@@ -2235,10 +2543,10 @@ class TestPollTaskFailureTranslation:
         # Every poll but the one that found the deadline gone was followed by
         # a sleep: the error fell through to the backoff, not a bare `continue`.
         assert handler.calls >= 1
-        assert len(sleeps) == handler.calls - 1
+        assert len(poll_clock.waits) == handler.calls - 1
 
     def test_poll_continues_through_a_decoding_error_to_success(
-        self, sleeps: list[float]
+        self, poll_clock: FakeClock
     ) -> None:
         """
         WR-05: an undecodable poll response is a blip, not a raw httpx2 escape.
@@ -2255,21 +2563,22 @@ class TestPollTaskFailureTranslation:
             return httpx2.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
 
         handler = _CountingHandler(respond)
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
             result = client.poll_task("t1", timeout=5)
         finally:
             client.close()
         assert result["status"] == "SUCCESS"
         assert handler.calls == 2
-        assert sleeps == [0.5]
+        assert poll_clock.waits == [0.5]
 
     def test_poll_deadline_without_transport_error_has_no_last_error(
-        self, sleeps: list[float]
+        self, poll_clock: FakeClock
     ) -> None:
         """A task that simply stays PENDING keeps today's timeout message."""
         client = _poll_client(
-            _CountingHandler(_task_answer({"task_id": "t1", "status": "PENDING"}))
+            _CountingHandler(_task_answer({"task_id": "t1", "status": "PENDING"})),
+            clock=poll_clock,
         )
         try:
             with pytest.raises(PaperlessTimeoutError) as exc_info:
@@ -2278,10 +2587,10 @@ class TestPollTaskFailureTranslation:
             client.close()
         assert str(exc_info.value) == "Paperless task t1 did not finish within 0.05s"
         assert exc_info.value.__cause__ is None
-        assert sleeps
+        assert poll_clock.waits
 
     def test_poll_deadline_after_a_recovered_blip_names_no_stale_error(
-        self, sleeps: list[float]
+        self, poll_clock: FakeClock
     ) -> None:
         """
         IN-02: a transport error followed by answered polls is not the cause.
@@ -2297,7 +2606,7 @@ class TestPollTaskFailureTranslation:
             return httpx2.Response(200, json=[{"task_id": "t1", "status": "PENDING"}])
 
         handler = _CountingHandler(respond)
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
             with pytest.raises(PaperlessTimeoutError) as exc_info:
                 client.poll_task("t1", timeout=0.05)
@@ -2306,27 +2615,27 @@ class TestPollTaskFailureTranslation:
         assert str(exc_info.value) == "Paperless task t1 did not finish within 0.05s"
         assert exc_info.value.__cause__ is None
         assert handler.calls >= 2
-        assert sleeps
+        assert poll_clock.waits
 
-    def test_poll_401_still_fails_at_once(self, sleeps: list[float]) -> None:
+    def test_poll_401_still_fails_at_once(self, poll_clock: FakeClock) -> None:
         """OUTC-07: a non-200 is not a transport blip and ends the poll at once."""
         handler = _CountingHandler(_answering(httpx2.Response(401, text="Invalid")))
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
-            with pytest.raises(PaperlessError, match="401 Unauthorized"):
+            with pytest.raises(PaperlessUnconfirmedError, match="401 Unauthorized"):
                 client.poll_task("t1", timeout=30)
         finally:
             client.close()
         assert handler.calls == 1
-        assert sleeps == []
+        assert poll_clock.waits == []
 
-    def test_poll_non_json_200_is_a_paperless_error(self, sleeps: list[float]) -> None:
+    def test_poll_non_json_200_is_unconfirmed(self, poll_clock: FakeClock) -> None:
         """EXC-01: a login page served with 200 is not a raw ValueError."""
         handler = _CountingHandler(_answering(httpx2.Response(200, text="<html>")))
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
             with pytest.raises(
-                PaperlessError,
+                PaperlessUnconfirmedError,
                 match=(
                     "Paperless at http://paperless:8000 returned a task response "
                     "that is not JSON"
@@ -2337,7 +2646,7 @@ class TestPollTaskFailureTranslation:
             client.close()
         assert isinstance(exc_info.value.__cause__, ValueError)
         assert handler.calls == 1
-        assert sleeps == []
+        assert poll_clock.waits == []
 
     def test_duplicate_v9_failure_says_check_before_rescanning(self) -> None:
         """D-10: the v9 duplicate text gets the check-first sentence."""
@@ -2554,18 +2863,6 @@ class TestMetadataFetchTranslation:
             f"Could not fetch {noun} from Paperless: paperless.url is not set, or "
             "has no http or https scheme; set it to the paperless-ngx address"
         )
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_metadata_list_response_is_returned(self, method: str, noun: str) -> None:
-        """A bare-list response is returned unchanged."""
-        items = [{"id": 1, "name": f"first {noun}"}]
-        handler = _CountingHandler(_answering(httpx2.Response(200, json=items)))
-        client = _metadata_client(handler)
-        try:
-            assert getattr(client, method)() == items
-        finally:
-            client.close()
-        assert handler.calls == 1
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     def test_metadata_paginated_response_is_unwrapped(
@@ -3320,16 +3617,6 @@ class TestMetadataPagination:
         )
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_a_bare_list_is_returned_after_one_request(
-        self, method: str, noun: str
-    ) -> None:
-        """A bare JSON list is the whole collection: nothing more is asked for."""
-        items = _items(noun, 1, 2)
-        handler = _PagedHandler({1: httpx2.Response(200, json=items)})
-        assert _fetch(handler, method) == items
-        assert len(handler.requests) == 1
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     def test_an_empty_page_ends_the_fetch(self, method: str, noun: str) -> None:
         """
         An empty page stops the fetch even though its ``next`` is not null.
@@ -3437,45 +3724,99 @@ class TestMetadataResponseShape:
             _fetch(handler, method)
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_a_bare_list_of_non_objects_fails(self, method: str, noun: str) -> None:
-        """A bare list must hold objects too."""
-        handler = _PagedHandler({1: httpx2.Response(200, json=["one", "two"])})
-        with pytest.raises(PaperlessError, match="page 1 did not hold a list"):
-            _fetch(handler, method)
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_a_bare_list_after_page_one_fails(self, method: str, noun: str) -> None:
-        """
-        A bare list is the whole collection only on page 1.
-
-        On a later page it used to be returned alone, throwing away the pages
-        already collected.
-        """
-        handler = _PagedHandler(
-            {
-                1: httpx2.Response(
-                    200, json=_page_payload(_items(noun, 1, 2), _next_link(noun, 2))
-                ),
-                2: httpx2.Response(200, json=_items(noun, 3, 2)),
-            }
-        )
-        with pytest.raises(PaperlessError) as exc_info:
-            _fetch(handler, method)
-        assert str(exc_info.value).endswith(
-            "page 2 was a bare list, which only page 1 may be"
-        )
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    @pytest.mark.parametrize("body", [42, "tags", True])
-    def test_a_body_that_is_neither_a_list_nor_an_object_fails(
+    @pytest.mark.parametrize(
+        "body",
+        [42, "tags", True, [], [{"id": 1, "name": "one"}]],
+        ids=["int", "string", "bool", "empty-list", "bare-list"],
+    )
+    def test_a_body_that_is_not_an_object_fails(
         self, method: str, noun: str, body: object
     ) -> None:
-        """A scalar body is a PaperlessError naming the collection."""
+        """
+        A body that is not a page object is a PaperlessError naming the collection.
+
+        Every paperless-ngx release saneless supports paginates tags and
+        correspondents, so a bare list is not a collection either: it is
+        something other than paperless-ngx answering.
+        """
         handler = _PagedHandler({1: httpx2.Response(200, json=body)})
         with pytest.raises(PaperlessError) as exc_info:
             _fetch(handler, method)
-        assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
-        assert str(exc_info.value).endswith("neither a list nor an object")
+        assert str(exc_info.value) == (
+            f"Could not fetch {noun} from Paperless at "
+            f"http://{_CONFIGURED_HOST}:8000: the response was not an object"
+        )
+        assert len(handler.requests) == 1
+
+
+class TestMetadataTimeout:
+    """
+    A metadata fetch can carry a shorter timeout than the client's 30 s.
+
+    Checking the configured tags and correspondents before a scan starts
+    should answer in seconds when paperless-ngx is down, so the caller may
+    pass its own bound.  What needs proving is which budget each request
+    carried, which ``request.extensions["timeout"]`` records as a value.
+    """
+
+    @staticmethod
+    def _recorded_timeouts(
+        method: str, timeout: float | None
+    ) -> list[dict[str, float | None]]:
+        """
+        Fetch two pages of one collection and return each request's timeout.
+
+        Args:
+            method: ``get_tags`` or ``get_correspondents``.
+            timeout: The bound to pass, or None to call with no argument.
+
+        Returns:
+            The ``timeout`` extension of every request, in order.
+
+        """
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request.extensions["timeout"])
+            page = int(request.url.params["page"])
+            return httpx2.Response(
+                200,
+                json={
+                    "count": 2,
+                    "next": "more" if page == 1 else None,
+                    "results": [{"id": page, "name": f"item {page}"}],
+                },
+            )
+
+        client = _poll_client(handler)
+        try:
+            fetch = getattr(client, method)
+            items = fetch() if timeout is None else fetch(timeout=timeout)
+        finally:
+            client.close()
+        assert [item["id"] for item in items] == [1, 2]
+        return seen
+
+    @pytest.mark.parametrize("method", ["get_tags", "get_correspondents"])
+    def test_a_timeout_is_sent_on_every_page(self, method: str) -> None:
+        """``timeout=5.0`` bounds each page request to 5 s in every phase."""
+        five = {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
+        assert self._recorded_timeouts(method, 5.0) == [five, five]
+
+    @pytest.mark.parametrize("method", ["get_tags", "get_correspondents"])
+    def test_no_timeout_keeps_the_client_default(self, method: str) -> None:
+        """Called with no bound, every page keeps the client's 30 s."""
+        thirty = {"connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0}
+        assert self._recorded_timeouts(method, None) == [thirty, thirty]
+
+    @pytest.mark.parametrize("method", ["get_tags", "get_correspondents"])
+    def test_the_timeout_is_keyword_only_and_optional(self, method: str) -> None:
+        """The bound is a keyword, defaulting to None, the client default."""
+        parameter = inspect.signature(getattr(PaperlessClient, method)).parameters[
+            "timeout"
+        ]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
 
 
 class _EndlessHandler:
@@ -4759,7 +5100,7 @@ class TestTaskIdIsBoundedInLogs:
     )
     def test_task_id_in_the_timeout_message_is_bounded(
         self,
-        sleeps: list[float],
+        poll_clock: FakeClock,
         caplog: pytest.LogCaptureFixture,
         respond: Callable[[int], httpx2.Response],
     ) -> None:
@@ -4770,7 +5111,7 @@ class TestTaskIdIsBoundedInLogs:
             sent.append(request.url.params["task_id"])
             return respond(len(sent))
 
-        client = _poll_client(handler)
+        client = _poll_client(handler, clock=poll_clock)
         try:
             with (
                 caplog.at_level(logging.INFO, logger="saneless.paperless"),
@@ -4780,7 +5121,7 @@ class TestTaskIdIsBoundedInLogs:
         finally:
             client.close()
 
-        assert sleeps
+        assert poll_clock.waits
         # What goes back to paperless is the id it issued, untouched.
         assert set(sent) == {_HOSTILE_TASK_ID}
         message = str(exc_info.value)

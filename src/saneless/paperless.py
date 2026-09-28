@@ -33,6 +33,7 @@ from .exceptions import (
     PaperlessIncompatibleError,
     PaperlessTimeoutError,
     PaperlessUncertainSendError,
+    PaperlessUnconfirmedError,
     describe,
 )
 from .text_safety import neutralise_bounded, neutralise_controls
@@ -114,6 +115,10 @@ _SEND_BUDGET_SECONDS: Final = 60.0
 # to this, so a server that comes back is found within a few seconds of it.
 _MAX_BACKOFF_SECONDS: Final = 5.0
 
+# The longest single wait between task polls.  The waits double from 0.5 s up
+# to this, so a task that finishes just after a poll is found within 5 s.
+_MAX_POLL_DELAY_SECONDS: Final = 5.0
+
 # The upload's connect timeout.  Shorter than the client-wide 30 s, so a host
 # that drops packets still gets several attempts within the send budget.
 _UPLOAD_CONNECT_SECONDS: Final = 10.0
@@ -175,32 +180,54 @@ def _unreadable_pdf(pdf_path: Path, exc: OSError) -> PaperlessError:
     )
 
 
-def _extract_task(payload: object) -> dict[str, object] | None:
+def _extract_task(payload: object, task_id: str) -> dict[str, object] | None:
     """
-    Return the single task from either paperless-ngx response shape.
+    Return the task with id ``task_id`` from either paperless-ngx response shape.
 
     API v9 answers ``GET /api/tasks/`` with a bare list; v10 paginates it
-    into ``{"count", "next", "previous", "results"}``.  This is the same
-    both-shapes tolerance ``get_tags`` and ``get_correspondents`` already
-    apply to their own endpoints.
+    into ``{"count", "next", "previous", "results"}``.  paperless-ngx filters
+    the list by ``?task_id=`` on the server, so the answer normally holds our
+    task or nothing.  An entry for any other task -- which a proxy that drops
+    the query string would produce -- says nothing about our document, so
+    only an entry whose ``task_id`` equals ours is chosen, wherever it sits.
 
     Args:
         payload: The decoded JSON body of a 200 response.
+        task_id: The id paperless-ngx answered the upload with.
 
     Returns:
-        The first task dict, or None when the response carried no task.
-        None is **not** an error: a task is not always visible immediately
-        after the upload that created it, so the caller must keep polling
-        inside its deadline rather than raise.
+        Our task dict, or None when the response did not carry it.  None is
+        **not** an error: a task is not always visible immediately after the
+        upload that created it, so the caller must keep polling inside its
+        deadline rather than raise.
 
     """
     if isinstance(payload, dict):
         payload = payload.get("results")
-    if isinstance(payload, list) and payload:
-        first = payload[0]
-        if isinstance(first, dict):
-            return {str(key): value for key, value in first.items()}
+    if not isinstance(payload, list):
+        return None
+    for entry in payload:
+        if isinstance(entry, dict) and entry.get("task_id") == task_id:
+            return {str(key): value for key, value in entry.items()}
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class _PollTransient:
+    """
+    A task poll answer that says "ask again later", not "this failed".
+
+    A 5xx is usually a reverse proxy in front of a paperless-ngx that is
+    restarting, and a 429 is a rate limit; either can clear within the
+    poll's deadline.
+
+    Attributes:
+        description: The status and body on one bounded line, with the token
+            struck, for the log and for the timeout message.
+
+    """
+
+    description: str
 
 
 def _usable_count(page: dict[object, object]) -> int | None:
@@ -234,7 +261,7 @@ def _metadata_items(value: object, prefix: str, page: int) -> list[dict[str, obj
     characters or keys.
 
     Args:
-        value: The page's items: a bare-list body or a page's ``results``.
+        value: The page's items: its ``results``.
         prefix: The message prefix naming the collection and base URL.
         page: The page number, for the message.
 
@@ -808,8 +835,10 @@ class PaperlessTiming:
         send_budget: How many seconds an upload keeps retrying failures that
             prove nothing arrived, counted from its first attempt on
             ``clock``.  0 makes exactly one attempt.
-        clock: The monotonic clock the send budget is measured on.
-        sleep: How the upload waits between those attempts.
+        clock: The monotonic clock the send budget and the task poll's
+            deadline are measured on.
+        sleep: How the upload waits between those attempts, and the task
+            poll between its polls.
         upload_timeout: Builds the upload request's timeout from the PDF's
             size in bytes.
 
@@ -1563,59 +1592,70 @@ class PaperlessClient:
         status in lowercase, and moved the failure text into
         ``result_data["error_message"]``.  The client asks for v10 once the
         server has announced it and for v9 until then (see ``api_version``),
-        so either shape can arrive.
+        so either shape can arrive.  In both, only the entry whose
+        ``task_id`` equals ours is read; an answer holding only other tasks
+        means ours is not visible yet.
 
-        A 200 carrying no task is not an error.  A task is not always
+        A 200 carrying no task of ours is not an error.  A task is not always
         visible immediately after the upload that created it, so an empty
         list (or an empty ``results``) means "ask again", and polling
-        continues until the deadline.  A non-200 *is* an error and ends the
-        poll at once: a revoked token or a moved endpoint should be reported
-        as what it is within a second, not as a timeout several minutes
-        later.
+        continues until the deadline.
 
-        A request-level error while polling (a connection refused, a reset,
-        a read timeout, a proxy closing the connection, a body that cannot be
-        decoded) does *not* end the poll.  The upload has already been
-        accepted, so failing the job now would invite the user to scan the
-        document again and create a duplicate.  The error is logged and
-        remembered, and the poll backs off and asks again within the same
-        monotonic deadline.
+        Nor does an answer that says "later" end the poll: a 5xx, which is
+        usually a reverse proxy in front of a restarting paperless-ngx, or a
+        429 rate limit.  Neither does a request-level error (a connection
+        refused, a reset, a read timeout, a proxy closing the connection, a
+        body that cannot be decoded).  Each is logged and remembered, and the
+        poll backs off and asks again within the same deadline.  The waits
+        double from 0.5 s up to 5 s, and the last is cut to what remains.
+        An answered poll clears what was remembered.
+
+        A 401, 403, 404 or 406, and any other non-200, ends the poll at once:
+        a revoked token or a moved endpoint should be reported as what it is
+        within a second, not as a timeout several minutes later.
+
+        paperless-ngx accepted the upload before the poll began, so it holds
+        the document.  Every failure from here on is therefore "received, not
+        confirmed", never a plain failed upload that would invite a second
+        scan of the same document.
 
         Args:
             task_id: Task UUID returned from upload.
-            timeout: Maximum seconds to wait, measured on a monotonic clock
-                that includes request time as well as sleep time. There is
-                no default: callers pass ``output.paperless_task_timeout``,
-                so the configured value is the only source.
+            timeout: Maximum seconds to wait, measured on the client's clock
+                (see ``PaperlessTiming``), which includes request time as
+                well as sleep time. There is no default: callers pass
+                ``output.paperless_task_timeout``, so the configured value is
+                the only source.
 
         Returns:
             The task dict, only when the task reached SUCCESS.
 
         Raises:
-            PaperlessError: If the task ends FAILURE or REVOKED, carrying
-                the message paperless-ngx supplied (plus a check-before-
-                rescanning hint when it was a duplicate); if any poll
-                returns a non-200 response, carrying the status code, the
+            PaperlessUnconfirmedError: If the task ends FAILURE, carrying the
+                message paperless-ngx supplied (plus a check-before-
+                rescanning hint when it was a duplicate), or REVOKED, saying
+                paperless-ngx cancelled it; if a poll is answered 406, in the
+                incompatible-version wording; if a poll gets any other
+                non-200 but a 5xx or 429, carrying the status code, the
                 reason phrase and the body reduced to one bounded line by
                 ``_render_error_body``; or if a 200 body is not JSON,
                 chained to the ValueError.  The token is struck out of every
                 piece of server text in the message.
-            PaperlessTimeoutError: If the deadline passes before the task
-                reaches a terminal status. The message names the task id so
-                the task can be looked up in paperless-ngx directly, and,
-                when the last poll failed with a request error rather than
-                being answered, ends by naming that error and is chained to it
-                -- unless that error's chain quotes the token, when it carries
-                no cause.
+            PaperlessTimeoutError: A ``PaperlessUnconfirmedError``, if the
+                deadline passes before the task reaches a terminal status.
+                The message names the task id so the task can be looked up in
+                paperless-ngx directly, and, when the last poll got a 5xx, a
+                429 or a request error rather than an answer, ends by naming
+                it.  A request error is chained, unless its chain quotes the
+                token, when there is no cause.
 
         """
-        deadline = time.monotonic() + timeout
+        deadline = self._clock() + timeout
         delay = 0.5
-        # RequestError rather than TransportError: DecodingError (a corrupt
-        # compressed body) is a request-level failure that is not a transport
-        # one, and it must neither escape this boundary as a raw httpx2 type nor
-        # fail an upload Paperless already accepted.
-        last_transport_error: httpx2.RequestError | None = None
+        # What went wrong with the latest poll, on one line with the token
+        # struck, and the request error to chain to when it was one.
+        last_error: str | None = None
+        last_cause: BaseException | None = None
 
         while True:
             try:
@@ -1623,67 +1663,94 @@ class PaperlessClient:
                     "/api/tasks/",
                     params={"task_id": task_id},
                 )
+            # RequestError rather than TransportError: DecodingError (a corrupt
+            # compressed body) is a request-level failure that is not a
+            # transport one, and it must neither escape this boundary as a raw
+            # httpx2 type nor fail an upload Paperless already accepted.
             except httpx2.RequestError as exc:
-                last_transport_error = exc
+                last_error = self._reason(exc)
+                last_cause = self._cause(exc)
                 logger.warning(
                     "Polling task %r failed, retrying until the deadline: %s",
                     _loggable_task_id(task_id),
-                    self._reason(exc),
+                    last_error,
                 )
             else:
-                # Paperless answered, so an earlier blip is no longer the story:
-                # a timeout after this names no stale transport error.
-                last_transport_error = None
-                task = self._finished_task(task_id, response)
-                if task is not None:
-                    return task
+                answer = self._finished_task(task_id, response)
+                if isinstance(answer, _PollTransient):
+                    last_error = answer.description
+                    last_cause = None
+                    logger.warning(
+                        "Polling task %r was answered %s; retrying until the deadline",
+                        _loggable_task_id(task_id),
+                        last_error,
+                    )
+                elif answer is not None:
+                    return answer
+                else:
+                    # Paperless answered, so an earlier blip is no longer the
+                    # story: a timeout after this names no stale error.
+                    last_error = None
+                    last_cause = None
 
             # Every path through the loop body reaches this check -- a
             # transport error included -- so the poll cannot outlive its
             # deadline.
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock()
             if remaining <= 0:
                 shown = _loggable_task_id(task_id)
                 logger.warning("Task %r did not finish within %ss", shown, timeout)
                 msg = f"Paperless task {shown} did not finish within {timeout}s"
-                if last_transport_error is None:
+                if last_error is None:
                     raise PaperlessTimeoutError(msg)
-                msg = f"{msg}; last error: {self._reason(last_transport_error)}"
-                raise PaperlessTimeoutError(msg) from self._cause(last_transport_error)
+                msg = f"{msg}; last error: {last_error}"
+                raise PaperlessTimeoutError(msg) from last_cause
 
             # Clamped so the poll never sleeps past its own deadline -- that
             # is what makes a sub-second timeout cost what it says it does
             # rather than the 0.5s first backoff.
-            time.sleep(min(delay, remaining))
-            delay = min(delay * 2, 30.0)
+            self._sleep(min(delay, remaining))
+            delay = min(delay * 2, _MAX_POLL_DELAY_SECONDS)
 
     def _finished_task(
         self, task_id: str, response: httpx2.Response
-    ) -> dict[str, object] | None:
+    ) -> dict[str, object] | _PollTransient | None:
         """
         Read one task poll response.
 
         Args:
-            task_id: The task being polled, for the messages.
+            task_id: The task being polled, for the selection and the
+                messages.
             response: The response to ``GET /api/tasks/``.
 
         Returns:
-            The task dict when it reached SUCCESS; None when it is not
-            visible yet or has not reached a terminal status, so the caller
-            keeps polling.
+            The task dict when it reached SUCCESS; a ``_PollTransient`` for a
+            5xx or a 429, which may clear; None when the task is not visible
+            yet or has not reached a terminal status.  The caller keeps
+            polling on either of the last two.
 
         Raises:
-            PaperlessError: If the response is not a 200, if its body is not
-                JSON, or if the task ended FAILURE or REVOKED.  Every message
-                is one line.
+            PaperlessUnconfirmedError: If the response is a 406 or any other
+                non-200, if its body is not JSON, or if the task ended
+                FAILURE or REVOKED.  Every message is one line.
 
         """
+        shown = _loggable_task_id(task_id)
+        if response.is_server_error or response.status_code == 429:
+            return _PollTransient(
+                f"{_status_text(response)}: {_render_error_body(response, self._token)}"
+            )
+        if response.status_code == 406:
+            # The same fixed text as a refused upload; the 406 body only
+            # restates the refusal.
+            msg = f"Could not confirm Paperless task {shown}: "
+            raise PaperlessUnconfirmedError(msg + self._incompatible_message())
         if response.status_code != 200:
             msg = (
                 f"Paperless task poll failed ({_status_text(response)}): "
                 f"{_render_error_body(response, self._token)}"
             )
-            raise PaperlessError(msg)
+            raise PaperlessUnconfirmedError(msg)
 
         try:
             payload = response.json()
@@ -1692,15 +1759,21 @@ class PaperlessClient:
                 f"Paperless{self._at_url} returned a task response that is "
                 f"not JSON: {self._reason(exc)}"
             )
-            raise PaperlessError(msg) from self._cause(exc)
+            raise PaperlessUnconfirmedError(msg) from self._cause(exc)
 
-        task = _extract_task(payload)
+        task = _extract_task(payload, task_id)
         if task is None:
             return None
         status = _task_status(task)
         if status == "SUCCESS":
-            logger.info("Task %r completed: %s", _loggable_task_id(task_id), status)
+            logger.info("Task %r completed: %s", shown, status)
             return task
+        if status == "REVOKED":
+            msg = (
+                f"paperless-ngx cancelled task {shown} before it finished; "
+                "the document was not filed"
+            )
+            raise PaperlessUnconfirmedError(msg)
         if status in _TERMINAL_STATUSES:
             full_failure = " ".join(
                 _strike(_failure_message(task), self._token).split()
@@ -1710,12 +1783,10 @@ class PaperlessClient:
             # the CLI line.  The duplicate check reads the
             # whole text, so a hint past the cut is not lost.
             failure = _bounded_line(full_failure) or _NO_FAILURE_MESSAGE
-            msg = (
-                f"Paperless task {_loggable_task_id(task_id)} ended {status}: {failure}"
-            )
+            msg = f"Paperless task {shown} ended {status}: {failure}"
             if _is_duplicate_failure(task, full_failure):
                 msg = f"{msg}; {_DUPLICATE_HINT}"
-            raise PaperlessError(msg)
+            raise PaperlessUnconfirmedError(msg)
         return None
 
     def test_connection(
@@ -1795,9 +1866,15 @@ class PaperlessClient:
         logger.warning("Unexpected paperless status %s", response.status_code)
         return ConnectionStatus.SERVER_ERROR
 
-    def get_tags(self) -> list[dict[str, object]]:
+    def get_tags(self, *, timeout: float | None = None) -> list[dict[str, object]]:
         """
         Fetch all tags from paperless-ngx.
+
+        Args:
+            timeout: The per-request budget in seconds, sent on every page
+                request, or None to use the client's own 30 s default.  A
+                check made before a scan starts passes a short one, so a
+                paperless-ngx that is down is reported in seconds.
 
         Returns:
             List of tag dicts with at least 'id' and 'name' keys.
@@ -1815,11 +1892,19 @@ class PaperlessClient:
                 unless the cause's chain quotes the token.
 
         """
-        return self._fetch_collection("/api/tags/", "tags")
+        return self._fetch_collection("/api/tags/", "tags", timeout=timeout)
 
-    def get_correspondents(self) -> list[dict[str, object]]:
+    def get_correspondents(
+        self, *, timeout: float | None = None
+    ) -> list[dict[str, object]]:
         """
         Fetch all correspondents from paperless-ngx.
+
+        Args:
+            timeout: The per-request budget in seconds, sent on every page
+                request, or None to use the client's own 30 s default.  A
+                check made before a scan starts passes a short one, so a
+                paperless-ngx that is down is reported in seconds.
 
         Returns:
             List of correspondent dicts with at least 'id' and 'name' keys.
@@ -1837,9 +1922,13 @@ class PaperlessClient:
                 unless the cause's chain quotes the token.
 
         """
-        return self._fetch_collection("/api/correspondents/", "correspondents")
+        return self._fetch_collection(
+            "/api/correspondents/", "correspondents", timeout=timeout
+        )
 
-    def _fetch_collection(self, path: str, noun: str) -> list[dict[str, object]]:
+    def _fetch_collection(
+        self, path: str, noun: str, *, timeout: float | None = None
+    ) -> list[dict[str, object]]:
         """
         Fetch every page of one metadata collection.
 
@@ -1850,9 +1939,9 @@ class PaperlessClient:
         requested: a server behind a misconfigured proxy builds it
         from the wrong host or scheme, and following it would send the API
         token there.  A redirect is not followed either; it fails the fetch.
-        A bare-list response on page 1 is the whole collection; on a later
-        page it fails the fetch rather than replacing the pages collected.
-        Each page's items must be a list of objects.
+        Every paperless-ngx release this client supports paginates tags and
+        correspondents, so each page must be an object whose ``results`` is
+        a list of objects; a bare list is not a collection.
 
         The client does not take the server's word alone that it is making
         progress.  A proxy that drops the query string, or a server that
@@ -1871,9 +1960,11 @@ class PaperlessClient:
         Args:
             path: The collection endpoint, e.g. ``/api/tags/``.
             noun: What the collection holds, for the message.
+            timeout: The per-request budget in seconds for every page, or
+                None for the client's default.
 
         Returns:
-            The ``results`` of every page in order, or a bare list as is.
+            The ``results`` of every page in order.
 
         Raises:
             ConfigError: ``Could not fetch <noun> from Paperless at <url>:
@@ -1897,14 +1988,9 @@ class PaperlessClient:
         page_limit = _METADATA_MAX_PAGES
         page = 1
         while True:
-            data = self._fetch_page(path, page, prefix)
-            if isinstance(data, list):
-                if page > 1:
-                    msg = f"{prefix}: page {page} was a bare list, which only page 1 may be"
-                    raise PaperlessError(msg)
-                return _metadata_items(data, prefix, page)
+            data = self._fetch_page(path, page, prefix, timeout=timeout)
             if not isinstance(data, dict):
-                msg = f"{prefix}: the response was neither a list nor an object"
+                msg = f"{prefix}: the response was not an object"
                 raise PaperlessError(msg)
             batch = _metadata_items(data.get("results"), prefix, page)
             if not batch:
@@ -1933,7 +2019,9 @@ class PaperlessClient:
             previous = batch
             page += 1
 
-    def _fetch_page(self, path: str, page: int, prefix: str) -> object:
+    def _fetch_page(
+        self, path: str, page: int, prefix: str, *, timeout: float | None = None
+    ) -> object:
         """
         Request one metadata page and return its decoded JSON body.
 
@@ -1941,6 +2029,8 @@ class PaperlessClient:
             path: The collection endpoint, e.g. ``/api/tags/``.
             page: The page number to ask for.
             prefix: The message prefix naming the collection and base URL.
+            timeout: The request's budget in seconds, or None for the
+                client's default.
 
         Returns:
             The decoded body, whatever its shape.
@@ -1961,7 +2051,9 @@ class PaperlessClient:
         """
         try:
             response = self._client.get(
-                path, params={"page": page, "page_size": _METADATA_PAGE_SIZE}
+                path,
+                params={"page": page, "page_size": _METADATA_PAGE_SIZE},
+                timeout=timeout if timeout is not None else httpx2.USE_CLIENT_DEFAULT,
             )
             response.raise_for_status()
         except httpx2.HTTPError as exc:

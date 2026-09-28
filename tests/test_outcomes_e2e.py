@@ -42,8 +42,11 @@ together sleep for well under a second, using only seams that already exist:
   case is the one that needs it.  The two misconfiguration cases keep the
   default budget on a ``FakeClock`` instead, and assert that it never waited.
 * ``paperless_task_timeout`` is 0 for the poll-timeout case, so ``poll_task``'s
-  monotonic deadline has already passed when the first poll comes back without
-  a terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
+  deadline has already passed when the first poll comes back without a
+  terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
+* The outcome cases' task polls run on a ``FakeClock`` through the same
+  ``PaperlessTiming`` seam, so the proxy-blip case's one backoff wait, after
+  its 502, costs no real time.
 * ``operator_wait_timeout_seconds`` is 1 for the flip-timeout case, the smallest value
   config accepts, so the flip wait costs one second.  See
   ``_FLIP_TIMEOUT_BUDGET``.  The two multi-page cases that wait a question
@@ -56,8 +59,8 @@ The sleep primitive itself is **not** patched anywhere here, and no flat
 pause appears in this module -- an acceptance grep enforces both.  Patching it
 in ``saneless.paperless`` would disable the ``min(delay, remaining)`` deadline
 clamp that plan 23-04 added, which is part of what these cases prove; Phase 32
-owns that sweep.  The upload's own waits go through the client's
-``PaperlessTiming`` seam, which exists because a 60 s budget cannot be waited
+owns that sweep.  The upload's and the poll's own waits go through the
+client's ``PaperlessTiming`` seam, which exists because a 60 s budget cannot be waited
 out under pytest's 60 s timeout; where a case needs no retry it simply gets a
 zero budget.
 """
@@ -182,6 +185,7 @@ _FLIP_TIMEOUT_BUDGET = 1
 
 _FAILURE_TASK = "e2e-task-failure"
 _PENDING_TASK = "e2e-task-never-finishes"
+_BLIP_TASK = "e2e-task-after-a-proxy-blip"
 _PAPERLESS_MESSAGE = "Document consumption failed: unsupported PDF producer"
 
 # The mid-batch fault HARD-02 is about, shaped like the SANE backend's own
@@ -344,6 +348,36 @@ def _never_finishing_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     return handler
 
 
+def _proxy_blip_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Accept the upload, answer the first poll 502, then report SUCCESS.
+
+    A reverse proxy answers 502 while paperless-ngx behind it restarts.  The
+    upload was already accepted, so the poll must wait the blip out and file
+    the document, not fail a job paperless-ngx is about to finish.
+
+    Returns:
+        A fresh handler with its own poll counter.
+
+    """
+    polls: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == _DOCUMENTS_PATH:
+            return httpx2.Response(200, json=_BLIP_TASK)
+        if request.url.path == _TASKS_PATH:
+            polled = str(request.url.params.get("task_id", ""))
+            if polled != _BLIP_TASK:
+                return _unexpected(request)
+            polls.append(polled)
+            if len(polls) == 1:
+                return httpx2.Response(502, text="<html>502 Bad Gateway</html>")
+            return httpx2.Response(200, json=_v9_tasks(polled, "SUCCESS"))
+        return _unexpected(request)
+
+    return handler
+
+
 def _refused_connection_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     """
     Refuse the connection for every upload, so the consume directory is the route.
@@ -472,6 +506,7 @@ _CASES = [
         expected_failed_pdfs=1,
         expected_consume_pdfs=0,
         error_contains=(_FAILURE_TASK, "FAILURE", _PAPERLESS_MESSAGE),
+        expected_category=ErrorCategory.UNCONFIRMED_FILING,
     ),
     _Case(
         label="poll-timeout",
@@ -484,6 +519,15 @@ _CASES = [
         task_timeout=_TIMEOUT_BUDGET,
         error_contains=(_PENDING_TASK, "did not finish"),
         expected_category=ErrorCategory.UNCONFIRMED_FILING,
+    ),
+    _Case(
+        label="poll-502-then-success",
+        handler_factory=_proxy_blip_handler,
+        expected_state=JobState.DONE,
+        expected_outcome=ScanOutcome.SUCCESS,
+        expected_pages=(2, 0, 2),
+        expected_failed_pdfs=0,
+        expected_consume_pdfs=0,
     ),
     _Case(
         label="after-send-500",
@@ -802,6 +846,9 @@ class TestFiveOutcomesEndToEnd:
         settings = _build_settings(tmp_path, case)
         consume_dir = tmp_path / "consume"
         store = JobStore(db_path=settings.output.db_path)
+        # The task poll's waits run on a fake clock, so the proxy-blip case's
+        # backoff costs no real time; every other case polls at most once.
+        clock = FakeClock()
         paperless = PaperlessClient(
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
@@ -810,7 +857,7 @@ class TestFiveOutcomesEndToEnd:
             # fallback behaviour is identical at any budget -- spending it is
             # what triggers it.
             transport=httpx2.MockTransport(case.handler_factory()),
-            timing=PaperlessTiming(send_budget=0.0),
+            timing=PaperlessTiming(send_budget=0.0, clock=clock.now, sleep=clock.sleep),
         )
         worker = ScanWorker(
             _build_scanner(case.scan_passes),
