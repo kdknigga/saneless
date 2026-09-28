@@ -1200,6 +1200,22 @@ class _MultiPageDocument:
             None,
         )
 
+    def substituted(self) -> str | None:
+        """
+        Return the source a pass asked for when Auto took it through the feeder.
+
+        Every pass of a document scans from the same profile, so the first
+        accepted pass that carries a substitution speaks for all of them, and
+        the warning built from it is said once however many carried it.
+
+        Returns:
+            The requested source, or None when no accepted pass carries one.
+
+        """
+        return next(
+            (p.substituted for p in self.passes if p.substituted is not None), None
+        )
+
     @property
     def kept(self) -> int:
         """How many pages the document holds: accepted and not skipped."""
@@ -2901,8 +2917,8 @@ class _PipelineRun:
 
         Returns:
             How the run resolved.  Its warning says why the document finished
-            without the operator pressing Finish, beside any delivery or
-            unreadable-sheet warning.
+            without the operator pressing Finish, beside any delivery,
+            unreadable-sheet or source-substitution warning.
 
         Raises:
             AllPagesBlankError: If no page is kept; the guard keeps the
@@ -2931,14 +2947,7 @@ class _PipelineRun:
             if position not in skipped
         ]
         rejected_warning = _rejected_pages_warning(document.unreadable)
-        # Every pass of a document scans from the same profile, so a
-        # substitution is said once however many passes carried it.
-        substitution_warning = _substitution_warning(
-            next(
-                (p.substituted for p in document.passes if p.substituted is not None),
-                None,
-            )
-        )
+        substitution_warning = _substitution_warning(document.substituted())
         pdf_path = self._assemble(kept)
         outcome, warning = self._deliver_document(pdf_path)
         result = ScanResult(
