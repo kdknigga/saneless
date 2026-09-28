@@ -49,7 +49,6 @@ from .pipeline import (
 from .vocabulary import (
     ACTIVE_STATES,
     PASS_WAIT_STATES,
-    RESTART_REASON,
     WAITING_STATES,
     ConfigFileState,
     ErrorCategory,
@@ -62,6 +61,8 @@ from .vocabulary import (
     WorkerHealth,
     classify_error,
     job_state_for,
+    restart_category,
+    restart_error,
 )
 
 if TYPE_CHECKING:
@@ -151,7 +152,8 @@ class _OwedWrite:
         error: The job-row error text, for an ERROR write, or the cancel's
             message, for a CANCELLED write.
         category: The error's category, for an ERROR write.  A CANCELLED
-            write, like a shutdown's ERROR, has none.
+            write has none, and a shutdown's ERROR has one only when the job
+            was uploading (``restart_category``).
 
     """
 
@@ -729,10 +731,11 @@ class ScanWorker:
         # Whether the first successful probe must also fail the rows a crashed
         # process left active, because startup recovery could not.
         self._restart_recovery_pending = False
-        # The error texts startup's workspace recovery composed for the rows
-        # whose pages it kept, by job id, still to be written.  Set before the
+        # The kept-file sentences startup's workspace recovery found for the
+        # rows whose pages it kept, by job id, still to be written; the store
+        # puts each row's restart text before its sentence.  Set before the
         # thread exists and then touched only by the worker thread.
-        self._recovered_texts: dict[str, str] = {}
+        self._recovered_kept: dict[str, str] = {}
         # The device this worker's last auto-detecting job chose, handed to
         # every job's pipeline so a change between jobs is logged.  Touched
         # only by the worker thread, one job at a time.
@@ -748,7 +751,7 @@ class ScanWorker:
         self._thread.start()
         logger.info("ScanWorker started")
 
-    def mark_recovery_pending(self, texts: Mapping[str, str] | None = None) -> None:
+    def mark_recovery_pending(self, kept: Mapping[str, str] | None = None) -> None:
         """
         Start degraded, owing startup's crash recovery to the first good probe.
 
@@ -756,18 +759,19 @@ class ScanWorker:
         raised at startup.  The app still starts, ``/health`` answers a
         truthful 503 and scans are rejected, instead of the service refusing to
         come up over a store that may recover.  The first successful idle probe
-        then writes ``texts`` onto the rows they name, fails the rows the
-        previous process left active with ``RESTART_REASON`` and clears
-        degraded.
+        then fails the rows ``kept`` names, each with its restart text and its
+        sentence, fails the other rows the previous process left active with
+        their restart text alone, and clears degraded.  The store words each
+        row by the state it was left in, exactly as startup would have.
 
         Args:
-            texts: The error text for each row whose orphaned workspace
-                startup recovered, naming where its pages were kept, by job
-                id; written before the blanket ``RESTART_REASON``, so those
-                rows keep it.  None or empty when there is none.
+            kept: The sentence naming where its pages were kept, for each row
+                whose orphaned workspace startup recovered, by job id;
+                written before the rest, so those rows keep it.  None or
+                empty when there is none.
 
         """
-        self._recovered_texts = dict(texts or {})
+        self._recovered_kept = dict(kept or {})
         self._restart_recovery_pending = True
         self._degraded.set()
 
@@ -785,7 +789,7 @@ class ScanWorker:
         path while degraded, sharing the flush of the loop guard's owed
         failures.  If the worker thread is not running (DOWN) no tick comes:
         ``/health`` reports 503 meanwhile, and the next startup's
-        ``fail_active_jobs(RESTART_REASON)`` ends the row.
+        ``fail_active_jobs()`` ends the row.
 
         Args:
             job_id: The refused submit's job row.
@@ -1765,6 +1769,33 @@ class ScanWorker:
                 self._unrecorded_failures[job_id] = owed
             raise
 
+    def _end_by_shutdown(
+        self, job_id: str, exc: ScanInterrupted, last: JobState
+    ) -> None:
+        """
+        Record a job a server stop ended, worded by how far the run had got.
+
+        The text and category follow the last state the run announced: a stop
+        during the upload may have left the document in paperless-ngx, so
+        that row is the amber after-send category, and any earlier stop has
+        none.  The pipeline's note, when it kept pages, names where they went
+        and follows the restart text.
+
+        Args:
+            job_id: The job row to write.
+            exc: The interruption, carrying the pipeline's note, if any.
+            last: The last active state the run announced.
+
+        Raises:
+            Exception: Whatever the store raises, as ``_finish_or_owe`` does.
+
+        """
+        kept = note_text(exc)
+        error = restart_error(last, kept or None)
+        owed = _OwedWrite(JobState.ERROR, error=error, category=restart_category(last))
+        self._finish_or_owe(job_id, owed)
+        logger.info("Job %s ended by shutdown: %r", job_id, error)
+
     def _idle_housekeeping(self) -> None:
         """
         Use an idle tick: retry owed writes (probing while degraded), then prune.
@@ -1865,10 +1896,12 @@ class ScanWorker:
         below is accepted, and its row is new, so it is neither of the rows
         written here.
 
-        Each row gets a text that already exists: the failure the guard tried
-        to write; for a row whose orphaned workspace startup recovered, the
-        text naming where its pages were kept; or ``RESTART_REASON`` for the
-        other rows a failed startup recovery left behind.  Any raise leaves the
+        Each row gets the text it was already owed: the failure the guard
+        tried to write; for a row whose orphaned workspace startup recovered,
+        its restart text followed by the sentence naming where its pages were
+        kept; or its restart text alone for the other rows a failed startup
+        recovery left behind.  The store chooses each restart text, and its
+        category, by the state the row was left in.  Any raise leaves the
         worker degraded to try again next tick; it is not counted again, and
         whatever was written stays written.
         Clearing degraded also ends any owed-write streak, so a returning fault
@@ -1884,11 +1917,11 @@ class ScanWorker:
             # active, so the restart recovery below cannot give them its text.
             self._flush_unrecorded_failures()
             if self._restart_recovery_pending:
-                # The recovered rows' own texts next, for the same reason:
-                # the blanket restart text below would otherwise take them.
-                if self._recovered_texts:
-                    self._job_store.fail_recovered_jobs(self._recovered_texts)
-                    self._recovered_texts = {}
+                # The recovered rows' own sentences next, for the same reason:
+                # the plain restart text below would otherwise take them.
+                if self._recovered_kept:
+                    self._job_store.fail_recovered_jobs(self._recovered_kept)
+                    self._recovered_kept = {}
                 self._job_store.fail_active_jobs()
                 self._restart_recovery_pending = False
         except Exception:
@@ -1997,8 +2030,8 @@ class ScanWorker:
         (see :meth:`_store_progress_state`).  A cancel is recorded as
         CANCELLED, and a server stop -- ``ScanInterrupted``, which is not an
         ``Exception`` and would otherwise end the worker thread -- as ERROR
-        with ``RESTART_REASON`` followed by whatever the pipeline kept;
-        neither is a failure.  The loop's own store
+        with the restart text for the last state the run announced, followed
+        by whatever the pipeline kept; neither is a failure.  The loop's own store
         writes -- SCANNING before the pipeline, and the terminal write of
         either outcome -- are never swallowed, so their failure escapes to
         ``_run`` as a loop-level failure.  A failed terminal write is owed
@@ -2057,9 +2090,14 @@ class ScanWorker:
         # the state we just wrote would blank error/error_category a second
         # time for no change of state.
         persisted_state = JobState.SCANNING
+        # The last active state the run announced, whether or not its write
+        # landed.  A server stop words the row by it: an upload that had begun
+        # may already be in paperless-ngx, even when the UPLOADING write failed
+        # and the row still reads an earlier state.
+        announced_state = JobState.SCANNING
 
         def _status_cb(event: PipelineEvent, _jid: str = job.id) -> None:
-            nonlocal persisted_state
+            nonlocal persisted_state, announced_state
             logger.info("Pipeline event: %s", event.value)
             state = event.job_state
             if state not in ACTIVE_STATES:
@@ -2067,6 +2105,8 @@ class ScanWorker:
                 # run_pipeline has returned and its temporary directory is
                 # gone -- never from in here.
                 return
+            # Before the write, so a failed write cannot hide it.
+            announced_state = state
             # Before the write, and before the check below, so no poll can
             # read the next question's state beside the previous answer.
             _announce_pass_wait(state, pass_coordinator)
@@ -2148,16 +2188,12 @@ class ScanWorker:
             # The server is stopping, and the pipeline has already kept what
             # it had; its note says where.  Caught by name because it is a
             # BaseException: escaping here would end the worker thread with
-            # the row still active.  Not a failure, so no category, no ERROR
-            # line and no traceback, and not a cancel either: nobody chose to
-            # throw the scan away.  Like every ending below, this is the
-            # worker thread's own final write, so the rule against a
-            # shutdown-time write -- about the lifespan writing over a running
-            # thread -- holds.
-            kept = note_text(exc)
-            error = f"{RESTART_REASON}. {kept}" if kept else RESTART_REASON
-            self._finish_or_owe(job.id, _OwedWrite(JobState.ERROR, error=error))
-            logger.info("Job %s ended by shutdown: %r", job.id, error)
+            # the row still active.  Not a failure, so no ERROR line and no
+            # traceback, and not a cancel either: nobody chose to throw the
+            # scan away.  Like every ending below, this is the worker thread's
+            # own final write, so the rule against a shutdown-time write --
+            # about the lifespan writing over a running thread -- holds.
+            self._end_by_shutdown(job.id, exc, announced_state)
             return
         except Exception as exc:
             # No result argument: outcome, warning and all three page counts
