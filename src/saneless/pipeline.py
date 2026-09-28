@@ -2168,12 +2168,12 @@ class _PipelineRun:
         # to no kept front, and every back after it would pair with the front
         # one sheet away. The fronts go out as the document, and
         # _finish_document adds the sentence saying the backs were not scanned.
-        if front_batch.cap_reached is not None:
+        if (front_cap := front_batch.cap_reached) is not None:
             logger.warning(
                 "Pass A stopped at its %d-sheet cap; not asking for a flip, "
                 "because sheet %d is already in the output tray",
-                front_batch.cap_reached.cap,
-                front_batch.cap_reached.sheet_not_kept,
+                front_cap.cap,
+                front_cap.sheet_not_kept,
             )
             return front_batch
 
@@ -3165,8 +3165,9 @@ class _PipelineRun:
         PDF is in sheet order, the reverse of the order pass B produced its
         pages.  Its page N is the back of the ``(fronts)`` PDF's page N only
         when both passes fed every sheet exactly once, which a mismatch says
-        they did not: from the sheet that was skipped, missed or fed twice on,
-        the two halves drift apart, which is why they are not interleaved.
+        they did not: from the sheet that was skipped, missed, fed twice or
+        fed past the backs pass's cap on, the two halves drift apart, which is
+        why they are not interleaved.
 
         The two halves are one document between them, so a failure on either
         keeps both: an assembly failure keeps every page file of both passes,
@@ -3186,7 +3187,8 @@ class _PipelineRun:
 
         Returns:
             SUCCESS when both halves reached the paperless-ngx API, otherwise
-            FALLBACK, always carrying the mismatch warning.
+            FALLBACK, always carrying the mismatch warning, followed by the
+            substitution and pass-cap sentences when those happened.
 
         """
         fronts = mismatch.fronts
