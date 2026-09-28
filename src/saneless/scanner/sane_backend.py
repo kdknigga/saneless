@@ -50,7 +50,6 @@ from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
     ScanError,
-    ScanInterrupted,
     describe,
     describe_text,
 )
@@ -199,6 +198,13 @@ def _listed_devices(reply: ListingReply) -> tuple[DeviceInfo, ...]:
 # replaced, so anything at 300 dpi, where a page typically takes 10-15 s, is
 # bounded exactly as before.
 #
+# The ceiling keeps every page at an hour or less. The parameters are numbers
+# the device reports, over the LAN for a `net` scanner, and nothing else bounds
+# them: a frame claiming 2**31-1 bytes a line would otherwise earn a budget of
+# months, or one too large for `threading.Event.wait` to accept at all. An
+# hour is six times the budget of a legal colour page at 1200 dpi and more
+# than a 2400 dpi A4 colour page needs.
+#
 # The inputs are the parameters the device reports once every option and the
 # scan area are set -- the page it will actually send, not the one asked for.
 # A device that does not know the length in advance, as a feeder may not, is
@@ -210,6 +216,7 @@ def _listed_devices(reply: ListingReply) -> tuple[DeviceInfo, ...]:
 _REFERENCE_PAGE_BYTES: Final = 4961 * 7016 * 3
 _REFERENCE_PAGE_SECONDS: Final = 60.0
 _PAGE_TIMEOUT_FLOOR_SECONDS: Final = 120.0
+_PAGE_TIMEOUT_CEILING_SECONDS: Final = 3600.0
 _UNKNOWN_LENGTH_MM: Final = PAPER_SIZES_MM["legal"][1]
 
 # The frame formats of a three-pass colour scan, which sends a page as three
@@ -2214,7 +2221,9 @@ def _acquire_with_timeout(
 
     A ``KeyboardInterrupt`` arriving while this waits takes the identical path
     and is then re-raised, so Ctrl-C during a read leaves the device in the
-    same state a timeout does.  A second one arriving during the grace ends
+    same state a timeout does.  So does any other exception once the reader
+    has started, since no exception type may leave a running read behind a
+    handle the device context is about to close.  A second one arriving during the grace ends
     the wait early and replaces the first, but the wedge written before the
     cancel still stands, so the handle is not closed under the read.
 
@@ -2280,14 +2289,15 @@ def _acquire_with_timeout(
         reader.start()
         started = True
         finished = done.wait(budget.timeout)
-    except KeyboardInterrupt, ScanInterrupted:
+    except BaseException:
         # Ctrl-C, or a SIGTERM/SIGHUP (or a server stop) raised as
-        # ScanInterrupted, landed while this thread waited on the read.  A
-        # signal interruption must leave the device settled exactly as Ctrl-C
-        # does: cancel the read and wait for it, so the handle is never closed
-        # under a read that is still running.  With no reader started there
-        # is nothing to settle.  The exception is re-raised unchanged either
-        # way, so the caller still tells a cancel from an interruption.
+        # ScanInterrupted, landed while this thread waited on the read -- or
+        # the wait itself failed.  Whatever it was, a reader that has started
+        # must be settled exactly as on a timeout: cancel the read and wait
+        # for it, so the handle is never closed under a read that is still
+        # running.  With no reader started there is nothing to settle.  The
+        # exception is re-raised unchanged either way, so the caller still
+        # tells a cancel from an interruption.
         if started or reader.is_alive():
             _settle_or_wedge(dev, done, budget.grace, page_label)
         raise
@@ -3151,8 +3161,8 @@ def _page_budget_seconds(parameters: _ScanParameters, resolution: int) -> float:
     Return how long one page may take, from the page the device will send.
 
     Twice the page's share, by bytes, of the minute a reference page is
-    estimated to take, and never less than the floor; see the constants for
-    the reasoning. ``bytes_per_line`` already accounts for the mode and the
+    estimated to take, never less than the floor and never more than the
+    ceiling; see the constants for the reasoning. ``bytes_per_line`` already accounts for the mode and the
     bit depth. A three-pass colour scan sends three frames of that size, so it
     counts three. A negative line length from a confused device counts as no
     data, so the floor applies.
@@ -3173,7 +3183,10 @@ def _page_budget_seconds(parameters: _ScanParameters, resolution: int) -> float:
     frames = 3 if parameters.frame_format in _THREE_PASS_FORMATS else 1
     page_bytes = max(parameters.bytes_per_line, 0) * lines * frames
     estimate = _REFERENCE_PAGE_SECONDS * page_bytes / _REFERENCE_PAGE_BYTES
-    return max(_PAGE_TIMEOUT_FLOOR_SECONDS, 2.0 * estimate)
+    return min(
+        _PAGE_TIMEOUT_CEILING_SECONDS,
+        max(_PAGE_TIMEOUT_FLOOR_SECONDS, 2.0 * estimate),
+    )
 
 
 def _describe_page(parameters: _ScanParameters, resolution: int) -> str:

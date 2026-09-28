@@ -3658,6 +3658,33 @@ class TestSaneBackendCancelSequence:
             assert fake_device.close_calls == 0
 
         assert "did not respond" not in str(raised.value)
+
+    def test_any_error_from_the_wait_still_settles_a_started_read(
+        self, sane_backend: SaneBackend, fake_device: FakeSaneDev
+    ) -> None:
+        """
+        An exception that is not an interrupt still cancels and waits out a read.
+
+        A wait too long for ``threading.Event.wait`` raises ``OverflowError``
+        once the reader is running. Left unsettled, the device context would
+        cancel and close the handle while the read was still inside it.
+        """
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            with pytest.raises(OverflowError):
+                sane_backend_mod._acquire_with_timeout(
+                    dev,
+                    fake_device.snap,
+                    sane_backend_mod._page_label(0),
+                    sane_backend_mod._PageBudget(timeout=1e300),
+                )
+
+            assert fake_device.cancel_calls == 1
+            assert fake_device.read_is_blocked() is False
+            assert sane_backend_mod._WEDGE.stuck is False
+
+        assert fake_device.close_while_blocked is False
         assert fake_device.close_calls == 1
         assert fake_device.close_while_cancelling is False
 
@@ -6217,6 +6244,36 @@ class TestPageBudget:
         assert budget == pytest.approx(
             sane_backend_mod._page_budget_seconds(legal, 1200), rel=0.001
         )
+
+    @pytest.mark.parametrize(
+        ("parameters", "resolution"),
+        [
+            pytest.param(
+                _parameters("color", 1, -1, 2**31 - 1),
+                1200,
+                id="huge-line-of-unknown-length",
+            ),
+            pytest.param(
+                _parameters("red", 1, 2**31 - 1, 2**31 - 1),
+                1200,
+                id="huge-three-pass-frame",
+            ),
+        ],
+    )
+    def test_a_nonsense_frame_is_capped_at_an_hour(
+        self, parameters: sane_backend_mod._ScanParameters, resolution: int
+    ) -> None:
+        """
+        The device's numbers cannot make one page's limit unbounded.
+
+        Uncapped, the first budget is months and the second is too large for
+        ``threading.Event.wait`` to accept at all.
+        """
+        budget = sane_backend_mod._page_budget_seconds(parameters, resolution)
+
+        assert budget == 3600.0
+        assert budget == sane_backend_mod._PAGE_TIMEOUT_CEILING_SECONDS
+        assert budget < threading.TIMEOUT_MAX
 
     def test_the_floor_is_two_minutes_with_no_setting(self) -> None:
         """The floor is the old fixed limit, and a default budget uses it."""

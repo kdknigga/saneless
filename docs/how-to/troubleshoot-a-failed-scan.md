@@ -90,8 +90,9 @@ What the common cases mean:
     picked up. saneless never deletes anything from `failed/`; draining it is your job (see
     [Docker volumes](../reference/docker.md#volumes)).
 - **A page took too long.** Each page has a time limit, on the feeder and on the flatbed alike.
-  The limit scales with the resolution and page size the scanner agreed to, and is never below
-  120 seconds: anything at 300 dpi gets 120 seconds, and an A4 colour page at 1200 dpi about 480.
+  The limit scales with the resolution and page size the scanner agreed to, is never below
+  120 seconds and never above an hour: anything at 300 dpi gets 120 seconds, and an A4 colour page
+  at 1200 dpi about 480.
   The line states the limit and the page it was worked out for, for example:
 
     ```
