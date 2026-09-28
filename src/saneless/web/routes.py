@@ -961,8 +961,12 @@ def _pass_wait_context(
     rule as the flip prompt: the owner, or anyone when the job recorded no
     owner.  Nobody else gets a prompt number, a button or the scanner's error
     text, because none of it is put in their context at all.  The error text
-    is scrubbed of host paths and addresses before it goes into the copy, so
-    even the owner never sees one.
+    is a job detail rather than part of the question, so it follows the rule
+    the rest of the job view uses (``owns_detail``) rather than the answering
+    rule: a job that recorded no owner may be answered by anyone, but its
+    error text is nobody's, just as ``build_job_view`` hides that job's stored
+    error.  It is scrubbed of host paths and addresses before it goes into the
+    copy, so even the owner never sees one.
 
     Args:
         worker: The scan worker, for the open question and its answer.
@@ -984,9 +988,15 @@ def _pass_wait_context(
             answer = worker.pass_answer(job.id)
         if answer is None and is_owner:
             prompt = worker.pass_prompt(job.id)
-    if prompt is not None:
-        error = scrub_for_owner(prompt.error, facts.settings) if prompt.error else None
-        copy = pass_prompt_copy(prompt, error=error)
+    if prompt is not None and job is not None:
+        error = (
+            scrub_for_owner(prompt.error, facts.settings)
+            if prompt.error and owns_detail(facts.owner_token, job.owner_token)
+            else None
+        )
+        # Replaced on the prompt itself rather than passed beside it: given no
+        # error, the copy falls back to the prompt's own, unscrubbed text.
+        copy = pass_prompt_copy(replace(prompt, error=error))
     return {"pass_answer": answer, "pass_prompt": prompt, "pass_copy": copy}
 
 

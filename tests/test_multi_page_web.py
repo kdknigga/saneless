@@ -543,29 +543,37 @@ class _Stager:
         self._askers: list[_Asker] = []
         self._coordinators: list[WorkerPassCoordinator] = []
 
-    def job(self, state: JobState) -> str:
+    def job(self, state: JobState, *, owner: str | None = _OWNER) -> str:
         """
-        Create a row owned by ``_OWNER`` in ``state``, as the worker's current job.
+        Create a row owned by ``owner`` in ``state``, as the worker's current job.
+
+        Args:
+            state: The row's state.
+            owner: The owner token the row records; None for an unowned job.
 
         Returns:
             The job's id.
 
         """
         store = self._served.job_store
-        job = store.create_job(profile=FLATBED, title="Multi-page", owner_token=_OWNER)
+        job = store.create_job(profile=FLATBED, title="Multi-page", owner_token=owner)
         store.update_state(job.id, state)
         self._served.app.state.worker._current_job_id = job.id
         return job.id
 
-    def prompt(self, prompt: PassPrompt) -> _Waiting:
+    def prompt(self, prompt: PassPrompt, *, owner: str | None = _OWNER) -> _Waiting:
         """
         Stage a job waiting on ``prompt``, with the prompt published.
+
+        Args:
+            prompt: The open question.
+            owner: The owner token the row records; None for an unowned job.
 
         Returns:
             The staged job, its prompt, its coordinator and the asking thread.
 
         """
-        job_id = self.job(pass_wait_state(prompt.wait))
+        job_id = self.job(pass_wait_state(prompt.wait), owner=owner)
         coordinator = WorkerPassCoordinator(job_id, stopping=threading.Event())
         self._coordinators.append(coordinator)
         self._served.app.state.worker._pass_coordinator = coordinator
@@ -830,6 +838,28 @@ class TestThePromptTheOwnerSees:
 
 class TestWhatEveryoneElseSees:
     """Another browser sees that the job waits, and nothing it could answer."""
+
+    def test_an_unowned_job_is_answerable_but_its_error_text_is_nobodys(
+        self, served: _Served, stager: _Stager
+    ) -> None:
+        """
+        Anyone may answer a job that recorded no owner, but not read its detail.
+
+        Answering follows the answering rule; the scanner's error text is the
+        job's detail, and follows the rule the rest of the job view uses.
+        """
+        stager.prompt(_retry(_DEVICE_ERROR), owner=None)
+
+        area = _status_area(_status(served))
+
+        assert [_button_id(attrs) for attrs, _ in _buttons(area)] == [
+            "mp-retry",
+            "mp-finish",
+            "mp-abort",
+        ]
+        assert "The scanner reported" not in area
+        assert "/dev/bus/usb" not in area
+        assert "device I/O" not in area
 
     @pytest.mark.parametrize("wait", list(PassWait))
     @pytest.mark.parametrize("presented", [_STRANGER, None], ids=["stranger", "none"])
