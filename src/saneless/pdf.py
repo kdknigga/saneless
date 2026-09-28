@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 import img2pdf
 import pikepdf
 
-from saneless.exceptions import PdfError, describe
+from saneless.exceptions import DiskSpaceError, PdfError, describe, is_out_of_space
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -282,8 +282,8 @@ def assemble_pdf(
     argv unique and in document order by construction, with nothing sorted and
     nothing globbed.
 
-    This function is a module boundary that raises only ``PdfError``, and the
-    caught type is ``Exception``, **deliberately**. img2pdf raises seven
+    This function is a module boundary that raises only ``PdfError`` and
+    ``DiskSpaceError``, and the caught type is ``Exception``, **deliberately**. img2pdf raises seven
     unrelated error classes -- each a direct ``Exception`` subclass with no
     shared base -- plus bare ``Exception``, ``TypeError`` and ``ValueError``;
     Pillow raises ``OSError`` and ``SystemError`` while a page is read; and
@@ -295,6 +295,11 @@ def assemble_pdf(
     reason: its errors are ordinary ``Exception`` subclasses and this boundary
     already covered them, so every one of them still leaves this function
     as a ``PdfError``.
+    The one exception is a full disk: a failure whose chain holds an
+    ``OSError`` with ``ENOSPC`` or ``EDQUOT`` -- raised directly, as img2pdf
+    and Pillow do, or under a library's own type -- leaves as a
+    ``DiskSpaceError`` with the same message, because nothing is wrong with
+    the pages or the writer and the fix is to free space.
     Nothing is masked: the original is always chained on ``__cause__`` and its
     text kept in the message. ``KeyboardInterrupt`` and ``SystemExit`` derive
     from ``BaseException`` and pass through untouched.
@@ -314,9 +319,13 @@ def assemble_pdf(
         Path to the generated PDF file.
 
     Raises:
-        PdfError: When ``records`` is empty, or when anything goes wrong while
-            the PDF is being assembled or written. The message names the page
-            count, the target PDF path and the original failure's text.
+        DiskSpaceError: When assembling or writing the PDF runs out of space
+            or quota. The message names the page count, the target PDF path
+            and the original failure's text.
+        PdfError: When ``records`` is empty, or when anything else goes wrong
+            while the PDF is being assembled or written. The message names
+            the page count, the target PDF path and the original failure's
+            text.
 
     """
     if not records:
@@ -379,15 +388,17 @@ def assemble_pdf(
                 )
 
         logger.info("Assembled %d page(s) into %s", len(records), pdf_path)
-    except PdfError:
-        # Already the boundary's own type: wrapping it again would only
-        # repeat the message.
+    except PdfError, DiskSpaceError:
+        # Already one of the boundary's own types: wrapping it again would
+        # only repeat the message, or report a full disk as a PDF fault.
         raise
     except Exception as exc:
         msg = (
             f"Could not assemble {len(records)} page(s) into {pdf_path}: "
             f"{describe(exc)}"
         )
+        if is_out_of_space(exc):
+            raise DiskSpaceError(msg) from exc
         raise PdfError(msg) from exc
 
     return pdf_path

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from saneless.atomic_write import refused_mode_change
-from saneless.exceptions import PdfError, describe
+from saneless.exceptions import DiskSpaceError, PdfError, describe
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import make_private_dir
 
@@ -408,9 +408,10 @@ def ensure_room_to_assemble(
         reserve_mb: The ``min_free_space_mb`` reserve to keep free as well.
 
     Raises:
-        PdfError: If the free space is under twice the spooled pages' bytes
-            plus the reserve, naming the MB needed, the MB free and the page
-            count; or if a page or the directory cannot be measured.
+        DiskSpaceError: If the free space is under twice the spooled pages'
+            bytes plus the reserve, naming the MB needed, the MB free and the
+            page count.  A full disk, not a PDF the writer refused.
+        PdfError: If a page or the directory cannot be measured.
 
     """
     try:
@@ -431,7 +432,7 @@ def ensure_room_to_assemble(
         f"{_mb_rounded_up(spooled)} MB of spooled pages plus the {reserve_mb} MB "
         f"min_free_space_mb reserve), {free // _BYTES_PER_MB} MB free"
     )
-    raise PdfError(msg)
+    raise DiskSpaceError(msg)
 
 
 class RunStage(StrEnum):
@@ -656,7 +657,9 @@ def _build_pdf(
         The assembled PDF, still inside the workspace.
 
     Raises:
-        PdfError: If the disk rule refuses or the assembly fails.
+        DiskSpaceError: If the disk rule refuses, or the assembly runs out
+            of space.
+        PdfError: If the assembly fails for any other reason.
 
     """
     ensure_room_to_assemble(records, artefacts.workspace, artefacts.reserve_mb)
@@ -697,7 +700,9 @@ def build_pass_pdf(
         The assembled PDF, still inside the workspace.
 
     Raises:
-        PdfError: If the disk rule refuses or the assembly fails.
+        DiskSpaceError: If the disk rule refuses, or the assembly runs out
+            of space.
+        PdfError: If the assembly fails for any other reason.
 
     """
     ordered = list(reversed(records)) if suffix == BACKS_SUFFIX else list(records)

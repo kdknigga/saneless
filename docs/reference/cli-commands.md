@@ -60,7 +60,7 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME] [--multi-page
 | 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt or a multi-page question) |
 | 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `--multi-page` without an interactive terminal or with a manual duplex profile, an unset or placeholder paperless-ngx API token, no scanner found, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
 | 3 | Paperless-ngx upload error (unreachable after retries, or upload rejected) |
-| 4 | PDF assembly error (disk full, unwritable output directory) |
+| 4 | PDF assembly error: the scanned pages could not be written as a PDF (a full disk is exit 10) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 6 | Saved to the consume folder, not uploaded: the document is there but its title, tags and correspondent were not applied; stdout reads `Saved to folder: <title>` |
 | 7 | Uploaded with a warning (a sheet the scanner skipped, manual-duplex front and back counts that differed, uploaded as two documents, a scan that reached its per-scan sheet cap, a flatbed source the scanner's Auto source scanned through the feeder, or a `--multi-page` document finished because a question timed out or the document reached the page limit); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |

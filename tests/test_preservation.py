@@ -15,7 +15,7 @@ import pikepdf
 import pytest
 
 import saneless.preservation as preservation_module
-from saneless.exceptions import PdfError, ScanInterrupted
+from saneless.exceptions import DiskSpaceError, PdfError, ScanInterrupted
 from saneless.preservation import (
     BACKS_SUFFIX,
     FAILED_DIR_WARN_THRESHOLD,
@@ -30,6 +30,7 @@ from saneless.preservation import (
     warn_if_failed_dir_growing,
 )
 from saneless.spool import SpooledPageSink
+from saneless.vocabulary import ErrorCategory, classify_error
 from tests.golden_support import distinct_page, embedded_streams, png_idat
 
 if TYPE_CHECKING:
@@ -856,18 +857,25 @@ class TestTheTwiceTheSpoolRule:
         spooled = sum(record.path.stat().st_size for record in records)
         return 2 * spooled + reserve_mb * _MIB
 
-    def test_one_byte_short_is_refused_with_the_numbers(
+    def test_one_byte_short_is_a_disk_space_refusal_with_the_numbers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The refusal names the MB needed, the MB free and the page count."""
+        """
+        The refusal is a full disk, naming the MB needed, free and the pages.
+
+        Not a ``PdfError``: nothing is wrong with the pages or the PDF writer,
+        so it must not be reported as a PDF that could not be written.
+        """
         records = _spool(tmp_path / "spool", "a", 3)
         need = self._need(records, 10)
         monkeypatch.setattr(preservation_module, "_free_bytes", lambda _d: need - 1)
 
-        with pytest.raises(PdfError) as excinfo:
+        with pytest.raises(DiskSpaceError) as excinfo:
             ensure_room_to_assemble(records, tmp_path, reserve_mb=10)
 
+        assert classify_error(excinfo.value) is ErrorCategory.DISK_SPACE
         message = str(excinfo.value)
+        assert message.startswith("Not enough free disk space to assemble 3 page(s)")
         assert f"{math.ceil(need / _MIB)} MB needed" in message
         assert f"{(need - 1) // _MIB} MB free" in message
         assert "3 page(s)" in message
@@ -891,8 +899,10 @@ class TestTheTwiceTheSpoolRule:
         records = _spool(tmp_path / "spool", "a", 2)
         records[1].path.unlink()
 
-        with pytest.raises(PdfError, match=r"a-0002\.png"):
+        with pytest.raises(PdfError, match=r"a-0002\.png") as excinfo:
             ensure_room_to_assemble(records, tmp_path, reserve_mb=0)
+
+        assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
 
     def test_preservation_refused_by_the_rule_keeps_the_page_files(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

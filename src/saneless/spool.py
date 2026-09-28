@@ -43,7 +43,14 @@ import shutil
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
-from .exceptions import ScanError, ScanInterrupted, SpoolError, describe
+from .exceptions import (
+    DiskSpaceError,
+    ScanError,
+    ScanInterrupted,
+    SpoolError,
+    describe,
+    is_out_of_space,
+)
 from .pages import generate_thumbnail, measure_ink
 from .scanner.base import PageRecord, PageSink
 
@@ -232,8 +239,8 @@ class SpooledPageSink(PageSink):
         interruption go on.  The signal handler has ignored both signals by
         then, so nothing interrupts the second attempt, and the page keeps the
         number the first attempt gave it.  A second attempt that fails on its
-        own account -- a refused mode, a full disk -- raises that ``ScanError``
-        as the first attempt would have.  What this cannot cover is a signal
+        own account -- a refused mode, a full disk -- raises that error as the
+        first attempt would have.  What this cannot cover is a signal
         that lands before this method starts: in the moments between the
         device handing the page back and the backend calling ``add`` -- its
         integrity check and the crop to paper size -- the page is not yet the
@@ -264,10 +271,13 @@ class SpooledPageSink(PageSink):
         Raises:
             ScanError: If the page's mode is one the spool refuses: the
                 scanner delivered a page saneless cannot store.
-            SpoolError: If the page plus the assembly reserve would not fit,
-                if free space could not be measured, or if writing it failed.
-                A ``ScanError`` too, so a caller catching that still catches
-                it.  No raw OSError escapes this method.
+            DiskSpaceError: If the page plus the assembly reserve would not
+                fit, or if writing it ran out of space or quota.  Not a
+                ``ScanError``, so no scanner handler can claim a full disk.
+            SpoolError: If free space could not be measured, or if writing it
+                failed for any other reason.  A ``ScanError`` too, so a caller
+                catching that still catches it.  No raw OSError escapes this
+                method.
 
         """
         # The record is appended inside the try, with no call between the
@@ -336,6 +346,7 @@ class SpooledPageSink(PageSink):
 
         Raises:
             ScanError: As ``add`` documents.
+            DiskSpaceError: As ``add`` documents.
             SpoolError: As ``add`` documents.
 
         """
@@ -375,8 +386,9 @@ class SpooledPageSink(PageSink):
             png_path: Where it would have been written, for the message.
 
         Raises:
-            SpoolError: If free space is below the page plus the reserve, or
-                if it could not be measured at all.  ``add``'s "no raw OSError
+            DiskSpaceError: If free space is below the page plus the reserve.
+            SpoolError: If free space could not be measured at all: that says
+                nothing about how much there is.  ``add``'s "no raw OSError
                 escapes this method" promise covers the measurement as
                 well as the write: a spool directory that has been removed, or
                 whose mount went away, raises ``FileNotFoundError`` here, and
@@ -411,7 +423,7 @@ class SpooledPageSink(PageSink):
                 f"{free_mb} MB free in {png_path}, {required_mb} MB required "
                 "(configure min_free_space_mb to adjust)"
             )
-            raise SpoolError(msg)
+            raise DiskSpaceError(msg)
 
     def _write(
         self, image: Image.Image, sequence: int, png_path: Path, dpi: int
@@ -432,8 +444,11 @@ class SpooledPageSink(PageSink):
             dpi: The resolution written into the PNG's pHYs chunk.
 
         Raises:
-            SpoolError: If the write or the rename failed, chained from the
-                original OSError.
+            DiskSpaceError: If the write or the rename ran out of space or
+                quota (``ENOSPC`` or ``EDQUOT``), chained from the original
+                OSError.
+            SpoolError: If the write or the rename failed for any other
+                reason, chained from the original OSError.
 
         """
         part_path = png_path.with_name(f"{png_path.name}.part")
@@ -451,4 +466,6 @@ class SpooledPageSink(PageSink):
             with contextlib.suppress(OSError):
                 part_path.unlink(missing_ok=True)
             msg = f"Could not write page {sequence} to {png_path}: {describe(exc)}"
+            if is_out_of_space(exc):
+                raise DiskSpaceError(msg) from exc
             raise SpoolError(msg) from exc

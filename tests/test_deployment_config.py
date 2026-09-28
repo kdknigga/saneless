@@ -866,6 +866,27 @@ def test_scripting_exit_9_row_says_never_to_rescan() -> None:
     )
 
 
+@pytest.mark.parametrize("path", [CLI_REFERENCE, CLI_SCRIPTING], ids=lambda p: p.name)
+def test_exit_4_rows_do_not_claim_a_full_disk(path: Path) -> None:
+    """
+    A full disk is exit 10, so no exit-4 row may still say it is exit 4.
+
+    Exit 4 means only that the scanned pages could not be written as a PDF.
+    A row may point a script at exit 10, and that pointer is the one mention
+    of the disk it may make.
+    """
+    text, name = _read(path)
+    rows = [line for line in text.splitlines() if line.startswith("| 4 |")]
+    assert rows, f"{name}: no exit-4 row found"
+    for row in rows:
+        rest = row.lower().replace("a full disk is exit 10", "")
+        assert "disk" not in rest, f"{name}: an exit-4 row names the disk: {row}"
+        assert "written as a pdf" in row.lower(), (
+            f"{name}: an exit-4 row does not say the images could not be written "
+            f"as a PDF: {row}"
+        )
+
+
 def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
     """
     The troubleshooting how-to exists, is navigable, and covers every code (D-13).

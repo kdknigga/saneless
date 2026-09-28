@@ -17,6 +17,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, NoReturn
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,7 @@ from saneless.config import ProfileConfig
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
+    DiskSpaceError,
     FeederEmptyError,
     PaperlessError,
     PaperlessTimeoutError,
@@ -39,7 +41,9 @@ from saneless.exceptions import (
     ScanCancelledError,
     ScanError,
     ScanInterrupted,
+    SpoolError,
     failure_text,
+    is_out_of_space,
 )
 from saneless.pages import BlankFilterResult
 from saneless.paperless import (
@@ -66,6 +70,7 @@ from saneless.pipeline import (
     _note_pass_count,
     _open_workspace,
     _resolve_device,
+    _returns_to_prompt,
     run_pipeline,
 )
 from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
@@ -74,6 +79,7 @@ from saneless.scanner.sane_backend import SaneBackend
 from saneless.spool import SpooledPageSink
 from saneless.vocabulary import (
     ErrorCategory,
+    ExitCode,
     FlipOutcome,
     JobState,
     ScanOutcome,
@@ -81,6 +87,7 @@ from saneless.vocabulary import (
     backs_pass_cap_note,
     backs_pass_cap_warning,
     classify_error,
+    exit_code_for,
     pass_cap_note,
     pass_cap_warning,
     substituted_source_warning,
@@ -2827,10 +2834,19 @@ class TestDiskSpaceCheck:
         """No exception when free space exceeds minimum."""
         _check_disk_space(tmp_path, 1)
 
-    def test_disk_space_check_fails_when_insufficient(self, tmp_path: Path) -> None:
-        """Raises ScanError when free space below threshold."""
-        with pytest.raises(ScanError, match="Insufficient disk space"):
+    def test_disk_space_check_fails_as_disk_space_when_insufficient(
+        self, tmp_path: Path
+    ) -> None:
+        """Too little free space is a full disk: DISK_SPACE, never the scanner."""
+        with pytest.raises(DiskSpaceError) as exc_info:
             _check_disk_space(tmp_path, 999_999_999)
+
+        error = exc_info.value
+        assert not isinstance(error, ScanError)
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert str(error).startswith("Insufficient disk space: ")
+        assert str(tmp_path) in str(error)
+        assert "999999999 MB required" in str(error)
 
     @pytest.mark.parametrize("failing_call", ["mkdir", "disk_usage", "JobWorkspace"])
     def test_workspace_filesystem_failure_is_a_config_error(
@@ -2844,15 +2860,16 @@ class TestDiskSpaceCheck:
         """
         IN-07: a tmp_dir that cannot be used is a setup error, not a bug.
 
-        Each of the three start-up steps can raise a raw OSError -- a full
-        disk, or tmp_dir removed since start-up.  Untranslated, it classified
-        UNKNOWN and the CLI called it a saneless bug (exit 5), while
-        ``validate_settings_dirs`` reports the same condition as a ConfigError
-        at start-up.  Nothing is scanned.
+        Each of the three start-up steps can raise a raw OSError -- a
+        permission refused, or tmp_dir removed since start-up.  Untranslated,
+        it classified UNKNOWN and the CLI called it a saneless bug (exit 5),
+        while ``validate_settings_dirs`` reports the same condition as a
+        ConfigError at start-up.  Nothing is scanned.  A full disk is the one
+        OSError that is not a setup error; the test after this one covers it.
         """
         tmp_dir = tmp_path / "work"
         default_settings.output.tmp_dir = tmp_dir
-        failure = OSError(errno.ENOSPC, "No space left on device")
+        failure = OSError(errno.EACCES, "Permission denied")
         if failing_call == "mkdir":
             (tmp_path / "blocker").write_text("")
             tmp_dir = tmp_path / "blocker" / "work"
@@ -2894,6 +2911,57 @@ class TestDiskSpaceCheck:
                 f"Could not prepare the working directory {tmp_dir}: "
             )
         assert isinstance(exc_info.value.__cause__, OSError)
+        scanner.scan_pages.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"]
+    )
+    @pytest.mark.parametrize("failing_call", ["mkdir", "JobWorkspace"])
+    def test_workspace_out_of_space_is_a_disk_space_error(
+        self,
+        failing_call: str,
+        code: int,
+        tmp_path: Path,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A full disk while preparing tmp_dir is disk space, not configuration.
+
+        Both the creation of a missing tmp_dir and the job workspace inside
+        it write to the disk, and either can find it full or the quota used
+        up.  That is not something the settings got wrong, so it must not be
+        reported as one.  Nothing is scanned.
+        """
+        tmp_dir = tmp_path / "work"
+        default_settings.output.tmp_dir = tmp_dir
+        failure = OSError(code, os.strerror(code))
+
+        def failing(*_args: object, **_kwargs: object) -> NoReturn:
+            raise failure
+
+        if failing_call == "mkdir":
+            monkeypatch.setattr("saneless.private_dirs.make_private_dir", failing)
+        else:
+            monkeypatch.setattr("saneless.workspace.tempfile.mkdtemp", failing)
+        scanner = MagicMock(spec=ScannerBackend)
+
+        with pytest.raises(DiskSpaceError) as exc_info:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="No room"),
+            )
+
+        error = exc_info.value
+        assert failure_text(error).startswith(
+            f"Could not prepare the working directory {tmp_dir}: "
+        )
+        assert os.strerror(code) in failure_text(error)
+        assert is_out_of_space(error)
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert exit_code_for(classify_error(error)) is ExitCode.DISK_SPACE
         scanner.scan_pages.assert_not_called()
 
     def test_open_workspace_creates_a_missing_tmp_dir_private(
@@ -2942,6 +3010,81 @@ class TestDiskSpaceCheck:
         assert not message.startswith("Could not prepare the working directory")
         if shape == "symlink":
             assert list((tmp_path / "elsewhere").iterdir()) == []
+
+
+class TestFullDiskIsNotTheScanner:
+    """A full disk anywhere in acquisition is reported as disk space."""
+
+    def test_a_full_disk_is_never_returned_to_the_prompt_disk_space(self) -> None:
+        """
+        A multi-page run does not offer to try a pass again on a full disk.
+
+        The same pass would fail the same way at once.  A jam is the contrast:
+        the operator can clear it, so it is worth asking about.
+        """
+        assert not _returns_to_prompt(DiskSpaceError("Insufficient disk space"))
+        assert not _returns_to_prompt(SpoolError("Could not write page 1"))
+        assert _returns_to_prompt(ScanError("Paper jam"))
+
+    def test_a_spool_that_fills_on_page_2_is_disk_space_through_the_backend(
+        self,
+        default_settings: Settings,
+        mock_paperless: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A spool that runs out of room mid-feed reaches the caller as disk space.
+
+        Driven through the real ``SaneBackend`` over the shared fake, because
+        the question is whether the backend's acquisition ladder, which turns
+        every non-saneless failure into "Scanner error on page N", can claim
+        the sink's refusal.  The spool reports plenty of room for page 1 and
+        none for page 2; everything else measures the real disk.  The run
+        guard keeps page 1.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        profile = default_settings.profiles["default"]
+        profile.source = "Automatic Document Feeder"
+        profile.mode = "Color"
+
+        dev = FakeSaneDev()
+        dev.report_sources(["Flatbed", "Automatic Document Feeder"])
+        dev.load_feeder([_make_content_image(c) for c in ["red", "green", "blue"]])
+        monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+
+        real_disk_usage = shutil.disk_usage
+        spool_measurements: list[Path] = []
+        roomy_pages = 1
+
+        def filling_spool(path: str | os.PathLike[str]) -> object:
+            """Report no room in the spool from its second page on."""
+            if Path(path).name == SPOOL_DIR_NAME:
+                spool_measurements.append(Path(path))
+                if len(spool_measurements) > roomy_pages:
+                    return SimpleNamespace(total=0, used=0, free=0)
+            return real_disk_usage(path)
+
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", filling_spool)
+
+        with pytest.raises(DiskSpaceError) as exc_info:
+            run_pipeline(
+                scanner=SaneBackend(),
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Full disk"),
+            )
+
+        error = exc_info.value
+        message = failure_text(error)
+        assert "Scanner error" not in message
+        assert message.startswith("Insufficient disk space for page 2: ")
+        assert classify_error(error) is ErrorCategory.DISK_SPACE
+        assert exit_code_for(classify_error(error)) is ExitCode.DISK_SPACE
+        assert len(spool_measurements) == roomy_pages + 1
+        mock_paperless.upload_document.assert_not_called()
+        (kept,) = failed_dir.glob("*.pdf")
+        assert kept.stat().st_size > 0
 
 
 class TestPipelineEventEnum:
@@ -5007,7 +5150,7 @@ class TestAssemblyFailureKeepsThePageFiles:
 
         with (
             patch("saneless.pipeline.assemble_pdf", assembling),
-            pytest.raises(PdfError) as excinfo,
+            pytest.raises(DiskSpaceError) as excinfo,
         ):
             run_pipeline(
                 scanner=scanner,
@@ -5030,7 +5173,8 @@ class TestAssemblyFailureKeepsThePageFiles:
         assert "MB needed" in message
         assert "1 MB free" in message
         assert f"The 3 spooled page file(s) were preserved at {kept[0]}" in message
-        assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
+        assert classify_error(excinfo.value) is ErrorCategory.DISK_SPACE
+        assert exit_code_for(classify_error(excinfo.value)) is ExitCode.DISK_SPACE
 
     def test_mismatch_halves_are_refused_up_front_without_the_room(
         self,
@@ -5046,7 +5190,7 @@ class TestAssemblyFailureKeepsThePageFiles:
 
         with (
             patch("saneless.pipeline.assemble_pdf", assembling),
-            pytest.raises(PdfError, match="MB needed"),
+            pytest.raises(DiskSpaceError, match="MB needed"),
         ):
             run_pipeline(
                 scanner=_mismatched_duplex_scanner(),
