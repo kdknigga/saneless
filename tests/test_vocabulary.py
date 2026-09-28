@@ -45,6 +45,7 @@ from saneless.vocabulary import (
     PASS_WAIT_STATES,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
+    RESTART_UPLOADING_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
@@ -102,6 +103,8 @@ from saneless.vocabulary import (
     rejection_status_code,
     removed_pages,
     removed_pages_note,
+    restart_category,
+    restart_error,
     scan_page_description,
     sixteen_bit_error,
     source_not_offered_error,
@@ -1742,6 +1745,7 @@ _JOB_ROW_TEXTS: list[str] = [
     TOKEN_UNSET_JOB_ERROR,
     URL_UNSET_JOB_ERROR,
     RESTART_REASON,
+    RESTART_UPLOADING_REASON,
 ]
 
 
@@ -1857,6 +1861,72 @@ class TestRequestRejection:
         """Job-row texts follow the job.error convention of no trailing period (D-05)."""
         assert text
         assert not text.endswith(".")
+
+
+_KEPT_SENTENCE = "The scan was preserved at /data/failed/kept.pdf"
+"""A kept-file sentence, as the startup sweep words one."""
+
+
+class TestRestartWording:
+    """The text and category a job gets when a restart or stop ends it."""
+
+    def test_restart_uploading_reason_says_it_may_have_arrived(self) -> None:
+        """An upload cut short by a restart may already be in paperless-ngx."""
+        assert "may have reached paperless-ngx" in RESTART_UPLOADING_REASON
+        assert "before this scan finished" not in RESTART_UPLOADING_REASON
+
+    def test_restart_error_while_uploading(self) -> None:
+        """An uploading job gets the uploading reason, alone or before the kept file."""
+        assert restart_error(JobState.UPLOADING, None) == RESTART_UPLOADING_REASON
+        assert restart_error(JobState.UPLOADING, "kept.") == (
+            f"{RESTART_UPLOADING_REASON}. kept."
+        )
+
+    def test_restart_error_before_uploading(self) -> None:
+        """A job not yet uploading keeps the plain restart reason."""
+        assert restart_error(JobState.SCANNING, None) == RESTART_REASON
+        assert restart_error(JobState.ASSEMBLING, "kept.") == f"{RESTART_REASON}. kept."
+
+    @pytest.mark.parametrize(
+        "state", sorted(ACTIVE_STATES - {JobState.UPLOADING}, key=str)
+    )
+    def test_restart_error_for_every_other_active_state(self, state: JobState) -> None:
+        """Every active state before the upload reads as never finished."""
+        assert restart_error(state, None) == RESTART_REASON
+        assert restart_error(state, _KEPT_SENTENCE) == (
+            f"{RESTART_REASON}. {_KEPT_SENTENCE}"
+        )
+
+    def test_restart_category_while_uploading_is_unconfirmed_send(self) -> None:
+        """An uploading job restarted is the amber after-send category."""
+        assert restart_category(JobState.UPLOADING) is ErrorCategory.UNCONFIRMED_SEND
+
+    @pytest.mark.parametrize(
+        "state", sorted(ACTIVE_STATES - {JobState.UPLOADING}, key=str)
+    )
+    def test_restart_category_for_every_other_active_state_is_none(
+        self, state: JobState
+    ) -> None:
+        """A job restarted before the upload carries no category, only its text."""
+        assert restart_category(state) is None
+
+    @pytest.mark.parametrize("state", sorted(TERMINAL_STATES, key=str))
+    def test_restart_category_refuses_a_terminal_state(self, state: JobState) -> None:
+        """A finished job is never restarted, so asking about one is a caller bug."""
+        with pytest.raises(ValueError, match=state.value):
+            restart_category(state)
+
+    @pytest.mark.parametrize("state", sorted(TERMINAL_STATES, key=str))
+    def test_restart_error_refuses_a_terminal_state(self, state: JobState) -> None:
+        """The text follows the same rule as the category."""
+        with pytest.raises(ValueError, match=state.value):
+            restart_error(state, None)
+
+    def test_restart_category_raises_on_unrecognised_value(self) -> None:
+        """A value outside JobState fails loudly rather than choosing a category."""
+        bad = cast("JobState", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            restart_category(bad)
 
 
 class TestConnectionStatus:
