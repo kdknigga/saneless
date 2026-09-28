@@ -63,7 +63,7 @@ Done: Lease agreement
 ```
 
 - **`n`** scans the next page, **`r`** throws away the last scan and scans again, **`f`** finishes and uploads the document, **`a`** aborts.
-- **`a`** asks you to confirm, with No as the default. Only a yes aborts the scan. It uploads nothing, keeps nothing and exits with code 130.
+- **`a`** asks you to confirm, with No as the default. Only a yes aborts the scan. It uploads nothing, keeps nothing and exits with code 130. If the wait runs out while you are confirming, saneless holds on for your answer, for up to one more `operator_wait_timeout_seconds`, rather than finishing the document under you. A no, or no answer by then, finishes it as a timeout would.
 - Letters are not case-sensitive, and only the first character of your answer counts. Anything else prints `Error: Choose one of: ...`, listing the letters you can use, and asks again.
 - Anything you typed while the scanner was busy is discarded before each question, so a key pressed early cannot answer the next question for you.
 - **Ctrl-C** or **Ctrl-D** at the question cancels the scan straight away, with no confirmation, however many pages are kept. It uploads nothing, keeps nothing and exits with code 130. Press `f` if you want to keep the pages.

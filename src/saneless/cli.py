@@ -535,7 +535,51 @@ def _flush_typed_ahead() -> None:
         return
 
 
-def _read_pass_answer(prompt: PassPrompt) -> PassAnswer:
+class _AbortConfirmation:
+    """
+    Whether the operator is confirming an abort, which the clock must wait out.
+
+    The operator who typed ``a`` is at the terminal, answering "abort?".  If
+    the wait ran out under them and the clock claimed its answer, the document
+    would be finished and uploaded while they were confirming they wanted it
+    thrown away.  So the prompt thread opens this before it asks, and the
+    calling thread, its wait over, waits for it to close before it claims the
+    timeout.  A Yes is left open until the abort has been claimed, so the
+    calling thread can never find the confirmation over and the answer still
+    unclaimed.
+    """
+
+    def __init__(self) -> None:
+        """Start closed: no abort is being confirmed."""
+        self._changed = threading.Condition()
+        self._open = False
+
+    def begin(self) -> None:
+        """Mark an abort as being confirmed."""
+        with self._changed:
+            self._open = True
+
+    def end(self) -> None:
+        """Mark the confirmation over, and wake a waiter.  Idempotent."""
+        with self._changed:
+            self._open = False
+            self._changed.notify_all()
+
+    def wait_out(self, timeout: float) -> None:
+        """
+        Wait until no abort is being confirmed, for at most ``timeout`` seconds.
+
+        Args:
+            timeout: The longest to wait, in seconds.
+
+        """
+        with self._changed:
+            self._changed.wait_for(lambda: not self._open, timeout)
+
+
+def _read_pass_answer(
+    prompt: PassPrompt, confirmation: _AbortConfirmation
+) -> PassAnswer:
     """
     Ask one multi-page question at the terminal until it has an answer.
 
@@ -547,6 +591,9 @@ def _read_pass_answer(prompt: PassPrompt) -> PassAnswer:
 
     Args:
         prompt: The open question.
+        confirmation: Opened while an abort is being confirmed.  Closed again
+            on a No; left open on a Yes, for the caller to close once the
+            abort is claimed.
 
     Returns:
         The operator's answer, one of those ``prompt`` offers.
@@ -589,8 +636,10 @@ def _read_pass_answer(prompt: PassPrompt) -> PassAnswer:
         answer = click.prompt(question, value_proc=parse, show_default=False)
         if answer is not PassAnswer.ABORT:
             return answer
+        confirmation.begin()
         if click.confirm(abort_question(prompt.pages_kept), default=False):
             return answer
+        confirmation.end()
 
 
 class ClickPassCoordinator(PassCoordinator):
@@ -613,6 +662,13 @@ class ClickPassCoordinator(PassCoordinator):
     read error answers ``ABORT`` at once, logged with its traceback, and
     records the exception as ``abort_cause``: nobody chose to stop, so the
     scan is reported as failed, not cancelled, and its pages are kept.
+
+    An abort being confirmed when the wait runs out holds the clock
+    (``_AbortConfirmation``), for at most one more ``timeout_seconds``: a Yes
+    then aborts, as the operator chose, rather than being overtaken by a
+    finish that uploads the pages.  A No, or no answer within that bound --
+    the confirmation's default -- is not an abort, and the expired wait
+    resolves ``TIMED_OUT``.
 
     Accepted cost, as at the flip prompt, deliberate and not a leak: after a
     timeout the prompt thread is abandoned.  It keeps its read on stdin until
@@ -655,15 +711,20 @@ class ClickPassCoordinator(PassCoordinator):
 
         """
         slot = AnswerSlot[PassAnswer]()
+        confirmation = _AbortConfirmation()
         reader = threading.Thread(
             target=self._prompt,
-            args=(prompt, slot),
+            args=(prompt, slot, confirmation),
             name="saneless-multi-page-prompt",
             daemon=True,
         )
         reader.start()
         try:
             slot.wait(prompt.timeout_seconds)
+            # The operator may be confirming an abort as the wait runs out;
+            # the clock must not finish the document under them.  Returns at
+            # once when nothing is being confirmed.
+            confirmation.wait_out(prompt.timeout_seconds)
         except KeyboardInterrupt:
             # Ctrl-C lands here, not in click.prompt: Python handles SIGINT on
             # the main thread, which is this one, parked in the wait.  It is
@@ -673,17 +734,47 @@ class ClickPassCoordinator(PassCoordinator):
         # claimed is handed back, and an expired wait claims TIMED_OUT.
         return slot.settle(PassAnswer.TIMED_OUT)
 
-    def _prompt(self, prompt: PassPrompt, slot: AnswerSlot[PassAnswer]) -> None:
+    def _prompt(
+        self,
+        prompt: PassPrompt,
+        slot: AnswerSlot[PassAnswer],
+        confirmation: _AbortConfirmation,
+    ) -> None:
         """
-        Ask the operator on the prompt thread and claim their answer.
+        Ask the operator on the prompt thread, claim their answer, then let go.
+
+        The abort confirmation is closed only once the answer is claimed,
+        whatever the ending, so the calling thread never finds it over with
+        nothing claimed.
 
         Args:
             prompt: The open question.
             slot: This question's slot.
+            confirmation: Open while the operator confirms an abort.
 
         """
         try:
-            answer = _read_pass_answer(prompt)
+            self._claim(prompt, slot, confirmation)
+        finally:
+            confirmation.end()
+
+    def _claim(
+        self,
+        prompt: PassPrompt,
+        slot: AnswerSlot[PassAnswer],
+        confirmation: _AbortConfirmation,
+    ) -> None:
+        """
+        Ask the operator and claim their answer, or the prompt's failure.
+
+        Args:
+            prompt: The open question.
+            slot: This question's slot.
+            confirmation: Passed to ``_read_pass_answer``.
+
+        """
+        try:
+            answer = _read_pass_answer(prompt, confirmation)
         except click.Abort:
             _end_of_input(partial(slot.settle, PassAnswer.ABORT), "Multi-page prompt")
             return

@@ -760,6 +760,85 @@ class TestClickPassCoordinatorEndings:
         assert coordinator.abort_cause is None
         assert confirmations == []
 
+    @pytest.mark.parametrize(
+        ("reply", "timeout", "expected"),
+        [
+            ("yes", _TIMEOUT, PassAnswer.ABORT),
+            ("no", _TIMEOUT, PassAnswer.TIMED_OUT),
+            ("never", 0, PassAnswer.TIMED_OUT),
+        ],
+        ids=["yes-aborts", "no-finishes", "unanswered-is-bounded"],
+    )
+    def test_an_abort_being_confirmed_holds_the_clock(
+        self,
+        reply: str,
+        timeout: float,
+        expected: PassAnswer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The wait running out mid-confirmation does not finish the document under it.
+
+        The operator typed ``a`` and the clock ran out while "abort?" was on
+        screen.  A yes then aborts, as the operator chose, rather than being
+        overtaken by a finish that uploads the pages.  A no is not an abort,
+        so the expired wait finishes.  A confirmation nobody answers is held
+        for at most one more wait, then read as its default, No.
+
+        The slot's wait is made to expire only once the confirmation is on
+        screen, and the confirmation is answered only once it has, so the
+        straddle is certain rather than a matter of timing.
+        """
+        on_screen = threading.Event()
+        clock_ran_out = threading.Event()
+        operator = threading.Event()
+        release = threading.Event()
+        answers: list[PassAnswer] = []
+        typed: list[PassAnswer] = [PassAnswer.ABORT]
+
+        def expired_wait(_slot: object, timeout: float) -> None:
+            """Run out once the confirmation is showing."""
+            del timeout
+            assert on_screen.wait(5)
+            clock_ran_out.set()
+
+        def question(*_args: object, **_kwargs: object) -> PassAnswer:
+            """Type ``a`` once; then leave the question unanswered."""
+            if typed:
+                return typed.pop()
+            release.wait()
+            return PassAnswer.NEXT
+
+        def confirm(*_args: object, **_kwargs: object) -> bool:
+            """Show the confirmation, and answer it when the test says."""
+            on_screen.set()
+            if reply == "never":
+                release.wait()
+                return False
+            assert operator.wait(5)
+            return reply == "yes"
+
+        monkeypatch.setattr(AnswerSlot, "wait", expired_wait)
+        monkeypatch.setattr("saneless.cli.click.prompt", question)
+        monkeypatch.setattr("saneless.cli.click.confirm", confirm)
+        coordinator = ClickPassCoordinator()
+        prompt = _next_pass_prompt(pages_kept=3, timeout=timeout)
+        asker = threading.Thread(target=lambda: answers.append(coordinator.ask(prompt)))
+
+        asker.start()
+        try:
+            assert clock_ran_out.wait(5)
+            operator.set()
+            asker.join(5)
+        finally:
+            operator.set()
+            release.set()
+        _join_prompt_threads()
+
+        assert not asker.is_alive()
+        assert answers == [expected]
+        assert coordinator.abort_cause is None
+
     def test_end_of_input_with_no_signal_is_an_abort(self) -> None:
         """Ctrl-D at the prompt is the operator's cancel, once the grace has passed."""
         answer, _, coordinator = _ask(_next_pass_prompt(), "")
