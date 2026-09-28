@@ -468,7 +468,10 @@ class TestRealSaneCancelSequence:
 
             with pytest.raises(ScanError) as raised:
                 sane_backend_mod._acquire_with_timeout(
-                    device, start_and_snap, "Page 1", _SLOW_READ_TIMEOUT_SECONDS
+                    device,
+                    start_and_snap,
+                    "Page 1",
+                    sane_backend_mod._PageBudget(timeout=_SLOW_READ_TIMEOUT_SECONDS),
                 )
 
             message = str(raised.value)

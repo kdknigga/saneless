@@ -80,6 +80,7 @@ from saneless.vocabulary import (
     local_time,
     outcome_line,
     page_counts,
+    page_timeout_error,
     pages_phrase,
     pass_answer_label,
     pass_wait_state,
@@ -88,6 +89,7 @@ from saneless.vocabulary import (
     rejection_status_code,
     removed_pages,
     removed_pages_note,
+    scan_page_description,
     sixteen_bit_error,
     source_not_offered_error,
     state_label,
@@ -682,6 +684,54 @@ class TestFinishWarnings:
         assert sixteen_bit_error("test:0") == (
             "The scanner test:0 is set to 16 bits per sample, and saneless scans "
             "at 8. Choose an 8-bit mode, such as Gray or Color, in the profile."
+        )
+
+    def test_scan_page_description_colour(self) -> None:
+        """A colour page of known length is named by its size and dpi."""
+        assert scan_page_description(9921, 14031, colour=True, dpi=1200) == (
+            "a colour page of 9921 x 14031 pixels at 1200 dpi"
+        )
+
+    def test_scan_page_description_grey(self) -> None:
+        """A page that is not colour is named as grey."""
+        assert scan_page_description(2480, 3508, colour=False, dpi=300) == (
+            "a grey page of 2480 x 3508 pixels at 300 dpi"
+        )
+
+    def test_scan_page_description_unknown_length(self) -> None:
+        """A page whose length the device does not know says so."""
+        assert scan_page_description(9921, -1, colour=True, dpi=1200) == (
+            "a colour page 9921 pixels wide and of unknown length at 1200 dpi"
+        )
+        assert scan_page_description(2480, 0, colour=False, dpi=300) == (
+            "a grey page 2480 pixels wide and of unknown length at 300 dpi"
+        )
+
+    def test_page_timeout_error_names_the_limit_and_the_page(self) -> None:
+        """A timed-out page says how long it had, and for what page."""
+        page = scan_page_description(9921, 14031, colour=True, dpi=1200)
+        assert page_timeout_error("Page 3", 479.6, page, returned=True) == (
+            "Page 3 timed out after 480s, the limit for a colour page of "
+            "9921 x 14031 pixels at 1200 dpi"
+        )
+
+    def test_page_timeout_error_when_the_read_did_not_return(self) -> None:
+        """A read the cancel did not end is named as still outstanding."""
+        page = scan_page_description(2480, 3508, colour=False, dpi=300)
+        assert page_timeout_error("Page 1", 120.0, page, returned=False) == (
+            "Page 1 timed out after 120s, the limit for a grey page of "
+            "2480 x 3508 pixels at 300 dpi; the scanner did not respond to the "
+            "cancel, so saneless is still waiting for that read to return"
+        )
+
+    def test_page_timeout_error_without_a_page(self) -> None:
+        """With no page described, only the limit is named."""
+        assert page_timeout_error("Page 2", 120.0, None, returned=True) == (
+            "Page 2 timed out after 120s"
+        )
+        assert page_timeout_error("Page 2", 120.0, None, returned=False) == (
+            "Page 2 timed out after 120s; the scanner did not respond to the "
+            "cancel, so saneless is still waiting for that read to return"
         )
 
     def test_blank_timeout_finish_warning(self) -> None:

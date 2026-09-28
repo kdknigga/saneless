@@ -55,6 +55,7 @@ from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
+from saneless.vocabulary import scan_page_description
 from tests.conftest import (
     StubScannerBackend,
     images_of,
@@ -3280,7 +3281,7 @@ class TestSaneBackendCancelSequence:
             .parameters["budget"]
             .default
         )
-        assert budget.timeout == sane_backend_mod._DEFAULT_PAGE_TIMEOUT_SECONDS
+        assert budget.timeout == sane_backend_mod._PAGE_TIMEOUT_FLOOR_SECONDS
         assert budget.grace == sane_backend_mod._CANCEL_GRACE_SECONDS
         fake_device.block_read(ReadBlockMode.PARTIAL)
 
@@ -3570,7 +3571,10 @@ class TestSaneBackendCancelSequence:
             began = time.monotonic()
             with pytest.raises(type(interruption)):
                 sane_backend_mod._acquire_with_timeout(
-                    dev, fake_device.snap, sane_backend_mod._page_label(0), 5.0, grace
+                    dev,
+                    fake_device.snap,
+                    sane_backend_mod._page_label(0),
+                    sane_backend_mod._PageBudget(timeout=5.0, grace=grace),
                 )
             elapsed = time.monotonic() - began
 
@@ -3889,7 +3893,7 @@ _STUCK_READ_CHILD = '''\
 import os
 
 from saneless.exceptions import ScanError
-from saneless.scanner.sane_backend import _acquire_with_timeout
+from saneless.scanner.sane_backend import _acquire_with_timeout, _PageBudget
 
 
 class StuckScanner:
@@ -3917,7 +3921,9 @@ def never_returns() -> object:
 
 
 try:
-    _acquire_with_timeout(device, never_returns, "Page 1", 0.2, 0.2)
+    _acquire_with_timeout(
+        device, never_returns, "Page 1", _PageBudget(timeout=0.2, grace=0.2)
+    )
 except ScanError as exc:
     returned = "did not respond" not in str(exc)
 
@@ -5833,6 +5839,236 @@ class TestSixteenBitDepth:
 
         assert dev.assignments == ["source", "mode", "depth", "resolution"]
         assert getattr(dev, _DEPTH) == 8
+
+
+# An A4 sheet at 1200 dpi, as a device reports it: 9921 x 14031 pixels, with
+# three bytes a pixel in colour and one in grey.
+_A4_1200_WIDTH = 9921
+_A4_1200_LINES = 14031
+
+
+def _parameters(
+    frame_format: str, pixels_per_line: int, lines: int, bytes_per_line: int
+) -> sane_backend_mod._ScanParameters:
+    """
+    Build the parameters a device reports for an 8-bit frame.
+
+    Args:
+        frame_format: SANE's frame format, such as ``"color"``.
+        pixels_per_line: The width in pixels.
+        lines: The height in lines, or -1 for a length not known in advance.
+        bytes_per_line: The length of one line of image data.
+
+    Returns:
+        The parameters.
+
+    """
+    return sane_backend_mod._ScanParameters(
+        frame_format=frame_format,
+        last_frame=True,
+        pixels_per_line=pixels_per_line,
+        lines=lines,
+        depth=8,
+        bytes_per_line=bytes_per_line,
+    )
+
+
+class TestPageBudget:
+    """
+    Each page's timeout scales with the page the device agreed to send.
+
+    A fixed two minutes cut off honest high-resolution colour scans on slow
+    links and blamed the network.  The budget is twice an estimate anchored on
+    one minute for an A4 colour page at 600 dpi, scaled by how many bytes the
+    negotiated page holds, and never below two minutes.  There is no setting:
+    the device's own parameters decide it.
+    """
+
+    @pytest.mark.parametrize(
+        ("parameters", "resolution", "expected"),
+        [
+            pytest.param(
+                _parameters("color", 4961, 7016, 4961 * 3),
+                600,
+                120.0,
+                id="a4-600-colour",
+            ),
+            pytest.param(
+                _parameters(
+                    "color", _A4_1200_WIDTH, _A4_1200_LINES, _A4_1200_WIDTH * 3
+                ),
+                1200,
+                pytest.approx(480, rel=0.01),
+                id="a4-1200-colour",
+            ),
+            pytest.param(
+                _parameters("gray", _A4_1200_WIDTH, _A4_1200_LINES, _A4_1200_WIDTH),
+                1200,
+                pytest.approx(160, rel=0.01),
+                id="a4-1200-grey",
+            ),
+            pytest.param(
+                _parameters("gray", 2480, 3508, 2480), 300, 120.0, id="a4-300-grey"
+            ),
+            pytest.param(
+                _parameters("color", 2480, 3508, 2480 * 3),
+                300,
+                120.0,
+                id="a4-300-colour",
+            ),
+            pytest.param(
+                _parameters("red", _A4_1200_WIDTH, _A4_1200_LINES, _A4_1200_WIDTH),
+                1200,
+                pytest.approx(480, rel=0.01),
+                id="three-pass-counts-three-frames",
+            ),
+            pytest.param(
+                _parameters("color", _A4_1200_WIDTH, _A4_1200_LINES, -5),
+                1200,
+                120.0,
+                id="negative-line-length-is-the-floor",
+            ),
+        ],
+    )
+    def test_the_budget_scales_with_the_negotiated_page(
+        self,
+        parameters: sane_backend_mod._ScanParameters,
+        resolution: int,
+        expected: object,
+    ) -> None:
+        """Twice the page's share of a minute per A4 colour page at 600 dpi."""
+        assert sane_backend_mod._page_budget_seconds(parameters, resolution) == expected
+
+    def test_a_page_of_unknown_length_is_budgeted_as_legal_length(self) -> None:
+        """
+        SANE's "length not known in advance" is budgeted as a legal sheet.
+
+        A legal sheet is 355.6 mm, 16,800 lines at 1200 dpi, longer than A4,
+        so the budget is more than A4's and follows from that length.
+        """
+        unknown = _parameters("color", _A4_1200_WIDTH, -1, _A4_1200_WIDTH * 3)
+        legal = _parameters("color", _A4_1200_WIDTH, 16800, _A4_1200_WIDTH * 3)
+
+        budget = sane_backend_mod._page_budget_seconds(unknown, 1200)
+
+        assert budget > 480
+        assert budget == pytest.approx(
+            sane_backend_mod._page_budget_seconds(legal, 1200), rel=0.001
+        )
+
+    def test_the_floor_is_two_minutes_with_no_setting(self) -> None:
+        """The floor is the old fixed limit, and a default budget uses it."""
+        assert sane_backend_mod._PAGE_TIMEOUT_FLOOR_SECONDS == 120.0
+        assert sane_backend_mod._PageBudget().timeout == 120.0
+        assert sane_backend_mod._PageBudget().page is None
+
+    @staticmethod
+    def _spy_on_budgets(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> list[sane_backend_mod._PageBudget]:
+        """
+        Record the budget every acquisition is given, then acquire as usual.
+
+        Args:
+            monkeypatch: Fixture used to wrap the acquisition.
+
+        Returns:
+            The list the budgets are appended to, in acquisition order.
+
+        """
+        budgets: list[sane_backend_mod._PageBudget] = []
+        real = sane_backend_mod._acquire_with_timeout
+
+        def spy(
+            dev: object,
+            work: Callable[[], object],
+            page_label: str,
+            budget: sane_backend_mod._PageBudget,
+        ) -> Image.Image:
+            budgets.append(budget)
+            return real(dev, work, page_label, budget)
+
+        monkeypatch.setattr(sane_backend_mod, "_acquire_with_timeout", spy)
+        return budgets
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("Flatbed", id="flatbed"),
+            pytest.param(_FEEDER_SOURCE, id="feeder"),
+        ],
+    )
+    def test_both_paths_get_the_budget_for_the_negotiated_page(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        source: str,
+    ) -> None:
+        """A 1200 dpi A4 colour page gets 480 s on the glass and in the feeder."""
+        dev = FakeSaneDev(pages=1)
+        dev.set_parameters(
+            frame_format="color",
+            pixels_per_line=_A4_1200_WIDTH,
+            lines=_A4_1200_LINES,
+            bytes_per_line=_A4_1200_WIDTH * 3,
+        )
+        budgets = self._spy_on_budgets(monkeypatch)
+        settings = ScanSettings(source=source, resolution=1200, mode="Color")
+
+        batch = _backend_with(dev, monkeypatch).scan_pages(
+            _TEST_DEVICE, settings, page_sink
+        )
+
+        assert len(batch.pages) == 1
+        assert budgets
+        for budget in budgets:
+            assert budget.timeout == pytest.approx(480, rel=0.01)
+            assert budget.page == scan_page_description(
+                _A4_1200_WIDTH, _A4_1200_LINES, colour=True, dpi=1200
+            )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("Flatbed", id="flatbed"),
+            pytest.param(_FEEDER_SOURCE, id="feeder"),
+        ],
+    )
+    def test_a_timeout_names_the_budget_and_the_page(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        source: str,
+    ) -> None:
+        """
+        The error says how long the page was given, and for what page.
+
+        The floor is lowered so the read that never finishes times out at
+        once; the read still returns after the cancel, as a cooperative
+        scanner's does, so only the limit is named, not a stuck read.
+        """
+        monkeypatch.setattr(sane_backend_mod, "_PAGE_TIMEOUT_FLOOR_SECONDS", 0.05)
+        dev = FakeSaneDev(pages=1)
+        dev.set_parameters(
+            frame_format="gray", pixels_per_line=236, lines=295, bytes_per_line=236
+        )
+        dev.block_read(ReadBlockMode.PARTIAL)
+        settings = ScanSettings(source=source, resolution=300, mode="Gray")
+
+        try:
+            with pytest.raises(ScanError) as raised:
+                _backend_with(dev, monkeypatch).scan_pages(
+                    _TEST_DEVICE, settings, page_sink
+                )
+        finally:
+            dev.release_read()
+            _join_sane_reader_threads()
+
+        message = str(raised.value)
+        assert message.startswith("Page 1 timed out after 0s, the limit for ")
+        assert scan_page_description(236, 295, colour=False, dpi=300) in message
+        assert "at 300 dpi" in message
+        assert "did not respond" not in message
 
 
 class TestSourceOptionPresence:
