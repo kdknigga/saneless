@@ -4665,7 +4665,9 @@ class TestFeederPaperSize:
         The window starts at the sheet's left edge, so cutting it down to the
         paper size from its top-left corner loses nothing.
         """
-        dev = FakeSaneDev(options=build_option_table(omit=_GEOMETRY_OPTION_NAMES))
+        dev = FakeSaneDev(
+            options=build_option_table(omit=_GEOMETRY_OPTION_NAMES), pages=1
+        )
         dev.report_sources(["Flatbed", "ADF"])
         dev.offer_page_size_options()
         dev.set_page_size(3000, 4000)

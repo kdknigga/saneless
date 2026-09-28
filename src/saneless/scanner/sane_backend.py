@@ -296,10 +296,19 @@ _MM_PER_INCH = 25.4
 # exact figure is not delicate.
 _AREA_TOLERANCE_MM = 1.0
 
-# SANE's value-type code for a fixed-point option, read at index 4 of the tuple
-# get_options() reports.  python-sane refuses an int for one and a float for an
-# integer option, so a value has to be written in the option's own type.
+# SANE's value-type codes for an integer and a fixed-point option, read at
+# index 4 of the tuple get_options() reports.  python-sane refuses an int for a
+# fixed-point option and a float for an integer one, even a whole float, so a
+# value has to be written in the option's own type.
+_SANE_TYPE_INT = 1
 _SANE_TYPE_FIXED = 2
+
+# The options a feeder that centres the sheet uses to learn the paper size, in
+# the hyphenated spelling get_options() reports.  The fujitsu and canon_dr
+# backends offer them, active only while a feeder source is selected; told the
+# paper size, the device places its scan window over the middle of the feed
+# path, and the scan area is then measured from that window's corner.
+_PAGE_SIZE_OPTIONS: tuple[str, str] = ("page-width", "page-height")
 
 # The capability bits, at index 7, that say whether software may set an option
 # right now: it must be software-selectable and not inactive.
@@ -699,6 +708,42 @@ def _units_per_mm(unit: GeometryUnit, resolution: int) -> float | None:
     return scale
 
 
+def _option_unit(
+    raw_options: list[tuple], name: str, *, fallback: str
+) -> GeometryUnit | None:
+    """
+    Read the unit the device reports for one option, index 5 of its tuple.
+
+    The conversion is defensive because the tuple is device-supplied.  A
+    conforming backend cannot report a code outside the seven, but nothing in
+    the protocol stops a broken one, and scaling by a garbage factor would
+    silently mis-size the page.
+
+    Args:
+        raw_options: The device's option tuples.
+        name: The hyphenated option name.
+        fallback: What the scan does instead, for the WARNING an unknown code
+            logs, e.g. ``"will crop after scanning"``.
+
+    Returns:
+        The reported unit, or None if the device does not report the option or
+        reports something that is not a SANE unit at all.
+
+    """
+    opt = _option_tuple(raw_options, name)
+    reported = None if opt is None else opt[5]
+    try:
+        return GeometryUnit(reported)
+    except ValueError:
+        logger.warning(
+            "Scanner reports unit code %s for %s, which is not a SANE unit, %s",
+            reported,
+            name,
+            fallback,
+        )
+        return None
+
+
 def _geometry_unit(raw_options: list[tuple]) -> GeometryUnit | None:
     """
     Read the unit the device reports for its scan-area options.
@@ -709,11 +754,6 @@ def _geometry_unit(raw_options: list[tuple]) -> GeometryUnit | None:
     ``br-x`` is the option read: the four scan-area options describe one box,
     and a device reports one unit for all of them.
 
-    The conversion is defensive because the tuple is device-supplied.  A
-    conforming backend cannot report a code outside the seven, but nothing in
-    the protocol stops a broken one, and scaling by a garbage factor would
-    silently mis-size the page.
-
     Args:
         raw_options: The device's option tuples.
 
@@ -722,19 +762,7 @@ def _geometry_unit(raw_options: list[tuple]) -> GeometryUnit | None:
         a SANE unit at all.
 
     """
-    reported = next(
-        (opt[5] for opt in raw_options if len(opt) >= 9 and opt[1] == "br-x"),
-        None,
-    )
-    try:
-        return GeometryUnit(reported)
-    except ValueError:
-        logger.warning(
-            "Scanner reports scan-area unit code %s, which is not a SANE unit, "
-            "will crop after scanning",
-            reported,
-        )
-        return None
+    return _option_unit(raw_options, "br-x", fallback="will crop after scanning")
 
 
 def _missing_geometry_options(raw_options: list[tuple]) -> list[str]:
@@ -839,6 +867,60 @@ def _area_matches(
     return False
 
 
+def _in_option_type(raw_options: list[tuple], name: str, value: float) -> int | float:
+    """
+    Express a number in an option's own SANE type.
+
+    Args:
+        raw_options: The device's option tuples.
+        name: The hyphenated option name.
+        value: The number to write, in the option's unit.
+
+    Returns:
+        ``round(value)`` for an integer option, which refuses a float, and
+        ``float(value)`` otherwise, since a fixed-point option refuses an int.
+
+    """
+    if _option_type(raw_options, name) == _SANE_TYPE_INT:
+        return round(value)
+    return float(value)
+
+
+def _in_option_types(
+    raw_options: list[tuple], values: dict[str, float]
+) -> dict[str, int | float]:
+    """
+    Express several numbers each in its own option's SANE type.
+
+    Args:
+        raw_options: The device's option tuples.
+        values: The number for each hyphenated option name, in its unit.
+
+    Returns:
+        The same names, in the same order, with values ``_in_option_type``
+        gives them.
+
+    """
+    return {
+        name: _in_option_type(raw_options, name, value)
+        for name, value in values.items()
+    }
+
+
+def _write_options(dev: SaneDevice, values: dict[str, int | float]) -> None:
+    """
+    Assign options in order, letting any refusal propagate.
+
+    Args:
+        dev: Open SANE device handle.
+        values: The value for each hyphenated option name, already in its
+            option's type, in the order the device should receive them.
+
+    """
+    for name, value in values.items():
+        setattr(dev, name.replace("-", "_"), value)
+
+
 def _set_geometry(
     dev: SaneDevice,
     paper_size: PaperSize,
@@ -887,12 +969,25 @@ def _set_geometry(
         # success is worse than the crop fallback it bypasses.
         return False
     width_mm, height_mm = dims
-    expected = (width_mm * scale, height_mm * scale)
+    # Each corner in its option's own type: a scan area in pixels is an
+    # integer option on a real device, and python-sane refuses a float there.
+    # The box compared below is the one written, rounding and all, so the
+    # read-back is checked in the same unit and type it was set in.
+    corners = _in_option_types(
+        raw_options,
+        {
+            "tl-x": 0.0,
+            "tl-y": 0.0,
+            "br-x": width_mm * scale,
+            "br-y": height_mm * scale,
+        },
+    )
+    expected = (
+        corners["br-x"] - corners["tl-x"],
+        corners["br-y"] - corners["tl-y"],
+    )
     try:
-        dev.tl_x = 0.0
-        dev.tl_y = 0.0
-        dev.br_x = expected[0]
-        dev.br_y = expected[1]
+        _write_options(dev, corners)
         actual = dev.area
     except Exception as exc:
         # Name what was swallowed.  A device that reports the options and then
@@ -916,6 +1011,117 @@ def _set_geometry(
     return True
 
 
+def _set_page_size(
+    dev: SaneDevice,
+    dims: tuple[float, float],
+    raw_options: list[tuple],
+    resolution: int,
+) -> bool:
+    """
+    Tell a centring feeder the paper size, in each option's unit and type.
+
+    Args:
+        dev: Open SANE device handle.
+        dims: The paper's ``(width, height)`` in millimetres.
+        raw_options: The option list for the source selected, which reports
+            ``page-width`` and ``page-height`` as active and settable.
+        resolution: The resolution the device actually reported, in dpi, for
+            an option denominated in pixels.
+
+    Returns:
+        True if both options were set, False if a unit could not be converted
+        or the device refused a value, each logged as a WARNING.
+
+    """
+    lengths: dict[str, float] = {}
+    for name, length_mm in zip(_PAGE_SIZE_OPTIONS, dims, strict=True):
+        unit = _option_unit(raw_options, name, fallback="will scan the full window")
+        scale = None if unit is None else _units_per_mm(unit, resolution)
+        if scale is None or scale <= 0.0:
+            return False
+        lengths[name] = length_mm * scale
+    try:
+        _write_options(dev, _in_option_types(raw_options, lengths))
+    except Exception as exc:
+        logger.warning(
+            "Scanner rejected the page-size options (%s), will scan the full window",
+            exc,
+        )
+        return False
+    return True
+
+
+def _apply_paper_size(
+    dev: SaneDevice,
+    options: list[tuple],
+    settings: ScanSettings,
+    *,
+    use_adf: bool,
+    resolution: int,
+) -> _PageFraming:
+    """
+    Frame every page of the pass to the paper size, where that loses nothing.
+
+    **Where the sheet sits is what decides.**  On the flatbed it sits in the
+    top-left corner, so the scan area is set from that corner, and when the
+    device will not take the area the page is cropped from the same corner.
+    In a feeder it sits wherever the feeder guides it: against one side on
+    some, in the middle on others.  A box measured from the top-left corner
+    cuts the right edge off every page of a feeder that centres the sheet, and
+    saneless has no way to see which kind it has.
+
+    So on a pass through the feeder:
+
+    - A device that reports ``page-width`` and ``page-height``, active and
+      settable for the source selected, is told the paper size first.  It
+      then places its own window over the sheet, and the scan area is set
+      inside that window, from its corner, exactly as on the flatbed; a crop
+      from that corner is equally safe if the area is refused.
+    - A device that does not is left alone: no scan area and no crop.  The
+      paper size is **not applied** and the page is the full window, larger
+      but complete.  That is one INFO line, not a warning, because nothing is
+      lost.
+
+    It is the routing that makes a pass a feeder pass, not the source's name:
+    an ``Auto`` source sent through the feeder has the same unknown
+    registration as a named feeder.
+
+    Args:
+        dev: Open SANE device handle.
+        options: The option list read after the source was assigned, which is
+            the only one that says whether the page-size options are active.
+        settings: The requested scan settings, for ``paper_size``.
+        use_adf: Whether this pass reads from the feeder.
+        resolution: The resolution the device actually reported, in dpi.
+
+    Returns:
+        The framing every page is cropped to and laid out at.  A paper size
+        that was not applied is framed as ``"full"``, the whole window.
+
+    """
+    paper_size = settings.paper_size
+    whole = _PageFraming(paper_size="full", resolution=resolution, geometry_set=True)
+    dims = PAPER_SIZES_MM.get(paper_size)
+    if dims is None:
+        return whole
+    if use_adf:
+        if not all(_option_is_writable(options, name) for name in _PAGE_SIZE_OPTIONS):
+            logger.info(
+                "paper_size %s not applied: the feeder does not report "
+                "page-width/page-height, so where it places the sheet is "
+                "unknown; scanning the full window",
+                paper_size,
+            )
+            return whole
+        if not _set_page_size(dev, dims, options, resolution):
+            return whole
+    return _PageFraming(
+        paper_size=paper_size,
+        resolution=resolution,
+        geometry_set=_set_geometry(dev, paper_size, options, resolution),
+    )
+
+
 def _maybe_crop(
     image: Image.Image,
     paper_size: PaperSize,
@@ -926,9 +1132,15 @@ def _maybe_crop(
     """
     Crop to the paper size when the area could not be set on the device.
 
+    The crop is measured from the page's top-left corner, which is right only
+    where the sheet's corner is the window's: on the flatbed, and in a feeder
+    window the device has centred on the paper itself.  A paper size that was
+    not applied reaches here as ``"full"``, so a feeder page whose placement is
+    unknown is never cropped.
+
     Args:
         image: Scanned page image.
-        paper_size: Paper size key (e.g. ``"a4"``).
+        paper_size: Paper size key (e.g. ``"a4"``), or ``"full"`` for none.
         resolution: The resolution the device actually reported, in dpi.
             Deliberately not the requested one: the crop arithmetic and the
             device's real sampling rate have to agree, or a silently clamped
@@ -958,7 +1170,10 @@ class _PageFraming:
     ``PLR0913`` limit, and would let the two disagree.
 
     Attributes:
-        paper_size: The requested paper size key, e.g. ``"a4"``, or ``"full"``.
+        paper_size: The paper size key the pages are framed to, e.g. ``"a4"``,
+            or ``"full"`` for the whole window: either because none was asked
+            for, or because it was not applied, on a feeder that cannot say
+            where it places the sheet.
         resolution: The resolution the device actually reported, in dpi. The
             crop arithmetic uses it, and every PDF lays the page out at it.
         geometry_set: Whether the scan area was already set on the device, in
@@ -2314,8 +2529,8 @@ def _configure_device(
     source change does exactly that.  Setting the source last therefore lets a
     resolution validated against the platen's constraint be stranded under a
     feeder's narrower one.  Asking the device what it is scanning *from* before
-    telling it *how* removes that whole class of failure.  Geometry is set
-    afterwards, by ``_set_geometry`` in the caller.
+    telling it *how* removes that whole class of failure.  The paper size is
+    applied afterwards, by ``_apply_paper_size`` in the caller.
 
     The order is source, mode, depth, resolution. After the source, the option
     list is read again, once: the reload may have changed which options the
@@ -3206,11 +3421,23 @@ class SaneBackend(ScannerBackend):
             )
             actual_resolution = configured.resolution
 
-            # Constrain the scan area to the paper size, if the device reports
-            # the options to do it with, scaling by the unit it reports at the
-            # resolution it actually chose.
-            geometry_set = _set_geometry(
-                dev, settings.paper_size, configured.options, actual_resolution
+            # Routing comes before the paper size, because whether the pass
+            # feeds decides how the paper size can be applied without cutting
+            # an edge off the page.
+            use_adf = _route(choice, settings)
+
+            # Frame the pages to the paper size where that loses nothing,
+            # scaling by the unit the device reports at the resolution it
+            # actually chose.  Built once here and handed down, so both
+            # acquisition paths crop the same way and hand the sink the same
+            # read-back dpi, and neither has to carry the geometry facts as
+            # extra parameters past ruff's PLR0913 ceiling.
+            framing = _apply_paper_size(
+                dev,
+                configured.options,
+                settings,
+                use_adf=use_adf,
+                resolution=actual_resolution,
             )
 
             # What the device will now deliver, read once every option and
@@ -3218,18 +3445,6 @@ class SaneBackend(ScannerBackend):
             # either acquisition path starts a page.
             parameters = _read_parameters(dev, device_id)
             _refuse_sixteen_bit(parameters, device_id)
-
-            use_adf = _route(choice, settings)
-
-            # Built once here and handed down, so both acquisition paths crop
-            # the same way and hand the sink the same read-back dpi, and
-            # neither has to carry the three geometry facts as extra
-            # parameters past ruff's PLR0913 ceiling.
-            framing = _PageFraming(
-                paper_size=settings.paper_size,
-                resolution=actual_resolution,
-                geometry_set=geometry_set,
-            )
 
             if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
