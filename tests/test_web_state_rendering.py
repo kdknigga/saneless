@@ -905,7 +905,7 @@ def test_title_input_is_capped_at_the_server_limit(client: TestClient) -> None:
     match = _TITLE_INPUT.search(client.get("/").text)
     assert match is not None, "title input markup not found"
     assert f'maxlength="{TITLE_MAX_LENGTH}"' in match.group(0)
-    assert 'maxlength="256"' in match.group(0)
+    assert 'maxlength="118"' in match.group(0)
 
 
 def test_title_input_cap_comes_from_the_route_context(
