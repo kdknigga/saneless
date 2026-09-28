@@ -61,6 +61,7 @@ from saneless.vocabulary import (
     ScanOutcome,
     SubmitResult,
     WorkerHealth,
+    ambiguous_source_error,
     blank_timeout_finish_warning,
     busy_line,
     cap_finish_warning,
@@ -87,6 +88,7 @@ from saneless.vocabulary import (
     rejection_status_code,
     removed_pages,
     removed_pages_note,
+    source_not_offered_error,
     state_label,
     timeout_finish_warning,
     worker_health_detail,
@@ -650,6 +652,28 @@ class TestFinishWarnings:
         """The cap warning names where the document ended and the cap."""
         assert cap_finish_warning(512, 500) == (
             "Finished at 512 pages: no new scan starts once a document has 500 pages. Scan any remaining pages as a new document."
+        )
+
+    def test_source_not_offered_error(self) -> None:
+        """The refusal names the request, the offered sources and the fix."""
+        assert source_not_offered_error("Nope", ["Auto", "Flatbed", "ADF"]) == (
+            "The scanner has no source named 'Nope'. It offers 'Auto', 'Flatbed', "
+            "'ADF'; set the profile's source to one of those names."
+        )
+
+    def test_source_not_offered_error_when_the_scanner_lists_none(self) -> None:
+        """An empty list is said plainly rather than as an empty enumeration."""
+        assert source_not_offered_error("ADF", []) == (
+            "The scanner has no source named 'ADF', and it lists no sources to "
+            "choose from."
+        )
+
+    def test_ambiguous_source_error(self) -> None:
+        """The refusal names the request and every entry it could have meant."""
+        assert ambiguous_source_error("Adf", ["ADF", "adf"]) == (
+            "The source 'Adf' matches more than one of the scanner's sources "
+            "when case and surrounding spaces are ignored: 'ADF', 'adf'. Set "
+            "the profile's source to one of those names exactly."
         )
 
     def test_blank_timeout_finish_warning(self) -> None:

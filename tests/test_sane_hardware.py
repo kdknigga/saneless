@@ -258,6 +258,46 @@ class TestRealSaneTestBackend:
         assert [record.sequence for record in pages] == list(range(1, 11))
         assert all(record.path.exists() for record in pages)
 
+    def test_a_lowercase_feeder_name_drains_the_feeder(self, tmp_path: Path) -> None:
+        """
+        The feeder's name in another case scans all ten sheets through it.
+
+        libsane would take the lowercase name on its own, but saneless decides
+        routing from the name it resolved, so the match has to be saneless's:
+        refused, or matched to the platen, this reads ``0`` or ``1`` pages.
+
+        Args:
+            tmp_path: Where the ten pages are spooled.
+
+        """
+        settings = ScanSettings(
+            source="automatic document feeder", resolution=75, mode="Gray"
+        )
+        pages = (
+            SaneBackend().scan_pages("test:0", settings, _page_sink_for(tmp_path)).pages
+        )
+        assert len(pages) == 10
+
+    def test_a_prefix_of_the_feeder_name_is_refused(self, tmp_path: Path) -> None:
+        """
+        'adf' is not taken as a prefix of the feeder, and nothing is spooled.
+
+        ``test:0`` names its feeder "Automatic Document Feeder", which 'adf'
+        is not a case-insensitive spelling of, and saneless does no prefix
+        matching of its own.
+
+        Args:
+            tmp_path: Where any page would have been spooled.
+
+        """
+        settings = ScanSettings(source="adf", resolution=75, mode="Gray")
+        with pytest.raises(ScanError) as excinfo:
+            SaneBackend().scan_pages("test:0", settings, _page_sink_for(tmp_path))
+        message = str(excinfo.value)
+        assert "'adf'" in message
+        assert "'Automatic Document Feeder'" in message
+        assert not list((tmp_path / "spool").iterdir())
+
     def test_every_uniformly_black_page_survives_the_scanner_layer(
         self, tmp_path: Path
     ) -> None:

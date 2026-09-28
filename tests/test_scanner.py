@@ -2490,22 +2490,20 @@ class TestResolveSourceForManualDuplex:
         """The device's own first feeder is chosen, not a guessed name."""
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
 
-        effective, has_source_option = sane_backend_mod._resolve_source(
-            raw, "Flatbed", resolve_feeder=True
-        )
+        choice = sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
 
-        assert effective == "Automatic Document Feeder"
-        assert has_source_option is True
+        assert choice.effective == "Automatic Document Feeder"
+        assert choice.has_option is True
 
     def test_a_single_sided_feeder_the_operator_named_is_honoured(self) -> None:
         """An operator who picked one of two feeders gets that one (T-25-28)."""
         raw = _options_reporting(["Flatbed", "ADF Front", "Automatic Document Feeder"])
 
-        effective, _ = sane_backend_mod._resolve_source(
+        choice = sane_backend_mod._resolve_source(
             raw, "Automatic Document Feeder", resolve_feeder=True
         )
 
-        assert effective == "Automatic Document Feeder"
+        assert choice.effective == "Automatic Document Feeder"
 
     def test_a_named_both_sides_feeder_is_overridden_loudly(
         self, caplog: pytest.LogCaptureFixture
@@ -2521,11 +2519,11 @@ class TestResolveSourceForManualDuplex:
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            effective, _ = sane_backend_mod._resolve_source(
+            choice = sane_backend_mod._resolve_source(
                 raw, "ADF Duplex", resolve_feeder=True
             )
 
-        assert effective == "Automatic Document Feeder"
+        assert choice.effective == "Automatic Document Feeder"
         warnings = [
             record.getMessage()
             for record in caplog.records
@@ -2543,11 +2541,9 @@ class TestResolveSourceForManualDuplex:
         """The first *single-sided* feeder is chosen, not the first feeder (WR-02)."""
         raw = _options_reporting(["Flatbed", "ADF Duplex", "Automatic Document Feeder"])
 
-        effective, _ = sane_backend_mod._resolve_source(
-            raw, "Flatbed", resolve_feeder=True
-        )
+        choice = sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
 
-        assert effective == "Automatic Document Feeder"
+        assert choice.effective == "Automatic Document Feeder"
 
     def test_a_device_whose_only_feeder_scans_both_sides_is_refused(self) -> None:
         """
@@ -2570,9 +2566,9 @@ class TestResolveSourceForManualDuplex:
         """``source = "ADF"`` on a device that says "Automatic Document Feeder"."""
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder"])
 
-        effective, _ = sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+        choice = sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
 
-        assert effective == "Automatic Document Feeder"
+        assert choice.effective == "Automatic Document Feeder"
 
     def test_a_flatbed_only_device_is_refused_naming_its_sources(self) -> None:
         """No feeder means no manual duplex, said loudly and before any scan."""
@@ -2607,18 +2603,19 @@ class TestResolveSourceForManualDuplex:
         """
         raw = build_option_table(omit=("source",))
 
-        assert sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True) == (
-            "ADF",
-            False,
-        )
+        choice = sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+
+        assert (choice.effective, choice.has_option) == ("ADF", False)
 
     def test_no_source_option_accepts_the_legacy_manual_duplex_name(self) -> None:
         """The pre-phase ``source = "Manual Duplex"`` profile runs again (WR-03)."""
         raw = build_option_table(omit=("source",))
 
-        assert sane_backend_mod._resolve_source(
+        choice = sane_backend_mod._resolve_source(
             raw, "Manual Duplex", resolve_feeder=True
-        ) == ("Manual Duplex", False)
+        )
+
+        assert (choice.effective, choice.has_option) == ("Manual Duplex", False)
 
     def test_no_source_option_refuses_a_non_feeder_name(self) -> None:
         """A configured flatbed on a device with no source option is refused (WR-03)."""
@@ -2629,29 +2626,40 @@ class TestResolveSourceForManualDuplex:
 
         assert "'Flatbed'" in str(excinfo.value)
 
-    def test_without_the_flag_auto_is_still_substituted(self) -> None:
-        """The simplex path's validate-or-substitute behaviour is unchanged."""
+    def test_without_the_flag_a_missing_feeder_is_refused_not_auto(self) -> None:
+        """
+        The simplex path no longer swaps ``Auto`` in for a feeder it lacks.
+
+        ``Auto`` routed by the default ``auto_source_mode`` takes one platen
+        snapshot, so a stack would come back as one page reported as success.
+        """
         raw = _options_reporting(["Flatbed", "Auto"])
 
-        assert sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=False) == (
-            "Auto",
-            True,
-        )
+        with pytest.raises(ScanError) as excinfo:
+            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=False)
+
+        message = str(excinfo.value)
+        assert all(name in message for name in ("'ADF'", "'Flatbed'", "'Auto'"))
 
     def test_without_the_flag_an_unsupported_source_still_raises(self) -> None:
-        """The simplex path's refusal message keeps its existing shape."""
+        """The simplex refusal names what was asked for and what is on offer."""
         raw = _options_reporting(["Flatbed"])
 
-        with pytest.raises(ScanError, match="Device does not support source 'ADF'"):
+        with pytest.raises(ScanError) as excinfo:
             sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=False)
+
+        message = str(excinfo.value)
+        assert "'ADF'" in message
+        assert "'Flatbed'" in message
 
     def test_without_the_flag_a_reported_flatbed_is_kept(self) -> None:
         """Only manual duplex looks for a feeder; a simplex flatbed stays put."""
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder"])
 
-        assert sane_backend_mod._resolve_source(
-            raw, "Flatbed", resolve_feeder=False
-        ) == ("Flatbed", True)
+        choice = sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=False)
+
+        assert (choice.effective, choice.has_option) == ("Flatbed", True)
+        assert choice.substituted_from is None
 
     def test_scan_settings_does_not_resolve_a_feeder_by_default(self) -> None:
         """Every existing simplex construction keeps today's behaviour."""
@@ -4813,10 +4821,10 @@ class TestSourceOptionPresence:
 
     def test_a_device_with_no_source_option_is_left_alone(self) -> None:
         """No source option means nothing to assign and nothing to validate."""
-        effective, has_source_option = sane_backend_mod._resolve_source([], "Flatbed")
+        choice = sane_backend_mod._resolve_source([], "Flatbed")
 
-        assert has_source_option is False
-        assert effective == "Flatbed"
+        assert choice.has_option is False
+        assert choice.effective == "Flatbed"
 
     @pytest.mark.parametrize(
         "constraint",
@@ -4827,66 +4835,376 @@ class TestSourceOptionPresence:
         self, constraint: object
     ) -> None:
         """
-        Presence is detected even when the constraint cannot be read as a list.
+        An unreadable constraint still means a source to assign.
 
-        This is a regression guard rather than a RED assertion: it already holds,
-        and it is precisely the behaviour most at risk from the dedup.  The raise
-        is what witnesses presence -- a device whose source option went
-        unnoticed would return cleanly here instead, and saneless would scan
-        from whatever source the device happened to be left on.
+        saneless cannot check the name against a list it cannot read, so it
+        hands the requested name over, trimmed, and leaves the device to accept
+        or refuse it. Refusing here instead would stop every scan on such a
+        device, and not assigning at all would scan from whatever source the
+        device happened to be left on.
         """
-        with pytest.raises(ScanError):
-            sane_backend_mod._resolve_source(
-                [_option(1, "source", _STRING_OPTION, constraint)], "Flatbed"
-            )
+        choice = sane_backend_mod._resolve_source(
+            [_option(1, "source", _STRING_OPTION, constraint)], " ADF "
+        )
+
+        assert choice.has_option is True
+        assert choice.effective == "ADF"
+        assert choice.substituted_from is None
 
 
 class TestAutoSourceFallbackIsAudible:
     """
-    Substituting 'Auto' for a missing source can change the page count (WR-02).
+    Only a flatbed request may still become 'Auto', and never silently.
 
-    ``scan_pages`` classifies the *effective* source, so a profile asking for
-    "ADF Duplex" on a device offering only Flatbed and Auto is routed by
-    ``auto_source_mode``, which defaults to "flatbed" -- one page out of a
-    whole stack.  That was announced at INFO, while the comparable resolution
-    substitution has warned since M-16.
+    ``scan_pages`` classifies the *effective* source, so ``Auto`` is routed by
+    ``auto_source_mode``, which defaults to "flatbed". A feeder request swapped
+    for ``Auto`` would therefore bring a whole stack back as one page, so that
+    swap is refused. A flatbed request swapped for ``Auto`` on a device with no
+    ``Flatbed`` entry scans the glass as asked, so it is kept and logged.
     """
 
     def _flatbed_and_auto(self) -> list[tuple]:
         """Build an option table whose source list offers no feeder."""
         return [_option(1, "source", _STRING_OPTION, ["Flatbed", "Auto"])]
 
-    def test_the_substitution_still_happens(self) -> None:
-        """Raising the level must not change which source is chosen."""
-        effective, has_source_option = sane_backend_mod._resolve_source(
-            self._flatbed_and_auto(), "ADF Duplex"
+    def _auto_and_adf(self) -> list[tuple]:
+        """Build an option table whose source list offers no flatbed."""
+        return [_option(1, "source", _STRING_OPTION, ["Auto", "ADF"])]
+
+    def test_a_feeder_request_is_refused_rather_than_substituted(self) -> None:
+        """'ADF Duplex' on a Flatbed-and-Auto device refuses, naming the sources."""
+        with pytest.raises(ScanError) as excinfo:
+            sane_backend_mod._resolve_source(self._flatbed_and_auto(), "ADF Duplex")
+
+        message = str(excinfo.value)
+        assert all(name in message for name in ("'ADF Duplex'", "'Flatbed'", "'Auto'"))
+
+    def test_a_flatbed_request_is_still_substituted(self) -> None:
+        """A flatbed request becomes the device's Auto, and the record says so."""
+        choice = sane_backend_mod._resolve_source(self._auto_and_adf(), "Flatbed")
+
+        assert choice.effective == "Auto"
+        assert choice.has_option is True
+        assert choice.substituted_from == "Flatbed"
+
+    def test_the_device_spelling_of_auto_is_the_one_assigned(self) -> None:
+        """Auto is recognised by the classifier, so a lowercase 'auto' is used."""
+        raw = [_option(1, "source", _STRING_OPTION, ["auto", "ADF"])]
+
+        choice = sane_backend_mod._resolve_source(raw, "Flatbed")
+
+        assert choice.effective == "auto"
+        assert choice.substituted_from == "Flatbed"
+
+    def test_the_substitution_is_logged_where_routing_is_known(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A substitution that keeps the glass is an INFO line naming both sources.
+
+        Resolution cannot know whether ``Auto`` will feed, so the line is
+        written once routing is decided, and at INFO because nothing is lost.
+        """
+        dev = FakeSaneDev(pages=1)
+        dev.report_sources(["Auto", "ADF"])
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        with caplog.at_level(logging.INFO, logger=_BACKEND_LOGGER):
+            backend.scan_pages(_TEST_DEVICE, settings, page_sink)
+
+        assert [
+            record
+            for record in caplog.records
+            if record.name == _BACKEND_LOGGER
+            and record.levelno == logging.INFO
+            and "'Flatbed'" in record.getMessage()
+            and "'Auto'" in record.getMessage()
+        ]
+
+
+class TestSourceMatching:
+    """
+    A profile's source is matched as an operator means it, or refused.
+
+    Case and surrounding whitespace are ignored and the device's own spelling
+    is assigned. Nothing is matched by prefix, two entries that differ only in
+    case are never guessed between, and a name the device does not offer is
+    refused before anything is started -- except a flatbed request, which may
+    fall back to the device's Auto source.
+    """
+
+    def _scan(
+        self,
+        sources: list[str],
+        settings: ScanSettings,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+    ) -> tuple[FakeSaneDev, ScanBatch]:
+        """
+        Scan once from a device offering ``sources``.
+
+        Args:
+            sources: The source names the device reports.
+            settings: The scan settings to run.
+            monkeypatch: Fixture used to wire the device into the backend.
+            page_sink: Where the pages go.
+
+        Returns:
+            The device, for inspection, and the batch the scan returned.
+
+        """
+        dev = FakeSaneDev()
+        dev.report_sources(sources)
+        batch = _backend_with(dev, monkeypatch).scan_pages(
+            _TEST_DEVICE, settings, page_sink
+        )
+        return dev, batch
+
+    def _refused(
+        self,
+        sources: list[str],
+        requested: str,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+    ) -> tuple[FakeSaneDev, str]:
+        """
+        Scan from a device that must refuse ``requested``.
+
+        ``auto_source_mode`` is "adf", so an ``Auto`` substituted in its place
+        would feed: a refusal cannot be mistaken for a harmless platen snapshot.
+
+        Args:
+            sources: The source names the device reports.
+            requested: The profile's source.
+            monkeypatch: Fixture used to wire the device into the backend.
+            page_sink: Where the pages would go.
+
+        Returns:
+            The device, for inspection, and the refusal's message.
+
+        """
+        dev = FakeSaneDev()
+        dev.report_sources(sources)
+        settings = ScanSettings(
+            source=requested, resolution=300, mode="Color", auto_source_mode="adf"
+        )
+        with pytest.raises(ScanError) as excinfo:
+            _backend_with(dev, monkeypatch).scan_pages(
+                _TEST_DEVICE, settings, page_sink
+            )
+        return dev, str(excinfo.value)
+
+    def test_a_lowercase_feeder_name_scans_the_device_feeder(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """'adf' selects the device's 'ADF' and drains the stack, not Auto."""
+        settings = ScanSettings(source="adf", resolution=300, mode="Color")
+
+        dev, batch = self._scan(
+            ["Auto", "Flatbed", "ADF"], settings, monkeypatch, page_sink
         )
 
-        assert effective == "Auto"
-        assert has_source_option is True
+        assert dev.source == "ADF"
+        assert len(batch.pages) == 3
+        assert dev.calls == _THREE_SHEET_FEEDER_CALLS
+        assert batch.substituted_source is None
 
-    def test_the_substitution_is_a_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The requested source is named, at a level the operator sees."""
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            sane_backend_mod._resolve_source(self._flatbed_and_auto(), "ADF Duplex")
-
-        assert [m for m in _warning_messages(caplog) if "ADF Duplex" in m]
-
-    def test_the_warning_names_the_routing_consequence(
-        self, caplog: pytest.LogCaptureFixture
+    def test_surrounding_whitespace_and_case_are_ignored(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """
-        The page-count risk is the point, not the substitution alone.
+        '  flatbed ' selects 'Flatbed'.
 
-        "Falling back to Auto" reads as harmless; "may not be multi-page" is
-        the part that explains a one-page PDF from a twenty-sheet stack.
+        The device's spelling is what is assigned: libsane strips nothing, so
+        handing it the padded name would be refused.
         """
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            sane_backend_mod._resolve_source(self._flatbed_and_auto(), "ADF Duplex")
+        settings = ScanSettings(source="  flatbed ", resolution=300, mode="Color")
 
-        assert [m for m in _warning_messages(caplog) if "auto_source_mode" in m]
+        dev, batch = self._scan(["Flatbed", "ADF"], settings, monkeypatch, page_sink)
+
+        assert dev.source == "Flatbed"
+        assert len(batch.pages) == 1
+        assert dev.calls == ["start", "snap"]
+
+    def test_the_device_spelling_is_the_value_assigned(self) -> None:
+        """The resolved name is the device's entry, not the request."""
+        raw = _options_reporting(["Auto", "Flatbed", "ADF"])
+
+        choice = sane_backend_mod._resolve_source(raw, " adf")
+
+        assert choice.effective == "ADF"
+        assert choice.substituted_from is None
+
+    @pytest.mark.parametrize(
+        ("requested", "sources"),
+        [
+            ("Nope", ["Auto", "Flatbed", "ADF"]),
+            ("ADF Duplex", ["Flatbed", "Auto"]),
+            ("Tray 2", ["Flatbed", "Auto"]),
+            ("Flatbed", ["ADF"]),
+        ],
+        ids=["unknown-name", "duplex-feeder", "unclassified", "flatbed-without-auto"],
+    )
+    def test_an_unmatched_source_is_refused_before_any_page(
+        self,
+        requested: str,
+        sources: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """Nothing is started, the source is never assigned, and both are named."""
+        dev, message = self._refused(sources, requested, monkeypatch, page_sink)
+
+        assert dev.calls == []
+        assert "source" not in dev.assignments
+        assert repr(requested) in message
+        assert all(repr(name) in message for name in sources)
+
+    def test_two_entries_differing_only_in_case_are_not_guessed_between(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """'Adf' against 'ADF' and 'adf' refuses, naming both."""
+        dev, message = self._refused(
+            ["Auto", "ADF", "adf"], "Adf", monkeypatch, page_sink
+        )
+
+        assert dev.calls == []
+        assert "'Adf'" in message
+        assert "'ADF'" in message
+        assert "'adf'" in message
+
+    def test_an_exact_entry_wins_over_its_case_twin(self) -> None:
+        """'adf' against 'ADF' and 'adf' is not ambiguous: it is listed exactly."""
+        raw = _options_reporting(["Auto", "ADF", "adf"])
+
+        choice = sane_backend_mod._resolve_source(raw, "adf")
+
+        assert choice.effective == "adf"
+
+    @pytest.mark.parametrize(
+        "sources", [["ADF"], ["Auto", "ADF"]], ids=["feeder-only", "with-auto"]
+    )
+    def test_a_prefix_is_not_a_match(
+        self,
+        sources: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        'AD' is refused, although libsane itself would take it as 'ADF'.
+
+        A prefix is a guess: 'ADF' is also a prefix of 'ADF Duplex'.
+        """
+        dev, message = self._refused(sources, "AD", monkeypatch, page_sink)
+
+        assert dev.calls == []
+        assert "'AD'" in message
+
+    def test_a_flatbed_request_on_auto_keeps_the_glass_quietly(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        Flatbed becomes Auto, scans one page, and leaves nothing on the batch.
+
+        This is the built-in default profile on a scanner that lists only Auto
+        and ADF: the glass is scanned as asked, so it is an INFO line and not
+        a warning.
+        """
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", auto_source_mode="flatbed"
+        )
+
+        with caplog.at_level(logging.INFO, logger=_BACKEND_LOGGER):
+            dev, batch = self._scan(["Auto", "ADF"], settings, monkeypatch, page_sink)
+
+        assert dev.source == "Auto"
+        assert len(batch.pages) == 1
+        assert batch.substituted_source is None
+        backend_records = [r for r in caplog.records if r.name == _BACKEND_LOGGER]
+        assert [
+            r
+            for r in backend_records
+            if r.levelno == logging.INFO
+            and "'Flatbed'" in r.getMessage()
+            and "'Auto'" in r.getMessage()
+        ]
+        assert not [
+            r
+            for r in backend_records
+            if r.levelno >= logging.WARNING and "Flatbed" in r.getMessage()
+        ]
+
+    def test_a_flatbed_request_routed_to_the_feeder_is_recorded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        Flatbed becomes Auto, auto_source_mode sends it to the feeder: a fact.
+
+        The operator asked for the glass and got a stack, so the batch names
+        the requested source and the log warns.
+        """
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", auto_source_mode="adf"
+        )
+
+        with caplog.at_level(logging.INFO, logger=_BACKEND_LOGGER):
+            dev, batch = self._scan(["Auto", "ADF"], settings, monkeypatch, page_sink)
+
+        assert dev.source == "Auto"
+        assert len(batch.pages) == 3
+        assert dev.calls == _THREE_SHEET_FEEDER_CALLS
+        assert batch.substituted_source == "Flatbed"
+        assert [m for m in _warning_messages(caplog) if "'Flatbed'" in m]
+
+    def test_an_unreadable_constraint_assigns_the_trimmed_request(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        A source option whose constraint is not a list is given ' ADF ' trimmed.
+
+        The device validates it; saneless routes on it, so the stack is fed.
+        """
+        table = [
+            (*option[:8], None) if option[1] == "source" else option
+            for option in build_option_table()
+        ]
+        dev = FakeSaneDev(options=table)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source=" ADF ", resolution=300, mode="Color")
+
+        batch = backend.scan_pages(_TEST_DEVICE, settings, page_sink)
+
+        assert dev.source == "ADF"
+        assert len(batch.pages) == 3
+        assert dev.calls == _THREE_SHEET_FEEDER_CALLS
+
+    def test_manual_duplex_matches_the_named_feeder_the_same_way(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """'adf' picks the device's 'ADF', not merely its first feeder."""
+        settings = ScanSettings(
+            source="adf", resolution=300, mode="Color", resolve_feeder_source=True
+        )
+
+        dev, batch = self._scan(
+            ["Flatbed", "Automatic Document Feeder", "ADF"],
+            settings,
+            monkeypatch,
+            page_sink,
+        )
+
+        assert dev.source == "ADF"
+        assert len(batch.pages) == 3
 
 
 class TestDeviceCapabilitiesShape:
