@@ -173,6 +173,7 @@ _CONNECTION_STATUS_CASES = [
     pytest.param(401, ConnectionStatus.TOKEN_REJECTED, id="401"),
     pytest.param(403, ConnectionStatus.TOKEN_REJECTED, id="403"),
     pytest.param(404, ConnectionStatus.NOT_FOUND, id="404"),
+    pytest.param(406, ConnectionStatus.INCOMPATIBLE, id="406"),
     pytest.param(500, ConnectionStatus.SERVER_ERROR, id="500"),
     pytest.param(503, ConnectionStatus.SERVER_ERROR, id="503"),
     pytest.param(302, ConnectionStatus.SERVER_ERROR, id="302"),
@@ -3667,11 +3668,11 @@ class TestConnectionTest:
         """
         No ConnectionStatus member is unreachable from a real response.
 
-        Parametrised over `list(ConnectionStatus)` so a sixth member cannot
+        Parametrised over `list(ConnectionStatus)` so a new member cannot
         be added without someone deciding what produces it.
         """
         produced = {
-            _connection_result_for_status(code) for code in (200, 401, 404, 500)
+            _connection_result_for_status(code) for code in (200, 401, 404, 406, 500)
         }
         produced.add(_connection_result_for_exception(httpx2.ConnectError))
         assert member in produced, f"{member.name} is not produced by any input"
@@ -3687,6 +3688,10 @@ class TestConnectionTest:
         assert _connection_result_for_status(200) == "connected"
         assert _connection_result_for_status(401) == "token_rejected"
         assert _connection_result_for_exception(httpx2.ConnectError) == "unreachable"
+
+    def test_connection_406_is_incompatible_version_on_the_wire(self) -> None:
+        """A server refusing API 9 answers the documented sixth string."""
+        assert _connection_result_for_status(406) == "incompatible_version"
 
     def test_connection_test_hits_the_tags_endpoint(self) -> None:
         """The probe is a one-row GET against /api/tags/."""

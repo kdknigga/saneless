@@ -5557,6 +5557,9 @@ _PROBE_OUTCOMES = [
     pytest.param(
         500, CheckState.FAIL, ConnectionStatus.SERVER_ERROR, id="server-error"
     ),
+    pytest.param(
+        406, CheckState.FAIL, ConnectionStatus.INCOMPATIBLE, id="incompatible"
+    ),
 ]
 
 
@@ -5700,6 +5703,38 @@ class TestPaperlessCheck:
         assert row.message == "Could not reach paperless-ngx."
         assert row.next_step == (
             "Check paperless-ngx is running and on the network, then press Check again."
+        )
+
+    def test_an_incompatible_paperless_names_the_release_needed(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A 406 is its own failure row, not a server error, and says what to run.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+
+        def responder(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
+                406, json={"detail": 'Invalid version in "Accept" header.'}
+            )
+
+        counter = _RequestCounter(responder)
+        client = _paperless(counter)
+        try:
+            results = run_checks(_context(_settings(tmp_path), paperless=client))
+        finally:
+            client.close()
+        row = _row(results, CheckKey.PAPERLESS)
+        assert row.state is CheckState.FAIL
+        assert row.message == (
+            "This paperless-ngx does not speak an API version saneless supports."
+        )
+        assert row.next_step == (
+            "saneless needs paperless-ngx 2.16 or later (API version 9 or 10); "
+            "upgrade paperless-ngx, then press Check again."
         )
 
     def test_the_probe_is_bounded(self, tmp_path: Path) -> None:

@@ -1862,16 +1862,16 @@ class TestRequestRejection:
 class TestConnectionStatus:
     """ConnectionStatus membership, wire-value and message tests."""
 
-    def test_connection_status_has_exactly_five_members(self) -> None:
+    def test_connection_status_has_exactly_six_members(self) -> None:
         """
-        ConnectionStatus declares exactly five outcomes (OUTC-08).
+        ConnectionStatus declares exactly six outcomes.
 
         A count guard, not a name list: adding a member should fail the
         parametrised completeness test below -- which forces a user-facing
         message -- rather than a hand-written roster that only records what the
         enum happened to contain when it was written.
         """
-        assert len(list(ConnectionStatus)) == 5
+        assert len(list(ConnectionStatus)) == 6
 
     @pytest.mark.parametrize(
         ("status", "expected"),
@@ -1881,6 +1881,7 @@ class TestConnectionStatus:
             (ConnectionStatus.NOT_FOUND, "not_found"),
             (ConnectionStatus.SERVER_ERROR, "server_error"),
             (ConnectionStatus.UNREACHABLE, "unreachable"),
+            (ConnectionStatus.INCOMPATIBLE, "incompatible_version"),
         ],
     )
     def test_connection_status_wire_values(
@@ -1945,6 +1946,9 @@ class TestConnectionStatus:
         )
         assert connection_status_message(ConnectionStatus.UNREACHABLE) == (
             "Could not reach paperless-ngx."
+        )
+        assert connection_status_message(ConnectionStatus.INCOMPATIBLE) == (
+            "This paperless-ngx does not speak an API version saneless supports."
         )
 
     def test_connection_status_message_raises_on_unrecognised_value(self) -> None:

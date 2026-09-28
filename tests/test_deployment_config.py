@@ -116,6 +116,7 @@ from saneless.pipeline import MAX_DOCUMENT_PAGES, PipelineEvent
 from saneless.scanner.base import MAX_PAGES_PER_PASS, PageRecord
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
+    ConnectionStatus,
     ExitCode,
     JobState,
     RequestRejection,
@@ -1646,6 +1647,30 @@ def test_every_rejection_member_is_documented_with_its_message() -> None:
     assert not missing, (
         f"{name} does not document these rejections, with the member name and "
         "the exact sentence saneless renders:\n" + "\n".join(missing)
+    )
+
+
+_COUNT_WORDS = {5: "five", 6: "six", 7: "seven", 8: "eight"}
+
+
+def test_every_connection_status_is_documented_in_the_web_api_reference() -> None:
+    """
+    Every ``/api/paperless/test`` value is in the reference, and the count too.
+
+    Derived from ``ConnectionStatus``: a value added later cannot ship
+    without its table row, and the sentence calling the set complete cannot
+    keep an old count.
+    """
+    text, name = _read(WEB_API_REFERENCE)
+    missing = [
+        member.value
+        for member in ConnectionStatus
+        if f'`{{"status": "{member.value}"}}`' not in text
+    ]
+    assert not missing, f"{name} does not document these statuses: {missing}"
+    count = _COUNT_WORDS[len(ConnectionStatus)]
+    assert f"The {count} 200 values are the complete set" in text, (
+        f"{name} does not say the {count} 200 values are the complete set"
     )
 
 
