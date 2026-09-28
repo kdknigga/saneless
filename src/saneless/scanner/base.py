@@ -35,6 +35,7 @@ __all__ = [
     "DeviceSurvey",
     "PageRecord",
     "PageSink",
+    "PassCapReached",
     "ScanBatch",
     "ScanSettings",
     "ScannerBackend",
@@ -139,8 +140,10 @@ def classify_source(source: str) -> SourceKind:
     # above. That is visible to the operator and is fixed by one entry in a
     # tuple. The opposite failure -- treating a flatbed as a feeder and
     # re-scanning the platen until something stops it -- is the expensive one,
-    # and it is bounded separately by MAX_PAGES_PER_PASS above, which
-    # sane_backend.py enforces as _MAX_ADF_PAGES.
+    # and it is bounded separately, per pass: by MAX_PAGES_PER_PASS above for a
+    # source named as a feeder, which sane_backend.py enforces as
+    # _MAX_ADF_PAGES, and by the much lower _MAX_AUTO_FEEDER_PAGES there for a
+    # source sent through the feeder that does not classify as one.
     #
     # This is a settled answer. Do not re-open it as an unmade decision.
     return SourceKind.UNKNOWN
@@ -291,20 +294,47 @@ class ScanSettings:
     paper_size: PaperSize = "full"
 
 
+@dataclass(frozen=True, slots=True)
+class PassCapReached:
+    """
+    One acquisition pass stopped at its page cap, and which sheet it dropped.
+
+    A pass is bounded because a device that never reports the end of its feed
+    -- a platen rescanned as a feeder -- would otherwise scan forever. Reaching
+    the bound is not a failure: the pages already scanned are kept, and this
+    records where the pass stopped so the operator knows where to resume.
+
+    Attributes:
+        cap: The most pages the pass could keep.
+        sheet_not_kept: The number of the fed sheet that was acquired past the
+            cap and discarded, counted from one over every sheet fed in the
+            pass, readable or not. The overrun is only seen on that sheet, so
+            it is always ``cap + 1``.
+        auto_source: Whether the lower bound for a source that is not a named
+            feeder applied, rather than the per-pass cap a named feeder gets.
+
+    """
+
+    cap: int
+    sheet_not_kept: int
+    auto_source: bool
+
+
 @dataclass(frozen=True)
 class ScanBatch:
     """
     The pages one acquisition produced, and what the device actually did.
 
-    Four fields, and the per-page structure is ``pages`` itself: the ordered
+    Five fields, and the per-page structure is ``pages`` itself: the ordered
     page records are that design, and every per-page fact -- which file a
     sheet landed in, what was measured about it, where it sat in the pass --
     belongs on ``PageRecord`` rather than here. What survives at batch level
     is what the backend knows about the pass as a whole: the two things the
-    device reports (``actual_resolution`` and ``pages_rejected``) and one
-    thing its own source resolution produced (``substituted_source``). This
-    is the one channel carrying them alongside the records, and there is no
-    second route out of the backend. Do not extend this casually: a fact that
+    device reports (``actual_resolution`` and ``pages_rejected``), one thing
+    its own source resolution produced (``substituted_source``), and whether
+    the pass stopped at its page cap (``cap_reached``). This is the one
+    channel carrying them alongside the records, and there is no second route
+    out of the backend. Do not extend this casually: a fact that
     is per-page belongs on the record. It deliberately carries no geometry
     either, because a scan area the device clamped falls back to the existing
     crop rather than being reported back out.
@@ -335,6 +365,11 @@ class ScanBatch:
             document feeder. None otherwise, including when ``Auto`` stood in
             for a flatbed and scanned the glass as asked: nothing was lost
             then, so there is nothing for the job to report.
+        cap_reached: The page cap the pass stopped at and the sheet it fed but
+            did not keep, when the device was still feeding at the cap. None
+            when the feed ended on its own. A capped pass keeps its pages and
+            is not an error: this is a fact about the whole pass, reported so
+            the job can say where to resume.
 
     """
 
@@ -342,6 +377,7 @@ class ScanBatch:
     actual_resolution: int
     pages_rejected: int
     substituted_source: str | None = None
+    cap_reached: PassCapReached | None = None
 
 
 @dataclass(frozen=True)

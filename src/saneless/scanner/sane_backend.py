@@ -59,6 +59,7 @@ from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
     DeviceSurvey,
+    PassCapReached,
     ScanBatch,
     ScannerBackend,
     ScanSettings,
@@ -232,7 +233,13 @@ _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 # start()/snap() keep succeeding, so the iterator re-scans the platen and the
 # loop never terminates on its own -- reproduced live against a Flatbed source.
 # The per-page timeout is no defence: a scan that succeeds satisfies it every
-# iteration. This cap is what stops that loop.
+# iteration. This cap is what stops that loop for a source named as a feeder;
+# _MAX_AUTO_FEEDER_PAGES below stops it much sooner for one that is not.
+#
+# Reaching it is not a failure. The sheet past the cap -- the only place the
+# overrun can be seen -- is discarded, the pages already kept are returned, and
+# the batch records which sheet was fed but not kept, so the operator knows
+# where to resume.
 #
 # WHAT IT DOES NOT BOUND: memory. At A4 300 dpi colour a page is roughly 26 MB,
 # so at 500 pages a backend that accumulated them would hold roughly 13 GB.
@@ -258,6 +265,21 @@ _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 # cap that has to be read together with this one is paired with that constant
 # rather than with a copy of it.
 _MAX_ADF_PAGES: int = MAX_PAGES_PER_PASS
+
+# The per-pass bound for a source sent through the feeder that does not
+# classify as a feeder: in practice Auto with auto_source_mode = "adf", whether
+# the profile asked for Auto or Auto stood in for a flatbed request.
+#
+# Such a source may be a platen rescanned as a feeder. Measured on the SANE
+# test backend, a Flatbed source driven through multi_scan() never reports the
+# end of its feed, so the only thing that ends the pass is a cap, and at
+# _MAX_ADF_PAGES that is hours of a scanner rescanning one sheet. Fifty bounds
+# it to minutes while still covering any plausible stack fed through Auto.
+#
+# It is a module constant beside _MAX_ADF_PAGES and deliberately not a config
+# key. Stopping after a run of identical pages was considered and rejected: it
+# needs fuzzy image comparison, and a stack of identical forms would trip it.
+_MAX_AUTO_FEEDER_PAGES: Final = 50
 
 # The one message reported when a feeder produced no pages at all.
 _FEEDER_EMPTY_MESSAGE = "No paper detected in feeder"
@@ -2112,15 +2134,68 @@ def _acquire_with_timeout(
     raise ScanError(timeout_msg)
 
 
+@dataclass(frozen=True)
+class _PageBudget:
+    """
+    How long one page may take, how long its cancel may, and how many a pass may.
+
+    Bundled into one record rather than passed as separate parameters because
+    ``_acquire_pages`` and ``_snap_flatbed`` would otherwise sit past ruff's
+    ``PLR0913`` argument limit, and CLAUDE.md forbids both raising the limit
+    and suppressing the rule. Both acquisition paths take the same record, so
+    one sheet is bounded the same way whichever way it was presented; the page
+    cap means nothing to the flatbed path, which takes one sheet.
+
+    Every default is the module constant the feeder path uses, so "one sheet
+    is one sheet, whichever way it was presented" is expressed in the default
+    rather than merely asserted about it.
+
+    Attributes:
+        timeout: Maximum seconds to wait for the sheet.
+        grace: Maximum seconds to wait for a cancelled read to return.
+        max_pages: The most sheets one feeder pass keeps. The sheet past it is
+            fed, discarded and reported, never spooled.
+
+    """
+
+    timeout: float = _DEFAULT_PAGE_TIMEOUT_SECONDS
+    grace: float = _CANCEL_GRACE_SECONDS
+    max_pages: int = _MAX_ADF_PAGES
+
+
+# The shared default instance.  A module constant and not an inline
+# ``_PageBudget()`` in the signature, because a call in a default argument is
+# what ruff's B008 rejects; a frozen instance is safe to share.
+_DEFAULT_PAGE_BUDGET = _PageBudget()
+
+
+@dataclass(frozen=True)
+class _FeedResult:
+    """
+    What one feeder pass produced.
+
+    Attributes:
+        records: The records the sink returned, in acquisition order.
+        rejected: How many fed sheets were skipped for failing their integrity
+            checks.
+        sheet_not_kept: The number of the sheet fed past the page cap and
+            discarded, or ``None`` when the feed ended on its own.
+
+    """
+
+    records: list[PageRecord]
+    rejected: int
+    sheet_not_kept: int | None
+
+
 def _acquire_pages(
     dev: SaneDevice,
     sink: PageSink,
     framing: _PageFraming,
-    timeout_per_page: float,
-    grace: float = _CANCEL_GRACE_SECONDS,
-) -> tuple[list[PageRecord], int]:
+    budget: _PageBudget = _DEFAULT_PAGE_BUDGET,
+) -> _FeedResult:
     """
-    Spool the validated ADF pages, and report how many sheets were skipped.
+    Spool the validated ADF pages, and report what was skipped or not kept.
 
     A page flows device -> validate -> crop -> ``sink.add`` -> record, one at a
     time, and no list of images exists anywhere along it.  The
@@ -2149,6 +2224,13 @@ def _acquire_pages(
     would reach ``assemble_pdf([])`` and record a job that produced nothing as
     a success.
 
+    Reaching the page cap is not a failure either. The overrun can only be
+    seen on the sheet *past* the cap, so that sheet has been fed and acquired
+    by the time it is recognised; it is discarded without validation or the
+    sink, the feed is stopped, and its number goes back to the caller with the
+    pages already kept. A capped pass in which every kept-or-skipped sheet was
+    unreadable still raises, exactly as an uncapped one does.
+
     **A skipped page may break manual-duplex parity, and that is accepted
     deliberately.** One skipped front makes ``len(front_pages) !=
     len(back_pages)``, which ``pipeline.py`` routes to its duplex-mismatch
@@ -2174,22 +2256,23 @@ def _acquire_pages(
             resolution -- the one the device read back -- is the dpi the sink
             records the page at.  The caller builds it from the paper size,
             that resolution and whether the scan area was set on the device.
-        timeout_per_page: Maximum seconds to wait for each page.
-        grace: Maximum seconds to wait for a timed-out read to come back
-            after it has been cancelled.  Injectable for the same reason
-            ``timeout_per_page`` is: a test proving the unresponsive-cancel
-            path must not wait out the module's real ten seconds.
+        budget: The per-page timeout, the grace a timed-out read is given
+            to come back after it has been cancelled, and the most sheets the
+            pass keeps.  The first two are injectable so a test proving the
+            unresponsive-cancel path need not wait out the module's real ten
+            seconds; the cap is chosen by the caller from the source.
 
     Returns:
-        The records the sink returned, in acquisition order, and how many fed
-        sheets were skipped for failing their integrity checks.  The count
-        leaves the backend inside ``ScanBatch`` and by no other route.
+        The records the sink returned, in acquisition order, how many fed
+        sheets were skipped for failing their integrity checks, and the
+        number of the sheet fed past the cap when there was one.  Both facts
+        leave the backend inside ``ScanBatch`` and by no other route.
 
     Raises:
         FeederEmptyError: If the feeder produced no pages at all.
-        ScanError: If a page times out, the device reports a fault, the page
-            count runs past ``_MAX_ADF_PAGES``, every fed page failed its
-            integrity checks, or the sink could not take a page.
+        ScanError: If a page times out, the device reports a fault, every
+            sheet kept or skipped failed its integrity checks, or the sink
+            could not take a page.
 
     """
     iterator = dev.multi_scan()
@@ -2203,6 +2286,7 @@ def _acquire_pages(
     # detection and is shown to users as pages removed for being blank, so
     # reporting a corrupt page through it would tell them something untrue.
     rejected_pages = 0
+    sheet_not_kept: int | None = None
     try:
         while True:
             try:
@@ -2210,8 +2294,8 @@ def _acquire_pages(
                     dev,
                     functools.partial(next, iterator),
                     _page_label(page_num),
-                    timeout_per_page,
-                    grace,
+                    budget.timeout,
+                    budget.grace,
                 )
             except StopIteration:
                 break
@@ -2225,18 +2309,23 @@ def _acquire_pages(
                 )
                 raise ScanError(scan_error_msg) from exc
 
-            page_num += 1
-
             # The overrun is detected on the page *past* the cap, not on the
             # cap itself: a legitimate maximal stack only learns it is finished
             # when the next probe raises, so stopping at equality would reject
-            # a full hopper.
-            if page_num > _MAX_ADF_PAGES:
-                cap_msg = (
-                    f"ADF page cap exceeded: stopped after {page_num} pages "
-                    f"(limit {_MAX_ADF_PAGES})"
+            # a full hopper.  That sheet has been fed, so it is discarded here,
+            # before validation or the sink, and not counted in page_num: the
+            # checks below are about the sheets the pass kept or skipped.
+            if page_num >= budget.max_pages:
+                sheet_not_kept = page_num + 1
+                logger.warning(
+                    "Stopped the feed at the %d-page cap: sheet %d was fed "
+                    "but not kept",
+                    budget.max_pages,
+                    sheet_not_kept,
                 )
-                raise ScanError(cap_msg)
+                break
+
+            page_num += 1
 
             # Integrity only: nonzero dimensions and minimum raw size. Whether
             # the page is worth keeping is the pipeline's decision, not ours.
@@ -2278,7 +2367,7 @@ def _acquire_pages(
         )
         raise ScanError(all_rejected_msg)
 
-    return records, rejected_pages
+    return _FeedResult(records, rejected_pages, sheet_not_kept)
 
 
 def _choose_feeder_source(available_sources: list[str], requested: str) -> str:
@@ -2881,38 +2970,6 @@ def _refuse_sixteen_bit(parameters: _ScanParameters, device_id: str) -> None:
         raise ScanError(sixteen_bit_error(neutralise_controls(device_id)))
 
 
-@dataclass(frozen=True)
-class _PageBudget:
-    """
-    How long one page may take, and how long its cancel may.
-
-    Bundled into one record rather than passed as two parameters because
-    ``_snap_flatbed`` already sits exactly on ruff's ``PLR0913`` argument
-    limit, and CLAUDE.md forbids both raising the limit and suppressing the
-    rule. ``_acquire_pages`` takes the two separately and is at the same limit
-    without needing this, so the asymmetry is the lint's, not a design
-    statement.
-
-    Both defaults are the module constants the ADF path uses, so "one sheet is
-    one sheet, whichever way it was presented" is expressed in the
-    default rather than merely asserted about it.
-
-    Attributes:
-        timeout: Maximum seconds to wait for the sheet.
-        grace: Maximum seconds to wait for a cancelled read to return.
-
-    """
-
-    timeout: float = _DEFAULT_PAGE_TIMEOUT_SECONDS
-    grace: float = _CANCEL_GRACE_SECONDS
-
-
-# The shared default instance.  A module constant and not an inline
-# ``_PageBudget()`` in the signature, because a call in a default argument is
-# what ruff's B008 rejects; a frozen instance is safe to share.
-_DEFAULT_PAGE_BUDGET = _PageBudget()
-
-
 def _snap_flatbed(
     dev: SaneDevice,
     device_id: str,
@@ -2949,9 +3006,10 @@ def _snap_flatbed(
             page passed its integrity checks and was cropped.
         framing: The crop applied to the page before the sink sees it, and
             the read-back dpi the sink records it at.
-        budget: The per-page timeout and the cancel grace.  Both default to the
-            constants the feeder path uses, and both are injectable for the
-            reason ``_acquire_pages``' are: a test proving the
+        budget: The per-page timeout and the cancel grace; its page cap does
+            not apply to one sheet.  Both default to the constants the feeder
+            path uses, and both are injectable for the reason the feeder
+            path's are: a test proving the
             unresponsive-cancel path must not wait out the module's real ten
             seconds, and without an injectable grace there could be no fast
             flatbed equivalent of ``test_did_not_respond_to_cancel`` at
@@ -3422,9 +3480,8 @@ class SaneBackend(ScannerBackend):
         dev: SaneDevice,
         sink: PageSink,
         framing: _PageFraming,
-        timeout_per_page: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
-        grace: float = _CANCEL_GRACE_SECONDS,
-    ) -> tuple[list[PageRecord], int]:
+        budget: _PageBudget = _DEFAULT_PAGE_BUDGET,
+    ) -> _FeedResult:
         """
         Spool the validated ADF pages, with a per-page timeout.
 
@@ -3444,15 +3501,15 @@ class SaneBackend(ScannerBackend):
             sink: Where each accepted page goes.
             framing: The crop applied to each accepted page before the sink
                 sees it, and the read-back dpi the sink records it at.
-            timeout_per_page: Maximum seconds to wait for each page.
-            grace: Maximum seconds to wait for a cancelled read to return.
+            budget: The per-page timeout, the cancel grace and the page cap.
 
         Returns:
-            The records the sink returned, and the count of fed sheets skipped
-            for failing their integrity checks.
+            The records the sink returned, the count of fed sheets skipped
+            for failing their integrity checks, and the sheet fed past the cap
+            when there was one.
 
         """
-        return _acquire_pages(dev, sink, framing, timeout_per_page, grace)
+        return _acquire_pages(dev, sink, framing, budget)
 
     def scan_pages(
         self, device_id: str, settings: ScanSettings, sink: PageSink
@@ -3493,8 +3550,10 @@ class SaneBackend(ScannerBackend):
         Returns:
             A ScanBatch carrying the records the sink returned, the resolution
             the device actually used, how many fed sheets failed their
-            integrity checks, and the requested source when the device's
-            ``Auto`` stood in for it and fed.
+            integrity checks, the requested source when the device's
+            ``Auto`` stood in for it and fed, and the cap the pass stopped at
+            when the feeder was still feeding there.  A capped pass keeps its
+            pages and is not an error.
 
         Raises:
             ScanError: If a previous read has not returned, in which case no
@@ -3555,9 +3614,25 @@ class SaneBackend(ScannerBackend):
             parameters = _read_parameters(dev, device_id)
             _refuse_sixteen_bit(parameters, device_id)
 
+            cap_reached: PassCapReached | None = None
             if use_adf:
-                # ADF/duplex: use multi_scan() for multi-page acquisition
-                records, pages_rejected = self._scan_adf_pages(dev, sink, framing)
+                # ADF/duplex: use multi_scan() for multi-page acquisition,
+                # under the cap the source earns.  A source named as a feeder
+                # gets the per-pass cap; one that is not -- Auto sent through
+                # the feeder -- may be a platen rescanned forever, so it gets
+                # the much lower one.
+                named_feeder = classify_source(choice.effective).uses_feeder
+                budget = _PageBudget(
+                    max_pages=_MAX_ADF_PAGES if named_feeder else _MAX_AUTO_FEEDER_PAGES
+                )
+                fed = self._scan_adf_pages(dev, sink, framing, budget)
+                records, pages_rejected = fed.records, fed.rejected
+                if fed.sheet_not_kept is not None:
+                    cap_reached = PassCapReached(
+                        cap=budget.max_pages,
+                        sheet_not_kept=fed.sheet_not_kept,
+                        auto_source=not named_feeder,
+                    )
             else:
                 # Flatbed: start() initiates the SANE data channel, then
                 # snap() drains it via sane_read() loop.  Without start()
@@ -3577,4 +3652,5 @@ class SaneBackend(ScannerBackend):
             actual_resolution=actual_resolution,
             pages_rejected=pages_rejected,
             substituted_source=choice.substituted_from if use_adf else None,
+            cap_reached=cap_reached,
         )
