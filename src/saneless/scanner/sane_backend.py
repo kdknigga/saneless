@@ -36,6 +36,7 @@ import contextlib
 import functools
 import importlib
 import logging
+import math
 import os
 import threading
 from dataclasses import dataclass, field
@@ -71,7 +72,11 @@ from saneless.scanner.net_hosts import (
     exported_sane_net_hosts,
 )
 from saneless.text_safety import neutralise_controls
-from saneless.vocabulary import ambiguous_source_error, source_not_offered_error
+from saneless.vocabulary import (
+    ambiguous_source_error,
+    sixteen_bit_error,
+    source_not_offered_error,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -291,6 +296,23 @@ _MM_PER_INCH = 25.4
 # exact figure is not delicate.
 _AREA_TOLERANCE_MM = 1.0
 
+# SANE's value-type code for a fixed-point option, read at index 4 of the tuple
+# get_options() reports.  python-sane refuses an int for one and a float for an
+# integer option, so a value has to be written in the option's own type.
+_SANE_TYPE_FIXED = 2
+
+# The capability bits, at index 7, that say whether software may set an option
+# right now: it must be software-selectable and not inactive.
+_SANE_CAP_SOFT_SELECT = 1
+_SANE_CAP_INACTIVE = 32
+
+# The bits per sample saneless scans at, and the depth it refuses.  Its pages
+# are 8-bit, and python-sane misreads a 16-bit frame: the image comes back
+# twice as tall, read past the end of its buffer.  python-sane itself refuses
+# every depth other than 1, 8 and 16, so 16 is the only one to refuse here.
+_EIGHT_BITS = 8
+_SIXTEEN_BITS = 16
+
 __all__ = ["GeometryUnit", "SaneBackend", "require_sane", "shutdown"]
 
 logger = logging.getLogger(__name__)
@@ -420,6 +442,116 @@ def _constraint(raw_options: list[tuple], name: str) -> _OptionConstraint:
                 present=True, values=None, span=_as_span(constraint)
             )
     return _OptionConstraint(present=False, values=None, span=None)
+
+
+def _option_tuple(raw_options: list[tuple], name: str) -> tuple | None:
+    """
+    Find one option's tuple in the device's option list.
+
+    Args:
+        raw_options: The device's option tuples, as ``get_options()`` returns
+            them.
+        name: The option name, in the hyphenated spelling ``get_options()``
+            uses.
+
+    Returns:
+        The option's nine-element tuple, or None if the device does not report
+        it or reports it too short to read.
+
+    """
+    for opt in raw_options:
+        if len(opt) >= 9 and opt[1] == name:
+            return opt
+    return None
+
+
+def _option_type(raw_options: list[tuple], name: str) -> int | None:
+    """
+    Read an option's SANE value type, index 4 of its tuple.
+
+    Args:
+        raw_options: The device's option tuples.
+        name: The hyphenated option name.
+
+    Returns:
+        The value-type code, or None if the device does not report the option.
+
+    """
+    opt = _option_tuple(raw_options, name)
+    return None if opt is None else opt[4]
+
+
+def _option_is_writable(raw_options: list[tuple], name: str) -> bool:
+    """
+    Report whether software may set an option now: selectable and active.
+
+    An inactive option refuses a value with ``AttributeError``, which the
+    configuring code would report as a failed scan, so an option a device
+    lists but has switched off -- ``depth`` in a line-art mode, say -- is one
+    to leave alone rather than to write.
+
+    Args:
+        raw_options: The device's option tuples.
+        name: The hyphenated option name.
+
+    Returns:
+        True if the option is reported, software-selectable and active.
+
+    """
+    opt = _option_tuple(raw_options, name)
+    if opt is None or not isinstance(opt[7], int):
+        return False
+    return bool(opt[7] & _SANE_CAP_SOFT_SELECT) and not opt[7] & _SANE_CAP_INACTIVE
+
+
+def _includes_eight(found: _OptionConstraint) -> bool:
+    """
+    Report whether a ``depth`` constraint lets the device scan at 8 bits.
+
+    A word list includes 8 when 8 is one of its words. A range includes it when
+    8 lies between its bounds and on its step grid, counted from the minimum;
+    a step of 0 means any value in the range.
+
+    Args:
+        found: What the device reports for ``depth``.
+
+    Returns:
+        True if 8 is a value the device accepts as it is.
+
+    """
+    if found.values is not None:
+        return any(_is_number(word) and word == _EIGHT_BITS for word in found.values)
+    if found.span is None:
+        return False
+    low, high, step = found.span
+    if not low <= _EIGHT_BITS <= high:
+        return False
+    if step <= 0:
+        return True
+    steps = (_EIGHT_BITS - low) / step
+    return math.isclose(steps, round(steps), abs_tol=1e-9)
+
+
+def _eight_bit_depth(raw_options: list[tuple]) -> int | float | None:
+    """
+    Decide the ``depth`` value to write, if the device can scan at 8 bits.
+
+    Args:
+        raw_options: The device's option tuples, as reported for the source
+            already selected.
+
+    Returns:
+        ``8`` for an integer option, ``8.0`` for a fixed-point one, or None
+        when the device has no writable ``depth`` option that includes 8.
+
+    """
+    if not _option_is_writable(raw_options, "depth"):
+        return None
+    if not _includes_eight(_constraint(raw_options, "depth")):
+        return None
+    if _option_type(raw_options, "depth") == _SANE_TYPE_FIXED:
+        return float(_EIGHT_BITS)
+    return _EIGHT_BITS
 
 
 @dataclass(frozen=True)
@@ -2118,13 +2250,62 @@ def _resolve_source(
     raise ScanError(not_offered_msg)
 
 
+@dataclass(frozen=True)
+class _Configured:
+    """
+    What configuring the device left behind for the steps after it.
+
+    Attributes:
+        resolution: The resolution the device reports after the assignment,
+            in whole dpi; it may not be the one requested.
+        options: The option list read after the source was assigned, or the
+            list the caller passed in when no source was assigned. A source
+            change reloads the device's option descriptors, so this is the
+            list that describes the source actually selected, and every later
+            decision about the device's options is made from it.
+
+    """
+
+    resolution: int
+    options: list[tuple]
+
+
+def _assign(dev: SaneDevice, name: str, value: object, device_id: str) -> None:
+    """
+    Assign one option, as a saneless error naming it if the device refuses.
+
+    Args:
+        dev: Open SANE device handle.
+        name: The option, in the underscore spelling attribute access uses.
+        value: The value to assign.
+        device_id: The SANE device name, for the error message.
+
+    Raises:
+        ScanError: If the device refuses -- python-sane raises ``_sane.error``
+            for a bad value, ``AttributeError`` for an inactive option and
+            ``TypeError`` for a value of the wrong type. The message names the
+            option, the value (``!r``, so control characters are escaped) and
+            the device, and the original is the cause.
+
+    """
+    try:
+        setattr(dev, name, value)
+    except Exception as exc:
+        set_msg = (
+            f"Could not set {name} to {value!r} on "
+            f"{neutralise_controls(device_id)}: {describe(exc)}"
+        )
+        raise ScanError(set_msg) from exc
+
+
 def _configure_device(
     dev: SaneDevice,
     settings: ScanSettings,
     choice: _SourceChoice,
     *,
+    options: list[tuple],
     device_id: str,
-) -> int:
+) -> _Configured:
     """
     Assign the scan options to the open device, source first.
 
@@ -2135,6 +2316,19 @@ def _configure_device(
     feeder's narrower one.  Asking the device what it is scanning *from* before
     telling it *how* removes that whole class of failure.  Geometry is set
     afterwards, by ``_set_geometry`` in the caller.
+
+    The order is source, mode, depth, resolution. After the source, the option
+    list is read again, once: the reload may have changed which options the
+    device offers and what they accept, and the list read before the source
+    was set describes a source no longer selected. ``depth`` is decided from
+    the re-read list, and so is everything the caller decides after this
+    returns, which is why the list is handed back.
+
+    ``depth`` is set to 8 when the device offers 8, after ``mode`` (which can
+    change what ``depth`` accepts) and before ``resolution``. It is set
+    silently: saneless's pages are 8-bit whatever the device scans at, and
+    python-sane cannot read a 16-bit frame correctly, so nothing the operator
+    chose is lost.
 
     The resolution is then read back, because SANE substitutes silently:
     measured against the real ``test`` backend, ``5000`` comes back as
@@ -2148,36 +2342,29 @@ def _configure_device(
         settings: The requested scan settings.
         choice: The source ``_resolve_source`` chose. Its name is assigned
             only when the device exposes a ``source`` option at all.
+        options: The option list the caller read before resolving the source.
+            It stands when no source is assigned, since nothing reloads it.
         device_id: The SANE device name, for the error messages.
 
     Returns:
-        The resolution the device actually reports, as an ``int``.  The device
-        returns a float; callers downstream want whole dpi.
+        The resolution the device actually reports, as an ``int`` (the device
+        returns a float; callers downstream want whole dpi), and the option
+        list that describes the selected source.
 
     Raises:
-        ScanError: If the device refuses an assignment -- python-sane raises
-            ``_sane.error`` for a bad value and ``AttributeError`` for an
-            inactive option -- or the resolution cannot be read back.  The
-            message names the option, the value (``!r``, so control characters
-            are escaped) and the device, and the original is the cause.
+        ScanError: If the device refuses an assignment, if the option list
+            cannot be read again, or if the resolution cannot be read back,
+            naming the device, with the original as the cause.
 
     """
-    # One try per assignment, in order, so the message names the option that
-    # failed.  The order itself is the load-bearing part described above.
-    assignments: list[tuple[str, str | int]] = []
     if choice.has_option:
-        assignments.append(("source", choice.effective))
-    assignments.append(("mode", settings.mode))
-    assignments.append(("resolution", settings.resolution))
-    for name, value in assignments:
-        try:
-            setattr(dev, name, value)
-        except Exception as exc:
-            set_msg = (
-                f"Could not set {name} to {value!r} on "
-                f"{neutralise_controls(device_id)}: {describe(exc)}"
-            )
-            raise ScanError(set_msg) from exc
+        _assign(dev, "source", choice.effective, device_id)
+        options = _read_options(dev, device_id)
+    _assign(dev, "mode", settings.mode, device_id)
+    depth = _eight_bit_depth(options)
+    if depth is not None:
+        _assign(dev, "depth", depth, device_id)
+    _assign(dev, "resolution", settings.resolution, device_id)
 
     try:
         actual_resolution = int(dev.resolution)
@@ -2193,7 +2380,7 @@ def _configure_device(
             settings.resolution,
             actual_resolution,
         )
-    return actual_resolution
+    return _Configured(resolution=actual_resolution, options=options)
 
 
 def _route(choice: _SourceChoice, settings: ScanSettings) -> bool:
@@ -2282,6 +2469,92 @@ def _read_options(dev: SaneDevice, device_id: str) -> list:
             f"{describe(exc)}"
         )
         raise ScanError(options_msg) from exc
+
+
+@dataclass(frozen=True)
+class _ScanParameters:
+    """
+    The frame the device reports it is set up to scan, before any page starts.
+
+    What python-sane's ``get_parameters()`` returns, with names. It describes
+    the frame the options now describe, so it is read after every option and
+    the scan area are set.
+
+    Attributes:
+        frame_format: SANE's frame format, such as ``"gray"`` or ``"color"``.
+        last_frame: Whether this is the last frame of the image.
+        pixels_per_line: The width of the frame in pixels.
+        lines: The height of the frame in lines, or -1 when the device does
+            not know it in advance, as a feeder may not.
+        depth: The bits per sample.
+        bytes_per_line: The length of one line of image data in bytes.
+
+    """
+
+    frame_format: str
+    last_frame: bool
+    pixels_per_line: int
+    lines: int
+    depth: int
+    bytes_per_line: int
+
+
+def _read_parameters(dev: SaneDevice, device_id: str) -> _ScanParameters:
+    """
+    Read the scan parameters, as a saneless error on failure.
+
+    Args:
+        dev: Open SANE device handle, already configured.
+        device_id: The SANE device name, for the error message.
+
+    Returns:
+        The parameters the device reports.
+
+    Raises:
+        ScanError: If the device cannot report its parameters, or reports
+            something that is not SANE's five-element shape, naming the device
+            and chained to the original.
+
+    """
+    try:
+        frame_format, last_frame, size, depth, bytes_per_line = dev.get_parameters()
+        pixels_per_line, lines = size
+        return _ScanParameters(
+            frame_format=frame_format,
+            last_frame=bool(last_frame),
+            pixels_per_line=pixels_per_line,
+            lines=lines,
+            depth=depth,
+            bytes_per_line=bytes_per_line,
+        )
+    except Exception as exc:
+        parameters_msg = (
+            f"Could not read the scan parameters from "
+            f"{neutralise_controls(device_id)}: {describe(exc)}"
+        )
+        raise ScanError(parameters_msg) from exc
+
+
+def _refuse_sixteen_bit(parameters: _ScanParameters, device_id: str) -> None:
+    """
+    Refuse a 16-bit frame before any page is started.
+
+    ``_configure_device`` sets ``depth`` to 8 wherever the device offers it, so
+    a 16-bit frame reaching here comes from a device that cannot scan at 8 in
+    the chosen mode: one whose ``depth`` lists only 16, or whose mode implies
+    16 bits with no ``depth`` option at all. python-sane would read such a
+    frame as an image twice as tall, so it is refused while no paper has moved.
+
+    Args:
+        parameters: What the configured device reports.
+        device_id: The SANE device name, for the error message.
+
+    Raises:
+        ScanError: If the frame is 16 bits per sample.
+
+    """
+    if parameters.depth == _SIXTEEN_BITS:
+        raise ScanError(sixteen_bit_error(neutralise_controls(device_id)))
 
 
 @dataclass(frozen=True)
@@ -2431,6 +2704,7 @@ class SaneDevice(Protocol):
     def area(self) -> tuple[tuple[float, float], tuple[float, float]]: ...
 
     def get_options(self) -> list: ...
+    def get_parameters(self) -> tuple[str, int, tuple[int, int], int, int]: ...
     def start(self) -> None: ...
     def snap(self) -> Image.Image: ...
     def multi_scan(self) -> Iterator[Image.Image]: ...
@@ -2910,10 +3184,11 @@ class SaneBackend(ScannerBackend):
         """
         _refuse_if_wedged(device_id, "scan from")
         with self._open_device(device_id) as dev:
-            # Fetched once and passed on: _resolve_source reads the source
-            # constraint from it and _set_geometry reads the scan-area options,
-            # and a second get_options() call would be a second device round
-            # trip for a list that cannot have changed in between.
+            # Read once here to match the source against.  Assigning the
+            # source reloads the device's option descriptors, so
+            # _configure_device reads the list once more after it and hands
+            # that list back; everything decided after the source is set is
+            # decided from the list for the source actually selected.
             raw_options = _read_options(dev, device_id)
 
             # Match the requested source against the device's list, or
@@ -2924,18 +3199,25 @@ class SaneBackend(ScannerBackend):
                 resolve_feeder=settings.resolve_feeder_source,
             )
 
-            # Set device options.  The return value is the resolution the
+            # Set device options.  The resolution it hands back is the one the
             # device actually chose, which may not be the one requested.
-            actual_resolution = _configure_device(
-                dev, settings, choice, device_id=device_id
+            configured = _configure_device(
+                dev, settings, choice, options=raw_options, device_id=device_id
             )
+            actual_resolution = configured.resolution
 
             # Constrain the scan area to the paper size, if the device reports
             # the options to do it with, scaling by the unit it reports at the
             # resolution it actually chose.
             geometry_set = _set_geometry(
-                dev, settings.paper_size, raw_options, actual_resolution
+                dev, settings.paper_size, configured.options, actual_resolution
             )
+
+            # What the device will now deliver, read once every option and
+            # the scan area are set.  A 16-bit frame is refused here, before
+            # either acquisition path starts a page.
+            parameters = _read_parameters(dev, device_id)
+            _refuse_sixteen_bit(parameters, device_id)
 
             use_adf = _route(choice, settings)
 

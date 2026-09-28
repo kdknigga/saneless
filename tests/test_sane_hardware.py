@@ -403,10 +403,18 @@ class TestRealSaneDepth:
 
     @pytest.mark.usefixtures("left_at_sixteen_bits")
     def test_the_refusal_helper_refuses_a_real_sixteen_bit_frame(self) -> None:
-        """The parameters a real 16-bit handle reports are refused."""
+        """
+        The parameters a real 16-bit handle reports are refused.
+
+        Source, mode and resolution are set here, not trusted: a freshly
+        initialised ``test:0`` reads its resolution back as a fraction of a
+        dpi, and reports a one-pixel frame.
+        """
         handle = sane_backend_mod._ensure_sane().open("test:0")
         try:
+            handle.source = "Flatbed"
             handle.mode = "Gray"
+            handle.resolution = 75
             parameters = sane_backend_mod._read_parameters(handle, "test:0")
 
             assert parameters.depth == 16

@@ -111,6 +111,7 @@ __all__ = [
     "rejection_status_code",
     "removed_pages",
     "removed_pages_note",
+    "sixteen_bit_error",
     "source_not_offered_error",
     "state_label",
     "timeout_finish_warning",
@@ -1460,6 +1461,28 @@ def source_not_offered_error(requested: str, available: Sequence[str]) -> str:
     return (
         f"The scanner has no source named {requested!r}. It offers {offered}; "
         "set the profile's source to one of those names."
+    )
+
+
+def sixteen_bit_error(device: str) -> str:
+    """
+    Return the refusal for a scanner set to 16 bits per sample.
+
+    saneless writes 8-bit pages, and a 16-bit frame cannot be read back
+    correctly, so the scan is refused before any page is started. The sentence
+    names the device and says what to change. The caller neutralises the
+    device name before passing it in.
+
+    Args:
+        device: The SANE device name.
+
+    Returns:
+        The error sentence.
+
+    """
+    return (
+        f"The scanner {device} is set to 16 bits per sample, and saneless scans "
+        "at 8. Choose an 8-bit mode, such as Gray or Color, in the profile."
     )
 
 

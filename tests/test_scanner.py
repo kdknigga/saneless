@@ -4955,6 +4955,27 @@ class TestSixteenBitDepth:
         assert dev.assignments == ["source", "mode", "resolution"]
         assert len(batch.pages) == 1
 
+    def test_an_inactive_depth_option_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        A ``depth`` the device has switched off is not written, and the scan runs.
+
+        Writing an inactive option raises, so a device that lists ``depth`` but
+        disables it in the chosen mode would otherwise fail every scan.
+        """
+        inactive_settable = 32 | _SETTABLE
+        depth = _option(12, "depth", _INT_OPTION, [1, 8, 16])
+        dev = FakeSaneDev(
+            options=[*build_option_table(), (*depth[:7], inactive_settable, depth[8])],
+            pages=1,
+        )
+
+        batch = self._scan(dev, monkeypatch, page_sink)
+
+        assert dev.assignments == ["source", "mode", "resolution"]
+        assert len(batch.pages) == 1
+
     def test_a_device_offering_only_sixteen_is_refused_before_start(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
