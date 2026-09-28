@@ -470,8 +470,8 @@ def fake_sane_module(monkeypatch: pytest.MonkeyPatch) -> FakeSaneModule:
 
 @pytest.fixture
 def fake_device(fake_sane_module: FakeSaneModule) -> FakeSaneDev:
-    """Return the one device handle the patched module hands out."""
-    return fake_sane_module.open(_TEST_DEVICE)
+    """Return the one device the patched module stands for, without opening it."""
+    return fake_sane_module.device
 
 
 @pytest.fixture
@@ -1591,7 +1591,7 @@ class TestSaneBackendScanPages:
         assert len(pages) == 1
         assert pages[0].sequence == 1
         assert pages[0].path.exists()
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         assert mock_dev.close_calls
 
     def test_sane_backend_cancel_before_close(
@@ -1603,7 +1603,7 @@ class TestSaneBackendScanPages:
         """Device cancel() is called before close() on normal exit."""
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings, page_sink)
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         assert mock_dev.cancel_calls
         assert mock_dev.close_calls
 
@@ -1636,7 +1636,7 @@ class TestSaneBackendScanPages:
         page_sink: SpooledPageSink,
     ) -> None:
         """Verify snap() is called without progress argument (Pitfall #2)."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings, page_sink)
@@ -1709,7 +1709,7 @@ class TestSaneBackendADFScan:
         page_sink: SpooledPageSink,
     ) -> None:
         """ADF scan calls multi_scan(), not snap()."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
 
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings, page_sink)
@@ -1723,7 +1723,7 @@ class TestSaneBackendADFScan:
         page_sink: SpooledPageSink,
     ) -> None:
         """Flatbed scan still uses snap(), not multi_scan()."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         pages = sane_backend.scan_pages("test:device:001", settings, page_sink).pages
@@ -1753,7 +1753,7 @@ class TestSaneBackendAutomaticDocumentFeeder:
         called. This is the C-06 fix and the phase's one authorised behaviour
         change (D-11); it could not have passed before Phase 21.
         """
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "Automatic Document Feeder"])
 
         settings = ScanSettings(
@@ -1789,7 +1789,7 @@ class TestSaneBackendDuplex:
         page_sink: SpooledPageSink,
     ) -> None:
         """ADF Duplex uses multi_scan(), not snap()."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
 
         settings = ScanSettings(source="ADF Duplex", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings, page_sink)
@@ -1812,7 +1812,7 @@ class TestSaneBackendEmptyFeeder:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """Multi_scan that yields zero pages raises FeederEmptyError."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([])
 
         backend = SaneBackend()
@@ -2015,7 +2015,7 @@ class TestSaneBackendPageValidation:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """Page with zero dimensions is skipped with warning."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         zero_img = Image.new("RGB", (0, 0))
         normal_img = _make_content_image()
         mock_dev.load_feeder([zero_img, normal_img])
@@ -2029,7 +2029,7 @@ class TestSaneBackendPageValidation:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """Page below MIN_PAGE_BYTES (1x1 pixel) is skipped."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         tiny_img = Image.new("RGB", (1, 1), "red")
         normal_img = _make_content_image()
         mock_dev.load_feeder([tiny_img, normal_img])
@@ -2052,7 +2052,7 @@ class TestSaneBackendPageValidation:
         under the profile's ``enable_empty_page_detection`` toggle, where the
         user can see it and turn it off (M-14, D-05).
         """
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         white_img = Image.new("RGB", (200, 300), (255, 255, 255))
         normal_img = _make_content_image()
         mock_dev.load_feeder([white_img, normal_img])
@@ -2078,7 +2078,7 @@ class TestSaneBackendPageValidation:
         was destroyed by the backend before the pipeline ever saw it.  Judging
         content is not the scanner layer's job (M-14, D-05).
         """
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         black_img = Image.new("RGB", (200, 300), (0, 0, 0))
         normal_img = _make_content_image()
         mock_dev.load_feeder([black_img, normal_img])
@@ -2095,7 +2095,7 @@ class TestSaneBackendPageValidation:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """Image with mixed content passes all validation checks."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         content_img = _make_content_image()
         mock_dev.load_feeder([content_img])
 
@@ -2115,7 +2115,7 @@ class TestSaneBackendPageValidation:
         page handed over carries a real orientation tag, so the assertion
         fails if anything on the way writes EXIF out.
         """
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([_with_orientation_exif(_make_content_image())])
 
         backend = SaneBackend()
@@ -2129,7 +2129,7 @@ class TestSaneBackendPageValidation:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """No EXIF reaches the PNG the flatbed path spooled either."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         page = _with_orientation_exif(Image.new("RGB", (100, 100), "white"))
         mock_dev.load_feeder([page])
 
@@ -2161,7 +2161,7 @@ class TestFlatbedIntegrityChecks:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """A 0x0 image is not a page, however successfully it was returned."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([Image.new("RGB", (0, 0))])
 
         backend = SaneBackend()
@@ -2174,7 +2174,7 @@ class TestFlatbedIntegrityChecks:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """A 10x10 RGB page is 300 bytes, far below the floor."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([Image.new("RGB", (10, 10), "white")])
 
         backend = SaneBackend()
@@ -2187,7 +2187,7 @@ class TestFlatbedIntegrityChecks:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """The check must not start counting good flatbed pages as rejects."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([_make_content_image()])
 
         backend = SaneBackend()
@@ -2220,7 +2220,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         page_sink: SpooledPageSink,
     ) -> None:
         """A zero-dimension third sheet is skipped and named; four survive."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder(
             [
                 _make_content_image(),
@@ -2245,7 +2245,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """Three unreadable sheets raise ScanError naming how many were fed."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([Image.new("RGB", (0, 0)) for _ in range(3)])
 
         backend = SaneBackend()
@@ -2263,7 +2263,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """No paper at all stays FeederEmptyError, not the all-rejected error."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([])
 
         backend = SaneBackend()
@@ -2279,7 +2279,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         page_sink: SpooledPageSink,
     ) -> None:
         """Five readable sheets yield five pages and no skip warning at all."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([_make_content_image() for _ in range(5)])
 
         backend = SaneBackend()
@@ -2302,7 +2302,7 @@ class TestAutoSourceRouting:
     ) -> None:
         """scan_pages with source='Auto' and auto_source_mode='adf' uses ADF path."""
         # Add "Auto" to available sources
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "ADF", "Auto"])
         settings = ScanSettings(
             source="Auto", resolution=300, mode="Color", auto_source_mode="adf"
@@ -2318,7 +2318,7 @@ class TestAutoSourceRouting:
         page_sink: SpooledPageSink,
     ) -> None:
         """scan_pages with source='Auto' and auto_source_mode='flatbed' uses flatbed path."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "ADF", "Auto"])
         settings = ScanSettings(
             source="Auto", resolution=300, mode="Color", auto_source_mode="flatbed"
@@ -2349,7 +2349,7 @@ class TestAutoSourceRouting:
         page_sink: SpooledPageSink,
     ) -> None:
         """Explicit Flatbed source ignores auto_source_mode setting."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", auto_source_mode="adf"
         )
@@ -2378,7 +2378,7 @@ class TestAutoSourceRecognition:
         single-page path and skipped the override entirely -- silently ignoring
         ``auto_source_mode = "adf"`` and returning one page from a whole stack.
         """
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "ADF", reported])
         settings = ScanSettings(
             source=reported, resolution=300, mode="Color", auto_source_mode="adf"
@@ -2399,7 +2399,7 @@ class TestAutoSourceRecognition:
         page_sink: SpooledPageSink,
     ) -> None:
         """The override is consulted, not merely coincidentally agreed with."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "ADF", reported])
         settings = ScanSettings(
             source=reported, resolution=300, mode="Color", auto_source_mode="flatbed"
@@ -2417,7 +2417,7 @@ class TestAutoSourceRecognition:
         page_sink: SpooledPageSink,
     ) -> None:
         """It is a feeder by classification, so auto_source_mode is irrelevant."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "ADF", "Automatic Document Feeder"])
         settings = ScanSettings(
             source="Automatic Document Feeder",
@@ -2447,7 +2447,7 @@ class TestAutoSourceRecognition:
         precisely to show an unrecognised name does not reach the Auto
         override either.
         """
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "ADF", "Mystery Tray"])
         settings = ScanSettings(
             source="Mystery Tray",
@@ -2663,7 +2663,7 @@ class TestResolveSourceForManualDuplex:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """The flag reaches the backend, which assigns and drives the real feeder."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "Automatic Document Feeder"])
         settings = ScanSettings(
             source="ADF",
@@ -2701,7 +2701,7 @@ class TestResolveSourceForManualDuplex:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """A flatbed-plus-Auto device takes no snapshot at all for manual duplex."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "Auto"])
         settings = ScanSettings(
             source="ADF",
@@ -2737,7 +2737,7 @@ class TestSaneBackendPerPageTimeout:
         timeout at ERROR, or every timeout reads as two failures.
         """
         caplog.set_level(logging.DEBUG, logger=_BACKEND_LOGGER)
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.block_read(ReadBlockMode.PARTIAL)
 
         backend = SaneBackend()
@@ -2764,7 +2764,7 @@ class TestSaneBackendPerPageTimeout:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """Pages acquired within timeout are spooled and reported in order."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         assert isinstance(mock_dev, FakeSaneDev)
 
         backend = SaneBackend()
@@ -3738,7 +3738,7 @@ class TestSaneBackendADFCleanup:
         """
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings, page_sink)
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         assert mock_dev.cancel_calls
         assert mock_dev.close_calls
 
@@ -3868,7 +3868,7 @@ class TestPaperSizeGeometry:
         page_sink: SpooledPageSink,
     ) -> None:
         """When paper_size='a4', dev.br_x=210.0 and dev.br_y=297.0."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([Image.new("RGB", (2500, 3600), "white")])
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
@@ -3886,7 +3886,7 @@ class TestPaperSizeGeometry:
         page_sink: SpooledPageSink,
     ) -> None:
         """When paper_size='full', no geometry option is assigned at all."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", paper_size="full"
         )
@@ -3917,7 +3917,7 @@ class TestPaperSizeGeometry:
         nearest whole millimetre: 216.0 x 279.0.  The fixed-point tolerance
         with no step at all is proven by ``TestClampedScanArea``.
         """
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([Image.new("RGB", (2600, 3400), "white")])
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", paper_size="letter"
@@ -3952,7 +3952,7 @@ class TestPaperSizeCropFallback:
         page_sink: SpooledPageSink,
     ) -> None:
         """When paper_size='full', the page is spooled at its original size."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         original_img = Image.new("RGB", (5000, 6000), "white")
         mock_dev.load_feeder([original_img])
         settings = ScanSettings(
@@ -4959,7 +4959,7 @@ class TestScanBatch:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """Five readable sheets are five pages and a zero rejection count."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([_make_content_image() for _ in range(5)])
 
         backend = SaneBackend()
@@ -4982,7 +4982,7 @@ class TestScanBatch:
         pages = [_make_content_image() for _ in range(5)]
         # Far below _MIN_PAGE_BYTES: a 10x10 RGB page is 300 bytes.
         pages[2] = Image.new("RGB", (10, 10), "white")
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder(pages)
 
         backend = SaneBackend()
@@ -5012,7 +5012,7 @@ class TestScanBatch:
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
         """The feeder path hands the sink the read-back dpi for every sheet."""
-        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev = fake_sane_module.device
         mock_dev.load_feeder([_make_content_image() for _ in range(3)])
 
         backend = SaneBackend()

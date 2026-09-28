@@ -1405,7 +1405,7 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
         # thread, which is the only place the app is allowed to touch SANE
         # from.  Without this the counters above would also be satisfied by a
         # scan that never started.
-        assert fake.open("test:device:001").calls
+        assert fake.device.calls
 
     # The lifespan's shutdown is the one stop made off the worker thread, and
     # the worker restarted SANE exactly once for each job it ran.

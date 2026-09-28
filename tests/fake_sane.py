@@ -1682,6 +1682,16 @@ class FakeSaneModule:
             else list(devices)
         )
 
+    @property
+    def device(self) -> FakeSaneDev:
+        """
+        The device itself, for a test to arrange and inspect.
+
+        Fetching it this way opens nothing, so a test that configures the
+        device before the code under test runs is not counted as an open.
+        """
+        return self._device
+
     def init(self) -> tuple[int, int, int, int]:
         """
         Record the call and report a SANE version.
