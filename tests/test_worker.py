@@ -69,7 +69,13 @@ from saneless.vocabulary import (
 )
 from saneless.web.job_view import build_job_view
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, poll_until, quiet_window, scan_batch
+from tests.conftest import (
+    StubScannerBackend,
+    build_settings,
+    poll_until,
+    quiet_window,
+    scan_batch,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -367,6 +373,106 @@ def _success_result() -> ScanResult:
         pages_removed=0,
         pages_uploaded=1,
     )
+
+
+class TestJobMetadataReachesTheRequest:
+    """The job row's metadata is the scan's, whatever the profile defaults say."""
+
+    def test_the_row_is_the_answer_not_the_profile(
+        self,
+        tmp_path: Path,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A row holding tag 3 and no correspondent runs with exactly those.
+
+        The scan route resolved the profile's defaults when it wrote the row,
+        so by the time the worker runs the job they have been applied or
+        answered away, and applying them again would re-tag a submit whose
+        operator cleared them.
+        """
+        settings = build_settings(
+            tmp_path,
+            profiles={
+                "default": ProfileConfig.model_validate(
+                    {"default_tags": [5, 9], "default_correspondent": 4}
+                )
+            },
+        )
+        captured: list[PipelineRequest] = []
+
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            """Record the request."""
+            captured.append(request)
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", capturing_pipeline)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, settings, store)
+            worker.start()
+            job = store.create_job("default", "Row", tags=[3], correspondent=None)
+            worker.submit(job)
+            wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+        finally:
+            store.close()
+
+        assert len(captured) == 1
+        assert captured[0].tags == [3]
+        assert captured[0].correspondent is None
+        assert captured[0].job_id == job.id
+
+
+def _pipeline_request_builders() -> list[tuple[str, str]]:
+    """
+    Find every construction of ``PipelineRequest`` in the saneless package.
+
+    The walk is over the syntax tree, so a docstring or comment naming the
+    class is not mistaken for a call.
+
+    Returns:
+        One ``(file name, enclosing function name)`` pair per construction,
+        with ``""`` for one outside any function.
+
+    """
+    package = Path(worker_module.__file__).parent
+    sites: list[tuple[str, str]] = []
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        owner: dict[int, str] = {}
+        # ast.walk visits an outer function before the ones nested in it, so
+        # the innermost enclosing function is the last one written here.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                for inner in ast.walk(node):
+                    owner[id(inner)] = node.name
+        sites.extend(
+            (path.relative_to(package).as_posix(), owner.get(id(node), ""))
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "PipelineRequest"
+        )
+    return sites
+
+
+def test_every_pipeline_request_comes_from_the_one_builder() -> None:
+    """
+    The worker and the CLI build their requests one way.
+
+    Two builders are how the web and the command line came to file the same
+    profile's scan with different metadata; with one, they cannot drift.
+    """
+    assert _pipeline_request_builders() == [("pipeline.py", "build_pipeline_request")]
 
 
 # How long the simulated pipeline below waits for a flip.  Generous against

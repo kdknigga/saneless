@@ -583,6 +583,45 @@ class TestScanCommand:
         assert request.title == "Typed"
         assert "Done: Typed" in result.output
 
+    def test_scan_files_the_document_with_the_profile_metadata(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The command line asks nobody, so the profile's defaults are the answer.
+
+        It has no tag or correspondent option, which is exactly an untouched
+        control: the profile's tags and correspondent apply, as they do for a
+        web form nobody changed.
+        """
+        settings = _make_settings(
+            tmp_path,
+            profiles={
+                "default": ProfileConfig(),
+                "receipts": ProfileConfig.model_validate(
+                    {"default_tags": [3, 7], "default_correspondent": 12}
+                ),
+            },
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        captured: list[PipelineRequest] = []
+
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            captured.append(request)
+            return _clean_scan_result()
+
+        monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
+        result = runner.invoke(cli, ["scan", "--profile", "receipts"])
+
+        assert result.exit_code == 0, result.output
+        assert len(captured) == 1
+        assert captured[0].tags == [3, 7]
+        assert captured[0].correspondent == 12
+
     def test_scan_unknown_profile_exits_2_before_title_resolution(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

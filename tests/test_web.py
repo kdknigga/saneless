@@ -2818,16 +2818,32 @@ def _newest_job(client: TestClient) -> Job:
 
 class TestProfileDefaultsFollowTheFormShape:
     """
-    WR-06: a profile default fills in for a control nobody was shown.
+    A shown control is answered by the submit; a hidden one takes the default.
 
-    An empty tag list and an absent correspondent reach ``start_scan``
-    identically whether the control was never rendered or was rendered and
-    then cleared, so the submit on its own cannot tell the two apart.  The
-    config key that decided whether to render the control is the only fact
-    that can, and gating on it is what lets a household member untick every
-    box and get a job with no tags -- something the appliance could do before
-    this phase and lost to an ungated fallback.
+    The form offers a profile's default tags and correspondent already chosen,
+    so a submit from a shown control is the operator's whole answer: the
+    defaults when nobody touched it, none when every box was unticked.  A
+    control ``[web]`` hides was never answered, and the one metadata policy
+    the command line also uses fills it with the profile's default.  An empty
+    tag list and an absent correspondent arrive identically either way, so
+    the config key that decided whether to render the control, never the
+    submitted value, is what tells the two apart.
     """
+
+    def test_the_scan_route_resolves_metadata_through_the_shared_policy(
+        self,
+    ) -> None:
+        """The route asks the same function the command line asks, once."""
+        source = inspect.getsource(routes_module.start_scan)
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "resolve_scan_metadata"
+        ]
+
+        assert len(calls) == 1
 
     def test_a_cleared_tag_list_submits_no_tags(self, tmp_path: Path) -> None:
         """The review's named regression test: unticking every box means none."""
