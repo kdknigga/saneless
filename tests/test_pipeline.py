@@ -5923,6 +5923,7 @@ class TestDuplicateIsAWarnedDelivery:
         )
 
         assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
         assert result.warning == duplicate_warning(42, in_trash=False)
         assert "#42" in result.warning
         assert (

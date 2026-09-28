@@ -98,6 +98,7 @@ __all__ = [
     "cli_pass_choices",
     "cli_pass_question",
     "connection_status_message",
+    "duplicate_warning",
     "duration_phrase",
     "error_advice",
     "error_message",
@@ -106,6 +107,7 @@ __all__ = [
     "exit_code_for_outcome",
     "exit_code_for_signal",
     "flip_answer_label",
+    "half_delivery_error",
     "is_amber_category",
     "job_label",
     "job_state_for",
@@ -764,6 +766,67 @@ RESTART_UPLOADING_REASON: Final = (
 # ``state_label``, so the CLI outcome line, the web status area and the
 # history row cannot drift apart.  Neither carries a configured value.
 WARNED_UPLOAD_LABEL: Final = "Uploaded with a warning"
+
+
+def duplicate_warning(
+    document_id: int | None, *, in_trash: bool, half: str | None = None
+) -> str:
+    """
+    Return the warning for an upload paperless-ngx refused as a duplicate.
+
+    paperless-ngx already holds the file, so the scan is delivered, not
+    lost: the job ends DONE with this warning, and it never says to scan
+    again.  What the user does lose is this scan's title and tags, which
+    were not applied to the document paperless-ngx already had.  Only the
+    id and a fixed half suffix are interpolated.
+
+    Args:
+        document_id: The existing document's id, or None when paperless-ngx
+            did not name it.
+        in_trash: Whether that document is in paperless-ngx's trash.
+        half: The half of a split duplex job this was, such as
+            ``"(backs)"``, or None for a whole scan.
+
+    Returns:
+        The warning, one or two sentences.
+
+    """
+    subject = "this file" if half is None else f"the {half} half"
+    existing = (
+        "an existing document" if document_id is None else f"document #{document_id}"
+    )
+    warning = (
+        f"paperless-ngx already holds {subject} as {existing}; it was not stored "
+        "again, and this scan's title and tags were not applied to it."
+    )
+    if in_trash:
+        warning = f"{warning} That document is in paperless-ngx's trash."
+    return warning
+
+
+def half_delivery_error(delivered: str, failed: str, reason: str) -> str:
+    """
+    Return the error for a split duplex job that delivered only one half.
+
+    Once one half is in paperless-ngx, "could not be sent, start the scan
+    again" would file that half twice, so the job's headline says which
+    half arrived and which did not.  It is raised as an unconfirmed filing,
+    whose advice says to check paperless-ngx first.
+
+    Args:
+        delivered: The half paperless-ngx accepted, such as ``"(fronts)"``.
+        failed: The half that failed.
+        reason: Why it failed, already one line with the token struck.
+
+    Returns:
+        The error message.
+
+    """
+    return (
+        f"The {delivered} half reached paperless-ngx; the {failed} half failed: "
+        f"{reason}"
+    )
+
 
 # The words for a failure that may already be in paperless-ngx, in place of
 # "Failed".  The job is an ERROR, but "Failed" -- like the red it is drawn in --

@@ -26,15 +26,17 @@ from saneless.exceptions import (
     ConfigError,
     DiskSpaceError,
     NoScannerFoundError,
+    PaperlessUnconfirmedError,
     ScanCancelledError,
     ScanError,
     ScanInterrupted,
     SpoolError,
     describe,
+    failure_text,
     is_out_of_space,
 )
 from saneless.pages import BlankFilterResult, filter_blank_pages, generate_thumbnail
-from saneless.paperless import ApiDelivery, FolderDelivery
+from saneless.paperless import ApiDelivery, FolderDelivery, TaskDuplicate, TaskFiled
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
@@ -54,6 +56,8 @@ from saneless.vocabulary import (
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
+    duplicate_warning,
+    half_delivery_error,
     pass_cap_note,
     pass_cap_warning,
     pass_wait_state,
@@ -3218,29 +3222,44 @@ class _PipelineRun:
             raise
         return upload
 
-    def _poll(self, upload: UploadResult) -> None:
+    def _poll(self, upload: UploadResult, half: str | None = None) -> str | None:
         """
         Wait for an upload's consume task, when it reached the API.
 
         Only an ApiDelivery has a task id; a document that only reached the
-        consume directory has no task to wait for.
-
-        The return value is discarded on purpose: ``poll_task`` raises on
-        every failed task, so a successful poll means "it returned".
+        consume directory has no task to wait for.  ``poll_task`` raises on
+        every failed task, so returning means the document is in
+        paperless-ngx: filed, or refused because paperless-ngx already held
+        it.
 
         Args:
             upload: What the upload did.
+            half: The half of a split duplex job this upload was, for the
+                duplicate warning, or None for a whole scan.
+
+        Returns:
+            The duplicate warning when paperless-ngx refused the upload as a
+            duplicate, otherwise None.
 
         """
         match upload:
             case ApiDelivery(task_id=task_id):
-                self.paperless.poll_task(
+                outcome = self.paperless.poll_task(
                     task_id, timeout=self.settings.output.paperless_task_timeout
                 )
             case FolderDelivery():
-                pass
+                return None
             case _:
                 assert_never(upload)
+        match outcome:
+            case TaskFiled():
+                return None
+            case TaskDuplicate(document_id=document_id, in_trash=in_trash):
+                warning = duplicate_warning(document_id, in_trash=in_trash, half=half)
+                logger.warning(warning)
+                return warning
+            case _:
+                assert_never(outcome)
 
     def _deliver_document(self, pdf_path: Path) -> tuple[ScanOutcome, str | None]:
         """
@@ -3250,20 +3269,21 @@ class _PipelineRun:
             pdf_path: The assembled PDF, still inside the workspace.
 
         Returns:
-            SUCCESS with no warning when the document reached the API and its
-            task finished, or FALLBACK with the consume-directory warning when
-            it took the other route.
+            SUCCESS when the document reached the API and its task finished,
+            with no warning when it was filed and the duplicate warning when
+            paperless-ngx already held it; or FALLBACK with the
+            consume-directory warning when it took the other route.
 
         """
         self.artefacts.pdfs = [pdf_path]
         self.artefacts.stage = preservation.RunStage.DELIVERING
         self._notify(PipelineEvent.UPLOADING)
         upload = self._upload(pdf_path, self.request.title)
-        self._poll(upload)
+        duplicate = self._poll(upload)
         self._delivered()
         match upload:
             case ApiDelivery():
-                return ScanOutcome.SUCCESS, None
+                return ScanOutcome.SUCCESS, duplicate
             case FolderDelivery(path=path):
                 # A state alone would leave the user to work out for
                 # themselves why the title and tags they chose never appeared
@@ -3291,6 +3311,14 @@ class _PipelineRun:
         distinct names, both carrying the job id, so they cannot overwrite
         each other on the way into ``failed/``.
 
+        Once paperless-ngx has taken the ``(fronts)`` half, a failure is no
+        longer "not sent": a rescan would file that half twice.  So a failure
+        of the ``(backs)`` upload or of either poll is raised as an
+        unconfirmed filing that names the half which arrived and the half
+        which failed.  A duplicate refusal of either half is no failure at
+        all: that half is in paperless-ngx, and its sentence joins the
+        warning.
+
         The blank-page filter does not run here, on purpose, so
         ``pages_removed`` is simply 0 and no position is named as removed.  A
         mismatched run is an anomaly sent to a person for manual review, and a
@@ -3304,7 +3332,14 @@ class _PipelineRun:
         Returns:
             SUCCESS when both halves reached the paperless-ngx API, otherwise
             FALLBACK, always carrying the mismatch warning, followed by the
-            substitution and pass-cap sentences when those happened.
+            duplicate, substitution and pass-cap sentences when those
+            happened.
+
+        Raises:
+            PaperlessUnconfirmedError: If the ``(backs)`` upload or either
+                poll fails after the ``(fronts)`` upload returned, chained to
+                that failure.  A failure of the ``(fronts)`` upload itself
+                propagates unchanged: nothing had been delivered.
 
         """
         cap = mismatch.backs_cap
@@ -3359,12 +3394,25 @@ class _PipelineRun:
         self.artefacts.stage = preservation.RunStage.DELIVERING
         self._notify(PipelineEvent.UPLOADING)
         fronts_result = self._upload(fronts_pdf, fronts_title)
-        backs_result = self._upload(backs_pdf, backs_title)
-        # Both halves that reach the API are polled: a half that failed
-        # consumption is not a half that was delivered, and this path is the
-        # one most likely to be holding a document the user actually needs.
-        self._poll(fronts_result)
-        self._poll(backs_result)
+        # From here one half is in paperless-ngx, so whatever fails is named
+        # against the half that arrived.  ``halves`` is (delivered, failed)
+        # should the next step raise: the backs upload and the backs poll
+        # fail the (backs) half, the fronts poll the (fronts) one, whose
+        # backs were accepted by then.  ScanInterrupted is a BaseException
+        # and passes through unchanged.
+        halves = (preservation.FRONTS_SUFFIX, preservation.BACKS_SUFFIX)
+        try:
+            backs_result = self._upload(backs_pdf, backs_title)
+            # Both halves that reach the API are polled: a half that failed
+            # consumption is not a half that was delivered, and this path is
+            # the one most likely to be holding a document the user needs.
+            halves = (preservation.BACKS_SUFFIX, preservation.FRONTS_SUFFIX)
+            fronts_duplicate = self._poll(fronts_result, preservation.FRONTS_SUFFIX)
+            halves = (preservation.FRONTS_SUFFIX, preservation.BACKS_SUFFIX)
+            backs_duplicate = self._poll(backs_result, preservation.BACKS_SUFFIX)
+        except Exception as exc:
+            msg = half_delivery_error(*halves, failure_text(exc))
+            raise PaperlessUnconfirmedError(msg) from exc
         self._delivered()
         delivered = isinstance(fronts_result, ApiDelivery) and isinstance(
             backs_result, ApiDelivery
@@ -3380,6 +3428,8 @@ class _PipelineRun:
         # agrees with pages_uploaded below.
         warning = _join_warnings(
             mismatch_warning,
+            fronts_duplicate,
+            backs_duplicate,
             _substitution_warning(mismatch.substituted_source),
             _backs_cap_warning(mismatch.backs_cap, mismatch_pages),
         )
