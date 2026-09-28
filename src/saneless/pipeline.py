@@ -31,6 +31,7 @@ from saneless.exceptions import (
     describe,
 )
 from saneless.pages import BlankFilterResult, filter_blank_pages, generate_thumbnail
+from saneless.paperless import ApiDelivery, FolderDelivery
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
@@ -875,12 +876,16 @@ def _accepted_how(upload: UploadResult) -> str:
         The words that follow the kept file's name.
 
     """
-    if upload.task_uuid is not None:
-        return (
-            f"had already been accepted by paperless-ngx as task "
-            f"{upload.task_uuid}, which had not confirmed it was consumed"
-        )
-    return "had already been saved to the paperless-ngx consume folder"
+    match upload:
+        case ApiDelivery(task_id=task_id):
+            return (
+                f"had already been accepted by paperless-ngx as task "
+                f"{task_id}, which had not confirmed it was consumed"
+            )
+        case FolderDelivery():
+            return "had already been saved to the paperless-ngx consume folder"
+        case _:
+            assert_never(upload)
 
 
 def _unlink_pages(records: Sequence[PageRecord]) -> None:
@@ -1061,7 +1066,7 @@ def _drop_blank_pages(
     return result
 
 
-def _consume_dir_warning(destination: Path | None) -> str:
+def _consume_dir_warning(destination: Path) -> str:
     """
     Describe what a consume-directory delivery cost the document.
 
@@ -1079,18 +1084,13 @@ def _consume_dir_warning(destination: Path | None) -> str:
 
     Args:
         destination: Where the PDF was written.
-            ``UploadResult.__post_init__`` guarantees this for every delivery
-            that did not reach the API; the ``None`` arm exists only because
-            the field is typed optional, and a warning that reaches the user
-            must never be empty or read "None".
 
     Returns:
         The warning text recorded on the job and rendered in the status area.
 
     """
-    where = f" at {destination}" if destination is not None else ""
     return (
-        f"Saved to the paperless-ngx consume directory{where} instead of "
+        f"Saved to the paperless-ngx consume directory at {destination} instead of "
         "uploading through the API, so the title, tags and correspondent "
         "chosen for this scan were not applied -- paperless-ngx will apply "
         "its own matching rules to the file instead."
@@ -3179,10 +3179,8 @@ class _PipelineRun:
         """
         Wait for an upload's consume task, when it reached the API.
 
-        ``UploadResult.__post_init__`` guarantees a task id iff the document
-        reached the API, so the test is exactly ``delivered_to_api`` and also
-        narrows the id to ``str``.  A document that only reached the consume
-        directory has no task to wait for.
+        Only an ApiDelivery has a task id; a document that only reached the
+        consume directory has no task to wait for.
 
         The return value is discarded on purpose: ``poll_task`` raises on
         every failed task, so a successful poll means "it returned".
@@ -3191,10 +3189,15 @@ class _PipelineRun:
             upload: What the upload did.
 
         """
-        if upload.task_uuid is not None:
-            self.paperless.poll_task(
-                upload.task_uuid, timeout=self.settings.output.paperless_task_timeout
-            )
+        match upload:
+            case ApiDelivery(task_id=task_id):
+                self.paperless.poll_task(
+                    task_id, timeout=self.settings.output.paperless_task_timeout
+                )
+            case FolderDelivery():
+                pass
+            case _:
+                assert_never(upload)
 
     def _deliver_document(self, pdf_path: Path) -> tuple[ScanOutcome, str | None]:
         """
@@ -3215,11 +3218,16 @@ class _PipelineRun:
         upload = self._upload(pdf_path, self.request.title)
         self._poll(upload)
         self._delivered()
-        if upload.delivered_to_api:
-            return ScanOutcome.SUCCESS, None
-        # A state alone would leave the user to work out for themselves why the
-        # title and tags they chose never appeared in paperless-ngx.
-        return ScanOutcome.FALLBACK, _consume_dir_warning(upload.consume_dir_path)
+        match upload:
+            case ApiDelivery():
+                return ScanOutcome.SUCCESS, None
+            case FolderDelivery(path=path):
+                # A state alone would leave the user to work out for
+                # themselves why the title and tags they chose never appeared
+                # in paperless-ngx.
+                return ScanOutcome.FALLBACK, _consume_dir_warning(path)
+            case _:
+                assert_never(upload)
 
     def _finish_mismatch(self, mismatch: _DuplexMismatch) -> ScanResult:
         """
@@ -3315,7 +3323,9 @@ class _PipelineRun:
         self._poll(fronts_result)
         self._poll(backs_result)
         self._delivered()
-        delivered = fronts_result.delivered_to_api and backs_result.delivered_to_api
+        delivered = isinstance(fronts_result, ApiDelivery) and isinstance(
+            backs_result, ApiDelivery
+        )
 
         mismatch_pages = len(mismatch.fronts) + len(mismatch.backs)
         mismatch_warning = _duplex_mismatch_warning(mismatch)

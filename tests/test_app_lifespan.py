@@ -39,7 +39,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.job import JobStore
-from saneless.paperless import UploadResult
+from saneless.paperless import ApiDelivery
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     RESTART_REASON,
@@ -1307,8 +1307,8 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     app.state.paperless.get_tags = list
     app.state.paperless.get_correspondents = list
     app.state.paperless.test_connection = lambda: "connected"
-    app.state.paperless.upload_document = lambda *_a, **_k: UploadResult(
-        delivered_to_api=True, task_uuid="d-19-proof"
+    app.state.paperless.upload_document = lambda *_a, **_k: ApiDelivery(
+        task_id="d-19-proof"
     )
     app.state.paperless.poll_task = lambda *_a, **_k: {"status": "SUCCESS"}
     store: JobStore = app.state.job_store

@@ -42,7 +42,12 @@ from saneless.exceptions import (
     failure_text,
 )
 from saneless.pages import BlankFilterResult
-from saneless.paperless import PaperlessClient, UploadResult
+from saneless.paperless import (
+    ApiDelivery,
+    FolderDelivery,
+    PaperlessClient,
+    UploadResult,
+)
 from saneless.pdf import assemble_pdf
 from saneless.pipeline import (
     _SPOOL_LABEL_A,
@@ -221,8 +226,8 @@ class TestRunPipeline:
         default_settings: Settings,
     ) -> None:
         """After upload, pipeline calls poll_task with returned UUID."""
-        mock_paperless.upload_document.return_value = UploadResult(
-            delivered_to_api=True, task_uuid="task-uuid-123"
+        mock_paperless.upload_document.return_value = ApiDelivery(
+            task_id="task-uuid-123"
         )
         mock_paperless.poll_task.return_value = {"status": "SUCCESS"}
 
@@ -1524,9 +1529,8 @@ class TestManualDuplex:
         """
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
-        mock_paperless.upload_document.return_value = UploadResult(
-            delivered_to_api=False,
-            consume_dir_path=tmp_path / "consume" / "doc.pdf",
+        mock_paperless.upload_document.return_value = FolderDelivery(
+            path=tmp_path / "consume" / "doc.pdf"
         )
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -1561,11 +1565,8 @@ class TestManualDuplex:
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
         mock_paperless.upload_document.side_effect = [
-            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
-            UploadResult(
-                delivered_to_api=False,
-                consume_dir_path=tmp_path / "consume" / "backs.pdf",
-            ),
+            ApiDelivery(task_id="fronts-task"),
+            FolderDelivery(path=tmp_path / "consume" / "backs.pdf"),
         ]
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -2481,7 +2482,7 @@ def _manual_duplex_over_the_fake(
         """Keep the PDF as uploaded, and accept it."""
         del tags, correspondent
         uploads.append((title, pdf_path.read_bytes()))
-        return UploadResult(delivered_to_api=True, task_uuid=f"task-{len(uploads)}")
+        return ApiDelivery(task_id=f"task-{len(uploads)}")
 
     paperless.upload_document.side_effect = _capture
 
@@ -3068,7 +3069,7 @@ class TestScanResultContract:
         assert result.pages_removed == 0
         assert result.pages_uploaded == 3
 
-    def test_fallback_outcome_when_not_delivered_to_api(
+    def test_fallback_outcome_when_delivered_to_the_folder(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
@@ -3076,9 +3077,8 @@ class TestScanResultContract:
         tmp_path: Path,
     ) -> None:
         """An upload that only reached the consume dir reports FALLBACK."""
-        mock_paperless.upload_document.return_value = UploadResult(
-            delivered_to_api=False,
-            consume_dir_path=tmp_path / "consume" / "doc.pdf",
+        mock_paperless.upload_document.return_value = FolderDelivery(
+            path=tmp_path / "consume" / "doc.pdf"
         )
 
         request = PipelineRequest(profile_name="default", title="Fallback Doc")
@@ -3132,12 +3132,10 @@ def _one_page_scanner() -> MagicMock:
     return scanner
 
 
-def _delivering_to_api(task_uuid: str = "task-uuid-1") -> MagicMock:
+def _delivering_to_api(task_id: str = "task-uuid-1") -> MagicMock:
     """Return a paperless client whose upload reaches the API and polls clean."""
     paperless = MagicMock()
-    paperless.upload_document.return_value = UploadResult(
-        delivered_to_api=True, task_uuid=task_uuid
-    )
+    paperless.upload_document.return_value = ApiDelivery(task_id=task_id)
     paperless.poll_task.return_value = None
     return paperless
 
@@ -5248,8 +5246,8 @@ def _both_halves_delivered() -> MagicMock:
     """Return a paperless client that accepts both partial uploads."""
     paperless = MagicMock()
     paperless.upload_document.side_effect = [
-        UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
-        UploadResult(delivered_to_api=True, task_uuid="backs-task"),
+        ApiDelivery(task_id="fronts-task"),
+        ApiDelivery(task_id="backs-task"),
     ]
     paperless.poll_task.return_value = None
     return paperless
@@ -5394,7 +5392,7 @@ class TestDuplexMismatchDelivery:
         default_settings.profiles["default"].duplex = "manual"
         paperless = MagicMock()
         paperless.upload_document.side_effect = [
-            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
+            ApiDelivery(task_id="fronts-task"),
             PaperlessError("Upload rejected"),
         ]
 
@@ -5661,11 +5659,8 @@ class TestDuplexMismatchDelivery:
         default_settings.profiles["default"].duplex = "manual"
         paperless = MagicMock()
         paperless.upload_document.side_effect = [
-            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
-            UploadResult(
-                delivered_to_api=False,
-                consume_dir_path=tmp_path / "consume" / "backs.pdf",
-            ),
+            ApiDelivery(task_id="fronts-task"),
+            FolderDelivery(path=tmp_path / "consume" / "backs.pdf"),
         ]
         paperless.poll_task.return_value = None
 

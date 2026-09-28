@@ -58,7 +58,7 @@ from saneless.exceptions import (
 )
 from saneless.job import Job, JobResult, JobStore
 from saneless.logging_config import configure_logging
-from saneless.paperless import UploadResult
+from saneless.paperless import ApiDelivery, UploadResult
 from saneless.pipeline import PipelineEvent, PipelineRequest, ScanResult
 from saneless.scanner import sane_backend
 from saneless.scanner.base import (
@@ -268,7 +268,7 @@ def _patch_cli(
                 self, *_args: object, **_kwargs: object
             ) -> UploadResult:
                 """Return a delivered upload result carrying a fake task UUID."""
-                return UploadResult(delivered_to_api=True, task_uuid="mock-task-uuid")
+                return ApiDelivery(task_id="mock-task-uuid")
 
             def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
                 """Return a successful task result."""
@@ -947,7 +947,7 @@ def _recording_paperless(uploads: list[str]) -> type:
         def upload_document(self, *_args: object, **_kwargs: object) -> UploadResult:
             """Record the upload and report it delivered."""
             uploads.append("uploaded")
-            return UploadResult(delivered_to_api=True, task_uuid="mock-task-uuid")
+            return ApiDelivery(task_id="mock-task-uuid")
 
         def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
             """Return a successful task result."""

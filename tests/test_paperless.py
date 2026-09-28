@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import inspect
 import logging
@@ -24,6 +25,8 @@ from saneless.exceptions import (
     describe,
 )
 from saneless.paperless import (
+    ApiDelivery,
+    FolderDelivery,
     PaperlessClient,
     UploadResult,
     _not_accepted_message,
@@ -268,11 +271,11 @@ class TestUploadDocument:
     """Document upload tests."""
 
     def test_upload_document(self, sample_pdf: Path) -> None:
-        """Upload returns task UUID on success."""
-        task_uuid = "abc-123-def"
+        """Upload returns the task id on success."""
+        task_id = "abc-123-def"
 
         def handler(_request: httpx2.Request) -> httpx2.Response:
-            return httpx2.Response(200, json=task_uuid)
+            return httpx2.Response(200, json=task_id)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -281,9 +284,7 @@ class TestUploadDocument:
             transport=transport,
         )
         result = client.upload_document(sample_pdf, title="Test Doc")
-        assert result.delivered_to_api is True
-        assert result.task_uuid == task_uuid
-        assert result.consume_dir_path is None
+        assert result == ApiDelivery(task_id=task_id)
         client.close()
 
     def test_upload_with_tags(self, sample_pdf: Path) -> None:
@@ -366,8 +367,7 @@ class TestUploadDocument:
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Retry Test")
-        assert result.delivered_to_api is True
-        assert result.task_uuid == "task-id-ok"
+        assert result == ApiDelivery(task_id="task-id-ok")
         assert call_count["n"] == 3
         assert sleeps == [1, 2]
         client.close()
@@ -432,8 +432,6 @@ class TestUploadDocument:
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Fallback")
-        assert result.delivered_to_api is False
-        assert result.task_uuid is None
         # PDF should have been copied to consume dir
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
@@ -442,7 +440,7 @@ class TestUploadDocument:
         _assert_no_staging_files(consume_dir)
         # The result names the exact file the PDF was copied to -- something
         # the old magic-string sentinel could not carry.
-        assert result.consume_dir_path == copied[0]
+        assert result == FolderDelivery(path=copied[0])
         assert sleeps == [1, 2]
         client.close()
 
@@ -892,6 +890,7 @@ class TestUploadFailureTranslation:
     ) -> None:
         """With a consume directory the exhausted retries take the fallback."""
         consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
         handler = _CountingHandler(_raising(exc_type("upstream went away")))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:
@@ -899,9 +898,7 @@ class TestUploadFailureTranslation:
         finally:
             client.close()
         assert handler.calls == 3
-        assert result == UploadResult(
-            delivered_to_api=False, consume_dir_path=consume_dir / "test.pdf"
-        )
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
         assert sleeps == [1, 2]
 
@@ -922,8 +919,7 @@ class TestUploadFailureTranslation:
             result = client.upload_document(sample_pdf, title="Flaky proxy")
         finally:
             client.close()
-        assert result.delivered_to_api is True
-        assert result.task_uuid == "task-id"
+        assert result == ApiDelivery(task_id="task-id")
         assert handler.calls == 3
         assert sleeps == [1, 2]
 
@@ -1264,6 +1260,7 @@ class TestUploadFailureTranslation:
     ) -> None:
         """A 503 on every attempt takes the fallback when one is configured."""
         consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
         handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:
@@ -1272,7 +1269,7 @@ class TestUploadFailureTranslation:
             client.close()
         assert handler.calls == 3
         assert sleeps == [1, 2]
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
 
     def test_non_json_200_raises_without_retry(
         self, sample_pdf: Path, sleeps: list[float]
@@ -2293,7 +2290,7 @@ class TestLoopbackClientSideProtocolErrors:
                 task = client.poll_task(LOOPBACK_TASK_ID, timeout=5)
             finally:
                 client.close()
-        assert result == UploadResult(delivered_to_api=True, task_uuid=LOOPBACK_TASK_ID)
+        assert result == ApiDelivery(task_id=LOOPBACK_TASK_ID)
         assert task["status"] == "SUCCESS"
         assert server.hits == [
             LoopbackHit("POST", DOCUMENTS_PATH, f"Token {_MOCK_AUTH}"),
@@ -3392,34 +3389,6 @@ class TestConnectionTimeout:
 class TestConsumeDir:
     """Consume directory fallback tests."""
 
-    def test_consume_dir_created_if_not_exists(
-        self, sample_pdf: Path, tmp_path: Path
-    ) -> None:
-        """Fallback creates consume_dir if it does not exist before copying."""
-        consume_dir = tmp_path / "nonexistent" / "consume"
-        assert not consume_dir.exists()
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            msg = "connection refused"
-            raise httpx2.ConnectError(msg)
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            consume_dir=consume_dir,
-            transport=transport,
-            max_retries=1,
-        )
-        result = client.upload_document(sample_pdf, title="Auto-create test")
-        assert result.delivered_to_api is False
-        assert consume_dir.exists()
-        copied = list(consume_dir.iterdir())
-        assert len(copied) == 1
-        assert copied[0].name == "test.pdf"
-        assert result.consume_dir_path == consume_dir / "test.pdf"
-        client.close()
-
     def test_consume_dir_works_when_exists(
         self, sample_pdf: Path, tmp_path: Path
     ) -> None:
@@ -3440,10 +3409,9 @@ class TestConsumeDir:
             max_retries=1,
         )
         result = client.upload_document(sample_pdf, title="Existing dir test")
-        assert result.delivered_to_api is False
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         client.close()
 
     def test_delivery_leaves_only_the_final_file(
@@ -3472,7 +3440,7 @@ class TestConsumeDir:
         entries = sorted(entry.name for entry in consume_dir.iterdir())
         assert entries == ["test.pdf"]
         _assert_no_staging_files(consume_dir)
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
 
     def test_a_failed_staged_write_leaves_the_directory_empty(
@@ -3517,19 +3485,18 @@ class TestConsumeDir:
         assert isinstance(exc_info.value.__cause__, OSError)
         assert sorted(entry.name for entry in consume_dir.iterdir()) == []
 
-    def test_an_uncreatable_consume_dir_raises_a_paperless_error(
+    def test_consume_dir_missing_is_reported_and_nothing_is_created(
         self, sample_pdf: Path, tmp_path: Path
     ) -> None:
         """
-        EXC-01: a consume directory that cannot be created is a PaperlessError.
+        A missing consume directory fails the handoff and is never created.
 
-        A regular file sits where the directory should be, so ``mkdir`` fails
-        whatever user runs the tests (a permission-based setup would pass
-        under root).
+        A directory created where no volume is mounted is one nothing
+        watches: the copy would sit there unseen while the job reported a
+        fallback that saved the scan.
         """
-        blocker = tmp_path / "not-a-dir"
-        blocker.write_text("occupied")
-        consume_dir = blocker / "consume"
+        consume_dir = tmp_path / "missing" / "consume"
+        before = sorted(entry.name for entry in tmp_path.iterdir())
 
         client = PaperlessClient(
             url="http://paperless:8000",
@@ -3539,39 +3506,113 @@ class TestConsumeDir:
             max_retries=1,
         )
         try:
-            with pytest.raises(
-                PaperlessError,
-                match="Could not copy the PDF to the consume directory",
-            ) as exc_info:
-                client.upload_document(sample_pdf, title="Blocked")
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Unmounted")
         finally:
             client.close()
 
-        assert isinstance(exc_info.value.__cause__, OSError)
+        message = str(exc_info.value)
+        assert message == (
+            f"consume directory {consume_dir} does not exist — "
+            "is the paperless-ngx volume mounted?"
+        )
+        assert not (tmp_path / "missing").exists()
+        assert sorted(entry.name for entry in tmp_path.iterdir()) == before
 
-    def test_consume_dir_logs_warning_on_create(
-        self, sample_pdf: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    def test_consume_dir_missing_when_a_file_is_in_its_place(
+        self, sample_pdf: Path, tmp_path: Path
     ) -> None:
-        """A warning is logged when creating the consume directory."""
-        consume_dir = tmp_path / "warn-consume"
-        assert not consume_dir.exists()
+        """A regular file where the directory should be is not a directory."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.write_bytes(b"occupied")
 
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            msg = "connection refused"
-            raise httpx2.ConnectError(msg)
-
-        transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            transport=transport,
+            transport=_make_transport(_always_refused),
             max_retries=1,
         )
-        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
-            client.upload_document(sample_pdf, title="Warning test")
-        assert any("Created consume directory" in msg for msg in caplog.messages)
-        client.close()
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Occupied")
+        finally:
+            client.close()
+
+        message = str(exc_info.value)
+        assert "does not exist" in message
+        assert "is the paperless-ngx volume mounted?" in message
+        assert consume_dir.read_bytes() == b"occupied"
+
+    def test_staging_leaves_a_symlink_at_the_old_name_untouched(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """
+        A symlink planted at the predictable staging name is not written through.
+
+        The consume folder is often shared, so anyone who can write to it
+        could otherwise aim the copy at a file outside it.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        target = tmp_path / "outside.txt"
+        target.write_bytes(b"keep me")
+        planted = consume_dir / f".{sample_pdf.name}.part"
+        planted.symlink_to(target)
+
+        result = _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        dest = consume_dir / sample_pdf.name
+        assert result == FolderDelivery(path=dest)
+        assert target.read_bytes() == b"keep me"
+        assert planted.is_symlink()
+        assert planted.readlink() == target
+        assert not dest.is_symlink()
+        assert dest.read_bytes() == sample_pdf.read_bytes()
+
+    def test_staging_leaves_a_leftover_at_the_old_name_untouched(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """A crash leftover at the old fixed staging name cannot collide."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        leftover = consume_dir / f".{sample_pdf.name}.part"
+        leftover.write_bytes(b"leftover")
+
+        _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        assert leftover.read_bytes() == b"leftover"
+        assert (consume_dir / sample_pdf.name).read_bytes() == sample_pdf.read_bytes()
+
+    def test_staging_file_is_hidden_unique_and_removed(
+        self, sample_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The bytes go to a hidden, uniquely named ``.part`` file.
+
+        It is created exclusively, so its name is not the predictable one,
+        and it is gone once the PDF has its final name.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        seen: list[str] = []
+        original = shutil.copyfileobj
+
+        def recording(source: BinaryIO, target: BinaryIO) -> None:
+            seen.extend(entry.name for entry in consume_dir.iterdir())
+            original(source, target)
+
+        monkeypatch.setattr(shutil, "copyfileobj", recording)
+        _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        assert len(seen) == 1
+        staged = seen[0]
+        assert staged.startswith(f".{sample_pdf.name}.")
+        assert staged.endswith(".part")
+        assert staged != f".{sample_pdf.name}.part"
+        assert sorted(entry.name for entry in consume_dir.iterdir()) == [
+            sample_pdf.name
+        ]
 
 
 class TestAuthHeader:
@@ -3621,53 +3662,57 @@ class TestAuthHeader:
 
 
 class TestUploadResultContract:
-    """UploadResult cannot represent a destination it did not reach (CTR-03)."""
+    """The upload result names exactly one destination, and only a real one."""
 
-    def test_api_delivery_carries_a_task_uuid(self) -> None:
-        """A result claiming API delivery must carry the task id (CTR-03)."""
-        result = UploadResult(delivered_to_api=True, task_uuid="task-123")
-        assert result.task_uuid == "task-123"
-        assert result.consume_dir_path is None
+    def test_api_delivery_carries_the_task_id(self) -> None:
+        """An API delivery is its task id and nothing else."""
+        result = ApiDelivery(task_id="task-123")
+        assert result.task_id == "task-123"
+        assert [field.name for field in dataclasses.fields(result)] == ["task_id"]
 
-    def test_consume_dir_delivery_carries_a_path(self, tmp_path: Path) -> None:
-        """A result claiming consume-dir delivery must carry the path (CTR-03)."""
+    def test_folder_delivery_carries_the_path(self, tmp_path: Path) -> None:
+        """A consume-folder delivery is its path and nothing else."""
         dest = tmp_path / "consume" / "doc.pdf"
-        result = UploadResult(delivered_to_api=False, consume_dir_path=dest)
-        assert result.consume_dir_path == dest
-        assert result.task_uuid is None
+        result = FolderDelivery(path=dest)
+        assert result.path == dest
+        assert [field.name for field in dataclasses.fields(result)] == ["path"]
 
-    def test_api_delivery_without_task_uuid_is_rejected(self) -> None:
-        """
-        delivered_to_api=True with no task id is unconstructible (CTR-03).
+    def test_both_deliveries_are_frozen_and_slotted(self, tmp_path: Path) -> None:
+        """A delivery cannot be changed after the fact or grow a field."""
+        for result in (ApiDelivery(task_id="t"), FolderDelivery(path=tmp_path / "x")):
+            for field in dataclasses.fields(result):
+                with pytest.raises(dataclasses.FrozenInstanceError):
+                    setattr(result, field.name, getattr(result, field.name))
+            assert not hasattr(result, "__dict__")
 
-        This is the state the old "fallback" sentinel could not express and the
-        typed result must not silently allow: run_pipeline reads the presence of
-        a task id to decide SUCCESS vs FALLBACK, so such a result would report a
-        document that reached paperless-ngx as a consume-directory fallback.
-        """
-        with pytest.raises(ValueError, match="requires a task_uuid"):
-            UploadResult(delivered_to_api=True)
+    def test_upload_result_is_the_union_of_the_two(self, tmp_path: Path) -> None:
+        """The alias is a plain union, so ``isinstance`` accepts it."""
+        assert UploadResult == ApiDelivery | FolderDelivery
+        assert isinstance(ApiDelivery(task_id="t"), UploadResult)
+        assert isinstance(FolderDelivery(path=tmp_path / "x"), UploadResult)
+        assert not isinstance("t", UploadResult)
 
-    def test_consume_dir_delivery_without_path_is_rejected(self) -> None:
-        """delivered_to_api=False with no path is unconstructible (CTR-03)."""
-        with pytest.raises(ValueError, match="requires a consume_dir_path"):
-            UploadResult(delivered_to_api=False)
+    def test_upload_document_returns_an_api_delivery(self, sample_pdf: Path) -> None:
+        """An accepted upload is an ApiDelivery carrying the task id."""
 
-    def test_the_two_destinations_are_mutually_exclusive(self, tmp_path: Path) -> None:
-        """A result cannot claim both destinations at once (CTR-03)."""
-        dest = tmp_path / "consume" / "doc.pdf"
-        with pytest.raises(ValueError, match="cannot carry a consume_dir_path"):
-            UploadResult(
-                delivered_to_api=True,
-                task_uuid="task-123",
-                consume_dir_path=dest,
-            )
-        with pytest.raises(ValueError, match="cannot carry a task_uuid"):
-            UploadResult(
-                delivered_to_api=False,
-                task_uuid="task-123",
-                consume_dir_path=dest,
-            )
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json="task-abc")
+
+        client = _poll_client(handler)
+        try:
+            result = client.upload_document(sample_pdf, title="Accepted")
+        finally:
+            client.close()
+        assert result == ApiDelivery(task_id="task-abc")
+
+    def test_upload_document_returns_a_folder_delivery(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """A consume-folder fallback is a FolderDelivery carrying the path."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        result = _deliver_to_consume_dir(sample_pdf, consume_dir)
+        assert result == FolderDelivery(path=consume_dir / sample_pdf.name)
 
     def test_null_task_id_from_paperless_is_rejected(self, sample_pdf: Path) -> None:
         """
@@ -3752,7 +3797,7 @@ class TestConsumeCopyMode:
         finally:
             os.umask(old)
 
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert stat.S_IMODE((consume_dir / "test.pdf").stat().st_mode) == 0o644
         _assert_no_staging_files(consume_dir)
 
@@ -3813,7 +3858,7 @@ class TestConsumeCopyMode:
             result = _deliver_to_consume_dir(sample_pdf, consume_dir)
 
         assert calls == [0o644]
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
         _assert_no_staging_files(consume_dir)
         assert any(
@@ -3913,7 +3958,7 @@ class TestTaskIdIsBoundedInLogs:
         finally:
             client.close()
 
-        assert result.task_uuid == _HOSTILE_TASK_ID
+        assert result == ApiDelivery(task_id=_HOSTILE_TASK_ID)
         lines = [line for line in _paperless_lines(caplog) if "task" in line.lower()]
         assert lines
         for line in lines:
