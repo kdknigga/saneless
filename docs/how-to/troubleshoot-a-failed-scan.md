@@ -544,6 +544,9 @@ They are recovered the next time saneless starts: when `saneless serve` starts, 
 - In the web UI, the job shows as failed with "The server restarted before this scan finished",
   followed by where its pages were kept. Only the browser that started the scan sees the path. A
   scan started with `saneless scan` has no job in the web UI, so the log warning is where to look.
+- A web job that was already uploading shows as "May be in paperless-ngx" instead, with "The
+  server restarted while this scan was being uploaded; it may have reached paperless-ngx". Check
+  paperless-ngx's document list before scanning it again.
 - A web job that was waiting for someone -- at the flip prompt, or at a multi-page question -- is
   marked failed the same way at the next start of `saneless serve`, so the page stops waiting for
   an answer that can no longer arrive. Start this release at least once before going back to an

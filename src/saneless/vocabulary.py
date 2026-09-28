@@ -52,6 +52,7 @@ __all__ = [
     "PASS_WAIT_STATES",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
+    "RESTART_UPLOADING_REASON",
     "SCAN_BLOCKED_REASON",
     "SCAN_BLOCKED_URL_REASON",
     "TERMINAL_STATES",
@@ -125,6 +126,8 @@ __all__ = [
     "rejection_status_code",
     "removed_pages",
     "removed_pages_note",
+    "restart_category",
+    "restart_error",
     "scan_page_description",
     "sixteen_bit_error",
     "source_not_offered_error",
@@ -742,10 +745,17 @@ SCAN_BLOCKED_URL_REASON: Final = (
     "The paperless-ngx address has not been set — see System status above."
 )
 
-# What startup recovery passes to ``JobStore.fail_active_jobs`` for a job the
-# previous process left in flight, and how a job a server stop interrupted
-# begins its error, before the sentence naming what was kept.
+# How a job the previous process left in flight, or a server stop interrupted,
+# begins its error, before the sentence naming what was kept.  The first is for
+# a job that had not started its upload.  The second is for one that had: the
+# upload may have been sent, or accepted while saneless waited for filing, so
+# "before this scan finished" would invite a rescan that files it twice.
+# ``restart_error`` picks between them by the job's state.
 RESTART_REASON: Final = "The server restarted before this scan finished"
+RESTART_UPLOADING_REASON: Final = (
+    "The server restarted while this scan was being uploaded; "
+    "it may have reached paperless-ngx"
+)
 
 # The words for a delivered scan that did not go cleanly.  A DONE job carrying
 # a warning is labelled WARNED_UPLOAD_LABEL rather than "Complete", and a
@@ -1153,6 +1163,84 @@ def job_status_class(
         case _:
             assert_never(state)
     return css
+
+
+def restart_category(state: JobState) -> ErrorCategory | None:
+    """
+    Return the category a job gets when a restart or a stop ends it.
+
+    The job's last state is the only evidence of how far it got.  An
+    UPLOADING job may have been sent with no answer back, or accepted while
+    saneless waited for paperless-ngx to file it, so it is
+    ``UNCONFIRMED_SEND``: amber, and advice that says to check the document
+    list before scanning again.  That is truthful for every UPLOADING job, and
+    the stronger "received" is not, because nothing recorded whether an
+    answer came back.  A job in any other active state had not started its
+    upload and gets no category, so the status area shows its restart text
+    rather than a category's generic sentence.
+
+    The match is exhaustive, so a new state has to choose here.
+
+    Args:
+        state: The state the job was in when the restart or stop ended it.
+
+    Returns:
+        ``ErrorCategory.UNCONFIRMED_SEND`` for UPLOADING, else None.
+
+    Raises:
+        ValueError: If the state is terminal: a finished job is never ended
+            by a restart, so asking about one is a caller bug.
+        AssertionError: If the value is not a JobState member.
+
+    """
+    match state:
+        case JobState.UPLOADING:
+            category = ErrorCategory.UNCONFIRMED_SEND
+        case (
+            JobState.PENDING
+            | JobState.SCANNING
+            | JobState.AWAITING_FLIP
+            | JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+            | JobState.SCANNING_REVERSE
+            | JobState.ASSEMBLING
+        ):
+            category = None
+        case JobState.DONE | JobState.ERROR | JobState.FALLBACK | JobState.CANCELLED:
+            msg = f"{state.value} is a finished state, so no restart ended it"
+            raise ValueError(msg)
+        case _:
+            assert_never(state)
+    return category
+
+
+def restart_error(state: JobState, kept: str | None) -> str:
+    """
+    Return the error a job gets when a restart or a stop ends it.
+
+    ``RESTART_UPLOADING_REASON`` for a job that had started its upload, and
+    ``RESTART_REASON`` for one that had not, chosen by ``restart_category`` so
+    the text and the category can never disagree.  The sentence naming the
+    kept file, when there is one, follows after ". ".
+
+    Args:
+        state: The state the job was in when the restart or stop ended it.
+        kept: The sentence naming where the job's pages were kept, or None
+            (or an empty string) when nothing was kept.
+
+    Returns:
+        The job's error text.
+
+    Raises:
+        ValueError: If the state is terminal, as ``restart_category`` does.
+
+    """
+    if restart_category(state) is ErrorCategory.UNCONFIRMED_SEND:
+        reason = RESTART_UPLOADING_REASON
+    else:
+        reason = RESTART_REASON
+    return f"{reason}. {kept}" if kept else reason
 
 
 def outcome_line(state: JobState, warning: str | None, title: str) -> str:

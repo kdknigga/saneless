@@ -34,6 +34,7 @@ from saneless.job import (
 from saneless.vocabulary import (
     ACTIVE_STATES,
     QUEUE_FULL_JOB_ERROR,
+    RESTART_UPLOADING_REASON,
     TERMINAL_STATES,
     WORKER_DOWN_JOB_ERROR,
     ScanOutcome,
@@ -232,21 +233,49 @@ VACUUM_ERROR = "E" * 8192
 CONTROL_TITLE = "a\nb"
 """A title carrying a newline, which a ``%s`` log line would split in two."""
 
-RESTART_REASON = "Interrupted by restart"
-"""The reason ``fail_active_jobs()`` records when the caller names none.
+KEPT_SENTENCE = "The scan was preserved at /data/failed/one.pdf"
+"""The kept-file sentence the recovered-row cases pass for a job."""
 
-Spelled out here rather than imported from ``job.py``, so a change to that
-default surfaces as a visible test failure instead of a constant that silently
-agrees with whatever the source now says.
-"""
+OTHER_KEPT_SENTENCE = "The scan was preserved at /data/failed/two.pdf"
+"""A second kept-file sentence, so two recovered rows cannot be confused."""
 
-CUSTOM_REASON = "server restarted"
-"""The caller-supplied reason the custom-reason case passes.
 
-STOR-05's own prose asks for "a 'server restarted' reason" while M-03's
-prescription is the ``Interrupted by restart`` default; a defaulted parameter
-satisfies both, and this constant is what proves the parameter is honoured.
-"""
+def _restart_text(state: JobState, kept: str | None = None) -> str:
+    """
+    Spell out the text a restart leaves on a row, independently of the source.
+
+    Written here rather than read from ``restart_error``, so the tests pin the
+    wording instead of repeating whatever the function says.
+
+    Args:
+        state: The state the row was in when the restart ended it.
+        kept: The sentence naming the kept file, if any.
+
+    Returns:
+        The expected error text.
+
+    """
+    reason = (
+        RESTART_UPLOADING_REASON
+        if state is JobState.UPLOADING
+        else SERVER_RESTART_REASON
+    )
+    return f"{reason}. {kept}" if kept else reason
+
+
+def _restart_category(state: JobState) -> ErrorCategory | None:
+    """
+    Spell out the category a restart leaves on a row, independently of the source.
+
+    Args:
+        state: The state the row was in when the restart ended it.
+
+    Returns:
+        ``UNCONFIRMED_SEND`` for an uploading row, else None.
+
+    """
+    return ErrorCategory.UNCONFIRMED_SEND if state is JobState.UPLOADING else None
+
 
 QUEUE_ROWS = 6
 """Jobs the ``list_pending()`` ordering case creates."""
@@ -1689,7 +1718,8 @@ class TestQueryMethods:
                 assert job is not None
                 if original in ACTIVE_STATES:
                     assert job.state == JobState.ERROR
-                    assert job.error == RESTART_REASON
+                    assert job.error == _restart_text(original)
+                    assert job.error_category is _restart_category(original)
                 else:
                     # Not merely "still terminal": the same state AND the same
                     # error text it carried before the call.  A predicate that
@@ -1718,41 +1748,57 @@ class TestQueryMethods:
         finally:
             store.close()
 
-    def test_fail_active_jobs_honours_a_custom_reason(self) -> None:
-        """A caller-supplied reason is the text recorded on the failed row (STOR-05)."""
+    def test_fail_active_jobs_words_a_restart_by_the_row_state(self) -> None:
+        """An uploading row may have arrived; a scanning row never finished."""
         store = JobStore()
         try:
-            job = store.create_job(profile="default", title="In flight")
-            store.update_state(job.id, JobState.SCANNING)
+            uploading, scanning, done = _create_in_order(store, 3)
+            store.update_state(uploading, JobState.UPLOADING)
+            store.update_state(scanning, JobState.SCANNING)
+            store.finish_job(done, JobState.DONE)
 
-            failed = store.fail_active_jobs(reason=CUSTOM_REASON)
+            failed = store.fail_active_jobs()
 
-            assert failed == 1
-            stopped = store.get_job(job.id)
-            assert stopped is not None
-            assert stopped.state == JobState.ERROR
-            assert stopped.error == CUSTOM_REASON
+            assert failed == 2
+            sent = store.get_job(uploading)
+            assert sent is not None
+            assert sent.state == JobState.ERROR
+            assert sent.error == RESTART_UPLOADING_REASON
+            assert sent.error_category is ErrorCategory.UNCONFIRMED_SEND
+            unfinished = store.get_job(scanning)
+            assert unfinished is not None
+            assert unfinished.state == JobState.ERROR
+            assert unfinished.error == SERVER_RESTART_REASON
+            assert unfinished.error_category is None
+            finished = store.get_job(done)
+            assert finished is not None
+            assert finished.state == JobState.DONE
+            assert finished.error is None
+            assert finished.error_category is None
         finally:
             store.close()
 
-    def test_fail_active_jobs_leaves_error_category_unset(self) -> None:
-        """fail_active_jobs writes no error_category on the rows it fails (STOR-05)."""
-        # A deliberate assertion, not an omission.  N-14 records error_category
-        # as written but never read, Phase 21's D-12 left it unwired, and Phase
-        # 30 (APPL-04) owns giving it a consumer -- a second unread writer here
-        # would work against the milestone that has to justify or delete the
-        # field.  ErrorCategory.UNKNOWN would additionally be wrong: an
-        # interrupted restart is not an unknown failure.
+    def test_fail_active_jobs_restart_category_only_on_the_uploading_row(
+        self,
+    ) -> None:
+        """Every restarted row but the uploading one shows its text, not a category."""
+        # UNKNOWN would be wrong for any of them: an interrupted restart is a
+        # precisely known failure.  The uploading row is the one exception,
+        # because its amber category's advice says to check paperless-ngx
+        # before scanning again.
         store = JobStore()
         try:
             seeded = _seed_one_per_state(store)
 
             store.fail_active_jobs()
 
-            for job_id in seeded:
+            categorised = set()
+            for job_id, original in seeded.items():
                 job = store.get_job(job_id)
                 assert job is not None
-                assert job.error_category is None
+                if job.error_category is not None:
+                    categorised.add(original)
+            assert categorised == {JobState.UPLOADING}
         finally:
             store.close()
 
@@ -1783,7 +1829,7 @@ class TestQueryMethods:
             store.close()
 
     def test_fail_recovered_jobs_fails_only_the_named_active_rows(self) -> None:
-        """Each named active row gets its own text; nothing else is touched."""
+        """Each named active row gets its own kept sentence; nothing else is touched."""
         store = JobStore()
         try:
             seeded = _seed_one_per_state(store)
@@ -1792,7 +1838,7 @@ class TestQueryMethods:
 
             failed = store.fail_recovered_jobs(
                 {
-                    active: "The scan was preserved at /data/failed/one.pdf",
+                    active: KEPT_SENTENCE,
                     terminal: "must not land on a finished job",
                     "no-such-job": "must not land anywhere",
                 }
@@ -1804,7 +1850,7 @@ class TestQueryMethods:
                 assert job is not None
                 if job_id == active:
                     assert job.state == JobState.ERROR
-                    assert job.error == "The scan was preserved at /data/failed/one.pdf"
+                    assert job.error == f"{SERVER_RESTART_REASON}. {KEPT_SENTENCE}"
                     assert job.error_category is None
                 else:
                     # The unnamed active row is left for fail_active_jobs, and
@@ -1812,6 +1858,54 @@ class TestQueryMethods:
                     assert job.state == original
                     assert job.error == f"before {original.value}"
             assert store.get_job("no-such-job") is None
+        finally:
+            store.close()
+
+    def test_fail_recovered_jobs_restart_words_each_row_by_its_state(self) -> None:
+        """An uploading row with kept pages reads as maybe delivered, and is amber."""
+        store = JobStore()
+        try:
+            uploading, scanning = _create_in_order(store, 2)
+            store.update_state(uploading, JobState.UPLOADING)
+            store.update_state(scanning, JobState.SCANNING)
+
+            failed = store.fail_recovered_jobs(
+                {uploading: KEPT_SENTENCE, scanning: OTHER_KEPT_SENTENCE}
+            )
+
+            assert failed == 2
+            sent = store.get_job(uploading)
+            assert sent is not None
+            assert sent.state == JobState.ERROR
+            assert sent.error == f"{RESTART_UPLOADING_REASON}. {KEPT_SENTENCE}"
+            assert sent.error_category is ErrorCategory.UNCONFIRMED_SEND
+            unfinished = store.get_job(scanning)
+            assert unfinished is not None
+            assert unfinished.state == JobState.ERROR
+            assert unfinished.error == (
+                f"{SERVER_RESTART_REASON}. {OTHER_KEPT_SENTENCE}"
+            )
+            assert unfinished.error_category is None
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("state", sorted(ACTIVE_STATES, key=str))
+    def test_fail_recovered_jobs_restart_text_for_every_active_state(
+        self, state: JobState
+    ) -> None:
+        """Every active state gets the text and category its restart deserves."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="In flight")
+            store.update_state(job.id, state)
+
+            assert store.fail_recovered_jobs({job.id: KEPT_SENTENCE}) == 1
+
+            ended = store.get_job(job.id)
+            assert ended is not None
+            assert ended.state == JobState.ERROR
+            assert ended.error == _restart_text(state, KEPT_SENTENCE)
+            assert ended.error_category is _restart_category(state)
         finally:
             store.close()
 
@@ -1948,7 +2042,7 @@ class TestQueryMethods:
             )
             store._conn.commit()
             store.update_state(interrupted_id, JobState.SCANNING)
-            store.fail_active_jobs(SERVER_RESTART_REASON)
+            store.fail_active_jobs()
 
             latest = store.latest_run_job()
 

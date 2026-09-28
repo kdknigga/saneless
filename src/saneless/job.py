@@ -29,9 +29,12 @@ from saneless.exceptions import StorageError, describe
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    RESTART_REASON,
     ErrorCategory,
     JobState,
     ScanOutcome,
+    restart_category,
+    restart_error,
 )
 
 if TYPE_CHECKING:
@@ -168,8 +171,8 @@ _UPDATE_JOBS = "UPDATE jobs"
 """The ``UPDATE`` verb and its target table, held under a name.
 
 Declared here so every statement in this module is assembled the same way, and
-consumed by ``_FAIL_ACTIVE`` and ``_FAIL_RECOVERED`` below.  Its safety argument is
-``_SELECT_JOBS``'s.
+consumed by ``_FAIL_ACTIVE``, ``_FAIL_UPLOADING`` and ``_FAIL_RECOVERED`` below.
+Its safety argument is ``_SELECT_JOBS``'s.
 """
 
 _DELETE_JOBS = "DELETE FROM jobs"
@@ -212,9 +215,9 @@ integer ``latest_run_job`` derives from how many ids it excludes.
 Neither is ever written into the statement text.
 ``IS NOT`` rather than ``!=`` because it is NULL-safe in SQLite: ``NULL != 'X'``
 is NULL and would drop the row, while ``NULL IS NOT 'X'`` is true.  Every job
-that has not failed, and every job ``fail_active_jobs`` failed on restart, has
-no category, so ``!=`` would silently hide exactly the jobs this query exists to
-return.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated value
+that has not failed, and every job ``fail_active_jobs`` failed on restart before
+its upload, has no category, so ``!=`` would silently hide exactly the jobs this
+query exists to return.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated value
 is the module-level ``_SELECT_ALL``, and the category is bound.
 
 Like ``_SELECT_RECENT``'s, the ``ORDER BY`` is lexicographic over
@@ -249,18 +252,40 @@ here, but JSON1 was a compile-time option before SQLite 3.38, so it would add a
 soft dependency on an extension this module otherwise does not need.
 """
 
-_FAIL_RECOVERED = (
-    f"{_UPDATE_JOBS} SET state = ?, error = ? "
-    f"WHERE id = ? AND state IN ({_ACTIVE_MARKS})"
+_FAIL_UPLOADING = (
+    f"{_UPDATE_JOBS} SET state = ?, error = ?, error_category = ? WHERE state = ?"
 )
-"""Move one named job to a failed state with its own error text, if still active.
+"""Move every job still uploading to a failed state, with a text and a category.
 
-Bound parameters, in this order: the target state value, the error text, the
-job id, then one per entry of ``_ACTIVE_STATE_VALUES``.  Its safety argument is
-``_FAIL_ACTIVE``'s: the only interpolated values are the module-level
-``_UPDATE_JOBS`` literal and a run of ``?`` characters whose length comes from a
-module-level tuple.  The id and the text -- which quotes a title read back from a
-workspace on disk -- are bound, never written into the statement.
+Run before ``_FAIL_ACTIVE``, because an uploading job may already be in
+paperless-ngx and so gets a text and a category of its own.  Bound parameters,
+in this order: the target state value, the error text, the category value, then
+``JobState.UPLOADING.value``.  Its safety argument is ``_FAIL_ACTIVE``'s, and
+simpler: the only interpolated value is the module-level ``_UPDATE_JOBS``
+literal.  Every runtime value is a bound parameter.
+"""
+
+_SELECT_STATE_BY_ID = f"{_SELECT_JOBS} state FROM jobs WHERE id = ?"
+"""Read one job's state by its primary key, for ``fail_recovered_jobs``.
+
+One bound parameter, the job id.  Its safety argument is ``_SELECT_JOBS``'s:
+the only interpolated value is that module-level literal.
+"""
+
+_FAIL_RECOVERED = (
+    f"{_UPDATE_JOBS} SET state = ?, error = ?, error_category = ? "
+    "WHERE id = ? AND state = ?"
+)
+"""Move one named job to a failed state with its own text and category.
+
+The sibling of ``_FAIL_UPLOADING`` for one named row.  Bound parameters, in
+this order: the target state value, the error text, the category value (or
+NULL), the job id, then the state the row was read in.  Matching that state
+means the write lands only on the row the text was composed for.  Its safety
+argument is ``_FAIL_UPLOADING``'s: the only interpolated value is the
+module-level ``_UPDATE_JOBS`` literal.  The id and the text -- which quotes a
+title read back from a workspace on disk -- are bound, never written into the
+statement.
 """
 
 _DELETE_BY_ID = f"{_DELETE_JOBS} WHERE id = ?"
@@ -1441,16 +1466,20 @@ class JobStore:
             self._conn.execute(f"PRAGMA user_version = {version}")
 
     @_locked
-    def fail_active_jobs(self, reason: str = "Interrupted by restart") -> int:
+    def fail_active_jobs(self) -> int:
         """
         Fail every job still in flight, for recovery after an unclean restart.
 
         A job left mid-scan by a killed process has no worker behind it any
         more, so it would otherwise sit in an active state for ever and the UI
         would poll it for ever.  Every row whose state is in ``ACTIVE_STATES``
-        moves to ``JobState.ERROR`` carrying ``reason``.
+        moves to ``JobState.ERROR``, worded by the state it was left in:
+        ``restart_error`` and ``restart_category`` choose the text and the
+        category.  The UPLOADING rows are written first, by ``_FAIL_UPLOADING``,
+        and every other active row then gets ``RESTART_REASON``, all in one
+        transaction.
 
-        The predicate is derived from ``ACTIVE_STATES`` rather than listed by
+        The ``_FAIL_ACTIVE`` predicate is derived from ``ACTIVE_STATES`` rather than listed by
         hand, which buys two things: ``ACTIVE_STATES`` and ``TERMINAL_STATES``
         partition ``JobState``, so it provably cannot reach a completed job's
         recorded history; and a state added to that frozenset later is covered
@@ -1461,55 +1490,65 @@ class JobStore:
         SQLite TEXT and read back through the enum constructor, so adding or
         renaming a member is a data migration.
 
-        ``error_category`` is deliberately not written.  With no category the
-        status area shows ``reason`` itself rather than a category's generic
-        sentence, and ``UNKNOWN`` would be the wrong value anyway: an
-        interrupted restart is not an unknown failure, it is a precisely known
-        one.
+        ``error_category`` is written only for the UPLOADING rows.  A row with
+        no category shows its text itself in the status area rather than a
+        category's generic sentence, which is right for a job that had not
+        started its upload: an interrupted restart is a precisely known
+        failure, and ``UNKNOWN`` would be the wrong value.  An UPLOADING row
+        may already be in paperless-ngx, so it needs the amber category and its
+        advice to check the document list before scanning again.
 
         Its caller is the web lifespan at startup, before the worker thread
-        begins, passing ``RESTART_REASON``; when that call raises, the worker's
-        recovery makes the same call once the store accepts writes again.  The
-        returned count is what lets the lifespan
-        log how many jobs it failed without a second query.
-
-        Args:
-            reason: The error text recorded on every job this fails.
+        begins; when that call raises, the worker's recovery makes the same
+        call once the store accepts writes again.  The returned count is what
+        lets the lifespan log how many jobs it failed without a second query.
 
         Returns:
             How many jobs were moved to ERROR.
 
         """
+        category = restart_category(JobState.UPLOADING)
         with self._conn:
             failed = self._conn.execute(
+                _FAIL_UPLOADING,
+                (
+                    JobState.ERROR.value,
+                    restart_error(JobState.UPLOADING, None),
+                    category.value if category else None,
+                    JobState.UPLOADING.value,
+                ),
+            ).rowcount
+            failed += self._conn.execute(
                 _FAIL_ACTIVE,
-                (JobState.ERROR.value, reason, *_ACTIVE_STATE_VALUES),
+                (JobState.ERROR.value, RESTART_REASON, *_ACTIVE_STATE_VALUES),
             ).rowcount
 
         if failed > 0:
-            logger.debug("Failed %d in-flight job(s): %s", failed, reason)
+            logger.debug("Failed %d in-flight job(s) after a restart", failed)
         return failed
 
     @_locked
-    def fail_recovered_jobs(self, texts: Mapping[str, str]) -> int:
+    def fail_recovered_jobs(self, kept: Mapping[str, str]) -> int:
         """
-        Fail each named job still in flight, each with its own error text.
+        Fail each named job still in flight, each naming where its pages went.
 
         Startup's workspace recovery calls this before ``fail_active_jobs``:
         a job whose workspace a killed process left behind has had its pages
         kept in ``failed/``, and its row should say where rather than carry
-        the bare restart text.  Only a row whose id is in ``texts`` *and*
-        whose state is in ``ACTIVE_STATES`` moves, to ``JobState.ERROR``
-        carrying its text, so a finished job's recorded history is never
-        rewritten and an id with no row is ignored.  Every row is written in
-        one transaction.
+        the bare restart text.  Only a row whose id is in ``kept`` *and*
+        whose state is in ``ACTIVE_STATES`` moves, to ``JobState.ERROR``, so a
+        finished job's recorded history is never rewritten and an id with no
+        row is ignored.  Each row's state is read inside the one transaction
+        every row is written in, and its text and category are composed from
+        that state by ``restart_error`` and ``restart_category``: the restart
+        text for the state, then the kept sentence.
 
-        ``error_category`` is deliberately not written, for the reason
-        ``fail_active_jobs`` gives: an interrupted restart is a precisely known
-        failure, and with no category the status area shows the text itself.
+        ``error_category`` is written only for an UPLOADING row, for the
+        reason ``fail_active_jobs`` gives: a row with no category shows its
+        text, and an UPLOADING row needs the amber category's advice.
 
         Args:
-            texts: The error text to record, by job id.
+            kept: The sentence naming the kept file, by job id.
 
         Returns:
             How many jobs were moved to ERROR.
@@ -1517,10 +1556,21 @@ class JobStore:
         """
         failed = 0
         with self._conn:
-            for job_id, text in texts.items():
+            for job_id, sentence in kept.items():
+                row = self._conn.execute(_SELECT_STATE_BY_ID, (job_id,)).fetchone()
+                if row is None or row[0] not in _ACTIVE_STATE_VALUES:
+                    continue
+                state = JobState(row[0])
+                category = restart_category(state)
                 failed += self._conn.execute(
                     _FAIL_RECOVERED,
-                    (JobState.ERROR.value, text, job_id, *_ACTIVE_STATE_VALUES),
+                    (
+                        JobState.ERROR.value,
+                        restart_error(state, sentence),
+                        category.value if category else None,
+                        job_id,
+                        state.value,
+                    ),
                 ).rowcount
 
         if failed > 0:
