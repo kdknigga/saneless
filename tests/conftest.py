@@ -305,6 +305,8 @@ def reset_sane_process_state() -> None:
     record.iterator = None
     record.device_id = ""
     record.page_label = ""
+    record.settling = False
+    record.outstanding = set()
     sane_backend_mod._restore_sane_net_hosts()
     sane_backend_mod._INIT.done = False
     sane_backend_mod._INIT.host = ""

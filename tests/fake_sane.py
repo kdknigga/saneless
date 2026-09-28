@@ -1072,9 +1072,15 @@ class FakeSaneDev:
     high_water_live_pages: int
     read_gate: threading.Event
     read_started: threading.Event
+    cancel_started: threading.Event
     close_while_blocked: bool
+    close_while_cancelling: bool
+    cancels_in_flight_max: int
     _block_mode: ReadBlockMode | None
     _blocked_readers: int
+    _cancel_gate: threading.Event | None
+    _cancels_in_flight: int
+    _cancel_count_lock: threading.Lock
     _options: list[tuple]
     _values: dict[str, Any]
     _pages: int
@@ -1147,9 +1153,15 @@ class FakeSaneDev:
         state["high_water_live_pages"] = 0
         state["read_gate"] = threading.Event()
         state["read_started"] = threading.Event()
+        state["cancel_started"] = threading.Event()
         state["close_while_blocked"] = False
+        state["close_while_cancelling"] = False
+        state["cancels_in_flight_max"] = 0
         state["_block_mode"] = None
         state["_blocked_readers"] = 0
+        state["_cancel_gate"] = None
+        state["_cancels_in_flight"] = 0
+        state["_cancel_count_lock"] = threading.Lock()
 
     def __setattr__(self, key: str, value: object) -> None:
         """
@@ -1266,6 +1278,37 @@ class FakeSaneDev:
         self.__dict__["_block_mode"] = mode
         self.__dict__["read_gate"].clear()
         self.__dict__["read_started"].clear()
+        self.__dict__["cancel_started"].clear()
+
+    def block_cancel(self, release: threading.Event) -> None:
+        """
+        Make ``cancel()`` slow to answer, as a ``net`` scanner can be.
+
+        On ``net`` a cancel is a request to the host, and a host that is slow
+        to reply holds the thread that sent it.  The armed cancel still
+        releases a gated read in the modes that model a scanner which
+        answered -- the read comes back -- but the call itself does not return
+        until the test sets ``release``, bounded like every other wait here.
+
+        Args:
+            release: The event that lets a cancel in progress return.
+
+        """
+        self.__dict__["_cancel_gate"] = release
+
+    def _cancel_began(self) -> None:
+        """Count a cancel as in flight, and keep the most seen at once."""
+        with self._cancel_count_lock:
+            in_flight = self._cancels_in_flight + 1
+            self.__dict__["_cancels_in_flight"] = in_flight
+            self.__dict__["cancels_in_flight_max"] = max(
+                self.cancels_in_flight_max, in_flight
+            )
+
+    def _cancel_ended(self) -> None:
+        """Count a cancel as no longer in flight."""
+        with self._cancel_count_lock:
+            self.__dict__["_cancels_in_flight"] = self._cancels_in_flight - 1
 
     def release_read(self) -> None:
         """
@@ -1967,16 +2010,32 @@ class FakeSaneDev:
         is exactly what the backend does, and what this models.  Whether the
         read then comes back is the scanner's answer, not the frontend's, so
         it is the armed ``ReadBlockMode`` and not this method that decides.
+
+        A cancel armed with ``block_cancel`` does not return until released.
+        Every cancel is counted in flight while it runs, so a test can assert
+        that no two ran at once (``cancels_in_flight_max``) and that nothing
+        closed the device under one (``close_while_cancelling``).
         """
         self.cancel_calls += 1
-        if self._block_mode in {ReadBlockMode.PARTIAL, ReadBlockMode.RAISE}:
-            self.__dict__["read_gate"].set()
+        self._cancel_began()
+        # Set on the way in, so a test that has to act while a cancel is
+        # being made -- a second Ctrl-C, say -- waits on a real event.
+        self.__dict__["cancel_started"].set()
+        try:
+            if self._block_mode in {ReadBlockMode.PARTIAL, ReadBlockMode.RAISE}:
+                self.__dict__["read_gate"].set()
+            gate = self._cancel_gate
+            if gate is not None:
+                gate.wait(_READ_GATE_CEILING_SECONDS)
+        finally:
+            self._cancel_ended()
 
     def close(self) -> None:
         """
         Record that the device was closed, and whether a read was blocked.
 
-        ``close_while_blocked`` is what the close-ordering tests assert on.
+        ``close_while_blocked`` is what the close-ordering tests assert on,
+        and ``close_while_cancelling`` its twin for a cancel still running.
         The SANE standard forbids any other operation while a read is
         outstanding, and ``sane_close`` additionally runs holding the GIL, so a
         close racing a read is doubly unsafe.  The fake records it rather than
@@ -1991,6 +2050,8 @@ class FakeSaneDev:
         """
         if self.read_is_blocked():
             self.__dict__["close_while_blocked"] = True
+        if self._cancels_in_flight > 0:
+            self.__dict__["close_while_cancelling"] = True
         self.close_calls += 1
         error = self._call_errors.get("close")
         if error is not None:

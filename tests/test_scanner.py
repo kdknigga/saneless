@@ -410,6 +410,26 @@ def _join_sane_reader_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
             thread.join(timeout)
 
 
+# The name the backend gives the thread that cancels a timed-out read.
+_CANCEL_THREAD_NAME = "sane-cancel"
+
+
+def _join_sane_cancel_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
+    """
+    Wait for every cancel thread the backend started to finish.
+
+    Joined like the readers, and for the same reason: it is how a test sees a
+    slow cancel come back without polling or a sleep.
+
+    Args:
+        timeout: The bound each join waits under.
+
+    """
+    for thread in threading.enumerate():
+        if thread.name == _CANCEL_THREAD_NAME:
+            thread.join(timeout)
+
+
 # The framing for a direct acquisition call: pages handed on uncropped, at
 # 300 dpi.  ``_acquire_pages`` takes the crop and the read-back dpi as one
 # record because ``scan_pages`` builds both from the paper size, the
@@ -3001,6 +3021,7 @@ class TestSaneBackendCancelSequence:
         yield
         fake_device.release_read()
         _join_sane_reader_threads()
+        _join_sane_cancel_threads()
         record = sane_backend_mod._WEDGE
         record.stuck = False
         record.done = None
@@ -3008,6 +3029,8 @@ class TestSaneBackendCancelSequence:
         record.iterator = None
         record.device_id = ""
         record.page_label = ""
+        record.settling = False
+        record.outstanding = set()
 
     @staticmethod
     def _wedge(
@@ -3582,6 +3605,182 @@ class TestSaneBackendCancelSequence:
             assert sane_backend_mod._WEDGE.stuck is False
 
         assert elapsed < grace
+
+    def test_a_read_that_settles_in_the_grace_leaves_no_wedge(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        The wedge written before the cancel is cleared once the read returns.
+
+        The record goes in before the cancel fires, so a read that comes back
+        inside the grace has to take it out again.  Left behind, it would
+        refuse every later scan for a device that answered, and the device
+        context would leave a perfectly good handle open.
+        """
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            with pytest.raises(ScanError, match="timed out") as raised:
+                sane_backend._scan_adf_pages(
+                    dev,
+                    page_sink,
+                    _UNCROPPED,
+                    sane_backend_mod._PageBudget(timeout=0.05),
+                )
+            record = sane_backend_mod._WEDGE
+            assert record.stuck is False
+            assert record.settling is False
+            assert record.outstanding == set()
+            assert fake_device.close_calls == 0
+
+        assert "did not respond" not in str(raised.value)
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_cancelling is False
+
+    def test_a_slow_cancel_reply_holds_the_worker_no_longer_than_the_grace(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+    ) -> None:
+        """
+        A cancel still in flight at the end of the grace leaves the handle wedged.
+
+        On ``net`` a cancel is a request to the host, and a host slow to reply
+        holds the thread that sent it.  Here the read comes back at once but
+        the cancel does not: the worker gives it the grace and no more, sends
+        no second cancel, and closes nothing, because closing a handle while
+        SANE is still inside a cancel on it is as unsafe as closing it under a
+        read.  The cancel thread closes the handle itself when the reply
+        finally arrives, and the wedge clears.
+
+        The margin on the elapsed time is generous on purpose: what it pins is
+        "about the grace", not a scheduling latency.
+        """
+        release = threading.Event()
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+        fake_device.block_cancel(release)
+        grace = 1.0
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
+
+        try:
+            began = time.monotonic()
+            with (
+                pytest.raises(ScanError, match="timed out") as raised,
+                sane_backend._open_device(_TEST_DEVICE) as dev,
+            ):
+                sane_backend._scan_adf_pages(
+                    dev,
+                    page_sink,
+                    _UNCROPPED,
+                    sane_backend_mod._PageBudget(timeout=0.05, grace=grace),
+                )
+            elapsed = time.monotonic() - began
+
+            assert elapsed < grace + 1.0
+            assert "did not respond" in str(raised.value)
+            assert fake_device.cancel_calls == 1
+            assert fake_device.cancels_in_flight_max == 1
+            assert fake_device.close_calls == 0
+            assert fake_device.close_while_cancelling is False
+            assert sane_backend_mod._WEDGE.stuck is True
+            with pytest.raises(ScanError, match="Restart saneless"):
+                sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
+        finally:
+            release.set()
+        _join_sane_cancel_threads()
+
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_cancelling is False
+        assert fake_device.close_while_blocked is False
+        assert fake_device.cancels_in_flight_max == 1
+        assert sane_backend_mod._WEDGE.stuck is False
+
+    @pytest.mark.parametrize(
+        ("signum", "expected"),
+        [
+            pytest.param(signal.SIGINT, KeyboardInterrupt, id="ctrl-c"),
+            pytest.param(signal.SIGTERM, ScanInterrupted, id="sigterm"),
+        ],
+    )
+    def test_a_second_interrupt_during_the_grace_still_records_the_wedge(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        signum: signal.Signals,
+        expected: type[BaseException],
+    ) -> None:
+        """
+        Ctrl-C pressed twice leaves the stuck read recorded, not closed under.
+
+        The first interrupt lands while the page is being read and starts the
+        cancel; the second lands while the worker waits out the grace for a
+        read that ignores the cancel.  The wedge was written before the cancel
+        fired, so the second interrupt cannot skip it: the device context
+        leaves the handle alone, the next scan is refused, and the handle is
+        closed by the reader when the late read returns.
+
+        Both signals go to the main thread with ``pthread_kill``, which is
+        where the wait they interrupt is running.  ``raise_signal`` would
+        deliver them to the interrupter thread instead, and the main thread
+        would notice only when its wait ended on its own.  Each signal waits
+        on the fake's event for the moment it is meant to hit, so there is no
+        sleep.
+        """
+        fake_device.block_read(ReadBlockMode.NEVER)
+        main_thread = threading.main_thread().ident
+        assert main_thread is not None
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
+
+        def interrupt_twice() -> None:
+            if not fake_device.read_started.wait(_READER_JOIN_SECONDS):
+                return
+            signal.pthread_kill(main_thread, signum)
+            if fake_device.cancel_started.wait(_READER_JOIN_SECONDS):
+                signal.pthread_kill(main_thread, signum)
+
+        interrupter = threading.Thread(
+            target=interrupt_twice, name="interrupter", daemon=True
+        )
+        handling = (
+            _signal_raises_scan_interrupted(signum)
+            if expected is ScanInterrupted
+            else contextlib.nullcontext()
+        )
+
+        # Started before the scan: it does nothing until the read has begun.
+        interrupter.start()
+        with (
+            handling,
+            pytest.raises(expected),
+            sane_backend._open_device(_TEST_DEVICE) as dev,
+        ):
+            sane_backend._scan_adf_pages(
+                dev,
+                page_sink,
+                _UNCROPPED,
+                sane_backend_mod._PageBudget(timeout=20.0, grace=20.0),
+            )
+        interrupter.join(_READER_JOIN_SECONDS)
+
+        assert sane_backend_mod._WEDGE.stuck is True
+        assert fake_device.cancel_calls == 1
+        assert fake_device.close_while_blocked is False
+        assert fake_device.close_calls == 0
+        with pytest.raises(ScanError, match="Restart saneless"):
+            sane_backend.scan_pages(_TEST_DEVICE, settings, page_sink)
+
+        fake_device.release_read()
+        _join_sane_reader_threads()
+
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_blocked is False
+        assert sane_backend_mod._WEDGE.stuck is False
 
 
 class TestReinitialise:
