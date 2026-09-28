@@ -83,6 +83,7 @@ from saneless.vocabulary import (
     page_timeout_error,
     pages_phrase,
     pass_answer_label,
+    pass_cap_warning,
     pass_wait_state,
     progress_label,
     rejection_message,
@@ -93,6 +94,7 @@ from saneless.vocabulary import (
     sixteen_bit_error,
     source_not_offered_error,
     state_label,
+    substituted_source_warning,
     timeout_finish_warning,
     worker_health_detail,
 )
@@ -656,6 +658,55 @@ class TestFinishWarnings:
         assert cap_finish_warning(512, 500) == (
             "Finished at 512 pages: no new scan starts once a document has 500 pages. Scan any remaining pages as a new document."
         )
+
+    def test_pass_cap_warning_for_a_named_feeder(self) -> None:
+        """A named feeder's cap names the sheet that was fed but not kept."""
+        assert pass_cap_warning(500, 500, 501, auto_source=False) == (
+            "Finished at 500 pages: one scan stops after 500 sheets, so sheet 501 "
+            "was fed but not kept. Scan sheet 501 and any remaining pages as a new "
+            "document."
+        )
+
+    def test_pass_cap_warning_for_an_auto_source(self) -> None:
+        """The Auto cap also says how to stop the glass being scanned again."""
+        assert pass_cap_warning(50, 50, 51, auto_source=True) == (
+            "Finished at 50 pages: a scan from an Auto source through the feeder "
+            "stops after 50 sheets, so sheet 51 was fed but not kept. If the feeder "
+            "was already empty, the scanner was scanning its glass again; set "
+            'auto_source_mode = "flatbed" for this profile. Otherwise scan sheet 51 '
+            "and any remaining pages as a new document."
+        )
+
+    @pytest.mark.parametrize("auto_source", [False, True])
+    def test_pass_cap_warning_shares_the_document_cap_lead_and_tail(
+        self, *, auto_source: bool
+    ) -> None:
+        """Both cap warnings open and close the way cap_finish_warning does."""
+        warning = pass_cap_warning(497, 500, 501, auto_source=auto_source)
+        assert warning.startswith("Finished at 497 pages: ")
+        assert "sheet 501 was fed but not kept" in warning
+        assert warning.endswith("any remaining pages as a new document.")
+        assert cap_finish_warning(497, 500).endswith(
+            "any remaining pages as a new document."
+        )
+
+    def test_pass_cap_warning_counts_one_page(self) -> None:
+        """A single kept page is a page, not pages."""
+        assert pass_cap_warning(1, 500, 501, auto_source=False).startswith(
+            "Finished at 1 page: "
+        )
+
+    def test_substituted_source_warning(self) -> None:
+        """The substitution names the request, the feeder and the fix."""
+        assert substituted_source_warning("Flatbed") == (
+            "The scanner has no source named 'Flatbed', so its Auto source was "
+            "scanned through the feeder, because this profile's auto_source_mode "
+            'is "adf". Set the profile\'s source to one the scanner lists.'
+        )
+
+    def test_substituted_source_warning_shows_the_name_with_repr(self) -> None:
+        """An empty or padded name is visible in the sentence."""
+        assert "' Flatbed '" in substituted_source_warning(" Flatbed ")
 
     def test_source_not_offered_error(self) -> None:
         """The refusal names the request, the offered sources and the fix."""
