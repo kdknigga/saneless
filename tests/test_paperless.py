@@ -49,6 +49,7 @@ from tests.golden_support import (
     LOOPBACK_TASK_ID,
     TASKS_PATH,
     LoopbackHit,
+    RecordingPaperless,
     loopback_paperless,
     multipart_fields,
     production_debug_logging,
@@ -4094,6 +4095,339 @@ class TestAuthHeader:
         client.test_connection()
         assert captured_headers["accept"] == "application/json; version=9"
         client.close()
+
+
+_ACCEPT_V9 = "application/json; version=9"
+_ACCEPT_V10 = "application/json; version=10"
+
+_INCOMPATIBLE_TEXT = (
+    "does not accept API version 9 or 10; saneless needs paperless-ngx 2.16 or later"
+)
+
+
+class _VersionedServer:
+    """
+    Answer like a paperless-ngx that allows API versions up to ``offered``.
+
+    Every answer is in the shape of the version the request asked for, so a
+    client that asked for 10 gets a paginated, lowercase task list, and every
+    answer advertises ``offered`` in ``X-Api-Version`` when there is one.
+    """
+
+    def __init__(self, offered: int | None, *, task_status: str = "SUCCESS") -> None:
+        """
+        Start with no requests seen.
+
+        Args:
+            offered: The highest version to advertise, or None for no header.
+            task_status: The status every task poll reports for ``t1``.
+
+        """
+        self.accepts: list[str | None] = []
+        self._offered = offered
+        self._task_status = task_status
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        """Record the Accept header and answer in the version it asked for."""
+        accept = request.headers.get("accept")
+        self.accepts.append(accept)
+        shape = _v10_payload if accept == _ACCEPT_V10 else _v9_payload
+        headers = {} if self._offered is None else {"X-Api-Version": str(self._offered)}
+        path = request.url.path
+        body: object
+        if path == DOCUMENTS_PATH:
+            body = "t1"
+        elif path == TASKS_PATH:
+            failed = self._task_status.upper() == "FAILURE"
+            body = shape(self._task_status, "disk on fire" if failed else None)
+        else:
+            body = {
+                "count": 1,
+                "next": None,
+                "previous": None,
+                "results": [{"id": 1, "name": "one"}],
+            }
+        return httpx2.Response(200, json=body, headers=headers)
+
+
+def _advertising(*values: str | None) -> tuple[list[str | None], PaperlessClient]:
+    """
+    Build a client whose n-th answer advertises the n-th value.
+
+    Args:
+        values: The ``X-Api-Version`` value of each answer in turn, or None
+            for an answer without the header; the last repeats.
+
+    Returns:
+        The Accept header of every request sent, and the client.
+
+    """
+    accepts: list[str | None] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        accepts.append(request.headers.get("accept"))
+        value = values[min(len(accepts), len(values)) - 1]
+        headers = {} if value is None else {"X-Api-Version": value}
+        return httpx2.Response(200, json={"count": 0, "results": []}, headers=headers)
+
+    return accepts, _poll_client(handler)
+
+
+class TestApiVersionNegotiation:
+    """The client speaks API 10 to a server that offers it, and 9 otherwise."""
+
+    def test_api_version_starts_at_9(self) -> None:
+        """Before any answer the client speaks the version every server allows."""
+        _accepts, client = _advertising(None)
+        try:
+            assert client.api_version == 9
+        finally:
+            client.close()
+
+    def test_api_version_10_offered_is_sent_on_the_next_request(self) -> None:
+        """An authenticated answer naming 10 moves every later request to 10."""
+        accepts, client = _advertising("10")
+        try:
+            client.test_connection()
+            assert client.api_version == 10
+            client.test_connection()
+            client.test_connection()
+        finally:
+            client.close()
+        assert accepts == [_ACCEPT_V9, _ACCEPT_V10, _ACCEPT_V10]
+
+    def test_api_version_stays_at_9_without_the_header(self) -> None:
+        """A server that names no version is spoken to in 9 throughout."""
+        accepts, client = _advertising(None)
+        try:
+            client.test_connection()
+            client.test_connection()
+            assert client.api_version == 9
+        finally:
+            client.close()
+        assert accepts == [_ACCEPT_V9, _ACCEPT_V9]
+
+    def test_api_version_9_offered_stays_at_9(self) -> None:
+        """A paperless-ngx 2.x names 9, which is what the client already sends."""
+        accepts, client = _advertising("9")
+        try:
+            client.test_connection()
+            client.test_connection()
+            assert client.api_version == 9
+        finally:
+            client.close()
+        assert accepts == [_ACCEPT_V9, _ACCEPT_V9]
+
+    @pytest.mark.parametrize("offered", ["11", "999"])
+    def test_api_version_above_10_offered_is_spoken_as_10(self, offered: str) -> None:
+        """A newer server still allows 10, the highest this client knows."""
+        accepts, client = _advertising(offered)
+        try:
+            client.test_connection()
+            client.test_connection()
+            assert client.api_version == 10
+        finally:
+            client.close()
+        assert accepts == [_ACCEPT_V9, _ACCEPT_V10]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("999999", id="too-long"),
+            pytest.param("1000", id="four-digits"),
+            pytest.param("10\r\n", id="crlf"),
+            pytest.param("1 0", id="inner-space"),
+            pytest.param("ten", id="word"),
+            pytest.param("", id="empty"),
+            pytest.param("8", id="below-9"),
+            pytest.param("-10", id="negative"),
+            pytest.param("10.0", id="decimal"),
+            pytest.param("\u0661\u0660", id="non-ascii-digits"),
+        ],
+    )
+    def test_api_version_header_that_is_not_a_version_is_ignored(
+        self, value: str
+    ) -> None:
+        """Only one to three ASCII digits naming at least 9 are ever read."""
+        accepts, client = _advertising(value)
+        try:
+            client.test_connection()
+            client.test_connection()
+            assert client.api_version == 9
+        finally:
+            client.close()
+        assert accepts == [_ACCEPT_V9, _ACCEPT_V9]
+
+    @pytest.mark.parametrize(
+        "later",
+        [
+            pytest.param(None, id="no-header"),
+            pytest.param("8", id="below-9"),
+            pytest.param("garbage", id="garbage"),
+        ],
+    )
+    def test_api_version_10_is_kept_when_a_later_answer_names_none(
+        self, later: str | None
+    ) -> None:
+        """An answer without a usable header does not forget what was learned."""
+        accepts, client = _advertising("10", later)
+        try:
+            for _ in range(3):
+                client.test_connection()
+            assert client.api_version == 10
+        finally:
+            client.close()
+        assert accepts == [_ACCEPT_V9, _ACCEPT_V10, _ACCEPT_V10]
+
+    def test_api_version_follows_a_server_that_now_names_9(self) -> None:
+        """
+        The latest usable header counts, so a downgraded server gets 9 again.
+
+        Sending 10 to a server that allows only 9 would be refused with 406.
+        """
+        accepts, client = _advertising("10", "9")
+        try:
+            for _ in range(3):
+                client.test_connection()
+            assert client.api_version == 9
+        finally:
+            client.close()
+        assert accepts == [_ACCEPT_V9, _ACCEPT_V10, _ACCEPT_V9]
+
+    def test_api_version_is_learned_from_an_error_answer(self) -> None:
+        """
+        A refused request still teaches the version its answer names.
+
+        paperless-ngx names it on any authenticated answer, a 4xx included,
+        and the next request should not repeat the old version.
+        """
+        calls = {"n": 0}
+
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx2.Response(
+                    400, json={"detail": "bad page"}, headers={"X-Api-Version": "10"}
+                )
+            return httpx2.Response(200, json={"count": 0, "results": []})
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError):
+                client.get_tags()
+            assert client.api_version == 10
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_metadata_406_is_incompatible(self, method: str, noun: str) -> None:
+        """A 406 on a metadata fetch names the versions and the release needed."""
+        handler = _CountingHandler(
+            _answering(
+                httpx2.Response(406, json={"detail": 'Invalid version in "Accept".'})
+            )
+        )
+        client = _metadata_client(handler)
+        try:
+            with pytest.raises(PaperlessIncompatibleError) as exc_info:
+                getattr(client, method)()
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            f"Paperless at http://paperless.test:8000 {_INCOMPATIBLE_TEXT}"
+        )
+        assert noun not in str(exc_info.value)
+        assert "Invalid version" not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert handler.calls == 1
+
+    @pytest.mark.parametrize(
+        ("offered", "spoken"),
+        [
+            pytest.param(None, _ACCEPT_V9, id="api_version-none"),
+            pytest.param(9, _ACCEPT_V9, id="api_version-9"),
+            pytest.param(10, _ACCEPT_V10, id="api_version-10"),
+        ],
+    )
+    def test_whole_run_speaks_the_offered_api_version(
+        self,
+        offered: int | None,
+        spoken: str,
+        sample_pdf: Path,
+        upload_clock: FakeClock,
+    ) -> None:
+        """Both metadata fetches, the upload and the poll work in either shape."""
+        server = _VersionedServer(offered)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            transport=_make_transport(server),
+            timing=PaperlessTiming(clock=upload_clock.now, sleep=upload_clock.sleep),
+        )
+        try:
+            tags = client.get_tags()
+            correspondents = client.get_correspondents()
+            delivery = client.upload_document(sample_pdf, title="Versioned")
+            task = client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        assert tags == [{"id": 1, "name": "one"}]
+        assert correspondents == [{"id": 1, "name": "one"}]
+        assert delivery == ApiDelivery(task_id="t1")
+        assert str(task["status"]).upper() == "SUCCESS"
+        assert server.accepts == [_ACCEPT_V9, spoken, spoken, spoken]
+
+    @pytest.mark.parametrize(
+        "offered",
+        [
+            pytest.param(9, id="api_version-9"),
+            pytest.param(10, id="api_version-10"),
+        ],
+    )
+    def test_failed_task_is_reported_in_either_api_version(self, offered: int) -> None:
+        """A v10 lowercase ``failure`` fails the poll just as v9's FAILURE does."""
+        server = _VersionedServer(offered, task_status="FAILURE")
+        client = _poll_client(server)
+        try:
+            client.test_connection()
+            with pytest.raises(PaperlessError, match="disk on fire"):
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        assert server.accepts[-1] == (_ACCEPT_V10 if offered == 10 else _ACCEPT_V9)
+
+    @pytest.mark.parametrize(
+        ("offered", "spoken"),
+        [
+            pytest.param(None, _ACCEPT_V9, id="api_version-none"),
+            pytest.param(10, _ACCEPT_V10, id="api_version-10"),
+        ],
+    )
+    def test_duplicate_is_detected_in_either_api_version(
+        self,
+        offered: int | None,
+        spoken: str,
+        sample_pdf: Path,
+        upload_clock: FakeClock,
+    ) -> None:
+        """A duplicate is named whether it comes as v9 text or v10 result_data."""
+        recorder = RecordingPaperless(api_version=offered, duplicate_of=42)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            transport=_make_transport(recorder),
+            timing=PaperlessTiming(clock=upload_clock.now, sleep=upload_clock.sleep),
+        )
+        try:
+            delivery = client.upload_document(sample_pdf, title="Twice")
+            assert isinstance(delivery, ApiDelivery)
+            with pytest.raises(PaperlessError) as exc_info:
+                client.poll_task(delivery.task_id, timeout=10)
+        finally:
+            client.close()
+        assert str(exc_info.value).endswith(f"; {_DUPLICATE_SENTENCE}")
+        (poll,) = recorder.polls()
+        assert poll.headers["accept"] == spoken
 
 
 class TestUploadResultContract:
