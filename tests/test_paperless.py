@@ -3392,34 +3392,6 @@ class TestConnectionTimeout:
 class TestConsumeDir:
     """Consume directory fallback tests."""
 
-    def test_consume_dir_created_if_not_exists(
-        self, sample_pdf: Path, tmp_path: Path
-    ) -> None:
-        """Fallback creates consume_dir if it does not exist before copying."""
-        consume_dir = tmp_path / "nonexistent" / "consume"
-        assert not consume_dir.exists()
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            msg = "connection refused"
-            raise httpx2.ConnectError(msg)
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            consume_dir=consume_dir,
-            transport=transport,
-            max_retries=1,
-        )
-        result = client.upload_document(sample_pdf, title="Auto-create test")
-        assert result.delivered_to_api is False
-        assert consume_dir.exists()
-        copied = list(consume_dir.iterdir())
-        assert len(copied) == 1
-        assert copied[0].name == "test.pdf"
-        assert result.consume_dir_path == consume_dir / "test.pdf"
-        client.close()
-
     def test_consume_dir_works_when_exists(
         self, sample_pdf: Path, tmp_path: Path
     ) -> None:
@@ -3517,19 +3489,18 @@ class TestConsumeDir:
         assert isinstance(exc_info.value.__cause__, OSError)
         assert sorted(entry.name for entry in consume_dir.iterdir()) == []
 
-    def test_an_uncreatable_consume_dir_raises_a_paperless_error(
+    def test_consume_dir_missing_is_reported_and_nothing_is_created(
         self, sample_pdf: Path, tmp_path: Path
     ) -> None:
         """
-        EXC-01: a consume directory that cannot be created is a PaperlessError.
+        A missing consume directory fails the handoff and is never created.
 
-        A regular file sits where the directory should be, so ``mkdir`` fails
-        whatever user runs the tests (a permission-based setup would pass
-        under root).
+        A directory created where no volume is mounted is one nothing
+        watches: the copy would sit there unseen while the job reported a
+        fallback that saved the scan.
         """
-        blocker = tmp_path / "not-a-dir"
-        blocker.write_text("occupied")
-        consume_dir = blocker / "consume"
+        consume_dir = tmp_path / "missing" / "consume"
+        before = sorted(entry.name for entry in tmp_path.iterdir())
 
         client = PaperlessClient(
             url="http://paperless:8000",
@@ -3539,39 +3510,113 @@ class TestConsumeDir:
             max_retries=1,
         )
         try:
-            with pytest.raises(
-                PaperlessError,
-                match="Could not copy the PDF to the consume directory",
-            ) as exc_info:
-                client.upload_document(sample_pdf, title="Blocked")
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Unmounted")
         finally:
             client.close()
 
-        assert isinstance(exc_info.value.__cause__, OSError)
+        message = str(exc_info.value)
+        assert message == (
+            f"consume directory {consume_dir} does not exist — "
+            "is the paperless-ngx volume mounted?"
+        )
+        assert not (tmp_path / "missing").exists()
+        assert sorted(entry.name for entry in tmp_path.iterdir()) == before
 
-    def test_consume_dir_logs_warning_on_create(
-        self, sample_pdf: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    def test_consume_dir_missing_when_a_file_is_in_its_place(
+        self, sample_pdf: Path, tmp_path: Path
     ) -> None:
-        """A warning is logged when creating the consume directory."""
-        consume_dir = tmp_path / "warn-consume"
-        assert not consume_dir.exists()
+        """A regular file where the directory should be is not a directory."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.write_bytes(b"occupied")
 
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            msg = "connection refused"
-            raise httpx2.ConnectError(msg)
-
-        transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            transport=transport,
+            transport=_make_transport(_always_refused),
             max_retries=1,
         )
-        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
-            client.upload_document(sample_pdf, title="Warning test")
-        assert any("Created consume directory" in msg for msg in caplog.messages)
-        client.close()
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Occupied")
+        finally:
+            client.close()
+
+        message = str(exc_info.value)
+        assert "does not exist" in message
+        assert "is the paperless-ngx volume mounted?" in message
+        assert consume_dir.read_bytes() == b"occupied"
+
+    def test_staging_leaves_a_symlink_at_the_old_name_untouched(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """
+        A symlink planted at the predictable staging name is not written through.
+
+        The consume folder is often shared, so anyone who can write to it
+        could otherwise aim the copy at a file outside it.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        target = tmp_path / "outside.txt"
+        target.write_bytes(b"keep me")
+        planted = consume_dir / f".{sample_pdf.name}.part"
+        planted.symlink_to(target)
+
+        result = _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        dest = consume_dir / sample_pdf.name
+        assert result.consume_dir_path == dest
+        assert target.read_bytes() == b"keep me"
+        assert planted.is_symlink()
+        assert planted.readlink() == target
+        assert not dest.is_symlink()
+        assert dest.read_bytes() == sample_pdf.read_bytes()
+
+    def test_staging_leaves_a_leftover_at_the_old_name_untouched(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """A crash leftover at the old fixed staging name cannot collide."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        leftover = consume_dir / f".{sample_pdf.name}.part"
+        leftover.write_bytes(b"leftover")
+
+        _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        assert leftover.read_bytes() == b"leftover"
+        assert (consume_dir / sample_pdf.name).read_bytes() == sample_pdf.read_bytes()
+
+    def test_staging_file_is_hidden_unique_and_removed(
+        self, sample_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The bytes go to a hidden, uniquely named ``.part`` file.
+
+        It is created exclusively, so its name is not the predictable one,
+        and it is gone once the PDF has its final name.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        seen: list[str] = []
+        original = shutil.copyfileobj
+
+        def recording(source: BinaryIO, target: BinaryIO) -> None:
+            seen.extend(entry.name for entry in consume_dir.iterdir())
+            original(source, target)
+
+        monkeypatch.setattr(shutil, "copyfileobj", recording)
+        _deliver_to_consume_dir(sample_pdf, consume_dir)
+
+        assert len(seen) == 1
+        staged = seen[0]
+        assert staged.startswith(f".{sample_pdf.name}.")
+        assert staged.endswith(".part")
+        assert staged != f".{sample_pdf.name}.part"
+        assert sorted(entry.name for entry in consume_dir.iterdir()) == [
+            sample_pdf.name
+        ]
 
 
 class TestAuthHeader:
