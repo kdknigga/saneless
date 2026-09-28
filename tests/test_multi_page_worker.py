@@ -18,12 +18,12 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import pytest
 
 from saneless.job import ErrorCategory, Job, JobState, JobStore
-from saneless.pipeline import PipelineEvent, ScanResult
+from saneless.pipeline import AnswerSlot, PipelineEvent, ScanResult
 from saneless.vocabulary import (
     TERMINAL_STATES,
     PassAnswer,
@@ -335,6 +335,40 @@ class TestWorkerPassCoordinator:
         assert asker.result() is PassAnswer.NEXT
 
         assert coordinator.ask(_prompt(2)) is PassAnswer.TIMED_OUT
+
+
+class _AnsweredBetweenReads(AnswerSlot[PassAnswer]):
+    """
+    A slot the operator answers between one read of it and the next.
+
+    The first read of ``answer`` finds the prompt open and every later read
+    finds it answered, which is what a click landing mid-read looks like.
+    """
+
+    def __init__(self, answer: PassAnswer) -> None:
+        """
+        Start unread.
+
+        Args:
+            answer: What every read after the first returns.
+
+        """
+        super().__init__()
+        self._late = answer
+        self._reads = 0
+
+    @property
+    @override
+    def answer(self) -> PassAnswer | None:
+        """
+        Report the prompt open on the first read, and answered afterwards.
+
+        Returns:
+            ``None`` the first time; the late answer every time after.
+
+        """
+        self._reads += 1
+        return None if self._reads == 1 else self._late
 
 
 class _FakePipeline:
@@ -819,6 +853,35 @@ class TestScanWorkerMultiPage:
         _finished(store, job.id)
 
         assert kept == expected
+
+    def test_pages_kept_reads_the_prompt_and_its_answer_once(
+        self, running: tuple[ScanWorker, JobStore]
+    ) -> None:
+        """
+        A prompt answered mid-read still reports its own count, never zero.
+
+        Reading the claim and the open prompt separately could find the prompt
+        open in the first read and answered in the second, and so neither.
+        """
+        worker, _store = running
+        coordinator = WorkerPassCoordinator("job-1", stopping=threading.Event())
+        coordinator._prompt = PassPrompt(
+            number=2,
+            wait=PassWait.NEXT_PASS,
+            pages_kept=3,
+            offered=_NEXT_PASS_OFFERED,
+            timeout_seconds=_OPEN_PROMPT_TIMEOUT,
+            last_pass_pages=1,
+            last_pass_kept=1,
+        )
+        coordinator._slot = _AnsweredBetweenReads(PassAnswer.NEXT)
+        worker._pass_coordinator = coordinator
+        try:
+            kept = worker.pages_kept
+        finally:
+            worker._pass_coordinator = None
+
+        assert kept == 3
 
     def test_pages_kept_is_none_without_a_multi_page_job(
         self,

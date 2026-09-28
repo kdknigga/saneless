@@ -481,6 +481,25 @@ class WorkerPassCoordinator(PassCoordinator):
             slot = None if self._superseded else self._slot
         return None if slot is None else slot.answer
 
+    @property
+    def latest(self) -> tuple[PassPrompt, PassAnswer | None] | None:
+        """
+        The latest prompt and its answer, read together, or ``None`` before any.
+
+        One read of the prompt and one of its answer, so a click landing
+        between two reads can never make an open prompt and its claim both
+        look absent.
+
+        Returns:
+            The latest published prompt, with its claimed answer or ``None``
+            while it is open; ``None`` when no prompt has been published.
+
+        """
+        prompt, slot = self._snapshot()
+        if prompt is None or slot is None:
+            return None
+        return prompt, slot.answer
+
     def announce_next_question(self) -> None:
         """
         Note that the run has announced its next question but not yet asked it.
@@ -1183,13 +1202,14 @@ class ScanWorker:
         coordinator = self._pass_coordinator
         if coordinator is None:
             return None
-        claimed = coordinator.claimed
-        if claimed is None:
-            # Nothing answered yet: the first pass is scanning, or a prompt is
-            # open and its own count is the document's.
-            waiting = coordinator.open_prompt
-            return 0 if waiting is None else waiting.pages_kept
-        prompt, answer = claimed
+        latest = coordinator.latest
+        if latest is None:
+            # No prompt yet: the first pass is scanning.
+            return 0
+        prompt, answer = latest
+        if answer is None:
+            # The prompt is open, and its own count is the document's.
+            return prompt.pages_kept
         if prompt.wait is PassWait.NEXT_PASS and answer is PassAnswer.RESCAN:
             return prompt.pages_kept - prompt.last_pass_kept
         return prompt.pages_kept
