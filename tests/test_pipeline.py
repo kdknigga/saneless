@@ -72,8 +72,10 @@ from saneless.vocabulary import (
     JobState,
     ScanOutcome,
     backs_not_scanned_warning,
+    backs_pass_cap_note,
     backs_pass_cap_warning,
     classify_error,
+    pass_cap_note,
     pass_cap_warning,
     substituted_source_warning,
 )
@@ -6087,6 +6089,53 @@ class TestBatchFactWarnings:
         assert result.pages_uploaded == 2
         assert result.warning == pass_cap_warning(2, 500, 501, auto_source=False)
 
+    @pytest.mark.parametrize(
+        "blank",
+        [
+            pytest.param(False, id="delivery-fails"),
+            pytest.param(True, id="all-blank"),
+        ],
+    )
+    def test_a_failure_after_a_capped_pass_still_names_the_sheet_not_kept(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        *,
+        blank: bool,
+    ) -> None:
+        """
+        The failure line carries the cap sentence, not only the log.
+
+        The pages are kept in ``failed/``, and the operator resuming from them
+        needs to know which sheet was fed and not kept. Parametrised over a
+        delivery that fails and a pass whose every page is blank, which fails
+        before anything is assembled.
+        """
+        _isolate_dirs(default_settings, tmp_path)
+        expected: type[Exception] = AllPagesBlankError
+        if not blank:
+            expected = PaperlessError
+            mock_paperless.upload_document.side_effect = PaperlessError("Upload failed")
+        make = _make_empty_image if blank else _make_content_image
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [make() for _ in range(3)],
+            cap_reached=PassCapReached(500, 501, auto_source=False),
+        )
+
+        with pytest.raises(expected) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Capped"),
+            )
+
+        text = failure_text(excinfo.value)
+        assert text.endswith(pass_cap_note(500, 501, auto_source=False))
+        assert "preserved" in text
+
     def test_an_auto_source_cap_carries_the_auto_sentence(
         self,
         mock_paperless: MagicMock,
@@ -6281,6 +6330,66 @@ class TestManualDuplexPassCap:
         # does not advise resuming from a sheet whose front was never scanned.
         assert result.warning.count(backs_pass_cap_warning(7, 500, 501)) == 1
         assert "one scan stops after" not in result.warning
+
+    def test_a_failed_capped_fronts_run_still_names_the_sheet_and_the_backs(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A delivery failure after a capped fronts pass keeps both sentences."""
+        _isolate_dirs(default_settings, tmp_path)
+        mock_paperless.upload_document.side_effect = PaperlessError("Upload failed")
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3), cap_reached=self._CAP),
+        )
+
+        with pytest.raises(PaperlessError) as excinfo:
+            self._run(
+                scanner,
+                mock_paperless,
+                default_settings,
+                AlwaysContinueFlipCoordinator(),
+                events,
+            )
+
+        assert failure_text(excinfo.value).endswith(
+            " ".join(
+                (
+                    pass_cap_note(500, 501, auto_source=False),
+                    backs_not_scanned_warning(501),
+                )
+            )
+        )
+
+    def test_a_failed_capped_backs_run_still_names_the_sheet(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A delivery failure after a capped backs pass keeps its own sentence."""
+        _isolate_dirs(default_settings, tmp_path)
+        mock_paperless.upload_document.side_effect = PaperlessError("Upload failed")
+        events: list[PipelineEvent] = []
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _passes_in_turn(
+            spooling(self._pages(3)),
+            spooling(self._pages(4, start=3), cap_reached=self._CAP),
+        )
+
+        with pytest.raises(PaperlessError) as excinfo:
+            self._run(
+                scanner,
+                mock_paperless,
+                default_settings,
+                AlwaysContinueFlipCoordinator(),
+                events,
+            )
+
+        assert failure_text(excinfo.value).endswith(backs_pass_cap_note(500, 501))
 
     def test_a_capped_backs_pass_is_never_interleaved_even_when_counts_agree(
         self,

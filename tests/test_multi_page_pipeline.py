@@ -38,10 +38,12 @@ from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
     ListingCrashedError,
+    PaperlessError,
     ScanCancelledError,
     ScanError,
     ScanInterrupted,
     SpoolError,
+    failure_text,
 )
 from saneless.pages import generate_thumbnail, is_blank
 from saneless.paperless import PaperlessClient, UploadResult
@@ -74,6 +76,7 @@ from saneless.vocabulary import (
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
+    pass_cap_note,
     pass_cap_warning,
     pass_wait_state,
     substituted_source_warning,
@@ -1987,6 +1990,21 @@ class TestMultiPagePassFacts:
         assert result.warning == pass_cap_warning(3, 50, 51, auto_source=True)
         (document,) = rig.uploads
         assert embedded_streams(document) == _pages(scanner, [0, 1, 2])
+
+    def test_a_failure_after_a_capped_pass_still_names_the_sheet_not_kept(
+        self, rig: _Rig
+    ) -> None:
+        """A delivery that fails after the capped pass keeps its cap sentence."""
+        scanner = _FactScanner(passes=((0,), (1, 2)), caps={2: _AUTO_CAP})
+        coordinator = ScriptedPassCoordinator([_NEXT])
+        rig.paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        with pytest.raises(PaperlessError) as excinfo:
+            rig.run(scanner, coordinator)
+
+        assert failure_text(excinfo.value).endswith(
+            pass_cap_note(50, 51, auto_source=True)
+        )
 
     def test_the_pass_cap_sentence_replaces_the_document_cap_sentence(
         self, rig: _Rig, monkeypatch: pytest.MonkeyPatch

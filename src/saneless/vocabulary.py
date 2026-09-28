@@ -81,6 +81,7 @@ __all__ = [
     "abort_question",
     "ambiguous_source_error",
     "backs_not_scanned_warning",
+    "backs_pass_cap_note",
     "backs_pass_cap_warning",
     "blank_timeout_finish_warning",
     "busy_line",
@@ -107,6 +108,7 @@ __all__ = [
     "page_timeout_error",
     "pages_phrase",
     "pass_answer_label",
+    "pass_cap_note",
     "pass_cap_warning",
     "pass_prompt_copy",
     "pass_wait_state",
@@ -1441,6 +1443,41 @@ def cap_finish_warning(pages_kept: int, cap: int) -> str:
     )
 
 
+# The lead a cap's sentence takes when the job failed after the capped pass:
+# there is no finished document to count, but the sheet fed and not kept is
+# still where the operator resumes.
+_CAP_NOTE_LEAD = "The scan had reached its sheet cap before that: "
+
+
+def _pass_cap_body(cap: int, sheet_not_kept: int, *, auto_source: bool) -> str:
+    """
+    Return what a capped pass did and where to resume, after the lead.
+
+    Args:
+        cap: The sheet count at which one scan stops.
+        sheet_not_kept: The sheet that was fed but not kept.
+        auto_source: Whether the capped scan was an Auto source sent through
+            the feeder rather than a source named as a feeder.
+
+    Returns:
+        The sentence, starting in lower case, to follow a lead.
+
+    """
+    stopped = (
+        f"stops after {_counted(cap, 'sheet')}, so sheet {sheet_not_kept} was "
+        "fed but not kept."
+    )
+    resume = f"sheet {sheet_not_kept} and any remaining pages as a new document."
+    if auto_source:
+        return (
+            f"a scan from an Auto source through the feeder {stopped} If "
+            "the feeder was already empty, the scanner was scanning its glass "
+            'again; set auto_source_mode = "flatbed" for this profile. Otherwise '
+            f"scan {resume}"
+        )
+    return f"one scan {stopped} Scan {resume}"
+
+
 def pass_cap_warning(
     pages_kept: int, cap: int, sheet_not_kept: int, *, auto_source: bool
 ) -> str:
@@ -1467,20 +1504,53 @@ def pass_cap_warning(
         The warning sentence.
 
     """
-    lead = f"Finished at {pages_phrase(pages_kept)}: "
-    stopped = (
-        f"stops after {_counted(cap, 'sheet')}, so sheet {sheet_not_kept} was "
-        "fed but not kept."
+    body = _pass_cap_body(cap, sheet_not_kept, auto_source=auto_source)
+    return f"Finished at {pages_phrase(pages_kept)}: {body}"
+
+
+def pass_cap_note(cap: int, sheet_not_kept: int, *, auto_source: bool) -> str:
+    """
+    Return the cap sentence a job that failed after a capped pass carries.
+
+    The job failed after the pass, so there is no finished document to count,
+    but which sheet was fed and not kept is still the one fact the operator
+    needs to resume, and without this it would survive only in the log. It
+    follows the sentence saying where the pages were kept.
+
+    Args:
+        cap: The sheet count at which one scan stops.
+        sheet_not_kept: The sheet that was fed but not kept.
+        auto_source: Whether the capped scan was an Auto source sent through
+            the feeder rather than a source named as a feeder.
+
+    Returns:
+        The sentence.
+
+    """
+    body = _pass_cap_body(cap, sheet_not_kept, auto_source=auto_source)
+    return f"{_CAP_NOTE_LEAD}{body}"
+
+
+def _backs_cap_body(cap: int, sheet_not_kept: int) -> str:
+    """
+    Return what a capped backs pass did and what to do, after the lead.
+
+    Args:
+        cap: The sheet count at which one scan stops.
+        sheet_not_kept: The sheet of the turned-over stack that was fed but
+            not kept.
+
+    Returns:
+        The sentence, starting in lower case, to follow a lead.
+
+    """
+    return (
+        f"the scan of the backs stops after {_counted(cap, 'sheet')}, so sheet "
+        f"{sheet_not_kept} of the turned-over stack was fed but not kept, and "
+        "the stack held more sheets than the scan of the fronts fed. Check "
+        "both documents, and scan any sheet missing from either again, both "
+        "sides, as a new document."
     )
-    resume = f"sheet {sheet_not_kept} and any remaining pages as a new document."
-    if auto_source:
-        return (
-            f"{lead}a scan from an Auto source through the feeder {stopped} If "
-            "the feeder was already empty, the scanner was scanning its glass "
-            'again; set auto_source_mode = "flatbed" for this profile. Otherwise '
-            f"scan {resume}"
-        )
-    return f"{lead}one scan {stopped} Scan {resume}"
 
 
 def backs_pass_cap_warning(pages_kept: int, cap: int, sheet_not_kept: int) -> str:
@@ -1506,14 +1576,27 @@ def backs_pass_cap_warning(pages_kept: int, cap: int, sheet_not_kept: int) -> st
         The warning sentence.
 
     """
-    return (
-        f"Finished at {pages_phrase(pages_kept)}: the scan of the backs stops "
-        f"after {_counted(cap, 'sheet')}, so sheet {sheet_not_kept} of the "
-        "turned-over stack was fed but not kept, and the stack held more "
-        "sheets than the scan of the fronts fed. Check both documents, and "
-        "scan any sheet missing from either again, both sides, as a new "
-        "document."
-    )
+    body = _backs_cap_body(cap, sheet_not_kept)
+    return f"Finished at {pages_phrase(pages_kept)}: {body}"
+
+
+def backs_pass_cap_note(cap: int, sheet_not_kept: int) -> str:
+    """
+    Return the backs-cap sentence a manual duplex job that then failed carries.
+
+    The counterpart of ``pass_cap_note`` for a capped backs pass, whose
+    advice differs; see ``backs_pass_cap_warning``.
+
+    Args:
+        cap: The sheet count at which one scan stops.
+        sheet_not_kept: The sheet of the turned-over stack that was fed but
+            not kept.
+
+    Returns:
+        The sentence.
+
+    """
+    return f"{_CAP_NOTE_LEAD}{_backs_cap_body(cap, sheet_not_kept)}"
 
 
 def backs_not_scanned_warning(sheet_not_kept: int) -> str:

@@ -45,10 +45,12 @@ from saneless.vocabulary import (
     PassWait,
     ScanOutcome,
     backs_not_scanned_warning,
+    backs_pass_cap_note,
     backs_pass_cap_warning,
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
+    pass_cap_note,
     pass_cap_warning,
     pass_wait_state,
     substituted_source_warning,
@@ -1764,6 +1766,11 @@ class _PipelineRun:
             recover it, which it will not for a workspace used unlocked.
         ledger: What each acquisition pass has spooled; built here.
         artefacts: What the run has produced and how far it got; built here.
+        failure_notes: Sentences a failure from here on must carry beside
+            the one saying where the pages were kept, because the fact would
+            otherwise survive only in the log: a pass that stopped at its
+            cap, which names the sheet the operator resumes from. Empty until
+            then; built here.
 
     """
 
@@ -1780,10 +1787,12 @@ class _PipelineRun:
     keep_workspace: Callable[[], bool]
     ledger: _SpoolLedger = field(init=False)
     artefacts: preservation.RunArtefacts = field(init=False)
+    failure_notes: list[str] = field(init=False)
 
     def __post_init__(self) -> None:
         """Start the ledger and the artefacts before anything has been scanned."""
         self.ledger = _SpoolLedger()
+        self.failure_notes = []
         self.artefacts = preservation.RunArtefacts(
             job_id=self.request.job_id,
             title=self.request.title,
@@ -1872,6 +1881,10 @@ class _PipelineRun:
             sentence = report.sentence()
             if sentence is not None:
                 exc.add_note(sentence)
+            # What a finished run would have warned about and a failed one
+            # must still say: the sheet a capped pass fed and did not keep.
+            for note in self.failure_notes:
+                exc.add_note(note)
             if report.problems and has_pages_left(self.spool_dir):
                 # Removing the workspace now would delete the only copy of
                 # the pages the preservation could not move, so it stays for
@@ -2474,6 +2487,7 @@ class _PipelineRun:
         # just accepted is the last one: Re-scan at the blank prompt never
         # accepts it, and no next-pass prompt follows a capped one.
         pass_cap = _pass_cap_warning(document.passes[-1].cap, document.kept)
+        self._keep_cap_for_failure(document.passes[-1].cap)
         if decision is PassAnswer.TIMED_OUT or pass_cap is not None:
             document.warning = _join_warnings(document.warning, pass_cap)
             return None
@@ -2940,6 +2954,28 @@ class _PipelineRun:
         logger.warning(warning)
         return warning
 
+    def _keep_cap_for_failure(self, cap: PassCapReached | None) -> None:
+        """
+        Keep a capped pass's sentence for any failure after it, if it was capped.
+
+        The warning a finished run carries is worded only once the pages are
+        delivered, so a failure in between -- a blank-page verdict, assembly
+        or delivery -- would otherwise lose which sheet was fed and not kept.
+        On a manual duplex run the capped pass is the fronts pass, so the
+        backs were not scanned either, and that is kept too.
+
+        Args:
+            cap: The cap the pass reached, or None when it ended on its own.
+
+        """
+        if cap is None:
+            return
+        self.failure_notes.append(
+            pass_cap_note(cap.cap, cap.sheet_not_kept, auto_source=cap.auto_source)
+        )
+        if self.flip is not None:
+            self.failure_notes.append(backs_not_scanned_warning(cap.sheet_not_kept))
+
     def _finish_document(self, batch: ScanBatch) -> ScanResult:
         """
         Filter, assemble and deliver one document.
@@ -2967,6 +3003,7 @@ class _PipelineRun:
         # here, and a pass that stopped at its cap, with the pages before it
         # kept, once the blank pages are out.
         substitution_warning = _substitution_warning(batch.substituted_source)
+        self._keep_cap_for_failure(batch.cap_reached)
 
         # There is no per-page EXIF strip here, and one would have nothing to
         # act on.  python-sane builds each page with ``Image.frombuffer``,
@@ -3219,6 +3256,9 @@ class _PipelineRun:
             substitution and pass-cap sentences when those happened.
 
         """
+        cap = mismatch.backs_cap
+        if cap is not None:
+            self.failure_notes.append(backs_pass_cap_note(cap.cap, cap.sheet_not_kept))
         fronts = mismatch.fronts
         # Pass B runs over the flipped stack, so it produces the backs last sheet
         # first.  Reversed here, as _interleave_duplex does, the (backs) PDF runs
