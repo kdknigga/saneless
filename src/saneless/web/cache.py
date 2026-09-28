@@ -8,11 +8,14 @@ import time
 from typing import TYPE_CHECKING, Final
 
 from saneless.exceptions import ConfigError, PaperlessError, describe
+from saneless.scan_metadata import fetch_metadata, metadata_ids
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-__all__ = ["MetadataCache"]
+    from saneless.scan_metadata import MetadataKind, MetadataSource
+
+__all__ = ["CachedMetadataLookup", "MetadataCache"]
 
 logger = logging.getLogger(__name__)
 
@@ -209,3 +212,47 @@ class MetadataCache:
         with self._locks_guard:
             self._generations[key] = self._generations.get(key, 0) + 1
             self._store.pop(key, None)
+
+
+class CachedMetadataLookup:
+    """
+    The id check's lookup for the web: the page's cache first, then the client.
+
+    A first look reads the list the tag and correspondent pickers were served
+    from, so a scan whose ids are all known costs no request.  A fresh look,
+    made only when an id seemed to be missing, goes to the client directly:
+    the cache's own fetch serves the last good copy when paperless-ngx is
+    down, and that copy would make an unreachable paperless-ngx look like
+    proof the id is still missing.  Every list the client returns is stored,
+    so the pickers see it too; a failed fetch stores nothing and answers None.
+
+    Args:
+        cache: The web tier's metadata cache.
+        client: The paperless-ngx client.
+
+    """
+
+    def __init__(self, cache: MetadataCache, client: MetadataSource) -> None:
+        """Keep the cache and the client the lookups read."""
+        self._cache = cache
+        self._client = client
+
+    def tag_ids(self, *, fresh: bool) -> frozenset[int] | None:
+        """Return the ids of paperless-ngx's tags, or None when unknown."""
+        return self._ids("tags", fresh=fresh)
+
+    def correspondent_ids(self, *, fresh: bool) -> frozenset[int] | None:
+        """Return the ids of paperless-ngx's correspondents, or None when unknown."""
+        return self._ids("correspondents", fresh=fresh)
+
+    def _ids(self, kind: MetadataKind, *, fresh: bool) -> frozenset[int] | None:
+        """Return one list's ids from the cache, or from the client."""
+        if not fresh:
+            cached = self._cache.get(kind)
+            if cached is not None:
+                return metadata_ids(cached)
+        rows = fetch_metadata(self._client, kind)
+        if rows is None:
+            return None
+        self._cache.set(kind, rows)
+        return metadata_ids(rows)

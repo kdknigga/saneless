@@ -104,6 +104,7 @@ __all__ = [
     "cli_pass_choices",
     "cli_pass_question",
     "connection_status_message",
+    "dropped_ids_warning",
     "duplicate_warning",
     "duration_phrase",
     "error_advice",
@@ -824,6 +825,64 @@ RESTART_UPLOADING_REASON: Final = (
 # ``state_label``, so the CLI outcome line, the web status area and the
 # history row cannot drift apart.  Neither carries a configured value.
 WARNED_UPLOAD_LABEL: Final = "Uploaded with a warning"
+
+
+def _id_list(ids: Sequence[int]) -> str:
+    """
+    Return ids as prose: "9", "3 and 9", or "3, 7 and 9".
+
+    Args:
+        ids: At least one id, in the order they were chosen.
+
+    Returns:
+        The ids joined with commas and a final "and".
+
+    """
+    words = [str(item) for item in ids]
+    if len(words) == 1:
+        return words[0]
+    return f"{', '.join(words[:-1])} and {words[-1]}"
+
+
+def dropped_ids_warning(tags: Sequence[int], correspondent: int | None) -> str | None:
+    """
+    Return the warning for ids paperless-ngx no longer has, or None for none.
+
+    A tag or correspondent that is missing from paperless-ngx's lists, even
+    after one refetch, is dropped before scanning and the scan goes ahead:
+    the job ends DONE with this warning, the document filed without them.
+    Every surface words the drop with this one sentence.  Only the ids are
+    interpolated.
+
+    Args:
+        tags: The tag ids dropped, in the order they were chosen.
+        correspondent: The correspondent id dropped, or None.
+
+    Returns:
+        One sentence naming every dropped id, or None when nothing was.
+
+    """
+    parts: list[str] = []
+    if tags:
+        parts.append(f"{'tag' if len(tags) == 1 else 'tags'} {_id_list(tags)}")
+    if correspondent is not None:
+        parts.append(f"correspondent {correspondent}")
+    if not parts:
+        return None
+    # "tags 3 and 9 and correspondent 12" would read as one list, so commas
+    # set the correspondent apart when the tag list has an "and" of its own.
+    subject = (
+        f"{parts[0]}, and {parts[1]},"
+        if len(parts) == 2 and len(tags) > 1
+        else " and ".join(parts)
+    )
+    dropped = len(tags) + (0 if correspondent is None else 1)
+    predicate = (
+        "no longer exists in paperless-ngx and was not applied."
+        if dropped == 1
+        else "no longer exist in paperless-ngx and were not applied."
+    )
+    return f"{subject} {predicate}"
 
 
 def duplicate_warning(
