@@ -340,21 +340,25 @@ def _never_finishing_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     return handler
 
 
-def _server_error_handler() -> Callable[[httpx2.Request], httpx2.Response]:
+def _refused_connection_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     """
-    Refuse every upload with a 500, so the consume directory is the only route.
+    Refuse the connection for every upload, so the consume directory is the route.
 
-    A poll reaching this handler would mean the fallback was not taken and the
-    client invented a task id, so the tasks path is left to ``_unexpected``.
+    A refused connection is a failure before anything was sent: paperless-ngx
+    cannot have received the document, which is the only failure a consume
+    folder copy may follow without risking a second filing.  A poll reaching
+    this handler would mean the fallback was not taken and the client invented
+    a task id, so the tasks path is left to ``_unexpected``.
 
     Returns:
-        A handler answering the upload path with a retryable server error.
+        A handler raising ``httpx2.ConnectError`` on the upload path.
 
     """
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == _DOCUMENTS_PATH:
-            return httpx2.Response(500, text="paperless-ngx is restarting")
+            msg = "connection refused"
+            raise httpx2.ConnectError(msg, request=request)
         return _unexpected(request)
 
     return handler
@@ -453,7 +457,7 @@ _CASES = [
     ),
     _Case(
         label="consume-dir-fallback",
-        handler_factory=_server_error_handler,
+        handler_factory=_refused_connection_handler,
         expected_state=JobState.FALLBACK,
         expected_outcome=ScanOutcome.FALLBACK,
         expected_pages=(2, 0, 2),
