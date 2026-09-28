@@ -2865,18 +2865,6 @@ class TestMetadataFetchTranslation:
         )
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_metadata_list_response_is_returned(self, method: str, noun: str) -> None:
-        """A bare-list response is returned unchanged."""
-        items = [{"id": 1, "name": f"first {noun}"}]
-        handler = _CountingHandler(_answering(httpx2.Response(200, json=items)))
-        client = _metadata_client(handler)
-        try:
-            assert getattr(client, method)() == items
-        finally:
-            client.close()
-        assert handler.calls == 1
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     def test_metadata_paginated_response_is_unwrapped(
         self, method: str, noun: str
     ) -> None:
@@ -3629,16 +3617,6 @@ class TestMetadataPagination:
         )
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_a_bare_list_is_returned_after_one_request(
-        self, method: str, noun: str
-    ) -> None:
-        """A bare JSON list is the whole collection: nothing more is asked for."""
-        items = _items(noun, 1, 2)
-        handler = _PagedHandler({1: httpx2.Response(200, json=items)})
-        assert _fetch(handler, method) == items
-        assert len(handler.requests) == 1
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     def test_an_empty_page_ends_the_fetch(self, method: str, noun: str) -> None:
         """
         An empty page stops the fetch even though its ``next`` is not null.
@@ -3746,45 +3724,99 @@ class TestMetadataResponseShape:
             _fetch(handler, method)
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_a_bare_list_of_non_objects_fails(self, method: str, noun: str) -> None:
-        """A bare list must hold objects too."""
-        handler = _PagedHandler({1: httpx2.Response(200, json=["one", "two"])})
-        with pytest.raises(PaperlessError, match="page 1 did not hold a list"):
-            _fetch(handler, method)
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    def test_a_bare_list_after_page_one_fails(self, method: str, noun: str) -> None:
-        """
-        A bare list is the whole collection only on page 1.
-
-        On a later page it used to be returned alone, throwing away the pages
-        already collected.
-        """
-        handler = _PagedHandler(
-            {
-                1: httpx2.Response(
-                    200, json=_page_payload(_items(noun, 1, 2), _next_link(noun, 2))
-                ),
-                2: httpx2.Response(200, json=_items(noun, 3, 2)),
-            }
-        )
-        with pytest.raises(PaperlessError) as exc_info:
-            _fetch(handler, method)
-        assert str(exc_info.value).endswith(
-            "page 2 was a bare list, which only page 1 may be"
-        )
-
-    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    @pytest.mark.parametrize("body", [42, "tags", True])
-    def test_a_body_that_is_neither_a_list_nor_an_object_fails(
+    @pytest.mark.parametrize(
+        "body",
+        [42, "tags", True, None, [], [{"id": 1, "name": "one"}]],
+        ids=["int", "string", "bool", "null", "empty-list", "bare-list"],
+    )
+    def test_a_body_that_is_not_an_object_fails(
         self, method: str, noun: str, body: object
     ) -> None:
-        """A scalar body is a PaperlessError naming the collection."""
+        """
+        A body that is not a page object is a PaperlessError naming the collection.
+
+        Every paperless-ngx release saneless supports paginates tags and
+        correspondents, so a bare list is not a collection either: it is
+        something other than paperless-ngx answering.
+        """
         handler = _PagedHandler({1: httpx2.Response(200, json=body)})
         with pytest.raises(PaperlessError) as exc_info:
             _fetch(handler, method)
-        assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
-        assert str(exc_info.value).endswith("neither a list nor an object")
+        assert str(exc_info.value) == (
+            f"Could not fetch {noun} from Paperless at "
+            f"http://{_CONFIGURED_HOST}:8000: the response was not an object"
+        )
+        assert len(handler.requests) == 1
+
+
+class TestMetadataTimeout:
+    """
+    A metadata fetch can carry a shorter timeout than the client's 30 s.
+
+    Checking the configured tags and correspondents before a scan starts
+    should answer in seconds when paperless-ngx is down, so the caller may
+    pass its own bound.  What needs proving is which budget each request
+    carried, which ``request.extensions["timeout"]`` records as a value.
+    """
+
+    @staticmethod
+    def _recorded_timeouts(
+        method: str, timeout: float | None
+    ) -> list[dict[str, float | None]]:
+        """
+        Fetch two pages of one collection and return each request's timeout.
+
+        Args:
+            method: ``get_tags`` or ``get_correspondents``.
+            timeout: The bound to pass, or None to call with no argument.
+
+        Returns:
+            The ``timeout`` extension of every request, in order.
+
+        """
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request.extensions["timeout"])
+            page = int(request.url.params["page"])
+            return httpx2.Response(
+                200,
+                json={
+                    "count": 2,
+                    "next": "more" if page == 1 else None,
+                    "results": [{"id": page, "name": f"item {page}"}],
+                },
+            )
+
+        client = _poll_client(handler)
+        try:
+            fetch = getattr(client, method)
+            items = fetch() if timeout is None else fetch(timeout=timeout)
+        finally:
+            client.close()
+        assert [item["id"] for item in items] == [1, 2]
+        return seen
+
+    @pytest.mark.parametrize("method", ["get_tags", "get_correspondents"])
+    def test_a_timeout_is_sent_on_every_page(self, method: str) -> None:
+        """``timeout=5.0`` bounds each page request to 5 s in every phase."""
+        five = {"connect": 5.0, "read": 5.0, "write": 5.0, "pool": 5.0}
+        assert self._recorded_timeouts(method, 5.0) == [five, five]
+
+    @pytest.mark.parametrize("method", ["get_tags", "get_correspondents"])
+    def test_no_timeout_keeps_the_client_default(self, method: str) -> None:
+        """Called with no bound, every page keeps the client's 30 s."""
+        thirty = {"connect": 30.0, "read": 30.0, "write": 30.0, "pool": 30.0}
+        assert self._recorded_timeouts(method, None) == [thirty, thirty]
+
+    @pytest.mark.parametrize("method", ["get_tags", "get_correspondents"])
+    def test_the_timeout_is_keyword_only_and_optional(self, method: str) -> None:
+        """The bound is a keyword, defaulting to None, the client default."""
+        parameter = inspect.signature(getattr(PaperlessClient, method)).parameters[
+            "timeout"
+        ]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
 
 
 class _EndlessHandler:
