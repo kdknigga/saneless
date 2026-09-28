@@ -5607,10 +5607,11 @@ class TestSaneBoundary:
 
     def test_scanner_package_does_not_offer_the_backend(self) -> None:
         """
-        The package exports the abstraction only, never the SANE backend.
+        The package exports nothing, and never the SANE backend.
 
-        Callers import ``saneless.scanner.sane_backend`` by name, so the
-        package itself never has a reason to reach python-sane.
+        Callers import ``saneless.scanner.base`` and
+        ``saneless.scanner.sane_backend`` by name, so the package itself never
+        has a reason to reach python-sane.
         """
         assert "SaneBackend" not in scanner_pkg.__all__
         assert not hasattr(scanner_pkg, "SaneBackend")
