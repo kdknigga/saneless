@@ -2141,8 +2141,8 @@ class _PageBudget:
 
     Bundled into one record rather than passed as separate parameters because
     ``_acquire_pages`` and ``_snap_flatbed`` would otherwise sit past ruff's
-    ``PLR0913`` argument limit, and CLAUDE.md forbids both raising the limit
-    and suppressing the rule. Both acquisition paths take the same record, so
+    ``PLR0913`` argument limit, and this project neither raises the limit nor
+    suppresses the rule. Both acquisition paths take the same record, so
     one sheet is bounded the same way whichever way it was presented; the page
     cap means nothing to the flatbed path, which takes one sheet.
 
