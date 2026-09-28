@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, assert_never
+from typing import TYPE_CHECKING, Final, Literal, assert_never
 
 from saneless.exceptions import (
     ListingCrashedError,
@@ -201,7 +201,7 @@ class DeviceSurvey:
     open_error: str | None = None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DeviceCapabilities:
     """
     Available options and constraints reported by a scanner device.
@@ -222,17 +222,18 @@ class DeviceCapabilities:
     whole dpi coerce at the point of use rather than at the point of reading,
     so nothing here quietly rounds off what the scanner said.
 
-    ``resolution_range`` is defaulted and sits with the other defaulted fields.
-    Moving it above ``raw_options`` would reorder the dataclass and break the
-    positional construction call sites across the suite rely on.
+    Construction is keyword-only, so the field order is nobody's dependency,
+    and the option list is carried as names rather than as a backend's own
+    option records: nothing outside a backend has to know where in a SANE
+    option tuple the name sits.
 
     Attributes:
         sources: The scan sources the device offers.
         resolutions: The exact resolutions the device offers, when it
             constrains the option with a word list. Empty otherwise.
         modes: The scan modes the device offers.
-        raw_options: The device's option tuples, as ``get_options()`` returns
-            them.
+        option_names: The names of the options the device reports, in the
+            order it reports them.
         resolution_range: The ``(min, max, step)`` the device reports, when it
             constrains the option with a range. None otherwise.
 
@@ -241,32 +242,52 @@ class DeviceCapabilities:
     sources: list[str]
     resolutions: list[int]
     modes: list[str]
-    raw_options: list[tuple] = field(default_factory=list)
+    option_names: tuple[str, ...] = ()
     resolution_range: tuple[float, float, float] | None = None
 
 
-@dataclass
+@dataclass(frozen=True, kw_only=True)
 class ScanSettings:
-    """Settings for a scan operation."""
+    """
+    Settings for a scan operation.
+
+    Frozen, so the settings resolved for a job are the settings the scanner
+    uses: nothing between ``run_pipeline`` and the backend can change a field
+    after construction. Keyword-only, so every field is named at the call site
+    and adding one cannot silently shift another's value.
+
+    Attributes:
+        source: The source name, as the profile gives it.
+        resolution: The requested resolution in dpi.
+        mode: The requested scan mode.
+        auto_source_mode: Where an ``Auto`` source is routed, mirroring
+            ``ProfileConfig.auto_source_mode``.
+        duplex: The profile's duplex choice, mirroring
+            ``ProfileConfig.duplex``.
+        paper_size: The paper size to frame the page to.
+
+    """
 
     source: str
     resolution: int
     mode: str
-    auto_source_mode: str = "flatbed"
-    # Manual duplex: resolve a document feeder from the device's own source
-    # list instead of validating ``source`` verbatim. The backend
-    # prefers ``source`` when the device reports it and it feeds, falls back
-    # to the first reported feeder, and refuses when there is none -- it never
+    auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
+    # Mirrors ProfileConfig.duplex, converted at one point in run_pipeline.
+    # The scanner package still does not depend on the job-state enums, so
+    # this is the profile's own Literal rather than a scanner-side enum.
+    #
+    # "manual" resolves a document feeder from the device's own source list
+    # instead of validating ``source`` verbatim: the backend prefers
+    # ``source`` when the device reports it and it feeds, falls back to the
+    # first reported feeder, and refuses when there is none -- it never
     # substitutes ``Auto``, which is how manual duplex once took two platen
     # snapshots and reported success.
     #
-    # A plain bool, not a scanner-side DuplexMode enum: inside the scanner
-    # that enum's NONE and HARDWARE members would behave identically, one
-    # behaviour with two spellings. The bool also keeps ProfileConfig.duplex's
-    # Literal as the only spelling of "duplex", with one conversion point in
-    # run_pipeline. Like auto_source_mode it is a plain value, because the
-    # scanner package deliberately does not depend on the job-state enums.
-    resolve_feeder_source: bool = False
+    # "hardware" reaches the scanner as its own value, not folded into
+    # "none": a device that selects duplex through a separate ADF-mode option
+    # needs that option set, so the two are not one behaviour with two
+    # spellings.
+    duplex: Literal["none", "hardware", "manual"] = "none"
     paper_size: PaperSize = "full"
 
 

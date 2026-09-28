@@ -2281,7 +2281,7 @@ def _acquire_pages(
     return records, rejected_pages
 
 
-def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
+def _choose_feeder_source(available_sources: list[str], requested: str) -> str:
     """
     Pick the single-sided document feeder a manual-duplex pass scans through.
 
@@ -2398,7 +2398,7 @@ def _resolve_source(
             them.
         requested: The source name the caller asked for.
         resolve_feeder: Manual duplex. Resolve a feeder from the device's own
-            list via ``_resolve_feeder_source`` instead of validating
+            list via ``_choose_feeder_source`` instead of validating
             ``requested`` alone.
 
     Returns:
@@ -2436,7 +2436,7 @@ def _resolve_source(
                 f"name of its feeder (got {requested!r})"
             )
             raise ScanError(msg)
-        feeder = _resolve_feeder_source(available_sources, requested)
+        feeder = _choose_feeder_source(available_sources, requested)
         return _SourceChoice(feeder, has_option=True, substituted_from=None)
 
     if not reported.present:
@@ -3304,7 +3304,7 @@ class SaneBackend(ScannerBackend):
                 sources=[str(s) for s in sources],
                 resolutions=[int(r) for r in resolution.values or []],
                 modes=[str(m) for m in modes],
-                raw_options=raw_options,
+                option_names=tuple(str(opt[1]) for opt in raw_options if len(opt) >= 2),
                 resolution_range=resolution.span,
             )
 
@@ -3411,7 +3411,7 @@ class SaneBackend(ScannerBackend):
             choice = _resolve_source(
                 raw_options,
                 settings.source,
-                resolve_feeder=settings.resolve_feeder_source,
+                resolve_feeder=settings.duplex == "manual",
             )
 
             # Set device options.  The resolution it hands back is the one the

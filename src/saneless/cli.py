@@ -1570,11 +1570,10 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
     if caps.modes:
         modes = ", ".join(neutralise_controls(m) for m in caps.modes)
         click.echo(f"  Modes: {modes}")
-    if caps.raw_options:
+    if caps.option_names:
         click.echo("  Raw options:")
-        for opt in caps.raw_options:
-            if len(opt) >= 2:
-                click.echo(f"    {neutralise_controls(str(opt[1]))}")
+        for name in caps.option_names:
+            click.echo(f"    {neutralise_controls(name)}")
 
 
 def _capabilities_dict(caps: DeviceCapabilities) -> dict[str, object]:
@@ -1604,9 +1603,10 @@ def _capabilities_dict(caps: DeviceCapabilities) -> dict[str, object]:
         result["resolution_range"] = {"min": low, "max": high, "step": step}
     if caps.modes:
         result["modes"] = list(caps.modes)
-    raw_names = [opt[1] for opt in caps.raw_options if len(opt) >= 2]
-    if raw_names:
-        result["raw_options"] = raw_names
+    # The key keeps its documented name: scripts read "raw_options", whatever
+    # the value object calls the field.
+    if caps.option_names:
+        result["raw_options"] = list(caps.option_names)
     return result
 
 

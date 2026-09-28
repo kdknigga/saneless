@@ -3185,10 +3185,11 @@ def run_pipeline(
         resolution=profile.resolution,
         mode=profile.mode,
         auto_source_mode=profile.auto_source_mode,
-        # The single conversion point from the config Literal to the scanner's
-        # feeder-resolution flag. Do not add a second: the scanner
-        # package never sees ProfileConfig.duplex or the job vocabulary.
-        resolve_feeder_source=manual_duplex,
+        # The single conversion point from the profile to the scanner's
+        # settings. Do not add a second: the scanner package takes the
+        # profile's duplex Literal as a plain value and never sees
+        # ProfileConfig or the job vocabulary.
+        duplex=profile.duplex,
         paper_size=profile.paper_size,
     )
 
