@@ -31,7 +31,7 @@ from saneless.checks import (
     POLL_STILL_CHECKING_LINE,
     CheckKey,
 )
-from saneless.config import is_placeholder_token, resolve_job_title
+from saneless.config import PaperlessId, is_placeholder_token, resolve_job_title
 from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
 from saneless.scanner.base import SourceKind, classify_source
@@ -100,7 +100,8 @@ what a single row can hold: the ids are stored as JSON on the job row, so
 an unbounded list would let one request, refused or not, write as much as
 it liked.  ``Form(max_length=...)`` and ``Query(max_length=...)`` turn a
 longer list into a 422 before the handler body runs, on the scan form, the
-tag list and the tag refresh alike.
+tag list and the tag refresh alike.  Each id is bounded too, by
+``PaperlessId``, to what a paperless-ngx key can be.
 """
 
 _TAGS_FORM_DEFAULT = Form(default=[], max_length=TAGS_MAX_COUNT)
@@ -1641,8 +1642,8 @@ def start_scan(
         Form(max_length=TITLE_MAX_LENGTH),
         AfterValidator(_refuse_control_characters),
     ] = "",
-    tags: list[int] = _TAGS_FORM_DEFAULT,
-    correspondent: Annotated[int | None, Form()] = None,
+    tags: list[PaperlessId] = _TAGS_FORM_DEFAULT,
+    correspondent: Annotated[PaperlessId | None, Form()] = None,
 ) -> Response:
     """
     Start a new scan job from form submission.
@@ -1688,8 +1689,11 @@ def start_scan(
         choice: The scan profile name and whether Multiple pages was ticked.
         title: Document title; when blank, the profile's title, else
             'Scan <time>'.
-        tags: List of paperless-ngx tag IDs.
-        correspondent: Optional paperless-ngx correspondent ID.
+        tags: List of paperless-ngx tag IDs, each within ``PaperlessId``'s
+            bounds, so an id no paperless-ngx can have is a 422 before any
+            job row exists.
+        correspondent: Optional paperless-ngx correspondent ID, bounded the
+            same way.
 
     Raises:
         RequestRejected: The profile is unknown, Multiple pages was asked for
@@ -2105,7 +2109,7 @@ def refresh_checks(request: Request) -> Response:
 def get_tags(
     request: Request,
     q: Annotated[str, Query(max_length=TAG_FILTER_MAX_LENGTH)] = "",
-    tags: list[int] = _TAGS_QUERY_DEFAULT,
+    tags: list[PaperlessId] = _TAGS_QUERY_DEFAULT,
 ) -> Response:
     """
     Render the tag checkbox list, optionally narrowed by a filter.
@@ -2240,7 +2244,7 @@ def invalidate_cache(
     request: Request,
     resource: MetadataResource,
     q: Annotated[str, Form(max_length=TAG_FILTER_MAX_LENGTH)] = "",
-    tags: list[int] = _TAGS_FORM_DEFAULT,
+    tags: list[PaperlessId] = _TAGS_FORM_DEFAULT,
 ) -> Response:
     """
     Invalidate a specific cache entry and return fresh data.

@@ -45,6 +45,7 @@ __all__ = [
     "HIDDEN_PRESERVED_ERROR",
     "HIDDEN_WARNING_LINE",
     "LOCAL_TIME_FORMAT",
+    "MAX_PAPERLESS_ID",
     "MULTI_PAGE_DISABLED_REASON",
     "MULTI_PAGE_HELP",
     "MULTI_PAGE_LABEL",
@@ -762,6 +763,11 @@ def half_title(title: str, suffix: str) -> str:
 TITLE_MAX_LENGTH: Final = PAPERLESS_TITLE_LIMIT - max(
     len(half_title("", suffix)) for suffix in (FRONTS_SUFFIX, BACKS_SUFFIX)
 )
+
+# The largest id a paperless-ngx tag or correspondent can have.  Its primary
+# keys are 32-bit auto-increment integers, which start at 1, so an id outside
+# 1..MAX_PAPERLESS_ID cannot name anything and is refused where it enters.
+MAX_PAPERLESS_ID: Final = 2_147_483_647
 
 # Job-row error texts.  A submit refused because the queue was full, the
 # worker was down or degraded, or the paperless-ngx API token or address was

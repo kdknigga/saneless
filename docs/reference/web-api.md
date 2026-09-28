@@ -101,8 +101,8 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 |-------|------|----------|-------------|
 | `profile` | string | yes | Scan profile name from config |
 | `title` | string | no | Document title, at most 118 characters so paperless-ngx keeps it whole, with no tab or other control character (auto-generated from timestamp if empty) |
-| `tags` | int[] | no | Paperless-ngx tag IDs, at most 100 |
-| `correspondent` | int | no | Paperless-ngx correspondent ID |
+| `tags` | int[] | no | Paperless-ngx tag IDs, at most 100, each from 1 to 2147483647 |
+| `correspondent` | int | no | Paperless-ngx correspondent ID, from 1 to 2147483647 |
 | `multi_page` | boolean | no | `on` when Multiple pages is ticked. Chosen for this scan only; it is not stored on the profile or the job. Absent means one pass. Refused with `422` on a manual-duplex profile |
 
 **Responses:**
@@ -111,7 +111,7 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 |-------------|---------|
 | 200 | The job is queued. HTML partial: the status indicator for HTMX swap, plus an out-of-band Scan button and an out-of-band clear of any earlier error message. |
 | 403 | The request was blocked as cross-site. See [Cross-site requests](#cross-site-requests). |
-| 422 | The request is not valid: the profile does not exist, Multiple pages was asked for on a manual-duplex profile, the title is longer than 118 characters, the title contains a tab or another control character, more than 100 `tags` were sent, or a required field is missing. No job is created. |
+| 422 | The request is not valid: the profile does not exist, Multiple pages was asked for on a manual-duplex profile, the title is longer than 118 characters, the title contains a tab or another control character, more than 100 `tags` were sent, a tag or correspondent ID is outside 1 to 2147483647 (the range of a paperless-ngx ID), or a required field is missing. No job is created. |
 | 429 | The scan queue is full: 10 jobs are already waiting to start. The response carries `Retry-After: 30`. |
 | 503 | The worker is not running, or it is degraded (see [`GET /health`](#get-health)). |
 
@@ -212,7 +212,7 @@ Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses ca
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `q` | string | no | Filter text, at most 100 characters. Longer is rejected with `422` before any work. Filtering is done by saneless over the cached list -- `q` is never sent to paperless-ngx, and never appears in the response |
-| `tags` | int[] | no | The tag ids currently ticked, at most 100; more is rejected with `422`. They ride along so that a filtered re-render keeps your selection: a tag you ticked and then filtered out of view stays selected and is still submitted |
+| `tags` | int[] | no | The tag ids currently ticked, at most 100, each from 1 to 2147483647; more, or an id outside that range, is rejected with `422`. They ride along so that a filtered re-render keeps your selection: a tag you ticked and then filtered out of view stays selected and is still submitted |
 
 **Response:** HTML partial (the whole tag block including its wrapper, for `outerHTML` swap).
 
@@ -274,7 +274,7 @@ If paperless-ngx cannot be reached, the response is built from the last list tha
 |-----------|------|-------------|
 | `resource` | string | Resource to invalidate: `tags` or `correspondents` |
 
-**Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched. So is a form body carrying more than 100 `tags`, the ticked tag ids a tag refresh sends so it can keep the selection.
+**Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched. So is a form body carrying more than 100 `tags`, or a tag id outside 1 to 2147483647, the ticked tag ids a tag refresh sends so it can keep the selection.
 
 At most one refetch per resource every 2 seconds; a sooner call returns the cached list. It
 is answered with the same status code and the same partial as a call that refetched,

@@ -17,10 +17,11 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Final, Literal, Protocol, cast
 
 import httpx2
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -42,6 +43,7 @@ from pydantic_settings.exceptions import SettingsError
 from saneless.exceptions import ConfigError
 from saneless.private_dirs import check_private_dir
 from saneless.vocabulary import (
+    MAX_PAPERLESS_ID,
     TITLE_MAX_LENGTH,
     ConfigFileState,
     PaperSize,
@@ -67,6 +69,7 @@ __all__ = [
     "LogLevel",
     "OutputConfig",
     "PaperlessConfig",
+    "PaperlessId",
     "ProfileConfig",
     "ScannerConfig",
     "Settings",
@@ -106,6 +109,31 @@ PROFILE_LABEL_MAX_LENGTH: Final = 64
 
 PROFILE_DESCRIPTION_MAX_LENGTH: Final = 200
 """The longest ``profiles.<name>.description`` a config may carry."""
+
+# A paperless-ngx tag or correspondent id, as a profile or a request may carry
+# one.  paperless-ngx keys are 32-bit auto-increment integers, so anything
+# outside 1..MAX_PAPERLESS_ID -- zero, a negative, a 22-digit number -- cannot
+# name a tag or correspondent.  It is refused where it enters (a load-time
+# ConfigError for a profile, a 422 for a form or query), never stored or sent.
+PaperlessId = Annotated[int, Field(ge=1, le=MAX_PAPERLESS_ID)]
+
+
+def _dedupe_ids(values: list[int]) -> list[int]:
+    """
+    Return ``values`` with each id kept once, where it first appears.
+
+    A repeated tag means nothing more than the tag once, so it is collapsed
+    silently rather than refused.
+
+    Args:
+        values: The ids, already bounded.
+
+    Returns:
+        The distinct ids, in their first order.
+
+    """
+    return list(dict.fromkeys(values))
+
 
 CONFIG_FILENAME: Final = "saneless.toml"
 """The one name a configuration file may have, in every searched location."""
@@ -667,8 +695,10 @@ class ProfileConfig(BaseModel):
     # never been cross-checked (auto_source_mode is not checked against Auto).
     duplex: Literal["none", "hardware", "manual"] = "none"
     paper_size: PaperSize = "full"
-    default_tags: list[int] = []
-    default_correspondent: int | None = None
+    # Bounded to what a paperless-ngx key can be, so a malformed id fails the
+    # load instead of every scan the profile runs.
+    default_tags: Annotated[list[PaperlessId], AfterValidator(_dedupe_ids)] = []
+    default_correspondent: PaperlessId | None = None
     # A literal title, not a template: no placeholder vocabulary. Used when a
     # scan is submitted with a blank title (resolve_job_title). Bounded because
     # the route's Form(max_length=...) only checks the typed title, so an

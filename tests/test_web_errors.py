@@ -1140,6 +1140,22 @@ def test_scan_malformed_id_is_422_without_a_row(
     assert _job_store(client).list_recent(limit=50) == before
 
 
+def test_scan_malformed_id_is_neither_echoed_nor_logged(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refused id stays out of the response and the log; only loc and type."""
+    value = "9876543210987654321012"
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Refused", "tags": [value]},
+        )
+    _assert_json_error(response, RequestRejection.INVALID_REQUEST, 422)
+    assert value not in response.text
+    assert value not in caplog.text
+    assert all(value not in r.getMessage() for r in caplog.records)
+
+
 def test_scan_malformed_tag_among_good_ones_is_422(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
