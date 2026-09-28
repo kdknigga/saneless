@@ -92,7 +92,7 @@ from saneless.config import (
     discover_config,
 )
 from saneless.job import JobResult
-from saneless.paperless import UploadResult
+from saneless.paperless import ApiDelivery, UploadResult
 from saneless.scanner.base import DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
@@ -644,7 +644,7 @@ def _make_paperless_deliver(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> No
     paperless = app.state.paperless
 
     def _upload_document(*_args: object, **_kwargs: object) -> UploadResult:
-        return UploadResult(delivered_to_api=True, task_uuid="browser-test-task")
+        return ApiDelivery(task_id="browser-test-task")
 
     def _poll_task(*_args: object, **_kwargs: object) -> None:
         return None

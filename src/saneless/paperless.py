@@ -30,7 +30,7 @@ from .exceptions import ConfigError, PaperlessError, PaperlessTimeoutError, desc
 from .text_safety import neutralise_bounded, neutralise_controls
 from .vocabulary import ConnectionStatus
 
-__all__ = ["PaperlessClient", "UploadResult"]
+__all__ = ["ApiDelivery", "FolderDelivery", "PaperlessClient", "UploadResult"]
 
 logger = logging.getLogger(__name__)
 
@@ -620,45 +620,36 @@ def _not_accepted_message(response: httpx2.Response, token: str) -> str:
     )
 
 
-@dataclass
-class UploadResult:
+@dataclass(frozen=True, slots=True)
+class ApiDelivery:
     """
-    Where a document ended up when upload_document returned.
-
-    The two destinations are mutually exclusive and the payload field for each
-    is required, enforced in __post_init__.  A result that claimed API delivery
-    while carrying no task UUID would be reported downstream as a
-    consume-directory fallback -- the replacement for the old "fallback"
-    sentinel must not be able to lie about itself the way the sentinel could.
+    paperless-ngx accepted the upload and gave it this task id.
 
     Attributes:
-        delivered_to_api: True when paperless-ngx accepted the upload.
-        task_uuid: Paperless task id. Present iff delivered_to_api is True.
-        consume_dir_path: Where the PDF was copied instead. Present iff
-            delivered_to_api is False.
+        task_id: The paperless-ngx consume task to poll.
 
     """
 
-    delivered_to_api: bool
-    task_uuid: str | None = None
-    consume_dir_path: Path | None = None
+    task_id: str
 
-    def __post_init__(self) -> None:
-        """Reject the two contradictory combinations."""
-        if self.delivered_to_api:
-            if self.task_uuid is None:
-                msg = "delivered_to_api=True requires a task_uuid"
-                raise ValueError(msg)
-            if self.consume_dir_path is not None:
-                msg = "delivered_to_api=True cannot carry a consume_dir_path"
-                raise ValueError(msg)
-        else:
-            if self.consume_dir_path is None:
-                msg = "delivered_to_api=False requires a consume_dir_path"
-                raise ValueError(msg)
-            if self.task_uuid is not None:
-                msg = "delivered_to_api=False cannot carry a task_uuid"
-                raise ValueError(msg)
+
+@dataclass(frozen=True, slots=True)
+class FolderDelivery:
+    """
+    The PDF was copied into the consume folder at this path.
+
+    Attributes:
+        path: The copy paperless-ngx will find in its consume folder.
+
+    """
+
+    path: Path
+
+
+# A plain union rather than a ``type`` statement, so ``isinstance`` accepts it.
+# Each class carries only its own destination, so no result can claim both, or
+# claim one without saying where; callers dispatch with ``match``.
+UploadResult = ApiDelivery | FolderDelivery
 
 
 class PaperlessClient:
@@ -846,11 +837,10 @@ class PaperlessClient:
             correspondent: Optional correspondent ID.
 
         Returns:
-            An UploadResult. On success ``delivered_to_api`` is True and
-            ``task_uuid`` carries the paperless-ngx task id. When the
-            retries are exhausted and a consume directory is configured,
-            ``delivered_to_api`` is False and ``consume_dir_path`` names the
-            file the PDF was copied to.
+            An ApiDelivery carrying the paperless-ngx task id on success.
+            When the retries are exhausted and a consume directory is
+            configured, a FolderDelivery naming the file the PDF was copied
+            to.
 
         Raises:
             ConfigError: If the request cannot be sent from the configured
@@ -914,7 +904,7 @@ class PaperlessClient:
                         assert_never(unreachable)
             else:
                 logger.info("Upload succeeded, task ID: %r", _loggable_task_id(task_id))
-                return UploadResult(delivered_to_api=True, task_uuid=task_id)
+                return ApiDelivery(task_id=task_id)
 
         if self._consume_dir is not None:
             return self._fall_back_to_consume_dir(pdf_path, self._consume_dir)
@@ -1102,7 +1092,9 @@ class PaperlessClient:
         if attempt < self._max_retries - 1:
             time.sleep(2**attempt)
 
-    def _fall_back_to_consume_dir(self, pdf_path: Path, dest_dir: Path) -> UploadResult:
+    def _fall_back_to_consume_dir(
+        self, pdf_path: Path, dest_dir: Path
+    ) -> FolderDelivery:
         """
         Copy the PDF into the consume directory after the upload did not land.
 
@@ -1115,7 +1107,7 @@ class PaperlessClient:
             dest_dir: The configured consume directory.
 
         Returns:
-            An UploadResult naming the file the PDF was copied to.
+            A FolderDelivery naming the file the PDF was copied to.
 
         Raises:
             PaperlessError: If the directory does not exist (or is not a
@@ -1138,7 +1130,7 @@ class PaperlessClient:
             )
             raise PaperlessError(msg) from exc
         logger.warning("Upload failed; copied PDF to %s", dest)
-        return UploadResult(delivered_to_api=False, consume_dir_path=dest)
+        return FolderDelivery(path=dest)
 
     @staticmethod
     def _deliver_to_consume_dir(pdf_path: Path, dest_dir: Path, dest: Path) -> None:

@@ -51,7 +51,7 @@ from saneless.job import (
     JobState,
     JobStore,
 )
-from saneless.paperless import UploadResult
+from saneless.paperless import ApiDelivery, UploadResult
 from saneless.pipeline import DeviceMemory, PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.text_safety import has_control_characters
@@ -6104,7 +6104,7 @@ class TestFrontPages:
             """
             uploading.set()
             release_upload.wait(_PASS_B_GATE_CEILING)
-            return UploadResult(delivered_to_api=True, task_uuid="held-task")
+            return ApiDelivery(task_id="held-task")
 
         mock_paperless.upload_document.side_effect = holding_upload
         store = JobStore()

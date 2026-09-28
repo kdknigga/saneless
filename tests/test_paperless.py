@@ -271,11 +271,11 @@ class TestUploadDocument:
     """Document upload tests."""
 
     def test_upload_document(self, sample_pdf: Path) -> None:
-        """Upload returns task UUID on success."""
-        task_uuid = "abc-123-def"
+        """Upload returns the task id on success."""
+        task_id = "abc-123-def"
 
         def handler(_request: httpx2.Request) -> httpx2.Response:
-            return httpx2.Response(200, json=task_uuid)
+            return httpx2.Response(200, json=task_id)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -284,9 +284,7 @@ class TestUploadDocument:
             transport=transport,
         )
         result = client.upload_document(sample_pdf, title="Test Doc")
-        assert result.delivered_to_api is True
-        assert result.task_uuid == task_uuid
-        assert result.consume_dir_path is None
+        assert result == ApiDelivery(task_id=task_id)
         client.close()
 
     def test_upload_with_tags(self, sample_pdf: Path) -> None:
@@ -369,8 +367,7 @@ class TestUploadDocument:
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Retry Test")
-        assert result.delivered_to_api is True
-        assert result.task_uuid == "task-id-ok"
+        assert result == ApiDelivery(task_id="task-id-ok")
         assert call_count["n"] == 3
         assert sleeps == [1, 2]
         client.close()
@@ -435,8 +432,6 @@ class TestUploadDocument:
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Fallback")
-        assert result.delivered_to_api is False
-        assert result.task_uuid is None
         # PDF should have been copied to consume dir
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
@@ -445,7 +440,7 @@ class TestUploadDocument:
         _assert_no_staging_files(consume_dir)
         # The result names the exact file the PDF was copied to -- something
         # the old magic-string sentinel could not carry.
-        assert result.consume_dir_path == copied[0]
+        assert result == FolderDelivery(path=copied[0])
         assert sleeps == [1, 2]
         client.close()
 
@@ -903,9 +898,7 @@ class TestUploadFailureTranslation:
         finally:
             client.close()
         assert handler.calls == 3
-        assert result == UploadResult(
-            delivered_to_api=False, consume_dir_path=consume_dir / "test.pdf"
-        )
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
         assert sleeps == [1, 2]
 
@@ -926,8 +919,7 @@ class TestUploadFailureTranslation:
             result = client.upload_document(sample_pdf, title="Flaky proxy")
         finally:
             client.close()
-        assert result.delivered_to_api is True
-        assert result.task_uuid == "task-id"
+        assert result == ApiDelivery(task_id="task-id")
         assert handler.calls == 3
         assert sleeps == [1, 2]
 
@@ -1277,7 +1269,7 @@ class TestUploadFailureTranslation:
             client.close()
         assert handler.calls == 3
         assert sleeps == [1, 2]
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
 
     def test_non_json_200_raises_without_retry(
         self, sample_pdf: Path, sleeps: list[float]
@@ -2298,7 +2290,7 @@ class TestLoopbackClientSideProtocolErrors:
                 task = client.poll_task(LOOPBACK_TASK_ID, timeout=5)
             finally:
                 client.close()
-        assert result == UploadResult(delivered_to_api=True, task_uuid=LOOPBACK_TASK_ID)
+        assert result == ApiDelivery(task_id=LOOPBACK_TASK_ID)
         assert task["status"] == "SUCCESS"
         assert server.hits == [
             LoopbackHit("POST", DOCUMENTS_PATH, f"Token {_MOCK_AUTH}"),
@@ -3417,10 +3409,9 @@ class TestConsumeDir:
             max_retries=1,
         )
         result = client.upload_document(sample_pdf, title="Existing dir test")
-        assert result.delivered_to_api is False
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         client.close()
 
     def test_delivery_leaves_only_the_final_file(
@@ -3449,7 +3440,7 @@ class TestConsumeDir:
         entries = sorted(entry.name for entry in consume_dir.iterdir())
         assert entries == ["test.pdf"]
         _assert_no_staging_files(consume_dir)
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
 
     def test_a_failed_staged_write_leaves_the_directory_empty(
@@ -3572,7 +3563,7 @@ class TestConsumeDir:
         result = _deliver_to_consume_dir(sample_pdf, consume_dir)
 
         dest = consume_dir / sample_pdf.name
-        assert result.consume_dir_path == dest
+        assert result == FolderDelivery(path=dest)
         assert target.read_bytes() == b"keep me"
         assert planted.is_symlink()
         assert planted.readlink() == target
@@ -3806,7 +3797,7 @@ class TestConsumeCopyMode:
         finally:
             os.umask(old)
 
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert stat.S_IMODE((consume_dir / "test.pdf").stat().st_mode) == 0o644
         _assert_no_staging_files(consume_dir)
 
@@ -3867,7 +3858,7 @@ class TestConsumeCopyMode:
             result = _deliver_to_consume_dir(sample_pdf, consume_dir)
 
         assert calls == [0o644]
-        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert result == FolderDelivery(path=consume_dir / "test.pdf")
         assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
         _assert_no_staging_files(consume_dir)
         assert any(
@@ -3967,7 +3958,7 @@ class TestTaskIdIsBoundedInLogs:
         finally:
             client.close()
 
-        assert result.task_uuid == _HOSTILE_TASK_ID
+        assert result == ApiDelivery(task_id=_HOSTILE_TASK_ID)
         lines = [line for line in _paperless_lines(caplog) if "task" in line.lower()]
         assert lines
         for line in lines:
