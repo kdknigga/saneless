@@ -344,6 +344,27 @@ class PassCoordinator(ABC):
         """
         return None
 
+    @property
+    def stopping(self) -> bool:
+        """
+        Whether saneless is stopping, so no further pass may start.
+
+        An answer claimed just before a stop keeps its meaning at the prompt,
+        but the pass it asks for must not begin: a pass outlasts the bounded
+        stop, and a run killed inside one never reaches the guard that keeps
+        its accepted pages.  The run checks this before every pass after the
+        first and ends as interrupted instead.
+
+        Concrete rather than abstract, so a coordinator that is never stopped
+        this way -- the CLI's, where a signal interrupts the run directly --
+        needs no change.
+
+        Returns:
+            True once stopping has begun; False otherwise.
+
+        """
+        return False
+
 
 class AnswerSlot[T: StrEnum]:
     """
@@ -2227,7 +2248,8 @@ class _PipelineRun:
         more than one pass before it returns.
 
         Args:
-            context: The timeout every prompt carries.
+            context: The coordinator, which says whether saneless is stopping,
+                and the timeout every prompt carries.
             document: The document the pass is accepted into.
 
         Returns:
@@ -2236,8 +2258,21 @@ class _PipelineRun:
             answered about the pass's blank pages, or the pass took the
             document to the page cap.
 
+        Raises:
+            ScanInterrupted: If saneless began stopping after the answer
+                that asked for this pass was claimed; every accepted page is
+                kept.
+
         """
         while True:
+            if document.started > 0 and context.coordinator.stopping:
+                # The answer that asked for this pass was claimed before the
+                # stop, so the prompt could not carry the stop to the run.
+                # Starting the pass anyway would outlast the bounded stop and
+                # lose the accepted document, which the guard only keeps if
+                # the run ends here.
+                msg = "The server is stopping"
+                raise ScanInterrupted(msg)
             scanned = self._scan_pass(document, document.start_pass())
             if isinstance(scanned, Exception):
                 return self._retry_prompt(context, document, scanned)

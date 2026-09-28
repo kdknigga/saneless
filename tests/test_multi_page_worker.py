@@ -194,6 +194,31 @@ class TestWorkerPassCoordinator:
         assert time.monotonic() - started < _OPEN_PROMPT_TIMEOUT / 2
         assert coordinator.open_prompt is None
 
+    def test_stopping_follows_the_worker_stop_flag(self) -> None:
+        """The run reads the worker's own flag before it starts another pass."""
+        stopping = threading.Event()
+        coordinator = WorkerPassCoordinator("job-1", stopping=stopping)
+        before = coordinator.stopping
+
+        stopping.set()
+
+        assert (before, coordinator.stopping) == (False, True)
+
+    def test_an_answer_claimed_before_a_stop_keeps_its_meaning(self) -> None:
+        """The stop cannot replace a claimed answer; ``stopping`` is what reports it."""
+        stopping = threading.Event()
+        coordinator = WorkerPassCoordinator("job-1", stopping=stopping)
+        prompt = _prompt(timeout=_OPEN_PROMPT_TIMEOUT)
+
+        asker = _Asker(coordinator, prompt)
+        _wait_until_open(coordinator, 1)
+        assert coordinator.answer(1, PassAnswer.NEXT) is True
+        stopping.set()
+        assert coordinator.interrupt_for_shutdown() is False
+
+        assert asker.result() is PassAnswer.NEXT
+        assert coordinator.stopping is True
+
     def test_an_unanswered_prompt_times_out(self) -> None:
         """Nobody answering is the clock's answer, recorded as the claim."""
         coordinator = WorkerPassCoordinator("job-1", stopping=threading.Event())

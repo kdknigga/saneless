@@ -409,7 +409,9 @@ class WorkerPassCoordinator(PassCoordinator):
     prompt.  ``interrupt_for_shutdown`` only reaches a prompt that is open when
     the stop lands; a stop that arrives mid-pass, or before this job had a
     coordinator at all, must not leave the next prompt waiting its full
-    timeout while the server tries to exit.
+    timeout while the server tries to exit.  The same latch is ``stopping``,
+    which the run reads before each later pass: an answer claimed just before
+    the stop is still returned, but the pass it asked for never starts.
 
     Args:
         job_id: The id of the job whose prompts this coordinator answers.
@@ -431,6 +433,21 @@ class WorkerPassCoordinator(PassCoordinator):
     def job_id(self) -> str:
         """The id of the job whose prompts this coordinator answers."""
         return self._job_id
+
+    @property
+    def stopping(self) -> bool:
+        """
+        Whether the worker is stopping, so the run starts no further pass.
+
+        The same sticky latch ``ask`` checks: an answer claimed before the
+        stop still reaches the run, and this is what then keeps it from
+        starting the pass that answer asked for.
+
+        Returns:
+            True once ``stop()`` has set the worker's stop flag.
+
+        """
+        return self._stopping.is_set()
 
     @property
     def open_prompt(self) -> PassPrompt | None:

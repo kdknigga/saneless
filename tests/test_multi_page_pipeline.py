@@ -79,7 +79,7 @@ from tests.multi_page_support import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from enum import StrEnum
     from pathlib import Path
 
@@ -649,6 +649,58 @@ class _UnofferedAnswer(PassCoordinator):
         """
         del prompt
         return PassAnswer.SKIP_BLANKS
+
+
+class _StopLandsAfterAnswer(ScriptedPassCoordinator):
+    """
+    A script whose answer to one prompt is claimed just before saneless stops.
+
+    The prompt keeps that answer -- a stop never overrides a claimed one -- so
+    the only thing that can keep the run from acting on it is ``stopping``.
+    """
+
+    def __init__(self, answers: Sequence[PassAnswer], *, stop_after: int) -> None:
+        """
+        Prepare the script, and the prompt whose answer the stop follows.
+
+        Args:
+            answers: The answers to give, one per question, in order.
+            stop_after: The number of the prompt after whose answer the stop
+                lands.
+
+        """
+        super().__init__(answers)
+        self._stop_after = stop_after
+        self._stopping = False
+
+    @override
+    def ask(self, prompt: PassPrompt) -> PassAnswer:
+        """
+        Answer from the script, and start stopping once the chosen prompt is.
+
+        Args:
+            prompt: The question the run is asking.
+
+        Returns:
+            The next answer in the script.
+
+        """
+        answer = super().ask(prompt)
+        if prompt.number == self._stop_after:
+            self._stopping = True
+        return answer
+
+    @property
+    @override
+    def stopping(self) -> bool:
+        """
+        Whether the stop has landed.
+
+        Returns:
+            True once the chosen prompt was answered.
+
+        """
+        return self._stopping
 
 
 def _untouched_scanner() -> MagicMock:
@@ -1646,3 +1698,86 @@ class TestMultiPageBlankPages:
         assert result.warning is None
         (document,) = blank_rig.uploads
         assert embedded_streams(document) == _pages(scanner, [0, 2])
+
+
+@dataclass(frozen=True)
+class _StopCase:
+    """
+    One way an answer can ask for another pass just before saneless stops.
+
+    Attributes:
+        scanner: Builds the scanner the run feeds from.
+        answers: The operator's answers, in order.
+        detection: Whether the profile has empty-page detection on.
+        passes: How many passes the run is expected to have scanned.
+
+    """
+
+    scanner: Callable[[], DistinctPageScanner]
+    answers: tuple[PassAnswer, ...]
+    detection: bool
+    passes: int
+
+
+_STOP_CASES = [
+    pytest.param(
+        _StopCase(
+            scanner=lambda: DistinctPageScanner(passes=((0,), (1,))),
+            answers=(_NEXT,),
+            detection=False,
+            passes=1,
+        ),
+        id="scan-next",
+    ),
+    pytest.param(
+        _StopCase(
+            scanner=lambda: DistinctPageScanner(passes=((0,), (1,), (2,))),
+            answers=(_NEXT, _RESCAN),
+            detection=False,
+            passes=2,
+        ),
+        id="rescan-last",
+    ),
+    pytest.param(
+        _StopCase(
+            scanner=lambda: DistinctPageScanner(passes=((0,), (1,), (2,)), blank={1}),
+            answers=(_NEXT, _RESCAN),
+            detection=True,
+            passes=2,
+        ),
+        id="rescan-at-the-blank-prompt",
+    ),
+    pytest.param(
+        _StopCase(
+            scanner=_jams_on_pass_2, answers=(_NEXT, _NEXT), detection=False, passes=2
+        ),
+        id="try-again-after-a-jam",
+    ),
+]
+
+
+class TestMultiPageStopAfterAnAnswer:
+    """A stop that lands after an answer was claimed starts no further pass."""
+
+    @pytest.mark.parametrize("case", _STOP_CASES)
+    def test_no_pass_starts_and_the_document_is_kept(
+        self, tmp_path: Path, case: _StopCase
+    ) -> None:
+        """
+        The claimed answer is honoured up to the pass it asks for, then the run ends.
+
+        A pass started during a stop would outlast the bounded stop, and a run
+        killed inside it never reaches the guard, so the accepted document
+        would be lost; ending here keeps it as one PDF and uploads nothing.
+        """
+        rig = _Rig(multi_page_settings(tmp_path, detection=case.detection))
+        scanner = case.scanner()
+        coordinator = _StopLandsAfterAnswer(case.answers, stop_after=len(case.answers))
+
+        with pytest.raises(ScanInterrupted):
+            rig.run(scanner, coordinator)
+
+        assert scanner.calls == case.passes
+        (kept,) = rig.kept_pdfs()
+        assert embedded_streams(kept) == _pages(scanner, [0])
+        rig.paperless.upload_document.assert_not_called()
