@@ -14,13 +14,14 @@ from __future__ import annotations
 import logging
 import threading
 from typing import TYPE_CHECKING, NoReturn
+from unittest.mock import MagicMock
 
 import httpx2
 import pytest
 
 from saneless.exceptions import PaperlessError
 from saneless.paperless import PaperlessClient
-from saneless.web.cache import MetadataCache
+from saneless.web.cache import CachedMetadataLookup, MetadataCache
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -533,3 +534,101 @@ def test_invalidate_keeps_the_fallback() -> None:
 
     assert served is good
     assert cache.get("tags") is good
+
+
+class _LookupClient:
+    """A client double for the metadata lookup, answering from a queue per list."""
+
+    def __init__(
+        self,
+        *,
+        tags: list[_Rows | Exception] | None = None,
+        correspondents: list[_Rows | Exception] | None = None,
+    ) -> None:
+        """Take one answer per expected fetch, per list, in order."""
+        self._answers = {"tags": tags or [], "correspondents": correspondents or []}
+        self.fetches: list[tuple[str, float | None]] = []
+
+    def get_tags(self, *, timeout: float | None = None) -> _Rows:
+        """Answer the tag list."""
+        return self._serve("tags", timeout)
+
+    def get_correspondents(self, *, timeout: float | None = None) -> _Rows:
+        """Answer the correspondent list."""
+        return self._serve("correspondents", timeout)
+
+    def _serve(self, what: str, timeout: float | None) -> _Rows:
+        """Record the fetch, then raise or answer the next scripted value."""
+        self.fetches.append((what, timeout))
+        answer = self._answers[what].pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def test_cached_lookup_reads_a_cached_list_without_a_request() -> None:
+    """A cached list answers the first look; paperless-ngx is not asked."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    cache.set("tags", [{"id": 3}, {"id": 7}])
+    client = _LookupClient()
+
+    ids = CachedMetadataLookup(cache, client).tag_ids(fresh=False)
+
+    assert ids == frozenset({3, 7})
+    assert client.fetches == []
+
+
+def test_cached_lookup_miss_fetches_briefly_and_stores() -> None:
+    """Nothing cached: one 5 s fetch, and its list is cached for the pages."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    rows: _Rows = [{"id": 12}]
+    client = _LookupClient(correspondents=[rows])
+
+    ids = CachedMetadataLookup(cache, client).correspondent_ids(fresh=False)
+
+    assert ids == frozenset({12})
+    assert client.fetches == [("correspondents", 5.0)]
+    assert cache.get("correspondents") is rows
+
+
+def test_cached_lookup_fresh_goes_to_paperless_and_stores() -> None:
+    """A refetch bypasses the cached copy and replaces it on success."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    cache.set("tags", [{"id": 3}])
+    rows: _Rows = [{"id": 3}, {"id": 9}]
+    client = _LookupClient(tags=[rows])
+
+    ids = CachedMetadataLookup(cache, client).tag_ids(fresh=True)
+
+    assert ids == frozenset({3, 9})
+    assert client.fetches == [("tags", 5.0)]
+    assert cache.get("tags") is rows
+
+
+def test_cached_lookup_failed_refetch_is_unavailable_not_the_stale_copy() -> None:
+    """A failed refetch says 'cannot tell'; the last good copy proves nothing."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    cached: _Rows = [{"id": 3}]
+    cache.set("tags", cached)
+    client = _LookupClient(tags=[PaperlessError("down")])
+
+    assert CachedMetadataLookup(cache, client).tag_ids(fresh=True) is None
+    assert cache.get("tags") is cached
+
+
+def test_cached_lookup_failed_first_fetch_is_unavailable() -> None:
+    """Nothing cached and paperless-ngx down: the ids go unchecked."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    client = _LookupClient(tags=[PaperlessError("down")])
+
+    assert CachedMetadataLookup(cache, client).tag_ids(fresh=False) is None
+    assert cache.get("tags") is None
+
+
+def test_cached_lookup_never_caches_a_non_list() -> None:
+    """A stub's answer that is not a list is 'cannot tell', and is not stored."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    lookup = CachedMetadataLookup(cache, MagicMock(spec=PaperlessClient))
+
+    assert lookup.tag_ids(fresh=False) is None
+    assert cache.get("tags") is None

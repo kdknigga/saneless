@@ -84,6 +84,7 @@ from saneless.vocabulary import (
     cap_finish_warning,
     classify_error,
     connection_status_message,
+    dropped_ids_warning,
     duplicate_warning,
     duration_phrase,
     error_advice,
@@ -1973,6 +1974,43 @@ class TestRestartWording:
         bad = cast("JobState", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             restart_category(bad)
+
+
+class TestDroppedIdsWarning:
+    """A stale id dropped before scanning is named in one sentence."""
+
+    def test_dropped_single_tag(self) -> None:
+        """One tag: the sentence the operator reads on every surface."""
+        assert dropped_ids_warning((9,), None) == (
+            "tag 9 no longer exists in paperless-ngx and was not applied."
+        )
+
+    def test_dropped_single_correspondent(self) -> None:
+        """One correspondent reads the same way."""
+        assert dropped_ids_warning((), 12) == (
+            "correspondent 12 no longer exists in paperless-ngx and was not applied."
+        )
+
+    def test_dropped_tags_and_correspondent_are_one_sentence(self) -> None:
+        """Every dropped id is listed once, in a single sentence."""
+        assert dropped_ids_warning((3, 9), 12) == (
+            "tags 3 and 9, and correspondent 12, no longer exist in paperless-ngx "
+            "and were not applied."
+        )
+
+    def test_dropped_three_tags_and_one_with_a_correspondent(self) -> None:
+        """Longer lists use commas; one tag and a correspondent need none."""
+        assert dropped_ids_warning((3, 7, 9), None) == (
+            "tags 3, 7 and 9 no longer exist in paperless-ngx and were not applied."
+        )
+        assert dropped_ids_warning((9,), 12) == (
+            "tag 9 and correspondent 12 no longer exist in paperless-ngx and were "
+            "not applied."
+        )
+
+    def test_nothing_dropped_is_no_warning(self) -> None:
+        """Nothing dropped: no warning at all, so the DONE stays clean."""
+        assert dropped_ids_warning((), None) is None
 
 
 class TestDuplicateWarning:
