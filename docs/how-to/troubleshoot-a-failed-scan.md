@@ -15,7 +15,7 @@ In a shell, `echo $?` right after the command prints its exit code.
 | 0 | The command succeeded | -- |
 | 1 | No scanner was found, the scanner failed, or the scan produced no usable pages | [Scanner errors](#scanner-errors-exit-1) |
 | 2 | saneless could not start: configuration, profile or setup; or `paperless.url` is not set when a scan is started | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
-| 3 | paperless-ngx could not be reached or rejected the upload | [Paperless errors](#paperless-errors-exit-3) |
+| 3 | paperless-ngx could not be reached, rejected the upload, or is older than 2.16 | [Paperless errors](#paperless-errors-exit-3) |
 | 4 | The scanned pages could not be written as a PDF | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
 | 5 | An error saneless did not anticipate: a bug | [Unexpected errors](#unexpected-errors-exit-5) |
 | 6 | The scan was saved to the consume folder, not uploaded: its title, tags and correspondent were not applied | [Saved to the consume folder](#saved-to-the-consume-folder-exit-6) |
@@ -240,12 +240,15 @@ the scanner. The line gives the import's own reason and names the package to ins
 
 The line starts with `Paperless error:`.
 
-- **Unreachable.** saneless tries the upload three times, with a growing pause between attempts,
-  when the connection is refused or reset, times out, is closed by a reverse proxy, or
-  paperless-ngx answers with a server error. If every attempt fails and a consume directory is
-  configured, the PDF is saved there instead and the scan exits 6, not 3 -- see
+- **Unreachable.** saneless sends the upload again, with a growing pause of at most 5 seconds,
+  for about 60 seconds while every failure proves the upload cannot have reached paperless-ngx:
+  the connection is refused or cannot be made in time, no connection is free, a proxy refuses the
+  tunnel, or sending the file times out. If that goes on for the whole time and a consume
+  directory is configured, the PDF is saved there instead and the scan exits 6, not 3 -- see
   [Saved to the consume folder](#saved-to-the-consume-folder-exit-6). Without one, the scan
-  fails. Check that
+  fails, and the line says it could not connect for 60s. An upload that failed after the whole
+  file was sent, or that got a 5xx, is not this case and is never sent again: it is
+  [exit 9](#the-document-may-already-be-in-paperless-ngx-exit-9). Check that
   `paperless.url` is reachable from where saneless runs. A `https://` certificate that this
   machine does not trust also arrives here, reported as unreachable in both the log and the web
   UI -- see **TLS certificate not trusted** below before you go looking at the network.
@@ -253,7 +256,7 @@ The line starts with `Paperless error:`.
   `Paperless error: Could not fetch tags from Paperless at https://paperless.example.com/: [SSL:
   CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1081)`,
   and the scan exits 3 -- but only without a consume directory. A certificate that cannot be
-  verified is classified as unreachable, so the upload is retried, the retries are exhausted, and
+  verified is classified as unreachable, so the upload is retried for about 60 seconds, and
   with a consume directory configured the PDF is saved there instead: the scan then ends
   `FALLBACK`, shown as **Saved to folder**, and `saneless scan` prints `Saved to folder: <title>`
   on stdout, the `Not uploaded: ...` line and the warning on stderr, and exits 6 (see
@@ -298,10 +301,21 @@ The line starts with `Paperless error:`.
   line names where the upload was sent. It is not retried and never falls back; set
   `paperless.url` to the base of that address (often the `https://` form of the same host) and
   scan again.
-- **The document may already be in Paperless.** A retry after a lost response can reach
-  paperless-ngx twice. On default paperless-ngx settings that stores a second copy you can delete;
-  when paperless-ngx rejects duplicates, the failure says so. Check paperless-ngx before scanning
-  again.
+- **paperless-ngx is too old or too new.** The line reads `Paperless at <url> does not accept API
+  version 9 or 10; saneless needs paperless-ngx 2.16 or later`, and the web UI says *"This
+  paperless-ngx does not speak an API version saneless supports (9 or 10)."* paperless-ngx
+  answered `406`: it refuses every API version saneless speaks. saneless needs paperless-ngx 2.16
+  or later, which speaks version 9, or 10 on 3.x. Upgrade paperless-ngx, then scan again; the
+  status strip and `GET /api/paperless/test` report `incompatible_version` until you do. Nothing
+  was stored, so the kept PDF can be imported or the stack scanned again.
+- **Consume directory missing.** The line reads `consume directory <dir> does not exist — is the
+  paperless-ngx volume mounted?`. The upload could not get through, and the fallback found no
+  directory at `consume_dir`. saneless never creates it, because a directory made where the mount
+  should be is one paperless-ngx never looks at. Mount paperless-ngx's consume volume there, or
+  correct `consume_dir`, and import the kept PDF.
+- **A duplicate is not a failure.** When paperless-ngx refuses the upload as a duplicate of a
+  document it already holds, the scan ends **Uploaded with a warning** (exit 7), not here; see
+  [Uploaded with a warning](#uploaded-with-a-warning-exit-7).
 
 When the upload fails, the assembled PDF is kept and its path is added to the error. A kept PDF
 paperless-ngx had already taken is named as such: the failure came while saneless waited for the
@@ -342,8 +356,8 @@ folder without its title, tags or correspondent`, followed by the warning, which
 PDF was written.
 
 The document was delivered, so do not scan the stack again. saneless could not reach paperless-ngx
-through its API, even after retrying, and a consume directory is configured, so it wrote the PDF
-there instead. paperless-ngx picks the file up from that folder and applies its own matching rules
+through its API, even after retrying for about 60 seconds, and a consume directory is configured,
+so it wrote the PDF there instead. paperless-ngx picks the file up from that folder and applies its own matching rules
 to it, not the title, tags and correspondent chosen for this scan.
 
 - In paperless-ngx, find the new document and set its title, tags and correspondent by hand.
@@ -357,6 +371,21 @@ stdout reads `Uploaded with a warning: <title>`, and the warning itself is on st
 reached paperless-ngx with its title, tags and correspondent, so do not scan the whole stack
 again. The warning is one of these:
 
+- **paperless-ngx already holds this file as document #N.** paperless-ngx refused the upload as a
+  duplicate: it already has this exact file, as the document the warning names, so the scan is not
+  lost and nothing is kept in `failed/`. The warning goes on *"it was not stored again, and this
+  scan's title and tags were not applied to it"*, and adds that the document is in paperless-ngx's
+  trash when it is; restore it from there if you still want it. paperless-ngx 2.x always refuses a
+  duplicate, and 3.x does so only when `PAPERLESS_CONSUMER_DELETE_DUPLICATES` is enabled (it
+  otherwise stores a second document). In a manual duplex scan uploaded as two halves, the
+  warning names the half. Set the title and tags on the existing document by hand if you need
+  them.
+- **Tag N no longer exists in paperless-ngx and was not applied.** A tag or correspondent chosen
+  for the scan, or a profile default, was not in paperless-ngx's lists, even after asking again,
+  so the document was filed without it. The warning names every id it dropped. Pick another in
+  the form, or remove the id from the profile's `default_tags` or `default_correspondent`. A tag
+  the API token's user is not allowed to see counts as missing too; give that user permission to
+  view it if it should apply.
 - **Pages could not be read by the scanner and were skipped.** The warning gives the count. Those
   sheets are missing from the document in paperless-ngx; open it, find the gaps, and scan just
   those sheets.

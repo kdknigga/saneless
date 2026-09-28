@@ -1237,6 +1237,198 @@ def test_operator_pages_do_not_repeat_retracted_scanner_claims(
     assert retracted not in flat, f"{name} says again {retracted!r}; {why}"
 
 
+FALLBACK_EXPLANATION = DOCS_DIR / "explanation" / "consume-directory-fallback.md"
+
+# What the operator pages say about delivery to paperless-ngx and a scan's
+# metadata, each with the lower-case substrings that carry it. Compared with the
+# page's whitespace collapsed and in lower case, like the scanner claims above.
+DELIVERY_DOC_CLAIMS: tuple[tuple[Path, str, tuple[str, ...]], ...] = (
+    (
+        CONFIG_REFERENCE,
+        "the supported paperless-ngx range",
+        ("2.16 or later", "api version 9 or 10"),
+    ),
+    (
+        DEPLOY_HOWTO,
+        "the supported paperless-ngx range",
+        ("2.16 or later",),
+    ),
+    (
+        INSTALL_BARE_METAL,
+        "the supported paperless-ngx range",
+        ("2.16 or later",),
+    ),
+    (
+        DEPLOY_HOWTO,
+        "the upgrade notes name the status an incompatible paperless-ngx gets",
+        ("incompatible_version", "2.16 or later"),
+    ),
+    (
+        TROUBLESHOOTING,
+        "a 406 is explained, with the release saneless needs",
+        ("does not speak an api version saneless supports", "2.16 or later"),
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "an upload is resent only when it cannot have arrived, for about 60 seconds",
+        ("cannot have reached paperless-ngx", "60 seconds"),
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "an upload that may have arrived is never resent or copied, and exits 9",
+        ("never resent", "exit 9"),
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "paperless-ngx 2.x and 3.x treat a duplicate differently",
+        ("2.x", "3.x", "paperless_consumer_delete_duplicates"),
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "a refused duplicate is a warned upload naming the existing document",
+        ("already holds this file as document #", "exit 7"),
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "the consume folder is never created, and a missing one names the mount",
+        ("never creates", "is the paperless-ngx volume mounted?"),
+    ),
+    (
+        ARCHITECTURE,
+        "an upload is resent only when it cannot have arrived, for about 60 seconds",
+        ("cannot have reached paperless-ngx", "60 seconds"),
+    ),
+    (
+        TROUBLESHOOTING,
+        "an unreachable paperless-ngx is retried for about 60 seconds",
+        ("60 seconds",),
+    ),
+    (
+        TROUBLESHOOTING,
+        "a refused duplicate is a warned upload naming the existing document",
+        ("already holds this file as document #",),
+    ),
+    (
+        TROUBLESHOOTING,
+        "a tag or correspondent paperless-ngx no longer has is dropped with a warning",
+        ("no longer exists in paperless-ngx and was not applied",),
+    ),
+    (
+        ARCHITECTURE,
+        "the web UI and the CLI share one request builder and one metadata policy",
+        ("one request builder", "one metadata policy"),
+    ),
+    (
+        CONFIG_REFERENCE,
+        "the form shows a profile's defaults ticked, and a cleared one scans with none",
+        ("pre-ticked", "cleared"),
+    ),
+    (
+        CONFIG_REFERENCE,
+        "a default paperless-ngx no longer has is skipped with a warning",
+        ("no longer exists in paperless-ngx",),
+    ),
+    (
+        CONFIG_REFERENCE,
+        "a profile title is capped at 118 characters",
+        ("at most 118 characters",),
+    ),
+    (
+        CONFIG_REFERENCE,
+        "a profile id outside 1 to 2147483647 fails at load",
+        ("from 1 to 2147483647",),
+    ),
+    (
+        CONFIG_REFERENCE,
+        "job rows from an earlier release keep their category",
+        ("keeps the error category", "nothing is rewritten"),
+    ),
+    (
+        PROFILE_HOWTO,
+        "the form shows a profile's defaults ticked",
+        ("pre-ticked",),
+    ),
+    (
+        PROFILE_HOWTO,
+        "a tag the API token cannot see counts as missing",
+        ("token cannot see", "no longer exists in paperless-ngx"),
+    ),
+)
+
+# Sentences those pages used to carry that are no longer true, each with why.
+DELIVERY_DOC_RETRACTED: tuple[tuple[Path, str, str], ...] = (
+    (
+        FALLBACK_EXPLANATION,
+        "up to 3 times",
+        "an upload is resent for about 60 seconds, and only before it can have arrived",
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "a retry can create a duplicate",
+        "a resend happens only when the upload cannot have reached paperless-ngx",
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "the failure says the document may already be in paperless",
+        "a refused duplicate is a warned upload, not a failure",
+    ),
+    (
+        FALLBACK_EXPLANATION,
+        "all attempts are exhausted",
+        "the fallback follows about 60 seconds of failures, not a count",
+    ),
+    (
+        TROUBLESHOOTING,
+        "tries the upload three times",
+        "an upload is resent for about 60 seconds, and only before it can have arrived",
+    ),
+    (
+        TROUBLESHOOTING,
+        "a retry after a lost response can reach paperless-ngx twice",
+        "an upload that may have arrived is never resent",
+    ),
+    (
+        ARCHITECTURE,
+        "identical parameters",
+        "the surfaces share one request builder and one metadata policy",
+    ),
+    (
+        ARCHITECTURE,
+        "after the retries for a network error, a timeout or a server error",
+        "a 5xx or a read timeout may follow a delivered upload and is never resent",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("page", "claim", "needles"),
+    DELIVERY_DOC_CLAIMS,
+    ids=[f"{page.stem}: {claim}" for page, claim, _ in DELIVERY_DOC_CLAIMS],
+)
+def test_operator_pages_state_the_delivery_rules(
+    page: Path, claim: str, needles: tuple[str, ...]
+) -> None:
+    """Each operator page says how an upload is delivered and what metadata it gets."""
+    text, name = _read(page)
+    flat = " ".join(text.split()).lower()
+    for needle in needles:
+        assert needle in flat, f"{name} no longer says that {claim} ({needle!r})"
+
+
+@pytest.mark.parametrize(
+    ("page", "retracted", "why"),
+    DELIVERY_DOC_RETRACTED,
+    ids=[f"{page.stem}: {retracted}" for page, retracted, _ in DELIVERY_DOC_RETRACTED],
+)
+def test_operator_pages_do_not_repeat_retracted_delivery_claims(
+    page: Path, retracted: str, why: str
+) -> None:
+    """No operator page says again what delivery or the metadata policy no longer does."""
+    text, name = _read(page)
+    flat = " ".join(text.split()).lower()
+    assert retracted not in flat, f"{name} says again {retracted!r}; {why}"
+
+
 # ---------------------------------------------------------------------------
 # Phase 30: the shipped deployment template (D-17, APPL-07, APPL-11, APPL-12)
 # ---------------------------------------------------------------------------

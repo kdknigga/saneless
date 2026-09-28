@@ -8,7 +8,9 @@ If paperless-ngx is temporarily unavailable -- during maintenance, a restart, or
 
 When a `consume_dir` is configured and the API upload cannot get through, saneless deposits the assembled PDF into the consume directory instead of raising an error.
 
-The upload is attempted up to 3 times, with exponential backoff between attempts, whenever paperless-ngx cannot be reached or answers with a server error: a connection that is refused or reset, a timeout, a reverse proxy closing the connection, or a 5xx response. This means transient network blips are handled by retries, and only sustained outages trigger the fallback.
+An upload is sent again only when it cannot have reached paperless-ngx: the connection was refused or could not be made in time, no connection was free, a proxy refused to open the tunnel, or sending the file itself timed out, so paperless-ngx never had the whole document. Those failures are retried for about 60 seconds, with waits that double from 1 second up to 5 seconds. That is long enough to ride out a paperless-ngx or container restart, so a short blip still delivers through the API, and only an outage that lasts longer falls back to the consume directory.
+
+Any other failure is never resent and never copied to the consume directory. When the whole file was sent and then no usable answer came back -- the connection dropped or timed out while saneless waited for the answer, a reverse proxy or paperless-ngx answered with a 5xx, or a 200 did not carry a task id -- paperless-ngx may already have stored the document, and a second upload or a copy in the folder could file it twice. The scan then ends amber, labelled **May be in paperless-ngx** in the web UI, with the PDF kept in `failed/`, and `saneless scan` exits 9; see [The document may already be in paperless-ngx](../how-to/troubleshoot-a-failed-scan.md#the-document-may-already-be-in-paperless-ngx-exit-9). saneless waits for that answer for 30 seconds plus 1 second per MiB of the PDF, at most 300 seconds, because paperless-ngx answers only once it has read and stored the whole file.
 
 ## How Paperless-ngx Picks It Up
 
@@ -64,9 +66,14 @@ Other local users then cannot list or open anything in it. The folder is a short
 
 The fallback activates only when **all** of these conditions are true:
 
-1. The API upload fails in one of the ways listed above -- a connection refused or reset, a timeout, a reverse proxy closing the connection, or a server error.
-2. All attempts are exhausted.
+1. The API upload fails in a way that proves it cannot have reached paperless-ngx -- one of the failures listed above that are sent again.
+2. Those failures go on for about 60 seconds.
 3. A `consume_dir` is configured (non-empty string).
+4. That directory exists.
+
+**saneless never creates the consume directory.** A configured directory that is missing almost always means the paperless-ngx volume is not mounted where saneless looks, and a directory made in its place would be one nothing watches, so the copy would sit there unseen. So when a fallback finds no directory, the scan fails with `consume directory <dir> does not exist — is the paperless-ngx volume mounted?` (exit 3), and the PDF is kept in `failed/` as described below. The Fallback row of `saneless doctor` and the web UI's checks is red for as long as the directory is missing. Mount paperless-ngx's consume volume at that path, or correct `consume_dir`, then import the kept PDF into paperless-ngx rather than scanning the stack again.
+
+**An upload that may have arrived never falls back.** A dropped answer, a read timeout, a 5xx or a 200 without a task id ends amber and exits 9, as described above: the PDF goes to `failed/`, never to the consume directory.
 
 **A configuration problem never falls back either.** A `paperless.url` without an `http://` or `https://` scheme and a host, or a `paperless.token` with a space, line break or control character inside it, is refused when the config loads, so saneless does not run at all (exit 2). An empty `paperless.url` loads, because it means "not set yet", but no scan starts while it is empty: `saneless scan` and the web UI refuse before the scanner is opened. Should a scan reach the upload with no address anyway, it fails at once as a configuration error: it is not retried, nothing is copied to the consume directory, and the PDF is kept in `failed/` as described below. The consume directory stands in for paperless-ngx while paperless-ngx is away; it is not a way to run saneless with no paperless-ngx address at all.
 
@@ -74,7 +81,7 @@ The fallback activates only when **all** of these conditions are true:
 
 If no `consume_dir` is configured, the upload error propagates and the scan job enters the ERROR state. The user sees the error in the web UI or CLI output.
 
-**The scanned document is not lost when that happens.** Before the error propagates, saneless moves the assembled PDF into `failed/` inside its data directory -- durable storage, deliberately separate from the disposable scratch directory the scan was built in -- and appends the full path of the preserved file to the job's error message. The error text shown in the web UI therefore names the file to go and find. The same preservation happens when the upload reaches paperless-ngx but the consumption task then reports a failure, and when the task has not finished before `paperless_task_timeout` expires. See [Docker volumes](../reference/docker.md#volumes) for where that directory lives in a container and how to drain it.
+**The scanned document is not lost when that happens.** Before the error propagates, saneless moves the assembled PDF into `failed/` inside its data directory -- durable storage, deliberately separate from the disposable scratch directory the scan was built in -- and appends the full path of the preserved file to the job's error message. The error text shown in the web UI therefore names the file to go and find. The same preservation happens when the upload may have reached paperless-ngx without an answer, when it reaches paperless-ngx but the consumption task then reports a failure other than a duplicate, and when the task has not finished before `paperless_task_timeout` expires. Those three end amber rather than red, because the document may already be in paperless-ngx: check before you import the kept copy. See [Docker volumes](../reference/docker.md#volumes) for where that directory lives in a container and how to drain it.
 
 `failed/` is where every scan saneless could not deliver ends up, not only the ones an upload lost, so it holds three kinds of thing:
 
@@ -86,13 +93,18 @@ The rule is the same for all three: a failure keeps everything it can, because y
 
 ### Network blips after the upload
 
-Once paperless-ngx has accepted the upload, saneless waits for its consumption task to finish. A network error while checking on that task does not fail the scan: saneless keeps checking until `paperless_task_timeout` expires, and only then reports a timeout. When the last check failed with a network error, the timeout names that error; a blip that later checks got past is not blamed.
+Once paperless-ngx has accepted the upload, saneless waits for its consumption task to finish. A network error while checking on that task does not fail the scan, and nor does a 5xx or a 429 from paperless-ngx or a proxy in front of it: saneless keeps checking, with waits of at most 5 seconds, until `paperless_task_timeout` expires. Only then does it report that paperless-ngx received the document but did not confirm filing it: amber, labelled **Received, not confirmed** in the web UI, with the PDF kept in `failed/`, and exit 9 from `saneless scan`. When the last check failed, the message names that error; a blip that later checks got past is not blamed.
 
 ### Duplicates
 
-A retry can create a duplicate document. If the connection drops after paperless-ngx has received the file but before its answer reaches saneless, saneless cannot tell the upload arrived and sends it again. On default paperless-ngx settings that stores a second copy of the document, which you can delete. saneless accepts this trade: a duplicate is easy to remove, a lost scan is not.
+saneless's own retries never make a second document: an upload is sent again only when it cannot have reached paperless-ngx, and one that may have arrived is never resent or copied. If the connection drops after paperless-ngx has received the file but before its answer reaches saneless, the scan ends amber with exit 9 and a copy in `failed/`, and nothing is sent twice.
 
-When paperless-ngx is set to reject duplicates, the second upload's task fails instead, and the failure says the document may already be in Paperless. Check paperless-ngx before scanning again.
+paperless-ngx recognises a duplicate by the file's checksum, so this concerns the same file arriving twice -- such as the copy in `failed/` imported after the original did arrive -- rather than a new scan of the same paper. What happens then depends on the paperless-ngx release:
+
+- **paperless-ngx 2.x** always refuses a duplicate: its consumption task fails, naming the document it already holds.
+- **paperless-ngx 3.x** stores a duplicate as a second document, unless `PAPERLESS_CONSUMER_DELETE_DUPLICATES` is enabled, in which case it refuses it as 2.x does.
+
+When paperless-ngx refuses an upload as a duplicate, the document is already there, so saneless reports the scan as **Uploaded with a warning** rather than as a failure, and keeps nothing in `failed/` (exit 7 from `saneless scan`). The warning names the existing document -- *"paperless-ngx already holds this file as document #42; it was not stored again, and this scan's title and tags were not applied to it."* -- and says so when that document is in paperless-ngx's trash.
 
 ## Limitations
 

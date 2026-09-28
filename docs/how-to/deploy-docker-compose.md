@@ -5,7 +5,7 @@ Run saneless alongside paperless-ngx using Docker Compose -- the most common hom
 ## What you'll need
 
 - Docker and Docker Compose installed on your host
-- A running paperless-ngx instance, reachable from this host. This guide covers the saneless side only; stand paperless-ngx up from [its own compose files](https://docs.paperless-ngx.com/setup/) first
+- A running paperless-ngx instance, reachable from this host: paperless-ngx 2.16 or later, which speaks API version 9 or 10. This guide covers the saneless side only; stand paperless-ngx up from [its own compose files](https://docs.paperless-ngx.com/setup/) first
 - A paperless-ngx API token (generate one in paperless-ngx under Settings > API Tokens)
 - For network scanners: the scanner's IP address
 
@@ -256,6 +256,35 @@ of them move -- then pull it and recreate the container:
 docker compose pull saneless
 docker compose up -d
 ```
+
+### Upgrading: paperless-ngx 2.16 or later
+
+This release needs paperless-ngx 2.16 or later. It speaks API version 9, and
+10 once paperless-ngx says it allows it, as 3.x does. An older paperless-ngx
+refuses both with `406`: the status strip and `GET /api/paperless/test` then
+report `incompatible_version`, and every scan fails with `Paperless error: ...
+does not accept API version 9 or 10; saneless needs paperless-ngx 2.16 or
+later` (exit 3). Upgrade paperless-ngx first.
+
+- An upload is sent again only when it cannot have reached paperless-ngx, for
+  about 60 seconds, so a paperless-ngx restart is ridden out before the
+  consume-directory fallback is used. An upload that may have arrived is never
+  resent or copied: it ends amber, **May be in paperless-ngx**, with the PDF
+  in `failed/`, and `saneless scan` exits 9. Check paperless-ngx before you
+  scan again.
+- The consume directory is never created. If the mount is missing, a fallback
+  fails with `does not exist — is the paperless-ngx volume mounted?` and the
+  PDF is kept in `failed/`.
+- A duplicate paperless-ngx refuses is now **Uploaded with a warning** (exit
+  7), naming the document it already holds, rather than a failure.
+- The web form now shows a profile's `default_tags` and
+  `default_correspondent` pre-ticked, so an untouched form scans with them, as
+  `saneless scan --profile` does. A default that no longer exists in
+  paperless-ngx is skipped with a warning.
+- A profile `title` longer than 118 characters, or a tag or correspondent id
+  outside 1 to 2147483647, now stops the config from loading (exit 2).
+- Jobs recorded by an earlier release keep the error category they were
+  recorded with; nothing in the job history is rewritten.
 
 ### Upgrading: `[output] data_dir` now takes effect in the container
 

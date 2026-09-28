@@ -7,7 +7,7 @@ Install saneless directly on a Linux host with a SANE-compatible scanner.
 - A Linux system (Debian/Ubuntu, Fedora/RHEL/Rocky, Arch, or Alpine)
 - Python 3.14 or later
 - A SANE-compatible scanner accessible via `saned` on the network or locally via USB
-- A running paperless-ngx instance with an API token
+- A running paperless-ngx instance with an API token: paperless-ngx 2.16 or later, which speaks API version 9 or 10
 
 ## Step 1: Install SANE development headers
 
@@ -77,6 +77,8 @@ See [Configure Scan Profiles](configure-scan-profiles.md) for more profile optio
 Scans in progress are written under `tmp_dir`, by default `$TMPDIR/saneless-<uid>` (for example `/tmp/saneless-1000`), which saneless creates so that only your user can enter it; see [`[output]`](../reference/configuration.md#output) for what it refuses at startup. Upgrading from an earlier release? The old `/tmp/saneless` directory is no longer used and may be deleted, once any `saneless.db` a release older than `data_dir` left in it has been moved to `data_dir`.
 
 ### Upgrading from an earlier release
+
+This release needs paperless-ngx 2.16 or later, which speaks API version 9 or 10; an older paperless-ngx refuses every upload with `406`, and the status strip reports `incompatible_version`. [Upgrading: paperless-ngx 2.16 or later](deploy-docker-compose.md#upgrading-paperless-ngx-216-or-later) lists what else changed about delivery and a scan's metadata; it applies to a bare-metal install too.
 
 saneless now keeps what it writes under `data_dir` (by default `~/.local/state/saneless`) to your user. When it creates `data_dir`, `failed/` or a preserved page directory, it creates it `0700`. A new job database (`saneless.db`, with its `-wal` and `-shm` files) and each preserved PDF and page file are `0600`.
 
