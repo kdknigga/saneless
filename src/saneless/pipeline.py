@@ -45,6 +45,7 @@ from saneless.vocabulary import (
     PassWait,
     ScanOutcome,
     backs_not_scanned_warning,
+    backs_pass_cap_warning,
     blank_timeout_finish_warning,
     cap_finish_warning,
     classify_error,
@@ -1371,6 +1372,28 @@ def _pass_cap_warning(cap: PassCapReached | None, pages_kept: int) -> str | None
     warning = pass_cap_warning(
         pages_kept, cap.cap, cap.sheet_not_kept, auto_source=cap.auto_source
     )
+    logger.warning(warning)
+    return warning
+
+
+def _backs_cap_warning(cap: PassCapReached | None, pages_kept: int) -> str | None:
+    """
+    Say that a manual-duplex backs pass stopped at its cap, and log it, if so.
+
+    Worded apart from ``_pass_cap_warning``: the sheet past the cap has no
+    scanned front, so resuming from it would recover nothing.
+
+    Args:
+        cap: The cap the backs pass reached, or None when it ended on its own.
+        pages_kept: How many pages the two halves hold together.
+
+    Returns:
+        The warning text, or None when no cap was reached.
+
+    """
+    if cap is None:
+        return None
+    warning = backs_pass_cap_warning(pages_kept, cap.cap, cap.sheet_not_kept)
     logger.warning(warning)
     return warning
 
@@ -3249,23 +3272,23 @@ class _PipelineRun:
         self._delivered()
         delivered = fronts_result.delivered_to_api and backs_result.delivered_to_api
 
+        mismatch_pages = len(mismatch.fronts) + len(mismatch.backs)
         mismatch_warning = _duplex_mismatch_warning(mismatch)
         logger.warning(mismatch_warning)
         # A cap and a substitution are events of their own, not the reason
-        # the halves were split, so each is joined in its own sentence: the
-        # cap names the sheet that was fed but not kept, which is where the
-        # operator resumes. The backs pass is the only one a mismatch can
-        # carry a cap from, so its pages are the ones the cap kept.
+        # the halves were split, so each is joined in its own sentence. The
+        # backs pass is the only one a mismatch can carry a cap from, and its
+        # sentence counts every page uploaded, across both halves, so that it
+        # agrees with pages_uploaded below.
         warning = _join_warnings(
             mismatch_warning,
             _substitution_warning(mismatch.substituted_source),
-            _pass_cap_warning(mismatch.backs_cap, len(mismatch.backs)),
+            _backs_cap_warning(mismatch.backs_cap, mismatch_pages),
         )
         self._notify(PipelineEvent.DONE)
         logger.info(
             "Pipeline complete for %r (duplex mismatch recovery)", self.request.title
         )
-        mismatch_pages = len(mismatch.fronts) + len(mismatch.backs)
         # _MAX_ADF_PAGES applies to each scan_pages call, so to each pass: each
         # pass can feed up to that many sheets.
         return ScanResult(

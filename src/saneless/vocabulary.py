@@ -81,6 +81,7 @@ __all__ = [
     "abort_question",
     "ambiguous_source_error",
     "backs_not_scanned_warning",
+    "backs_pass_cap_warning",
     "blank_timeout_finish_warning",
     "busy_line",
     "cap_finish_warning",
@@ -1480,6 +1481,39 @@ def pass_cap_warning(
             f"scan {resume}"
         )
     return f"{lead}one scan {stopped} Scan {resume}"
+
+
+def backs_pass_cap_warning(pages_kept: int, cap: int, sheet_not_kept: int) -> str:
+    """
+    Return the warning for a manual duplex job whose backs pass hit its cap.
+
+    The fronts pass ended on its own, so it fed no more sheets than the cap,
+    and the backs pass fed one more than that: the turned-over stack held
+    sheets whose fronts were never scanned, and which ones cannot be told.
+    Resuming "from the next sheet", as ``pass_cap_warning`` advises, would
+    recover nothing, so this sentence says to check both documents and scan
+    the missing sheets again from both sides. It shares ``pass_cap_warning``'s
+    lead, with the count of every page the job uploaded across both
+    documents. Only counts are interpolated.
+
+    Args:
+        pages_kept: How many pages the two documents hold together.
+        cap: The sheet count at which one scan stops.
+        sheet_not_kept: The sheet of the turned-over stack that was fed but
+            not kept.
+
+    Returns:
+        The warning sentence.
+
+    """
+    return (
+        f"Finished at {pages_phrase(pages_kept)}: the scan of the backs stops "
+        f"after {_counted(cap, 'sheet')}, so sheet {sheet_not_kept} of the "
+        "turned-over stack was fed but not kept, and the stack held more "
+        "sheets than the scan of the fronts fed. Check both documents, and "
+        "scan any sheet missing from either again, both sides, as a new "
+        "document."
+    )
 
 
 def backs_not_scanned_warning(sheet_not_kept: int) -> str:

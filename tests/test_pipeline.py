@@ -72,6 +72,7 @@ from saneless.vocabulary import (
     JobState,
     ScanOutcome,
     backs_not_scanned_warning,
+    backs_pass_cap_warning,
     classify_error,
     pass_cap_warning,
     substituted_source_warning,
@@ -6250,9 +6251,10 @@ class TestManualDuplexPassCap:
         assert result.pages_uploaded == 7
         assert result.warning is not None
         assert "could not be paired reliably" in result.warning
-        assert (
-            result.warning.count(pass_cap_warning(4, 500, 501, auto_source=False)) == 1
-        )
+        # The cap sentence counts both halves, as pages_uploaded does, and
+        # does not advise resuming from a sheet whose front was never scanned.
+        assert result.warning.count(backs_pass_cap_warning(7, 500, 501)) == 1
+        assert "one scan stops after" not in result.warning
 
     def test_a_capped_backs_pass_is_never_interleaved_even_when_counts_agree(
         self,
@@ -6286,9 +6288,7 @@ class TestManualDuplexPassCap:
         # Three fronts and three backs are not a count mismatch, and saying so
         # would be false.
         assert "Page count mismatch" not in result.warning
-        assert (
-            result.warning.count(pass_cap_warning(3, 500, 501, auto_source=False)) == 1
-        )
+        assert result.warning.count(backs_pass_cap_warning(6, 500, 501)) == 1
 
     def test_an_interleaved_run_reports_a_feeder_substitution(
         self,

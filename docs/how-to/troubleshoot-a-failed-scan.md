@@ -381,6 +381,12 @@ again. The warning is one of these:
   The pages before it were uploaded. Take sheet 501 and everything after it from the output
   tray and the feeder, and scan them as a new document. In a multi-page scan the document is
   finished at that scan, and the warning counts the document's pages.
+- **Finished at N pages: the scan of the backs stops after 500 sheets, so sheet 501 of the
+  turned-over stack was fed but not kept.** The backs pass of a manual duplex scan reached its
+  cap. The fronts pass ended on its own with fewer sheets, so the turned-over stack held sheets
+  whose fronts were never scanned. The fronts and backs were uploaded as two documents, and N
+  counts the pages of both. Check both documents, and scan any sheet missing from either again,
+  both sides, as a new document.
 - **Finished at N pages: a scan from an Auto source through the feeder stops after 50 sheets, so
   sheet 51 was fed but not kept.** A profile whose `source` is the scanner's Auto source, with
   `auto_source_mode = "adf"`, keeps at most 50 sheets per scan, because a scanner that has no

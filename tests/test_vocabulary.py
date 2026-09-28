@@ -63,6 +63,7 @@ from saneless.vocabulary import (
     WorkerHealth,
     ambiguous_source_error,
     backs_not_scanned_warning,
+    backs_pass_cap_warning,
     blank_timeout_finish_warning,
     busy_line,
     cap_finish_warning,
@@ -695,6 +696,21 @@ class TestFinishWarnings:
         """A single kept page is a page, not pages."""
         assert pass_cap_warning(1, 500, 501, auto_source=False).startswith(
             "Finished at 1 page: "
+        )
+
+    def test_backs_pass_cap_warning(self) -> None:
+        """
+        A capped backs pass counts both halves and says to re-scan both sides.
+
+        Its sheet past the cap has no scanned front, so the advice is not to
+        resume from it, as the one-pass sentence says.
+        """
+        assert backs_pass_cap_warning(950, 500, 501) == (
+            "Finished at 950 pages: the scan of the backs stops after 500 "
+            "sheets, so sheet 501 of the turned-over stack was fed but not "
+            "kept, and the stack held more sheets than the scan of the fronts "
+            "fed. Check both documents, and scan any sheet missing from either "
+            "again, both sides, as a new document."
         )
 
     def test_backs_not_scanned_warning(self) -> None:
