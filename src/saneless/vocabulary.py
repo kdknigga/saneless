@@ -36,8 +36,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ACTIVE_STATES",
+    "BACKS_SUFFIX",
     "BUSY_STATES",
     "FALLBACK_NOT_UPLOADED_LINE",
+    "FRONTS_SUFFIX",
     "HIDDEN_ERROR_DETAIL",
     "HIDDEN_JOB_TITLE",
     "HIDDEN_PRESERVED_ERROR",
@@ -49,6 +51,8 @@ __all__ = [
     "MULTI_PAGE_NEEDS_TERMINAL",
     "MULTI_PAGE_OPTION_HELP",
     "NOTHING_TO_FINISH",
+    "PAPERLESS_TITLE_LIMIT",
+    "PARTIAL_SUFFIX",
     "PASS_WAIT_STATES",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
@@ -57,6 +61,7 @@ __all__ = [
     "SCAN_BLOCKED_URL_REASON",
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
+    "TITLE_SUFFIX_SEPARATOR",
     "TOKEN_UNSET_JOB_ERROR",
     "UNCONFIRMED_FILING_LABEL",
     "UNCONFIRMED_SEND_LABEL",
@@ -108,6 +113,7 @@ __all__ = [
     "exit_code_for_signal",
     "flip_answer_label",
     "half_delivery_error",
+    "half_title",
     "is_amber_category",
     "job_label",
     "job_state_for",
@@ -706,10 +712,56 @@ class RequestRejection(StrEnum):
     HOST_NOT_ALLOWED = "HOST_NOT_ALLOWED"
 
 
+# What a preserved artefact's title says it is.  It is appended to the
+# operator's own title for the PDF's /Title, and passed to
+# ``build_pdf_filename`` as its ``part`` segment, placed after the title slug
+# where the slug's length cap cannot cut it off.  The bracketed
+# spelling is the one the duplex-mismatch delivery already uses, and the two
+# paths have to agree: an operator looking in ``failed/`` should not have to
+# learn that a pass-B failure and a page-count mismatch name their halves
+# differently.  ``(partial)`` is the simplex and single-pass form.
+PARTIAL_SUFFIX: Final = "(partial)"
+FRONTS_SUFFIX: Final = "(fronts)"
+BACKS_SUFFIX: Final = "(backs)"
+
+# paperless-ngx's consumer stores the first 127 characters of a document's
+# title and drops the rest without a word; its upload API accepts any length.
+PAPERLESS_TITLE_LIMIT: Final = 127
+
+# What goes between the operator's title and a half's suffix.
+TITLE_SUFFIX_SEPARATOR: Final = " "
+
+
+def half_title(title: str, suffix: str) -> str:
+    """
+    Return the title one half of a split duplex job is uploaded under.
+
+    This is the one place a suffix is joined to a title, so the title cap
+    below can be derived from it: a split duplex job's two uploads and a
+    kept PDF's /Title all read it.
+
+    Args:
+        title: The operator's title, as typed or resolved.
+        suffix: ``FRONTS_SUFFIX`` or ``BACKS_SUFFIX``.
+
+    Returns:
+        The title, the separator, then the suffix.
+
+    """
+    return f"{title}{TITLE_SUFFIX_SEPARATOR}{suffix}"
+
+
 # The one title length cap.  The ``Form(max_length=...)`` validation on the scan
-# route, the ``maxlength`` attribute on the title input and the TITLE_TOO_LONG
-# message all read this constant, so the three cannot drift apart.
-TITLE_MAX_LENGTH: Final = 256
+# route, the ``maxlength`` attribute on the title input, a profile's ``title``,
+# the CLI's ``--title`` check and the TITLE_TOO_LONG message all read this
+# constant, so they cannot drift apart.  It is what paperless-ngx keeps less the
+# longest suffix saneless adds to a title it uploads, so a title at the cap
+# arrives whole even as one half of a split duplex job.  Only the two half
+# suffixes count: "(partial)" names files kept in failed/ and never reaches
+# paperless-ngx, and a consume-folder copy carries no title at all.
+TITLE_MAX_LENGTH: Final = PAPERLESS_TITLE_LIMIT - max(
+    len(half_title("", suffix)) for suffix in (FRONTS_SUFFIX, BACKS_SUFFIX)
+)
 
 # Job-row error texts.  A submit refused because the queue was full, the
 # worker was down or degraded, or the paperless-ngx API token or address was
@@ -785,7 +837,7 @@ def duplicate_warning(
             did not name it.
         in_trash: Whether that document is in paperless-ngx's trash.
         half: The half of a split duplex job this was, such as
-            ``"(backs)"``, or None for a whole scan.
+            ``BACKS_SUFFIX``, or None for a whole scan.
 
     Returns:
         The warning, one or two sentences.
@@ -814,7 +866,7 @@ def half_delivery_error(delivered: str, failed: str, reason: str) -> str:
     whose advice says to check paperless-ngx first.
 
     Args:
-        delivered: The half paperless-ngx accepted, such as ``"(fronts)"``.
+        delivered: The half paperless-ngx accepted, such as ``FRONTS_SUFFIX``.
         failed: The half that failed.
         reason: Why it failed, already one line with the token struck.
 

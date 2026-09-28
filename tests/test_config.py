@@ -741,7 +741,7 @@ class TestTomlStructureErrors:
         """
         toml_content = f'[profiles.default]\ntitle = "{"x" * 119}"\n'
         err = _load_error(tmp_config_dir / "long_title.toml", toml_content)
-        assert "profiles.default.title" in str(err)
+        assert "[profiles.default] title: String should have at most 118" in str(err)
 
     def test_title_of_what_paperless_keeps_loads(self, tmp_config_dir: Path) -> None:
         """A 118-character profile title loads unchanged."""

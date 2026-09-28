@@ -92,6 +92,7 @@ from .vocabulary import (
     MULTI_PAGE_NEEDS_TERMINAL,
     MULTI_PAGE_OPTION_HELP,
     NOTHING_TO_FINISH,
+    TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
     WARNED_UPLOAD_LABEL,
@@ -102,6 +103,7 @@ from .vocabulary import (
     JobState,
     PassAnswer,
     PassWait,
+    RequestRejection,
     ScanOutcome,
     abort_question,
     classify_error,
@@ -118,6 +120,7 @@ from .vocabulary import (
     multi_page_manual_duplex_refusal,
     outcome_line,
     progress_label,
+    rejection_message,
     removed_pages_note,
     state_label,
 )
@@ -1382,6 +1385,37 @@ def _recover_orphaned_workspaces(settings: Settings) -> None:
         )
 
 
+def _scan_title(title: str, profile: ProfileConfig, *, now: datetime) -> str:
+    """
+    Resolve the title ``scan`` uploads under, refusing one paperless-ngx would cut.
+
+    The rule is the one the web form shares: typed, else the profile's title,
+    else "Scan <time>"; blank after stripping counts as not typed. A longer
+    title than paperless-ngx keeps whole is refused before the scanner exists,
+    never shortened. Only a typed title can be that long: a profile's title is
+    held to the same cap when the config loads.
+
+    Args:
+        title: The ``--title`` value, possibly empty.
+        profile: The chosen profile, for its title.
+        now: The time a "Scan <time>" title names.
+
+    Returns:
+        The resolved title, exactly as typed or configured.
+
+    Raises:
+        click.BadParameter: If the title is longer than ``TITLE_MAX_LENGTH``,
+            which click reports as a usage error naming ``--title`` (exit 2).
+
+    """
+    resolved = resolve_job_title(title, profile, now=now)
+    if len(resolved) > TITLE_MAX_LENGTH:
+        raise click.BadParameter(
+            rejection_message(RequestRejection.TITLE_TOO_LONG), param_hint="--title"
+        )
+    return resolved
+
+
 @cli.command()
 @click.option(
     "--profile",
@@ -1411,10 +1445,8 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
         click.echo(f"Unknown profile: {profile}", err=True)
         ctx.exit(ExitCode.CONFIG)
 
-    # The one title rule the web form shares -- typed, else the profile's
-    # title, else "Scan <time>"; blank after stripping counts as not typed.
     now = datetime.now(tz=UTC)
-    resolved_title = resolve_job_title(title, settings.profiles[profile], now=now)
+    resolved_title = _scan_title(title, settings.profiles[profile], now=now)
 
     # Refused here, before the scanner is opened, because a scan that
     # cannot upload is wasted paper. The refusal is unconditional -- a

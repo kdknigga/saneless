@@ -1015,18 +1015,19 @@ class TestOfflinePage:
         )
         assert slot_precedes_status_area is True
 
-    def test_title_input_caps_at_256(self, page: Page, browser_server_url: str) -> None:
+    def test_title_input_caps_at_118(self, page: Page, browser_server_url: str) -> None:
         """
-        The title input stops at the server's 256-character cap (B14, ROBU-08).
+        The title input stops at the server's 118-character cap (B14, ROBU-08).
 
+        118 is what paperless-ngx keeps whole even with " (fronts)" appended.
         The server's 422 stays authoritative; this is what keeps a browser user
         from ever meeting it.
         """
         page.goto(browser_server_url)
         title_input = page.locator("#title-input")
-        assert title_input.get_attribute("maxlength") == "256"
+        assert title_input.get_attribute("maxlength") == "118"
         title_input.fill("x" * 300)
-        assert len(title_input.input_value()) == 256
+        assert len(title_input.input_value()) == 118
 
 
 @pytest.mark.browser

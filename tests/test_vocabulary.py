@@ -1686,7 +1686,7 @@ _REJECTION_MESSAGES: list[tuple[RequestRejection, str]] = [
     ),
     (
         RequestRejection.TITLE_TOO_LONG,
-        "The title is too long. Shorten it to 256 characters or fewer.",
+        "The title is too long. Shorten it to 118 characters or fewer.",
     ),
     (
         RequestRejection.TITLE_HAS_CONTROL,

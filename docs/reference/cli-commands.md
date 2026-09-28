@@ -48,7 +48,7 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME] [--multi-page
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--title` | TEXT | the profile's `title`, else `Scan <local date time with the zone named>` | Document title for paperless-ngx; a blank title counts as omitted |
+| `--title` | TEXT | the profile's `title`, else `Scan <local date time with the zone named>` | Document title for paperless-ngx; a blank title counts as omitted. At most 118 characters, which paperless-ngx keeps whole even as one half of a split duplex document; a longer title is refused with exit code 2 before the scanner is opened, never shortened |
 | `--profile` | TEXT | `default` | Scan profile name from config |
 | `--multi-page` | flag | off | Ask after each scan whether there is another page, and put every page in one document. Needs an interactive terminal, and is refused for a manual duplex profile. See [Scan a Multi-Page Document](../how-to/scan-a-multi-page-document.md) |
 
@@ -58,7 +58,7 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME] [--multi-page
 |------|---------|
 | 0 | Scan and upload completed successfully |
 | 1 | Scan error (no scanner found, scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt or a multi-page question) |
-| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `--multi-page` without an interactive terminal or with a manual duplex profile, an unset or placeholder paperless-ngx API token, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
+| 2 | Configuration or profile error (unknown profile, a `--title` longer than 118 characters, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `--multi-page` without an interactive terminal or with a manual duplex profile, an unset or placeholder paperless-ngx API token, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
 | 3 | Paperless-ngx upload error (unreachable after retries, or upload rejected) |
 | 4 | PDF assembly error: the scanned pages could not be written as a PDF (a full disk is exit 10) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |

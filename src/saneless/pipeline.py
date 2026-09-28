@@ -58,6 +58,7 @@ from saneless.vocabulary import (
     classify_error,
     duplicate_warning,
     half_delivery_error,
+    half_title,
     pass_cap_note,
     pass_cap_warning,
     pass_wait_state,
@@ -3354,8 +3355,8 @@ class _PipelineRun:
         # upload, so the two cannot drift apart.  The file name carries the
         # half as a part segment of its own instead: inside the title slug it
         # would be cut off a long title, and the halves would share one name.
-        fronts_title = f"{self.request.title} {preservation.FRONTS_SUFFIX}"
-        backs_title = f"{self.request.title} {preservation.BACKS_SUFFIX}"
+        fronts_title = half_title(self.request.title, preservation.FRONTS_SUFFIX)
+        backs_title = half_title(self.request.title, preservation.BACKS_SUFFIX)
 
         self.artefacts.stage = preservation.RunStage.ASSEMBLING
         self._notify(PipelineEvent.ASSEMBLING)

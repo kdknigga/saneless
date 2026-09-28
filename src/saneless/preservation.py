@@ -33,6 +33,16 @@ from saneless.exceptions import DiskSpaceError, PdfError, describe
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import make_private_dir
 
+# What a preserved artefact's title says it is.  The suffixes are spelled in
+# vocabulary, beside the title cap one of them bounds, and are re-exported
+# here for every caller that names a pass by its suffix.
+from saneless.vocabulary import (
+    BACKS_SUFFIX,
+    FRONTS_SUFFIX,
+    PARTIAL_SUFFIX,
+    half_title,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -60,18 +70,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-# What a preserved artefact's title says it is.  It is appended to the
-# operator's own title for the PDF's /Title, and passed to
-# ``build_pdf_filename`` as its ``part`` segment, placed after the title slug
-# where the slug's length cap cannot cut it off.  The bracketed
-# spelling is the one the duplex-mismatch delivery already uses, and the two
-# paths have to agree: an operator looking in ``failed/`` should not have to
-# learn that a pass-B failure and a page-count mismatch name their halves
-# differently.  ``(partial)`` is the simplex and single-pass form.
-PARTIAL_SUFFIX: Final = "(partial)"
-FRONTS_SUFFIX: Final = "(fronts)"
-BACKS_SUFFIX: Final = "(backs)"
 
 # The workspace subdirectory a preserved PDF is assembled in, kept apart from
 # the finished PDF's own directory so a preservation can never be mistaken for,
@@ -663,7 +661,7 @@ def _build_pdf(
 
     """
     ensure_room_to_assemble(records, artefacts.workspace, artefacts.reserve_mb)
-    title = f"{artefacts.title} {suffix}" if suffix else artefacts.title
+    title = half_title(artefacts.title, suffix) if suffix else artefacts.title
     return assemble_pdf(
         records,
         artefacts.workspace / PRESERVED_DIR_NAME,
