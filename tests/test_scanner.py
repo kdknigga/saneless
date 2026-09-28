@@ -43,6 +43,7 @@ from saneless.scanner.base import (
     DeviceInfo,
     PageRecord,
     PageSink,
+    PassCapReached,
     ScanBatch,
     ScannerBackend,
     ScanSettings,
@@ -54,7 +55,13 @@ from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
-from tests.conftest import StubScannerBackend, images_of, reset_sane_process_state
+from tests.conftest import (
+    StubScannerBackend,
+    images_of,
+    reset_sane_process_state,
+    scan_batch,
+    spooling,
+)
 from tests.fake_sane import (
     TYPE_INT,
     FakeSaneDev,
@@ -1971,20 +1978,62 @@ class TestAdfPageErrorsAreTruthful:
 
 class TestAdfPageCap:
     """
-    The ADF loop is bounded, so non-feeder hardware cannot spin forever (D-04).
+    The feeder loop is bounded, and reaching the bound keeps what was scanned.
 
     python-sane's ``_SaneIterator.__next__`` stops only on one exact message,
     so on hardware that is not a feeder ``start()``/``snap()`` keep succeeding
-    and the loop never terminates -- reproduced live during research with a
-    Flatbed source that yielded page after page and would not stop.  The
-    per-page timeout is no help: a scan that succeeds satisfies it every
-    single iteration.  This is Phase 21's W-01, discharged here.
+    and the loop never terminates -- reproduced live with a Flatbed source
+    that yielded page after page and would not stop.  The per-page timeout is
+    no help: a scan that succeeds satisfies it every single iteration.
+
+    A source named as a feeder is cut off at the per-pass cap.  A source that
+    is not one -- ``Auto`` sent through the feeder, asked for or stood in for
+    a flatbed -- may be a platen rescanned forever, so it is cut off much
+    sooner.  Either way the pass is not a failure: the pages already scanned
+    are kept, and the batch names the sheet that was fed but not kept, so the
+    operator knows where to resume.
     """
 
+    @staticmethod
+    def _auto_settings(source: str) -> ScanSettings:
+        """
+        Build settings that send the device's Auto source through the feeder.
+
+        Args:
+            source: The profile's source, ``Auto`` itself or a flatbed request
+                the device's Auto stands in for.
+
+        Returns:
+            Settings routing Auto to the feeder.
+
+        """
+        return ScanSettings(
+            source=source, resolution=300, mode="Color", auto_source_mode="adf"
+        )
+
+    @staticmethod
+    def _auto_device(sheets: int) -> FakeSaneDev:
+        """
+        Build a device offering only Auto and ADF, holding ``sheets`` sheets.
+
+        Args:
+            sheets: How many sheets the feeder holds.
+
+        Returns:
+            The device.
+
+        """
+        dev = FakeSaneDev(pages=sheets)
+        dev.report_sources(["Auto", "ADF"])
+        return dev
+
     def test_an_endless_feeder_is_cut_off_at_the_cap(
-        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        tmp_path: Path,
     ) -> None:
-        """A device that never reports end-of-feed raises ScanError at the cap."""
+        """A feeder that never reports end-of-feed keeps 500 pages and names 501."""
         cap = sane_backend_mod._MAX_ADF_PAGES
         # Far more sheets than the cap, so the fake never reports end-of-feed
         # and the loop has to be stopped by the cap rather than by the device.
@@ -1992,12 +2041,20 @@ class TestAdfPageCap:
         backend = _backend_with(dev, monkeypatch)
 
         started = time.monotonic()
-        with pytest.raises(ScanError) as exc_info:
-            backend.scan_pages("test:0", _feeder_settings(), page_sink)
+        batch = backend.scan_pages("test:0", _feeder_settings(), page_sink)
         elapsed = time.monotonic() - started
 
-        assert str(cap) in str(exc_info.value)
-        assert not isinstance(exc_info.value, FeederEmptyError)
+        assert len(batch.pages) == cap
+        assert batch.cap_reached == PassCapReached(
+            cap=cap, sheet_not_kept=cap + 1, auto_source=False
+        )
+        assert batch.pages_rejected == 0
+        # The sheet past the cap was acquired -- that is how the overrun is
+        # seen -- and then discarded rather than spooled.
+        assert dev.calls.count("start") == cap + 1
+        assert len(list((tmp_path / f"spool-{_SPOOL_LABEL_A}").iterdir())) == cap
+        # The feed was stopped, not merely abandoned.
+        assert dev.cancel_calls >= 1
         # The fake's pages are tiny, so the cap must be reached quickly -- a
         # slow run here would mean the bound is not what stopped the loop.
         assert elapsed < 10.0
@@ -2010,9 +2067,94 @@ class TestAdfPageCap:
         dev = FakeSaneDev(pages=cap)
         backend = _backend_with(dev, monkeypatch)
 
-        pages = backend.scan_pages("test:0", _feeder_settings(), page_sink).pages
+        batch = backend.scan_pages("test:0", _feeder_settings(), page_sink)
 
-        assert len(pages) == cap
+        assert len(batch.pages) == cap
+        assert batch.cap_reached is None
+
+    def test_auto_on_the_feeder_is_cut_off_at_fifty(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """Auto sent through the feeder keeps 50 pages and names sheet 51."""
+        dev = self._auto_device(1000)
+        backend = _backend_with(dev, monkeypatch)
+
+        batch = backend.scan_pages("test:0", self._auto_settings("Auto"), page_sink)
+
+        assert dev.source == "Auto"
+        assert len(batch.pages) == 50
+        assert batch.cap_reached == PassCapReached(
+            cap=50, sheet_not_kept=51, auto_source=True
+        )
+        assert dev.calls.count("start") == 51
+        assert batch.substituted_source is None
+
+    def test_an_auto_standing_in_for_a_flatbed_is_capped_and_named(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """A flatbed request fed through Auto carries both facts on one batch."""
+        dev = self._auto_device(1000)
+        backend = _backend_with(dev, monkeypatch)
+
+        batch = backend.scan_pages("test:0", self._auto_settings("Flatbed"), page_sink)
+
+        assert len(batch.pages) == 50
+        assert batch.cap_reached == PassCapReached(
+            cap=50, sheet_not_kept=51, auto_source=True
+        )
+        assert batch.substituted_source == "Flatbed"
+
+    def test_a_named_feeder_is_not_held_to_the_auto_cap(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """Sixty sheets through a named feeder are sixty pages, uncapped."""
+        dev = FakeSaneDev(pages=60)
+        backend = _backend_with(dev, monkeypatch)
+
+        batch = backend.scan_pages("test:0", _feeder_settings(), page_sink)
+
+        assert len(batch.pages) == 60
+        assert batch.cap_reached is None
+
+    def test_unreadable_sheets_inside_a_capped_pass_are_still_counted(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        Three unreadable sheets then an endless stack: 497 pages, sheet 501.
+
+        The cap counts sheets fed, not pages kept, so the sheet not kept is
+        still the 501st whatever was skipped before it.
+        """
+        cap = sane_backend_mod._MAX_ADF_PAGES
+        # Far below _MIN_PAGE_BYTES: a 10x10 RGB page is 300 bytes.
+        unreadable = Image.new("RGB", (10, 10), "white")
+        readable = _make_content_image()
+        dev = FakeSaneDev()
+        dev.load_feeder([unreadable] * 3 + [readable] * (cap * 2 - 3))
+        backend = _backend_with(dev, monkeypatch)
+
+        batch = backend.scan_pages("test:0", _feeder_settings(), page_sink)
+
+        assert len(batch.pages) == cap - 3
+        assert batch.pages_rejected == 3
+        assert batch.cap_reached == PassCapReached(
+            cap=cap, sheet_not_kept=cap + 1, auto_source=False
+        )
+
+    def test_a_capped_pass_of_nothing_readable_is_still_an_error(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """Every sheet unreadable, then the cap: the unreadable error, no batch."""
+        cap = sane_backend_mod._MAX_ADF_PAGES
+        dev = FakeSaneDev()
+        dev.load_feeder([Image.new("RGB", (10, 10), "white")] * (cap * 2))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError, match="unreadable") as exc_info:
+            backend.scan_pages("test:0", _feeder_settings(), page_sink)
+
+        assert not isinstance(exc_info.value, FeederEmptyError)
+        assert page_sink.records == ()
 
     def test_the_per_pass_cap_is_the_one_shared_constant(self) -> None:
         """
@@ -2023,6 +2165,15 @@ class TestAdfPageCap:
         """
         assert MAX_PAGES_PER_PASS == 500
         assert sane_backend_mod._MAX_ADF_PAGES == MAX_PAGES_PER_PASS
+
+    def test_the_budget_defaults_to_the_feeder_cap(self) -> None:
+        """A page budget built with no cap carries the named feeder's 500."""
+        assert sane_backend_mod._PageBudget().max_pages == 500
+        assert sane_backend_mod._DEFAULT_PAGE_BUDGET.max_pages == 500
+
+    def test_the_auto_cap_is_fifty(self) -> None:
+        """The bound for a source that is not a named feeder is 50 pages."""
+        assert sane_backend_mod._MAX_AUTO_FEEDER_PAGES == 50
 
 
 class TestSaneBackendPageValidation:
@@ -2770,7 +2921,10 @@ class TestSaneBackendPerPageTimeout:
         try:
             with pytest.raises(ScanError, match="timed out after"):
                 backend._scan_adf_pages(
-                    mock_dev, page_sink, _UNCROPPED, timeout_per_page=0.05
+                    mock_dev,
+                    page_sink,
+                    _UNCROPPED,
+                    sane_backend_mod._PageBudget(timeout=0.05),
                 )
         finally:
             mock_dev.release_read()
@@ -2793,9 +2947,9 @@ class TestSaneBackendPerPageTimeout:
         assert isinstance(mock_dev, FakeSaneDev)
 
         backend = SaneBackend()
-        records, _ = backend._scan_adf_pages(
-            mock_dev, page_sink, _UNCROPPED, timeout_per_page=5.0
-        )
+        records = backend._scan_adf_pages(
+            mock_dev, page_sink, _UNCROPPED, sane_backend_mod._PageBudget(timeout=5.0)
+        ).records
         assert len(records) == 3
         assert [record.sequence for record in records] == [1, 2, 3]
 
@@ -2874,7 +3028,10 @@ class TestSaneBackendCancelSequence:
             backend._open_device(_TEST_DEVICE) as dev,
         ):
             backend._scan_adf_pages(
-                dev, sink, _UNCROPPED, timeout_per_page=0.05, grace=0.05
+                dev,
+                sink,
+                _UNCROPPED,
+                sane_backend_mod._PageBudget(timeout=0.05, grace=0.05),
             )
 
     def test_close_not_called_while_blocked(
@@ -2897,7 +3054,10 @@ class TestSaneBackendCancelSequence:
         with sane_backend._open_device(_TEST_DEVICE) as dev:
             with pytest.raises(ScanError, match="timed out"):
                 sane_backend._scan_adf_pages(
-                    dev, page_sink, _UNCROPPED, timeout_per_page=0.05
+                    dev,
+                    page_sink,
+                    _UNCROPPED,
+                    sane_backend_mod._PageBudget(timeout=0.05),
                 )
             assert fake_device.cancel_calls == 1
             assert fake_device.close_while_blocked is False
@@ -2916,8 +3076,8 @@ class TestSaneBackendCancelSequence:
         """
         A scanner that never answers the cancel is reported, not closed.
 
-        The grace is injected the same way ``timeout_per_page`` is, so the
-        test does not wait out the module's real ten seconds.
+        The grace is injected through the page budget, as the timeout is, so
+        the test does not wait out the module's real ten seconds.
         """
         fake_device.block_read(ReadBlockMode.NEVER)
 
@@ -2927,7 +3087,10 @@ class TestSaneBackendCancelSequence:
             sane_backend._open_device(_TEST_DEVICE) as dev,
         ):
             sane_backend._scan_adf_pages(
-                dev, page_sink, _UNCROPPED, timeout_per_page=0.05, grace=0.05
+                dev,
+                page_sink,
+                _UNCROPPED,
+                sane_backend_mod._PageBudget(timeout=0.05, grace=0.05),
             )
 
         message = str(raised.value)
@@ -2964,7 +3127,7 @@ class TestSaneBackendCancelSequence:
             sane_backend._open_device(_TEST_DEVICE) as dev,
         ):
             sane_backend._scan_adf_pages(
-                dev, page_sink, _UNCROPPED, timeout_per_page=0.05
+                dev, page_sink, _UNCROPPED, sane_backend_mod._PageBudget(timeout=0.05)
             )
 
         assert page_sink.records == ()
@@ -3264,7 +3427,10 @@ class TestSaneBackendCancelSequence:
             interrupter.start()
             with pytest.raises(expected):
                 sane_backend._scan_adf_pages(
-                    dev, page_sink, _UNCROPPED, timeout_per_page=5.0
+                    dev,
+                    page_sink,
+                    _UNCROPPED,
+                    sane_backend_mod._PageBudget(timeout=5.0),
                 )
             interrupter.join(_READER_JOIN_SECONDS)
 
@@ -3302,7 +3468,7 @@ class TestSaneBackendCancelSequence:
             pytest.raises(ScanError, match="timed out"),
         ):
             sane_backend._scan_adf_pages(
-                dev, page_sink, _UNCROPPED, timeout_per_page=0.05
+                dev, page_sink, _UNCROPPED, sane_backend_mod._PageBudget(timeout=0.05)
             )
         gc.collect()
 
@@ -6187,29 +6353,58 @@ class TestScanBatch:
     them past it.
     """
 
-    def test_the_batch_carries_exactly_four_fields(self) -> None:
+    def test_the_batch_carries_exactly_five_fields(self) -> None:
         """
-        Four fields, in order, and the per-page detail lives in ``pages``.
+        Five fields, in order, and the per-page detail lives in ``pages``.
 
-        The object is still deliberately minimal.  HARD-01's ordered per-page
-        record design landed as ``pages: tuple[PageRecord, ...]`` rather than as
+        The object is still deliberately minimal.  The ordered per-page record
+        design landed as ``pages: tuple[PageRecord, ...]`` rather than as
         extra fields here, so anything measured about one page belongs on that
-        record.  The fourth field is about the pass as a whole -- the source
-        the device's Auto stood in for when it fed -- and so is not a second
-        channel for a per-page fact.
+        record.  The last two fields are about the pass as a whole -- the
+        source the device's Auto stood in for when it fed, and the cap the
+        pass reached -- and so are not a second channel for a per-page fact.
         """
         assert [field.name for field in dataclasses.fields(ScanBatch)] == [
             "pages",
             "actual_resolution",
             "pages_rejected",
             "substituted_source",
+            "cap_reached",
         ]
 
     def test_the_substitution_defaults_to_none(self) -> None:
-        """A batch built without the new fact reports no substitution."""
+        """A batch built without the new facts reports neither."""
         batch = ScanBatch(pages=(), actual_resolution=300, pages_rejected=0)
 
         assert batch.substituted_source is None
+        assert batch.cap_reached is None
+
+    def test_the_cap_fact_is_frozen(self) -> None:
+        """What the pass reached is a report, and cannot be rewritten."""
+        fact = PassCapReached(cap=50, sheet_not_kept=51, auto_source=True)
+        attribute = "sheet_not_kept"
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(fact, attribute, 52)
+
+        assert fact.sheet_not_kept == 51
+
+    def test_the_stub_helpers_pass_the_cap_fact_through(
+        self, page_sink: SpooledPageSink
+    ) -> None:
+        """``scan_batch`` and ``spooling`` carry the fact a test hands them."""
+        fact = PassCapReached(cap=500, sheet_not_kept=501, auto_source=False)
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
+
+        built = scan_batch([], cap_reached=fact)
+        spooled = spooling([_make_content_image()], cap_reached=fact)(
+            _TEST_DEVICE, settings, page_sink
+        )
+
+        assert built.cap_reached == fact
+        assert spooled.cap_reached == fact
+        assert len(spooled.pages) == 1
+        assert scan_batch([]).cap_reached is None
 
     def test_the_batch_is_not_an_iterator(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink

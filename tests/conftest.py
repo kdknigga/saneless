@@ -46,7 +46,13 @@ if TYPE_CHECKING:
     from starlette.routing import BaseRoute
 
     from saneless.job import Job, JobStore
-    from saneless.scanner.base import DeviceInfo, PageRecord, PageSink, ScanSettings
+    from saneless.scanner.base import (
+        DeviceInfo,
+        PageRecord,
+        PageSink,
+        PassCapReached,
+        ScanSettings,
+    )
     from saneless.scanner.listing import ListingRequest
     from saneless.vocabulary import JobState
 
@@ -683,6 +689,7 @@ def scan_batch(
     resolution: int = 300,
     rejected: int = 0,
     substituted_source: str | None = None,
+    cap_reached: PassCapReached | None = None,
 ) -> ScanBatch:
     """
     Build a ScanBatch for a stubbed scanner.
@@ -699,9 +706,9 @@ def scan_batch(
     actually exist.
 
     The extra facts default to "nothing surprising happened": the device
-    honoured the resolution it was asked for, rejected no sheets, and scanned
-    from the source the profile named. A test that cares about any of them
-    passes it explicitly.
+    honoured the resolution it was asked for, rejected no sheets, scanned
+    from the source the profile named, and ended before any per-pass cap.
+    A test that cares about any of them passes it explicitly.
 
     Args:
         pages: The records the stubbed scan produced, in document order.
@@ -709,6 +716,8 @@ def scan_batch(
         rejected: How many fed sheets failed their integrity checks.
         substituted_source: The requested source the device's Auto stood in
             for on the feeder path, or None.
+        cap_reached: The per-pass cap the stubbed scan reached, and the sheet
+            it fed but did not keep, or None.
 
     Returns:
         A ScanBatch carrying those records and every fact.
@@ -719,6 +728,7 @@ def scan_batch(
         actual_resolution=resolution,
         pages_rejected=rejected,
         substituted_source=substituted_source,
+        cap_reached=cap_reached,
     )
 
 
@@ -728,6 +738,7 @@ def spooling(
     resolution: int = 300,
     rejected: int = 0,
     substituted_source: str | None = None,
+    cap_reached: PassCapReached | None = None,
 ) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
     """
     Build the ``side_effect`` a stubbed ``scan_pages`` needs (D-01).
@@ -751,6 +762,8 @@ def spooling(
         rejected: How many fed sheets failed their integrity checks.
         substituted_source: The requested source the device's Auto stood in
             for on the feeder path, or None.
+        cap_reached: The per-pass cap the stubbed scan reached, and the sheet
+            it fed but did not keep, or None.
 
     Returns:
         One callable with ``scan_pages``' own ``(device_id, settings, sink)``
@@ -768,6 +781,7 @@ def spooling(
             resolution=resolution,
             rejected=rejected,
             substituted_source=substituted_source,
+            cap_reached=cap_reached,
         )
 
     return _spool_pages
