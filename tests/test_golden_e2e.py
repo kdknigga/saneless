@@ -57,8 +57,11 @@ from saneless.vocabulary import (
 from saneless.web.app import create_app
 from tests.conftest import poll_until, wait_for_state
 from tests.golden_support import (
+    GOLDEN_CORRESPONDENT_IDS,
+    GOLDEN_TAG_IDS,
     DistinctPageScanner,
     RecordingPaperless,
+    UploadFailure,
     cli_client_builder,
     embedded_streams,
     png_idat,
@@ -76,8 +79,9 @@ if TYPE_CHECKING:
     from saneless.worker import ScanWorker
 
 _TITLE = "Quarterly Report"
-_TAGS = ["3", "7"]
-_CORRESPONDENT = "12"
+# The ids the recording paperless-ngx lists, so the submitted metadata exists.
+_TAGS = [str(tag) for tag in GOLDEN_TAG_IDS]
+_CORRESPONDENT = str(GOLDEN_CORRESPONDENT_IDS[0])
 
 # Exactly these parts, and each name as often as listed: a date field, a
 # ``tags[]`` spelling or a dropped tag all change this multiset.
@@ -366,7 +370,7 @@ def _run_web(
     monkeypatch: pytest.MonkeyPatch,
     scenario: _Scenario,
     *,
-    refuse_uploads: bool = False,
+    upload_failure: UploadFailure | None = None,
 ) -> _WebRun:
     """
     Scan once through the web app, exactly as a browser would.
@@ -375,18 +379,20 @@ def _run_web(
         tmp_path: pytest's per-test directory.
         monkeypatch: Swaps the app's ``PaperlessClient`` for the recording one.
         scenario: What the scanner feeds.
-        refuse_uploads: Answer every upload with a 500 and give the run a
-            consume folder, so it falls back to it.
+        upload_failure: How every upload fails, which also gives the run a
+            consume folder; None uploads normally.  Only a before-send
+            failure -- the request never reached paperless-ngx -- may fall
+            back to the folder.
 
     Returns:
         What the run left behind.
 
     """
-    consume_dir = tmp_path / "consume" if refuse_uploads else None
+    consume_dir = tmp_path / "consume" if upload_failure is not None else None
     if consume_dir is not None:
         consume_dir.mkdir()
     settings = _settings(tmp_path, profile_metadata=False, consume_dir=consume_dir)
-    recorder = RecordingPaperless(refuse_uploads=refuse_uploads)
+    recorder = RecordingPaperless(upload_failure=upload_failure)
     scanner = DistinctPageScanner(passes=scenario.passes, rejected=scenario.rejected)
     monkeypatch.setattr(
         "saneless.web.app.PaperlessClient", web_client_builder(recorder)
@@ -505,7 +511,9 @@ def test_web_consume_folder_fallback_is_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A scan saved to the consume folder says so on every web surface."""
-    run = _run_web(tmp_path, monkeypatch, _SIMPLEX_RUN, refuse_uploads=True)
+    run = _run_web(
+        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.BEFORE_SEND
+    )
 
     assert run.job.state is JobState.FALLBACK
     assert run.job.warning is not None
@@ -597,7 +605,7 @@ def _run_cli(
     monkeypatch: pytest.MonkeyPatch,
     scenario: _Scenario,
     *,
-    refuse_uploads: bool = False,
+    upload_failure: UploadFailure | None = None,
     coverage_threshold: float | None = None,
 ) -> _CliRun:
     """
@@ -611,8 +619,10 @@ def _run_cli(
         tmp_path: pytest's per-test directory.
         monkeypatch: Replaces those five names in ``saneless.cli``.
         scenario: What the scanner feeds.
-        refuse_uploads: Answer every upload with a 500 and give the run a
-            consume folder, so it falls back to it.
+        upload_failure: How every upload fails, which also gives the run a
+            consume folder; None uploads normally.  Only a before-send
+            failure -- the request never reached paperless-ngx -- may fall
+            back to the folder.
         coverage_threshold: The scenario profile's blank-page threshold, when
             the run is not to use the shipped default.
 
@@ -620,14 +630,14 @@ def _run_cli(
         What the run left behind.
 
     """
-    consume_dir = tmp_path / "consume" if refuse_uploads else None
+    consume_dir = tmp_path / "consume" if upload_failure is not None else None
     if consume_dir is not None:
         consume_dir.mkdir()
     settings = _settings(tmp_path, profile_metadata=True, consume_dir=consume_dir)
     if coverage_threshold is not None:
         profile = settings.profiles[scenario.profile]
         profile.empty_page_coverage_threshold = coverage_threshold
-    recorder = RecordingPaperless(refuse_uploads=refuse_uploads)
+    recorder = RecordingPaperless(upload_failure=upload_failure)
     scanner = DistinctPageScanner(passes=scenario.passes, rejected=scenario.rejected)
 
     def load_settings(config_path: str | None = None) -> Settings:
@@ -834,7 +844,9 @@ def test_cli_consume_folder_fallback_is_reported_and_exits_6(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A scan saved to the consume folder says so, and says what it lost."""
-    run = _run_cli(tmp_path, monkeypatch, _SIMPLEX_RUN, refuse_uploads=True)
+    run = _run_cli(
+        tmp_path, monkeypatch, _SIMPLEX_RUN, upload_failure=UploadFailure.BEFORE_SEND
+    )
 
     assert run.result.exit_code == 6, run.result.output
     assert _FALLBACK_LINE in run.result.stdout
@@ -852,7 +864,9 @@ def test_cli_fallback_with_a_skipped_sheet_exits_6(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The fallback outranks the warning, and neither sentence is dropped."""
-    run = _run_cli(tmp_path, monkeypatch, _WARNED_RUN, refuse_uploads=True)
+    run = _run_cli(
+        tmp_path, monkeypatch, _WARNED_RUN, upload_failure=UploadFailure.BEFORE_SEND
+    )
 
     assert run.result.exit_code == 6, run.result.output
     assert _FALLBACK_LINE in run.result.stdout

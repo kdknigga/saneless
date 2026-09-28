@@ -14,13 +14,23 @@ metadata, reaching paperless-ngx exactly once:
 - ``RecordingPaperless`` answers the paperless-ngx API from memory and keeps
   every request it was sent; ``multipart_fields`` reads an upload back field by
   field with a real MIME parser, never with substring checks.
+- ``UploadFailure`` names the three ways ``RecordingPaperless`` can fail an
+  upload: before it is sent, after it is sent, or by never answering in time.
+  Only the first proves paperless-ngx never received the document.
+- ``GOLDEN_TAG_IDS`` and ``GOLDEN_CORRESPONDENT_IDS`` are the ids both fake
+  servers list by default, so the metadata a golden run submits exists.
+- ``RecordingPaperless(api_version=...)`` advertises an API version on every
+  answer, and ``RecordingPaperless(duplicate_of=...)`` fails the task poll as
+  a duplicate of an existing document, in the shape that version reports.
 - ``png_idat`` and ``embedded_streams`` compare a spooled page with a PDF page
   byte for byte: img2pdf copies a PNG's compressed pixel data into the PDF
   untouched, so equal bytes mean the PDF page *is* that spooled file.
 - ``web_client_builder`` and ``cli_client_builder`` stand in for the two
   places the application builds its ``PaperlessClient``.
 - ``loopback_paperless`` answers the same API over a real socket on
-  127.0.0.1, for the checks an in-memory transport cannot make.
+  127.0.0.1, for the checks an in-memory transport cannot make;
+  ``loopback_paperless(answer_gate=...)`` reads a whole upload, then holds its
+  answer until the gate is set, as a paperless-ngx that answers late does.
 
 Import it as ``from tests.golden_support import ...``; the bare
 ``golden_support`` form raises ``ModuleNotFoundError`` under pytest 9's
@@ -39,9 +49,10 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from email.message import EmailMessage
+from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Final, override
 from urllib.parse import parse_qs, urlsplit
 
 import httpx2
@@ -64,13 +75,68 @@ TASKS_PATH = "/api/tasks/"
 TAGS_PATH = "/api/tags/"
 CORRESPONDENTS_PATH = "/api/correspondents/"
 
-# An empty page in the paginated shape paperless-ngx lists collections in.
-_EMPTY_COLLECTION: dict[str, object] = {
-    "count": 0,
-    "next": None,
-    "previous": None,
-    "results": [],
-}
+# The tag and correspondent ids both fake servers list by default.  A golden
+# run submits exactly these, so metadata validation finds every one present.
+GOLDEN_TAG_IDS: Final = (3, 7)
+GOLDEN_CORRESPONDENT_IDS: Final = (12,)
+
+# The first paperless-ngx API version whose task list is paginated and whose
+# failed task reports a duplicate in ``result_data``.
+_PAGINATED_TASKS_VERSION = 10
+
+
+def _collection(results: Sequence[object]) -> dict[str, object]:
+    """
+    Wrap ``results`` in the single-page shape paperless-ngx lists them in.
+
+    Args:
+        results: Every item of the collection.
+
+    Returns:
+        A page with no next or previous page, holding all of ``results``.
+
+    """
+    return {"count": len(results), "next": None, "previous": None, "results": results}
+
+
+def _named(ids: Sequence[int], kind: str) -> list[dict[str, object]]:
+    """
+    Name each id the way the fake servers list it.
+
+    Args:
+        ids: The ids to list.
+        kind: The word in each name, such as ``"tag"``.
+
+    Returns:
+        One ``{"id", "name"}`` object per id, in order.
+
+    """
+    return [{"id": n, "name": f"golden-{kind}-{n}"} for n in ids]
+
+
+class UploadFailure(StrEnum):
+    """
+    How ``RecordingPaperless`` fails an upload.
+
+    The three differ in what the client can know afterwards, and so in what it
+    may do next.  Only ``BEFORE_SEND`` proves paperless-ngx never received the
+    document; after either of the others it may have been filed, and a copy
+    left in a consume folder could be filed twice.
+
+    Attributes:
+        BEFORE_SEND: The connection is refused (``httpx2.ConnectError``), so
+            nothing reached the server.
+        AFTER_SEND: The upload is answered with a 500, as a restarting
+            paperless-ngx answers one it received.
+        READ_TIMEOUT: The upload is sent and never answered in time
+            (``httpx2.ReadTimeout``).
+
+    """
+
+    BEFORE_SEND = "before-send"
+    AFTER_SEND = "after-send"
+    READ_TIMEOUT = "read-timeout"
+
 
 # A PNG file opens with an 8-byte signature; chunks follow it, each one a
 # 4-byte length, a 4-byte type, that many payload bytes and a 4-byte CRC.
@@ -350,37 +416,63 @@ class RecordingPaperless:
     A callable ``httpx2.MockTransport`` handler.  Every upload is issued its
     own task id, and a poll is answered only for an id that was issued, so a
     run cannot pass by polling a task that was never created.  Tag and
-    correspondent lists are answered empty, because the index page and the
-    status refresher ask for them on their own; a test therefore filters the
-    recorded requests by method and path and never counts them all.
+    correspondent lists are answered with the golden ids by default, because
+    the index page and the status refresher ask for them on their own; a test
+    therefore filters the recorded requests by method and path and never
+    counts them all.
+
+    Every request is recorded before it is answered or failed, so
+    ``uploads`` counts attempts, including ones that never reached a server.
 
     Anything else is answered by ``unexpected_request``.
     """
 
-    def __init__(self, *, refuse_uploads: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        upload_failure: UploadFailure | None = None,
+        tags: Sequence[int] = GOLDEN_TAG_IDS,
+        correspondents: Sequence[int] = GOLDEN_CORRESPONDENT_IDS,
+        api_version: int | None = None,
+        duplicate_of: int | None = None,
+    ) -> None:
         """
         Start with no requests recorded and no tasks issued.
 
         Args:
-            refuse_uploads: Answer every upload with a 500, as a restarting
-                paperless-ngx would, so a client with a consume directory
-                falls back to it.
+            upload_failure: How every upload fails, or None to accept each
+                one and issue it a task id.
+            tags: The tag ids the tag list holds.
+            correspondents: The correspondent ids the correspondent list
+                holds.
+            api_version: The version every answer advertises in an
+                ``X-Api-Version`` header, or None to send no such header, as
+                a paperless-ngx too old to have one does.
+            duplicate_of: When set, every task poll answers that the task
+                failed as a duplicate of the document with this id, in the
+                shape ``api_version`` reports it in: a paginated task list
+                with ``result_data`` from version 10, otherwise a bare list
+                carrying the failure text and ``related_document``.
 
         """
         self.requests: list[httpx2.Request] = []
         self.issued: list[str] = []
-        self._refuse_uploads = refuse_uploads
+        self._upload_failure = upload_failure
+        self._tags = tuple(tags)
+        self._correspondents = tuple(correspondents)
+        self._api_version = api_version
+        self._duplicate_of = duplicate_of
 
     @property
-    def refuses_uploads(self) -> bool:
+    def upload_failure(self) -> UploadFailure | None:
         """
-        Say whether every upload is answered with a 500.
+        Say how every upload fails.
 
         Returns:
-            The ``refuse_uploads`` this recorder was built with.
+            The ``upload_failure`` this recorder was built with.
 
         """
-        return self._refuse_uploads
+        return self._upload_failure
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """
@@ -392,23 +484,115 @@ class RecordingPaperless:
         Returns:
             The answer paperless-ngx would give, or a 418 naming the request.
 
+        Raises:
+            httpx2.ConnectError: For an upload, under ``BEFORE_SEND``.
+            httpx2.ReadTimeout: For an upload, under ``READ_TIMEOUT``.
+
         """
         self.requests.append(request)
         path = request.url.path
         if request.method == "POST" and path == DOCUMENTS_PATH:
-            if self._refuse_uploads:
-                return httpx2.Response(500, text="paperless-ngx is restarting")
-            task_id = f"golden-task-{len(self.issued) + 1}"
-            self.issued.append(task_id)
-            return httpx2.Response(200, json=task_id)
+            return self._upload(request)
         if request.method == "GET" and path == TASKS_PATH:
             polled = str(request.url.params.get("task_id", ""))
             if polled not in self.issued:
                 return unexpected_request(request)
-            return httpx2.Response(200, json=[{"task_id": polled, "status": "SUCCESS"}])
-        if request.method == "GET" and path in {TAGS_PATH, CORRESPONDENTS_PATH}:
-            return httpx2.Response(200, json=_EMPTY_COLLECTION)
+            return self._respond(200, self._task_answer(polled))
+        if request.method == "GET" and path == TAGS_PATH:
+            return self._respond(200, _collection(_named(self._tags, "tag")))
+        if request.method == "GET" and path == CORRESPONDENTS_PATH:
+            listed = _named(self._correspondents, "correspondent")
+            return self._respond(200, _collection(listed))
         return unexpected_request(request)
+
+    def _upload(self, request: httpx2.Request) -> httpx2.Response:
+        """
+        Accept an upload and issue it a task id, or fail it as configured.
+
+        Args:
+            request: The upload the client sent.
+
+        Returns:
+            The task id, or a 500 under ``AFTER_SEND``.
+
+        Raises:
+            httpx2.ConnectError: Under ``BEFORE_SEND``.
+            httpx2.ReadTimeout: Under ``READ_TIMEOUT``.
+
+        """
+        match self._upload_failure:
+            case UploadFailure.BEFORE_SEND:
+                msg = "connection refused"
+                raise httpx2.ConnectError(msg, request=request)
+            case UploadFailure.READ_TIMEOUT:
+                msg = "timed out waiting for paperless-ngx"
+                raise httpx2.ReadTimeout(msg, request=request)
+            case UploadFailure.AFTER_SEND:
+                return self._respond(500, text="paperless-ngx is restarting")
+            case None:
+                task_id = f"golden-task-{len(self.issued) + 1}"
+                self.issued.append(task_id)
+                return self._respond(200, task_id)
+
+    def _task_answer(self, task_id: str) -> object:
+        """
+        Build the task poll's answer for an issued task.
+
+        Args:
+            task_id: The task being polled.
+
+        Returns:
+            A SUCCESS, or a duplicate FAILURE when ``duplicate_of`` is set.
+
+        """
+        if self._duplicate_of is None:
+            return [{"task_id": task_id, "status": "SUCCESS"}]
+        existing = self._duplicate_of
+        if (
+            self._api_version is not None
+            and self._api_version >= _PAGINATED_TASKS_VERSION
+        ):
+            failed: dict[str, object] = {
+                "task_id": task_id,
+                "status": "failure",
+                "result_data": {"duplicate_of": existing, "duplicate_in_trash": False},
+            }
+            return _collection([failed])
+        return [
+            {
+                "task_id": task_id,
+                "status": "FAILURE",
+                "result": (
+                    f"Not consuming golden.pdf: It is a duplicate of "
+                    f"golden-document-{existing} (#{existing})."
+                ),
+                "related_document": str(existing),
+            }
+        ]
+
+    def _respond(
+        self, status: int, payload: object = None, *, text: str | None = None
+    ) -> httpx2.Response:
+        """
+        Build an answer, advertising ``api_version`` when there is one.
+
+        Args:
+            status: The HTTP status code.
+            payload: The value to encode as the JSON body, when ``text`` is None.
+            text: A plain-text body instead of JSON.
+
+        Returns:
+            The response.
+
+        """
+        headers = (
+            {}
+            if self._api_version is None
+            else {"X-Api-Version": str(self._api_version)}
+        )
+        if text is not None:
+            return httpx2.Response(status, text=text, headers=headers)
+        return httpx2.Response(status, json=payload, headers=headers)
 
     def _matching(self, method: str, path: str) -> list[httpx2.Request]:
         """
@@ -491,7 +675,7 @@ def web_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
     takes the same keywords and returns a real client over ``recorder``.  The
     client keeps the production retry count, so "uploaded exactly once" is
     proved at the count a real appliance runs with.  Only when ``recorder``
-    refuses every upload does it get one attempt: the fallback is reached
+    fails every upload does it get one attempt: the failure is handled
     exactly as at any retry count, and no backoff pause is ever reached.
 
     Args:
@@ -512,7 +696,7 @@ def web_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
             A client that never opens a socket.
 
         """
-        if recorder.refuses_uploads:
+        if recorder.upload_failure is not None:
             return PaperlessClient(
                 url=url,
                 token=token,
@@ -536,7 +720,7 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
 
     The ``scan`` command passes its arguments positionally, so this stand-in
     takes them positionally; otherwise it is ``web_client_builder``'s client,
-    with the production retry count unless ``recorder`` refuses every upload.
+    with the production retry count unless ``recorder`` fails every upload.
 
     Args:
         recorder: The in-memory paperless-ngx every request goes to.
@@ -556,7 +740,7 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
             A client that never opens a socket.
 
         """
-        if recorder.refuses_uploads:
+        if recorder.upload_failure is not None:
             return PaperlessClient(
                 url,
                 token,
@@ -578,6 +762,10 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
 LOOPBACK_SESSION_COOKIE = "sessionid=lb-5f0c8e2d91"
 
 LOOPBACK_TASK_ID = "loopback-task-1"
+
+# The longest a gated loopback upload answer is held, so a test that never
+# sets its gate still ends rather than leaving a handler thread blocked.
+_ANSWER_GATE_TIMEOUT = 5.0
 
 
 @dataclass(frozen=True)
@@ -613,12 +801,16 @@ class LoopbackPaperless:
     hits: list[LoopbackHit] = field(default_factory=list)
 
 
-def _loopback_handler(hits: list[LoopbackHit]) -> type[BaseHTTPRequestHandler]:
+def _loopback_handler(
+    hits: list[LoopbackHit], answer_gate: threading.Event | None
+) -> type[BaseHTTPRequestHandler]:
     """
     Build a request handler class that records into ``hits``.
 
     Args:
         hits: The list every received request is appended to.
+        answer_gate: When set, an upload is read in full and then answered
+            only once this event is set, or after five seconds at the most.
 
     Returns:
         A handler class for ``ThreadingHTTPServer``.
@@ -677,6 +869,9 @@ def _loopback_handler(hits: list[LoopbackHit]) -> type[BaseHTTPRequestHandler]:
             if path != DOCUMENTS_PATH:
                 self._answer(404, {"detail": "Not found."})
                 return
+            if answer_gate is not None:
+                # The whole document has arrived; the answer is what is late.
+                answer_gate.wait(timeout=_ANSWER_GATE_TIMEOUT)
             self._answer(200, LOOPBACK_TASK_ID, {"Set-Cookie": LOOPBACK_SESSION_COOKIE})
 
         def do_GET(self) -> None:
@@ -686,8 +881,11 @@ def _loopback_handler(hits: list[LoopbackHit]) -> type[BaseHTTPRequestHandler]:
                 query = parse_qs(urlsplit(self.path).query)
                 task_id = query.get("task_id", [""])[0]
                 self._answer(200, [{"task_id": task_id, "status": "SUCCESS"}])
-            elif path in {TAGS_PATH, CORRESPONDENTS_PATH}:
-                self._answer(200, _EMPTY_COLLECTION)
+            elif path == TAGS_PATH:
+                self._answer(200, _collection(_named(GOLDEN_TAG_IDS, "tag")))
+            elif path == CORRESPONDENTS_PATH:
+                listed = _named(GOLDEN_CORRESPONDENT_IDS, "correspondent")
+                self._answer(200, _collection(listed))
             else:
                 self._answer(404, {"detail": "Not found."})
 
@@ -731,7 +929,9 @@ def production_debug_logging() -> Generator[None]:
 
 
 @contextlib.contextmanager
-def loopback_paperless() -> Generator[LoopbackPaperless]:
+def loopback_paperless(
+    *, answer_gate: threading.Event | None = None
+) -> Generator[LoopbackPaperless]:
     """
     Serve a minimal paperless-ngx on a real socket on 127.0.0.1.
 
@@ -743,16 +943,25 @@ def loopback_paperless() -> Generator[LoopbackPaperless]:
 
     The server answers an upload with a task id and a ``Set-Cookie`` header
     (``LOOPBACK_SESSION_COOKIE``), a task poll with SUCCESS, and the tag and
-    correspondent lists with an empty page.  Anything else is a 404.  It
+    correspondent lists with the golden ids.  Anything else is a 404.  It
     listens on an ephemeral port and is shut down and closed on exit, so no
     socket outlives the test.
+
+    With ``answer_gate``, the server reads each upload in full and then holds
+    its answer until the test sets the gate: the document has reached
+    paperless-ngx, and only the answer is late.  The gate is set on exit
+    before the server shuts down, so no handler thread is left waiting.
+
+    Args:
+        answer_gate: The event that releases a held upload answer, or None to
+            answer every upload at once.
 
     Yields:
         Where the server listens, and every request it received.
 
     """
     hits: list[LoopbackHit] = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _loopback_handler(hits))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _loopback_handler(hits, answer_gate))
     thread = threading.Thread(
         target=server.serve_forever, name="loopback-paperless", daemon=True
     )
@@ -760,6 +969,8 @@ def loopback_paperless() -> Generator[LoopbackPaperless]:
     try:
         yield LoopbackPaperless(url=f"http://127.0.0.1:{server.server_port}", hits=hits)
     finally:
+        if answer_gate is not None:
+            answer_gate.set()
         server.shutdown()
         server.server_close()
         thread.join()
