@@ -4844,6 +4844,10 @@ class TestIntegerGeometry:
 # ---------------------------------------------------------------------------
 
 
+# SANE's SANE_CAP_INACTIVE bit, index 7 of an option tuple.
+_CAP_INACTIVE = 32
+
+
 class TestFakeSaneOptionReload:
     """The fake's assignment log and its source-triggered option reload."""
 
@@ -4880,6 +4884,30 @@ class TestFakeSaneOptionReload:
         dev.resolution = 1000
         dev.source = "ADF Duplex"
         assert dev.resolution == 1000.0
+
+    @pytest.mark.parametrize(
+        ("activates", "active_on_the_feeder"),
+        [
+            pytest.param(True, True, id="duplex-hardware"),
+            pytest.param(False, False, id="no-duplex-hardware"),
+        ],
+    )
+    def test_adf_mode_follows_the_source_when_it_activates(
+        self, *, activates: bool, active_on_the_feeder: bool
+    ) -> None:
+        """``adf-mode`` is inactive on the flatbed, and on the feeder if armed so."""
+        dev = FakeSaneDev()
+        dev.offer_adf_mode(activates=activates)
+
+        def inactive() -> bool:
+            caps = {opt[1]: opt[7] for opt in dev.get_options()}
+            return bool(caps["adf-mode"] & _CAP_INACTIVE)
+
+        assert inactive()
+        dev.source = "Automatic Document Feeder"
+        assert inactive() is not active_on_the_feeder
+        dev.source = "Flatbed"
+        assert inactive()
 
 
 # ---------------------------------------------------------------------------
@@ -4957,6 +4985,227 @@ class TestDeviceOptionOrdering:
         resolution = dev.resolution
         assert isinstance(resolution, float)
         assert 1.0 <= resolution <= 600.0
+
+
+# ---------------------------------------------------------------------------
+# Hardware duplex through a separate ADF-mode option
+# ---------------------------------------------------------------------------
+
+# The option python-sane reaches through ``getattr``, in its underscore
+# spelling; ``get_options()`` reports it as ``adf-mode``.
+_ADF_MODE = "adf_mode"
+
+_ADF_SOURCE = "ADF"
+
+
+def _adf_mode_device(*, activates: bool = True) -> FakeSaneDev:
+    """
+    Build a device with a flatbed, a feeder and an ``adf-mode`` option.
+
+    Args:
+        activates: Whether selecting the feeder makes ``adf-mode`` active, as
+            it does on an epson2 whose feeder can duplex.
+
+    Returns:
+        A one-sheet device that selects duplex by ``adf-mode``, not by a
+        source name.
+
+    """
+    dev = FakeSaneDev(pages=1)
+    dev.report_sources(["Flatbed", _ADF_SOURCE])
+    dev.offer_adf_mode(activates=activates)
+    return dev
+
+
+def _backend_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """
+    Return the WARNING messages the scanner backend logged.
+
+    Args:
+        caplog: The pytest log-capture fixture.
+
+    Returns:
+        One string per WARNING record from the backend's logger.
+
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _BACKEND_LOGGER and record.levelno == logging.WARNING
+    ]
+
+
+class TestAdfMode:
+    """
+    Hardware duplex on a scanner that selects it with ``adf-mode``.
+
+    epson2, kodakaio and magicolor offer one feeder source and a separate
+    ``adf-mode`` string list, ``["Simplex", "Duplex"]``, instead of a both-sides
+    source name. So ``duplex = "hardware"`` has to set that option, right after
+    the source, or the feeder scans one side while the profile says two. An
+    ``adf-mode`` the device reports inactive -- epson2 when the feeder cannot
+    duplex -- refuses the scan before paper moves. Option values persist
+    across handles, so any other scan on an active ``adf-mode`` sets
+    ``Simplex`` explicitly.
+    """
+
+    def _scan(
+        self,
+        dev: FakeSaneDev,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        *,
+        source: str,
+        duplex: Literal["none", "hardware", "manual"],
+    ) -> ScanBatch:
+        """
+        Scan once from ``dev`` in colour at 300 dpi.
+
+        Args:
+            dev: The device to scan from.
+            monkeypatch: Fixture used to wire the device into the backend.
+            page_sink: Where the pages go.
+            source: The profile's source.
+            duplex: The profile's duplex setting.
+
+        Returns:
+            The batch the scan returned.
+
+        """
+        settings = ScanSettings(
+            source=source, resolution=300, mode="Color", duplex=duplex
+        )
+        return _backend_with(dev, monkeypatch).scan_pages(
+            _TEST_DEVICE, settings, page_sink
+        )
+
+    def test_hardware_duplex_sets_duplex_right_after_the_source(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """Source, then adf_mode = 'Duplex', then mode and resolution."""
+        dev = _adf_mode_device()
+
+        batch = self._scan(
+            dev, monkeypatch, page_sink, source=_ADF_SOURCE, duplex="hardware"
+        )
+
+        assert dev.assignments == ["source", _ADF_MODE, "mode", "resolution"]
+        assert getattr(dev, _ADF_MODE) == "Duplex"
+        assert len(batch.pages) == 1
+
+    def test_an_inactive_adf_mode_refuses_hardware_duplex_before_start(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """
+        An epson2 that cannot duplex keeps ``adf-mode`` inactive on the feeder.
+
+        Scanning one side of every sheet under a profile that says both would
+        be a silent loss of every back page, so the scan is refused, naming
+        the option and the value, before any ``start()``.
+        """
+        dev = _adf_mode_device(activates=False)
+
+        with pytest.raises(ScanError) as excinfo:
+            self._scan(
+                dev, monkeypatch, page_sink, source=_ADF_SOURCE, duplex="hardware"
+            )
+
+        message = str(excinfo.value)
+        assert _ADF_MODE in message
+        assert "'Duplex'" in message
+        assert "start" not in dev.calls
+
+    def test_a_simplex_feeder_scan_sets_simplex_explicitly(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """A 'Duplex' left behind by an earlier handle is put back to 'Simplex'."""
+        dev = _adf_mode_device()
+        dev.source = _ADF_SOURCE
+        setattr(dev, _ADF_MODE, "Duplex")
+        dev.assignments.clear()
+
+        batch = self._scan(
+            dev, monkeypatch, page_sink, source=_ADF_SOURCE, duplex="none"
+        )
+
+        assert dev.assignments == ["source", _ADF_MODE, "mode", "resolution"]
+        assert getattr(dev, _ADF_MODE) == "Simplex"
+        assert len(batch.pages) == 1
+
+    def test_an_inactive_adf_mode_is_left_alone_on_the_flatbed(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """On the flatbed ``adf-mode`` is inactive, and nothing is written to it."""
+        dev = _adf_mode_device()
+
+        self._scan(dev, monkeypatch, page_sink, source="Flatbed", duplex="none")
+
+        assert dev.assignments == ["source", "mode", "resolution"]
+
+    def test_hardware_duplex_with_no_way_to_select_it_warns_and_scans(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A single-sided feeder name and no ``adf-mode``: one side, said aloud.
+
+        Nothing the device reports selects duplex, so the scan goes ahead as it
+        always has, and a WARNING says only one side of each sheet is scanned.
+        """
+        dev = FakeSaneDev(pages=1)
+        dev.report_sources(["Flatbed", _ADF_SOURCE])
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+
+        batch = self._scan(
+            dev, monkeypatch, page_sink, source=_ADF_SOURCE, duplex="hardware"
+        )
+
+        assert _ADF_MODE not in dev.assignments
+        assert any("one side" in message for message in _backend_warnings(caplog))
+        assert len(batch.pages) == 1
+
+    def test_a_duplex_source_name_needs_no_adf_mode_and_no_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A both-sides source name selects duplex by itself."""
+        dev = FakeSaneDev(pages=2)
+        dev.report_sources(["Flatbed", _ADF_SOURCE, "ADF Duplex"])
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+
+        self._scan(dev, monkeypatch, page_sink, source="ADF Duplex", duplex="hardware")
+
+        assert _ADF_MODE not in dev.assignments
+        assert _backend_warnings(caplog) == []
+
+    def test_each_manual_duplex_pass_sets_simplex(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+    ) -> None:
+        """
+        Both passes of a manual duplex job scan one side, whatever came before.
+
+        The device is left at 'Duplex' before each pass, as another profile's
+        hardware-duplex scan would leave it, and each pass puts it back.
+        """
+        dev = _adf_mode_device()
+        dev.source = _ADF_SOURCE
+        passes = []
+        for sink in (page_sink, second_pass_sink):
+            setattr(dev, _ADF_MODE, "Duplex")
+            dev.assignments.clear()
+            dev.load_feeder([_make_content_image()])
+            self._scan(dev, monkeypatch, sink, source=_ADF_SOURCE, duplex="manual")
+            passes.append((list(dev.assignments), getattr(dev, _ADF_MODE)))
+
+        expected = (["source", _ADF_MODE, "mode", "resolution"], "Simplex")
+        assert passes == [expected, expected]
 
 
 # The nine-element option tuple, as get_options() reports it:

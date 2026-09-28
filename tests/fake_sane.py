@@ -178,6 +178,11 @@ _PAGE_SIZE_OPTIONS = (
 )
 _PAGE_SIZE_NAMES = tuple(name for name, _title, _desc in _PAGE_SIZE_OPTIONS)
 
+# The option epson2, kodakaio and magicolor use to choose between scanning one
+# side and both sides of each fed sheet, with the entries they list.
+_ADF_MODE = "adf-mode"
+_ADF_MODE_VALUES = ("Simplex", "Duplex")
+
 # The one source on which those options are inactive.
 _FLATBED_SOURCE = "Flatbed"
 
@@ -1083,6 +1088,7 @@ class FakeSaneDev:
     _assignment_errors: dict[str, BaseException]
     _read_errors: dict[str, BaseException]
     _parameter_overrides: dict[str, int | str]
+    _adf_mode_activates: bool
 
     def __init__(
         self,
@@ -1130,6 +1136,7 @@ class FakeSaneDev:
         state["_assignment_errors"] = {}
         state["_read_errors"] = {}
         state["_parameter_overrides"] = {}
+        state["_adf_mode_activates"] = False
         state["calls"] = []
         state["assignments"] = []
         state["cancel_calls"] = 0
@@ -1554,6 +1561,77 @@ class FakeSaneDev:
                 options[index] = reloaded
                 self.__dict__["opt"][option[1].replace("-", "_")] = reloaded
 
+    def offer_adf_mode(
+        self,
+        values: tuple[str, ...] = _ADF_MODE_VALUES,
+        *,
+        activates: bool = True,
+    ) -> None:
+        """
+        Offer ``adf-mode``: a STRING list choosing one side or both of a sheet.
+
+        Modelled on epson2, whose kodakaio and magicolor siblings have the same
+        shape.  These drivers do not select duplex by a source name: the feeder
+        is one source, and ``adf-mode`` says whether it scans one side or both.
+        On epson2 the option is **inactive** unless a feeder source is selected
+        *and* the hardware can duplex, so its presence in a list read at the
+        default source proves nothing about the feeder.
+
+        With ``activates=True`` the option is inactive while the ``Flatbed``
+        source is stored and active for any other, following each source
+        assignment as the reload a source change triggers does.  With
+        ``activates=False`` it stays inactive whatever the source, which is an
+        epson2 whose feeder cannot duplex: assigning it raises the documented
+        ``AttributeError``.  It starts at the list's first entry.
+
+        Opt-in, like ``offer_depth``: most devices have no such option, and the
+        default table stays the one every other test was written against.
+
+        Args:
+            values: The entries the device lists.
+            activates: Whether selecting a feeder source makes it active.
+
+        """
+        entries = list(values)
+        options = self.__dict__["_options"]
+        index = max((option[0] for option in options), default=0) + 1
+        option = (
+            index,
+            _ADF_MODE,
+            "ADF Mode",
+            "Selects the ADF mode (simplex/duplex)",
+            _TYPE_STRING,
+            _UNIT_NONE,
+            _string_size(entries),
+            _CAP_INACTIVE_OPTION,
+            entries,
+        )
+        options.append(option)
+        key = _ADF_MODE.replace("-", "_")
+        self.__dict__["opt"][key] = option
+        if entries:
+            self.__dict__["_values"][key] = entries[0]
+        self.__dict__["_adf_mode_activates"] = activates
+        self._follow_source_with_adf_mode()
+
+    def _follow_source_with_adf_mode(self) -> None:
+        """
+        Make ``adf-mode`` active off the flatbed, when it is armed to activate.
+
+        Read from the source as stored, like the page-size options.  A table
+        without the option is left alone.
+
+        """
+        source = self.__dict__["_values"].get("source")
+        active = self.__dict__["_adf_mode_activates"] and source != _FLATBED_SOURCE
+        cap = _CAP_SETTABLE if active else _CAP_INACTIVE_OPTION
+        options = self.__dict__["_options"]
+        for index, option in enumerate(options):
+            if option[1] == _ADF_MODE:
+                reloaded = (*option[:7], cap, option[8])
+                options[index] = reloaded
+                self.__dict__["opt"][_ADF_MODE.replace("-", "_")] = reloaded
+
     def _replace_constraint(self, name: str, constraint: object) -> None:
         """
         Swap one option's constraint, keeping the lookup table consistent.
@@ -1642,14 +1720,15 @@ class FakeSaneDev:
         against the platen's range stands unchanged against the feeder's
         narrower one, so only assigning the source first keeps it legal.
 
-        The same reload switches the page-size options, when the device
-        offers them, on or off for the source now selected.
+        The same reload switches the page-size options and ``adf-mode``, when
+        the device offers them, on or off for the source now selected.
 
         Args:
             source: The source name just assigned.
 
         """
         self._follow_source_with_page_size()
+        self._follow_source_with_adf_mode()
         narrowed = self.__dict__["_source_resolution_ranges"].get(source)
         if narrowed is None:
             return
