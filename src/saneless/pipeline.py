@@ -1122,8 +1122,10 @@ class _DuplexMismatch:
             its own. A capped fronts pass never gets here: no backs pass is
             scanned after it.
         substituted_source: The flatbed source the profile asked for when the
-            scanner's Auto source took both passes through the feeder
-            instead, or None.
+            scanner's Auto source took pass A through the feeder instead, or
+            None. The SANE backend never substitutes on manual duplex, so it
+            is None from that backend; it is carried so that a backend that
+            did would still be reported.
 
     """
 
@@ -2306,9 +2308,11 @@ class _PipelineRun:
 
         interleaved = _interleave_duplex(front_pages, back_pages)
         logger.info("Interleaved %d total pages", len(interleaved))
-        # Both passes run with the same settings against the same device, so
-        # a substitution on one is a substitution on both; pass A's is the
-        # one reported.
+        # The SANE backend resolves a feeder for manual duplex and never puts
+        # its Auto source in place of one there, so this is None from it. It
+        # is carried anyway: ScanBatch lets any backend report a substitution,
+        # and dropping the field here would lose that warning without a word.
+        # Both passes run with the same settings, so pass A's stands for both.
         return ScanBatch(
             pages=tuple(interleaved),
             actual_resolution=resolution,
