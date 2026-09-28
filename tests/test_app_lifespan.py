@@ -1256,6 +1256,11 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     # and renders rather than short-circuiting on the 422 an unknown name gets.
     "/api/profiles/description": {"method": "GET", "params": {"profile": "default"}},
     "/api/profiles/multi-page": {"method": "GET", "params": {"profile": "default"}},
+    "/api/profiles/tags": {"method": "GET", "params": {"profile": "default"}},
+    "/api/profiles/correspondent": {
+        "method": "GET",
+        "params": {"profile": "default"},
+    },
     "/api/cache/invalidate": {"method": "POST", "params": {"resource": "tags"}},
     "/api/jobs/history": {"method": "GET"},
     # Answering a prompt no job is waiting at is a real request that the route
@@ -1297,8 +1302,10 @@ _LEAF_PATHS = frozenset(
         "/api/jobs/{job_id}/status",
         "/api/multi-page/answer",
         "/api/paperless/test",
+        "/api/profiles/correspondent",
         "/api/profiles/description",
         "/api/profiles/multi-page",
+        "/api/profiles/tags",
         "/api/scan",
         "/api/tags",
         "/health",
@@ -1326,13 +1333,13 @@ def test_leaf_routes_flattens_the_included_router(settings: Settings) -> None:
     with TestClient(app):
         leaves = leaf_routes(app)
 
-        assert len(leaves) == 18, (
-            f"the app serves {len(leaves)} leaf routes, not the 18 this test "
+        assert len(leaves) == 20, (
+            f"the app serves {len(leaves)} leaf routes, not the 20 this test "
             f"pins; a route was added or removed, so update this literal"
         )
         api_routes = [route for route in leaves if isinstance(route, APIRoute)]
-        assert len(api_routes) == 17, (
-            f"{len(api_routes)} of the leaves are APIRoute, not the 17 this "
+        assert len(api_routes) == 19, (
+            f"{len(api_routes)} of the leaves are APIRoute, not the 19 this "
             f"test pins; a route was added or removed, so update this literal"
         )
         # D-03's whole point: the Mount survives the flattening.
@@ -1481,8 +1488,8 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     enumerated = [
         route for route in leaf_routes(app) if isinstance(route, Route | Mount)
     ]
-    assert len(enumerated) == 18, (
-        f"the app serves {len(enumerated)} Route/Mount leaves, not the 18 this "
+    assert len(enumerated) == 20, (
+        f"the app serves {len(enumerated)} Route/Mount leaves, not the 20 this "
         f"test pins; a route was added or removed, so update this literal"
     )
 
@@ -1518,13 +1525,13 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
             for route in leaf_routes(app)
             if getattr(route, "path", "") in _ROUTE_CALLS
         ]
-        assert len(leaf_routes(app)) == 18, (
-            f"the app serves {len(leaf_routes(app))} leaves, not the 18 this "
+        assert len(leaf_routes(app)) == 20, (
+            f"the app serves {len(leaf_routes(app))} leaves, not the 20 this "
             f"test pins; a route was added or removed, so update this literal"
         )
-        assert len(drivable) == 17, (
+        assert len(drivable) == 19, (
             f"{len(drivable)} of the leaves are named in _ROUTE_CALLS, not the "
-            f"17 this test pins; a route was added or removed, so update this "
+            f"19 this test pins; a route was added or removed, so update this "
             f"literal"
         )
 
@@ -1595,8 +1602,8 @@ def test_the_schema_builds_in_process_and_is_not_served(settings: Settings) -> N
         }
         # Both sides of the comparison below would be empty if the app served
         # no API routes, so the size is asserted before the contents.
-        assert len(served) == 17, (
-            f"the app serves {len(served)} APIRoute paths, not the 17 this "
+        assert len(served) == 19, (
+            f"the app serves {len(served)} APIRoute paths, not the 19 this "
             f"test pins; a route was added or removed, so update this literal"
         )
         assert set(schema["paths"]) == served

@@ -180,10 +180,10 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
         route for route in leaf_routes(_app(client)) if isinstance(route, APIRoute)
     ]
     # The exact count, not just a non-empty one: a filter that found a single
-    # route would satisfy `assert routes` while leaving the other sixteen
+    # route would satisfy `assert routes` while leaving the other eighteen
     # handlers unchecked.
-    assert len(routes) == 17, (
-        f"the app serves {len(routes)} API routes, not the 17 this test pins; "
+    assert len(routes) == 19, (
+        f"the app serves {len(routes)} API routes, not the 19 this test pins; "
         f"a route was added or removed, so update this literal"
     )
     for route in routes:
@@ -1931,7 +1931,9 @@ class TestProfileDescriptionRoute:
         """A byte-empty body is what lets the :empty CSS rule hide the slot."""
         _configure_profiles(client, {"bare": ProfileConfig()})
 
-        response = client.get("/api/profiles/description", params={"profile": "bare"})
+        response = client.get(
+            "/api/profiles/description", params={"profile": "default"}
+        )
 
         assert response.status_code == 200
         assert response.text == ""
@@ -3188,6 +3190,281 @@ class TestProfileDefaultsFollowTheFormShape:
 
             assert response.status_code == 200
             assert _newest_job(client).title.startswith("Scan ")
+
+
+# The scenario the pre-ticking tests drive: the page opens on ``receipts``,
+# whose defaults are all in paperless-ngx; ``other`` has different ones, and
+# ``gone`` names a tag and a correspondent paperless-ngx no longer has.
+_RECEIPTS_TAGS = [3, 7]
+_RECEIPTS_CORRESPONDENT = 12
+_OTHER_TAGS = [7]
+_OTHER_CORRESPONDENT = 14
+_PRE_TICK_CORRESPONDENT_ROWS: list[dict[str, object]] = [
+    {"id": 12, "name": "Acme Water"},
+    {"id": 14, "name": "Globex Power"},
+]
+
+# The five attributes that make a control its own profile-change swap target.
+_PROFILE_CHANGE_ATTRIBUTES = (
+    'hx-trigger="change from:#profile-select"',
+    'hx-include="#profile-select"',
+    'hx-target="this"',
+    'hx-swap="outerHTML"',
+)
+_TAGS_WRAPPER = re.compile(r'<div id="tags-list"[^>]*>')
+_CORRESPONDENT_SELECT_TAG = re.compile(
+    r'<select name="correspondent" id="correspondent-select"[^>]*>'
+)
+
+
+def _pre_ticked_app(
+    tmp_path: Path, *, show_tags: bool = True, show_correspondent: bool = True
+) -> FastAPI:
+    """
+    Build an app whose first profile carries default tags and a correspondent.
+
+    Args:
+        tmp_path: Where the app writes its database and files.
+        show_tags: Whether the Tags fieldset is rendered at all.
+        show_correspondent: Whether the Correspondent control is rendered.
+
+    Returns:
+        The app, whose lifespan starts with its TestClient.
+
+    """
+    settings = Settings(
+        scanner=ScannerConfig(device="test:device:001"),
+        paperless=PaperlessConfig(
+            url="http://localhost:8000", token="a-real-looking-token"
+        ),
+        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+        web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
+        profiles={
+            "receipts": ProfileConfig(
+                default_tags=_RECEIPTS_TAGS,
+                default_correspondent=_RECEIPTS_CORRESPONDENT,
+            ),
+            "other": ProfileConfig(
+                default_tags=_OTHER_TAGS,
+                default_correspondent=_OTHER_CORRESPONDENT,
+            ),
+            "gone": ProfileConfig(default_tags=[3, 99], default_correspondent=98),
+            "default": ProfileConfig(),
+        },
+    )
+    app = create_app(settings, StubScannerBackend())
+    app.state.paperless.get_tags = lambda: list(_KNOWN_TAG_ROWS)
+    app.state.paperless.get_correspondents = lambda: list(_PRE_TICK_CORRESPONDENT_ROWS)
+    return app
+
+
+class TestProfileDefaultsArePreTicked:
+    """
+    The form opens on the profile's defaults and follows every profile change.
+
+    An untouched submit then carries exactly what ``saneless scan --profile``
+    carries, and a cleared one carries none.  A profile change replaces the
+    ticks rather than keeping them, because the new profile's defaults are
+    what the untouched form now has to mean; a refresh keeps them, because a
+    refresh changes the list and not the choice.
+    """
+
+    def test_profile_defaults_are_ticked_and_selected_on_first_paint(
+        self, tmp_path: Path
+    ) -> None:
+        """The first profile's tags are ticked and its correspondent chosen."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        assert "checked" in _checkbox(page, 3)
+        assert "checked" in _checkbox(page, 7)
+        assert "selected" in _option(page, _RECEIPTS_CORRESPONDENT)
+        assert "selected" not in _option(page, _OTHER_CORRESPONDENT)
+
+    def test_profile_defaults_controls_opt_out_of_form_state_restore(
+        self, tmp_path: Path
+    ) -> None:
+        """A browser restoring form state must not override the defaults."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        select = _CORRESPONDENT_SELECT_TAG.search(page)
+        assert select is not None, page
+        assert 'autocomplete="off"' in select.group(0)
+        assert 'aria-describedby="correspondent-help"' in select.group(0)
+        for box in re.findall(r'<input type="checkbox" name="tags"[^>]*>', page):
+            assert 'autocomplete="off"' in box, box
+
+    def test_profile_change_wrappers_are_on_the_first_paint(
+        self, tmp_path: Path
+    ) -> None:
+        """Both controls follow the profile select from the page's first load."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        wrapper = _TAGS_WRAPPER.search(page)
+        select = _CORRESPONDENT_SELECT_TAG.search(page)
+        assert wrapper is not None
+        assert select is not None
+        assert 'hx-get="/api/profiles/tags"' in wrapper.group(0)
+        assert 'hx-get="/api/profiles/correspondent"' in select.group(0)
+        for attribute in _PROFILE_CHANGE_ATTRIBUTES:
+            assert attribute in wrapper.group(0), attribute
+            assert attribute in select.group(0), attribute
+        assert page.count('id="correspondent-select"') == 1
+
+    def test_profile_change_tags_replace_the_earlier_ticks(
+        self, tmp_path: Path
+    ) -> None:
+        """The new profile's defaults are ticked; what was ticked before is not."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.get(
+                "/api/profiles/tags", params={"profile": "other", "tags": [3]}
+            )
+
+        assert response.status_code == 200
+        assert "checked" in _checkbox(response.text, 7)
+        assert "checked" not in _checkbox(response.text, 3)
+        wrapper = _TAGS_WRAPPER.search(response.text)
+        assert wrapper is not None, response.text
+        assert 'hx-get="/api/profiles/tags"' in wrapper.group(0)
+        for attribute in _PROFILE_CHANGE_ATTRIBUTES:
+            assert attribute in wrapper.group(0), attribute
+
+    def test_profile_change_to_a_profile_without_defaults_clears_every_tick(
+        self, tmp_path: Path
+    ) -> None:
+        """A profile with no defaults means none, so the swap ticks nothing."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            tags = client.get(
+                "/api/profiles/tags", params={"profile": "default", "tags": [3]}
+            )
+            select = client.get(
+                "/api/profiles/correspondent", params={"profile": "default"}
+            )
+
+        assert tags.status_code == 200
+        assert select.status_code == 200
+        assert _checkbox(tags.text, 3)
+        assert "checked" not in tags.text
+        assert _option(select.text, _RECEIPTS_CORRESPONDENT)
+        assert "selected" not in select.text
+
+    def test_profile_change_correspondent_renders_the_whole_select(
+        self, tmp_path: Path
+    ) -> None:
+        """The select comes back whole, with the new default chosen."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.get(
+                "/api/profiles/correspondent", params={"profile": "other"}
+            )
+
+        assert response.status_code == 200
+        select = _CORRESPONDENT_SELECT_TAG.search(response.text)
+        assert select is not None, response.text
+        assert 'hx-get="/api/profiles/correspondent"' in select.group(0)
+        assert 'autocomplete="off"' in select.group(0)
+        for attribute in _PROFILE_CHANGE_ATTRIBUTES:
+            assert attribute in select.group(0), attribute
+        assert "selected" in _option(response.text, _OTHER_CORRESPONDENT)
+        assert "selected" not in _option(response.text, _RECEIPTS_CORRESPONDENT)
+        assert response.text.rstrip().endswith("</select>")
+
+    def test_profile_change_shows_a_stale_default_ticked_with_the_note(
+        self, tmp_path: Path
+    ) -> None:
+        """A default paperless-ngx no longer has is ticked, and says so."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            tags = client.get("/api/profiles/tags", params={"profile": "gone"}).text
+            select = client.get(
+                "/api/profiles/correspondent", params={"profile": "gone"}
+            ).text
+
+        assert "checked" in _checkbox(tags, 99)
+        assert "tag 99 (no longer in paperless-ngx; will be skipped)" in tags
+        assert "checked" in _checkbox(tags, 3)
+        assert "selected" in _option(select, 98)
+        assert "correspondent 98 (no longer in paperless-ngx; will be skipped)" in (
+            select
+        )
+
+    @pytest.mark.parametrize(
+        "route", ["/api/profiles/tags", "/api/profiles/correspondent"]
+    )
+    def test_profile_change_to_an_unknown_profile_is_refused(
+        self, tmp_path: Path, route: str
+    ) -> None:
+        """The same 422 the other profile routes give, before any fetch."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.get(route, params={"profile": "../../etc/passwd"})
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "status": "error",
+            "detail": rejection_message(RequestRejection.UNKNOWN_PROFILE),
+        }
+
+    def test_profile_defaults_survive_a_correspondent_refresh(
+        self, tmp_path: Path
+    ) -> None:
+        """The refresh carries the choice and renders it chosen again."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+            response = client.post(
+                "/api/cache/invalidate?resource=correspondents",
+                data={"correspondent": str(_RECEIPTS_CORRESPONDENT)},
+            )
+
+        assert response.status_code == 200
+        assert "selected" in _option(response.text, _RECEIPTS_CORRESPONDENT)
+        button = re.search(
+            r'<button[^>]*hx-post="/api/cache/invalidate\?resource=correspondents"'
+            r"[^>]*>",
+            page,
+        )
+        assert button is not None, page
+        assert 'hx-include="#correspondent-select"' in button.group(0)
+        assert 'hx-target="#correspondent-select"' in button.group(0)
+        assert 'hx-swap="innerHTML"' in button.group(0)
+
+    def test_profile_defaults_refresh_refuses_a_malformed_correspondent(
+        self, tmp_path: Path
+    ) -> None:
+        """The refresh's correspondent is bounded like the scan's."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.post(
+                "/api/cache/invalidate?resource=correspondents",
+                data={"correspondent": "0"},
+            )
+
+        assert response.status_code == 422
+
+    def test_profile_defaults_route_answers_with_the_tag_control_hidden(
+        self, tmp_path: Path
+    ) -> None:
+        """No list on the page, and the route still renders an empty one."""
+        with TestClient(_pre_ticked_app(tmp_path, show_tags=False)) as client:
+            page = client.get("/").text
+            response = client.get("/api/profiles/tags", params={"profile": "other"})
+
+        assert 'id="tags-list"' not in page
+        assert response.status_code == 200
+        assert 'id="tags-list"' in response.text
+        assert 'type="checkbox"' not in response.text
+
+    def test_profile_defaults_route_answers_with_the_correspondent_hidden(
+        self, tmp_path: Path
+    ) -> None:
+        """No select on the page, and the route still renders one."""
+        with TestClient(_pre_ticked_app(tmp_path, show_correspondent=False)) as client:
+            page = client.get("/").text
+            response = client.get(
+                "/api/profiles/correspondent", params={"profile": "other"}
+            )
+
+        assert 'id="correspondent-select"' not in page
+        assert response.status_code == 200
+        assert "selected" in _option(response.text, _OTHER_CORRESPONDENT)
 
 
 # The two collection endpoints a page load can reach, as paperless.py spells
