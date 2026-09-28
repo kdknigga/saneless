@@ -5,15 +5,22 @@ All saneless-specific exceptions inherit from SanelessError,
 allowing callers to catch broad or narrow exception types.
 """
 
+import errno
+
 __all__ = [
     "AllPagesBlankError",
     "ConfigError",
+    "DiskSpaceError",
     "FeederEmptyError",
     "ListingCrashedError",
     "ListingNoAnswerError",
     "ListingTimedOutError",
+    "NoScannerFoundError",
     "PaperlessError",
+    "PaperlessIncompatibleError",
     "PaperlessTimeoutError",
+    "PaperlessUncertainSendError",
+    "PaperlessUnconfirmedError",
     "PdfError",
     "SanelessError",
     "ScanCancelledError",
@@ -24,12 +31,17 @@ __all__ = [
     "describe",
     "describe_text",
     "failure_text",
+    "is_out_of_space",
     "note_text",
 ]
 
 # What ends a sentence already, so failure_text joins a note with one space
 # rather than adding a second full stop.
 _SENTENCE_ENDINGS = (".", "!", "?")
+
+# The errno values that mean the filesystem has no room for a write: the
+# device is full, or the writer's disk quota is used up.
+_OUT_OF_SPACE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
 
 
 class SanelessError(Exception):
@@ -46,6 +58,18 @@ class ScanError(SanelessError):
 
 class FeederEmptyError(ScanError):
     """ADF feeder is empty -- no paper detected."""
+
+
+class NoScannerFoundError(ScanError):
+    """
+    No scanner could be found to scan with.
+
+    A scanner condition, not a configuration one: the scanner is switched
+    off, unplugged or unreachable, which the operator fixes at the scanner,
+    and the same settings work once it answers.  ``ConfigError`` is kept for
+    problems found when the configuration is loaded.  A ``ScanError``
+    subclass, so ``classify_error`` files it as ``ErrorCategory.SCANNER``.
+    """
 
 
 class ListingCrashedError(ScanError):
@@ -81,6 +105,21 @@ class SpoolError(ScanError):
     was.  It exists so a caller that must treat a full or failing disk
     differently from a device fault can test for it exactly: a jammed feeder
     is worth trying again, a disk with no room is not.
+    """
+
+
+class DiskSpaceError(SanelessError):
+    """
+    The server ran out of disk space for a scan.
+
+    Raised wherever a scan needs room it cannot get: the free-space check
+    before scanning, the spool writing a page, the working directory, and
+    assembling the PDF.  A sibling of ``ScanError`` and ``PdfError`` rather
+    than a subclass of either, like ``AllPagesBlankError``, so no ``except
+    ScanError`` can absorb it and blame the scanner, and it is never reported
+    as a PDF the writer refused.  ``classify_error`` files it as
+    ``ErrorCategory.DISK_SPACE``.  Its message names the folder and how much
+    space is needed; the advice beside it names neither.
     """
 
 
@@ -152,8 +191,54 @@ class PaperlessError(SanelessError):
     """Paperless-ngx API operation failure."""
 
 
-class PaperlessTimeoutError(PaperlessError):
-    """Paperless-ngx did not resolve a consume task before the deadline."""
+class PaperlessUncertainSendError(PaperlessError):
+    """
+    The upload was sent, but no usable answer came back.
+
+    The request body was written before the connection failed or the reply
+    was unusable -- a read timeout, a dropped connection, a proxy's 502 or
+    504 -- so paperless-ngx may hold the document.  Sending it again, or
+    saving it to the consume folder, could store it twice, so neither is
+    done.  ``classify_error`` files it as ``ErrorCategory.UNCONFIRMED_SEND``,
+    whose advice says to check paperless-ngx's document list first.
+    """
+
+
+class PaperlessUnconfirmedError(PaperlessError):
+    """
+    paperless-ngx accepted the upload but did not confirm filing it.
+
+    A task id is held, so paperless-ngx received the document; the task then
+    failed for a reason other than a duplicate, or never finished while
+    saneless waited.  A stronger statement than
+    ``PaperlessUncertainSendError``'s, so it is a class of its own.
+    ``classify_error`` files it as ``ErrorCategory.UNCONFIRMED_FILING``, whose
+    advice says to check paperless-ngx's document list before scanning again.
+    """
+
+
+class PaperlessTimeoutError(PaperlessUnconfirmedError):
+    """
+    Paperless-ngx did not resolve a consume task before the deadline.
+
+    The upload was accepted -- the task being polled is its answer -- so a
+    deadline that passes means only that filing was never confirmed: a long
+    OCR can outlast it.  That is why this subclasses
+    ``PaperlessUnconfirmedError`` and files as
+    ``ErrorCategory.UNCONFIRMED_FILING`` rather than as a failed upload.
+    """
+
+
+class PaperlessIncompatibleError(PaperlessError):
+    """
+    paperless-ngx refused every API version saneless speaks.
+
+    It answered 406 Not Acceptable, or advertised versions saneless does not
+    support.  The token and the network are fine, and a refused request
+    stores nothing, so ``classify_error`` files it as
+    ``ErrorCategory.PAPERLESS_VERSION``, whose advice is to upgrade
+    paperless-ngx rather than to check the token.
+    """
 
 
 class StorageError(SanelessError):
@@ -258,3 +343,31 @@ def failure_text(exc: BaseException) -> str:
         return message
     separator = " " if message.endswith(_SENTENCE_ENDINGS) else ". "
     return f"{message}{separator}{notes}"
+
+
+def is_out_of_space(exc: BaseException) -> bool:
+    """
+    Report whether an exception, or anything that caused it, is a full disk.
+
+    A full disk often surfaces wrapped: a library catches the ``OSError`` and
+    raises its own error ``from`` it, or raises while handling it.  This walks
+    the exception, then its ``__cause__``, or its ``__context__`` when there is
+    no cause, and stops at the first link seen twice, so a cycle ends.
+
+    Args:
+        exc: The exception to inspect.
+
+    Returns:
+        ``True`` when any link is an ``OSError`` whose ``errno`` is
+        ``ENOSPC`` (no space left on the device) or ``EDQUOT`` (the disk quota
+        is used up), otherwise ``False``.
+
+    """
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, OSError) and link.errno in _OUT_OF_SPACE_ERRNOS:
+            return True
+        link = link.__cause__ if link.__cause__ is not None else link.__context__
+    return False

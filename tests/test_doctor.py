@@ -84,7 +84,9 @@ if TYPE_CHECKING:
 # Every ExitCode member, written out rather than derived, so that adding a
 # member to the enum fails here as well as in the two doc-truth tests.  D-01
 # maps a red check onto the existing 2 and this is the assertion that says so.
-_EXPECTED_EXIT_CODES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 129, 130, 143}
+# 9 and 10 belong to a scan: an upload that may already be in paperless-ngx,
+# and a full disk.  doctor exits with neither.
+_EXPECTED_EXIT_CODES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 129, 130, 143}
 
 # Every call the CLI made to ``require_sane`` during one invocation.  Amendment
 # A-1 is an assertion about a call that must *not* happen, and a silent no-op
