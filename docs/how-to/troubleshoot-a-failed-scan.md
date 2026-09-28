@@ -89,9 +89,39 @@ What the common cases mean:
     detection is deliberately not applied to a preserved scan, so it shows exactly what the feeder
     picked up. saneless never deletes anything from `failed/`; draining it is your job (see
     [Docker volumes](../reference/docker.md#volumes)).
-- **A page took too long.** saneless allows 120 seconds for each page, on the feeder and on the
-  flatbed alike, and the line reads `Page 3 timed out after 120s`. On a network scanner this
-  usually means the link dropped mid-page. Any sheets scanned before it are preserved as above.
+- **A page took too long.** Each page has a time limit, on the feeder and on the flatbed alike.
+  The limit scales with the resolution and page size the scanner agreed to, and is never below
+  120 seconds: anything at 300 dpi gets 120 seconds, and an A4 colour page at 1200 dpi about 480.
+  The line states the limit and the page it was worked out for, for example:
+
+    ```
+    Page 3 timed out after 480s, the limit for a colour page of 9921 x 14031 pixels at 1200 dpi
+    ```
+
+    A dropped network link mid-page is one cause, but not the only one: a slow USB or Wi-Fi link,
+  or a high resolution the scanner is slow to deliver, can reach the limit too. Check the link
+  first; if pages at a high resolution keep timing out, lower the profile's `resolution`. Any
+  sheets scanned before it are preserved as above.
+- **The scanner has no source named the one in the profile.** The line names the profile's
+  source and every source the scanner offers, for example:
+
+    ```
+    The scanner has no source named 'Feeder'. It offers 'Flatbed', 'ADF'; set the profile's source to one of those names.
+    ```
+
+    saneless matches a profile's `source` against the scanner's list ignoring case and
+  surrounding spaces, and scans with the scanner's own spelling, so `adf` finds `ADF`. A name
+  that matches none is refused before any paper moves. A feeder name, or a name saneless does
+  not recognise, is never swapped for another source; only a flatbed name may fall back to the
+  scanner's Auto source, and when that sends the scan through the feeder the job ends with a
+  warning (see [Uploaded with a warning](#uploaded-with-a-warning-exit-7)). If two of the
+  scanner's sources differ only in case, the line says the profile's source matches more than
+  one of them and lists them; set `source` to one of them exactly.
+- **The scanner is set to 16 bits per sample.** The line reads `The scanner <device> is set to
+  16 bits per sample, and saneless scans at 8. Choose an 8-bit mode, such as Gray or Color, in
+  the profile.` saneless sets the scanner to 8 bits per sample wherever the scanner allows it,
+  so this appears only when the profile's `mode` can be scanned at 16 bits alone. The scan is
+  refused before any page. Set the profile's `mode` to an 8-bit one.
 - **saneless says to restart it.** After a page times out, saneless cancels the read and waits for
   the scanner to acknowledge. When it never does, the device cannot be reused safely, so the next
   scan is refused before saneless touches the scanner at all, with a line ending:
@@ -344,6 +374,38 @@ again. The warning is one of these:
   whatever is missing as a new document.
 - **Finished at N pages: no new scan starts once a document has 500 pages.** A multi-page document
   reached the page limit, so saneless finished it. Scan any remaining pages as a new document.
+- **Finished at N pages: one scan stops after 500 sheets, so sheet 501 was fed but not kept.**
+  One scan through the feeder keeps at most 500 sheets. A feeder can only tell that the stack
+  goes on by feeding one more sheet, so sheet 501 went through the feeder and was thrown away.
+  The 500 pages before it were uploaded. Take sheet 501 and everything after it from the output
+  tray and the feeder, and scan them as a new document. In a multi-page scan the document is
+  finished at that scan, and the warning counts the document's pages.
+- **Finished at N pages: a scan from an Auto source through the feeder stops after 50 sheets, so
+  sheet 51 was fed but not kept.** A profile whose `source` is the scanner's Auto source, with
+  `auto_source_mode = "adf"`, keeps at most 50 sheets per scan, because a scanner that has no
+  paper in its feeder may scan its glass again and again as if it were. The warning goes on:
+  *"If the feeder was already empty, the scanner was scanning its glass again; set
+  auto_source_mode = "flatbed" for this profile. Otherwise scan sheet 51 and any remaining pages
+  as a new document."* If you fed fewer than 51 sheets, delete the document, which is the glass
+  scanned over and over, and set `auto_source_mode = "flatbed"`.
+- **The scanner has no source named 'Flatbed', so its Auto source was scanned through the
+  feeder.** The profile asked for a flatbed source the scanner does not list, the scanner's Auto
+  source stood in for it, and because the profile's `auto_source_mode` is `"adf"`, Auto scanned
+  through the feeder rather than the glass. Check that the document is what you meant to scan,
+  then set the profile's `source` to one of the names the scanner lists (see
+  [Configure Scan Profiles](configure-scan-profiles.md)). When Auto stays on the glass, no
+  warning is given, because the scan did what the profile asked.
+- **The backs were not scanned: sheet N is already in the output tray.** A manual duplex scan
+  reached its sheet cap on the fronts pass, so saneless uploaded the fronts it kept, as one
+  document, and did not ask you to flip the stack: the sheet it fed but did not keep would have
+  paired every back with the wrong front. The warning before it names that sheet. Scan the backs
+  of the uploaded sheets, and the remaining sheets, as new documents. See
+  [When a manual duplex scan does not come out whole](set-up-adf-duplex.md#when-a-manual-duplex-scan-does-not-come-out-whole).
+- **The scan of the backs stopped at its sheet cap, so the fronts and backs could not be paired
+  reliably.** A manual duplex scan reached its sheet cap on the backs pass. The fronts and backs
+  were uploaded as two documents, `(fronts)` and `(backs)`, even when the counts agree, because
+  the backs pass fed a sheet the fronts pass never did. The warning goes on to name the sheet
+  that was fed but not kept.
 
 A run that was saved to the consume folder *and* carries a warning exits 6, not 7: the missing
 title, tags and correspondent are the larger problem.

@@ -891,6 +891,11 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("120", "feeder", "flatbed"),
     ),
     (
+        "the per-page limit scales with the page the scanner agreed to, with a "
+        "120-second floor",
+        ("120", "scales"),
+    ),
+    (
         "a timeout cancels the read and waits for it before closing the device",
         ("cancel", "before closing"),
     ),
@@ -912,6 +917,10 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("opening the device", "without a bound"),
     ),
     (
+        "reading the scan parameters runs without a bound",
+        ("scan parameters",),
+    ),
+    (
         "python-sane holds the GIL during those calls, so a hung one freezes the "
         "whole process and cannot be abandoned",
         ("global interpreter lock", "/health", "cannot be abandoned"),
@@ -922,11 +931,19 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
-# What the subsection used to promise about blocking scanner calls, and must not
-# promise again: only page reads and the cancel after a timeout run on a daemon
-# thread, so a scanner that stops answering during any other call is not bounded.
-ARCHITECTURE_MEMORY_RETRACTED: tuple[str, ...] = (
-    "every blocking scanner call runs on a daemon thread",
+# What the subsection used to promise and must not promise again, each with the
+# reason it is false: only page reads and the cancel after a timeout run on a
+# daemon thread, and the per-page limit grows with the page the scanner agreed
+# to send rather than being one fixed number.
+ARCHITECTURE_MEMORY_RETRACTED: tuple[tuple[str, str], ...] = (
+    (
+        "every blocking scanner call runs on a daemon thread",
+        "only page reads and the cancel after a timeout do",
+    ),
+    (
+        "one 120-second per-page timeout",
+        "the limit scales with the page, and 120 seconds is only its floor",
+    ),
 )
 
 
@@ -953,10 +970,10 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
                 f"{name}: the memory, disk and timeouts subsection no longer "
                 f"says that {claim} (looked for {needle!r})"
             )
-    for retracted in ARCHITECTURE_MEMORY_RETRACTED:
+    for retracted, why in ARCHITECTURE_MEMORY_RETRACTED:
         assert retracted not in body, (
             f"{name}: the memory, disk and timeouts subsection claims again that "
-            f"{retracted!r}; only page reads and the cancel after a timeout do"
+            f"{retracted!r}; {why}"
         )
 
     # The two claims the page used to make and must not make again. A PNG
@@ -975,6 +992,100 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
     assert "lossless" in lowered, (
         f"{name} no longer says the PNG-to-PDF embed is lossless"
     )
+
+
+ARCHITECTURE_FAILED_SCAN_HEADING = "### What a failed scan keeps"
+
+
+def test_architecture_page_says_a_pass_cap_keeps_its_pages() -> None:
+    """
+    A feeder scan that reaches its sheet cap uploads what it kept.
+
+    The cap used to be one of the failures that preserve a partial PDF. Now
+    the pages kept are uploaded with a warning naming the sheet the feeder
+    took past the cap, so listing the cap among failures again would tell an
+    operator to look in ``failed/`` for a document that is in paperless-ngx.
+    """
+    text, name = _read(ARCHITECTURE)
+    body = " ".join(
+        _subsection(text, ARCHITECTURE_FAILED_SCAN_HEADING, name).split()
+    ).lower()
+    assert "feeder page cap" not in body, (
+        f"{name} still lists the feeder page cap among the failures that keep a "
+        "partial PDF; reaching it uploads the pages kept"
+    )
+    for needle in ("fed but not kept", "500", "50 sheets"):
+        assert needle in body, (
+            f"{name}: {ARCHITECTURE_FAILED_SCAN_HEADING!r} no longer says what "
+            f"reaching a per-scan sheet cap does (looked for {needle!r})"
+        )
+
+
+# What the operator pages say about the scanner layer, each with the substrings
+# that carry it. Compared against the page with its whitespace collapsed and in
+# lower case, so rewrapping a paragraph does not fail here but dropping a claim
+# does.
+SCANNER_DOC_CLAIMS: tuple[tuple[Path, str, tuple[str, ...]], ...] = (
+    (
+        TROUBLESHOOTING,
+        "a scan that reaches its sheet cap names the sheet fed but not kept",
+        ("was fed but not kept",),
+    ),
+    (
+        TROUBLESHOOTING,
+        "the page limit scales with the page and is not only a dropped link",
+        ("scales", "wi-fi"),
+    ),
+    (
+        TROUBLESHOOTING,
+        "a source the scanner does not list is refused, naming what it offers",
+        ("has no source named",),
+    ),
+    (
+        TROUBLESHOOTING,
+        "a 16-bit mode is refused before any page",
+        ("16 bits per sample",),
+    ),
+)
+
+# Sentences those pages used to carry that are no longer true, each with why.
+SCANNER_DOC_RETRACTED: tuple[tuple[Path, str, str], ...] = (
+    (
+        TROUBLESHOOTING,
+        "usually means the link dropped",
+        "the limit grows with the page, so a slow link or a high resolution "
+        "can reach it too",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("page", "claim", "needles"),
+    SCANNER_DOC_CLAIMS,
+    ids=[f"{page.stem}: {claim}" for page, claim, _ in SCANNER_DOC_CLAIMS],
+)
+def test_operator_pages_state_the_scanner_rules(
+    page: Path, claim: str, needles: tuple[str, ...]
+) -> None:
+    """Each operator page still says what the scanner layer now does."""
+    text, name = _read(page)
+    flat = " ".join(text.split()).lower()
+    for needle in needles:
+        assert needle in flat, f"{name} no longer says that {claim} ({needle!r})"
+
+
+@pytest.mark.parametrize(
+    ("page", "retracted", "why"),
+    SCANNER_DOC_RETRACTED,
+    ids=[f"{page.stem}: {retracted}" for page, retracted, _ in SCANNER_DOC_RETRACTED],
+)
+def test_operator_pages_do_not_repeat_retracted_scanner_claims(
+    page: Path, retracted: str, why: str
+) -> None:
+    """No operator page says again what the scanner layer no longer does."""
+    text, name = _read(page)
+    flat = " ".join(text.split())
+    assert retracted not in flat, f"{name} says again {retracted!r}; {why}"
 
 
 # ---------------------------------------------------------------------------
