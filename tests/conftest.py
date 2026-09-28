@@ -212,6 +212,47 @@ def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
 
 
+@pytest.fixture(scope="session")
+def sane_test_backend_config(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """
+    Point SANE at a ``dll.conf`` naming only the ``test`` backend.
+
+    Requested by every test that drives real libsane: the hardware module
+    requests it for all of its tests, and the contract table requests it for
+    its libsane rows only.  It is not autouse, because a test that never
+    touches libsane has no reason to carry the variable.
+
+    Session-scoped deliberately, and this is not a style choice.  It was
+    measured that ``SANE_CONFIG_DIR`` is honoured only before the first
+    ``sane.init()`` in a process, that ``sane.exit()`` followed by a re-init
+    does *not* reset it, and that backends accumulate across re-inits so the
+    developer's real scanner never leaves the device list.  The natural thing
+    to write -- a function-scoped fixture calling ``setenv`` -- was measured
+    to fail.  ``pytest.MonkeyPatch.context()`` is used here because the
+    function-scoped fixture of that name is unavailable at session scope, and
+    the context manager guarantees the variable is unset at session end.
+
+    Only ``dll.conf`` is written; no ``test.conf`` is copied.  The backend's
+    compiled-in defaults already give two devices and a ten-sheet feeder.
+    Naming only ``test`` also keeps the ``net`` backend out, so no network
+    scanner is dialled while it is in force.
+
+    Args:
+        tmp_path_factory: Session-scoped temporary directory factory.
+
+    Yields:
+        None, once the environment is configured.
+
+    """
+    config_dir = tmp_path_factory.mktemp("sane.d")
+    (config_dir / "dll.conf").write_text("test\n")
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setenv("SANE_CONFIG_DIR", str(config_dir))
+        yield
+
+
 def reset_sane_process_state() -> None:
     """
     Return SANE to "never initialised, not wedged" for the next test.

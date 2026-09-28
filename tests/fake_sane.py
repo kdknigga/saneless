@@ -70,9 +70,12 @@ __all__ = [
     "FakeSaneModule",
     "ReadBlockMode",
     "build_option_table",
+    "build_test0_option_table",
 ]
 
 # SANE value types, read from _sane rather than guessed.
+_TYPE_BOOL = 0
+_TYPE_INT = 1
 _TYPE_FIXED = 2
 _TYPE_STRING = 3
 _TYPE_BUTTON = 4
@@ -362,6 +365,137 @@ def build_option_table(
         else option
         for option in _build_option_table(geometry_range=geometry_range)
         if option[1] not in omit
+    ]
+
+
+def _string_size(entries: list[str]) -> int:
+    """
+    Size a string option the way a backend does: its longest entry plus a NUL.
+
+    Args:
+        entries: The option's string list.
+
+    Returns:
+        The byte size SANE reports at index 6 of the option tuple.
+
+    """
+    return max((len(entry) for entry in entries), default=0) + 1
+
+
+def build_test0_option_table() -> list[tuple]:
+    """
+    Build an option table shaped like the real SANE ``test:0`` device.
+
+    Only the options the contract table exercises are here, with the indices,
+    types, units, sizes and constraints ``test:0`` reports for them:
+    ``mode`` and ``source`` string lists, ``depth`` an INT word list,
+    ``resolution`` a FIXED dpi range, the four geometry options FIXED
+    millimetre ranges, ``ppl-loss`` an INT pixel range, ``print-options`` a
+    button, and ``three-pass-order`` a string list that is inactive until
+    three-pass scanning is switched on.  The group separators ``test:0``
+    reports are left out, because python-sane drops them from its option
+    dictionary anyway.
+
+    Returns:
+        The option table, ready to hand to :class:`FakeSaneDev`.
+
+    """
+    modes = ["Gray", "Color"]
+    sources = ["Flatbed", "Automatic Document Feeder"]
+    frame_orders = ["RGB", "RBG", "GBR", "GRB", "BRG", "BGR"]
+    geometry = [
+        (
+            index,
+            name,
+            title,
+            f"{title} position of scan area.",
+            _TYPE_FIXED,
+            _UNIT_MM,
+            4,
+            _CAP_SETTABLE,
+            (0.0, 200.0, 1.0),
+        )
+        for index, (name, title) in enumerate(_GEOMETRY_OPTIONS, start=24)
+    ]
+    return [
+        (
+            2,
+            "mode",
+            "Scan mode",
+            "Selects the scan mode.",
+            _TYPE_STRING,
+            _UNIT_NONE,
+            _string_size(modes),
+            _CAP_SETTABLE,
+            modes,
+        ),
+        (
+            3,
+            "depth",
+            "Bit depth",
+            "Number of bits per sample.",
+            _TYPE_INT,
+            _UNIT_NONE,
+            4,
+            _CAP_SETTABLE,
+            [1, 8, 16],
+        ),
+        (
+            6,
+            "three-pass-order",
+            "Set the order of frames",
+            "Set the order of frames in three-pass color mode.",
+            _TYPE_STRING,
+            _UNIT_NONE,
+            _string_size(frame_orders),
+            _CAP_INACTIVE_OPTION,
+            frame_orders,
+        ),
+        (
+            7,
+            "resolution",
+            "Scan resolution",
+            "Sets the resolution of the scanned image.",
+            _TYPE_FIXED,
+            _UNIT_DPI,
+            4,
+            _CAP_SETTABLE,
+            (1.0, 1200.0, 1.0),
+        ),
+        (
+            8,
+            "source",
+            "Scan source",
+            "Selects the scan source.",
+            _TYPE_STRING,
+            _UNIT_NONE,
+            _string_size(sources),
+            _CAP_SETTABLE,
+            sources,
+        ),
+        (
+            17,
+            "ppl-loss",
+            "Loss of pixels per line",
+            "The number of pixels that are wasted at the end of each line.",
+            _TYPE_INT,
+            _UNIT_PIXEL,
+            4,
+            _CAP_SETTABLE,
+            (0, 128, 1),
+        ),
+        (
+            22,
+            "print-options",
+            "Print options",
+            "Print a list of all options.",
+            _TYPE_BUTTON,
+            _UNIT_NONE,
+            0,
+            _CAP_SETTABLE,
+            None,
+        ),
+        *geometry,
     ]
 
 

@@ -30,7 +30,6 @@ from tests.conftest import images_of
 from tests.fake_saned import SanedBehaviour, fake_saned
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
 
     from PIL import Image
@@ -155,35 +154,19 @@ def _run_against_loopback_saned(
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _sane_config_dir(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+def _sane_config_dir(sane_test_backend_config: None) -> None:
     """
-    Point SANE at a ``dll.conf`` naming only the ``test`` backend.
+    Give every test in this module the ``test``-only SANE configuration.
 
-    Session-scoped deliberately, and this is not a style choice.  It was
-    measured that ``SANE_CONFIG_DIR`` is honoured only before the first
-    ``sane.init()`` in a process, that ``sane.exit()`` followed by a re-init
-    does *not* reset it, and that backends accumulate across re-inits so the
-    developer's real scanner never leaves the device list.  The natural thing
-    to write -- a function-scoped fixture calling ``setenv`` -- was measured
-    to fail.  ``pytest.MonkeyPatch.context()`` is used here because the
-    function-scoped fixture of that name is unavailable at session scope, and
-    the context manager guarantees the variable is unset at session end.
-
-    Only ``dll.conf`` is written; no ``test.conf`` is copied.  The backend's
-    compiled-in defaults already give two devices and a ten-sheet feeder.
+    The configuration itself is ``sane_test_backend_config`` in
+    ``tests/conftest.py``, shared with the fake's contract table, whose
+    docstring explains why it has to be session-scoped.  This wrapper only
+    makes it apply to the whole module without each test naming it.
 
     Args:
-        tmp_path_factory: Session-scoped temporary directory factory.
-
-    Yields:
-        None, once the environment is configured.
+        sane_test_backend_config: Requested for its effect on the environment.
 
     """
-    config_dir = tmp_path_factory.mktemp("sane.d")
-    (config_dir / "dll.conf").write_text("test\n")
-    with pytest.MonkeyPatch.context() as patcher:
-        patcher.setenv("SANE_CONFIG_DIR", str(config_dir))
-        yield
 
 
 @pytest.mark.sane_hardware
