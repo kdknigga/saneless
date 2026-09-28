@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, assert_never
 
+from PIL import Image
+
 from saneless import preservation
 from saneless.exceptions import (
     AllPagesBlankError,
@@ -28,7 +30,7 @@ from saneless.exceptions import (
     SpoolError,
     describe,
 )
-from saneless.pages import BlankFilterResult, filter_blank_pages
+from saneless.pages import BlankFilterResult, filter_blank_pages, generate_thumbnail
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
@@ -1157,6 +1159,8 @@ class _MultiPageDocument:
         prompts: The number of the last prompt put to the operator.
         started: How many passes have been started, thrown-away ones
             included.
+        preview: The spooled page the job's preview was last made from, or
+            None before any.
 
     """
 
@@ -1167,6 +1171,25 @@ class _MultiPageDocument:
     warning: str | None = None
     prompts: int = 0
     started: int = 0
+    preview: Path | None = None
+
+    def first_kept(self) -> PageRecord | None:
+        """
+        Return the document's first page that is not skipped, if any.
+
+        Returns:
+            The record, or None while no page is kept.
+
+        """
+        removed = set(self.removed)
+        return next(
+            (
+                record
+                for position, record in enumerate(self.records, start=1)
+                if position not in removed
+            ),
+            None,
+        )
 
     @property
     def kept(self) -> int:
@@ -2169,7 +2192,9 @@ class _PipelineRun:
 
         Only the first page's sink carries the thumbnail observer, and only
         while no page is kept, so the job's preview stays the document's first
-        page and no later pass replaces it.
+        page and no later pass replaces it.  When that first page changes --
+        skipped as blank, or thrown away with its pass -- the preview is made
+        again from the first page kept (``_refresh_preview``).
 
         Two things end the document without the operator: the page cap, once
         a pass takes the kept pages to it, and a prompt nobody answers.  A
@@ -2371,6 +2396,10 @@ class _PipelineRun:
                 exc_info=exc,
             )
             return exc
+        if thumbnail is not None and sink.records:
+            # The sink made the preview from this pass's first page as it was
+            # spooled; noted so a later change of first page can be seen.
+            document.preview = sink.records[0].path
         return sink, batch
 
     def _blank_positions(self, batch: ScanBatch) -> tuple[int, ...]:
@@ -2565,6 +2594,7 @@ class _PipelineRun:
             len(skipped),
             document.kept,
         )
+        self._refresh_preview(document)
 
     def _discard_last_pass(self, document: _MultiPageDocument) -> None:
         """
@@ -2594,6 +2624,45 @@ class _PipelineRun:
             last.pages,
             document.kept,
         )
+        self._refresh_preview(document)
+
+    def _refresh_preview(self, document: _MultiPageDocument) -> None:
+        """
+        Remake the job's preview when the document's first kept page has changed.
+
+        The preview is made as a pass's first page is spooled, before anyone
+        has decided about that page, so it can end up showing a page the
+        document does not hold: one skipped as blank, or one from a pass
+        thrown away.  After every change to the document it is made again
+        from the first kept page, if that is not already the page it shows.
+        That reopens one spooled page, which is why it happens only when the
+        first page has changed.  With no page kept the preview is left alone:
+        the next pass, starting on an empty document, makes a new one.
+
+        Best-effort, as the preview is everywhere: a page that cannot be
+        reopened is logged and the scan goes on.
+
+        Args:
+            document: The document as it now stands.
+
+        """
+        if self.request.thumbnail_callback is None:
+            return
+        first = document.first_kept()
+        if first is None or first.path == document.preview:
+            return
+        document.preview = first.path
+        try:
+            with Image.open(first.path) as page:
+                thumbnail = generate_thumbnail(page)
+        except Exception:
+            logger.warning(
+                "Could not remake the preview from %s; the scan continues",
+                first.path.name,
+                exc_info=True,
+            )
+            return
+        self._thumbnail(thumbnail)
 
     def _next_pass_prompt(
         self, context: _MultiPageContext, document: _MultiPageDocument

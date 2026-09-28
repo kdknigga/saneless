@@ -21,6 +21,7 @@ operator answer comes from a script.
 from __future__ import annotations
 
 import inspect
+import io
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, override
@@ -41,7 +42,7 @@ from saneless.exceptions import (
     ScanInterrupted,
     SpoolError,
 )
-from saneless.pages import is_blank
+from saneless.pages import generate_thumbnail, is_blank
 from saneless.paperless import PaperlessClient, UploadResult
 from saneless.pipeline import (
     AnswerSlot,
@@ -1758,6 +1759,26 @@ class TestMultiPageBlankPages:
         (partial,) = blank_rig.kept_partials()
         assert embedded_streams(partial) == _pages(scanner, [1])
         blank_rig.paperless.upload_document.assert_not_called()
+
+    def test_a_skipped_first_page_does_not_stay_the_preview(
+        self, blank_rig: _Rig
+    ) -> None:
+        """
+        The job's preview moves to the first page the document really holds.
+
+        The preview is made as the pass's first page is spooled, before anyone
+        has decided about it; once that page is skipped, the preview is made
+        again from the first kept page.
+        """
+        scanner = DistinctPageScanner(passes=((0, 1),), blank={0})
+        coordinator = ScriptedPassCoordinator([_SKIP, _FINISH])
+
+        blank_rig.run(scanner, coordinator)
+
+        with Image.open(io.BytesIO(scanner.spooled[1])) as kept_first:
+            expected = generate_thumbnail(kept_first)
+        assert len(blank_rig.thumbnails) == 2
+        assert blank_rig.thumbnails[-1] == expected
 
     def test_rescan_takes_the_skipped_pages_away_with_the_pass(
         self, blank_rig: _Rig
