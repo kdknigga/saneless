@@ -6607,6 +6607,24 @@ class TestAutoSourceFallbackIsAudible:
         assert choice.has_option is True
         assert choice.substituted_from == "Flatbed"
 
+    def test_a_flatbed_listed_under_another_name_is_not_swapped_for_auto(
+        self,
+    ) -> None:
+        """
+        A device with its own flatbed gets a refusal naming it, not ``Auto``.
+
+        ``Auto`` stands in only for a flatbed the device does not have. Here
+        it has one, under a name the request does not match, so choosing
+        ``Auto`` would be a guess.
+        """
+        raw = [_option(1, "source", _STRING_OPTION, ["Flatbed Scanner", "Auto", "ADF"])]
+
+        with pytest.raises(ScanError) as excinfo:
+            sane_backend_mod._resolve_source(raw, "Flatbed")
+
+        message = str(excinfo.value)
+        assert all(name in message for name in ("'Flatbed'", "'Flatbed Scanner'"))
+
     def test_the_device_spelling_of_auto_is_the_one_assigned(self) -> None:
         """Auto is recognised by the classifier, so a lowercase 'auto' is used."""
         raw = [_option(1, "source", _STRING_OPTION, ["auto", "ADF"])]

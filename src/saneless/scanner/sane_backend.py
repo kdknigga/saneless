@@ -2745,7 +2745,9 @@ def _resolve_source(
     naming the sources the device offers -- with one exception. A request the
     classifier calls a flatbed may use the device's ``Auto`` source instead,
     because some scanners reach their glass only through ``Auto`` (they list
-    ``Auto`` and a feeder, and no ``Flatbed``). Any other request is never
+    ``Auto`` and a feeder, and no ``Flatbed``). That happens only when no
+    source the device lists classifies as a flatbed: one that lists its glass
+    under another name, such as ``Flatbed Scanner``, is refused naming it. Any other request is never
     swapped for ``Auto``: ``Auto`` is routed by ``auto_source_mode``, which
     defaults to the flatbed, so a feeder request swapped for it would bring a
     whole stack back as one page.
@@ -2769,8 +2771,9 @@ def _resolve_source(
 
     Raises:
         ScanError: If the device lists its sources and none matches the
-            request, unless the request is a flatbed and the device offers
-            ``Auto``; or if the request matches several of them. For manual
+            request, unless the request is a flatbed, the device lists no
+            flatbed and it offers ``Auto``; or if the request matches several
+            of them. For manual
             duplex: if the device has no source option and ``requested`` does
             not name a feeder, if its source list cannot be read and
             ``requested`` does not name a single-sided feeder, if every feeder
@@ -2796,7 +2799,14 @@ def _resolve_source(
     if matched is not None:
         return _SourceChoice(matched, has_option=True, substituted_from=None)
 
-    if classify_source(requested) is SourceKind.FLATBED:
+    # Auto stands in only for a flatbed the device does not have. A device
+    # that lists its own flatbed under another name is refused with that
+    # name in the list, rather than guessed at.
+    kinds = [classify_source(source) for source in available_sources]
+    if (
+        classify_source(requested) is SourceKind.FLATBED
+        and SourceKind.FLATBED not in kinds
+    ):
         auto = next(
             (s for s in available_sources if classify_source(s) is SourceKind.AUTO),
             None,
