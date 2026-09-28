@@ -5980,7 +5980,7 @@ class TestPageBudget:
         real = sane_backend_mod._acquire_with_timeout
 
         def spy(
-            dev: object,
+            dev: sane_backend_mod.SaneDevice,
             work: Callable[[], object],
             page_label: str,
             budget: sane_backend_mod._PageBudget,

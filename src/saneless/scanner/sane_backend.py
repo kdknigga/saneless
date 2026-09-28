@@ -75,6 +75,8 @@ from saneless.scanner.net_hosts import (
 from saneless.text_safety import neutralise_controls
 from saneless.vocabulary import (
     ambiguous_source_error,
+    page_timeout_error,
+    scan_page_description,
     sixteen_bit_error,
     source_not_offered_error,
 )
@@ -183,13 +185,35 @@ def _listed_devices(reply: ListingReply) -> tuple[DeviceInfo, ...]:
     )
 
 
-# Per-page timeout: 2x a generous single-page scan estimate (60s at 600 DPI).
-# At 300 DPI typical scan is ~10-15s, so 120s is very conservative.
+# The per-page timeout scales with the page the device agreed to send.
 #
-# It bounds one page on BOTH acquisition paths: one fed sheet's next(iterator)
-# and one flatbed sheet's start()+snap() alike, with no second constant and no
-# config key of its own.
-_DEFAULT_PAGE_TIMEOUT_SECONDS: float = 120.0
+# The reference page is A4 at 600 dpi in 8-bit colour, 4961 x 7016 pixels of
+# three bytes each, and a generous estimate for it is one minute. A page is
+# given twice its share of that minute, by bytes, so a page twice the size gets
+# twice the time: A4 colour at 1200 dpi gets 480 s, A4 grey at 1200 dpi 160 s.
+# The factor of two leaves room for a slow USB or Wi-Fi link without letting a
+# dead one hold a job for long.
+#
+# The floor keeps every page at two minutes or more, the fixed limit this
+# replaced, so anything at 300 dpi, where a page typically takes 10-15 s, is
+# bounded exactly as before.
+#
+# The inputs are the parameters the device reports once every option and the
+# scan area are set -- the page it will actually send, not the one asked for.
+# A device that does not know the length in advance, as a feeder may not, is
+# budgeted for a legal sheet, the longest paper size a profile can name.
+#
+# One budget bounds one page on BOTH acquisition paths: one fed sheet's
+# next(iterator) and one flatbed sheet's start()+snap() alike. There is no
+# config key: the device's parameters already say how big the page is.
+_REFERENCE_PAGE_BYTES: Final = 4961 * 7016 * 3
+_REFERENCE_PAGE_SECONDS: Final = 60.0
+_PAGE_TIMEOUT_FLOOR_SECONDS: Final = 120.0
+_UNKNOWN_LENGTH_MM: Final = PAPER_SIZES_MM["legal"][1]
+
+# The frame formats of a three-pass colour scan, which sends a page as three
+# frames, one per channel, each described by the same parameters.
+_THREE_PASS_FORMATS: Final = frozenset({"red", "green", "blue"})
 
 # How long the timeout path waits for a cancelled read to come back before it
 # gives up on the handle entirely.
@@ -2012,8 +2036,7 @@ def _acquire_with_timeout(
     dev: SaneDevice,
     work: Callable[[], object],
     page_label: str,
-    timeout: float,
-    grace: float = _CANCEL_GRACE_SECONDS,
+    budget: _PageBudget,
 ) -> Image.Image:
     """
     Run one blocking SANE acquisition under a wall-clock bound.
@@ -2073,15 +2096,16 @@ def _acquire_with_timeout(
         dev: The open handle the work will block inside.
         work: The blocking call, as a no-argument callable.
         page_label: Names the page in the timeout message and the thread.
-        timeout: Maximum seconds to wait for the page.
-        grace: Maximum seconds to wait for the read after cancelling it.
+        budget: How long to wait for the page and, after cancelling it, for
+            the read; its description of the page goes in the timeout message.
 
     Returns:
         The acquired page.
 
     Raises:
         ScanError: If the page did not arrive within the timeout, naming the
-            unresponsive cancel as well when the read never came back.
+            limit and the page it was for, and the unresponsive cancel as well
+            when the read never came back.
         BaseException: Whatever the work raised, re-raised unchanged --
             including ``StopIteration``, by design, because that is the
             feeder-empty signal the caller's ladder is written around.
@@ -2107,7 +2131,7 @@ def _acquire_with_timeout(
     try:
         reader.start()
         started = True
-        finished = done.wait(timeout)
+        finished = done.wait(budget.timeout)
     except KeyboardInterrupt, ScanInterrupted:
         # Ctrl-C, or a SIGTERM/SIGHUP (or a server stop) raised as
         # ScanInterrupted, landed while this thread waited on the read.  A
@@ -2117,21 +2141,17 @@ def _acquire_with_timeout(
         # is nothing to settle.  The exception is re-raised unchanged either
         # way, so the caller still tells a cancel from an interruption.
         if started or reader.is_alive():
-            _settle_or_wedge(dev, done, grace, page_label)
+            _settle_or_wedge(dev, done, budget.grace, page_label)
         raise
     if finished:
         if slot.error is not None:
             raise slot.error
         return _as_image(slot.value)
 
-    returned = _settle_or_wedge(dev, done, grace, page_label)
-    timeout_msg = f"{page_label} timed out after {timeout:.0f}s"
-    if not returned:
-        timeout_msg += (
-            "; the scanner did not respond to the cancel, so saneless is "
-            "still waiting for that read to return"
-        )
-    raise ScanError(timeout_msg)
+    returned = _settle_or_wedge(dev, done, budget.grace, page_label)
+    raise ScanError(
+        page_timeout_error(page_label, budget.timeout, budget.page, returned=returned)
+    )
 
 
 @dataclass(frozen=True)
@@ -2146,21 +2166,27 @@ class _PageBudget:
     one sheet is bounded the same way whichever way it was presented; the page
     cap means nothing to the flatbed path, which takes one sheet.
 
-    Every default is the module constant the feeder path uses, so "one sheet
-    is one sheet, whichever way it was presented" is expressed in the default
-    rather than merely asserted about it.
+    A scan builds one from the page the device agreed to send
+    (``_page_budget_seconds``), so the timeout grows with the page. Every
+    default is the module constant both paths share, so "one sheet is one
+    sheet, whichever way it was presented" is expressed in the default rather
+    than merely asserted about it.
 
     Attributes:
         timeout: Maximum seconds to wait for the sheet.
         grace: Maximum seconds to wait for a cancelled read to return.
         max_pages: The most sheets one feeder pass keeps. The sheet past it is
             fed, discarded and reported, never spooled.
+        page: The page the timeout was worked out for, as the operator reads
+            it in a timeout message, or ``None`` when it was not worked out
+            from a page.
 
     """
 
-    timeout: float = _DEFAULT_PAGE_TIMEOUT_SECONDS
+    timeout: float = _PAGE_TIMEOUT_FLOOR_SECONDS
     grace: float = _CANCEL_GRACE_SECONDS
     max_pages: int = _MAX_ADF_PAGES
+    page: str | None = None
 
 
 # The shared default instance.  A module constant and not an inline
@@ -2294,8 +2320,7 @@ def _acquire_pages(
                     dev,
                     functools.partial(next, iterator),
                     _page_label(page_num),
-                    budget.timeout,
-                    budget.grace,
+                    budget,
                 )
             except StopIteration:
                 break
@@ -2970,6 +2995,56 @@ def _refuse_sixteen_bit(parameters: _ScanParameters, device_id: str) -> None:
         raise ScanError(sixteen_bit_error(neutralise_controls(device_id)))
 
 
+def _page_budget_seconds(parameters: _ScanParameters, resolution: int) -> float:
+    """
+    Return how long one page may take, from the page the device will send.
+
+    Twice the page's share, by bytes, of the minute a reference page is
+    estimated to take, and never less than the floor; see the constants for
+    the reasoning. ``bytes_per_line`` already accounts for the mode and the
+    bit depth. A three-pass colour scan sends three frames of that size, so it
+    counts three. A negative line length from a confused device counts as no
+    data, so the floor applies.
+
+    Args:
+        parameters: What the configured device reports.
+        resolution: The resolution the device settled on, used to work out
+            the length of a page whose length is not known in advance.
+
+    Returns:
+        The page's timeout in seconds.
+
+    """
+    lines = parameters.lines
+    if lines <= 0:
+        # SANE reports -1 when the length is not known in advance.
+        lines = math.ceil(resolution * _UNKNOWN_LENGTH_MM / _MM_PER_INCH)
+    frames = 3 if parameters.frame_format in _THREE_PASS_FORMATS else 1
+    page_bytes = max(parameters.bytes_per_line, 0) * lines * frames
+    estimate = _REFERENCE_PAGE_SECONDS * page_bytes / _REFERENCE_PAGE_BYTES
+    return max(_PAGE_TIMEOUT_FLOOR_SECONDS, 2.0 * estimate)
+
+
+def _describe_page(parameters: _ScanParameters, resolution: int) -> str:
+    """
+    Describe the page a budget was worked out for, as a timeout message names it.
+
+    Args:
+        parameters: What the configured device reports.
+        resolution: The resolution the device settled on.
+
+    Returns:
+        The page's description.
+
+    """
+    colour = parameters.frame_format == "color" or (
+        parameters.frame_format in _THREE_PASS_FORMATS
+    )
+    return scan_page_description(
+        parameters.pixels_per_line, parameters.lines, colour=colour, dpi=resolution
+    )
+
+
 def _snap_flatbed(
     dev: SaneDevice,
     device_id: str,
@@ -2983,8 +3058,8 @@ def _snap_flatbed(
     ``start()`` opens the SANE data channel and ``snap()`` drains it, so the
     two are wrapped together and nothing else is.  They go through
     ``_acquire_with_timeout`` as a single unit of work, under the same
-    ``_DEFAULT_PAGE_TIMEOUT_SECONDS`` a fed sheet gets and with no config key
-    of its own: one sheet is one sheet, whichever way it was presented, and a
+    page budget a fed sheet of that size gets and with no config key of its
+    own: one sheet is one sheet, whichever way it was presented, and a
     platen that stops answering used to hang the job forever while the
     identical failure on a feeder was reported in two minutes.
 
@@ -3031,9 +3106,7 @@ def _snap_flatbed(
         return dev.snap()
 
     try:
-        image = _acquire_with_timeout(
-            dev, start_and_snap, _page_label(0), budget.timeout, budget.grace
-        )
+        image = _acquire_with_timeout(dev, start_and_snap, _page_label(0), budget)
     except ScanError:
         # The timeout path's own error, already worded and already logged.
         # FeederEmptyError subclasses ScanError and reaches here the same way.
@@ -3614,17 +3687,22 @@ class SaneBackend(ScannerBackend):
             parameters = _read_parameters(dev, device_id)
             _refuse_sixteen_bit(parameters, device_id)
 
+            # One budget for every page of the pass, sized to the page the
+            # device will send, on whichever path it is acquired.  The page
+            # cap is the one the source earns: a source named as a feeder
+            # gets the per-pass cap; one that is not -- Auto sent through the
+            # feeder -- may be a platen rescanned forever, so it gets the much
+            # lower one.  The flatbed path takes one sheet and ignores it.
+            named_feeder = classify_source(choice.effective).uses_feeder
+            budget = _PageBudget(
+                timeout=_page_budget_seconds(parameters, actual_resolution),
+                max_pages=_MAX_ADF_PAGES if named_feeder else _MAX_AUTO_FEEDER_PAGES,
+                page=_describe_page(parameters, actual_resolution),
+            )
+
             cap_reached: PassCapReached | None = None
             if use_adf:
-                # ADF/duplex: use multi_scan() for multi-page acquisition,
-                # under the cap the source earns.  A source named as a feeder
-                # gets the per-pass cap; one that is not -- Auto sent through
-                # the feeder -- may be a platen rescanned forever, so it gets
-                # the much lower one.
-                named_feeder = classify_source(choice.effective).uses_feeder
-                budget = _PageBudget(
-                    max_pages=_MAX_ADF_PAGES if named_feeder else _MAX_AUTO_FEEDER_PAGES
-                )
+                # ADF/duplex: use multi_scan() for multi-page acquisition.
                 fed = self._scan_adf_pages(dev, sink, framing, budget)
                 records, pages_rejected = fed.records, fed.rejected
                 if fed.sheet_not_kept is not None:
@@ -3639,7 +3717,7 @@ class SaneBackend(ScannerBackend):
                 # the read loop has no data source.  Validation and the crop
                 # live in there too, so one sheet reaches the sink by the same
                 # route however it was acquired.
-                records = [_snap_flatbed(dev, device_id, sink, framing)]
+                records = [_snap_flatbed(dev, device_id, sink, framing, budget)]
                 # Nothing was skipped: an unreadable sheet raised in there.
                 pages_rejected = 0
 

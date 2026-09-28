@@ -102,6 +102,7 @@ __all__ = [
     "multi_page_manual_duplex_refusal",
     "outcome_line",
     "page_counts",
+    "page_timeout_error",
     "pages_phrase",
     "pass_answer_label",
     "pass_prompt_copy",
@@ -111,6 +112,7 @@ __all__ = [
     "rejection_status_code",
     "removed_pages",
     "removed_pages_note",
+    "scan_page_description",
     "sixteen_bit_error",
     "source_not_offered_error",
     "state_label",
@@ -1484,6 +1486,69 @@ def sixteen_bit_error(device: str) -> str:
         f"The scanner {device} is set to 16 bits per sample, and saneless scans "
         "at 8. Choose an 8-bit mode, such as Gray or Color, in the profile."
     )
+
+
+def scan_page_description(
+    pixels_per_line: int, lines: int, *, colour: bool, dpi: int
+) -> str:
+    """
+    Describe the page a scanner agreed to send, for a timeout message.
+
+    The size is in the device's own pixels, as it reported them once the scan
+    was set up, so the operator can see why a page was given the time it
+    was. A length of zero or less is SANE's "not known in advance", which a
+    feeder may report, and is named as unknown rather than printed.
+
+    Args:
+        pixels_per_line: The page's width in pixels.
+        lines: The page's height in lines, or zero or less when unknown.
+        colour: Whether the page is in colour rather than grey.
+        dpi: The resolution the device scans at.
+
+    Returns:
+        E.g. ``"a colour page of 9921 x 14031 pixels at 1200 dpi"``.
+
+    """
+    kind = "colour" if colour else "grey"
+    if lines <= 0:
+        return (
+            f"a {kind} page {pixels_per_line} pixels wide and of unknown length "
+            f"at {dpi} dpi"
+        )
+    return f"a {kind} page of {pixels_per_line} x {lines} pixels at {dpi} dpi"
+
+
+def page_timeout_error(
+    page_label: str, seconds: float, page: str | None, *, returned: bool
+) -> str:
+    """
+    Return the error for a page that did not arrive within its limit.
+
+    The limit grows with the page, so the sentence names the limit and the
+    page it was worked out for: a timeout on a large page then reads as a
+    page that needed longer, not only as a dropped link. When the cancel did
+    not end the read either, the sentence says saneless is still waiting.
+
+    Args:
+        page_label: The page, e.g. ``"Page 3"``.
+        seconds: The limit the page was given.
+        page: The page the limit was worked out for, from
+            ``scan_page_description``, or ``None`` when there is none.
+        returned: Whether the read came back after it was cancelled.
+
+    Returns:
+        The error sentence.
+
+    """
+    message = f"{page_label} timed out after {seconds:.0f}s"
+    if page is not None:
+        message += f", the limit for {page}"
+    if not returned:
+        message += (
+            "; the scanner did not respond to the cancel, so saneless is "
+            "still waiting for that read to return"
+        )
+    return message
 
 
 def ambiguous_source_error(requested: str, matches: Sequence[str]) -> str:

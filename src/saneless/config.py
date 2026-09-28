@@ -781,7 +781,7 @@ class OutputConfig(BaseModel):
     # out fails the job, while a multi-page wait that times out finishes the
     # document with the pages it has.
     # A config key, unlike the scan-side module constants
-    # (_DEFAULT_PAGE_TIMEOUT_SECONDS, _MAX_ADF_PAGES): this is the only timeout
+    # (_PAGE_TIMEOUT_FLOOR_SECONDS, _MAX_ADF_PAGES): this is the only timeout
     # that waits on a human rather than a machine, and ten minutes is a guess
     # about someone else's household. Bounded at load: zero or a negative value
     # would fail every manual-duplex job right after pass A, and a value above
