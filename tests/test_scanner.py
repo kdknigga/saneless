@@ -6008,8 +6008,8 @@ class TestSixteenBitDepth:
         """
         A range includes 8 when 8 lies within it on its step grid.
 
-        The value is written in the option's own type: an int for INT, a float
-        for FIXED, since python-sane refuses the other one.
+        The value is written in the option's own type: an int for INT, since
+        python-sane refuses a float there, and a float for FIXED.
         """
         dev = _device_with_depth(value_type, constraint)
 

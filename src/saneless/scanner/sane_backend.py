@@ -354,9 +354,10 @@ _MM_PER_INCH = 25.4
 _AREA_TOLERANCE_MM = 1.0
 
 # SANE's value-type codes for an integer and a fixed-point option, read at
-# index 4 of the tuple get_options() reports.  python-sane refuses an int for a
-# fixed-point option and a float for an integer one, even a whole float, so a
-# value has to be written in the option's own type.
+# index 4 of the tuple get_options() reports.  python-sane refuses a float for
+# an integer option, even a whole float, so a value has to be written in the
+# option's own type.  (The other way round is forgiven: its attribute
+# assignment turns an int into a float for a fixed-point option.)
 _SANE_TYPE_INT = 1
 _SANE_TYPE_FIXED = 2
 
@@ -935,7 +936,7 @@ def _in_option_type(raw_options: list[tuple], name: str, value: float) -> int | 
 
     Returns:
         ``round(value)`` for an integer option, which refuses a float, and
-        ``float(value)`` otherwise, since a fixed-point option refuses an int.
+        ``float(value)`` otherwise, the type a fixed-point option holds.
 
     """
     if _option_type(raw_options, name) == _SANE_TYPE_INT:
