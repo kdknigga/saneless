@@ -969,13 +969,32 @@ class _OpenHandles:
     until the reader thread closes it, because until then it is exactly the
     kind of open handle ``sane_exit`` would try to close.
 
+    It also enforces one cancel per timed-out read.  Once the timeout's own
+    cancel has gone out on a handle, two more used to follow it: the feeder
+    iterator's finaliser (``_SaneIterator.__del__`` calls ``cancel()``) when
+    the iterator was dropped, and the routine cancel before close.  On the
+    ``net`` backend each is a request to a host that may have stopped
+    answering, and both ran on the worker thread with no bound.  So a handle
+    on which a cancel was issued is recorded in ``cancelled``; the device
+    context skips its routine cancel for it, and the feeder's iterator is
+    parked here instead of dropped.  ``_handle_closed`` drops a parked
+    iterator only once the handle is closed, when its finaliser's cancel is
+    refused by python-sane ("SaneDev object is closed") before it reaches
+    SANE, and swallowed.
+
     Attributes:
         handles: The ``id()`` of each handle opened by ``_open_device`` and
             not yet closed.
+        cancelled: The ``id()`` of each open handle on which a cancel has
+            already been issued.
+        parked: The feeder iterator of a cancelled handle, by the handle's
+            ``id()``, held until that handle is closed.
 
     """
 
     handles: set[int] = field(default_factory=set)
+    cancelled: set[int] = field(default_factory=set)
+    parked: dict[int, object] = field(default_factory=dict)
 
 
 # Guards every read and write of _OPEN_HANDLES.  It is taken inside
@@ -1001,12 +1020,73 @@ def _handle_closed(dev: SaneDevice) -> None:
     """
     Record a handle as closed, whether or not its close succeeded.
 
+    Its cancel record goes with it, and so does any iterator parked for it,
+    which is dropped here, after the close and outside the lock: its
+    finaliser's cancel then meets a closed handle and never reaches SANE.
+
     Args:
         dev: The handle.
 
     """
     with _HANDLES_LOCK:
         _OPEN_HANDLES.handles.discard(id(dev))
+        _OPEN_HANDLES.cancelled.discard(id(dev))
+        parked = _OPEN_HANDLES.parked.pop(id(dev), None)
+    del parked
+
+
+def _note_cancel_issued(dev: SaneDevice) -> None:
+    """
+    Record that a cancel has gone out on an open handle.
+
+    A handle ``_open_device`` did not open is not recorded, as nothing would
+    ever close it and clear the record.
+
+    Args:
+        dev: The handle the cancel was sent on.
+
+    """
+    with _HANDLES_LOCK:
+        if id(dev) in _OPEN_HANDLES.handles:
+            _OPEN_HANDLES.cancelled.add(id(dev))
+
+
+def _cancel_was_issued(dev: SaneDevice) -> bool:
+    """
+    Report whether a cancel has already gone out on this handle.
+
+    Args:
+        dev: The handle.
+
+    Returns:
+        True if a cancel was issued on it since it was opened.
+
+    """
+    with _HANDLES_LOCK:
+        return id(dev) in _OPEN_HANDLES.cancelled
+
+
+def _park_iterator(dev: SaneDevice, iterator: object) -> bool:
+    """
+    Hold a cancelled handle's feeder iterator until the handle is closed.
+
+    Dropping it any earlier would run its finaliser's cancel on an open
+    handle: a second cancel after the one already issued, and on the worker
+    thread, where nothing bounds it.
+
+    Args:
+        dev: The handle the iterator drives.
+        iterator: The ``multi_scan()`` iterator.
+
+    Returns:
+        True if the iterator was parked because a cancel was issued.
+
+    """
+    with _HANDLES_LOCK:
+        if id(dev) not in _OPEN_HANDLES.cancelled:
+            return False
+        _OPEN_HANDLES.parked[id(dev)] = iterator
+        return True
 
 
 def _handles_open() -> int:
@@ -1283,6 +1363,9 @@ def _cancel_and_settle(dev: SaneDevice, done: threading.Event, grace: float) -> 
         except Exception:
             logger.warning("Cancelling the blocked read failed", exc_info=True)
 
+    # Noted before the cancel goes out, so no later cleanup can race it into
+    # sending a second one (``_OpenHandles``).
+    _note_cancel_issued(dev)
     canceller = threading.Thread(target=fire, name="sane-cancel", daemon=True)
     canceller.start()
     return done.wait(grace)
@@ -1748,16 +1831,16 @@ def _acquire_pages(
             # -- and what is spooled is exactly what the PDF embeds.
             records.append(sink.add(framing.crop(page_image), dpi=framing.resolution))
     finally:
-        # ``del iterator`` is a cleanup everywhere except the wedge path, where
-        # it is the hazard, and this branch is that reversal. Dropping the last
-        # reference runs ``_SaneIterator.__del__``, which calls
-        # ``device.cancel()`` -- a SANE call on a handle a read is still
-        # inside, which is the one thing the timeout sequence exists to
-        # prevent. When the
-        # device is wedged the record takes the reference instead, and the
-        # reader thread drops it when it finally returns. On every other path
-        # the ``del`` is exactly what it always was.
-        if not _retain_iterator(dev, iterator):
+        # Dropping the last reference runs ``_SaneIterator.__del__``, which
+        # calls ``device.cancel()``, so where the iterator goes depends on
+        # whether a cancel may still be sent.  When the device is wedged a
+        # read is still inside it: the wedge record takes the reference, and
+        # the reader thread drops it when it finally returns.  When a cancel
+        # was already issued -- the page timed out, or the wait was
+        # interrupted -- one more would be a second, unbounded request on this
+        # thread: the handle's record takes the reference and drops it after
+        # the close.  Only a scan that ended without a cancel drops it here.
+        if not _retain_iterator(dev, iterator) and not _park_iterator(dev, iterator):
             del iterator
 
     if page_num == 0:
@@ -2331,7 +2414,11 @@ class SaneBackend(ScannerBackend):
         Opens the device, yields it for use, then ensures cancel()
         and close() are called on all exit paths (normal and error) --
         **unless** a reader thread is still inside SANE on this handle, in
-        which case both are skipped.  That is not an omission: the SANE
+        which case both are skipped.  The cancel is also skipped once a
+        cancel has already been issued on the handle, after a page timed out
+        or its wait was interrupted: that one is all the device gets, since
+        a second would be one more unbounded request to a scanner that has
+        already failed to answer in time (``_OpenHandles``).  That is not an omission: the SANE
         standard forbids any other operation while one is outstanding, and
         ``sane_close`` additionally runs holding the GIL while ``sane_read``
         has released it, so a close racing a blocked read is the one sequence
@@ -2394,8 +2481,9 @@ class SaneBackend(ScannerBackend):
                     device_id,
                 )
             else:
-                with contextlib.suppress(Exception):
-                    dev.cancel()
+                if not _cancel_was_issued(dev):
+                    with contextlib.suppress(Exception):
+                        dev.cancel()
                 try:
                     dev.close()
                 except Exception:

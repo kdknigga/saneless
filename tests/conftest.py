@@ -280,10 +280,16 @@ def reset_sane_process_state() -> None:
 
     The open-handle record is cleared on every path, because a test that wedged
     a handle and did not release it leaves that handle counted, which would
-    refuse every later test's ``reinitialise()``.
+    refuse every later test's ``reinitialise()``.  Its cancel record and any
+    iterator parked on it go too: a parked iterator would otherwise outlive
+    its test, and a recorded cancel could match a later handle given the same
+    ``id()``.
     """
     sane_backend_mod.shutdown()
-    sane_backend_mod._OPEN_HANDLES.handles.clear()
+    handles = sane_backend_mod._OPEN_HANDLES
+    handles.handles.clear()
+    handles.cancelled.clear()
+    handles.parked.clear()
     if not sane_backend_mod._INIT.done:
         return
     record = sane_backend_mod._WEDGE
