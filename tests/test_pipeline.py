@@ -6061,6 +6061,32 @@ class TestBatchFactWarnings:
         mock_paperless.upload_document.assert_called_once()
         assert result.warning == pass_cap_warning(3, 500, 501, auto_source=False)
 
+    def test_a_cap_counts_the_pages_uploaded_after_blank_removal(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        "Finished at N pages" agrees with pages_uploaded once blanks are out.
+
+        A multi-page document's cap sentence counts the pages it holds, so a
+        single pass counts the same thing: the pages uploaded, not the pages
+        scanned.
+        """
+        assert default_settings.profiles["default"].enable_empty_page_detection
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image(), _make_empty_image(), _make_content_image()],
+            cap_reached=PassCapReached(500, 501, auto_source=False),
+        )
+
+        result = self._run(scanner, mock_paperless, default_settings, tmp_path)
+
+        assert result.pages_scanned == 3
+        assert result.pages_uploaded == 2
+        assert result.warning == pass_cap_warning(2, 500, 501, auto_source=False)
+
     def test_an_auto_source_cap_carries_the_auto_sentence(
         self,
         mock_paperless: MagicMock,

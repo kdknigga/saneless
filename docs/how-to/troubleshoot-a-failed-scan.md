@@ -379,8 +379,9 @@ again. The warning is one of these:
   One scan through the feeder keeps at most 500 sheets. A feeder can only tell that the stack
   goes on by feeding one more sheet, so sheet 501 went through the feeder and was thrown away.
   The pages before it were uploaded. Take sheet 501 and everything after it from the output
-  tray and the feeder, and scan them as a new document. In a multi-page scan the document is
-  finished at that scan, and the warning counts the document's pages.
+  tray and the feeder, and scan them as a new document. N counts the pages uploaded, after any
+  blank pages were removed. In a multi-page scan the document is finished at that scan, and the
+  warning counts the document's pages.
 - **Finished at N pages: the scan of the backs stops after 500 sheets, so sheet 501 of the
   turned-over stack was fed but not kept.** The backs pass of a manual duplex scan reached its
   cap. The fronts pass ended on its own with fewer sheets, so the turned-over stack held sheets

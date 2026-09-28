@@ -2963,15 +2963,10 @@ class _PipelineRun:
         self.artefacts.document = tuple(records)
         rejected_warning = _rejected_pages_warning(batch.pages_rejected)
         # What the backend measured about the pass, each worded once: a
-        # flatbed request the scanner's Auto source took through the feeder,
-        # and a pass that stopped at its cap with the pages before it kept.
-        # Blank removal is reported apart, so the pages kept are every page
-        # the pass delivered.
+        # flatbed request the scanner's Auto source took through the feeder
+        # here, and a pass that stopped at its cap, with the pages before it
+        # kept, once the blank pages are out.
         substitution_warning = _substitution_warning(batch.substituted_source)
-        cap_warning = _join_warnings(
-            _pass_cap_warning(batch.cap_reached, len(records)),
-            self._backs_not_scanned(batch.cap_reached),
-        )
 
         # There is no per-page EXIF strip here, and one would have nothing to
         # act on.  python-sane builds each page with ``Image.frombuffer``,
@@ -2981,6 +2976,12 @@ class _PipelineRun:
         # thumbnail's JPEG save ever does.  An orientation tag that img2pdf
         # or a browser would act on therefore cannot reach either file.
         filtered = _drop_blank_pages(records, self.profile)
+        # A cap's sentence counts the pages uploaded, after blank removal, as
+        # a multi-page document's does, so it agrees with pages_uploaded.
+        cap_warning = _join_warnings(
+            _pass_cap_warning(batch.cap_reached, len(filtered.kept)),
+            self._backs_not_scanned(batch.cap_reached),
+        )
 
         # Each page is laid out at the dpi on its own record: the resolution
         # the device read back, not the one the profile asked for. SANE
