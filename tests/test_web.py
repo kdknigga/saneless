@@ -1461,6 +1461,177 @@ class TestOwnerCookie:
         assert minted not in caplog.text
 
 
+# Text a forced render failure carries, so a test can prove none of it reaches
+# the browser.
+_RENDER_FAILURE_MARKER = "render-failure-7d3a91"
+
+
+def _fail_render(*_args: object, **_kwargs: object) -> NoReturn:
+    """Stand in for a render step and raise, as a broken context or template would."""
+    raise RuntimeError(_RENDER_FAILURE_MARKER)
+
+
+def _lenient_browser(client: TestClient) -> TestClient:
+    """
+    Return a client over the same app that receives a server error as a response.
+
+    The shared client re-raises an unhandled exception in the test, which would
+    hide the response a browser is actually sent: the status, the cookie and
+    the body are what the scan's owner sees, so those are what is asserted.
+
+    Args:
+        client: The client whose running app to share.
+
+    Returns:
+        A client holding no cookies, answering errors as responses.
+
+    """
+    return TestClient(_app(client), raise_server_exceptions=False)
+
+
+def _job_count(client: TestClient) -> int:
+    """
+    Return how many job rows the app's store holds.
+
+    Args:
+        client: The client whose app owns the job store.
+
+    Returns:
+        The number of rows written so far.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    return len(job_store.list_recent(limit=10_000))
+
+
+class TestPostSubmitRender:
+    """
+    Once the worker has accepted a job, the response reports that job as queued.
+
+    The submit is the commit point: from there the scan will run whatever the
+    browser is told.  A failure while the response is rendered must therefore
+    not read as a failed submit, and must not lose the cookie that lets this
+    browser answer the job's flip prompt.
+    """
+
+    def _assert_still_queued(
+        self, browser: TestClient, response: httpx2.Response
+    ) -> None:
+        """
+        Assert the response reports the accepted job as queued, with its cookie.
+
+        Args:
+            browser: The client that submitted the scan.
+            response: The response to the submit.
+
+        """
+        assert response.status_code == 200
+        header = _owner_set_cookie(response)
+        assert header is not None
+        attributes = header.lower()
+        assert "httponly" in attributes
+        assert "samesite=lax" in attributes
+        assert "path=/" in attributes
+        assert _OWNER_COOKIE_MAX_AGE_ATTRIBUTE in attributes
+        assert "secure" not in attributes
+
+        job = _newest_job(browser)
+        assert job.owner_token == _owner_cookie_value(header)
+        assert job.state is JobState.PENDING
+        assert job.error_category is None
+
+        body = response.text
+        assert 'id="status-area"' in body
+        assert f'hx-get="/api/jobs/{job.id}/status"' in body
+        assert 'hx-trigger="every 1s"' in body
+        assert 'hx-swap="outerHTML"' in body
+        assert html.escape(progress_label(JobState.PENDING)) in body
+        assert '<div id="status-message" hx-swap-oob="innerHTML"></div>' in body
+        assert "try again" not in body.lower()
+        assert _RENDER_FAILURE_MARKER not in body
+        assert "RuntimeError" not in body
+
+    def test_post_submit_render_survives_a_failed_status_context(
+        self, accepting_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A status context that raises after the submit still reports the job."""
+        browser = _lenient_browser(accepting_client)
+        monkeypatch.setattr(routes_module, "_status_context", _fail_render)
+
+        response = browser.post(
+            "/api/scan", data={"profile": "duplex", "title": "Context Fails"}
+        )
+
+        self._assert_still_queued(browser, response)
+
+    def test_post_submit_render_survives_a_failed_template(
+        self, accepting_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template that raises while rendering still reports the job."""
+        browser = _lenient_browser(accepting_client)
+        templates = _app(accepting_client).state.templates
+        render = templates.TemplateResponse
+
+        def _fail_the_scan_response(
+            request: object, name: str, *args: object, **kwargs: object
+        ) -> object:
+            if name == "partials/status_response.html":
+                _fail_render()
+            return render(request, name, *args, **kwargs)
+
+        monkeypatch.setattr(templates, "TemplateResponse", _fail_the_scan_response)
+
+        response = browser.post(
+            "/api/scan", data={"profile": "duplex", "title": "Template Fails"}
+        )
+
+        self._assert_still_queued(browser, response)
+
+    def test_post_submit_render_context_failure_before_the_submit_writes_no_job(
+        self, accepting_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The status-strip context is built before the row, so its failure writes none."""
+        browser = _lenient_browser(accepting_client)
+        submitted: list[object] = []
+
+        def _record_submit(job: object, _options: object) -> SubmitResult:
+            submitted.append(job)
+            return SubmitResult.ACCEPTED
+
+        monkeypatch.setattr(
+            _app(accepting_client).state.worker, "submit", _record_submit
+        )
+        monkeypatch.setattr(routes_module, "_checks_context", _fail_render)
+        before = _job_count(accepting_client)
+
+        response = browser.post(
+            "/api/scan", data={"profile": "duplex", "title": "Checks Fail"}
+        )
+
+        assert response.status_code == 500
+        assert _job_count(accepting_client) == before
+        assert submitted == []
+
+    def test_post_submit_render_normal_path_is_the_full_status_response(
+        self, accepting_client: TestClient
+    ) -> None:
+        """Without a failure the submit answers today's whole status response."""
+        response = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Normal Path"}
+        )
+
+        assert response.status_code == 200
+        assert _owner_set_cookie(response) is not None
+        job = _newest_job(accepting_client)
+        body = response.text
+        assert f'hx-get="/api/jobs/{job.id}/status"' in body
+        assert '<div id="status-message" hx-swap-oob="innerHTML"></div>' in body
+        # The out-of-band Scan button and status strip ride along only in the
+        # full response, which is how it differs from the fallback.
+        assert 'id="scan-btn"' in body
+        assert 'id="checks-body"' in body
+
+
 # --- The followed job and the queue line (APPL-08, D-25) ---------------------
 
 

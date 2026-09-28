@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import secrets
 from dataclasses import dataclass, replace
@@ -17,7 +18,7 @@ from pydantic_core import PydanticCustomError
 # each route's return annotation when the decorator runs, and a Response it
 # cannot resolve becomes a response model that makes app.openapi() raise.
 # runtime-evaluated-decorators in pyproject.toml tells ruff the same.
-from starlette.responses import Response
+from starlette.responses import HTMLResponse, Response
 
 from saneless.checks import (
     CHECKING_GLYPH,
@@ -59,6 +60,7 @@ from saneless.vocabulary import (
     busy_line,
     local_time,
     pass_prompt_copy,
+    progress_label,
     worker_health_detail,
 )
 from saneless.web.errors import TITLE_CONTROL_TYPE, RequestRejected
@@ -153,6 +155,28 @@ OWNER_COOKIE: Final = "saneless_owner"
 # One year in seconds: the owner cookie's lifetime, renewed on every accepted
 # submit.
 OWNER_COOKIE_MAX_AGE: Final = 365 * 24 * 60 * 60
+
+
+def _set_owner_cookie(response: Response, owner: str) -> None:
+    """
+    Set the owner cookie on a response, with the attributes documented above.
+
+    The one place the cookie is written, so the response a scan submit sends
+    carries the same cookie whichever of its responses goes out.
+
+    Args:
+        response: The response to set the cookie on.
+        owner: The owner token the accepted job recorded.
+
+    """
+    response.set_cookie(
+        OWNER_COOKIE,
+        owner,
+        max_age=OWNER_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
 
 
 def _presented_owner(request: Request) -> str | None:
@@ -1578,6 +1602,36 @@ def _refuse_control_characters(value: str) -> str:
     return value
 
 
+def _queued_status_fallback(job_id: str) -> str:
+    """
+    Build the status area for a queued job without rendering a template.
+
+    This is what a scan submit answers when rendering its normal response
+    failed after the worker had already accepted the job.  It is fixed markup:
+    the status area with the same poll attributes ``partials/status.html``
+    gives a followed active job, holding the existing starting prose, plus the
+    out-of-band clear of ``#status-message`` that every accepted submit sends.
+    The first poll then renders the full status, the Scan button included.
+    No exception text reaches it; that goes to the server log only.
+
+    Args:
+        job_id: The accepted job, which the status area follows.
+
+    Returns:
+        The response body.
+
+    """
+    poll_url = html.escape(f"/api/jobs/{job_id}/status")
+    line = html.escape(progress_label(JobState.PENDING))
+    return (
+        f'<div id="status-area" hx-get="{poll_url}" hx-trigger="every 1s" '
+        f'hx-swap="outerHTML">\n'
+        f'  <p aria-busy="true">{line}</p>\n'
+        "</div>\n"
+        '<div id="status-message" hx-swap-oob="innerHTML"></div>\n'
+    )
+
+
 @router.post("/api/scan")
 def start_scan(
     request: Request,
@@ -1616,6 +1670,18 @@ def start_scan(
     nobody replaced, which is the one failure certain to waste paper because
     the pages would be scanned and then have nowhere to go.
     The rendered error reloads Job History only when that row was written.
+
+    The worker accepting the job is the commit point: from then on the scan
+    runs whatever this response says, so nothing after it may fail.  Anything
+    that can fail and is not about the job -- the status strip's context -- is
+    built before the job row exists, so its failure writes nothing.  If the
+    status response itself cannot be rendered after the commit point, the
+    failure is logged and a minimal status area answers instead, still 200 and
+    still following the job: an error telling the operator to try again would
+    be false, and trying again would queue a second scan behind the one
+    already running.  The owner cookie is set on
+    whichever of the two responses goes out, so this browser can still answer
+    the job's flip prompt.
 
     Args:
         request: The incoming HTTP request.
@@ -1707,6 +1773,9 @@ def start_scan(
     # renewed.
     presented = _presented_owner(request)
     owner = presented or secrets.token_urlsafe(32)
+    # Ahead of the row, not merely ahead of the submit: a failure between
+    # the two would leave a PENDING row that no worker will ever run.
+    checks = _checks_context(state)
     job = state.job_store.create_job(
         profile=form.profile,
         title=form.title,
@@ -1726,39 +1795,50 @@ def start_scan(
             # just become busy, so the strip's paused note is due now rather than
             # at the end of the cache's TTL.  The strip's own context rides
             # along because the partial is rendered inside this response.
-            response = state.templates.TemplateResponse(
-                request,
-                "partials/status_response.html",
-                {
-                    # The created job is the followed job, so the poll URL this
-                    # browser is handed names it and the status area keeps
-                    # reporting the scan this person started.
-                    **_status_context(
-                        state.worker,
-                        state.job_store,
-                        replace(
-                            _status_facts(request, followed_job_id=job.id),
-                            # The token this submit is owned by, which is the
-                            # minted one when the browser presented none: the
-                            # cookie carrying it has not reached the browser
-                            # yet, so the request cannot present it.
-                            owner_token=owner,
+            #
+            # The job is queued from here on, so a failure below must not
+            # escape into the error handler: Starlette renders the template
+            # inside the TemplateResponse constructor, and the generic error it
+            # would answer tells the operator to try again.
+            try:
+                response = state.templates.TemplateResponse(
+                    request,
+                    "partials/status_response.html",
+                    {
+                        # The created job is the followed job, so the poll URL
+                        # this browser is handed names it and the status area
+                        # keeps reporting the scan this person started.
+                        **_status_context(
+                            state.worker,
+                            state.job_store,
+                            replace(
+                                _status_facts(request, followed_job_id=job.id),
+                                # The token this submit is owned by, which is
+                                # the minted one when the browser presented
+                                # none: the cookie carrying it has not reached
+                                # the browser yet, so the request cannot
+                                # present it.
+                                owner_token=owner,
+                            ),
                         ),
-                    ),
-                    "clear_message": True,
-                    "refresh_checks": True,
-                    "terminal_reload": True,
-                    **_checks_context(state),
-                },
-            )
-            response.set_cookie(
-                OWNER_COOKIE,
-                owner,
-                max_age=OWNER_COOKIE_MAX_AGE,
-                httponly=True,
-                samesite="lax",
-                path="/",
-            )
+                        "clear_message": True,
+                        "refresh_checks": True,
+                        "terminal_reload": True,
+                        **checks,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Rendering the response for accepted job %s failed; "
+                    "answering the minimal queued status instead",
+                    job.id,
+                )
+                fallback = HTMLResponse(
+                    status_code=200, content=_queued_status_fallback(job.id)
+                )
+                _set_owner_cookie(fallback, owner)
+                return fallback
+            _set_owner_cookie(response, owner)
             return response
         case SubmitResult.QUEUE_FULL:
             rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
