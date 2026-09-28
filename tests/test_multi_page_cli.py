@@ -22,7 +22,7 @@ import logging
 import signal
 import termios
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import click
@@ -656,6 +656,24 @@ class TestClickPassCoordinatorAnswers:
 
         assert answer is expected
         assert "The scanner jammed" in shown
+
+    def test_the_failed_pass_error_has_its_control_characters_escaped(
+        self,
+    ) -> None:
+        """
+        A scanner's error text reaches the terminal escaped, as every failure line does.
+
+        The text comes from outside saneless -- a SANE status string, a wrapped
+        OS error -- so an escape sequence in it must be shown, not obeyed.
+        """
+        prompt = replace(_retry_prompt(), error="jammed\x1b[2J\x1b]0;owned\x07")
+
+        answer, shown, _ = _ask(prompt, "f\n")
+
+        assert answer is PassAnswer.FINISH
+        assert "\x1b" not in shown
+        assert "\x07" not in shown
+        assert "jammed\\x1b[2J\\x1b]0;owned\\x07" in shown
 
     def test_nothing_typed_but_spaces_asks_again(self) -> None:
         """A line of spaces is no letter at all: the choices are listed."""

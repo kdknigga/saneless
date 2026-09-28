@@ -1940,7 +1940,9 @@ def cli_pass_question(prompt: PassPrompt) -> str:
     This is the one source of the terminal's question; it reuses the web
     prompt's headlines, so the two say the same thing.  The failed-pass
     question is two lines: what failed, then what to do.  The error text is
-    shown as given: the terminal belongs to the host's own operator.
+    placed as given, so this module stays free of terminal concerns; the CLI
+    escapes its control characters before asking, as it does on every other
+    failure line, because that text comes from outside saneless.
 
     Args:
         prompt: The open question.

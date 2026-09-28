@@ -21,6 +21,7 @@ import sys
 import termios
 import threading
 import traceback
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -576,11 +577,16 @@ def _read_pass_answer(prompt: PassPrompt) -> PassAnswer:
             raise click.BadParameter(NOTHING_TO_FINISH)
         raise click.BadParameter(cli_choice_hint(prompt))
 
+    # A failed pass's error text comes from outside saneless -- a SANE status
+    # string, a wrapped OS error -- so its control characters are shown as
+    # escapes here, at the terminal, as on every other failure line.
+    shown = prompt
+    if prompt.error is not None:
+        shown = replace(prompt, error=neutralise_controls(prompt.error))
+    question = cli_pass_question(shown)
     _flush_typed_ahead()
     while True:
-        answer = click.prompt(
-            cli_pass_question(prompt), value_proc=parse, show_default=False
-        )
+        answer = click.prompt(question, value_proc=parse, show_default=False)
         if answer is not PassAnswer.ABORT:
             return answer
         if click.confirm(abort_question(prompt.pages_kept), default=False):
