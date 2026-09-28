@@ -431,22 +431,22 @@ def _constraint(raw_options: list[tuple], name: str) -> _OptionConstraint:
         carry a constraint is skipped rather than being an error.
 
     """
-    for opt in raw_options:
-        # SANE option tuple:
-        # (index, name, title, desc, type, unit, size, cap, constraint)
-        if len(opt) >= 9 and opt[1] == name:
-            constraint = opt[8]
-            if isinstance(constraint, list):
-                return _OptionConstraint(present=True, values=constraint, span=None)
-            return _OptionConstraint(
-                present=True, values=None, span=_as_span(constraint)
-            )
-    return _OptionConstraint(present=False, values=None, span=None)
+    opt = _option_tuple(raw_options, name)
+    if opt is None:
+        return _OptionConstraint(present=False, values=None, span=None)
+    constraint = opt[8]
+    if isinstance(constraint, list):
+        return _OptionConstraint(present=True, values=constraint, span=None)
+    return _OptionConstraint(present=True, values=None, span=_as_span(constraint))
 
 
 def _option_tuple(raw_options: list[tuple], name: str) -> tuple | None:
     """
     Find one option's tuple in the device's option list.
+
+    A SANE option tuple is ``(index, name, title, desc, type, unit, size, cap,
+    constraint)``; one too short to carry all nine is skipped rather than being
+    an error.
 
     Args:
         raw_options: The device's option tuples, as ``get_options()`` returns
