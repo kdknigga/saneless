@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Final, Literal, assert_never, cast
 import tomlkit
 from pydantic import TypeAdapter, ValidationError
 from tomlkit.exceptions import ParseError, TOMLKitError
-from tomlkit.items import InlineTable
+from tomlkit.items import InlineTable, Item
 
 from saneless.atomic_write import replace_file_atomically
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
@@ -899,6 +899,13 @@ _NOT_GENERATED_REASON: Final = (
     "rename or delete it to regenerate"
 )
 
+# The same skip, for ``default``. It cannot be renamed or deleted like any other
+# profile -- saneless requires it -- so the generic advice is wrong for it; the
+# flag is the one way to hand it back to the tool.
+_DEFAULT_NOT_GENERATED_REASON: Final = (
+    "add auto_generated = true to its table to let auto-profiles --force refresh it"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ProfileWriteResult:
@@ -912,6 +919,9 @@ class ProfileWriteResult:
         path: The config file the result describes.
         added: Generated names the file did not have, now written.
         refreshed: Flagged profiles whose owned keys ``force`` rewrote.
+        unchanged: Flagged profiles ``force`` found already matching the
+            generation, key for key; neither rewritten nor reported, since
+            nothing about them changed.
         skipped_not_generated: Same-name profiles without a truthy
             ``auto_generated``, never touched, under ``force`` too.
         skipped_existing: Flagged profiles left alone because ``force`` was
@@ -925,6 +935,7 @@ class ProfileWriteResult:
     path: Path
     added: tuple[str, ...] = ()
     refreshed: tuple[str, ...] = ()
+    unchanged: tuple[str, ...] = ()
     skipped_not_generated: tuple[str, ...] = ()
     skipped_existing: tuple[str, ...] = ()
     removed: tuple[str, ...] = ()
@@ -933,7 +944,7 @@ class ProfileWriteResult:
     @property
     def persisted(self) -> frozenset[str]:
         """Names whose file table now matches the generated profile."""
-        return frozenset(self.added + self.refreshed)
+        return frozenset(self.added + self.refreshed + self.unchanged)
 
     def groups(self) -> list[tuple[str, tuple[str, ...]]]:
         """
@@ -944,16 +955,31 @@ class ProfileWriteResult:
 
         Returns:
             ``(line, written_names)`` in the fixed order Added, Refreshed,
-            Skipped (not auto-generated), Skipped (already exists), Removed,
-            then the pinned device, if any, whose line names no profiles.
+            Skipped (not auto-generated) -- ``default`` on a line of its own
+            first, since the advice differs, then the rest -- Skipped (already
+            exists), Removed, then the pinned device, if any, whose line names
+            no profiles. Unchanged tables have no line: nothing happened to
+            them.
 
         """
+        skipped_default = tuple(
+            name for name in self.skipped_not_generated if name in _UNPRUNABLE
+        )
+        skipped_others = tuple(
+            name for name in self.skipped_not_generated if name not in _UNPRUNABLE
+        )
         labelled = (
             ("Added", self.added, "", True),
             ("Refreshed", self.refreshed, "", True),
             (
                 "Skipped (not auto-generated)",
-                self.skipped_not_generated,
+                skipped_default,
+                f" -- {_DEFAULT_NOT_GENERATED_REASON}",
+                False,
+            ),
+            (
+                "Skipped (not auto-generated)",
+                skipped_others,
                 f" -- {_NOT_GENERATED_REASON}",
                 False,
             ),
@@ -1177,8 +1203,28 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
 
 
 _MergeOutcome = Literal[
-    "added", "refreshed", "skipped_not_generated", "skipped_existing"
+    "added", "refreshed", "unchanged", "skipped_not_generated", "skipped_existing"
 ]
+
+
+def _same_value(stored: object, generated: object) -> bool:
+    """
+    Report whether a stored owned value is exactly the one a generation writes.
+
+    Type and value are both compared, so ``300.0`` against ``300`` and ``1``
+    against ``True`` are changes, though Python calls each pair equal: a
+    refresh must replace such a value with the generation's own.
+
+    Args:
+        stored: The value from the parsed table, a tomlkit item or plain data.
+        generated: The value ``_generated_values`` would write.
+
+    Returns:
+        True only when the unwrapped value has the same type and is equal.
+
+    """
+    value = stored.unwrap() if isinstance(stored, Item) else stored
+    return type(value) is type(generated) and value == generated
 
 
 def _merge_profile(
@@ -1227,6 +1273,14 @@ def _merge_profile(
     # this generation omits is deleted, so a stale ``duplex = "hardware"`` does
     # not outlive the source that produced it.
     owned = cast("MutableMapping[str, object]", existing)
+    # Compared first, so a table that already reads as the generation is left
+    # as it is and not reported refreshed. A key on one side only is a change.
+    if all(
+        (key in owned) == (key in values)
+        and (key not in values or _same_value(owned[key], values[key]))
+        for key in _OWNED_KEYS
+    ):
+        return "unchanged"
     for key in _OWNED_KEYS:
         if key in values:
             owned[key] = values[key]
@@ -1300,7 +1354,9 @@ def write_profiles_to_config(
     * present and flagged, without ``force``: skipped as already existing;
     * present and flagged, with ``force``: the owned keys (``_OWNED_KEYS``) are
       written onto the existing table and any the generation omits are
-      deleted, so every other key and every comment survives.
+      deleted, so every other key and every comment survives -- unless every
+      owned key already matches in type and value, when the table is left
+      alone and counted as unchanged rather than refreshed.
 
     Auto-generated profiles that the freshly generated set no longer names are
     pruned first, so renaming does not strand the profiles it replaced. The
@@ -1398,6 +1454,7 @@ def write_profiles_to_config(
     outcomes: dict[_MergeOutcome, list[str]] = {
         "added": [],
         "refreshed": [],
+        "unchanged": [],
         "skipped_not_generated": [],
         "skipped_existing": [],
     }
@@ -1405,14 +1462,18 @@ def write_profiles_to_config(
         outcome = _merge_profile(profiles_section, name, profile, force=force)
         outcomes[outcome].append(name)
 
-    if not (
+    changed = bool(
         outcomes["added"] or outcomes["refreshed"] or orphans or pinned is not None
-    ):
+    )
+    new_text = _render_checked(config_path, doc, original_text) if changed else ""
+    if not changed or new_text == original_text:
         # Nothing changed, so nothing is replaced -- and a legacy single-file
-        # mount gets no EBUSY error for a run that had nothing to write.
+        # mount gets no EBUSY error for a run that had nothing to write. The
+        # text comparison backs up the outcome bookkeeping: identical bytes
+        # are never swapped in, so the file keeps its inode, and with it any
+        # ACL or ownership set on it by hand.
         target = config_path.resolve()
     else:
-        new_text = _render_checked(config_path, doc, original_text)
         target = replace_file_atomically(config_path, new_text)
         if config_path.is_symlink():
             # The operator edits the link, the write lands on the target;
@@ -1429,6 +1490,7 @@ def write_profiles_to_config(
         path=target,
         added=tuple(outcomes["added"]),
         refreshed=tuple(outcomes["refreshed"]),
+        unchanged=tuple(outcomes["unchanged"]),
         skipped_not_generated=tuple(outcomes["skipped_not_generated"]),
         skipped_existing=tuple(outcomes["skipped_existing"]),
         removed=tuple(orphans),
