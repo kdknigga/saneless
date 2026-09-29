@@ -3899,6 +3899,119 @@ class TestOwedWriteStreak:
         assert loop_failures == 1
 
 
+class TestOwedWritesAfterAJob:
+    """
+    Owed writes are retried after every clean job, not only on an idle tick.
+
+    A queue that never empties never gives the worker an idle tick, so an owed
+    row retried only there would stay owed for as long as scans keep coming.
+    Each test takes the idle tick out of the window and snapshots what is owed
+    as every scan starts: the job before it has finished its loop pass by then,
+    so the snapshot cannot race the flush.
+    """
+
+    def test_owed_writes_flush_after_a_job_when_the_queue_is_busy(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """An owed rejection is written before the third job in a row scans."""
+        owed_at_scan: list[frozenset[str]] = []
+        store = JobStore()
+        worker = worker_for(store)
+
+        def snapshotting_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
+            owed_at_scan.append(worker.owed_rejection_ids())
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
+        monkeypatch.setattr("saneless.worker.run_pipeline", snapshotting_pipeline)
+        ticks = _count_idle_ticks(worker, monkeypatch)
+        try:
+            worker.start()
+            refused = store.create_job("default", "Refused While Busy")
+            worker.owe_rejection(refused.id, "queue full")
+            jobs = _submit_jobs(worker, store, 3)
+            finished = [
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+                for job in jobs
+            ]
+            row = _get(store, refused.id)
+            idle_ticks = ticks()
+        finally:
+            worker.stop()
+            store.close()
+
+        assert [job.state for job in finished] == [JobState.DONE] * 3
+        assert idle_ticks == 0
+        assert owed_at_scan == [frozenset({refused.id}), frozenset(), frozenset()]
+        assert row.state is JobState.ERROR
+        assert row.error == "queue full"
+        assert row.error_category is ErrorCategory.REJECTED
+
+    def test_a_degraded_worker_leaves_the_owed_flush_to_recovery(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        mock_scanner: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A clean job on a degraded worker does not retry owed writes.
+
+        Recovery owns the retry while degraded: it probes first, and clearing
+        degraded is its call.  Startup generation is held so every job is
+        queued before the worker takes one; the first jobs' SCANNING writes
+        fail until the worker degrades, and the two queued after them then run
+        cleanly on a degraded worker.
+        """
+        entered = threading.Event()
+        released = threading.Event()
+        owed_at_scan: list[frozenset[str]] = []
+        store = JobStore()
+        worker = worker_for(store)
+
+        def held_devices(*_args: object, **_kwargs: object) -> list[DeviceInfo]:
+            entered.set()
+            released.wait(_STATE_BUDGET * 5)
+            return []
+
+        def snapshotting_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
+            owed_at_scan.append(worker.owed_rejection_ids())
+            return _success_result()
+
+        mock_scanner.get_devices.side_effect = held_devices
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
+        monkeypatch.setattr("saneless.worker.run_pipeline", snapshotting_pipeline)
+        monkeypatch.setattr(
+            store,
+            "update_state",
+            _StoreFault(store.update_state, frozenset(range(1, _DEGRADING_JOBS + 1))),
+        )
+        try:
+            worker.start()
+            assert entered.wait(_STATE_BUDGET)
+            refused = store.create_job("default", "Refused Before Degraded")
+            worker.owe_rejection(refused.id, "queue full")
+            _submit_jobs(worker, store, _DEGRADING_JOBS)
+            clean = _submit_jobs(worker, store, 2)
+            released.set()
+            finished = [
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+                for job in clean
+            ]
+            health = worker.health
+        finally:
+            released.set()
+            worker.stop()
+            store.close()
+
+        assert [job.state for job in finished] == [JobState.DONE] * 2
+        assert health is WorkerHealth.DEGRADED
+        assert owed_at_scan == [frozenset({refused.id})] * 2
+
+
 # Loop-level failures in a row that make a worker degraded (D-10).
 _DEGRADING_JOBS = 3
 
