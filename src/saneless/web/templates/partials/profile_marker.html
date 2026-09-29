@@ -1,0 +1,19 @@
+{# Which profile's defaults a metadata control is showing, submitted with the
+   scan so the server can tell.  The tag list and the correspondent select each
+   follow the Profile select by their own request, so for a moment after a
+   change -- or for good, when that request fails -- they can still hold the
+   previous profile's defaults while the select names the new one.  A submit in
+   that window would otherwise file the new profile's scan with the old
+   profile's tags or correspondent.  start_scan compares this value with the
+   submitted profile and, when they differ, applies the submitted profile's
+   defaults instead of the values that belong to another one.
+
+   The page renders one per shown control, named by marker_id and marker_name,
+   carrying the profile the page opens on.  Only the profile-change responses
+   render it again, out-of-band with oob = true, so it changes in the same swap
+   that replaces the control's defaults and never before.  The filter and the
+   refresh keep the ticks and the profile, so they leave it alone.
+
+   Turning autocomplete off stops a browser that restores form state on reload
+   from bringing back a value the server did not render. #}
+<input type="hidden" id="{{ marker_id }}" name="{{ marker_name }}" value="{{ marker_profile }}" autocomplete="off"{% if oob %} hx-swap-oob="true"{% endif %}>

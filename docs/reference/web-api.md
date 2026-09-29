@@ -106,6 +106,13 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 | `tags` | int[] | no | Paperless-ngx tag IDs, at most 100, each from 1 to 2147483647 |
 | `correspondent` | int | no | Paperless-ngx correspondent ID, from 1 to 2147483647 |
 | `multi_page` | boolean | no | `on` when Multiple pages is ticked. Chosen for this scan only; it is not stored on the profile or the job. Absent means one pass. Refused with `422` on a manual-duplex profile |
+| `tags_profile` | string | no | The profile whose defaults the web UI's tag list was showing. When it names a profile other than `profile`, the submitted `tags` are ignored and `profile`'s `default_tags` apply. Absent means the `tags` are used as sent |
+| `correspondent_profile` | string | no | The same, for the correspondent dropdown: when it names another profile, `correspondent` is ignored and `profile`'s `default_correspondent` applies |
+
+The web UI sends the two `*_profile` fields so that a tag list or dropdown still showing
+another profile's defaults never files them under the profile you picked. That happens
+while the list is still being replaced after a profile change, or when replacing it
+failed. A script that posts its own `tags` and `correspondent` can leave them out.
 
 **Responses:**
 
@@ -286,7 +293,7 @@ page itself opens with the first profile's defaults ticked in the same way.
 
 | Status Code | Meaning |
 |-------------|---------|
-| 200 | HTML partial: the whole tag list including its wrapper, which replaces the one on the page. A default tag that paperless-ngx no longer has is ticked and labelled with a note, as described under `GET /api/tags`; leave it ticked and the finished job carries a warning that it was skipped, or untick it |
+| 200 | HTML partial: the whole tag list including its wrapper, which replaces the one on the page, and an out-of-band `tags_profile` field naming the profile (see [`POST /api/scan`](#post-apiscan)). A default tag that paperless-ngx no longer has is ticked and labelled with a note, as described under `GET /api/tags`; leave it ticked and the finished job carries a warning that it was skipped, or untick it |
 | 422 | The profile does not exist. |
 
 ---
@@ -311,7 +318,7 @@ skipped)`; one that cannot be checked because paperless-ngx is unreachable reads
 
 | Status Code | Meaning |
 |-------------|---------|
-| 200 | HTML partial: the whole `<select>` element, which replaces the one on the page |
+| 200 | HTML partial: the whole `<select>` element, which replaces the one on the page, and an out-of-band `correspondent_profile` field naming the profile (see [`POST /api/scan`](#post-apiscan)) |
 | 422 | The profile does not exist. |
 
 ---

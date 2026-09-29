@@ -40,7 +40,13 @@
    nothing else, replacing the earlier ticks on purpose, because the new
    profile's defaults are what an untouched form now means.  The filter box,
    the refresh button and the filter form each carry their own requests,
-   which do keep the ticks. #}
+   which do keep the ticks.
+
+   The profile-change response alone also carries the list's profile marker
+   out-of-band (see partials/profile_marker.html), so the marker names the new
+   profile in the same swap that ticks its defaults.  It comes first so the
+   wrapper stays the last element of the response. #}
+{% if follows_profile %}{% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
 <div id="tags-list" class="tag-list"
      hx-get="/api/profiles/tags"
      hx-trigger="change from:#profile-select"

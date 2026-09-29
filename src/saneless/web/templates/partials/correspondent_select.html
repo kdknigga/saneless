@@ -21,7 +21,13 @@
    opens on the profile's default.
 
    The options come from partials/correspondents.html; this file composes no
-   prose. #}
+   prose.
+
+   The profile-change response alone also carries the select's profile marker
+   out-of-band (see partials/profile_marker.html), so the marker names the new
+   profile in the same swap that selects its default.  It comes first so the
+   select stays the last element of the response. #}
+{% if follows_profile %}{% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
 <select name="correspondent" id="correspondent-select"
         aria-describedby="correspondent-help"
         autocomplete="off"

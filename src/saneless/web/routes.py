@@ -1511,19 +1511,54 @@ class _ScanChoice:
     suppression is not allowed, and ``_StatusFacts`` settled the answer to the
     same limit the same way.  Both fields are what decides how the job runs,
     which is why they, and not the title or the tags, travel together.
+
+    The two markers ride here for the same reason: they say whose defaults
+    the tag and correspondent controls were showing, which is a fact about
+    the profile, not about the metadata itself.
+
+    Attributes:
+        profile: The scan profile name.
+        multi_page: Whether Multiple pages was ticked.
+        tags_profile: The profile whose defaults the tag list showed, or None
+            when the submit carried no marker.
+        correspondent_profile: The profile whose default the correspondent
+            select showed, or None when the submit carried no marker.
+
     """
 
     profile: str
     multi_page: bool
+    tags_profile: str | None = None
+    correspondent_profile: str | None = None
+
+    def shows_own_defaults(self, marker: str | None) -> bool:
+        """
+        Say whether a control's values belong to the submitted profile.
+
+        A marker naming another profile means the control was still showing
+        that profile's defaults: a profile change whose swap had not landed,
+        or had failed.  No marker means the submit did not come from the page
+        -- a script posting its own values -- and those are taken as given.
+
+        Args:
+            marker: The control's profile marker as submitted, or None.
+
+        Returns:
+            False only when the marker names a different profile.
+
+        """
+        return marker is None or marker == self.profile
 
 
 def _scan_choice(
     *,
     profile: Annotated[str, Form()],
     multi_page: Annotated[bool, Form()] = False,
+    tags_profile: Annotated[str | None, Form()] = None,
+    correspondent_profile: Annotated[str | None, Form()] = None,
 ) -> _ScanChoice:
     """
-    Read the profile and the Multiple pages choice from a scan submission.
+    Read the profile, the Multiple pages choice and the profile markers.
 
     Keyword-only so the boolean is never a positional flag.  An unticked
     checkbox sends nothing at all, so its absence is False.
@@ -1531,12 +1566,20 @@ def _scan_choice(
     Args:
         profile: The scan profile name.
         multi_page: Whether Multiple pages was ticked.
+        tags_profile: The tag list's profile marker, if the page sent one.
+        correspondent_profile: The correspondent select's profile marker, if
+            the page sent one.
 
     Returns:
-        The two, together.
+        The four, together.
 
     """
-    return _ScanChoice(profile=profile, multi_page=multi_page)
+    return _ScanChoice(
+        profile=profile,
+        multi_page=multi_page,
+        tags_profile=tags_profile,
+        correspondent_profile=correspondent_profile,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1876,11 +1919,24 @@ def start_scan(
     # or was rendered and cleared.  Only the setting that decided which page
     # was served knows which happened, and with the control hidden the
     # submitted value for that field is ignored rather than merged.
+    #
+    # A shown control whose profile marker names another profile was not
+    # answering for this one either: its swap to the submitted profile's
+    # defaults had not landed, or had failed, so it still held the previous
+    # profile's.  Taking those values would file this scan with the other
+    # profile's metadata, so the submitted profile's defaults apply instead.
+    tags_answered = state.settings.web.show_tags and choice.shows_own_defaults(
+        choice.tags_profile
+    )
+    correspondent_answered = (
+        state.settings.web.show_correspondent
+        and choice.shows_own_defaults(choice.correspondent_profile)
+    )
     metadata = resolve_scan_metadata(
         found,
-        tags=tags if state.settings.web.show_tags else None,
+        tags=tags if tags_answered else None,
         correspondent=correspondent,
-        correspondent_given=state.settings.web.show_correspondent,
+        correspondent_given=correspondent_answered,
     )
     form = _ScanForm(
         profile=choice.profile,
@@ -2421,7 +2477,12 @@ def get_profile_tags(request: Request, profile: str) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/tags.html",
-        _tag_list_context(state, q="", selected=list(found.default_tags)),
+        {
+            **_tag_list_context(state, q="", selected=list(found.default_tags)),
+            # The list's profile marker rides along out-of-band, so the scan
+            # can tell whose defaults the ticks are (see ``start_scan``).
+            "follows_profile": profile,
+        },
     )
 
 
@@ -2453,7 +2514,10 @@ def get_profile_correspondent(request: Request, profile: str) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/correspondent_select.html",
-        _correspondent_options_context(state, found.default_correspondent),
+        {
+            **_correspondent_options_context(state, found.default_correspondent),
+            "follows_profile": profile,
+        },
     )
 
 

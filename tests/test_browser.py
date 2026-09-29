@@ -3578,6 +3578,104 @@ class TestProfileDefaultsInTheBrowser:
             f"a page violated its Content-Security-Policy: {violations}"
         )
 
+    @pytest.mark.parametrize("served", ["as-served", "without-no-store"])
+    def test_firefox_reload_after_a_profile_change_keeps_profile_and_ticks_together(
+        self,
+        playwright: Playwright,
+        defaults_server: _BrowserServer,
+        egress_allowlist: list[str],
+        served: Literal["as-served", "without-no-store"],
+    ) -> None:
+        """
+        A reload never pairs one profile with another's defaults.
+
+        Restoring the Profile select fires no change, so nothing would follow
+        it: the page would name ``receipts`` over the first profile's ticks,
+        and an untouched Scan would file them under ``receipts``.  As in the
+        other reload tests, the second case strips ``no-store`` so the
+        select's own ``autocomplete="off"`` is what is being tested.  The
+        submit is captured rather than served: what the browser sends is the
+        claim, and the scan's handling of it is covered without a browser.
+
+        The reads after the reload are single reads, not retrying assertions,
+        so they cannot pass on a moment before a restore.
+        """
+        url = defaults_server.url
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        firefox = playwright.firefox.launch()
+        try:
+            ctx = firefox.new_context()
+            ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            if served == "without-no-store":
+                ctx.route(f"{url}/", _drop_cache_control)
+            _make_csp_gate(ctx, violations)
+            page = ctx.new_page()
+            page.goto(url)
+            _choose_profile_defaults(page, _RECEIPTS)
+            assert _ticked_tags(page) == ["32", "33"]
+
+            page.reload()
+
+            expect(page.locator("#tags-list")).to_have_count(1)
+            profile = page.locator("#profile-select").input_value()
+            ticks = _ticked_tags(page)
+            correspondent = page.locator("#correspondent-select").input_value()
+            assert profile == "default", "Firefox restored the profile on reload"
+            assert ticks == ["31"], ticks
+            assert correspondent == "41", correspondent
+
+            fields = _captured_submit(page)
+        finally:
+            firefox.close()
+        assert fields["profile"] == ["default"], fields
+        assert fields["tags"] == ["31"], fields
+        assert fields["tags_profile"] == ["default"], fields
+        assert fields["correspondent_profile"] == ["default"], fields
+        assert seen, "the hand-built context's gate handled no request"
+        assert blocked == [], f"a page tried to reach the network: {blocked}"
+        assert violations == [], (
+            f"a page violated its Content-Security-Policy: {violations}"
+        )
+
+    def test_a_failed_profile_swap_files_the_chosen_profile_s_defaults(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        Ticks left over from the previous profile never reach the scan.
+
+        Both profile-change requests are cut off, so the list and the select
+        keep the first profile's defaults while the select names
+        ``receipts`` -- the state a slow or failed swap leaves behind.  The
+        markers still name the first profile, so the scan files
+        ``receipts``' own defaults rather than the ticks on screen.
+        """
+        page.goto(defaults_server.url)
+        page.route("**/api/profiles/tags*", lambda route: route.abort())
+        page.route("**/api/profiles/correspondent*", lambda route: route.abort())
+        with page.expect_request("**/api/profiles/correspondent*"):
+            page.select_option("#profile-select", _RECEIPTS)
+        assert _ticked_tags(page) == ["31"]
+        page.fill("#title-input", "Swap Cut Off")
+
+        with page.expect_request("**/api/scan") as submitted:
+            page.click("#scan-btn")
+
+        fields = parse_qs(submitted.value.post_data or "")
+        assert fields["profile"] == [_RECEIPTS], fields
+        assert fields["tags"] == ["31"], fields
+        assert fields["tags_profile"] == ["default"], fields
+        status = page.locator("#status-area")
+        expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
+        job_store: JobStore = defaults_server.app.state.job_store
+        job = next(
+            job for job in job_store.list_recent(100) if job.title == "Swap Cut Off"
+        )
+        assert job.profile == _RECEIPTS
+        assert job.tags == [32, 33]
+        assert job.correspondent == 42
+
     def test_stale_defaults_stay_ticked_with_their_note_and_end_warned(
         self, page: Page, defaults_server: _BrowserServer
     ) -> None:

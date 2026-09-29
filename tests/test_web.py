@@ -3479,6 +3479,183 @@ class TestProfileDefaultsArePreTicked:
         assert "selected" in _option(response.text, _OTHER_CORRESPONDENT)
 
 
+_PROFILE_SELECT_TAG = re.compile(r'<select name="profile" id="profile-select"[^>]*>')
+
+
+def _marker(html: str, name: str) -> str:
+    """
+    Return the one hidden profile marker named ``name`` in ``html``.
+
+    Args:
+        html: The page or partial to search.
+        name: The marker's form name.
+
+    Returns:
+        The marker's whole tag.
+
+    """
+    found = re.findall(rf'<input type="hidden"[^>]*name="{name}"[^>]*>', html)
+    assert len(found) == 1, html
+    return found[0]
+
+
+class TestMetadataFollowsTheSubmittedProfile:
+    """
+    The metadata a scan files belongs to the profile it names.
+
+    The tag list and the correspondent select each follow the Profile select
+    by their own request, so a submit can name one profile while a control
+    still shows another's defaults: a swap still in flight or failed, or a
+    browser that restored the select on reload.  The Profile select opts out
+    of form-state restore like the controls it drives, and each control
+    carries a marker naming whose defaults it shows, so a control that is out
+    of step is read as unanswered and the submitted profile's defaults apply.
+    """
+
+    def test_the_profile_select_opts_out_of_form_state_restore(
+        self, tmp_path: Path
+    ) -> None:
+        """Restored alone, the select would name a profile nothing followed."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        select = _PROFILE_SELECT_TAG.search(page)
+        assert select is not None, page
+        assert 'autocomplete="off"' in select.group(0)
+
+    def test_the_page_marks_both_controls_with_the_opening_profile(
+        self, tmp_path: Path
+    ) -> None:
+        """Each marker names the profile the page ticked the defaults of."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        for name in ("tags_profile", "correspondent_profile"):
+            marker = _marker(page, name)
+            assert 'value="receipts"' in marker, marker
+            assert 'autocomplete="off"' in marker, marker
+            assert "hx-swap-oob" not in marker, marker
+
+    def test_a_hidden_control_carries_no_marker(self, tmp_path: Path) -> None:
+        """No control on the page, nothing to mark."""
+        app = _pre_ticked_app(tmp_path, show_tags=False, show_correspondent=False)
+        with TestClient(app) as client:
+            page = client.get("/").text
+
+        assert "tags_profile" not in page
+        assert "correspondent_profile" not in page
+
+    def test_the_marker_is_after_the_correspondent_help_line(
+        self, tmp_path: Path
+    ) -> None:
+        """The select stays the element directly before its help line."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        assert re.search(r"</select>\s*<small id=\"correspondent-help\">", page), page
+
+    @pytest.mark.parametrize(
+        ("route", "name"),
+        [
+            ("/api/profiles/tags", "tags_profile"),
+            ("/api/profiles/correspondent", "correspondent_profile"),
+        ],
+    )
+    def test_a_profile_change_moves_its_marker_out_of_band(
+        self, tmp_path: Path, route: str, name: str
+    ) -> None:
+        """The marker changes in the same swap that shows the new defaults."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.get(route, params={"profile": "other"})
+
+        assert response.status_code == 200
+        marker = _marker(response.text, name)
+        assert 'value="other"' in marker, marker
+        assert 'hx-swap-oob="true"' in marker, marker
+
+    def test_a_filter_or_refresh_leaves_the_marker_alone(self, tmp_path: Path) -> None:
+        """They keep the ticks, so the profile they belong to has not changed."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            filtered = client.get("/api/tags", params={"q": "a", "tags": [3]})
+            refreshed_tags = client.post("/api/cache/invalidate?resource=tags")
+            refreshed_correspondents = client.post(
+                "/api/cache/invalidate?resource=correspondents"
+            )
+
+        for response in (filtered, refreshed_tags, refreshed_correspondents):
+            assert response.status_code == 200
+            assert "_profile" not in response.text, response.text
+
+    def test_ticks_marked_for_another_profile_give_way_to_its_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The regression: ``other`` submitted with ``receipts``' metadata.
+
+        This is what a restored Profile select or an unfinished swap sends,
+        and before the marker it filed ``receipts``' tags and correspondent
+        under ``other`` with no warning.
+        """
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan",
+                data={
+                    "profile": "other",
+                    "title": "Out of step",
+                    "tags": [str(tag) for tag in _RECEIPTS_TAGS],
+                    "correspondent": str(_RECEIPTS_CORRESPONDENT),
+                    "tags_profile": "receipts",
+                    "correspondent_profile": "receipts",
+                },
+            )
+
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == _OTHER_TAGS
+            assert job.correspondent == _OTHER_CORRESPONDENT
+
+    def test_each_control_is_judged_by_its_own_marker(self, tmp_path: Path) -> None:
+        """One swap landed and the other did not: only the stale one gives way."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan",
+                data={
+                    "profile": "other",
+                    "title": "Half swapped",
+                    "tags": [str(tag) for tag in _RECEIPTS_TAGS],
+                    "correspondent": str(_RECEIPTS_CORRESPONDENT),
+                    "tags_profile": "receipts",
+                    "correspondent_profile": "other",
+                },
+            )
+
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == _OTHER_TAGS
+            assert job.correspondent == _RECEIPTS_CORRESPONDENT
+
+    @pytest.mark.parametrize("marked", [True, False])
+    def test_values_marked_for_this_profile_or_unmarked_are_taken_as_given(
+        self, tmp_path: Path, *, marked: bool
+    ) -> None:
+        """The page's own answer, or a script's, is the operator's choice."""
+        data: dict[str, str | list[str]] = {
+            "profile": "other",
+            "title": "In step",
+            "tags": [str(tag) for tag in _RECEIPTS_TAGS],
+            "correspondent": str(_RECEIPTS_CORRESPONDENT),
+        }
+        if marked:
+            data |= {"tags_profile": "other", "correspondent_profile": "other"}
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.post("/api/scan", data=data)
+
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == _RECEIPTS_TAGS
+            assert job.correspondent == _RECEIPTS_CORRESPONDENT
+
+
 # The two collection endpoints a page load can reach, as paperless.py spells
 # them.  Counting by path is what separates "no tag request" from "no request
 # at all", which are different claims and fail differently.

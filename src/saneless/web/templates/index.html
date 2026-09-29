@@ -58,9 +58,19 @@
               set it.)
 
            The slot doubles as this control's one line of help text;
-           there is deliberately no second one. #}
+           there is deliberately no second one.
+
+           Turning autocomplete off matters more here than on any other
+           control.  The description, the Multiple pages field, the tag ticks
+           and the correspondent are all rendered for the profile this page
+           opens on, and the ones below it opt out of form-state restore.  A
+           browser that brought this select back to another profile on reload
+           or on Back would do so without firing change, so none of them would
+           follow it, and an untouched submit would name one profile with
+           another's metadata. #}
         <label for="profile-select">Profile</label>
         <select name="profile" id="profile-select"
+                autocomplete="off"
                 aria-describedby="profile-description"
                 hx-get="/api/profiles/description"
                 hx-trigger="change"
@@ -147,6 +157,7 @@
             <small id="tag-filter-help">Type to narrow the list. Ticked tags stay ticked.</small>
 
             {% include "partials/tags.html" %}
+            {% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = selected %}{% include "partials/profile_marker.html" %}{% endwith %}
         </fieldset>
         <small id="tags-help">Labels to file this under in paperless-ngx. Optional.</small>
         {% endif %}
@@ -172,6 +183,9 @@
         </label>
         {% include "partials/correspondent_select.html" %}
         <small id="correspondent-help">Who sent this document? Optional.</small>
+        {# After the help line, never between it and the select: the select
+           has to stay the element directly before its help line. #}
+        {% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = selected %}{% include "partials/profile_marker.html" %}{% endwith %}
         {% endif %}
 
         {% include "partials/scan_button.html" %}
