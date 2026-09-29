@@ -192,6 +192,19 @@ _SELECT_BY_ID = f"{_SELECT_ALL} WHERE id = ?"
 _SELECT_RECENT = f"{_SELECT_ALL} ORDER BY created_at DESC LIMIT ?"
 """Read the newest jobs first, up to a bound limit."""
 
+_CREATE_CREATED_AT_INDEX = (
+    "CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs(created_at)"
+)
+"""Index the jobs by creation time, so history reads walk it instead of sorting.
+
+Without it every ``_SELECT_RECENT`` sorts the whole table in a temporary
+B-tree while the store lock is held.  It is run at every open rather than as a
+step of ``_MIGRATIONS``: an index changes no data shape, so it needs no schema
+version, and keeping it out of the ladder keeps it out of the downgrade guard
+that reads the ladder's length.  An earlier release therefore still opens the
+database -- SQLite maintains an index whether or not the code knows about it.
+"""
+
 _LIST_PENDING = f"{_SELECT_ALL} WHERE state = ? ORDER BY created_at ASC"
 """Read the queued jobs oldest-first -- the order they will be worked in.
 
@@ -554,6 +567,11 @@ def _migrate(conn: sqlite3.Connection, db_path: str) -> None:
         # Commit per step: a ladder that fails at step N leaves a valid
         # database at version N - 1 rather than a half-applied one.
         conn.commit()
+    # The version read above opened a deferred read transaction, and on an
+    # up-to-date database no step committed it.  Committing here releases its
+    # WAL snapshot, so another connection's checkpoint is not held off for as
+    # long as this one sits idle.
+    conn.commit()
 
 
 def _open_failure(db_path: str, exc: sqlite3.Error | OSError) -> StorageError:
@@ -640,7 +658,9 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
         db_path: Path to the SQLite database file, or ":memory:".
 
     Returns:
-        The open connection, outside any transaction.
+        The open connection under explicit transaction control.  With
+        ``autocommit`` off a deferred transaction is always open, but it
+        holds no snapshot until its first read.
 
     Raises:
         StorageError: If the database cannot be opened or read as SQLite, or
@@ -902,7 +922,7 @@ class JobStore:
 
     def __init__(self, db_path: Path | str = ":memory:") -> None:
         """
-        Open the job store, enable WAL, and run the migration ladder.
+        Open the job store, enable WAL, run the ladder, and index the history.
 
         Raises:
             StorageError: If the database cannot be opened or read as SQLite,
@@ -916,11 +936,13 @@ class JobStore:
         self._conn = _open_connection(db_path)
         try:
             _migrate(self._conn, db_path)
+            self._conn.execute(_CREATE_CREATED_AT_INDEX)
+            self._conn.commit()
         except Exception as exc:
-            # Release the BEGIN DEFERRED the failed ladder still holds, and
-            # the file handle with it, before the caller sees the failure.  A
-            # rollback that fails too -- a disk I/O error on the same broken
-            # file -- must not replace the migration's own error with a raw
+            # Release the BEGIN DEFERRED the failed ladder or index still
+            # holds, and the file handle with it, before the caller sees the
+            # failure.  A rollback that fails too -- a disk I/O error on the
+            # same broken file -- must not replace the open's own error with a raw
             # sqlite3 one, which would exit 5 instead of 2.
             with contextlib.suppress(sqlite3.Error):
                 self._conn.rollback()
