@@ -31,7 +31,7 @@ mode = "Color"
 ```
 
 !!! note
-    The container reads `/etc/saneless/saneless.toml` from the mounted `./config` directory. If `saneless.toml` is missing, saneless uses its defaults plus environment variables and the container still starts; it does not create the file for you. The directory must be writable, because `saneless auto-profiles` and the profile generation at startup rewrite `saneless.toml` there once it exists. Neither one creates it. Without `saneless.toml`, the server keeps the profiles it generates in memory only, and `docker compose exec saneless saneless auto-profiles` writes `/var/lib/saneless/saneless.toml` (the image's working directory is the durable data directory, so `./saneless.toml` resolves there) instead of anything in `./config`. That file sits in the data volume, so it survives container recreation -- and saneless loads it ahead of any `saneless.toml` you add later, which means it goes on shadowing your real config until you delete it. So before you run `auto-profiles` in the container, create the file with `touch config/saneless.toml` (an empty file is a valid config). Keep only `saneless.toml` in the directory, and do not let untrusted users write to it.
+    The container reads `/etc/saneless/saneless.toml` from the mounted `./config` directory. If `saneless.toml` is missing, saneless uses its defaults plus environment variables and the container still starts. The directory must be writable by the container, because `saneless auto-profiles` and the profile generation at startup rewrite `saneless.toml` there. With no `saneless.toml`, `docker compose exec saneless saneless auto-profiles` creates `/etc/saneless/saneless.toml` in the mounted `./config` directory, because that directory exists and the container can write to it; you do not need to create the file first. The new file has mode `0600`, and when the command runs as root it is given the directory's owner. The profile generation at startup never creates the file: without `saneless.toml`, the server keeps the profiles it generates in memory only. If the container cannot write to `./config`, `auto-profiles` does not fall back to the data volume. It tries the per-user file under the container user's home instead, which the image does not provide, and exits 2 naming it; fix the ownership as the next note describes and run it again. Keep only `saneless.toml` in the directory, and do not let untrusted users write to it.
 
 !!! note "If your user ID is not 1000"
     The container runs as UID/GID **1000**, not root, so it writes to `./config` as 1000 no matter who owns the directory on the host. On a single-user Linux machine your own account is already 1000 and the directory you just created belongs to it, so there is nothing to do. If `id -u` reports anything else, hand the directory over once:
@@ -344,10 +344,23 @@ which, if you followed this guide, is not the paperless-ngx connection.
 
 **You will not have to guess.** The status page's first row, Configuration, turns **red** and names both the `/etc/saneless/config.toml` it found and the `/etc/saneless/saneless.toml` rename that fixes it. `saneless doctor` shows the same row and exits 2.
 
-!!! warning "If you ran `auto-profiles` in the container before renaming"
-    With no config file loaded, `docker compose exec saneless saneless auto-profiles` writes `/var/lib/saneless/saneless.toml`, which sits in the data volume and loads ahead of `/etc/saneless`. Once that file exists the Configuration row is **amber** instead of red: a config file did load, and your `/etc/saneless/config.toml` is a leftover beside the loaded `/var/lib/saneless/saneless.toml`.
+!!! warning "If an earlier release's `auto-profiles` ran in the container before you renamed"
+    An earlier release's `auto-profiles`, run with no config file loaded, wrote `/var/lib/saneless/saneless.toml` into the data volume, and that file loads ahead of `/etc/saneless`. The current release never writes there, and it refuses to write anything while an old `config.toml` is the only config file found. If that volume file exists, the Configuration row is **amber** instead of red: a config file did load, and your `/etc/saneless/config.toml` is a leftover beside the loaded `saneless.toml`.
 
-    That leftover is probably the only copy of your paperless-ngx URL and token. **Move anything you still need into the file that is actually loaded first, and delete the leftover only afterwards.** Deleting it first throws the token away.
+    That leftover is probably the only copy of your paperless-ngx URL and token. **Rename it first**, as above, so that it becomes `config/saneless.toml`. The row stays amber, now naming the volume file as the one in use and `/etc/saneless/saneless.toml` as a second file that is not read. The row's next step says to move what you need into the file in use; in the container, do it the other way round, because the file to keep is the one in `./config`. Print the volume file:
+
+    ```bash
+    docker compose exec saneless cat /var/lib/saneless/saneless.toml
+    ```
+
+    Copy anything you still need from it into `config/saneless.toml` on the host. Only then delete it and restart:
+
+    ```bash
+    docker compose exec saneless rm /var/lib/saneless/saneless.toml
+    docker compose restart saneless
+    ```
+
+    Deleting either file before its contents are merged throws the token away.
 
 **A `config.toml` that belongs to something else.** saneless searches its own working directory, so an unrelated tool's `config.toml` sitting there is reported in exactly the same way -- saneless reads only `saneless.toml` and cannot tell whose file it is. Move that file, or run saneless from a directory of its own.
 
