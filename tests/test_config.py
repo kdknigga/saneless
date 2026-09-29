@@ -1075,7 +1075,25 @@ class TestTomlKeyCaseContract:
             tmp_config_dir / "miscased_profile.toml",
             '[profiles.Default]\nsource = "ADF"\n',
         )
-        assert "A 'default' profile must be defined in config" in str(err)
+        assert "[profiles.default] table is required" in str(err)
+        assert "Value error" not in str(err)
+
+    def test_missing_default_profile_is_named_without_a_pydantic_prefix(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A config with no ``[profiles.default]`` says which table is missing."""
+        err = _load_error(
+            tmp_config_dir / "no_default.toml",
+            '[profiles.receipts]\nsource = "ADF"\n',
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if "[profiles.default] table is required" in line
+        ]
+        assert len(matching) == 1, str(err)
+        assert "Value error" not in matching[0]
+        assert "scan uses when none is named" in matching[0]
 
 
 _HOSTILE_SECRET = "tok-SECRET-4f1c9ba27e5d8031-DISTINCTIVE"
