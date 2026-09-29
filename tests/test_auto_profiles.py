@@ -16,6 +16,7 @@ from saneless.auto_profiles import (
     ProfileWriteResult,
     _profile_description,
     _profile_label,
+    _snap_into_range,
     device_type_of,
     generate_profiles,
     is_bare_default,
@@ -322,6 +323,58 @@ class TestPickClosestResolutionHonoursARange:
 
         assert profiles["flatbed"].resolution == 200
         assert profiles["default"].resolution == 200
+
+
+class TestSnapIntoRange:
+    """
+    The resolution snap only ever offers a value on the device's step grid.
+
+    A range says the device accepts its minimum plus whole multiples of its
+    step, up to its maximum. The maximum itself need not be on that grid, so
+    clamping to it can produce a value the device never offered. Ties go up, so
+    an equidistant pick is never below the target, and the coercion to whole
+    dpi rounds half up rather than to the nearest even number.
+    """
+
+    @pytest.mark.parametrize(
+        ("target", "resolution_range", "expected"),
+        [
+            (300, (50.0, 200.0, 100.0), 150),
+            (300, (100.0, 250.0, 100.0), 200),
+            (300, (75.0, 1200.0, 150.0), 375),
+            (300, (50.0, 1200.0, 100.0), 350),
+            (300, (100.0, 1200.0, 0.0), 300),
+            (5000, (100.0, 1200.0, 0.0), 1200),
+            (10, (100.0, 1200.0, 0.0), 100),
+            (300, (100.0, 1200.0, 0.5), 300),
+            (100, (150.5, 600.0, 0.0), 151),
+        ],
+        ids=[
+            "off-grid-maximum-snaps-down-to-the-grid",
+            "off-grid-maximum-with-an-aligned-minimum",
+            "tie-goes-up-on-an-odd-step-count",
+            "tie-goes-up-on-an-even-step-count",
+            "continuous-range-keeps-the-target",
+            "continuous-range-clamps-to-the-maximum",
+            "continuous-range-clamps-to-the-minimum",
+            "fractional-step-keeps-an-on-grid-target",
+            "whole-dpi-coercion-rounds-half-up",
+        ],
+    )
+    def test_snap_stays_on_grid(
+        self,
+        target: int,
+        resolution_range: tuple[float, float, float],
+        expected: int,
+    ) -> None:
+        """Each case lands in the range, on the grid, with ties going up."""
+        result = _snap_into_range(target, resolution_range)
+
+        assert result == expected
+        low, high, step = resolution_range
+        assert low <= result <= high
+        if step > 0:
+            assert (result - low) % step == 0
 
 
 class TestPickPreferredMode:
