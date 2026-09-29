@@ -24,7 +24,6 @@ import traceback
 from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Final, assert_never
 from uuid import uuid4
 
@@ -43,6 +42,7 @@ from .checks import (
     CheckState,
     check_name,
     configuration_check,
+    leftover_config_check,
     run_checks,
     worst_state,
 )
@@ -50,6 +50,7 @@ from .config import (
     CONFIG_FILENAME,
     Settings,
     config_file_state,
+    config_search_paths,
     is_placeholder_token,
     load_settings,
     log_config_sources,
@@ -131,6 +132,7 @@ from .workspace import sweep_orphans
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
     from types import FrameType
     from typing import TextIO
 
@@ -1216,7 +1218,8 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
 
 
 # The two situations in which a file under the superseded name is sitting in a
-# searched directory doing nothing.  Named once, because three places ask.
+# searched directory doing nothing.  Named once, so the stderr warning below
+# says the same thing the Configuration row does about the same situations.
 _SUPERSEDED_NAME_STATES: Final = (
     ConfigFileState.STALE_ONLY,
     ConfigFileState.LOADED_WITH_LEFTOVER,
@@ -1225,28 +1228,43 @@ _SUPERSEDED_NAME_STATES: Final = (
 
 def _warn_stale_config(settings: Settings) -> None:
     """
-    Say on stderr that a file under the old name is being ignored, if one is.
+    Say on stderr which config file is not being read, if one is not.
 
-    The startup log already says it, and on a service that is enough, because
-    the records stream to the same terminal the operator is watching.  A
-    one-shot command writes its log to ``log_file`` and is read afterwards if
-    at all, so the person who just ran ``saneless scan`` and got the defaults
-    sees nothing at all -- which is the failure this phase exists to remove,
-    in miniature.
+    Two situations.  A file under the old name is being ignored; or a second
+    ``saneless.toml`` is sitting in a later searched directory, so the file an
+    operator edits may not be the one saneless reads.  The startup log already
+    says both, and on a service that is enough, because the records stream to
+    the same terminal the operator is watching.  A one-shot command writes its
+    log to ``log_file`` and is read afterwards if at all, so the person who
+    just ran ``saneless scan`` and got the defaults, or the other file's
+    settings, sees nothing at all -- which is the failure this phase exists to
+    remove, in miniature.
 
     The words are not written here.  ``configuration_check`` holds the one
     copy of them, and the terminal spelling is the same sentence with the file
-    named by its resolved path, which a terminal may carry and the LAN-visible
-    status strip may not.
+    named by its absolute path, which a terminal may carry and the LAN-visible
+    status strip may not.  The row can show only one situation, and a shadowed
+    file outranks an old-name leftover there; the terminal has room for both,
+    and the leftover may hold the only copy of the Paperless URL and token, so
+    it gets its own line from ``leftover_config_check``.
 
     Args:
         settings: The settings in hand, carrying the search that built them.
 
     """
-    if config_file_state(settings) not in _SUPERSEDED_NAME_STATES:
+    state = config_file_state(settings)
+    if state is ConfigFileState.LOADED_WITH_SHADOWED:
+        rows = [
+            configuration_check(settings, absolute_paths=True),
+            leftover_config_check(settings, absolute_paths=True),
+        ]
+    elif state in _SUPERSEDED_NAME_STATES:
+        rows = [configuration_check(settings, absolute_paths=True)]
+    else:
         return
-    row = configuration_check(settings, absolute_paths=True)
-    click.echo(f"Warning: {row.message} {row.next_step}", err=True)
+    for row in rows:
+        if row is not None:
+            click.echo(f"Warning: {row.message} {row.next_step}", err=True)
 
 
 def _load_cli_settings(
@@ -2215,6 +2233,41 @@ def _echo_write_result(
             )
 
 
+def _new_config_target(settings: Settings) -> Path:
+    """
+    Choose where ``auto-profiles`` creates a config file when none was loaded.
+
+    The last documented location saneless may write, because the search reads
+    in order and stops at the first file: a new file in ``./`` -- which in the
+    container is the working directory ``/var/lib/saneless`` -- would outrank
+    ``/etc/saneless`` on the next start, and the command meant to help would
+    have built the shadowing trap itself.  So the system file is the target
+    when its directory already exists and this process may write it; that is
+    the directory the container's ``./config`` mount provides.  It must already
+    exist because saneless never creates a system directory, even as root.
+    Otherwise the per-user XDG file is the target, which nothing but the
+    working-directory file outranks.
+
+    The candidates are the ones the load searched, so this reads the same list
+    in the same order and cannot drift from it; settings built without a load
+    fall back to the search list itself.  Nothing is created here.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+
+    Returns:
+        The file to create, absolute.
+
+    """
+    discovery = settings.config_discovery
+    searched = discovery.searched if discovery is not None else ()
+    candidates = searched if len(searched) > 1 else config_search_paths()
+    system, user = candidates[-1], candidates[1]
+    if system.parent.is_dir() and os.access(system.parent, os.W_OK):
+        return system.absolute()
+    return user.absolute()
+
+
 @cli.command(name="auto-profiles")
 @click.option(
     "--force",
@@ -2237,8 +2290,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     settings = _load_cli_settings(ctx, warn_stale=False)
     if config_file_state(settings) is ConfigFileState.STALE_ONLY:
         # This command is the only thing in saneless that creates a config
-        # file, and with nothing loaded its target is ./saneless.toml -- the
-        # first path the next start looks at.  Writing it now would not lose
+        # file, and with nothing loaded its target is a saneless.toml in a
+        # searched directory -- which the next start loads.  Writing it now
+        # would not lose
         # the old file's URL and token but would permanently shadow them: the
         # search would stop at the new file, the row telling the operator to
         # rename the old one would go green, and the appliance would keep
@@ -2277,15 +2331,25 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     profiles = generate_profiles(caps, device_type_of(device_list, device_id))
 
     # The file that was loaded (including an explicit --config). With no loaded
-    # file the target is the one config filename in the working directory, and
-    # the output names the resolved absolute path so the operator sees where it
-    # went. Built from the constant, so the target followed the rename without
-    # anyone having to remember this line.
-    config_path = settings.config_path or Path(CONFIG_FILENAME)
+    # file the target is the last documented location that is writable, never
+    # the working directory, whose file would outrank every other on the next
+    # start; _new_config_target has the reasoning.  Chosen before the write so
+    # a failure below can always name it, and the output names it absolutely
+    # so the operator sees where it went.
+    config_path = settings.config_path or _new_config_target(settings)
     # A ConfigError here (a single-file bind mount, a non-UTF-8 file, or
     # merged text that would not parse) names the file and the fix; the group
-    # guard prints it as-is and exits 2, with no traceback.
+    # guard prints it as-is and exits 2, with no traceback.  An OSError --
+    # including a per-user directory that cannot be created, as in a container
+    # whose HOME does not exist -- ends the same way, naming the target.
     try:
+        # Only a new file's directory is created: the system target's
+        # directory exists by construction, so this is only ever the XDG
+        # ``saneless`` directory, made private because the file may later
+        # hold the Paperless token.  The file itself is 0600 and takes its
+        # directory's owner, which the atomic writer sees to.
+        if settings.config_path is None and not config_path.parent.is_dir():
+            config_path.parent.mkdir(mode=0o700, parents=True)
         result = write_profiles_to_config(
             config_path, profiles, force=force, device=pin
         )
@@ -2393,13 +2457,22 @@ _MARKER_WIDTH = max(
 _NAME_COL_WIDTH = max(len(check_name(key)) for key in CheckKey)
 _NEXT_STEP_INDENT = " " * (_MARKER_WIDTH + 1 + _NAME_COL_WIDTH + 1)
 
-# The config resolution table's caption and its five verdicts, one per line.
-# "used" and "not used" are about the search; "ignored" and "leftover" are
-# about a file under the superseded name, and they differ because the two
-# situations differ -- in one nothing was loaded and the file is the reason, in
-# the other something was loaded and the file is merely still there.
+# The config resolution table's caption and its six verdicts, one per line.
+# "used", "not used" and "same file" are about the search -- the last is a
+# candidate that names a file already listed, such as ./saneless.toml when run
+# from inside the XDG directory; "ignored" and "leftover" are about a file under
+# the superseded name, and they differ because the two situations differ -- in
+# one nothing was loaded and the file is the reason, in the other something was
+# loaded and the file is merely still there.
 _RESOLUTION_CAPTION: Final = "Config files searched, in order:"
-_RESOLUTION_LABELS: Final = ("used", "not used", "not found", "ignored", "leftover")
+_RESOLUTION_LABELS: Final = (
+    "used",
+    "not used",
+    "same file",
+    "not found",
+    "ignored",
+    "leftover",
+)
 # Derived, like the row widths above and for the same reason: respelling a
 # verdict must not be able to break the column silently.
 _RESOLUTION_LABEL_WIDTH: Final = max(len(label) for label in _RESOLUTION_LABELS)
@@ -2438,6 +2511,10 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
     program that is not running -- and the whole point of the table is to
     explain the settings the process is holding.
 
+    Each candidate is ``used``, ``not used`` (an earlier file won), ``same
+    file`` (a file already listed, reached through another spelling) or ``not
+    found``; each superseded-name file is ``ignored`` or ``leftover``.
+
     Args:
         settings: The settings in hand, carrying the search that built them.
 
@@ -2457,8 +2534,19 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
             )
         ]
     lines = []
+    listed: set[Path] = set()
     for candidate in discovery.searched:
-        if candidate == discovery.loaded:
+        # One file reached through a second candidate is listed once more,
+        # as itself: never "not used", which would claim a second file went
+        # unread, and never "not found", which would claim the path is empty.
+        # Two candidates can even be spelled alike (run from inside the XDG
+        # directory, ./saneless.toml is the XDG file), so a spelling already
+        # listed counts as well as a recorded alias.
+        if candidate in listed or (
+            candidate in discovery.duplicates and candidate not in discovery.found
+        ):
+            lines.append(_resolution_line("same file", candidate, " (already listed)"))
+        elif candidate == discovery.loaded:
             lines.append(_resolution_line("used", candidate))
         elif candidate in discovery.found:
             lines.append(
@@ -2466,6 +2554,7 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
             )
         else:
             lines.append(_resolution_line("not found", candidate))
+        listed.add(candidate)
     # A superseded-name file beside a candidate. Which verdict it gets is the
     # same distinction the Configuration row draws: with nothing loaded it is
     # the reason there is no configuration, and with something loaded it is

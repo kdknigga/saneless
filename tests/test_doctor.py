@@ -915,6 +915,42 @@ class TestDoctorConfigResolutionTable:
         lines = self._run(monkeypatch, tmp_path, discover_config(()))
         assert lines == ["none recorded"]
 
+    def test_doctor_lists_one_file_seen_twice_as_the_same_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Run from inside the XDG directory, ``./saneless.toml`` is the XDG file.
+
+        One file reached through two candidates is one file: listed once as
+        used, and once more as the same file, so the table neither claims a
+        second file was not read nor that the path held nothing.  Nothing is
+        amiss, so the Configuration row stays quiet as well.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[1].write_text("# in use\n")
+        monkeypatch.chdir(candidates[1].parent)
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(
+            (Path(CONFIG_FILENAME), candidates[1], candidates[2])
+        )
+        runner = _patch_doctor(monkeypatch, settings)
+        monkeypatch.setattr(
+            "saneless.cli.run_checks",
+            lambda context: _all_ok_but_real_configuration(context.settings),
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        lines = _table(result.output)
+        assert lines == [
+            f"used {candidates[1]}",
+            f"same file {candidates[1]} (already listed)",
+            f"not found {candidates[2]}",
+        ]
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        configuration = rows[list(CheckKey).index(CheckKey.CONFIGURATION)]
+        assert not configuration.startswith(_state_marker(CheckState.WARN))
+
     def test_the_paths_line_up_under_one_label_column(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -972,6 +1008,43 @@ class TestDoctorExitsOnTheConfigurationRow:
         assert configuration.startswith(_state_marker(CheckState.FAIL))
         assert f"saneless now reads {CONFIG_FILENAME}" in configuration
         assert str(stale.absolute()) in result.output
+
+    def test_doctor_warns_on_a_shadowed_config_and_exits_0(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Two config files are amber, named on the row, in the table and on stderr.
+
+        Amber and not red: the appliance runs on the file it found first, and a
+        second file may be deliberate.  So a scripted gate stays green while
+        every terminal surface says which file won.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[0].write_text("# in use\n")
+        candidates[2].write_text("# not read\n")
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(candidates)
+        runner = _patch_doctor(monkeypatch, settings)
+        monkeypatch.setattr(
+            "saneless.cli.run_checks",
+            lambda context: _all_ok_but_real_configuration(context.settings),
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        configuration = rows[list(CheckKey).index(CheckKey.CONFIGURATION)]
+        assert configuration.startswith(_state_marker(CheckState.WARN))
+        table = _table(result.stdout)
+        assert f"used {candidates[0]}" in table
+        assert f"not used {candidates[2]} (an earlier file won)" in table
+        warnings = [
+            line for line in result.stderr.splitlines() if line.startswith("Warning: ")
+        ]
+        assert len(warnings) == 1, result.stderr
+        assert warnings[0].startswith(f"Warning: Using {candidates[0]}")
+        assert str(candidates[2]) in warnings[0]
 
     def test_no_config_file_at_all_still_exits_zero(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
