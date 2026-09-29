@@ -1339,6 +1339,153 @@ class TestFeederSide:
         assert classify_source(source) is SourceKind.FEEDER
 
 
+# Source sets as real SANE backends report them. The two named by the unique
+# label requirement come first: a flatbed-plus-feeder device (epsonds) and a
+# sheet-fed one (fujitsu, canon_dr, kodak, epjitsu, avision).
+_FLATBED_AND_FEEDER = ["Flatbed", "ADF Front", "ADF Duplex"]
+_SHEET_FED = ["ADF Front", "ADF Back", "ADF Duplex"]
+# brother4: two feeder sources, neither naming a side.
+_BROTHER4 = [
+    "FlatBed",
+    "Automatic Document Feeder(left aligned)",
+    "Automatic Document Feeder(centrally aligned)",
+]
+# epson2: two sources the classifier does not recognise.
+_EPSON2 = ["Flatbed", "Automatic Document Feeder", "Transparency Unit", "TPU8x10"]
+_TWO_FLATBEDS = ["Flatbed", "Flatbed 2", "ADF"]
+
+
+def _labels_by_source(profiles: dict[str, ProfileConfig]) -> dict[str, str]:
+    """Map each non-default generated profile's source to its label."""
+    return {
+        profile.source: profile.label
+        for name, profile in profiles.items()
+        if name != "default"
+    }
+
+
+def _generate(sources: list[str]) -> dict[str, ProfileConfig]:
+    """Generate profiles for ``sources`` with a resolution and a mode."""
+    return generate_profiles(
+        DeviceCapabilities(
+            sources=sources, resolutions=[150, 300, 600], modes=["Gray", "Color"]
+        )
+    )
+
+
+class TestGeneratedLabelsAreUnique:
+    """
+    No two generated options share a label, and ``default`` is an exact twin.
+
+    Labels stay developer constants: a second holder of a label gets an
+    integer ordinal appended, never anything from the source name.
+    """
+
+    @pytest.mark.parametrize(
+        "sources",
+        [_FLATBED_AND_FEEDER, _SHEET_FED, _BROTHER4, _EPSON2, _TWO_FLATBEDS],
+        ids=["flatbed-and-feeder", "sheet-fed", "brother4", "epson2", "two-flatbeds"],
+    )
+    def test_generated_labels_are_unique_per_source_set(
+        self, sources: list[str]
+    ) -> None:
+        """Every option the dropdown offers can be told apart by its label."""
+        labels = list(_labels_by_source(_generate(sources)).values())
+        assert len(labels) == len(sources)
+        assert len(set(labels)) == len(labels), labels
+
+    def test_brother4_feeders_get_an_ordinal_label_in_source_order(self) -> None:
+        """The second unsided feeder reads as the first, plus 2."""
+        labels = _labels_by_source(_generate(_BROTHER4))
+        assert labels["Automatic Document Feeder(left aligned)"] == (
+            "Feeder, single-sided"
+        )
+        assert labels["Automatic Document Feeder(centrally aligned)"] == (
+            "Feeder, single-sided 2"
+        )
+        assert labels["FlatBed"] == "Glass (flatbed)"
+
+    def test_brother4_feeder_descriptions_stay_the_base_sentence(self) -> None:
+        """Only the dropdown text must differ; the sentence is true of both."""
+        descriptions = {
+            profile.description
+            for profile in _generate(_BROTHER4).values()
+            if profile.source.startswith("Automatic Document Feeder")
+        }
+        assert descriptions == {_profile_description("Automatic Document Feeder")}
+
+    @pytest.mark.parametrize(
+        ("sources", "expected"),
+        [
+            (
+                _EPSON2,
+                {
+                    "Transparency Unit": "Scanner source",
+                    "TPU8x10": "Scanner source 2",
+                },
+            ),
+            (
+                _TWO_FLATBEDS,
+                {"Flatbed": "Glass (flatbed)", "Flatbed 2": "Glass (flatbed) 2"},
+            ),
+        ],
+        ids=["epson2-unrecognised", "two-flatbeds"],
+    )
+    def test_any_repeated_label_gets_an_ordinal(
+        self, sources: list[str], expected: dict[str, str]
+    ) -> None:
+        """Two sources of one kind follow the same rule, whatever the kind."""
+        labels = _labels_by_source(_generate(sources))
+        for source, label in expected.items():
+            assert labels[source] == label
+
+    @pytest.mark.parametrize(
+        "sources",
+        [_FLATBED_AND_FEEDER, _SHEET_FED, _BROTHER4, _EPSON2, _TWO_FLATBEDS, ["Auto"]],
+        ids=[
+            "flatbed-and-feeder",
+            "sheet-fed",
+            "brother4",
+            "epson2",
+            "two-flatbeds",
+            "auto-only",
+        ],
+    )
+    def test_default_is_a_whole_model_twin_of_the_profile_it_copies(
+        self, sources: list[str]
+    ) -> None:
+        """``default`` equals its backing profile as a whole model, text included."""
+        profiles = _generate(sources)
+        default = profiles["default"]
+        twins = [
+            name
+            for name, profile in profiles.items()
+            if name != "default" and profile == default
+        ]
+        assert len(twins) == 1, twins
+        assert profiles[twins[0]].source == default.source
+
+    def test_refresh_keeps_the_ordinal_labels_in_the_file(self, tmp_path: Path) -> None:
+        """A write and a forced refresh both keep each feeder's own label."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("")
+        write_profiles_to_config(config_file, _generate(_BROTHER4))
+        write_profiles_to_config(config_file, _generate(_BROTHER4), force=True)
+
+        tables = tomllib.loads(config_file.read_text())["profiles"]
+        labels = {
+            table["source"]: table["label"]
+            for name, table in tables.items()
+            if name != "default"
+        }
+        assert labels["Automatic Document Feeder(left aligned)"] == (
+            "Feeder, single-sided"
+        )
+        assert labels["Automatic Document Feeder(centrally aligned)"] == (
+            "Feeder, single-sided 2"
+        )
+
+
 class TestGenerateProfilesSlugCollision:
     """Two names that normalise alike both survive, with a tie-break (Q5)."""
 
@@ -2061,12 +2208,16 @@ auto_generated = true
                 resolution=300,
                 mode="Color",
                 auto_generated=True,
+                label=_profile_label("ADF Front"),
+                description=_profile_description("ADF Front"),
             ),
             "handwritten": ProfileConfig(
                 source="ADF Front",
                 resolution=300,
                 mode="Color",
                 auto_generated=True,
+                label=_profile_label("ADF Front"),
+                description=_profile_description("ADF Front"),
             ),
         }
 
@@ -2104,14 +2255,44 @@ auto_generated = true
         This is what makes Phase 27 D-03's delete branch unreachable for the
         two free-text keys.
         """
+        profile = ProfileConfig(
+            source=source,
+            resolution=300,
+            mode="Color",
+            auto_generated=True,
+            label=_profile_label(source),
+            description=_profile_description(source),
+        )
+        values = auto_profiles._generated_values(profile)
+        assert values["label"] == profile.label
+        assert values["description"] == profile.description
+        assert list(values)[:2] == ["label", "description"]
+
+    def test_generated_values_writes_the_profile_label_not_a_rederived_one(
+        self,
+    ) -> None:
+        """
+        The written text is the generated profile's own, ordinal included.
+
+        A label depends on the whole source set once two sources share one, so
+        the source name alone cannot reproduce it; re-deriving it here would
+        write both feeders of a pair under the same name.
+        """
         values = auto_profiles._generated_values(
             ProfileConfig(
-                source=source, resolution=300, mode="Color", auto_generated=True
+                source="ADF",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+                label="Feeder, single-sided 2",
+                description="Scans one side of every page using the document feeder.",
             )
         )
-        assert values["label"] == _profile_label(source)
-        assert values["description"] == _profile_description(source)
-        assert list(values)[:2] == ["label", "description"]
+        assert values["label"] == "Feeder, single-sided 2"
+        assert (
+            values["description"]
+            == "Scans one side of every page using the document feeder."
+        )
 
     def test_force_overwrites_a_hand_typed_label_and_description(
         self, tmp_path: Path
@@ -2600,6 +2781,34 @@ class TestDurableConfigWrite:
             and str(real.resolve()) in record.getMessage()
         ]
         assert len(messages) == 1
+
+    def test_symlinked_parent_directory_logs_no_symlink_line(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A regular config reached through a linked directory is no symlink.
+
+        The file written is the file named, so a line calling it a symlink
+        would send the operator looking for a link that does not exist.
+        """
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        linked_dir = tmp_path / "linked"
+        linked_dir.symlink_to(real_dir, target_is_directory=True)
+        config_file = linked_dir / "saneless.toml"
+        config_file.write_text('[profiles.default]\nsource = "Flatbed"\n')
+        assert not config_file.is_symlink()
+
+        with caplog.at_level(logging.INFO, logger="saneless.auto_profiles"):
+            write_profiles_to_config(config_file, self._generated())
+
+        assert "flatbed" in tomllib.loads(config_file.read_text())["profiles"]
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == "saneless.auto_profiles"
+            and "(symlink to" in record.getMessage()
+        ]
 
 
 class TestDevicePin:
