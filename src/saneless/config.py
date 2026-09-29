@@ -397,11 +397,26 @@ def _xdg_base(variable: str, *fallback: str) -> Path:
         The variable's value when it is a non-empty absolute path, else
         ``$HOME`` joined with ``fallback``.
 
+    Raises:
+        ConfigError: The fallback is needed and there is no home directory:
+            ``HOME`` is unset and this user has no password-database entry,
+            as in a container run under an arbitrary uid.
+
     """
     value = os.environ.get(variable, "")
     if value and Path(value).is_absolute():
         return Path(value)
-    return Path.home().joinpath(*fallback)
+    try:
+        home = Path.home()
+    except RuntimeError:
+        # Path.home() says only "Could not determine home directory."; the
+        # operator needs to know which variables stand in for it.
+        msg = (
+            "Cannot determine the home directory: set HOME, or set "
+            "XDG_CONFIG_HOME and XDG_STATE_HOME to absolute paths"
+        )
+        raise ConfigError(msg) from None
+    return home.joinpath(*fallback)
 
 
 def xdg_config_home() -> Path:
@@ -413,6 +428,10 @@ def xdg_config_home() -> Path:
 
     Returns:
         The base directory user configuration files are searched under.
+
+    Raises:
+        ConfigError: ``$XDG_CONFIG_HOME`` is not usable and there is no home
+            directory to fall back to.
 
     """
     return _xdg_base("XDG_CONFIG_HOME", ".config")
@@ -427,6 +446,10 @@ def xdg_state_home() -> Path:
 
     Returns:
         The base directory durable state (database, log) defaults live under.
+
+    Raises:
+        ConfigError: ``$XDG_STATE_HOME`` is not usable and there is no home
+            directory to fall back to.
 
     """
     return _xdg_base("XDG_STATE_HOME", ".local", "state")
@@ -2080,22 +2103,34 @@ def _nearest_existing_ancestor(path: Path) -> Path:
 
 def _require_writable(label: str, directory: Path) -> None:
     """
-    Raise ConfigError unless ``directory`` could be written or created.
+    Raise ConfigError unless ``directory`` is, or could be created as, a directory.
 
     A missing directory is judged by its nearest existing ancestor, since that
     is where creating it would fail -- not just by an immediate parent that
     may not exist either.
+
+    The type is checked before writability, because ``os.access`` calls a
+    regular file writable: a ``data_dir`` that is a file, or that sits under
+    one, would otherwise pass here and fail mid-scan.
 
     Args:
         label: The setting name, e.g. ``data_dir``, for the message.
         directory: The configured directory.
 
     Raises:
-        ConfigError: If the directory, or its nearest existing ancestor when
-            the directory is missing, is not writable.
+        ConfigError: If the directory exists and is not a directory, if it is
+            missing and its nearest existing ancestor is not a directory, or
+            if the directory, or that ancestor when it is missing, is not
+            writable.
 
     """
     ancestor = _nearest_existing_ancestor(directory)
+    if not ancestor.is_dir():
+        if ancestor == directory:
+            msg = f"{label} is not a directory: {directory}"
+        else:
+            msg = f"{label} parent is not a directory: {ancestor}"
+        raise ConfigError(msg)
     if os.access(ancestor, os.W_OK):
         return
     if ancestor == directory:
@@ -2107,13 +2142,15 @@ def _require_writable(label: str, directory: Path) -> None:
 
 def validate_settings_dirs(settings: Settings) -> None:
     """
-    Fail fast with ConfigError if a configured directory is unwritable or unsafe.
+    Fail fast with ConfigError if a configured directory is unusable or unsafe.
 
-    Validates directory writability at startup so permission errors surface
-    immediately rather than mid-scan, or - for data_dir - at the moment a
-    failed scan needs preserving. Raises ConfigError (not ValueError) for
-    writability failures. A missing directory is checked against its nearest
-    existing ancestor, so ``<unwritable>/a/b/c`` fails here too.
+    Validates each directory at startup so errors surface immediately rather
+    than mid-scan, or - for data_dir - at the moment a failed scan needs
+    preserving. Raises ConfigError (not ValueError). A setting that names a
+    file, or a path under a file, is refused as not a directory; otherwise it
+    must be writable. A missing directory is checked against its nearest
+    existing ancestor, so ``<unwritable>/a/b/c`` and ``<file>/a/b`` fail here
+    too.
 
     An existing ``tmp_dir`` must also be private: a symlink, a directory
     owned by another user, or one with group- or world-write is refused, as
@@ -2124,8 +2161,8 @@ def validate_settings_dirs(settings: Settings) -> None:
         settings: Application settings to validate.
 
     Raises:
-        ConfigError: If any configured directory is not writable, or an
-            existing ``tmp_dir`` is not safe to use.
+        ConfigError: If any configured directory is not a directory or not
+            writable, or an existing ``tmp_dir`` is not safe to use.
 
     """
     tmp_dir = settings.output.tmp_dir
