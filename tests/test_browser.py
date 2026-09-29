@@ -35,7 +35,7 @@ import re
 import socket
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
@@ -66,6 +66,7 @@ import uvicorn
 from PIL import Image
 from playwright.sync_api import expect
 
+from saneless.auto_profiles import generate_profiles
 from saneless.checks import (
     CHECKING_GLYPH,
     CHECKING_MESSAGE,
@@ -93,7 +94,7 @@ from saneless.config import (
 )
 from saneless.job import JobResult
 from saneless.paperless import ApiDelivery, TaskFiled, UploadResult
-from saneless.scanner.base import DeviceInfo, ScanBatch
+from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
     HIDDEN_PRESERVED_ERROR,
@@ -3728,6 +3729,217 @@ class TestProfileDefaultsInTheBrowser:
         expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
         expect(status).to_contain_text("Done: Cleared Default")
         expect(status).not_to_contain_text(_GONE_TAG_WARNING)
+
+
+# ---------------------------------------------------------------------------
+# Which profile the page opens on, and what the Profile select offers.
+#
+# Every other browser fixture lists ``default`` first, so none of them can tell
+# "the page opens on default" from "the page opens on the first option".  Each
+# set here puts something else first.
+# ---------------------------------------------------------------------------
+
+_OPENING_DESCRIPTION = "The everyday scan: bank letters, filed to Acme Water."
+"""The description only ``default`` carries in the opening-profile set."""
+
+_FLATBED_AND_FEEDER = DeviceCapabilities(
+    sources=["Flatbed", "ADF"], resolutions=[150, 300], modes=["Color", "Gray"]
+)
+"""A device with a glass and a single-sided feeder."""
+
+_FEEDERS_ONLY = DeviceCapabilities(
+    sources=["Auto", "ADF Duplex", "ADF"],
+    resolutions=[150, 300],
+    modes=["Color", "Gray"],
+)
+"""A sheet-fed device: an automatic source and two feeders, and no glass."""
+
+
+@pytest.fixture
+def serve_profiles(
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[dict[str, ProfileConfig]], _BrowserServer]]:
+    """
+    Return an opener that serves a private app with the given profiles.
+
+    Built like ``defaults_server``: the server is added to the egress
+    allowlist and paperless-ngx is patched to answer the defaults tag and
+    correspondent lists, so a profile's ticks and choice can render.  Nothing
+    here scans -- every submit is captured -- so no delivery is patched in.
+    The server stops when the test ends.
+    """
+    with ExitStack() as stack:
+
+        def _open(profiles: dict[str, ProfileConfig]) -> _BrowserServer:
+            """Serve ``profiles`` and return the running server."""
+            base = _browser_test_settings(tmp_path)
+            settings = base.model_copy(update={"profiles": profiles})
+            server = stack.enter_context(_serve(settings, _BrowserTestScanner()))
+            egress_allowlist.append(server.url)
+            paperless = server.app.state.paperless
+            monkeypatch.setattr(paperless, "get_tags", _answer_list(_DEFAULTS_TAGS))
+            monkeypatch.setattr(
+                paperless,
+                "get_correspondents",
+                _answer_list(_DEFAULTS_CORRESPONDENTS),
+            )
+            server.app.state.cache.invalidate("tags")
+            server.app.state.cache.invalidate("correspondents")
+            return server
+
+        yield _open
+
+
+def _option_texts(page: Page) -> list[str]:
+    """
+    Return the Profile select's option texts, in page order.
+
+    Args:
+        page: The browser page.
+
+    Returns:
+        What each option reads.
+
+    """
+    return page.locator("#profile-select option").all_text_contents()
+
+
+@pytest.mark.browser
+class TestProfileDefaultsPreselection:
+    """The page opens on what ``saneless scan`` uses, each option offered once."""
+
+    def test_the_page_opens_on_default_listed_last(
+        self,
+        page: Page,
+        serve_profiles: Callable[[dict[str, ProfileConfig]], _BrowserServer],
+    ) -> None:
+        """
+        ``default`` is selected, described, ticked and submitted from last place.
+
+        The two profiles ahead of it carry defaults and a description of their
+        own, so a page that opened on the first option would show and send
+        tag 32, no correspondent and the glass sentence instead.
+        """
+        server = serve_profiles(
+            {
+                "flatbed": ProfileConfig(
+                    source="Flatbed",
+                    description=_FLATBED_DESCRIPTION,
+                    default_tags=[32],
+                ),
+                "adf": ProfileConfig(source="ADF", description=_FEEDER_DESCRIPTION),
+                "default": ProfileConfig(
+                    source="Flatbed",
+                    description=_OPENING_DESCRIPTION,
+                    default_tags=[31],
+                    default_correspondent=41,
+                ),
+            }
+        )
+        page.goto(server.url)
+
+        assert _option_texts(page) == ["flatbed", "adf", "default"]
+        expect(page.locator("#profile-select")).to_have_value("default")
+        expect(page.locator("#profile-description")).to_have_text(_OPENING_DESCRIPTION)
+        expect(page.locator('#tags-list input[value="31"]')).to_be_checked()
+        assert _ticked_tags(page) == ["31"]
+        expect(page.locator("#correspondent-select")).to_have_value("41")
+
+        fields = _captured_submit(page)
+
+        assert fields["profile"] == ["default"], fields
+        assert fields["tags"] == ["31"], fields
+        assert fields["correspondent"] == ["41"], fields
+
+    def test_a_generated_twin_default_is_not_offered(
+        self,
+        page: Page,
+        serve_profiles: Callable[[dict[str, ProfileConfig]], _BrowserServer],
+    ) -> None:
+        """
+        A generated ``default`` equal to the flatbed is hidden; the flatbed opens.
+
+        The set is the generator's own output for a flatbed-and-feeder device,
+        so its ``default`` is a whole-model copy of ``flatbed``, label and all.
+        Offered, it would be a second "Glass (flatbed)" in the list.
+        """
+        generated = generate_profiles(_FLATBED_AND_FEEDER)
+        assert list(generated) == ["flatbed", "adf", "default"]
+        assert generated["default"] == generated["flatbed"]
+        server = serve_profiles(generated)
+        page.goto(server.url)
+
+        expect(page.locator('#profile-select option[value="default"]')).to_have_count(0)
+        expect(page.locator("#profile-select option")).to_have_text(
+            [generated["flatbed"].label, generated["adf"].label]
+        )
+        expect(page.locator("#profile-select")).to_have_value("flatbed")
+        expect(page.locator("#profile-description")).to_have_text(
+            generated["flatbed"].description
+        )
+
+        fields = _captured_submit(page)
+
+        assert fields["profile"] == ["flatbed"], fields
+        # The stand-in's defaults are the generator's: no tag and no
+        # correspondent, which is what the twin it stands in for carries too.
+        assert "tags" not in fields, fields
+        assert fields.get("correspondent", [""]) == [""], fields
+
+    def test_duplicate_labels_read_differently(
+        self,
+        page: Page,
+        serve_profiles: Callable[[dict[str, ProfileConfig]], _BrowserServer],
+    ) -> None:
+        """Two hand-written profiles labelled alike read "<label> (<name>)"."""
+        server = serve_profiles(
+            {
+                "a": ProfileConfig(source="Flatbed", label="Scan"),
+                "b": ProfileConfig(source="ADF", label="Scan"),
+                "default": ProfileConfig(),
+            }
+        )
+        page.goto(server.url)
+
+        expect(page.locator("#profile-select option")).to_have_text(
+            ["Scan (a)", "Scan (b)", "default"]
+        )
+        texts = _option_texts(page)
+        assert len(set(texts)) == len(texts), texts
+
+    def test_sheet_fed_opens_on_the_stand_in_not_the_first_option(
+        self,
+        page: Page,
+        serve_profiles: Callable[[dict[str, ProfileConfig]], _BrowserServer],
+    ) -> None:
+        """
+        With no glass the feeders still lead, and the page opens on ``adf``.
+
+        ``auto`` is listed first in the configuration and still renders last,
+        so the feeder-first order is observed and not assumed; ``duplex`` then
+        leads the list, so opening on the first option would pick it and not
+        the profile the hidden ``default`` copies.
+        """
+        generated = generate_profiles(_FEEDERS_ONLY)
+        profiles = {
+            "auto": generated["auto"],
+            "duplex": generated["adf-duplex"],
+            "adf": generated["adf"],
+            "default": generated["adf"].model_copy(deep=True),
+        }
+        server = serve_profiles(profiles)
+        page.goto(server.url)
+
+        expect(page.locator("#profile-select option")).to_have_count(3)
+        option_values = page.locator("#profile-select option").evaluate_all(
+            "options => options.map(option => option.value)"
+        )
+        assert option_values == ["duplex", "adf", "auto"]
+        expect(page.locator("#profile-select")).to_have_value("adf")
+
+        fields = _captured_submit(page)
+
+        assert fields["profile"] == ["adf"], fields
 
 
 # ---------------------------------------------------------------------------
