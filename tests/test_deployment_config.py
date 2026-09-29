@@ -550,6 +550,37 @@ def test_first_scan_tutorial_example_is_a_description() -> None:
     )
 
 
+# The two pages that say when the scan worker becomes degraded.
+DEGRADED_WORKER_PAGES = (ARCHITECTURE, DOCS_DIR / "reference" / "web-api.md")
+
+
+@pytest.mark.parametrize(
+    "page", DEGRADED_WORKER_PAGES, ids=[page.name for page in DEGRADED_WORKER_PAGES]
+)
+def test_degraded_docs_say_when_owed_writes_are_retried(page: Path) -> None:
+    """
+    The degraded-worker text matches when the worker retries and resets.
+
+    Owed job records are retried after each scan that ends cleanly as well as
+    on the 5-second idle tick, so a streak of failed retries is not counted
+    in idle ticks; and a successful write -- a clean scan, a prune, an owed
+    record -- starts the job-store failure count again.
+    """
+    text, name = _read(page)
+    assert "idle ticks in a row" not in text, (
+        f"{name} still counts failed owed-write retries in idle ticks"
+    )
+    sentences = _sentences(text)
+    assert any(
+        "after each scan that ends cleanly" in sentence and "5 seconds" in sentence
+        for sentence in sentences
+    ), f"{name} does not say owed records are retried after each clean scan"
+    assert any(
+        "prune" in sentence and "starts the count again" in sentence
+        for sentence in sentences
+    ), f"{name} does not say a successful write ends the run of failures"
+
+
 def test_profile_howto_describes_force_as_a_merge() -> None:
     """The profile how-to describes ``--force`` as a merge, not an overwrite."""
     text = PROFILE_HOWTO.read_text(encoding="utf-8")
