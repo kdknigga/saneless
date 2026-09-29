@@ -121,8 +121,9 @@ _QUEUE_DEPTH: Final = 10
 # error without calling the store broken.  Not configurable.
 _DEGRADED_AFTER: Final = 3
 
-# How many idle ticks in a row the owed-write retry may fail before the worker
-# is degraded.  Kept apart from _DEGRADED_AFTER's loop count: the guard
+# How many retries in a row the owed-write retry may fail before the worker
+# is degraded.  A clean job ends a streak before its own retry, so every
+# retry after the first of a streak is an idle tick's.  Kept apart from _DEGRADED_AFTER's loop count: the guard
 # already counted the failure behind a guard debt, and a request-side
 # owe_rejection debt was never counted, so a streak of failed retries is its
 # own evidence that the store is not healing.  Three rides out a fault that
@@ -726,9 +727,9 @@ class ScanWorker:
         # meant to be: the loop's own terminal writes that failed, kept with
         # their real outcome, failures even the loop guard could not write,
         # and rejected submits whose REJECTED write failed in the request.
-        # Every idle tick retries them, and a streak of failed retries
-        # degrades the worker.  Shared by the worker thread (the guard and the
-        # idle flush) and request threads (owe_rejection), so every read and
+        # Every idle tick and every clean job retries them, and a streak of
+        # failed retries degrades the worker.  Shared by the worker thread
+        # (the guard and the flush) and request threads (owe_rejection), so every read and
         # write goes through _unrecorded_lock.
         self._unrecorded_lock = threading.Lock()
         self._unrecorded_failures: dict[str, _OwedWrite] = {}
@@ -793,8 +794,8 @@ class ScanWorker:
         refused by :meth:`submit` and never enqueued, so no job can be running
         under it.
 
-        The worker writes it on its next idle tick, or through the recovery
-        path while degraded, sharing the flush of the loop guard's owed
+        The worker writes it after its next clean job or on its next idle
+        tick, or through the recovery path while degraded, sharing the flush of the loop guard's owed
         failures.  If the worker thread is not running (DOWN) no tick comes:
         ``/health`` reports 503 meanwhile, and the next startup's
         ``fail_active_jobs()`` ends the row.
@@ -844,7 +845,7 @@ class ScanWorker:
         which ``/health`` reports as "worker thread is down".  ``DEGRADED``
         when the job store has failed the loop ``_DEGRADED_AFTER`` times in a
         row, or the owed-write retry has failed ``_OWED_RETRY_DEGRADED_AFTER``
-        idle ticks in a row, and no recovery has succeeded since, reported as
+        times in a row, and no recovery has succeeded since, reported as
         "job store failing".  Otherwise ``HEALTHY``.
         """
         if not self._thread.is_alive():
@@ -1580,7 +1581,7 @@ class ScanWorker:
         and answered with one best-effort terminal write so the row does not
         sit active until restart: the terminal write the loop was making, if
         that is what failed, otherwise an ERROR.  If that write fails too, idle
-        ticks retry it until it lands.
+        ticks and later clean jobs retry it until it lands.
 
         Before any job, the thread generates profiles.  A job submitted
         meanwhile waits in the queue and then runs against the generated set.
@@ -1614,11 +1615,17 @@ class ScanWorker:
                 self._best_effort_fail(job, exc)
             else:
                 # A job whose store writes all landed breaks the run, and the
-                # owed-write streak too: idle ticks either side of it are not
+                # owed-write streak too: retries either side of it are not
                 # "in a row" against a store that just accepted writes.  It
                 # does not clear degraded: only a successful idle probe does.
                 self._consecutive_loop_failures = 0
                 self._failed_flush_ticks = 0
+                # Owed writes are retried here as well as on an idle tick, so
+                # a queue that never empties cannot starve them.  Degraded,
+                # the retry is the recovery probe's alone; and prune stays on
+                # the idle tick, so a job is never followed by one.
+                if not self._degraded.is_set():
+                    self._flush_owed_guarded()
         self._flush_before_exit()
 
     def _flush_before_exit(self) -> None:
@@ -1694,7 +1701,8 @@ class ScanWorker:
         Otherwise the job is recorded as failed with the loop failure's text.
 
         The store just raised, so this may raise too; that is only logged.
-        The write is remembered instead, and the next idle tick retries it --
+        The write is remembered instead, and the next clean job or idle tick
+        retries it --
         through the recovery path while degraded -- until the store accepts
         it, so the row does not sit active until a restart.
 
@@ -1759,7 +1767,7 @@ class ScanWorker:
 
         The write is owed before the exception propagates, so the guard in
         ``_run`` retries this write -- not an ERROR built from the store's
-        exception -- and so does every idle tick after it.
+        exception -- and so does every clean job and idle tick after it.
 
         Args:
             job_id: The job row to write.
@@ -1840,6 +1848,9 @@ class ScanWorker:
         """
         Retry owed writes on a worker that is not degraded, counting a failure.
 
+        It runs on every idle tick and after every clean job, so a busy queue
+        cannot starve the owed rows.
+
         A failed retry is not a loop-level failure: the guard already counted
         the failure behind a guard debt.  But ``_OWED_RETRY_DEGRADED_AFTER``
         failed retries in a row degrade the worker, so a store that is not
@@ -1859,18 +1870,20 @@ class ScanWorker:
             # rest of the same streak would only repeat it.
             if self._failed_flush_ticks == 1:
                 logger.warning(
-                    "Owed job store writes failed; retrying on the next idle tick",
+                    "Owed job store writes failed; retrying after the next job "
+                    "or idle tick",
                     exc_info=True,
                 )
             else:
                 logger.debug(
-                    "Owed job store writes failed; retrying on the next idle tick",
+                    "Owed job store writes failed; retrying after the next job "
+                    "or idle tick",
                     exc_info=True,
                 )
             if self._failed_flush_ticks >= _OWED_RETRY_DEGRADED_AFTER:
                 self._degraded.set()
                 logger.warning(
-                    "Scan worker degraded after %d idle ticks in a row failed "
+                    "Scan worker degraded after %d retries in a row failed "
                     "to write owed job records; rejecting scans until the "
                     "store recovers",
                     self._failed_flush_ticks,
@@ -1884,16 +1897,19 @@ class ScanWorker:
         """
         Write the terminal rows the worker still owes, dropping each once written.
 
-        This runs only on an Empty tick -- from ``_idle_housekeeping`` or
-        ``_try_recover`` -- so no job is current, and an owed id belongs to a
-        job the loop already abandoned: none can be the job in flight.  With
-        nothing owed it returns without touching the store.
+        It runs on an idle tick (from ``_idle_housekeeping`` or
+        ``_try_recover``), after a clean job (from ``_run``), or once before
+        the thread exits.  None of these has a job current: after a job,
+        ``_process_job``'s ``finally`` has already cleared it, so an owed id
+        belongs to a job the loop already abandoned, or to a refused submit,
+        and is never the job in flight.  With nothing owed it returns without
+        touching the store.
 
         The owed entries are snapshotted under ``_unrecorded_lock``, and every
         store write runs outside it, so a request thread calling
         :meth:`owe_rejection` never waits on the store.  An entry is dropped
         only if it is unchanged since the snapshot; one owed after the
-        snapshot waits for the next tick.
+        snapshot waits for the next retry.
 
         Returns:
             How many rows it wrote: zero when nothing was owed.
@@ -1901,7 +1917,7 @@ class ScanWorker:
         Raises:
             Exception: Whatever the store raises.  Rows already written stay
                 written and are no longer owed; the rest wait for the next
-                tick.
+                retry.
 
         """
         with self._unrecorded_lock:
