@@ -2913,6 +2913,37 @@ class TestDiskSpaceCheck:
         assert str(tmp_path) in str(error)
         assert "999999999 MB required" in str(error)
 
+    def test_free_space_check_counts_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A megabyte is 10**6 bytes, as ``min_free_space_mb`` and the docs say.
+
+        Exactly 500 * 10**6 bytes free meets a 500 MB reserve.  Counted in
+        binary megabytes it is only 476, which would refuse the scan.
+        """
+        monkeypatch.setattr(
+            "saneless.pipeline.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=500 * 10**6),
+        )
+
+        assert _check_disk_space(tmp_path, 500) is None
+
+    def test_free_space_check_one_byte_short_reports_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One byte under 500 * 10**6 is refused, reported as 499 MB free."""
+        monkeypatch.setattr(
+            "saneless.pipeline.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=500 * 10**6 - 1),
+        )
+
+        with pytest.raises(DiskSpaceError) as exc_info:
+            _check_disk_space(tmp_path, 500)
+
+        assert "499 MB free" in str(exc_info.value)
+        assert "500 MB required" in str(exc_info.value)
+
     @pytest.mark.parametrize("failing_call", ["mkdir", "disk_usage", "JobWorkspace"])
     def test_workspace_filesystem_failure_is_a_config_error(
         self,
