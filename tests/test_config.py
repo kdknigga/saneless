@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import pwd
 import stat
 import tempfile
 import time
@@ -15,11 +16,13 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, NamedTuple, TypedDict, Unpack
 
 import pytest
+from click.testing import CliRunner
 from pydantic import ValidationError
 from pydantic_settings.exceptions import SettingsError
 
 import saneless.config as config_mod
 import saneless.vocabulary as vocabulary_mod
+from saneless.cli import cli
 from saneless.config import (
     DEFAULT_RESOLUTION,
     PLACEHOLDER_TOKENS,
@@ -415,6 +418,61 @@ class TestXdgBaseDirectories:
         output = Settings().output
         assert output.data_dir == state
         assert output.log_file == state / "saneless.log"
+
+
+_NO_HOME_FIX = "set HOME, or set XDG_CONFIG_HOME and XDG_STATE_HOME to absolute paths"
+"""The part of the no-home refusal that says how to fix it."""
+
+
+class TestUnresolvableHome:
+    """
+    A process with no home directory gets a configuration error, not a traceback.
+
+    A container user with no HOME and no passwd entry has nowhere for the XDG
+    defaults to live. ``Path.home()`` raised RuntimeError, which escaped the
+    loader as an unexpected error with a traceback and no hint of the fix.
+    """
+
+    @pytest.fixture
+    def no_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unset HOME and both XDG variables, and give this uid no passwd entry."""
+
+        def no_passwd_entry(uid: int) -> pwd.struct_passwd:
+            raise KeyError(uid)
+
+        monkeypatch.delenv("HOME")
+        monkeypatch.delenv("XDG_CONFIG_HOME")
+        monkeypatch.delenv("XDG_STATE_HOME")
+        monkeypatch.setattr(pwd, "getpwuid", no_passwd_entry)
+
+    @pytest.mark.usefixtures("no_home")
+    @pytest.mark.parametrize("source", ["search", "explicit"])
+    def test_unresolvable_home_is_a_config_error(
+        self, tmp_path: Path, source: str
+    ) -> None:
+        """
+        Both the search and the state defaults name the fix.
+
+        The search reaches the home directory through the XDG config
+        candidate; an explicit file skips the search and reaches it through
+        the ``data_dir`` default instead.
+        """
+        config_file = tmp_path / "x.toml"
+        config_file.write_text("[profiles.default]\n")
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(str(config_file) if source == "explicit" else None)
+
+        assert _NO_HOME_FIX in str(exc_info.value)
+
+    @pytest.mark.usefixtures("no_home")
+    def test_unresolvable_home_exits_2_from_the_cli(self) -> None:
+        """A command that loads settings exits 2 with the fix, not a traceback."""
+        result = CliRunner().invoke(cli, ["jobs"])
+
+        assert result.exit_code == 2, result.output
+        assert _NO_HOME_FIX in result.output
+        assert "Traceback" not in result.output
 
 
 class _OpenOptions(TypedDict, total=False):
@@ -4113,6 +4171,77 @@ class TestValidateSettingsDirs:
         """The nearest ancestor of a missing path is its deepest existing one."""
         assert config_mod._nearest_existing_ancestor(tmp_path / "a" / "b") == tmp_path
         assert config_mod._nearest_existing_ancestor(tmp_path) == tmp_path
+
+
+class TestDirectorySettingsMustBeDirectories:
+    """
+    A directory setting that names a file is refused at start-up.
+
+    ``os.access`` says a regular file is writable, so a ``data_dir`` that was
+    a file -- or that sat under one -- passed the start-up check and failed
+    mid-scan, when a failed scan needed preserving.
+    """
+
+    @staticmethod
+    def _settings_with(label: str, value: Path, writable: Path) -> Settings:
+        """
+        Build settings with ``label`` set to ``value`` and the others writable.
+
+        Returns:
+            The settings.
+
+        """
+        return Settings(
+            output=OutputConfig(
+                tmp_dir=str(value if label == "tmp_dir" else writable / "t"),
+                data_dir=str(value if label == "data_dir" else writable / "d"),
+            ),
+            paperless=PaperlessConfig(
+                consume_dir=str(value) if label == "consume_dir" else ""
+            ),
+            profiles={"default": ProfileConfig()},
+        )
+
+    @pytest.mark.parametrize("label", ["data_dir", "consume_dir"])
+    def test_directory_setting_naming_a_file_is_refused(
+        self, tmp_path: Path, label: str
+    ) -> None:
+        """An existing regular file is not a directory, and the message says so."""
+        a_file = tmp_path / "a-file"
+        a_file.write_text("")
+
+        with pytest.raises(ConfigError) as exc_info:
+            validate_settings_dirs(self._settings_with(label, a_file, tmp_path))
+
+        assert str(exc_info.value) == f"{label} is not a directory: {a_file}"
+
+    def test_tmp_dir_naming_a_file_is_refused_as_not_a_directory(
+        self, tmp_path: Path
+    ) -> None:
+        """``tmp_dir`` meets the private-directory check first; it names the key."""
+        a_file = tmp_path / "a-file"
+        a_file.write_text("")
+
+        with pytest.raises(ConfigError) as exc_info:
+            validate_settings_dirs(self._settings_with("tmp_dir", a_file, tmp_path))
+
+        message = str(exc_info.value)
+        assert "tmp_dir" in message
+        assert "is not a directory" in message
+
+    @pytest.mark.parametrize("label", ["tmp_dir", "data_dir", "consume_dir"])
+    def test_directory_setting_under_a_file_is_refused(
+        self, tmp_path: Path, label: str
+    ) -> None:
+        """A missing directory whose nearest existing ancestor is a file is refused."""
+        a_file = tmp_path / "a-file"
+        a_file.write_text("")
+        under = a_file / "sub" / "dir"
+
+        with pytest.raises(ConfigError) as exc_info:
+            validate_settings_dirs(self._settings_with(label, under, tmp_path))
+
+        assert str(exc_info.value) == f"{label} parent is not a directory: {a_file}"
 
 
 class TestPathExpansion:
