@@ -4575,6 +4575,60 @@ class TestWorkerProfileLock:
         assert swapped_customised is False
         assert names_after_customised == ["default", "photo"]
 
+    def test_set_profiles_refuses_a_set_without_default(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A set without ``default`` is refused, logged, and the current set kept.
+
+        Every scan that names no profile resolves ``default``, so a set without
+        it would leave the appliance unable to scan.  The refusal is an answer
+        and a WARNING, not an exception: the swap runs on the worker thread.
+        """
+        caplog.set_level(logging.WARNING, logger="saneless.worker")
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            names_before = worker.profile_names()
+            accepted = worker._set_profiles({"flatbed": ProfileConfig()})
+            names_after = worker.profile_names()
+        finally:
+            store.close()
+
+        assert accepted is False
+        assert names_after == names_before
+        assert "default" in names_after
+        records = _worker_records(caplog, logging.WARNING, "'default'")
+        assert len(records) == 1
+        assert "Not replacing the scan profiles" in records[0].getMessage()
+
+    def test_set_profiles_accepts_a_set_with_default(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A set holding ``default`` is swapped in, with no warning."""
+        caplog.set_level(logging.WARNING, logger="saneless.worker")
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            accepted = worker._set_profiles(
+                {"default": ProfileConfig(), "x": ProfileConfig()}
+            )
+            names = worker.profile_names()
+        finally:
+            store.close()
+
+        assert accepted is True
+        assert names == ["default", "x"]
+        assert _worker_records(caplog, logging.WARNING, "") == []
+
     def test_profile_lock_readers_never_see_a_dict_mid_update(
         self,
         mock_scanner: MagicMock,
@@ -4795,6 +4849,55 @@ class TestStartupProfileGeneration:
         )
         for name in set(expected) - {"default"}:
             assert worker.get_profile(name) == expected[name]
+
+    def test_startup_generation_on_a_no_source_scanner_keeps_default(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A scanner with no source option still leaves a working ``default``.
+
+        The generated set for such a device is ``default`` alone.  Start-up
+        swaps it in and writes it, so ``default`` is in memory and in the file
+        a restart loads -- the appliance can still scan with no profile named.
+        """
+        mock_scanner.get_devices.return_value = [
+            DeviceInfo(
+                name="test:device:001",
+                vendor="Test",
+                model="Scanner",
+                device_type="scanner",
+            ),
+        ]
+        mock_scanner.get_capabilities.return_value = DeviceCapabilities(
+            sources=[], resolutions=[300], modes=["Color"]
+        )
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("# loaded by --config\n")
+        default_settings._config_path = config_file
+
+        def swapped_in() -> bool:
+            """Whether the generated ``default`` has replaced the bare one."""
+            profile = worker.get_profile("default")
+            return profile is not None and profile.auto_generated
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            generated = poll_until(swapped_in, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert "default" in worker.profile_names()
+        on_disk = tomllib.loads(config_file.read_text())
+        assert "default" in on_disk["profiles"]
+        assert "source" not in on_disk["profiles"]["default"]
 
     def test_startup_generation_memory_keeps_every_unpersisted_name(
         self, tmp_path: Path
