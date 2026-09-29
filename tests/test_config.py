@@ -204,10 +204,17 @@ class TestLoadedConfigPath:
         assert missing in str(exc_info.value)
 
     def test_found_search_path_is_recorded(self, empty_cwd_and_home: Path) -> None:
-        """The relative search entry that was found is recorded (D-16, M-04)."""
+        """
+        The relative search entry that was found is recorded absolute.
+
+        A relative path is worth nothing to a reader without the working
+        directory it was relative to, and the log, ``doctor`` and the write
+        target all read this one recording.
+        """
         (empty_cwd_and_home / "saneless.toml").write_text("[profiles.default]\n")
         settings = load_settings()
-        assert settings.config_path == Path("saneless.toml")
+        assert settings.config_path == empty_cwd_and_home / "saneless.toml"
+        assert settings.config_path.is_absolute()
 
     def test_home_search_path_is_recorded(
         self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -2124,6 +2131,125 @@ class TestConfigDiscovery:
         )
         with pytest.raises(ValueError, match="searched"):
             discovery.documented_spelling(tmp_path / "z" / config_mod.CONFIG_FILENAME)
+
+    def test_recorded_search_is_absolute(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """
+        Every recorded path is absolute, and the search keeps its three places.
+
+        The fixture's first candidate is relative, exactly as the real one is,
+        so this fails for a recording that keeps the spelling it was given.
+        """
+        expected = patched_search_paths.cwd / config_mod.CONFIG_FILENAME
+        expected.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+        assert settings.config_path == expected
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.searched == (
+            expected,
+            patched_search_paths.xdg / config_mod.CONFIG_FILENAME,
+            patched_search_paths.etc / config_mod.CONFIG_FILENAME,
+        )
+        assert all(path.is_absolute() for path in discovery.searched)
+        assert discovery.found == (expected,)
+        assert discovery.loaded == expected
+
+    def test_explicit_relative_path_is_recorded_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A relative ``--config`` path is recorded against the working directory."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "rel").mkdir()
+        expected = tmp_path / "rel" / config_mod.CONFIG_FILENAME
+        expected.write_text(_MINIMAL_TOML)
+        settings = load_settings(config_path=f"rel/{config_mod.CONFIG_FILENAME}")
+        assert settings.config_path == expected
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.explicit == expected
+        assert discovery.found == (expected,)
+        assert discovery.loaded == expected
+
+    def test_same_file_through_two_spellings_is_one_file(
+        self, patched_search_paths: _SearchDirs, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Running from inside the XDG directory finds one file, not two.
+
+        The relative first candidate then names the XDG file.  Counting it
+        twice would report the file in use as also shadowed by itself.
+        """
+        monkeypatch.chdir(patched_search_paths.xdg)
+        the_file = patched_search_paths.xdg / config_mod.CONFIG_FILENAME
+        the_file.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.found == (the_file,)
+        assert discovery.loaded == the_file
+        assert discovery.duplicates == (the_file,)
+        assert len(discovery.searched) == len(config_mod.config_search_paths())
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED
+        )
+
+    def test_same_file_through_a_symlink_is_one_file(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """A ``./saneless.toml`` linked to the XDG file is that file."""
+        target = patched_search_paths.xdg / config_mod.CONFIG_FILENAME
+        target.write_text(_MINIMAL_TOML)
+        link = patched_search_paths.cwd / config_mod.CONFIG_FILENAME
+        link.symlink_to(target)
+        settings = load_settings()
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.found == (link,)
+        assert discovery.loaded == link
+        assert discovery.duplicates == (target,)
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED
+        )
+
+    def test_same_leftover_through_two_spellings_is_one_leftover(
+        self, patched_search_paths: _SearchDirs, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A superseded-name file seen through two spellings is named once."""
+        monkeypatch.chdir(patched_search_paths.xdg)
+        stale = self._stale_in(patched_search_paths.xdg)
+        stale.write_text(_MINIMAL_TOML)
+        discovery = load_settings().config_discovery
+        assert discovery is not None
+        assert discovery.stale == (stale,)
+
+    def test_two_distinct_files_are_both_found(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """Two different files are two, in search order, and the first loads."""
+        first = patched_search_paths.cwd / config_mod.CONFIG_FILENAME
+        second = patched_search_paths.etc / config_mod.CONFIG_FILENAME
+        first.write_text(_MINIMAL_TOML)
+        second.write_text(_MINIMAL_TOML)
+        discovery = load_settings().config_discovery
+        assert discovery is not None
+        assert discovery.found == (first, second)
+        assert discovery.loaded == first
+        assert discovery.duplicates == ()
+
+    def test_search_order_is_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The working directory, then XDG, then ``/etc/saneless``."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+        assert config_mod.config_search_paths() == (
+            Path(config_mod.CONFIG_FILENAME),
+            tmp_path / "xdg" / "saneless" / config_mod.CONFIG_FILENAME,
+            Path("/etc/saneless") / config_mod.CONFIG_FILENAME,
+        )
 
 
 def _env_line(err: ConfigError, variable: str) -> str:
