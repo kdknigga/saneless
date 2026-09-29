@@ -664,6 +664,15 @@ def _profile_description(
     return description
 
 
+# The human text of the ``default`` generated for a device with no ``source``
+# option. There is no source to describe, so neither phrase names an input; the
+# description says why the operator sees no other profile to choose from.
+_NO_SOURCE_LABEL: Final = "Standard scan"
+_NO_SOURCE_DESCRIPTION: Final = (
+    "Scans from the scanner, which offers no choice of where the page comes from."
+)
+
+
 def generate_profiles(
     capabilities: DeviceCapabilities,
     device_type: str = "",
@@ -674,15 +683,18 @@ def generate_profiles(
     Creates one profile per scanner source, plus a "default" profile. All
     generated profiles have auto_generated=True.
 
-    The "default" profile is emitted whenever the device reports any source at
-    all, and that is not a preference: ``Settings.validate_default_profile``
-    makes the key mandatory, so a generated set without it is written to disk
-    and then refused by saneless on the next load, with ``auto-profiles``
-    reporting success and exiting 0 over an unusable installation. A flatbed
-    backs it when the device has one; on a sheet-fed scanner the device's own
-    first reported source does, which is the only honest candidate available.
-    The default is a copy of the profile generated for that source, so the two
-    compare equal as whole models.
+    The "default" profile is always emitted, and that is not a preference:
+    ``Settings.validate_default_profile`` makes the key mandatory, so a
+    generated set without it is written to disk and then refused by saneless
+    on the next load, with ``auto-profiles`` reporting success and exiting 0
+    over an unusable installation. A flatbed backs it when the device has one;
+    on a sheet-fed scanner the device's own first reported source does, which
+    is the only honest candidate available. The default is then a copy of the
+    profile generated for that source, so the two compare equal as whole
+    models. A device that reports no source at all -- it has no SANE
+    ``source`` option -- gets a ``default`` that names no source: the backend
+    assigns none to such a device and routes by the model default's source, so
+    the profile scans from wherever the scanner feeds.
 
     Labels are unique within the set: a source whose label another source
     already holds gets an ordinal, so "Feeder, single-sided" is followed by
@@ -777,7 +789,20 @@ def generate_profiles(
             description=_profile_description(source, auto_source_mode=auto_source_mode),
         )
 
-    if default_slug is not None:
+    if default_slug is None:
+        # No source to copy: the device offers no choice of input. ``source``
+        # is left unset on purpose. The backend assigns nothing to a device
+        # without the option and routes by the model default's classification,
+        # and a table that names no source says so, where "Flatbed" would claim
+        # a platen the scanner never reported.
+        profiles["default"] = ProfileConfig(
+            resolution=resolution,
+            mode=mode,
+            auto_generated=True,
+            label=_NO_SOURCE_LABEL,
+            description=_NO_SOURCE_DESCRIPTION,
+        )
+    else:
         # A copy of the profile it duplicates rather than a second build from
         # the same inputs, so every field agrees by construction: an Auto
         # source on a platen-less device keeps the stack routing of the profile
@@ -971,7 +996,8 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     Insertion order is the file's key order for a new table. Only non-default
     values of ``auto_source_mode`` and ``duplex`` are included, so a refreshed
     table reads the way a freshly generated one does. ``label`` and
-    ``description`` are the exception: they are always written.
+    ``description`` are the exception: they are always written. ``source`` is
+    written only when the profile was given one.
 
     Args:
         profile: A generated profile.
@@ -995,10 +1021,14 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
         # passed in come from a fresh generation.
         "label": profile.label,
         "description": profile.description,
-        "source": profile.source,
-        "resolution": profile.resolution,
-        "mode": profile.mode,
     }
+    # Only a source the profile was given. A no-source device's default
+    # carries none, so its table names none, and a --force refresh deletes a
+    # stale one, as it does any owned key the generation omits.
+    if "source" in profile.model_fields_set:
+        values["source"] = profile.source
+    values["resolution"] = profile.resolution
+    values["mode"] = profile.mode
     if profile.auto_source_mode != "flatbed":
         values["auto_source_mode"] = profile.auto_source_mode
     # Written only when non-default, like auto_source_mode. In a generated set
@@ -1340,13 +1370,23 @@ def write_profiles_to_config(
         raise ConfigError(msg)
     profiles_section = cast("dict[str, object]", section)
 
-    orphans = [
-        name
-        for name, table in profiles_section.items()
-        if name not in profiles
-        and name not in _UNPRUNABLE
-        and _is_auto_generated(table)
-    ]
+    # Generation always emits ``default``, so "only default was generated" is
+    # the signal that the scanner reported no sources, and then nothing can be
+    # judged orphaned: the device said nothing about where pages come from,
+    # so a flagged profile is not absent, merely unasked about. A guard on an
+    # empty set would never fire, and the prune would delete every flagged
+    # profile together with the operator's own keys on it.
+    orphans = (
+        []
+        if set(profiles) <= _UNPRUNABLE
+        else [
+            name
+            for name, table in profiles_section.items()
+            if name not in profiles
+            and name not in _UNPRUNABLE
+            and _is_auto_generated(table)
+        ]
+    )
     for name in orphans:
         logger.info(
             "Removing auto-generated profile %r: the scanner's sources no "

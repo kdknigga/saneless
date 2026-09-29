@@ -2519,6 +2519,24 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
         )
         return config_file
 
+    @staticmethod
+    def _generated_with_a_source() -> dict[str, ProfileConfig]:
+        """
+        Build a generated set that names a source besides ``default``.
+
+        A set holding only ``default`` is what a scanner with no source option
+        generates, and the prune never runs for it; these tests are about how
+        the prune reads the flag, so the set must be one the prune runs for.
+        """
+        return {
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+            "flatbed": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
     @pytest.mark.parametrize("flag", _FALSY_STRINGS)
     def test_loader_and_writer_agree_the_profile_is_hand_written(
         self, tmp_path: Path, flag: str
@@ -2557,11 +2575,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
     ) -> None:
         """An orphan flagged ``"no"`` is not the tool's, so it is not removed."""
         config_file = self._config(tmp_path, "zzz", flag)
-        generated = {
-            "default": ProfileConfig(
-                source="Flatbed", resolution=300, mode="Color", auto_generated=True
-            ),
-        }
+        generated = self._generated_with_a_source()
 
         result = write_profiles_to_config(config_file, generated, force=force)
 
@@ -2572,11 +2586,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
     def test_a_string_true_flag_is_still_owned(self, tmp_path: Path) -> None:
         """``"yes"`` loads as True, so the writer owns and prunes it too."""
         config_file = self._config(tmp_path, "zzz", "yes")
-        generated = {
-            "default": ProfileConfig(
-                source="Flatbed", resolution=300, mode="Color", auto_generated=True
-            ),
-        }
+        generated = self._generated_with_a_source()
 
         result = write_profiles_to_config(config_file, generated)
 
@@ -2589,11 +2599,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
             '[profiles.default]\nsource = "Flatbed"\n\n'
             '[profiles.zzz]\nsource = "mine"\nauto_generated = "maybe"\n'
         )
-        generated = {
-            "default": ProfileConfig(
-                source="Flatbed", resolution=300, mode="Color", auto_generated=True
-            ),
-        }
+        generated = self._generated_with_a_source()
 
         result = write_profiles_to_config(config_file, generated)
 
