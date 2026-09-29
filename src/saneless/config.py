@@ -1284,23 +1284,24 @@ class Settings(BaseSettings):
         Configure settings sources with optional TOML file support.
 
         The _toml_file init kwarg is extracted and used to create a
-        _ByteExactTomlSource if the file exists. pydantic-settings calls
-        this by keyword, so the two unused sources keep their names.
+        _ByteExactTomlSource if the file exists. The private _skip_env init
+        kwarg drops the environment source, so the loader can still validate
+        the file when a SANELESS_* variable will not parse. pydantic-settings
+        calls this by keyword, so the two unused sources keep their names.
         """
         # saneless reads no .env file and no secrets directory.
         del dotenv_settings, file_secret_settings
         # init_settings is always an InitSettingsSource at runtime
         init_src = cast("InitSettingsSource", init_settings)
         toml_file = init_src.init_kwargs.pop("_toml_file", None)
+        skip_env = bool(init_src.init_kwargs.pop("_skip_env", False))
 
+        sources: list[PydanticBaseSettingsSource] = [init_settings]
+        if not skip_env:
+            sources.append(env_settings)
         if toml_file is not None:
-            toml_source = _ByteExactTomlSource(
-                settings_cls,
-                toml_file=toml_file,
-            )
-            return (init_settings, env_settings, toml_source)
-
-        return (init_settings, env_settings)
+            sources.append(_ByteExactTomlSource(settings_cls, toml_file=toml_file))
+        return tuple(sources)
 
     @field_validator("profiles")
     @classmethod
@@ -1639,6 +1640,66 @@ def _env_contribution() -> dict[str, object]:
 
     """
     return EnvSettingsSource(Settings)()
+
+
+# Fixed text: the variable's value is never part of the line, because a
+# JSON-valued section variable is exactly where a token can travel.
+_ENV_JSON_MESSAGE: Final = (
+    "must be JSON (a list or table is written as JSON, for example [3, 7])"
+)
+
+
+def _bad_json_variables() -> list[str]:
+    """
+    Name every SANELESS_* variable that holds invalid JSON for its field.
+
+    Each variable is handed alone to pydantic-settings' own
+    ``EnvSettingsSource``, so which variable is blamed follows exactly the
+    prefix, delimiter, case-folding and JSON rules the loader itself uses --
+    none of them is re-implemented here. The source's ``SettingsError`` is
+    dropped unread: its text is upstream-owned and may quote the value.
+
+    Returns:
+        The offending names as spelled, sorted.
+
+    """
+    prefix = _ENV_PREFIX.casefold()
+    bad: list[str] = []
+    for name, value in os.environ.items():
+        if not name.casefold().startswith(prefix):
+            continue
+        source = EnvSettingsSource(Settings)
+        # case_sensitive is left at its default, so the source's own keys
+        # are lower-cased; this one is too, to be looked up the same way.
+        source.env_vars = {name.lower(): value}
+        try:
+            source()
+        except SettingsError:
+            bad.append(name)
+    return sorted(bad)
+
+
+def _env_json_lines(exc: SettingsError) -> list[str]:
+    """
+    Render the environment source's refusal as one line per bad variable.
+
+    Args:
+        exc: What the environment source raised for the whole environment.
+
+    Returns:
+        One fixed-text line per variable holding invalid JSON. If no single
+        variable is to blame, one line from ``exc`` with every SANELESS_*
+        value struck out of it.
+
+    """
+    names = _bad_json_variables()
+    if names:
+        return [f"environment variable {name!r}: {_ENV_JSON_MESSAGE}" for name in names]
+    # pydantic-settings names the field and source, not the value, but that
+    # wording is upstream-owned -- the same dependency the render boundary
+    # exists to remove. The SANELESS_* values are struck out of it here so no
+    # upstream phrasing can put one in this line.
+    return [f"environment: {_escape_name(_redact_environment(str(exc)))}"]
 
 
 def _env_variable_for(
@@ -1992,15 +2053,24 @@ def _unknown_env_lines(environ: Mapping[str, str]) -> list[str]:
 
 class _SettingsFactory(Protocol):
     """
-    Callable view of ``Settings`` that accepts the private ``_toml_file`` kwarg.
+    Callable view of ``Settings`` that accepts its private init kwargs.
 
-    ``_toml_file`` is not a declared field on ``Settings``; it is a private init
-    kwarg popped out of ``init_kwargs`` by ``settings_customise_sources``. This
-    protocol describes the constructor signature that mechanism really provides.
+    Neither ``_toml_file`` nor ``_skip_env`` is a declared field on
+    ``Settings``; both are private init kwargs popped out of ``init_kwargs`` by
+    ``settings_customise_sources``. This protocol describes the constructor
+    signature that mechanism really provides.
     """
 
-    def __call__(self, *, _toml_file: Path) -> Settings:
-        """Construct ``Settings`` from an explicit TOML file path."""
+    def __call__(
+        self, *, _toml_file: Path | None = None, _skip_env: bool = False
+    ) -> Settings:
+        """
+        Construct ``Settings``, optionally from a TOML file.
+
+        ``_toml_file`` names the file to read, None for none. ``_skip_env``
+        leaves the SANELESS_* environment out, so the file and the defaults
+        are validated alone.
+        """
         ...
 
 
@@ -2012,8 +2082,15 @@ def _build_settings(
 
     Each error becomes one line under a header naming the file, or naming
     defaults and environment when no file was loaded. Errors whose value came
-    from the environment name the variable, unknown SANELESS_* variables are
-    added to the same list, and invalid JSON in a variable becomes a line too.
+    from the environment name the variable, and unknown SANELESS_* variables
+    are added to the same list.
+
+    A variable holding invalid JSON for a list or table field stops the
+    environment source before any field is validated. Each such variable is
+    then named on its own line, with fixed text and never its value, and the
+    file is validated with the environment left out, so its own errors join
+    the same list rather than being hidden behind the variable's.
+
     A TOML syntax error, a file that is not UTF-8 and a file that cannot be
     read each become one line under the same header too, chained to their
     cause.
@@ -2031,39 +2108,33 @@ def _build_settings(
     lines = _unknown_env_lines(os.environ)
     settings: Settings | None = None
     cause: Exception | None = None
+    env_data: Mapping[str, object]
     try:
         env_data = _env_contribution()
     except SettingsError as exc:
-        # pydantic-settings names the field and source, not the value, but
-        # that wording is upstream-owned -- the same dependency the render
-        # boundary exists to remove. The SANELESS_* values are struck out of
-        # it here so no upstream phrasing can put one in this line. The
-        # exception (and its JSON-decoding cause) is not chained.
-        lines.append(f"environment: {_escape_name(_redact_environment(str(exc)))}")
+        # The exception (and its JSON-decoding cause) is not chained: its
+        # text is upstream-owned and may quote the value.
+        lines.extend(_env_json_lines(exc))
+        env_data, skip_env = {}, True
     else:
-        try:
-            if toml_file is not None:
-                settings = cast("_SettingsFactory", Settings)(_toml_file=toml_file)
-            else:
-                settings = Settings()
-        except ValidationError as exc:
-            lines.extend(_render_error_lines(exc.errors(), env_data))
-        # Only the position and the parser's own words are rendered: the
-        # decode errors' ``doc`` and ``object`` hold file content, possibly the
-        # token.
-        except tomllib.TOMLDecodeError as exc:
-            lines.append(
-                f"line {exc.lineno}, column {exc.colno}: {_escape_name(exc.msg)}"
-            )
-            cause = exc
-        except UnicodeDecodeError as exc:
-            lines.append(
-                f"the file is not valid UTF-8 (byte {exc.start}: {exc.reason})"
-            )
-            cause = exc
-        except OSError as exc:
-            lines.append(f"cannot read the file: {exc.strerror or type(exc).__name__}")
-            cause = exc
+        skip_env = False
+    try:
+        settings = cast("_SettingsFactory", Settings)(
+            _toml_file=toml_file, _skip_env=skip_env
+        )
+    except ValidationError as exc:
+        lines.extend(_render_error_lines(exc.errors(), env_data))
+    # Only the position and the parser's own words are rendered: the decode
+    # errors' ``doc`` and ``object`` hold file content, possibly the token.
+    except tomllib.TOMLDecodeError as exc:
+        lines.append(f"line {exc.lineno}, column {exc.colno}: {_escape_name(exc.msg)}")
+        cause = exc
+    except UnicodeDecodeError as exc:
+        lines.append(f"the file is not valid UTF-8 (byte {exc.start}: {exc.reason})")
+        cause = exc
+    except OSError as exc:
+        lines.append(f"cannot read the file: {exc.strerror or type(exc).__name__}")
+        cause = exc
     if settings is not None and not lines:
         return settings
     lines.sort()

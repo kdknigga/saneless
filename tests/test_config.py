@@ -2634,6 +2634,28 @@ class TestEnvironmentJson:
             load_settings()
         assert _json_line(variable) in _error_lines(exc_info.value)
 
+    def test_a_refusal_no_variable_explains_is_still_redacted(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With no single variable to blame, the upstream line is kept, redacted.
+
+        The refusal is forced while every variable parses on its own, so the
+        per-variable probe finds nothing and the fallback line is what renders.
+        """
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", _HOSTILE_SECRET)
+
+        def hostile_env_contribution() -> dict[str, object]:
+            msg = f"error parsing value {_HOSTILE_SECRET} for field 'paperless'"
+            raise SettingsError(msg)
+
+        monkeypatch.setattr(config_mod, "_env_contribution", hostile_env_contribution)
+        err = _load_error(tmp_config_dir / "unexplained.toml", "[profiles.default]\n")
+        body = _error_lines(err)[1:]
+        assert len(body) == 1
+        assert body[0].startswith("  environment: error parsing value ")
+        assert _HOSTILE_SECRET not in str(err)
+
 
 class TestUnknownEnvironmentVariables:
     """
