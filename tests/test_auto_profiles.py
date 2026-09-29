@@ -1130,7 +1130,7 @@ class TestProfileLabels:
         self, source: str, expected: str
     ) -> None:
         """
-        D-19 names the feeder, duplex and glass strings; they are locked copy.
+        The feeder, duplex and glass strings are agreed, locked copy.
 
         A feeder that names exactly one side reads as that side, which is a
         wording refinement of the single-sided feeder form.
@@ -2030,6 +2030,11 @@ auto_generated = true
                 auto_source_mode="adf",
                 duplex="hardware",
                 auto_generated=True,
+                # The text a generation gives this source: the writer copies
+                # a profile's own label and description rather than deriving
+                # them again.
+                label=_profile_label("ADF Duplex"),
+                description=_profile_description("ADF Duplex"),
             )
         return profiles
 
