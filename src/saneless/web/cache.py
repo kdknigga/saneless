@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.scan_metadata import fetch_metadata, metadata_ids
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
     from saneless.scan_metadata import MetadataKind, MetadataSource
 
-__all__ = ["CachedMetadataLookup", "MetadataCache"]
+__all__ = ["CachedList", "CachedMetadataLookup", "MetadataCache"]
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,24 @@ _STALE_NOT_RE_ARMED: Final = (
     "Refreshing %s from paperless-ngx failed; "
     "serving the last good copy, and the next request fetches again: %s"
 )
+
+
+class CachedList(NamedTuple):
+    """
+    A list the cache served, and whether paperless-ngx vouches for it now.
+
+    Attributes:
+        rows: The list.
+        current: True when it came from a fetch that succeeded within the TTL,
+            or from :meth:`MetadataCache.set`; False when it is the last good
+            copy, served because refreshing it failed.  Only a current list
+            can show that an id is gone: the last good copy predates anything
+            created or deleted since.
+
+    """
+
+    rows: list[dict[str, object]]
+    current: bool
 
 
 class MetadataCache:
@@ -53,7 +71,9 @@ class MetadataCache:
         """Initialize the cache with the given TTL and clock."""
         self._ttl = ttl
         self._clock = clock
-        self._store: dict[str, tuple[float, list[dict[str, object]]]] = {}
+        # Each entry is when it was stored, the list, and whether the list is
+        # current (see CachedList) rather than a re-armed last good copy.
+        self._store: dict[str, tuple[float, list[dict[str, object]], bool]] = {}
         # The last value stored for each key.  Unlike the entry in _store it
         # never expires and invalidate() leaves it alone: invalidating means
         # "fetch again", not "forget what Paperless last said".
@@ -80,7 +100,7 @@ class MetadataCache:
         entry = self._store.get(key)
         if entry is None:
             return None
-        ts, data = entry
+        ts, data, _current = entry
         if self._clock() - ts < self._ttl:
             return data
         return None
@@ -96,7 +116,7 @@ class MetadataCache:
             data: List of metadata dicts to cache.
 
         """
-        self._store[key] = (self._clock(), data)
+        self._store[key] = (self._clock(), data, True)
         self._last_good[key] = data
 
     def generation(self, key: str) -> int:
@@ -146,6 +166,22 @@ class MetadataCache:
         self, key: str, fetch: Callable[[], list[dict[str, object]]]
     ) -> list[dict[str, object]]:
         """
+        Return :meth:`get_or_fetch_list`'s list alone.
+
+        Args:
+            key: Cache key.
+            fetch: Callable producing the value on a miss.
+
+        Returns:
+            The cached, freshly fetched, or last good list of dicts.
+
+        """
+        return self.get_or_fetch_list(key, fetch).rows
+
+    def get_or_fetch_list(
+        self, key: str, fetch: Callable[[], list[dict[str, object]]]
+    ) -> CachedList:
+        """
         Return a fresh cached value, fetching it once when it is missing.
 
         Single-flight: concurrent misses for one key share a per-key lock, and
@@ -173,22 +209,27 @@ class MetadataCache:
         good copy, the waiting threads retry the fetch one after another, each
         paying the connect timeout.
 
+        The answer says which it is: a last good copy -- served now, or
+        re-armed by an earlier failure and still within its extra TTL -- is
+        not current, so a caller can refuse to treat it as proof.
+
         Args:
             key: Cache key.
             fetch: Callable producing the value on a miss.
 
         Returns:
-            The cached, freshly fetched, or last good list of dicts.
+            The cached, freshly fetched, or last good list, and whether it is
+            current.
 
         """
-        cached = self.get(key)
+        cached = self._served(key)
         if cached is not None:
             return cached
         with self._locks_guard:
             key_lock = self._key_locks.setdefault(key, threading.Lock())
         with key_lock:
             # Another thread may have filled the entry while this one waited.
-            cached = self.get(key)
+            cached = self._served(key)
             if cached is not None:
                 return cached
             generation = self.generation(key)
@@ -209,9 +250,30 @@ class MetadataCache:
                     logger.warning(_STALE_RE_ARMED, key, self._ttl, reason)
                 else:
                     logger.warning(_STALE_NOT_RE_ARMED, key, reason)
-                return stale
+                return CachedList(stale, current=False)
             self.store_if_current(key, data, generation)
-            return data
+            return CachedList(data, current=True)
+
+    def _served(self, key: str) -> CachedList | None:
+        """
+        Return the unexpired entry for ``key`` with whether it is current.
+
+        The lookup itself goes through :meth:`get`, so the TTL rule lives in
+        one place; the flag is read from the entry that list came from.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            The entry, or None when it is missing or expired.
+
+        """
+        cached = self.get(key)
+        if cached is None:
+            return None
+        entry = self._store.get(key)
+        current = entry is not None and entry[1] is cached and entry[2]
+        return CachedList(cached, current=current)
 
     def _re_arm(
         self, key: str, generation: int
@@ -235,7 +297,7 @@ class MetadataCache:
             stale = self._last_good.get(key)
             re_armed = stale is not None and self._generations.get(key, 0) == generation
             if stale is not None and re_armed:
-                self._store[key] = (self._clock(), stale)
+                self._store[key] = (self._clock(), stale, False)
         return stale, re_armed
 
     def invalidate(self, key: str) -> None:

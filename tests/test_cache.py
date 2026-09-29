@@ -21,7 +21,7 @@ import pytest
 
 from saneless.exceptions import PaperlessError
 from saneless.paperless import PaperlessClient
-from saneless.web.cache import CachedMetadataLookup, MetadataCache
+from saneless.web.cache import CachedList, CachedMetadataLookup, MetadataCache
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -339,6 +339,36 @@ def test_recovered_refresh_replaces_the_last_good_value() -> None:
 
     assert cache.get_or_fetch("tags", lambda: recovered) is recovered
     assert cache.get("tags") is recovered
+
+
+def test_the_last_good_copy_is_served_as_not_current() -> None:
+    """
+    A caller can tell the last good copy from a list paperless-ngx just gave.
+
+    Only a current list may show an id gone; the copy predates anything
+    created or deleted since.  The flag holds for the re-armed entry's whole
+    extra TTL, and a successful refresh makes the list current again.
+    """
+    clock = _FakeClock()
+    cache = MetadataCache(ttl=60, clock=clock)
+    good: _Rows = [{"id": 1, "name": "receipt"}]
+
+    fetched = cache.get_or_fetch_list("tags", lambda: good)
+    assert fetched == CachedList(good, current=True)
+    assert cache.get_or_fetch_list("tags", list) == fetched
+
+    clock.advance(61)
+    down = cache.get_or_fetch_list("tags", lambda: _raise(PaperlessError("down")))
+    assert down == CachedList(good, current=False)
+    clock.advance(1)
+    rearmed = cache.get_or_fetch_list("tags", lambda: _raise(PaperlessError("down")))
+    assert rearmed == CachedList(good, current=False)
+
+    clock.advance(61)
+    recovered: _Rows = [{"id": 2, "name": "invoice"}]
+    assert cache.get_or_fetch_list("tags", lambda: recovered) == CachedList(
+        recovered, current=True
+    )
 
 
 def test_unexpected_refresh_failure_serves_the_last_good_value_by_class_name(

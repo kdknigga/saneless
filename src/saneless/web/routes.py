@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
     from saneless.vocabulary import PassPrompt, PassPromptCopy
-    from saneless.web.cache import MetadataCache
+    from saneless.web.cache import CachedList, MetadataCache
     from saneless.web.checks_cache import CachedChecks
     from saneless.web.job_view import JobView
     from saneless.worker import ScanWorker
@@ -575,17 +575,18 @@ def _cached_list_or_none(
     resource: MetadataResource,
     *,
     timeout: float | None = None,
-) -> list[dict[str, object]] | None:
+) -> CachedList | None:
     """
     Retrieve metadata from cache or paperless-ngx, or None when it is unknown.
 
-    The fetch goes through the cache's single-flight ``get_or_fetch``, so
+    The fetch goes through the cache's single-flight ``get_or_fetch_list``, so
     concurrent requests for the same resource make one Paperless call.  When
-    a refresh fails, the cache serves the last list fetched successfully;
-    only when there has never been one does the error reach this function,
-    which logs its cause and answers None.  None and an empty list are
-    different facts: paperless-ngx that has no tags can prove a ticked id
-    gone, and one that could not be asked cannot.
+    a refresh fails, the cache serves the last list fetched successfully,
+    marked as not current; only when there has never been one does the error
+    reach this function, which logs its cause and answers None.  None and an
+    empty list are different facts: paperless-ngx that has no tags can prove a
+    ticked id gone, and one that could not be asked cannot.  Nor can the last
+    good copy, which predates anything created or deleted since.
 
     Args:
         cache: Metadata cache instance.
@@ -595,13 +596,14 @@ def _cached_list_or_none(
             None for the client's own default.
 
     Returns:
-        The list, fresh or the last good one, or None when neither exists.
+        The list, fresh or the last good one, with whether it is current, or
+        None when neither exists.
 
     """
     getter = paperless.get_tags if resource == "tags" else paperless.get_correspondents
     fetch = getter if timeout is None else partial(getter, timeout=timeout)
     try:
-        return cache.get_or_fetch(resource, fetch)
+        return cache.get_or_fetch_list(resource, fetch)
     except (PaperlessError, ConfigError) as exc:
         logger.warning(
             "Failed to fetch %s from paperless-ngx, using empty list: %s",
@@ -639,30 +641,35 @@ def _get_cached_or_fetch(
 
     """
     data = _cached_list_or_none(cache, paperless, resource)
-    return [] if data is None else data
+    return [] if data is None else data.rows
 
 
 def _unnamed_rows(
     ticked: list[int],
     known_ids: frozenset[int] | None,
     *,
+    proven: bool,
     stale_label: Callable[[int], str],
     unlisted_label: Callable[[int], str],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     """
     Split the ticked ids the list does not name into stale and unlisted rows.
 
-    A list that was read and lacks an id proves it gone, so that id is stale
-    and its label says it will be skipped.  With no list at all nothing is
-    proved, so every ticked id is unlisted and labelled by number alone.
+    A list read from paperless-ngx just now that lacks an id proves it gone,
+    so that id is stale and its label says it will be skipped.  With no list
+    at all nothing is proved, so every ticked id is unlisted and labelled by
+    number alone.  Nor does the last good copy prove anything, served while
+    paperless-ngx cannot be reached: the scan will send the id unchecked, and
+    the id may be newer than the copy, so an id it lacks is unlisted too.
     Either way the row stays ticked: the untouched submit has to carry what
     the form shows, and the scan decides what to drop.
 
     Args:
         ticked: The ticked ids, in order and without repeats.
         known_ids: The ids the list holds, or None when it is unknown.
-        stale_label: Labels an id the known list lacks.
-        unlisted_label: Labels an id when the list is unknown.
+        proven: Whether the list is current, and so can prove an id gone.
+        stale_label: Labels an id a current list lacks.
+        unlisted_label: Labels an id nothing can prove gone.
 
     Returns:
         The stale rows and the unlisted rows, each ``{"id", "label"}``.
@@ -670,12 +677,10 @@ def _unnamed_rows(
     """
     if known_ids is None:
         return [], [{"id": item, "label": unlisted_label(item)} for item in ticked]
-    stale: list[dict[str, object]] = [
-        {"id": item, "label": stale_label(item)}
-        for item in ticked
-        if item not in known_ids
-    ]
-    return stale, []
+    missing = [item for item in ticked if item not in known_ids]
+    if not proven:
+        return [], [{"id": item, "label": unlisted_label(item)} for item in missing]
+    return [{"id": item, "label": stale_label(item)} for item in missing], []
 
 
 def _tag_list_context(
@@ -737,7 +742,8 @@ def _tag_list_context(
             "selected_tags": set(),
             "any_tags": False,
         }
-    listed = _cached_list_or_none(state.cache, state.paperless, "tags", timeout=timeout)
+    cached = _cached_list_or_none(state.cache, state.paperless, "tags", timeout=timeout)
+    listed = cached.rows if cached is not None else None
     # The same rule the pre-scan check applies, so the page and the scan
     # agree on which ids paperless-ngx still has.
     known_ids = metadata_ids(listed)
@@ -746,6 +752,7 @@ def _tag_list_context(
     stale, unlisted = _unnamed_rows(
         ticked,
         known_ids,
+        proven=cached is not None and cached.current,
         stale_label=stale_default_tag_label,
         unlisted_label=unlisted_tag_label,
     )
@@ -798,9 +805,10 @@ def _correspondent_options_context(
         chosen id, and the extra option or None.
 
     """
-    listed = _cached_list_or_none(
+    cached = _cached_list_or_none(
         state.cache, state.paperless, "correspondents", timeout=timeout
     )
+    listed = cached.rows if cached is not None else None
     known_ids = metadata_ids(listed)
     correspondents = listed if listed is not None and known_ids is not None else []
     extra_option: dict[str, object] | None = None
@@ -808,6 +816,7 @@ def _correspondent_options_context(
         stale, unlisted = _unnamed_rows(
             [selected],
             known_ids,
+            proven=cached is not None and cached.current,
             stale_label=stale_default_correspondent_label,
             unlisted_label=unlisted_correspondent_label,
         )

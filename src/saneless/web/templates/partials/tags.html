@@ -10,9 +10,10 @@
       with the note that says it will be skipped, so the untouched submit
       still carries it and the finished job names the drop; unticking it is
       how the operator clears both.
-   2. Unlisted: ticked while the tag list could not be read at all.  The row
-      is the bare id, with no note, because "no longer in paperless-ngx"
-      cannot be claimed without the list; it stays ticked for the same
+   2. Unlisted: ticked while the tag list could not be read at all, or
+      missing from the last good copy served while it could not be read.  The
+      row is the bare id, with no note, because "no longer in paperless-ngx"
+      cannot be claimed without a current list; it stays ticked for the same
       reason as a stale one.
    3. Pinned: ticked and in the list, but excluded by the filter.  Pinned
       above the list so a tick can never leave the DOM and therefore can

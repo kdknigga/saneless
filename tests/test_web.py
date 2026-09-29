@@ -3736,6 +3736,81 @@ class TestMetadataFollowsTheSubmittedProfile:
             assert job.correspondent == _RECEIPTS_CORRESPONDENT
 
 
+def _unreachable(*, timeout: float | None = None) -> NoReturn:
+    """
+    Stand in for a paperless-ngx that cannot be reached, whatever the timeout.
+
+    Args:
+        timeout: The budget the caller asked for, unused.
+
+    Raises:
+        ConnectionError: Always.
+
+    """
+    del timeout
+    msg = "paperless unreachable"
+    raise ConnectionError(msg)
+
+
+class TestTheLastGoodCopyProvesNothing:
+    """
+    A list served from the last good copy cannot show an id is gone.
+
+    While paperless-ngx cannot be reached the page still renders the list it
+    last read, but the scan will send the ids unchecked, and a tag created
+    since is missing from that copy without being gone.  So an id the copy
+    lacks is labelled by number alone, never "will be skipped".
+    """
+
+    def _outage(self, client: TestClient) -> None:
+        """Fill the cache while paperless-ngx answers, then take it away."""
+        app = _app(client)
+        assert client.get("/").status_code == 200
+        app.state.paperless.get_tags = _unreachable
+        app.state.paperless.get_correspondents = _unreachable
+        app.state.cache.invalidate("tags")
+        app.state.cache.invalidate("correspondents")
+
+    def test_a_default_missing_from_the_copy_is_unlisted_not_stale(
+        self, tmp_path: Path
+    ) -> None:
+        """Tag 99 and correspondent 98 are not claimed gone during an outage."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            self._outage(client)
+            tags = client.get("/api/profiles/tags", params={"profile": "gone"}).text
+            select = client.get(
+                "/api/profiles/correspondent", params={"profile": "gone"}
+            ).text
+
+        assert "checked" in _checkbox(tags, 99)
+        assert "no longer in paperless-ngx" not in tags
+        assert re.search(r'value="99"[^>]*> tag 99</label>', tags), tags
+        assert "selected" in _option(select, 98)
+        assert "no longer in paperless-ngx" not in select
+        # A ticked id the copy does list is rendered once, from the list.
+        assert tags.count('value="3"') == 1
+        assert "checked" in _checkbox(tags, 3)
+
+    def test_the_second_render_in_the_outage_is_not_proof_either(
+        self, tmp_path: Path
+    ) -> None:
+        """The re-armed copy stays unproven for its whole extra TTL."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            self._outage(client)
+            client.get("/api/profiles/tags", params={"profile": "gone"})
+            again = client.get("/api/profiles/tags", params={"profile": "gone"}).text
+
+        assert "no longer in paperless-ngx" not in again
+        assert "checked" in _checkbox(again, 99)
+
+    def test_a_current_list_still_proves_a_default_gone(self, tmp_path: Path) -> None:
+        """With paperless-ngx answering, the stale note is unchanged."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            tags = client.get("/api/profiles/tags", params={"profile": "gone"}).text
+
+        assert "tag 99 (no longer in paperless-ngx; will be skipped)" in tags
+
+
 # The two collection endpoints a page load can reach, as paperless.py spells
 # them.  Counting by path is what separates "no tag request" from "no request
 # at all", which are different claims and fail differently.

@@ -230,8 +230,9 @@ Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses ca
 
 A ticked id that is not in the list still comes back ticked, so a submit never loses it. If
 the list was fetched and the id is missing from it, the row reads, for example,
-`tag 7 (no longer in paperless-ngx; will be skipped)`. If paperless-ngx could not be asked
-and there is no earlier list, the row reads `tag 7`, with no claim either way.
+`tag 7 (no longer in paperless-ngx; will be skipped)`. If paperless-ngx could not be asked,
+the row reads `tag 7`, with no claim either way: whether there is no earlier list, or the
+page is showing the last list fetched successfully, which cannot show that a tag is gone.
 
 ---
 
