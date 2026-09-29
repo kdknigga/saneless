@@ -6,7 +6,7 @@ import logging
 import re
 import tomllib
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import pytest
 from tomlkit.exceptions import ParseError, TOMLKitError
@@ -1115,16 +1115,71 @@ class TestProfileLabels:
     @pytest.mark.parametrize(
         ("source", "expected"),
         [
-            ("ADF Front", "Feeder, single-sided"),
+            ("ADF", "Feeder, single-sided"),
+            ("ADF Front", "Feeder, front side only"),
+            ("ADF Back", "Feeder, back side only"),
             ("ADF Duplex", "Feeder, double-sided"),
             ("Flatbed", "Glass (flatbed)"),
+            # No feeder word, so these classify as UNKNOWN and never reach the
+            # front/back wording: the side refinement is not a second router.
+            ("Card Front", "Scanner source"),
+            ("Card Back", "Scanner source"),
         ],
     )
     def test_label_uses_the_three_d19_forms_verbatim(
         self, source: str, expected: str
     ) -> None:
-        """D-19 names these three strings exactly; they are locked copy."""
+        """
+        D-19 names the feeder, duplex and glass strings; they are locked copy.
+
+        A feeder that names exactly one side reads as that side, which is a
+        wording refinement of the single-sided feeder form.
+        """
         assert _profile_label(source) == expected
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                "ADF Front",
+                "Scans only the front of every page using the document feeder.",
+            ),
+            (
+                "ADF Back",
+                "Scans only the back of every page using the document feeder.",
+            ),
+            ("ADF", "Scans one side of every page using the document feeder."),
+        ],
+    )
+    def test_feeder_side_description_names_the_side(
+        self, source: str, expected: str
+    ) -> None:
+        """A front or back feeder's sentence matches its label."""
+        assert _profile_description(source) == expected
+
+    @pytest.mark.parametrize(
+        ("auto_source_mode", "expected"),
+        [
+            (
+                "adf",
+                "Scans every page in the document feeder; "
+                "the scanner decides how it feeds them.",
+            ),
+            ("flatbed", "Scans one page; the scanner picks the glass or the feeder."),
+        ],
+    )
+    def test_auto_description_follows_its_routing(
+        self, auto_source_mode: Literal["adf", "flatbed"], expected: str
+    ) -> None:
+        """
+        An ``Auto`` profile is described by how it routes, not by its kind.
+
+        On a platen-less device ``Auto`` is routed as a whole stack, on one
+        with a glass as a single page; one sentence cannot be true of both.
+        """
+        description = _profile_description("Auto", auto_source_mode=auto_source_mode)
+        assert description == expected
+        assert len(description) <= PROFILE_DESCRIPTION_MAX_LENGTH
 
     @pytest.mark.parametrize("source", ["Auto", "Some Unknown Source"])
     def test_label_is_never_empty_for_an_unclassified_source(self, source: str) -> None:
@@ -1218,7 +1273,7 @@ class TestProfileLabels:
         )
         profiles = generate_profiles(caps)
         assert profiles["flatbed"].label == "Glass (flatbed)"
-        assert profiles["adf-front"].label == "Feeder, single-sided"
+        assert profiles["adf-front"].label == "Feeder, front side only"
         assert profiles["adf-duplex"].label == "Feeder, double-sided"
         for slug, profile in profiles.items():
             assert profile.label == _profile_label(profile.source), slug
@@ -1237,6 +1292,51 @@ class TestProfileLabels:
         assert profiles["default"].source == "ADF Duplex"
         assert profiles["default"].label == "Feeder, double-sided"
         assert profiles["default"].description == _profile_description("ADF Duplex")
+
+
+class TestFeederSide:
+    """
+    ``_feeder_side`` names the one side a single-sided feeder scans.
+
+    It answers a wording question only. ``classify_source`` stays the one rule
+    that decides what a source is; this helper is reached only from the
+    ``FEEDER`` arm of the label and description functions, so a table over the
+    real SANE spellings is what pins it.
+    """
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            # fujitsu, canon_dr, kodak, epjitsu, avision, epsonds
+            ("ADF Front", "front"),
+            ("ADF Back", "back"),
+            ("adf back", "back"),
+            # escl, hp5590
+            ("ADF", None),
+            # epson2
+            ("Automatic Document Feeder", None),
+            # brother4
+            ("Automatic Document Feeder(left aligned)", None),
+            ("Automatic Document Feeder(centrally aligned)", None),
+            # Naming both sides names neither.
+            ("ADF Front Back", None),
+            # A side word must be a whole word, not part of one.
+            ("ADF Backlit", None),
+            ("ADF Frontal", None),
+        ],
+    )
+    def test_feeder_side_reads_one_whole_side_word(
+        self, source: str, expected: str | None
+    ) -> None:
+        """Exactly one whole side word names a side; anything else names none."""
+        assert auto_profiles._feeder_side(source) == expected
+
+    @pytest.mark.parametrize(
+        "source", ["ADF Front", "ADF Back", "ADF", "Automatic Document Feeder"]
+    )
+    def test_every_side_spelling_is_a_single_sided_feeder(self, source: str) -> None:
+        """The table's rows are the sources the ``FEEDER`` arm actually sees."""
+        assert classify_source(source) is SourceKind.FEEDER
 
 
 class TestGenerateProfilesSlugCollision:
@@ -2019,7 +2119,7 @@ auto_generated = true
         """D-18: free text is owned text while the flag is set."""
         config_file = self._write(tmp_path, force=True)
         scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
-        assert scan["label"] == "Feeder, single-sided"
+        assert scan["label"] == "Feeder, front side only"
         assert scan["description"] == _profile_description("ADF Front")
 
     def test_force_refresh_keeps_unowned_keys_and_comments(
@@ -2067,7 +2167,7 @@ auto_generated = true
         """The written values survive a real load, caps and all."""
         config_file = self._write(tmp_path, force=True)
         settings = load_settings(str(config_file))
-        assert settings.profiles["scan"].label == "Feeder, single-sided"
+        assert settings.profiles["scan"].label == "Feeder, front side only"
         assert settings.profiles["default"].label == "Glass (flatbed)"
 
 
