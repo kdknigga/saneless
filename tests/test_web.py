@@ -2876,6 +2876,7 @@ def _simple_form_app(
     return app
 
 
+@pytest.mark.usefixtures("offline_paperless")
 class TestSimpleForm:
     """
     D-28 and D-29: the owner can shrink the form without changing the scan.
@@ -3063,6 +3064,7 @@ def _newest_job(client: TestClient) -> Job:
     return rows[0]
 
 
+@pytest.mark.usefixtures("offline_paperless")
 class TestProfileDefaultsFollowTheFormShape:
     """
     A shown control is answered by the submit; a hidden one takes the default.
@@ -3579,6 +3581,7 @@ def _marker(html: str, name: str) -> str:
     return found[0]
 
 
+@pytest.mark.usefixtures("offline_paperless")
 class TestMetadataFollowsTheSubmittedProfile:
     """
     The metadata a scan files belongs to the profile it names.

@@ -2604,6 +2604,9 @@ class TestWhichResponsesCarryWhat:
         assert response.status_code == 200
         assert _OOB_CHECKS.search(response.text) is not None
 
+    # Offline, so the job this submit starts fails its upload at once rather
+    # than retrying a real localhost connection for a minute after the test.
+    @pytest.mark.usefixtures("offline_paperless")
     def test_a_scan_submit_on_an_idle_server_says_the_checks_are_paused(
         self, client: TestClient
     ) -> None:
