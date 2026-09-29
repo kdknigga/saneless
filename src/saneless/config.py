@@ -1091,6 +1091,19 @@ class _ByteExactTomlSource(TomlConfigSettingsSource):
         self.init_kwargs = dict(self.toml_data)
 
 
+# The pydantic error type a config without a default profile fails with.  A
+# custom error, not a ValueError, so the rendered line carries no "Value
+# error," prefix ahead of saneless's own sentence.
+_MISSING_DEFAULT_TYPE: Final = "missing_default_profile"
+
+# The sentence that line carries: which table is missing, and why a config
+# cannot do without it.
+_MISSING_DEFAULT_MESSAGE: Final = (
+    "a [profiles.default] table is required: "
+    "it is the profile a scan uses when none is named"
+)
+
+
 class Settings(BaseSettings):
     """
     Application settings with TOML + env var loading.
@@ -1197,10 +1210,15 @@ class Settings(BaseSettings):
         cls,
         v: dict[str, ProfileConfig],
     ) -> dict[str, ProfileConfig]:
-        """Ensure a default profile is always defined."""
+        """
+        Ensure a default profile is always defined.
+
+        Raises:
+            PydanticCustomError: No profile is named ``default``.
+
+        """
         if "default" not in v:
-            msg = "A 'default' profile must be defined in config"
-            raise ValueError(msg)
+            raise PydanticCustomError(_MISSING_DEFAULT_TYPE, _MISSING_DEFAULT_MESSAGE)
         return v
 
 
