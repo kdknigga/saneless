@@ -32,6 +32,7 @@ from saneless.atomic_write import refused_mode_change
 from saneless.exceptions import DiskSpaceError, PdfError, describe
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import make_private_dir
+from saneless.spool import BYTES_PER_MB
 
 # What a preserved artefact's title says it is.  The suffixes are spelled in
 # vocabulary, beside the title cap one of them bounds, and are re-exported
@@ -85,11 +86,6 @@ nothing except that a WARNING is emitted: saneless never deletes, moves,
 truncates or rotates a file it preserved, because the whole point of preserving
 one was that it is the only remaining copy of a scanned document.
 """
-
-# One megabyte, as every free-space check in saneless counts them, so the
-# per-page shortfall, the up-front workspace check and this rule report in the
-# same units.
-_BYTES_PER_MB: Final[int] = 1024 * 1024
 
 # A preserved scan is a whole document, so only its owner may read it.
 _PRIVATE_FILE_MODE: Final = 0o600
@@ -292,11 +288,11 @@ def warn_if_failed_dir_growing(failed_dir: Path) -> None:
         # not displace the failure the caller is about to report.
         return
     logger.warning(
-        "%d preserved scans (%.1f MiB) have accumulated in %s -- saneless "
+        "%d preserved scans (%.1f MB) have accumulated in %s -- saneless "
         "never deletes these files itself, so draining the directory is yours "
         "to do once those documents are safely in paperless-ngx",
         len(preserved) + len(page_dirs),
-        total_bytes / _BYTES_PER_MB,
+        total_bytes / BYTES_PER_MB,
         failed_dir,
     )
 
@@ -377,7 +373,7 @@ def _mb_rounded_up(size: int) -> int:
         The smallest whole number of megabytes that holds it.
 
     """
-    return (size + _BYTES_PER_MB - 1) // _BYTES_PER_MB
+    return (size + BYTES_PER_MB - 1) // BYTES_PER_MB
 
 
 def ensure_room_to_assemble(
@@ -421,14 +417,14 @@ def ensure_room_to_assemble(
             f"in {directory}: {describe(exc)}"
         )
         raise PdfError(msg) from exc
-    need = 2 * spooled + reserve_mb * _BYTES_PER_MB
+    need = 2 * spooled + reserve_mb * BYTES_PER_MB
     if free >= need:
         return
     msg = (
         f"Not enough free disk space to assemble {len(records)} page(s) in "
         f"{directory}: {_mb_rounded_up(need)} MB needed (twice the "
         f"{_mb_rounded_up(spooled)} MB of spooled pages plus the {reserve_mb} MB "
-        f"min_free_space_mb reserve), {free // _BYTES_PER_MB} MB free"
+        f"min_free_space_mb reserve), {free // BYTES_PER_MB} MB free"
     )
     raise DiskSpaceError(msg)
 
