@@ -2995,3 +2995,103 @@ class TestRemovedPositions:
             pages_uploaded=None,
         )
         assert result.removed_positions is None
+
+
+def _store_path(tmp_path: Path, where: str) -> str:
+    """Return a file database path under ``tmp_path``, or ``":memory:"``."""
+    return ":memory:" if where == "memory" else str(tmp_path / "jobs.db")
+
+
+def _created_at_indexes(conn: sqlite3.Connection) -> list[str]:
+    """Return the names of the indexes on the jobs table keyed on created_at alone."""
+    names = [row[1] for row in conn.execute("PRAGMA index_list(jobs)")]
+    return [
+        name
+        for name in names
+        # The index name comes from SQLite's own catalogue, not from a caller,
+        # and a PRAGMA argument cannot be bound.
+        if [row[2] for row in conn.execute(f"PRAGMA index_info({name})")]
+        == ["created_at"]
+    ]
+
+
+class TestOpenLeavesNoSnapshot:
+    """Opening an up-to-date database leaves no read snapshot behind."""
+
+    def test_checkpoint_is_not_busy_after_open(self, tmp_path: Path) -> None:
+        """Another connection's write can be checkpointed while the store sits idle."""
+        db_path = str(tmp_path / "jobs.db")
+        JobStore(db_path=db_path).close()
+
+        # The second open finds nothing to migrate: only the version read runs.
+        store = JobStore(db_path=db_path)
+        other = sqlite3.connect(db_path, isolation_level=None)
+        try:
+            other.execute(
+                "INSERT INTO jobs (id, profile, title, state, tags, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "other-1",
+                    "default",
+                    "Other",
+                    JobState.DONE.value,
+                    "[]",
+                    datetime.now(tz=UTC).isoformat(),
+                ),
+            )
+            busy, _log_frames, _checkpointed = other.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            assert busy == 0
+        finally:
+            other.close()
+            store.close()
+
+
+class TestCreatedAtIndex:
+    """History reads are served by an index on created_at, not a sort."""
+
+    @pytest.mark.parametrize("where", ["file", "memory"])
+    def test_recent_query_uses_the_created_at_index(
+        self, tmp_path: Path, where: str
+    ) -> None:
+        """The newest-first read plans without a temporary B-tree for its ORDER BY."""
+        store = JobStore(db_path=_store_path(tmp_path, where))
+        try:
+            plan = [
+                row[3]
+                for row in store._conn.execute(
+                    f"EXPLAIN QUERY PLAN {job_module._SELECT_RECENT}", (20,)
+                )
+            ]
+            assert not any("TEMP B-TREE" in detail for detail in plan), plan
+            assert _created_at_indexes(store._conn)
+        finally:
+            store.close()
+
+    @pytest.mark.parametrize("where", ["file", "memory"])
+    def test_index_leaves_the_schema_version_at_3(
+        self, tmp_path: Path, where: str
+    ) -> None:
+        """The index adds no ladder step, so an earlier release still opens the file."""
+        store = JobStore(db_path=_store_path(tmp_path, where))
+        try:
+            version, _columns = _read_schema(store._conn)
+            assert _created_at_indexes(store._conn)
+            assert version == HEAD_VERSION
+            assert len(job_module._MIGRATIONS) == HEAD_VERSION
+        finally:
+            store.close()
+
+    def test_reopening_with_the_index_present_succeeds(self, tmp_path: Path) -> None:
+        """A database that already carries the index opens again, still with one."""
+        db_path = str(tmp_path / "jobs.db")
+        JobStore(db_path=db_path).close()
+
+        store = JobStore(db_path=db_path)
+        try:
+            version, _columns = _read_schema(store._conn)
+            assert version == HEAD_VERSION
+            assert len(_created_at_indexes(store._conn)) == 1
+        finally:
+            store.close()
