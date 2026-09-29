@@ -65,6 +65,30 @@ _EMPTY_SLUG_FALLBACK = "source"
 # accepted trade.
 _PLATEN_DEVICE_TYPES: Final = ("flatbed", "all-in-one", "multi-function")
 
+# The mode a generated profile asks for when the device reported no modes at
+# all -- the conventional SANE name, which is what every profile used before
+# modes were ranked.
+_FALLBACK_MODE: Final = "Color"
+
+# Words that mark a scan mode as colour, and as gray, when found in a mode name.
+# Matched case-insensitively, as whole names first and then as substrings,
+# because backends decorate them ("24bit Color", "True Gray") and some use the
+# British spelling.
+_COLOUR_WORDS: Final = ("color", "colour")
+_GRAY_WORDS: Final = ("gray", "grey")
+
+# Words that mark a mode as a degraded rendering of its colour or gray family --
+# one or two bits per pixel, a dither, or an inverted image. A mode naming one
+# of these is chosen only when nothing cleaner in the same family exists.
+_DEGRADED_MODE_WORDS: Final = (
+    "lineart",
+    "halftone",
+    "negative",
+    "dither",
+    "binary",
+    "diffusion",
+)
+
 
 def _slugify(source: str) -> str:
     """
@@ -128,9 +152,14 @@ def _snap_into_range(target: int, resolution_range: tuple[float, float, float]) 
     Clamp a target into a reported range and snap it onto the range's step.
 
     Clamping alone is not enough. A range says the device accepts values from
-    its minimum to its maximum *in increments of its step*, so a value inside
+    its minimum *in increments of its step* up to its maximum, so a value inside
     the span but off the grid is still one the device never offered, and SANE
-    would silently substitute something else for it.
+    would silently substitute something else for it. The maximum itself need
+    not lie on the grid, so the ceiling used is the largest on-grid value not
+    above it -- clamping to the raw maximum could land off the grid.
+
+    Between two grid values the higher wins a tie, so an equidistant pick is
+    never below the target a profile asked for.
 
     A step of zero is not a defect to guard against but a documented SANE
     meaning -- the range is continuous and any value within it is acceptable --
@@ -147,13 +176,20 @@ def _snap_into_range(target: int, resolution_range: tuple[float, float, float]) 
 
     """
     low, high, step = resolution_range
-    clamped = min(max(float(target), low), high)
     if step > 0:
-        # Snap relative to the minimum, which is where the grid starts.
-        clamped = min(max(low + round((clamped - low) / step) * step, low), high)
-    # round() on a float already yields an int, which is the coercion this
-    # function exists to perform.
-    return round(clamped)
+        # The grid starts at the minimum; its top is the largest grid value
+        # that does not exceed the maximum.
+        top = low + math.floor((high - low) / step) * step
+        clamped = min(max(float(target), low), top)
+        below = low + math.floor((clamped - low) / step) * step
+        above = below + step
+        value = above if clamped - below >= above - clamped else below
+        value = min(value, top)
+    else:
+        value = min(max(float(target), low), high)
+    # Half-up coercion to whole dpi. Python's built-in rounding takes a .5 to
+    # the nearest even number, a rule about accumulated error, not scanners.
+    return math.floor(value + 0.5)
 
 
 def pick_closest_resolution(
@@ -195,25 +231,61 @@ def pick_closest_resolution(
     return target
 
 
-def pick_preferred_mode(
-    modes: list[str],
-    preferred: str = "Color",
-) -> str:
+def _first_mode_containing(modes: Sequence[str], words: tuple[str, ...]) -> str | None:
     """
-    Pick preferred scan mode, falling back to first available.
+    Pick the cleanest mode whose name contains one of the given words.
 
     Args:
-        modes: Available scan modes from scanner.
-        preferred: Preferred mode name (defaults to "Color").
+        modes: Available scan modes, in the order the device reported them.
+        words: Lowercase words marking the family wanted (colour or gray).
 
     Returns:
-        The matched mode string, or first available, or preferred if empty.
+        The first mode in the family that names no degraded rendering, else the
+        first mode in the family at all, else None when the family is absent.
+
+    """
+    family = [m for m in modes if any(w in m.casefold() for w in words)]
+    for mode in family:
+        if not any(w in mode.casefold() for w in _DEGRADED_MODE_WORDS):
+            return mode
+    return family[0] if family else None
+
+
+def pick_preferred_mode(modes: list[str]) -> str:
+    """
+    Pick the scan mode a person would choose, ranked by what each mode means.
+
+    SANE backends do not agree on how to spell colour: brother4 offers
+    ``24bit Color``, some drivers say ``Colour``, and the SANE standard names
+    include ``Color Lineart``. A backend's first entry is usually its
+    black-and-white mode, so matching only the exact word ``Color`` and falling
+    back to the first entry handed colour scanners black-and-white profiles.
+
+    The tiers, each scanning the modes in the order the device reported them
+    and matching case-insensitively:
+
+    1. A mode whose whole name is a colour word (``Color``, ``Colour``).
+    2. A mode containing a colour word, preferring one that names no degraded
+       rendering (lineart, halftone, negative, dither, binary, diffusion).
+    3. The same rule for gray (``Gray``, ``Grey``), so a device without colour
+       still scans in gray rather than in dithered black-and-white.
+    4. The first mode the device reported.
+
+    Args:
+        modes: Available scan modes from the scanner.
+
+    Returns:
+        The chosen mode, or ``_FALLBACK_MODE`` when the device reported none.
 
     """
     for mode in modes:
-        if mode.lower() == preferred.lower():
+        if mode.casefold() in _COLOUR_WORDS:
             return mode
-    return modes[0] if modes else preferred
+    for words in (_COLOUR_WORDS, _GRAY_WORDS):
+        chosen = _first_mode_containing(modes, words)
+        if chosen is not None:
+            return chosen
+    return modes[0] if modes else _FALLBACK_MODE
 
 
 def is_bare_default(settings: Settings) -> bool:
@@ -558,7 +630,7 @@ def generate_profiles(
         target=DEFAULT_RESOLUTION,
         resolution_range=capabilities.resolution_range,
     )
-    mode = pick_preferred_mode(capabilities.modes, preferred="Color")
+    mode = pick_preferred_mode(capabilities.modes)
     # Two independent witnesses to one fact, OR-ed rather than ranked: a named
     # Flatbed source, or a declared device type that has a glass. Either alone
     # is enough, because each covers the other's blind spot -- a backend can
