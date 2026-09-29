@@ -2163,9 +2163,61 @@ def config_search_paths() -> tuple[Path, ...]:
     )
 
 
+def _pin_relative_paths(settings: Settings, base: Path) -> None:
+    """
+    Make every relative path setting absolute, joined onto ``base``.
+
+    ``base`` is the directory of the loaded config file, or the working
+    directory when no file was loaded. A relative path used to be taken
+    against whichever directory a command happened to run in, so two commands
+    could open two different job databases. Pinned once at load, every
+    command agrees, and the log and ``doctor`` show the path that is used.
+
+    Where a value came from does not matter: a relative value from a
+    ``SANELESS_*`` variable is joined onto the same base as one from the file.
+    That keeps the rule one sentence long, and nothing needs to know which
+    source supplied a value.
+
+    ``base`` comes from ``Path.absolute()``, never ``resolve()``: the file is
+    anchored in the directory it was found in, which is the one the operator
+    named and the one the log prints, even when that file is a symlink into a
+    dotfiles checkout.
+
+    The field validators have already expanded ``~``, so any value still
+    relative here is joined; an absolute value is kept as it is.
+
+    Args:
+        settings: The freshly built settings, rebound in place.
+        base: An absolute directory to resolve relative values against.
+
+    """
+
+    def pin(value: Path) -> Path:
+        return value if value.is_absolute() else base / value
+
+    output = settings.output
+    settings.output = output.model_copy(
+        update={
+            "tmp_dir": pin(output.tmp_dir),
+            "data_dir": pin(output.data_dir),
+            "log_file": pin(output.log_file),
+        }
+    )
+    consume_dir = settings.paperless.consume_dir
+    if consume_dir is not None:
+        settings.paperless = settings.paperless.model_copy(
+            update={"consume_dir": pin(consume_dir)}
+        )
+
+
 def load_settings(config_path: str | None = None) -> Settings:
     """
     Load settings from TOML file with env var overrides.
+
+    Every path setting is absolute on return. A relative ``tmp_dir``,
+    ``data_dir``, ``log_file`` or ``consume_dir``, whether from the file or
+    the environment, is resolved against the loaded file's directory, or
+    against the working directory when no file was loaded.
 
     Args:
         config_path: Explicit path to a TOML config file. If not None,
@@ -2227,6 +2279,8 @@ def load_settings(config_path: str | None = None) -> Settings:
         path = discovery.loaded
     # With no path, only defaults + env vars are used.
     settings = _build_settings(toml_file=path)
+    # ``path`` is already absolute, so its parent is too.
+    _pin_relative_paths(settings, path.parent if path is not None else Path.cwd())
     settings._config_path = path
     settings._config_discovery = discovery
     return settings
