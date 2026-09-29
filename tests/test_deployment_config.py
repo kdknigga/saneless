@@ -103,6 +103,8 @@ from saneless.config import (
     ProfileConfig,
     WebConfig,
     is_placeholder_token,
+    load_settings,
+    validate_settings_dirs,
 )
 from saneless.pages import (
     EDGE_TRIM,
@@ -436,6 +438,167 @@ def _table_row(text: str, first_cell: str) -> str:
     rows = [line for line in text.splitlines() if line.startswith(f"| {first_cell} |")]
     assert rows, f"no table row starting with {first_cell}"
     return rows[0]
+
+
+# The configuration reference's section for each model whose numeric fields
+# carry load-time bounds.
+BOUNDED_SECTIONS = (
+    (OutputConfig, "## `[output]`"),
+    (ProfileConfig, "## `[profiles.NAME]`"),
+)
+
+
+def _plain_number(value: float) -> str:
+    """Spell a bound as the reference does: plain digits, no ``.0``, no separators."""
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def _stated_range(ge: float | None, le: float | None) -> re.Pattern[str]:
+    """
+    Return the pattern a table row states a field's range with.
+
+    ``from <ge> to <le>`` when there is a floor and a ceiling, ``<ge> or more``
+    when there is only a floor. The digit guards stop ``from 1 to 1000`` from
+    being read inside ``from 1 to 10000``, and ``0 or more`` inside
+    ``10 or more``.
+    """
+    low = re.escape(_plain_number(ge)) if ge is not None else None
+    high = re.escape(_plain_number(le)) if le is not None else None
+    if low is not None and high is not None:
+        return re.compile(rf"\bfrom {low} to {high}(?!\d|[.,]\d)", re.IGNORECASE)
+    if low is not None:
+        return re.compile(rf"(?<![\d.,]){low} or more\b", re.IGNORECASE)
+    return re.compile(rf"(?<![\d.,]){high} or less\b", re.IGNORECASE)
+
+
+def _sentences(text: str) -> list[str]:
+    """
+    Split the prose of a Markdown page into sentences.
+
+    Table rows, headings and fenced blocks are left out, so a sentence is
+    never a run of table cells that happens to hold the words a test looks for.
+    """
+    paragraphs: list[list[str]] = [[]]
+    in_fence = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+        if in_fence or not stripped or stripped.startswith(("```", "|", "#")):
+            paragraphs.append([])
+            continue
+        paragraphs[-1].append(stripped)
+    return [
+        sentence
+        for paragraph in paragraphs
+        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(paragraph))
+        if sentence
+    ]
+
+
+def test_configuration_reference_states_every_numeric_bound() -> None:
+    """
+    Each bounded numeric setting's row states the range the loader enforces.
+
+    The bounds are read from the models' own ``ge``/``le`` metadata, so a
+    bound changed in the code and not in the docs fails here. A value outside
+    the range stops saneless loading, so a reader who is not told the range
+    finds it out from an error.
+    """
+    text, name = _read(CONFIG_REFERENCE)
+    offenders: list[str] = []
+    checked = 0
+    for model, heading in BOUNDED_SECTIONS:
+        section = _section(text, heading, name)
+        for field_name, field in model.model_fields.items():
+            ge = next((item.ge for item in field.metadata if hasattr(item, "ge")), None)
+            le = next((item.le for item in field.metadata if hasattr(item, "le")), None)
+            if ge is None and le is None:
+                continue
+            checked += 1
+            key = field.alias or field_name
+            row = _table_row(section, f"`{key}`")
+            expected = _stated_range(ge, le)
+            if expected.search(row) is None:
+                offenders.append(f"{heading} {key}: expected {expected.pattern!r}")
+    assert checked >= 10, f"only {checked} bounded fields found in the models"
+    assert not offenders, (
+        f"{name} does not state these bounds as the loader enforces them:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_environment_reference_documents_json_values() -> None:
+    """
+    The environment reference says list and table fields take JSON.
+
+    A comma-separated ``default_tags`` looks right and is refused at start-up,
+    so the page has to say so in prose, naming the fields, and show the line
+    that names the variable.
+    """
+    text, name = _read(ENV_REFERENCE)
+    assert any(
+        "JSON" in sentence
+        and "`default_tags`" in sentence
+        and "`allowed_hosts`" in sentence
+        for sentence in _sentences(text)
+    ), f"{name} has no sentence saying default_tags and allowed_hosts take JSON"
+    assert "must be JSON" in text, (
+        f"{name} does not show the line naming a variable that is not JSON"
+    )
+
+
+def test_configuration_reference_documents_relative_paths() -> None:
+    """
+    Both references say what a relative path setting is resolved against.
+
+    It is the directory of the loaded config file, whichever source gave the
+    value, and the working directory only when no file loaded.
+    """
+    for page, heading in (
+        (CONFIG_REFERENCE, "## `[output]`"),
+        (ENV_REFERENCE, "## Notes"),
+    ):
+        text, name = _read(page)
+        sentences = _sentences(_section(text, heading, name))
+        assert any(
+            "relative" in sentence and "directory of the config file" in sentence
+            for sentence in sentences
+        ), f"{name} {heading} does not say relative paths follow the config file"
+        assert any(
+            "working directory" in sentence and "no config file" in sentence
+            for sentence in sentences
+        ), f"{name} {heading} does not say what happens with no config file"
+
+
+def test_configuration_reference_names_the_new_config_target() -> None:
+    """
+    The search-path section describes the shadowed state and today's write target.
+
+    With no file loaded, ``auto-profiles`` writes into ``/etc/saneless`` when
+    that directory exists and is writable, else into the XDG file, and never
+    into the working directory or the image's data volume. Two files found is
+    an amber row that names both.
+    """
+    text, name = _read(CONFIG_REFERENCE)
+    assert "/var/lib/saneless/saneless.toml" not in text, (
+        f"{name} still names the data volume as a place auto-profiles writes"
+    )
+    search = _section(text, "## Config File Search Path", name)
+    target = [
+        sentence
+        for sentence in _sentences(search)
+        if "auto-profiles" in sentence and "writes" in sentence
+    ]
+    assert any(
+        "`/etc/saneless/saneless.toml`" in sentence
+        and "`$XDG_CONFIG_HOME/saneless/saneless.toml`" in sentence
+        and "`./saneless.toml`" in sentence
+        for sentence in target
+    ), f"{name} does not say where auto-profiles writes with no config file"
+    assert "is also there and is not read" in search, (
+        f"{name} does not show the amber row for a second config file"
+    )
 
 
 def test_cli_reference_verbose_is_saneless_debug() -> None:
@@ -3632,6 +3795,57 @@ def test_the_example_config_does_not_ship_a_live_web_port() -> None:
         "is fixed and you remap on the host, so a live value here can only "
         "move the server away from the port the image's healthcheck "
         "probes:\n" + "\n".join(offenders)
+    )
+
+
+def test_example_config_loads_and_its_directories_validate() -> None:
+    """
+    ``saneless.toml.example`` loads and passes the start-up directory checks.
+
+    It is the file an operator copies to start from, so it has to be a config
+    saneless accepts as it stands. ``consume_dir`` is the optional fallback and
+    names a real paperless-ngx directory only on the operator's machine, so the
+    example leaves it commented out rather than shipping a path that does not
+    exist.
+    """
+    settings = load_settings(str(TOML_EXAMPLE))
+
+    assert settings.paperless.consume_dir is None, (
+        f"{TOML_EXAMPLE.relative_to(REPO_ROOT)} sets consume_dir live"
+    )
+    validate_settings_dirs(settings)
+
+
+def _complete_example(text: str) -> str:
+    """Return the TOML fence under the configuration reference's Complete Example."""
+    _, heading, after = text.partition("## Complete Example")
+    assert heading, "the configuration reference has no Complete Example heading"
+    match = re.search(r"^```toml\n(?P<body>.*?)^```", after, re.MULTILINE | re.DOTALL)
+    assert match is not None, "the Complete Example has no TOML fence"
+    return match.group("body")
+
+
+def test_complete_example_loads_and_names_every_output_key(tmp_path: Path) -> None:
+    """
+    The configuration reference's Complete Example loads and names every key.
+
+    A reader copies it as a whole. It has to be a file saneless accepts, and a
+    key missing from ``[output]`` is a setting the reader never learns exists.
+    """
+    body = _complete_example(CONFIG_REFERENCE.read_text(encoding="utf-8"))
+    config = tmp_path / CONFIG_NAME
+    config.write_text(body, encoding="utf-8")
+
+    load_settings(str(config))
+
+    missing = [
+        key
+        for key in OutputConfig.model_fields
+        if not re.search(rf"^#?\s*{key}\s*=", body, re.MULTILINE)
+    ]
+    assert not missing, (
+        f"{CONFIG_REFERENCE.relative_to(REPO_ROOT)}'s Complete Example does not "
+        f"name these [output] keys: {', '.join(missing)}"
     )
 
 

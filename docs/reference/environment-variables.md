@@ -34,7 +34,7 @@ Settings are resolved in this order (highest to lowest priority):
 | Variable | Config Path | Type | Example |
 |----------|-------------|------|---------|
 | `SANELESS_PAPERLESS__URL` | `paperless.url` | string | `http://paperless:8000` |
-| `SANELESS_PAPERLESS__TOKEN` | `paperless.token` | string | `abc123def456` |
+| `SANELESS_PAPERLESS__TOKEN` | `paperless.token` | string | `your-api-token-here` |
 | `SANELESS_PAPERLESS__CONSUME_DIR` | `paperless.consume_dir` | string | `/consume` |
 
 ### Output
@@ -74,6 +74,14 @@ The allowed-hosts variable must be a JSON list, even for one name: `'["scan.exam
 
 The web server's bind address is **not** in this section: it is `SANELESS_OUTPUT__WEB_HOST` and `SANELESS_OUTPUT__WEB_PORT` above. See [`[web]`](configuration.md#web).
 
+### JSON values
+
+A field that holds a list or a table -- `default_tags`, `allowed_hosts`, or a whole section such as `SANELESS_PAPERLESS` -- is read from its variable as JSON, for example `SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS='[3, 7]'`. A comma-separated `3,7` is not JSON, and neither is a bare `scan.example.com`: either stops saneless at startup with exit code 2. The error gives the variable a line of its own, naming it and never echoing its value, and the config file's own errors are still listed with it:
+
+```text
+environment variable 'SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS': must be JSON (a list or table is written as JSON, for example [3, 7])
+```
+
 ### Not a saneless variable: `TZ`
 
 | Variable | Type | Example |
@@ -106,6 +114,8 @@ A path that does not exist, or one that is a directory where `SSL_CERT_FILE` exp
 - **saneless logs where its settings came from.** At startup it writes one INFO line naming the config file it loaded (or saying there was none) and the dotted names of the settings that came from environment variables, for example `paperless.url, paperless.token`. Names only, never values.
 
 - **Docker deployments** commonly use environment variables for `SANELESS_PAPERLESS__URL`, `SANELESS_PAPERLESS__TOKEN`, and `SANELESS_SCANNER__HOST` while mounting a TOML file for profile definitions.
+
+- **A relative path follows the config file.** A relative `SANELESS_OUTPUT__TMP_DIR`, `SANELESS_OUTPUT__DATA_DIR`, `SANELESS_OUTPUT__LOG_FILE` or `SANELESS_PAPERLESS__CONSUME_DIR` is resolved against the directory of the config file that was loaded, exactly as the same value in the file would be, or against the working directory when no config file was loaded. The log and `saneless doctor` show the absolute result. See [`[output]`](configuration.md#output).
 
 - **Multiple scanner hosts** can be specified in `SANELESS_SCANNER__HOST` using colon separation: `192.168.1.50:192.168.1.51`.
 

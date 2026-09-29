@@ -232,7 +232,7 @@ All `SANELESS_*` environment variables are supported inside the container. Commo
 |----------|---------------|---------|
 | `SANELESS_SCANNER__HOST` | `192.168.1.50` | Network scanner IP address |
 | `SANELESS_PAPERLESS__URL` | `http://paperless:8000` | Paperless-ngx URL (Docker network) |
-| `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token. Prefer `saneless.toml` -- see below |
+| `SANELESS_PAPERLESS__TOKEN` | `your-api-token-here` | Paperless-ngx API token. Prefer `saneless.toml` -- see below |
 | `SANELESS_OUTPUT__WEB_PORT` | `8080` | **The container's port is fixed at 8080.** `web_port` is a bare-metal setting: setting it here moves the server off the port the image exposes and the healthcheck probes, so the container reports unhealthy while the UI is in fact running somewhere else. Remap on the host instead -- `-p 8888:8080` |
 | `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. Not set by the image: it defaults to `/var/lib/saneless` because the image sets `XDG_STATE_HOME=/var/lib`. Set it only if you mount the volume somewhere else; it overrides `[output] data_dir` in `saneless.toml` |
 | `TZ` | `America/Chicago` | Standard container variable, **not** a saneless setting. A container's clock reports UTC without it, and saneless renders every timestamp in the server's local zone, so `TZ` is what makes the job history, `saneless jobs` and the fallback document title show your local time |
@@ -384,5 +384,5 @@ volumes:
 ```toml
 [paperless]
 url = "http://paperless:8000"
-token = "abc123def456"
+token = "your-api-token-here"
 ```

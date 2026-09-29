@@ -22,7 +22,7 @@ Then create `config/saneless.toml` with your paperless-ngx connection details:
 ```toml
 [paperless]
 url = "http://paperless:8000"
-token = "your-paperless-api-token"
+token = "your-api-token-here"
 
 [profiles.default]
 source = "Flatbed"
@@ -378,7 +378,7 @@ After deleting the lines, put the connection in `config/saneless.toml`:
 ```toml
 [paperless]
 url = "http://paperless:8000"
-token = "your-paperless-api-token"
+token = "your-api-token-here"
 ```
 
 Then `docker compose up -d` to recreate the container, and check the status

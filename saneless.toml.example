@@ -8,7 +8,8 @@ device = ""
 [paperless]
 url = "http://your-paperless-host:8000"
 token = "your-api-token-here"
-consume_dir = "/path/to/paperless/consume"
+# Optional fallback: must name an existing, mounted paperless-ngx consume directory.
+# consume_dir = "/path/to/paperless/consume"
 
 [output]
 # web_port = 8080       # bare metal only; in Docker remap with -p
