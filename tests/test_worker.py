@@ -2847,6 +2847,42 @@ class TestWorkerGuard:
         assert records[0].exc_info is not None
         assert not _worker_records(caplog, logging.ERROR, "Idle history prune failed")
 
+    def test_interleaved_prune_failures_do_not_degrade(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A successful prune ends the run of loop-level failures.
+
+        Prunes 1, 3 and 5 fail and 2 and 4 succeed.  No two failures are
+        consecutive, so the worker must never degrade.  A degraded worker
+        heals on its next probe, so the check reads the degraded WARNING,
+        which stays in the log, rather than trusting the health at the end.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
+        store = JobStore()
+        fault = _StoreFault(store.prune, frozenset({1, 3, 5}))
+        monkeypatch.setattr(store, "prune", fault)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            pruned = poll_until(lambda: len(fault.calls) >= 5, _STATE_BUDGET)
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert pruned
+        assert health is not WorkerHealth.DEGRADED
+        assert worker._consecutive_loop_failures <= 1
+        failures = _worker_records(caplog, logging.WARNING, "Idle history prune failed")
+        assert len(failures) >= 3
+        assert not _worker_records(caplog, logging.WARNING, "Scan worker degraded")
+
     def test_pipeline_failures_are_job_failures_not_loop_failures(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
@@ -3787,6 +3823,80 @@ class TestOwedWriteStreak:
             caplog, logging.WARNING, "Owed job store writes failed"
         )
         assert len(retry_warnings) == 2
+
+    def test_a_non_empty_owed_flush_resets_the_loop_failure_count(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        An owed write that lands ends the run of loop-level failures.
+
+        The job's SCANNING write fails, one loop-level failure, and the
+        guard's ERROR write fails too, so the ERROR is owed.  The next idle
+        tick writes it: the store just accepted a write, so the failure
+        before it is no longer part of a run.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        monkeypatch.setattr(
+            store, "update_state", _StoreFault(store.update_state, frozenset({1}))
+        )
+        monkeypatch.setattr(
+            store, "finish_job", _StoreFault(store.finish_job, frozenset({1}))
+        )
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = _submit_jobs(worker, store, 1)[0]
+            row = wait_for_state(store, job.id, JobState.ERROR, _STATE_BUDGET)
+            # The flush drops the entry just after its write lands.
+            drained = poll_until(lambda: not worker._unrecorded_failures, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert row.error == _DISK_ERROR
+        assert drained
+        assert worker._consecutive_loop_failures == 0
+
+    def test_an_idle_tick_with_nothing_owed_keeps_the_loop_failure_count(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A flush that writes nothing proves nothing about the store.
+
+        The job's SCANNING write fails and the guard's ERROR write lands, so
+        nothing is owed.  Idle ticks then flush an empty set, which touches no
+        store, and the loop-level failure still counts.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        monkeypatch.setattr(
+            store, "update_state", _StoreFault(store.update_state, frozenset({1}))
+        )
+        worker = worker_for(store)
+        ticks = _count_idle_ticks(worker, monkeypatch)
+        try:
+            worker.start()
+            job = _submit_jobs(worker, store, 1)[0]
+            row = wait_for_state(store, job.id, JobState.ERROR, _STATE_BUDGET)
+            ticked_from = ticks()
+            ticked = poll_until(
+                lambda: ticks() >= ticked_from + _QUIET_TICKS, _STATE_BUDGET
+            )
+            loop_failures = worker._consecutive_loop_failures
+        finally:
+            worker.stop()
+            store.close()
+
+        assert row.error == _DISK_ERROR
+        assert ticked
+        assert loop_failures == 1
 
 
 # Loop-level failures in a row that make a worker degraded (D-10).
