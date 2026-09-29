@@ -465,7 +465,7 @@ def _stated_range(ge: float | None, le: float | None) -> re.Pattern[str]:
     low = re.escape(_plain_number(ge)) if ge is not None else None
     high = re.escape(_plain_number(le)) if le is not None else None
     if low is not None and high is not None:
-        return re.compile(rf"\bfrom {low} to {high}(?![\d,]|\.\d)", re.IGNORECASE)
+        return re.compile(rf"\bfrom {low} to {high}(?!\d|[.,]\d)", re.IGNORECASE)
     if low is not None:
         return re.compile(rf"(?<![\d.,]){low} or more\b", re.IGNORECASE)
     return re.compile(rf"(?<![\d.,]){high} or less\b", re.IGNORECASE)
