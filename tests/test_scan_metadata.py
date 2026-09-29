@@ -7,6 +7,7 @@ id paperless-ngx no longer has, and only when a successful fetch shows it.
 
 from __future__ import annotations
 
+import logging
 from typing import cast
 from unittest.mock import MagicMock
 
@@ -272,6 +273,26 @@ class TestClientMetadataLookup:
 
         assert lookup.tag_ids(fresh=False) is None
         assert lookup.correspondent_ids(fresh=False) is None
+
+    def test_any_other_client_exception_is_unavailable_and_logged_by_class(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        An exception the client did not convert still leaves the ids unchecked.
+
+        A deeply nested hostile body makes ``json`` raise ``RecursionError``,
+        which is no client error; it must not end the scan before the scanner
+        is touched.  Its text is third-party, so only the class name is logged.
+        """
+        error = RecursionError("secret-bearing text")
+        lookup = ClientMetadataLookup(_FakeMetadataClient(error=error))
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scan_metadata"):
+            assert lookup.tag_ids(fresh=False) is None
+            assert lookup.correspondent_ids(fresh=False) is None
+
+        assert "RecursionError" in caplog.text
+        assert "secret-bearing text" not in caplog.text
 
     def test_lookup_of_a_non_list_is_unavailable(self) -> None:
         """A stub's MagicMock answer is not data, so nothing is judged stale."""

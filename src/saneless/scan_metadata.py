@@ -151,8 +151,8 @@ def fetch_metadata(
         kind: Which list to fetch.
 
     Returns:
-        The list as paperless-ngx sent it, or None when the fetch raised a
-        client error (logged, by its message) or the answer was not a list.
+        The list as paperless-ngx sent it, or None when the fetch raised
+        (logged) or the answer was not a list.
 
     """
     fetch = source.get_tags if kind == "tags" else source.get_correspondents
@@ -164,6 +164,20 @@ def fetch_metadata(
             "they are sent unchecked: %s",
             kind,
             describe(exc),
+        )
+        return None
+    except Exception as exc:
+        # Anything else from the client -- a RecursionError from decoding a
+        # deeply nested hostile body is one -- still only means the ids cannot
+        # be checked, so it must not end the scan before the scanner is
+        # touched.  Logged by class name alone, the web tier's rule for client
+        # exceptions: third-party text can carry a URL, a header or the token.
+        # ScanInterrupted is a BaseException, so a signal still gets through.
+        logger.warning(
+            "Could not read %s from paperless-ngx to check this scan's ids; "
+            "they are sent unchecked: %s",
+            kind,
+            type(exc).__name__,
         )
         return None
     if not isinstance(items, list):
