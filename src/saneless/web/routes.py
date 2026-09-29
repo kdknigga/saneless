@@ -401,7 +401,9 @@ def _poll_line(
     return _freshness_line(cached, scan_active=scan_active)
 
 
-def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
+def _checks_context(
+    state: State, *, attempt: int = 0, scan_active: bool | None = None
+) -> dict[str, object]:
     """
     Build the context ``partials/checks.html`` renders from, without probing.
 
@@ -475,6 +477,11 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
         attempt: Which attempt produced this render.  Zero for a page render
             and for the out-of-band strip, both of which start a fresh chain;
             the browser carries the rest back in the query string.
+        scan_active: Whether a scan holds the scanner, when the caller knows
+            better than the worker's record; None reads that record.  A scan
+            submit passes True: it builds this before its job exists, so the
+            record still says idle, yet the strip it carries is due to say
+            the checks are paused.
 
     Returns:
         ``checks``, ``checking_rows``, ``freshness_line``, ``scan_active`` and
@@ -485,7 +492,9 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     # The worker's own record of a job in flight, not the scanner gate: reading
     # the gate would mean acquiring it, and a render is not allowed to contend
     # for the lock a live scan holds.
-    scan_active = state.worker.current_job_id is not None
+    scanning: bool = (
+        state.worker.current_job_id is not None if scan_active is None else scan_active
+    )
     # Read once, so the two decisions below cannot disagree about it.  This is
     # `Lock.locked()`: an observation, never an acquire.
     probe_in_flight = state.refresher.probe_in_flight
@@ -503,11 +512,11 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
         "checking_rows": _CHECKING_ROWS,
         "freshness_line": _poll_line(
             cached,
-            scan_active=scan_active,
+            scan_active=scanning,
             gave_up=gave_up,
             still_checking=still_checking,
         ),
-        "scan_active": scan_active,
+        "scan_active": scanning,
         "poll_attempt": (
             attempt + 1 if keep_asking and attempt < applicable_cap else None
         ),
@@ -2008,8 +2017,11 @@ def start_scan(
     presented = _presented_owner(request)
     owner = presented or secrets.token_urlsafe(32)
     # Ahead of the row, not merely ahead of the submit: a failure between
-    # the two would leave a PENDING row that no worker will ever run.
-    checks = _checks_context(state)
+    # the two would leave a PENDING row that no worker will ever run.  Built
+    # as a scan in progress, because it is rendered only for an accepted
+    # submit, and by then the scanner is this job's or a queued-ahead one's:
+    # read from the worker here, before the job exists, it would say idle.
+    checks = _checks_context(state, scan_active=True)
     job = state.job_store.create_job(
         profile=form.profile,
         title=form.title,

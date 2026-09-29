@@ -2604,6 +2604,23 @@ class TestWhichResponsesCarryWhat:
         assert response.status_code == 200
         assert _OOB_CHECKS.search(response.text) is not None
 
+    def test_a_scan_submit_on_an_idle_server_says_the_checks_are_paused(
+        self, client: TestClient
+    ) -> None:
+        """
+        The strip the submit carries is rendered as a scan in progress.
+
+        It is built before the job exists, when the worker's record still
+        says idle; read from there, the paused note it is carried for would
+        never appear.
+        """
+        assert _app(client).state.worker.current_job_id is None
+        response = client.post(
+            "/api/scan", data={"profile": "default", "title": "Paused proof"}
+        )
+        assert response.status_code == 200
+        assert PAUSED_PREFIX in response.text
+
     def test_the_status_poll_does_not(self, client: TestClient) -> None:
         """
         A poll carrying it would re-render the strip every second for nothing.
