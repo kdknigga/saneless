@@ -68,7 +68,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The Linux ``system.posix_acl_access`` value: a little-endian version word,
 # then one (tag, permissions, id) entry per ACL line. Building it by hand lets
-# the ACL tests run without ``setfacl`` and on tmpfs, which accepts POSIX ACLs
+# the ACL tests run with no ACL tool installed, and on tmpfs, which accepts ACLs
 # but refuses ``user.*`` attributes.
 ACL_XATTR = "system.posix_acl_access"
 ACL_VERSION = 2

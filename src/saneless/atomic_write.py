@@ -5,10 +5,13 @@ Durable, all-or-nothing replacement of a config file.
 file the operator owns. It writes the new text beside the real file, fsyncs
 it, and renames it into place, so a crash, a full disk, or a killed process
 leaves either the old file or the new one -- never a truncated config.
-It keeps the original's mode and owner, and its extended attributes and POSIX
-ACL -- refusing the rewrite when one of those cannot be kept -- follows
-symlinks to the real file, and reports a single-file bind mount -- which
-cannot be renamed over -- as a ``ConfigError`` naming the fix.
+It keeps the original's mode and owner (warning when the owner cannot be
+kept), and its extended attributes and POSIX ACL -- refusing the rewrite when
+one of those cannot be kept -- follows symlinks to the real file, and reports
+a single-file bind mount -- which cannot be renamed over -- as a
+``ConfigError`` naming the fix. A file it creates takes its directory's owner
+when permitted and stays 0600. Temp files left by a killed rewrite are swept
+on the next one.
 
 The module knows nothing about TOML: callers produce the text, this module
 only makes the write durable.
@@ -20,8 +23,10 @@ import contextlib
 import errno
 import logging
 import os
+import re
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Final
 
@@ -30,6 +35,13 @@ from .exceptions import ConfigError
 __all__ = ["refused_mode_change", "replace_file_atomically"]
 
 logger = logging.getLogger(__name__)
+
+# Where the mount errors send the operator: the published page, because an
+# operator reading the error has the site, not the repository.
+_DEPLOY_DOCS_URL: Final = (
+    "https://kdknigga.github.io/saneless/how-to/deploy-docker-compose/"
+    "#moving-from-a-single-file-config-mount"
+)
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -66,7 +78,7 @@ def _single_file_mount_message(target: Path) -> str:
     """
     return (
         f"Cannot replace {target}: it is bind-mounted as a single file. Mount "
-        "its directory instead (see docs/how-to/deploy-docker-compose.md)."
+        f"its directory instead (see {_DEPLOY_DOCS_URL})."
     )
 
 
@@ -115,7 +127,7 @@ def _read_only_mount_error(target: Path) -> ConfigError | None:
         return ConfigError(_single_file_mount_message(target))
     return ConfigError(
         f"Cannot replace {target}: it is on a read-only mount. Mount its "
-        "directory read-write instead (see docs/how-to/deploy-docker-compose.md)."
+        f"directory read-write instead (see {_DEPLOY_DOCS_URL})."
     )
 
 
@@ -227,8 +239,9 @@ def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
     A host-owned config must not become root-owned after a container rewrite,
     or the operator needs sudo to edit it. Each change is made only when the
     process is permitted and the filesystem supports it; a refusal is skipped
-    silently (with a DEBUG line) so it never fails a write that would
-    otherwise succeed. When the owner cannot be set, the group alone
+    so it never fails a write that would otherwise succeed, but it is logged
+    at WARNING with the ids that could not be kept, because the file then
+    changes hands. When the owner cannot be set, the group alone
     is still tried: a service user rewriting a ``root:saneless`` 0664 config
     may keep the group it belongs to. chown comes BEFORE chmod because
     chown(2) may clear the set-id bits the mode copy would otherwise
@@ -247,13 +260,23 @@ def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
     except OSError as exc:
         if not refused_mode_change(exc):
             raise
-        logger.debug("Not copying the config file's owner: %s", exc.strerror)
+        logger.warning(
+            "Not keeping the config file's owner (uid %d, gid %d); it is now "
+            "owned by this process: %s",
+            original.st_uid,
+            original.st_gid,
+            exc.strerror,
+        )
         try:
             os.fchown(fd, -1, original.st_gid)
         except OSError as group_exc:
             if not refused_mode_change(group_exc):
                 raise
-            logger.debug("Not copying the config file's group: %s", group_exc.strerror)
+            logger.warning(
+                "Not keeping the config file's group (gid %d) either: %s",
+                original.st_gid,
+                group_exc.strerror,
+            )
     try:
         os.fchmod(fd, stat.S_IMODE(original.st_mode))
     except OSError as exc:
@@ -261,6 +284,96 @@ def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
         if not refused_mode_change(exc):
             raise
         logger.debug("Not copying the config file's mode: %s", exc.strerror)
+
+
+# A leftover temp file is swept only once it is this old. That is longer than
+# any rewrite takes, so a concurrent writer's in-flight temp is never removed:
+# the worker's start-up profile generation and a CLI run can overlap.
+_STALE_TEMP_AGE_SECONDS: Final = 600
+
+
+def _sweep_stale_temps(target: Path) -> None:
+    """
+    Remove temp files a killed rewrite of ``target`` left beside it.
+
+    A SIGKILL or power loss between ``mkstemp`` and the rename skips the
+    ``finally`` that removes the temp, leaving a stray copy of the config --
+    possibly holding the Paperless token -- that nothing else cleans up.
+
+    Only this helper's own leftovers are removed: names that match exactly
+    what ``mkstemp`` produces for ``target`` (the ``.{name}.`` prefix, eight
+    characters from its alphabet, the ``.tmp`` suffix), that ``lstat`` shows
+    as a regular file -- never a symlink, which is neither removed nor
+    followed -- owned by this process's user, and older than
+    ``_STALE_TEMP_AGE_SECONDS``. Best effort: a failure to list or remove is
+    logged at DEBUG and never fails the rewrite.
+
+    Args:
+        target: The real file about to be replaced.
+
+    """
+    pattern = re.compile(rf"^\.{re.escape(target.name)}\.[a-z0-9_]{{8}}\.tmp$")
+    directory = target.parent
+    try:
+        candidates = [
+            entry for entry in directory.iterdir() if pattern.match(entry.name)
+        ]
+    except OSError as exc:
+        logger.debug("Not sweeping stale temp files in %s: %s", directory, exc.strerror)
+        return
+    cutoff = time.time() - _STALE_TEMP_AGE_SECONDS
+    euid = os.geteuid()
+    for candidate in candidates:
+        try:
+            status = candidate.lstat()
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_uid != euid
+                or status.st_mtime >= cutoff
+            ):
+                continue
+            candidate.unlink()
+        except OSError as exc:
+            logger.debug("Not removing stale temp file %s: %s", candidate, exc.strerror)
+            continue
+        logger.info(
+            "Removed a stale temp file left by an interrupted rewrite: %s", candidate
+        )
+
+
+def _adopt_directory_owner(fd: int, directory: Path) -> None:
+    """
+    Give a newly created file its directory's owner and group, when permitted.
+
+    A root ``docker compose exec`` writing a new config into the service's
+    config directory must leave a file the service can read. The mode is
+    never changed: the file keeps mkstemp's 0600, whoever owns it, because a
+    new config may hold the Paperless token. A refused change keeps this
+    process as the owner and is logged at DEBUG; the write goes ahead.
+
+    Args:
+        fd: The open temp file.
+        directory: The directory the file is being created in.
+
+    Raises:
+        OSError: The ownership change failed for a reason other than a
+            refusal.
+
+    """
+    status = directory.stat()
+    if (status.st_uid, status.st_gid) == (os.geteuid(), os.getegid()):
+        return
+    try:
+        os.fchown(fd, status.st_uid, status.st_gid)
+    except OSError as exc:
+        if not refused_mode_change(exc):
+            raise
+        logger.debug(
+            "Not giving the new config file its directory's owner (uid %d, gid %d): %s",
+            status.st_uid,
+            status.st_gid,
+            exc.strerror,
+        )
 
 
 def replace_file_atomically(path: Path, text: str) -> Path:
@@ -281,8 +394,14 @@ def replace_file_atomically(path: Path, text: str) -> Path:
       the temp file before any content is written, each when this process is
       permitted to set it and the filesystem supports it, so the rewrite
       neither changes who can edit the file nor widens who can read it. A
-      refused change is skipped, never a failed write. A new file keeps
-      mkstemp's 0600.
+      refused change is skipped, never a failed write; a lost owner or group
+      is logged at WARNING, because the file then changes hands.
+    * A **new** file takes its directory's owner and group when this process
+      may set them, so a config root creates in the service's config
+      directory (a ``docker compose exec``) stays readable by the service. A
+      refused change keeps this process as the owner. Either way the file
+      keeps mkstemp's 0600, because a new config may hold the Paperless
+      token.
     * An existing file's extended attributes -- its POSIX ACL included -- are
       copied onto the temp file **first**, before the owner and mode.
       Setting a ``user.*`` attribute needs write permission the writer may
@@ -293,10 +412,15 @@ def replace_file_atomically(path: Path, text: str) -> Path:
       attribute that cannot be copied refuses the rewrite, because dropping
       an ACL can widen who reads the file. ``security.*`` LSM labels are not
       copied; the new file is labelled by its directory's policy.
+    * Before the temp file is made, leftovers of a killed earlier rewrite --
+      the exact mkstemp name for this file, a regular file this user owns,
+      older than ten minutes -- are removed; a younger one may belong to a
+      concurrent writer and is left alone.
     * The temp file is fsynced **before** the rename; renaming unsynced data
       can leave a zero-length file after a crash.
     * A rename refused with EBUSY means the file is a single-file bind mount;
-      that is reported as a ``ConfigError`` naming the fix, with no
+      that is reported as a ``ConfigError`` naming the fix and citing the
+      published deployment guide, with no
       non-atomic fallback. A read-only mount -- the legacy ``:ro``
       single-file mount, or a read-only directory mount -- is reported the
       same way before anything is written, rather than as EACCES.
@@ -346,6 +470,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         # keeps today's meaning of a read-only file ("cannot be written").
         raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(target))
 
+    _sweep_stale_temps(target)
     fd, tmp_name = tempfile.mkstemp(
         dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
     )
@@ -356,7 +481,12 @@ def replace_file_atomically(path: Path, text: str) -> Path:
             if original is not None:
                 _copy_xattrs(handle.fileno(), target)
                 _copy_owner_and_mode(handle.fileno(), original)
-            # A new file keeps mkstemp's 0600: it may hold the Paperless token.
+            else:
+                # A new file takes its directory's owner, so one created by
+                # root in the service's config directory stays readable by
+                # the service; it keeps mkstemp's 0600 because it may hold
+                # the Paperless token.
+                _adopt_directory_owner(handle.fileno(), target.parent)
             handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
