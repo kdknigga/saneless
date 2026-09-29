@@ -177,10 +177,21 @@ TOML_EXAMPLE = REPO_ROOT / "saneless.toml.example"
 CLI_REFERENCE = DOCS_DIR / "reference" / "cli-commands.md"
 CLI_SCRIPTING = DOCS_DIR / "how-to" / "cli-scripting.md"
 
-# Where `saneless auto-profiles` writes inside the image when no config
-# file was loaded. The CLI writes `./saneless.toml`, and the runtime
-# stage's WORKDIR is what decides where that resolves to.
+# Where an earlier release's `saneless auto-profiles` put a new config inside
+# the image: it wrote `./saneless.toml`, and the image's working directory is
+# the data volume. That file outlived the container and, being first in the
+# search order, loaded ahead of the mounted `/etc/saneless` for good -- the
+# command meant to help built the shadowing trap itself. No page may name it
+# as a place `auto-profiles` writes again; the upgrade notes may still name it
+# as a leftover to merge and delete.
 AUTO_PROFILES_CONTAINER_PATH = "`/var/lib/saneless/saneless.toml`"
+# The system config file, which the container's `./config` mount provides and
+# which `auto-profiles` now creates when that directory exists and is writable.
+SYSTEM_CONFIG_PATH = "`/etc/saneless/saneless.toml`"
+# The per-user config file, the no-file target everywhere else.
+XDG_CONFIG_PATH = "`$XDG_CONFIG_HOME/saneless/saneless.toml`"
+# The working-directory file, which `auto-profiles` never creates.
+CWD_CONFIG_PATH = "`./saneless.toml`"
 
 
 def _doc_pages() -> list[Path]:
@@ -297,34 +308,100 @@ def test_deploy_doc_explains_missing_config_and_migration() -> None:
     )
 
 
-def test_deploy_doc_says_where_auto_profiles_writes_without_a_config_file() -> None:
+def test_deploy_doc_says_auto_profiles_never_writes_the_data_volume() -> None:
     """
-    With no ``saneless.toml``, the doc names the real write path (WR-06).
+    With no ``saneless.toml``, the how-to names ``/etc/saneless`` as the target.
 
-    The CLI writes ``./saneless.toml`` when no config file was loaded. The
-    image's runtime stage sets ``WORKDIR /var/lib/saneless``, so that resolves
-    to ``/var/lib/saneless/saneless.toml`` -- inside the declared data volume,
-    where it outlives the container, and still ahead of ``/etc/saneless`` in
-    the config search order. The how-to used to imply the write lands in
-    ``./config``, and before the WORKDIR existed it landed at ``/`` instead.
+    ``auto-profiles`` used to write ``./saneless.toml``, which in the image is
+    the data volume, and the how-to told container users to ``touch`` the
+    mounted file first to dodge it. The command now creates the file in the
+    mounted ``./config`` directory itself, so both the trap and the workaround
+    must be gone, and the page must say where the file goes. The volume path
+    may still be named as an earlier release's leftover, never as a place the
+    command writes.
     """
-    text = DEPLOY_HOWTO.read_text(encoding="utf-8")
-    name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
-    assert AUTO_PROFILES_CONTAINER_PATH in text, (
-        f"{name} does not say auto-profiles writes "
-        f"{AUTO_PROFILES_CONTAINER_PATH} when the config file is missing"
+    text, name = _read(DEPLOY_HOWTO)
+    sentences = _sentences(text)
+    trap = [
+        sentence
+        for sentence in sentences
+        if AUTO_PROFILES_CONTAINER_PATH in sentence and "writes" in sentence
+    ]
+    assert not trap, (
+        f"{name} still says auto-profiles writes {AUTO_PROFILES_CONTAINER_PATH}:\n"
+        + "\n".join(trap)
     )
-    assert f"touch config/{CONFIG_NAME}" in text, (
-        f"{name} does not tell container users to create config/{CONFIG_NAME} first"
+    assert f"touch config/{CONFIG_NAME}" not in text, (
+        f"{name} still tells container users to create config/{CONFIG_NAME} "
+        "with touch, which the command no longer needs"
+    )
+    assert any(
+        "auto-profiles" in sentence
+        and SYSTEM_CONFIG_PATH in sentence
+        and ("creates" in sentence or "writes" in sentence)
+        for sentence in sentences
+    ), f"{name} does not say auto-profiles creates {SYSTEM_CONFIG_PATH}"
+
+
+def test_cli_reference_names_the_new_config_target() -> None:
+    """
+    The CLI reference names both no-file targets and rules out the working directory.
+
+    With nothing loaded, ``auto-profiles`` writes the system file when its
+    directory already exists and is writable, else the per-user file, and
+    never ``./saneless.toml``, which would outrank both on the next start.
+    """
+    text, name = _read(CLI_REFERENCE)
+    assert AUTO_PROFILES_CONTAINER_PATH not in text, (
+        f"{name} still names {AUTO_PROFILES_CONTAINER_PATH} as a write target"
+    )
+    sentences = _sentences(_section(text, "## `saneless auto-profiles`", name))
+    assert any(
+        SYSTEM_CONFIG_PATH in sentence and XDG_CONFIG_PATH in sentence
+        for sentence in sentences
+    ), (
+        f"{name} does not name {SYSTEM_CONFIG_PATH} and {XDG_CONFIG_PATH} as the "
+        "auto-profiles targets with no config file loaded"
+    )
+    assert any(
+        "never" in sentence and CWD_CONFIG_PATH in sentence for sentence in sentences
+    ), f"{name} does not say auto-profiles never writes {CWD_CONFIG_PATH}"
+
+
+def test_cli_reference_says_doctor_warns_on_a_shadowed_config() -> None:
+    """
+    The doctor section says a second config file is a warning, not a failure.
+
+    More than one ``saneless.toml`` found is amber: ``[WARN]``, naming the file
+    in use and every one not read, and the command still exits 0. One file
+    reached through two candidates is listed once and then as ``same file``.
+    """
+    text, name = _read(CLI_REFERENCE)
+    section = _section(text, "## `saneless doctor`", name)
+    sentences = _sentences(section)
+    assert any(
+        "`[WARN]`" in sentence and "more than one" in sentence for sentence in sentences
+    ), f"{name} does not say doctor prints [WARN] for more than one config file"
+    assert any("exits 0" in sentence for sentence in sentences), (
+        f"{name} does not say doctor exits 0 with a second config file"
+    )
+    assert "(already listed)" in _table_row(section, "`same file`"), (
+        f"{name} does not explain the 'same file' verdict"
     )
 
 
-def test_cli_reference_says_where_auto_profiles_writes_in_the_image() -> None:
-    """The CLI reference names the image's real write path (WR-06)."""
-    text = CLI_REFERENCE.read_text(encoding="utf-8")
-    name = CLI_REFERENCE.relative_to(REPO_ROOT)
-    assert AUTO_PROFILES_CONTAINER_PATH in text, (
-        f"{name} does not say where the image writes with no config file loaded"
+def test_deploy_doc_keeps_the_single_file_mount_heading() -> None:
+    """
+    The heading the config-write errors link to is still there, spelled once.
+
+    The error saneless prints for a single-file bind mount carries a link to
+    this section's anchor, which the heading text decides; rewording the
+    heading would break every link already printed.
+    """
+    heading = "### Moving from a single-file config mount"
+    text, name = _read(DEPLOY_HOWTO)
+    assert text.count(f"\n{heading}\n") == 1, (
+        f"{name} lost the {heading!r} heading the write errors link to"
     )
 
 
