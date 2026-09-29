@@ -24,7 +24,6 @@ import traceback
 from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Final, assert_never
 from uuid import uuid4
 
@@ -51,6 +50,7 @@ from .config import (
     CONFIG_FILENAME,
     Settings,
     config_file_state,
+    config_search_paths,
     is_placeholder_token,
     load_settings,
     log_config_sources,
@@ -132,6 +132,7 @@ from .workspace import sweep_orphans
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
     from types import FrameType
     from typing import TextIO
 
@@ -2232,6 +2233,41 @@ def _echo_write_result(
             )
 
 
+def _new_config_target(settings: Settings) -> Path:
+    """
+    Choose where ``auto-profiles`` creates a config file when none was loaded.
+
+    The last documented location saneless may write, because the search reads
+    in order and stops at the first file: a new file in ``./`` -- which in the
+    container is the working directory ``/var/lib/saneless`` -- would outrank
+    ``/etc/saneless`` on the next start, and the command meant to help would
+    have built the shadowing trap itself.  So the system file is the target
+    when its directory already exists and this process may write it; that is
+    the directory the container's ``./config`` mount provides.  It must already
+    exist because saneless never creates a system directory, even as root.
+    Otherwise the per-user XDG file is the target, which nothing but the
+    working-directory file outranks.
+
+    The candidates are the ones the load searched, so this reads the same list
+    in the same order and cannot drift from it; settings built without a load
+    fall back to the search list itself.  Nothing is created here.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+
+    Returns:
+        The file to create, absolute.
+
+    """
+    discovery = settings.config_discovery
+    searched = discovery.searched if discovery is not None else ()
+    candidates = searched if len(searched) > 1 else config_search_paths()
+    system, user = candidates[-1], candidates[1]
+    if system.parent.is_dir() and os.access(system.parent, os.W_OK):
+        return system.absolute()
+    return user.absolute()
+
+
 @cli.command(name="auto-profiles")
 @click.option(
     "--force",
@@ -2254,8 +2290,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     settings = _load_cli_settings(ctx, warn_stale=False)
     if config_file_state(settings) is ConfigFileState.STALE_ONLY:
         # This command is the only thing in saneless that creates a config
-        # file, and with nothing loaded its target is ./saneless.toml -- the
-        # first path the next start looks at.  Writing it now would not lose
+        # file, and with nothing loaded its target is a saneless.toml in a
+        # searched directory -- which the next start loads.  Writing it now
+        # would not lose
         # the old file's URL and token but would permanently shadow them: the
         # search would stop at the new file, the row telling the operator to
         # rename the old one would go green, and the appliance would keep
@@ -2294,15 +2331,25 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     profiles = generate_profiles(caps, device_type_of(device_list, device_id))
 
     # The file that was loaded (including an explicit --config). With no loaded
-    # file the target is the one config filename in the working directory, and
-    # the output names the resolved absolute path so the operator sees where it
-    # went. Built from the constant, so the target followed the rename without
-    # anyone having to remember this line.
-    config_path = settings.config_path or Path(CONFIG_FILENAME)
+    # file the target is the last documented location that is writable, never
+    # the working directory, whose file would outrank every other on the next
+    # start; _new_config_target has the reasoning.  Chosen before the write so
+    # a failure below can always name it, and the output names it absolutely
+    # so the operator sees where it went.
+    config_path = settings.config_path or _new_config_target(settings)
     # A ConfigError here (a single-file bind mount, a non-UTF-8 file, or
     # merged text that would not parse) names the file and the fix; the group
-    # guard prints it as-is and exits 2, with no traceback.
+    # guard prints it as-is and exits 2, with no traceback.  An OSError --
+    # including a per-user directory that cannot be created, as in a container
+    # whose HOME does not exist -- ends the same way, naming the target.
     try:
+        # Only a new file's directory is created: the system target's
+        # directory exists by construction, so this is only ever the XDG
+        # ``saneless`` directory, made private because the file may later
+        # hold the Paperless token.  The file itself is 0600 and takes its
+        # directory's owner, which the atomic writer sees to.
+        if settings.config_path is None and not config_path.parent.is_dir():
+            config_path.parent.mkdir(mode=0o700, parents=True)
         result = write_profiles_to_config(
             config_path, profiles, force=force, device=pin
         )
