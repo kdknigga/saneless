@@ -100,7 +100,7 @@ if TYPE_CHECKING:
     from saneless.pipeline import ScanResult
     from saneless.scanner.base import PageSink, ScanBatch
 
-# The free space a test sink insists on, in MiB: small enough for any runner.
+# The free space a test sink insists on, in MB: small enough for any runner.
 _RESERVE_MB = 1
 
 _SETTINGS = ScanSettings(source="Flatbed", resolution=100, mode="Gray")

@@ -685,10 +685,10 @@ class TestSpooledPageSinkModes:
     @pytest.mark.parametrize(
         ("mode", "size", "required_mb"),
         [
-            # Four bands arrive and three are written: 3 MiB, not 4.
-            ("RGBA", (1024, 1024), 3),
-            # Two bytes a pixel arrive and one is written: 2 MiB, not 4.
-            ("I;16", (2048, 1024), 2),
+            # Four bands arrive and three are written: 3 MB, not 4.
+            ("RGBA", (1000, 1000), 3),
+            # Two bytes a pixel arrive and one is written: 2 MB, not 4.
+            ("I;16", (2000, 1000), 2),
         ],
     )
     def test_the_room_estimate_is_of_the_normalised_page(
@@ -705,6 +705,38 @@ class TestSpooledPageSinkModes:
         with pytest.raises(DiskSpaceError) as excinfo:
             sink.add(Image.new(mode, size), dpi=300)
         assert f"{required_mb} MB required" in str(excinfo.value)
+
+    def test_page_megabytes_are_decimal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A page of 1,040,000 bytes needs 2 MB: a megabyte is 10**6 bytes.
+
+        Counted in binary megabytes it would fit in one, and the message
+        would disagree with the ``min_free_space_mb`` it names.
+        """
+        monkeypatch.setattr("saneless.spool.shutil.disk_usage", _no_free_space)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        with pytest.raises(DiskSpaceError) as excinfo:
+            sink.add(Image.new("L", (1040, 1000)), dpi=300)
+        assert "2 MB required" in str(excinfo.value)
+
+    def test_free_space_is_counted_in_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Exactly 10**6 bytes free is room for a page of exactly 10**6 bytes.
+
+        Counted in binary megabytes the free space rounds down to nothing and
+        the page is refused.
+        """
+        monkeypatch.setattr(
+            "saneless.spool.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=10**6),
+        )
+        sink = SpooledPageSink(tmp_path, "a", 0)
+        record = sink.add(Image.new("L", (1000, 1000)), dpi=300)
+        assert record.path.exists()
 
 
 class TestSpooledPageSinkAtomicWrite:

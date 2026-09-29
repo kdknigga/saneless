@@ -2913,6 +2913,37 @@ class TestDiskSpaceCheck:
         assert str(tmp_path) in str(error)
         assert "999999999 MB required" in str(error)
 
+    def test_free_space_check_counts_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A megabyte is 10**6 bytes, as ``min_free_space_mb`` and the docs say.
+
+        Exactly 500 * 10**6 bytes free meets a 500 MB reserve.  Counted in
+        binary megabytes it is only 476, which would refuse the scan.
+        """
+        monkeypatch.setattr(
+            "saneless.pipeline.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=500 * 10**6),
+        )
+
+        assert _check_disk_space(tmp_path, 500) is None
+
+    def test_free_space_check_one_byte_short_reports_decimal_megabytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One byte under 500 * 10**6 is refused, reported as 499 MB free."""
+        monkeypatch.setattr(
+            "saneless.pipeline.shutil.disk_usage",
+            lambda _path: SimpleNamespace(total=0, used=0, free=500 * 10**6 - 1),
+        )
+
+        with pytest.raises(DiskSpaceError) as exc_info:
+            _check_disk_space(tmp_path, 500)
+
+        assert "499 MB free" in str(exc_info.value)
+        assert "500 MB required" in str(exc_info.value)
+
     @pytest.mark.parametrize("failing_call", ["mkdir", "disk_usage", "JobWorkspace"])
     def test_workspace_filesystem_failure_is_a_config_error(
         self,
@@ -4519,7 +4550,8 @@ class TestFailedDirWarning:
             if str(failed_dir) in record.getMessage()
         )
         assert str(FAILED_DIR_WARN_THRESHOLD) in message
-        assert "MiB" in message
+        assert " MB)" in message
+        assert "MiB" not in message
         assert str(failed_dir) in message
 
     def test_failed_dir_warning_is_silent_below_the_threshold(
@@ -4538,7 +4570,7 @@ class TestFailedDirWarning:
         assert [
             record.getMessage()
             for record in caplog.records
-            if "MiB" in record.getMessage()
+            if "have accumulated in" in record.getMessage()
         ] == []
 
     def test_failed_dir_warning_deletes_nothing(
@@ -5209,7 +5241,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         )
         # Below the reserve alone, so below twice the spool plus the reserve.
         monkeypatch.setattr(
-            preservation_module, "_free_bytes", lambda _directory: 1024 * 1024
+            preservation_module, "_free_bytes", lambda _directory: 1_000_000
         )
         assembling = MagicMock()
 
@@ -5358,10 +5390,11 @@ class TestFailedDirCountsPreservedPageDirectories:
             if str(failed_dir) in record.getMessage()
         )
         assert str(FAILED_DIR_WARN_THRESHOLD) in message
-        # 2 x 110 KiB of page files plus 19 x 512 bytes of PDFs.  A size sum
-        # that skipped the directories, or walked only their top level, would
-        # report 0.0 or 0.1 here.
-        assert "0.2 MiB" in message
+        # 2 x 110 KiB of page files plus 19 x 512 bytes of PDFs: 235,008
+        # bytes.  A size sum that skipped the directories, or walked only
+        # their top level, would report 0.0 or 0.1 here.
+        assert "0.2 MB" in message
+        assert "MiB" not in message
 
     def test_failed_dir_stays_silent_below_the_threshold_with_directories(
         self,
@@ -5379,7 +5412,7 @@ class TestFailedDirCountsPreservedPageDirectories:
         assert [
             record.getMessage()
             for record in caplog.records
-            if "MiB" in record.getMessage()
+            if "have accumulated in" in record.getMessage()
         ] == []
 
     def test_failed_dir_counts_directories_never_raises_on_a_vanished_walk(

@@ -46,7 +46,7 @@ from saneless.scan_metadata import (
     check_scan_metadata,
 )
 from saneless.scanner.base import MAX_PAGES_PER_PASS, ScanBatch, ScanSettings
-from saneless.spool import SpooledPageSink
+from saneless.spool import BYTES_PER_MB, SpooledPageSink
 from saneless.text_safety import neutralise_controls
 from saneless.vocabulary import (
     ErrorCategory,
@@ -859,7 +859,7 @@ def _check_disk_space(tmp_dir: Path, min_free_mb: int) -> None:
 
     """
     usage = shutil.disk_usage(tmp_dir)
-    free_mb = usage.free // (1024 * 1024)
+    free_mb = usage.free // BYTES_PER_MB
     if free_mb < min_free_mb:
         msg = (
             f"Insufficient disk space: {free_mb} MB free in {tmp_dir}, "
