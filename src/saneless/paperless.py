@@ -548,7 +548,7 @@ def _one_line_reason(exc: BaseException, token: str) -> str:
     """
     if isinstance(exc, httpx2.HTTPStatusError):
         response = exc.response
-        return f"{_status_text(response)}: {_render_error_body(response, token)}"
+        return f"{_status_text(response, token)}: {_render_error_body(response, token)}"
     return _strike(describe(exc), token)
 
 
@@ -868,22 +868,26 @@ def _bounded_line(text: str) -> str:
     return line
 
 
-def _status_text(response: httpx2.Response) -> str:
+def _status_text(response: httpx2.Response, token: str) -> str:
     """
     Render a response's status code and reason phrase for a message.
 
     The reason phrase is upstream text like the body: HTTP allows any control
     character in it but NUL, CR and LF, so it goes through ``_bounded_line``
-    before it reaches a message that is printed and logged.
+    before it reaches a message that is printed and logged.  A proxy or an
+    auth gateway can put what it was sent into it, the ``Authorization``
+    header included, so the token is struck out first, as it is from the body.
 
     Args:
         response: The response whose status line is reported.
+        token: The configured token, struck out of the reason by ``_strike``.
 
     Returns:
         ``"<code> <reason>"``, or only the code when the reason is empty.
 
     """
-    return f"{response.status_code} {_bounded_line(response.reason_phrase)}".rstrip()
+    reason = _bounded_line(_strike(response.reason_phrase, token))
+    return f"{response.status_code} {reason}".rstrip()
 
 
 def _loggable_task_id(task_id: str) -> str:
@@ -923,7 +927,7 @@ def _not_accepted_message(response: httpx2.Response, token: str) -> str:
         A single line naming the status and what to check.
 
     """
-    status = _status_text(response)
+    status = _status_text(response, token)
     location = _bounded_line(
         _strike(_without_userinfo(response.headers.get("location", "")), token)
     )
@@ -1976,7 +1980,8 @@ class PaperlessClient:
         shown = _loggable_task_id(task_id)
         if response.is_server_error or response.status_code == 429:
             return _PollTransient(
-                f"{_status_text(response)}: {_render_error_body(response, self._token)}"
+                f"{_status_text(response, self._token)}: "
+                f"{_render_error_body(response, self._token)}"
             )
         if response.status_code == 406:
             # The same fixed text as a refused upload; the 406 body only
@@ -1985,7 +1990,7 @@ class PaperlessClient:
             raise PaperlessUnconfirmedError(msg + self._incompatible_message())
         if response.status_code != 200:
             msg = (
-                f"Paperless task poll failed ({_status_text(response)}): "
+                f"Paperless task poll failed ({_status_text(response, self._token)}): "
                 f"{_render_error_body(response, self._token)}"
             )
             raise PaperlessUnconfirmedError(msg)

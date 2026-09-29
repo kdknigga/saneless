@@ -1930,6 +1930,43 @@ class TestRenderErrorBody:
         assert not has_control_characters(result)
         assert "400 Bad\\x1b]0;owned\\x07\\x1b[31mRed" in result
 
+    @pytest.mark.parametrize(
+        "render",
+        [
+            pytest.param(
+                lambda response: _one_line_reason(
+                    httpx2.HTTPStatusError(
+                        "refused",
+                        request=httpx2.Request("POST", "http://paperless.test/"),
+                        response=response,
+                    ),
+                    _MOCK_AUTH,
+                ),
+                id="status-error",
+            ),
+            pytest.param(
+                lambda response: _not_accepted_message(response, _MOCK_AUTH),
+                id="upload-not-accepted",
+            ),
+            pytest.param(
+                lambda response: _failed_poll_message(lambda _call: response),
+                id="task-poll",
+            ),
+        ],
+    )
+    def test_reason_phrase_has_the_token_struck(
+        self, render: Callable[[httpx2.Response], str]
+    ) -> None:
+        """A proxy that quotes the Authorization header in its reason is struck."""
+        response = httpx2.Response(
+            400,
+            json={"detail": "no"},
+            extensions={"reason_phrase": f"Bad Token {_MOCK_AUTH}".encode()},
+        )
+        result = render(response)
+        assert "400 Bad Token ***" in result
+        _assert_token_absent(_MOCK_AUTH, result)
+
     def test_empty_body_says_so(self) -> None:
         """An empty body renders as an explicit marker, never an empty string."""
         response = httpx2.Response(500, text="")
@@ -2412,6 +2449,35 @@ class TestPollTaskRidesOutTransientAnswers:
         _assert_token_absent(_MOCK_AUTH, message)
         assert exc_info.value.__cause__ is None
         assert handler.calls == len(poll_clock.waits) + 1
+
+    def test_a_token_in_the_reason_phrase_never_reaches_the_timeout(
+        self, poll_clock: FakeClock
+    ) -> None:
+        """
+        A gateway echoing the Authorization header in its status line is struck.
+
+        The last transient answer's status line becomes the timeout's message,
+        which is the job's error and the CLI line, so the reason phrase gets
+        the same strike as the body beside it.
+        """
+        handler = _CountingHandler(
+            _answering(
+                httpx2.Response(
+                    503,
+                    text="unavailable",
+                    extensions={"reason_phrase": f"Denied Token {_MOCK_AUTH}".encode()},
+                )
+            )
+        )
+        client = _poll_client(handler, clock=poll_clock)
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+        message = str(exc_info.value)
+        assert "503 Denied Token ***: unavailable" in message
+        _assert_token_absent(_MOCK_AUTH, message)
 
     def test_an_answer_after_a_transient_one_clears_it(
         self, poll_clock: FakeClock
