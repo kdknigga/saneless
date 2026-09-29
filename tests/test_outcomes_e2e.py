@@ -41,9 +41,10 @@ together sleep for well under a second, using only seams that already exist:
   60 s budget a refused connection would wait it out.  The consume-directory
   case is the one that needs it.  The two misconfiguration cases keep the
   default budget on a ``FakeClock`` instead, and assert that it never waited.
-* ``paperless_task_timeout`` is 0 for the poll-timeout case, so ``poll_task``'s
-  deadline has already passed when the first poll comes back without a
-  terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
+* ``paperless_task_timeout`` is 1 for the poll-timeout case, the smallest value
+  config accepts, and that case's polls run on a ``FakeClock``, so the second
+  elapses through ``poll_task``'s own backoff sleeps without any wall clock.
+  See ``_TIMEOUT_BUDGET``.
 * The outcome cases' task polls run on a ``FakeClock`` through the same
   ``PaperlessTiming`` seam, so the proxy-blip case's one backoff wait, after
   its 502, costs no real time.
@@ -156,18 +157,16 @@ _LEGACY_DUPLEX_SOURCE = "ADF Manual Duplex"
 # number is the honest thing to run with.
 _PRODUCTION_TIMEOUT = 300
 
-# Zero, not the 0.05 s the plan suggested.  OutputConfig.paperless_task_timeout
-# is typed ``int``, so pydantic rejects 0.05 outright (a float with a fractional
-# part is not a lax-mode int) and assigning it afterwards would be a type lie
-# that ty and pyrefly are right to reject.  Widening the production field to
-# float purely for a test was not worth it.  Zero costs no wall clock at all and
-# proves the same property end to end: poll_task computes
-# ``deadline = monotonic() + timeout``, issues its first poll, sees no terminal
-# status, finds no time remaining and raises PaperlessTimeoutError -- which is
-# the raise this case exists to follow into the preservation guard.  The
-# ``min(delay, remaining)`` backoff clamp itself is proven by
-# ``tests/test_paperless.py``'s dedicated wall-clock test at the unit level.
-_TIMEOUT_BUDGET = 0
+# One second, the smallest value config accepts: zero is refused at load, since
+# a zero budget would fail every accepted upload.  The field is typed ``int``, so
+# a fractional float like 0.05 is refused too, and assigning one afterwards would
+# be a type lie that ty and pyrefly are right to reject.  The second costs no wall
+# clock: this case's polls run on the ``FakeClock`` through ``PaperlessTiming``,
+# so ``poll_task`` computes ``deadline = clock() + 1``, polls, sees no terminal
+# status, and its ``min(delay, remaining)`` backoff sleeps move the fake clock on
+# until no time remains and it raises PaperlessTimeoutError -- the raise this
+# case exists to follow into the preservation guard.
+_TIMEOUT_BUDGET = 1
 
 # The shipped flip wait, for every case whose operator answers the prompt: the
 # answer arrives first, so the bound never elapses.
