@@ -1050,7 +1050,8 @@ class TestErrorAdvice:
 
         A plain "start the scan again" would store the document twice.  The
         next step sends the reader to paperless-ngx's document list first, and
-        says a copy is kept in failed/ to import only if it is not there.
+        says a copy the error names in failed/ is to be imported only if it is
+        not there.
         """
         advice = error_advice(category)
         for text in (advice.message.lower(), advice.next_step.lower()):
@@ -1059,6 +1060,26 @@ class TestErrorAdvice:
         assert "document list" in advice.next_step
         assert "failed/" in advice.next_step
         assert "only if the document is not in paperless-ngx" in advice.next_step
+
+    @pytest.mark.parametrize(
+        "category",
+        [ErrorCategory.UNCONFIRMED_SEND, ErrorCategory.UNCONFIRMED_FILING],
+    )
+    def test_unconfirmed_advice_does_not_promise_a_copy(
+        self, category: ErrorCategory
+    ) -> None:
+        """
+        The copy in failed/ is conditional, because sometimes there is none.
+
+        A job that was uploading when saneless restarted keeps a copy only if
+        the startup sweep found its PDF, and a copy that could not be written
+        is reported as such.  An unconditional "a copy is kept" would send the
+        operator who finds nothing in paperless-ngx looking for a file that
+        does not exist.
+        """
+        next_step = error_advice(category).next_step
+        assert "a copy is kept" not in next_step.lower()
+        assert "If the error names a copy kept in failed/" in next_step
 
     def test_unconfirmed_messages_say_which_situation_it_is(self) -> None:
         """The received statement is stronger, so the two messages differ."""

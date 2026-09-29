@@ -28,7 +28,7 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | 6 | Saved to the consume folder without its title, tags or correspondent. The document was delivered, so do not scan it again |
 | 7 | Uploaded, with a warning on stderr: a sheet the scanner skipped, or manual-duplex front and back counts that differed. The document was delivered, so do not rescan the whole stack |
 | 8 | Every page looked blank to empty-page detection, so nothing was uploaded. The pages were kept in `failed/`, normally as one PDF; the error line names what was kept |
-| 9 | The document may already be in paperless-ngx: the upload may have reached it, or paperless-ngx received it but did not confirm filing it. Check paperless-ngx's document list before scanning again; a copy is kept in `failed/` |
+| 9 | The document may already be in paperless-ngx: the upload may have reached it, or paperless-ngx received it but did not confirm filing it. Check paperless-ngx's document list before scanning again; the error line names the copy kept in `failed/`, when one could be kept |
 | 10 | The server ran out of disk space; the error line names the folder, and how much space is needed when saneless found the shortfall before writing |
 | 129 | Interrupted by SIGHUP, for example a dropped SSH session. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 | 130 | Cancelled by the operator |
@@ -65,7 +65,7 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME] [--multi-page
 | 6 | Saved to the consume folder, not uploaded: the document is there but its title, tags and correspondent were not applied; stdout reads `Saved to folder: <title>` |
 | 7 | Uploaded with a warning (a sheet the scanner skipped, manual-duplex front and back counts that differed, uploaded as two documents, a scan that reached its per-scan sheet cap, a flatbed source the scanner's Auto source scanned through the feeder, or a `--multi-page` document finished because a question timed out or the document reached the page limit); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |
 | 8 | Every page looked blank to empty-page detection, or a `--multi-page` question timed out while every page so far had been skipped as blank; nothing was uploaded, and the pages were kept in `failed/`, normally as one PDF (the error line names what was kept) |
-| 9 | The document may already be in paperless-ngx: the upload may have reached it, or paperless-ngx received it but did not confirm filing it. Check paperless-ngx's document list before scanning again; a copy is kept in `failed/` |
+| 9 | The document may already be in paperless-ngx: the upload may have reached it, or paperless-ngx received it but did not confirm filing it. Check paperless-ngx's document list before scanning again; the error line names the copy kept in `failed/`, when one could be kept |
 | 10 | The server ran out of disk space; the error line names the folder, and how much space is needed when saneless found the shortfall before writing |
 | 129 | Interrupted by SIGHUP (for example a dropped SSH session); pages already scanned, if any, were kept in `failed/` when they could be, and the `Interrupted:` line says what was kept, or where the pages were left |
 | 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt; a confirmed `a`, Ctrl-D or Ctrl-C at a `--multi-page` question; or Ctrl-C during the scan) |

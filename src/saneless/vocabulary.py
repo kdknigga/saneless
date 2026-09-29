@@ -408,8 +408,8 @@ class ExitCode(IntEnum):
 
     ``UNCONFIRMED`` (9) means the document may already be in paperless-ngx:
     the upload was sent and no usable answer came back, or paperless-ngx
-    received it and did not confirm filing it.  A copy is kept in
-    ``failed/``.  It is kept apart from ``PAPERLESS`` because a script that
+    received it and did not confirm filing it.  A copy is normally kept in
+    ``failed/``, and the error line names it when it is.  It is kept apart from ``PAPERLESS`` because a script that
     retries on 3 is right to, and a script that retried on 9 could store the
     document twice: a script must never rescan on 9, and must check
     paperless-ngx's document list first.
@@ -2945,6 +2945,12 @@ def _unconfirmed_advice(category: _UnconfirmedCategory) -> ErrorAdvice:
     but the next step is one: it never says to start the scan again, since a
     blind rescan could store the document twice.
 
+    The next step does not promise a copy in ``failed/``.  Usually there is
+    one, and the error beside this advice names it; but a job that was
+    uploading when saneless restarted keeps one only if the startup sweep
+    found its PDF, and a copy that could not be written is reported as such.
+    So the import is conditional on the error naming a copy.
+
     Args:
         category: One of the two unconfirmed categories.
 
@@ -2969,9 +2975,9 @@ def _unconfirmed_advice(category: _UnconfirmedCategory) -> ErrorAdvice:
     return ErrorAdvice(
         message=message,
         next_step=(
-            "Check paperless-ngx's document list before scanning again. A copy "
-            "is kept in failed/; import it only if the document is not in "
-            "paperless-ngx."
+            "Check paperless-ngx's document list before scanning again. If the "
+            "error names a copy kept in failed/, import it only if the document "
+            "is not in paperless-ngx."
         ),
     )
 

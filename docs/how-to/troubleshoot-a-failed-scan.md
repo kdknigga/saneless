@@ -499,10 +499,12 @@ title, or for a document with its pages. When paperless-ngx received the documen
 minutes to finish before you decide it is not there.
 
 - **If the document is in paperless-ngx**, there is nothing to do. Delete the copy in `failed/`.
-- **If it is not**, a copy is kept in `failed/` in saneless's data directory, and the line names
-  it. Import that copy into paperless-ngx yourself, or scan the stack again. Import it only if
-  the document is not in paperless-ngx: the copy is the same document, and importing it next to
-  one that arrived makes a duplicate.
+- **If it is not**, a copy is normally kept in `failed/` in saneless's data directory, and the
+  line names it. Import that copy into paperless-ngx yourself, or scan the stack again. Import it
+  only if the document is not in paperless-ngx: the copy is the same document, and importing it
+  next to one that arrived makes a duplicate. If the line names no copy, none was kept -- saneless
+  restarted during the upload and found no PDF to keep, or the copy could not be written -- so
+  scan the stack again.
 
 ## Out of disk space (exit 10)
 
