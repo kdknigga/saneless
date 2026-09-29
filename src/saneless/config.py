@@ -1347,6 +1347,11 @@ def config_file_state(settings: Settings) -> ConfigFileState:
     of this rule would be four chances for them to describe the same appliance
     differently.
 
+    A second distinct config file outranks a leftover under the old name: the
+    file not read may hold the edit an operator already made, while the
+    leftover is only a trap for the next one.  The log and ``doctor`` still
+    name every leftover, whichever state wins.
+
     It reads the recording made when the settings were loaded and stats
     nothing.  Settings built directly carry no recording and so loaded nothing
     by search; they are reported by whether a path was recorded on them, which
@@ -1356,21 +1361,23 @@ def config_file_state(settings: Settings) -> ConfigFileState:
         settings: The settings in hand.
 
     Returns:
-        Which of the four situations this process started in.
+        Which of the five situations this process started in.
 
     """
     discovery = settings.config_discovery
     if discovery is None:
-        if settings.config_path is not None:
-            return ConfigFileState.LOADED
-        return ConfigFileState.NOT_FOUND
-    if discovery.loaded is not None:
+        loaded_by_path = settings.config_path is not None
+        return ConfigFileState.LOADED if loaded_by_path else ConfigFileState.NOT_FOUND
+    if discovery.loaded is None:
         if discovery.stale:
-            return ConfigFileState.LOADED_WITH_LEFTOVER
-        return ConfigFileState.LOADED
+            return ConfigFileState.STALE_ONLY
+        return ConfigFileState.NOT_FOUND
+    # Tested before the leftover: a shadowed file outranks it.
+    if len(discovery.found) > 1:
+        return ConfigFileState.LOADED_WITH_SHADOWED
     if discovery.stale:
-        return ConfigFileState.STALE_ONLY
-    return ConfigFileState.NOT_FOUND
+        return ConfigFileState.LOADED_WITH_LEFTOVER
+    return ConfigFileState.LOADED
 
 
 def warn_on_legacy_duplex_sources(settings: Settings) -> None:
@@ -2283,6 +2290,11 @@ def log_config_sources(settings: Settings) -> None:
     three extra paths on every healthy start are noise in a log that is read
     when something is wrong.
 
+    Each further config file that was found and not read then gets its own
+    warning, naming it and the file in use, both absolute: a second file is
+    allowed, since it can be a deliberate override, but the one an operator
+    edits may be the one that is ignored.
+
     Each superseded-name file found beside a candidate then gets its own
     warning, naming it and the rename that makes it load. A leftover beside a
     file that did load is told to have anything still wanted moved out of it
@@ -2295,7 +2307,7 @@ def log_config_sources(settings: Settings) -> None:
     state = config_file_state(settings)
     discovery = settings.config_discovery
     if settings.config_path is not None:
-        source = str(settings.config_path)
+        source = str(settings.config_path.absolute())
     else:
         searched = ", ".join(
             str(candidate.absolute())
@@ -2308,6 +2320,19 @@ def log_config_sources(settings: Settings) -> None:
     logger.info("Configuration: %s; from environment: %s", source, keys)
     if discovery is None:
         return
+    loaded = discovery.loaded
+    if loaded is not None:
+        for other in discovery.found:
+            if other == loaded:
+                continue
+            logger.warning(
+                "Not reading %s: %s is in use and was found first; move anything "
+                "you still need from it into %s, or delete it if it is not "
+                "deliberate",
+                other.absolute(),
+                loaded.absolute(),
+                loaded.absolute(),
+            )
     for stale in discovery.stale:
         if state is ConfigFileState.STALE_ONLY:
             logger.warning(

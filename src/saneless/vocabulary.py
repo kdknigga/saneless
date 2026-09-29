@@ -355,7 +355,7 @@ class ConfigFileState(StrEnum):
     that file, and a fresh stat cannot reproduce it -- a file created, renamed
     or deleted since startup would make a re-probe describe a program that is
     not running.  Mixing a recorded "loaded" with a freshly probed "stale"
-    would also produce combinations none of these four members describe.
+    would also produce combinations none of these five members describe.
     Every surface that reports configuration -- the startup log, the status
     strip, ``saneless doctor`` and the one-shot commands -- reads the one
     recording, so they cannot disagree about the same appliance.
@@ -368,10 +368,20 @@ class ConfigFileState(StrEnum):
     is supported.  ``STALE_ONLY`` is a failure: a file under the old name is
     the only thing in the searched directories, so nothing the operator wrote
     was read, and saneless is running on defaults while appearing configured.
+
+    ``LOADED_WITH_SHADOWED`` means more than one distinct ``saneless.toml`` was
+    found, and only the first in search order was read.  It is a warning and
+    not a failure: two files can be deliberate, such as a per-user file
+    overriding the system one.  But the file an operator edits may be the one
+    that is not read, so it outranks a leftover under the old name, which is
+    only a trap for the next edit.  One file reached through two spellings --
+    a symlink, or running from inside a searched directory -- is one file and
+    does not count.
     """
 
     LOADED = "LOADED"
     LOADED_WITH_LEFTOVER = "LOADED_WITH_LEFTOVER"
+    LOADED_WITH_SHADOWED = "LOADED_WITH_SHADOWED"
     NOT_FOUND = "NOT_FOUND"
     STALE_ONLY = "STALE_ONLY"
 

@@ -106,6 +106,7 @@ __all__ = [
     "check_state_glyph",
     "check_state_label",
     "configuration_check",
+    "leftover_config_check",
     "run_checks",
     "worst_state",
 ]
@@ -1942,6 +1943,123 @@ def _stale_file_as_named(settings: Settings, *, absolute_paths: bool) -> str:
     return discovery.documented_spelling(stale)
 
 
+def _config_file_as_named(
+    settings: Settings, path: Path, *, absolute_paths: bool
+) -> str:
+    """
+    Spell a found config file the way the surface asking may show it.
+
+    The same two spellings as ``_stale_file_as_named``, for the same two
+    callers: the documented spelling for the LAN-visible strip, the absolute
+    path for ``saneless doctor`` and the log.
+
+    Args:
+        settings: The settings whose recorded search found the file.
+        path: A file the search found under the current name.
+        absolute_paths: True for the terminal spelling.
+
+    Returns:
+        The file, spelled for the surface that asked.
+
+    Raises:
+        AssertionError: If the settings carry no recording.  Only a recorded
+            search can find more than one file, so reaching this means the
+            state derivation and this function have come apart.
+
+    """
+    discovery = settings.config_discovery
+    if discovery is None:
+        msg = "A shadowed config file can only come from a recorded search"
+        raise AssertionError(msg)
+    if absolute_paths:
+        return str(path.absolute())
+    return discovery.documented_spelling(path)
+
+
+def leftover_config_check(
+    settings: Settings, *, absolute_paths: bool = False
+) -> CheckResult | None:
+    """
+    Report an old-name file left beside a config file that did load.
+
+    Its own function because two states need it.  It is the Configuration
+    row when a leftover is the only thing wrong; and when a shadowed file
+    outranks it on that row, a terminal surface can still tell the operator
+    about the leftover in these same sentences, with no second copy of them.
+
+    Why the next step says move before it says delete: after an upgrade the
+    leftover can hold the only copy of the Paperless URL and token, and a
+    bare "delete it" would be advice to destroy the configuration.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+        absolute_paths: True to spell the file as a resolved path, for the
+            terminal and the log; False for the LAN-visible strip.
+
+    Returns:
+        The amber row, or None when no file loaded or no leftover was found.
+
+    """
+    discovery = settings.config_discovery
+    if discovery is None or discovery.loaded is None or not discovery.stale:
+        return None
+    named = _stale_file_as_named(settings, absolute_paths=absolute_paths)
+    return CheckResult(
+        key=CheckKey.CONFIGURATION,
+        state=CheckState.WARN,
+        # One literal, deliberately over the 88-column guide (E501 is off in
+        # this project): the sentence is pinned word for word, and a grep for
+        # it has to find it on one line.
+        message=f"Using {CONFIG_FILENAME}; an old {LEGACY_CONFIG_FILENAME} is being ignored.",
+        next_step=(
+            f"Move anything you still need from {named} into the "
+            f"{CONFIG_FILENAME} in use, then delete {named} and "
+            "restart saneless."
+        ),
+    )
+
+
+def _shadowed_config_check(settings: Settings, *, absolute_paths: bool) -> CheckResult:
+    """
+    Report a config file in use with at least one more that is not read.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+        absolute_paths: True to spell the files as resolved paths.
+
+    Returns:
+        The amber row naming the file in use and every file not read.
+
+    Raises:
+        AssertionError: If the recording holds fewer than two found files,
+            which the shadowed state cannot come from.
+
+    """
+    discovery = settings.config_discovery
+    if discovery is None or len(discovery.found) <= 1:
+        msg = "A shadowed config state needs a recording that found two files"
+        raise AssertionError(msg)
+    used, *others = (
+        _config_file_as_named(settings, path, absolute_paths=absolute_paths)
+        for path in discovery.found
+    )
+    unread = " and ".join(others)
+    if len(others) == 1:
+        # One literal per sentence, over the 88-column guide for the reason
+        # the leftover row gives.
+        message = f"Using {used}; {unread} is also there and is not read."
+        next_step = f"If that is not deliberate, move anything you still need from {unread} into {used}, then delete {unread} and restart saneless."
+    else:
+        message = f"Using {used}; {unread} are also there and are not read."
+        next_step = f"If that is not deliberate, move anything you still need from {unread} into {used}, then delete them and restart saneless."
+    return CheckResult(
+        key=CheckKey.CONFIGURATION,
+        state=CheckState.WARN,
+        message=message,
+        next_step=next_step,
+    )
+
+
 def configuration_check(
     settings: Settings, *, absolute_paths: bool = False
 ) -> CheckResult:
@@ -1949,7 +2067,7 @@ def configuration_check(
     Report which configuration file is in use, and whether an old one is not.
 
     The row that exists because four rows once went red or amber for one
-    missing file and not one of them named it.  Its four outcomes come from
+    missing file and not one of them named it.  Its five outcomes come from
     ``config_file_state``, which is the single derivation the startup log, the
     status strip, ``saneless doctor`` and the one-shot commands all read, so
     none of them can describe the same appliance differently.
@@ -1973,7 +2091,13 @@ def configuration_check(
     Why the leftover next step says move before it says delete: after an
     upgrade the leftover can hold the only copy of the Paperless URL and
     token, and a bare "delete it" would be advice to destroy the
-    configuration.
+    configuration.  Those sentences live in ``leftover_config_check``.
+
+    Why a shadowed file is amber and not red: more than one ``saneless.toml``
+    can be deliberate, such as a per-user file overriding the system one, so
+    nothing may have failed.  But only the first is read, and the one an
+    operator edits may be another, so the row names the file in use and every
+    file not read, and its next step allows for the override being meant.
 
     Why both next steps end in a restart: the search is run once, at load, and
     the outcome is recorded.  Renaming the file changes nothing until the
@@ -2000,20 +2124,13 @@ def configuration_check(
                 message="Config file loaded.",
             )
         case ConfigFileState.LOADED_WITH_LEFTOVER:
-            named = _stale_file_as_named(settings, absolute_paths=absolute_paths)
-            return CheckResult(
-                key=CheckKey.CONFIGURATION,
-                state=CheckState.WARN,
-                # One literal, deliberately over the 88-column guide (E501 is
-                # off in this project): the sentence is pinned word for word,
-                # and a grep for it has to find it on one line.
-                message=f"Using {CONFIG_FILENAME}; an old {LEGACY_CONFIG_FILENAME} is being ignored.",
-                next_step=(
-                    f"Move anything you still need from {named} into the "
-                    f"{CONFIG_FILENAME} in use, then delete {named} and "
-                    "restart saneless."
-                ),
-            )
+            leftover = leftover_config_check(settings, absolute_paths=absolute_paths)
+            if leftover is None:
+                msg = "A leftover state needs a recording with a loaded file and a leftover"
+                raise AssertionError(msg)
+            return leftover
+        case ConfigFileState.LOADED_WITH_SHADOWED:
+            return _shadowed_config_check(settings, absolute_paths=absolute_paths)
         case ConfigFileState.NOT_FOUND:
             return CheckResult(
                 key=CheckKey.CONFIGURATION,
