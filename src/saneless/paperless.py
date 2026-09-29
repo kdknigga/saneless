@@ -115,6 +115,16 @@ _TASK_ID_LOG_LIMIT: Final = 64
 # time (see ``_duplicate_id_in_text``).  ``[0-9]``, not ``\d``, which also
 # matches digits from other scripts that ``int()`` accepts.
 _DUPLICATE_OF: Final = re.compile(r"duplicate of ", re.IGNORECASE)
+# The two ways paperless-ngx's own refusal words a duplicate: "It is a
+# duplicate of <title> (#N)" and "It is a duplicate of document #N" from the
+# consumer, and "duplicate of document #N" on its own.  Deciding that a failure
+# IS a duplicate needs one of these, not the bare phrase: a duplicate ends the
+# job delivered and keeps no copy, so a failure whose text merely quotes
+# "duplicate of" -- a workflow error, document content -- must not qualify.
+# Both alternatives are literal prefixes, so the search is linear.
+_DUPLICATE_REFUSAL: Final = re.compile(
+    r"It is a duplicate of |duplicate of document #[0-9]", re.IGNORECASE
+)
 _BRACKETED_ID: Final = re.compile(r"\(#([0-9]+)\)")
 _DOCUMENT_ID: Final = re.compile(r"document #([0-9]+)", re.IGNORECASE)
 # A document id: one to eighteen ASCII digits, the whole value, so a longer
@@ -363,19 +373,25 @@ def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
     as a ``TaskDuplicate`` instead of raising, and the job ends delivered,
     with a warning naming the existing document.
 
+    Because a duplicate keeps no copy of the scan, a false match loses it
+    behind a job that reports success.  So only paperless-ngx's own shapes
+    count: a ``duplicate_of`` that names a document, or the refusal's own
+    wording (``_DUPLICATE_REFUSAL``).  A ``duplicate_of`` of null, or text
+    that merely contains "duplicate of", is an ordinary failure.
+
     Args:
         task: A task dict whose status is FAILURE or REVOKED.
         message: The failure text ``_failure_message`` chose for it.
 
     Returns:
-        True when the text contains "duplicate of" in any case, or
-        ``result_data`` has a ``duplicate_of`` key.
+        True when ``result_data``'s ``duplicate_of`` is a document id, or the
+        text words a duplicate refusal the way paperless-ngx does.
 
     """
-    if "duplicate of" in message.casefold():
-        return True
     data = task.get("result_data")
-    return isinstance(data, dict) and "duplicate_of" in data
+    if isinstance(data, dict) and _document_id(data.get("duplicate_of")) is not None:
+        return True
+    return _DUPLICATE_REFUSAL.search(message) is not None
 
 
 def _document_id(value: object) -> int | None:

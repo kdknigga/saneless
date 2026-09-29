@@ -2781,11 +2781,60 @@ class TestPollTaskDuplicate:
         assert outcome == TaskDuplicate(document_id=42, in_trash=in_trash)
 
     def test_v10_duplicate_of_true_is_not_a_document_id(self) -> None:
-        """A bool is an int to Python, but ``True`` is not document #1."""
-        outcome = _poll_outcome(
-            _v10_duplicate({"duplicate_of": True, "duplicate_in_trash": False})
-        )
-        assert outcome == TaskDuplicate(document_id=None, in_trash=False)
+        """
+        A bool is an int to Python, but ``True`` is not document #1.
+
+        Nor is it a duplicate: a duplicate keeps no copy of the scan, so only
+        a ``duplicate_of`` that names a document is taken as one, and anything
+        else ends unconfirmed, with the copy kept.
+        """
+        with pytest.raises(PaperlessUnconfirmedError):
+            _poll_outcome(
+                _v10_duplicate({"duplicate_of": True, "duplicate_in_trash": False})
+            )
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(
+                _v10_duplicate(
+                    {
+                        "duplicate_of": None,
+                        "error_type": "ConsumerError",
+                        "error_message": "OCR failed on page 2",
+                    }
+                ),
+                id="v10-duplicate_of-null",
+            ),
+            pytest.param(
+                _v10_payload(
+                    "failure",
+                    "Workflow 'Receipts' failed: the title 'Duplicate of invoice' "
+                    "is already in use",
+                ),
+                id="v10-text-quotes-the-phrase",
+            ),
+            pytest.param(
+                _v9_payload(
+                    "failure",
+                    "Error while consuming: page text reads 'duplicate of the "
+                    "original, keep both'",
+                ),
+                id="v9-text-quotes-the-phrase",
+            ),
+        ],
+    )
+    def test_a_failure_that_only_mentions_a_duplicate_is_not_one(
+        self, payload: object
+    ) -> None:
+        """
+        A near miss ends unconfirmed, never as a delivered duplicate.
+
+        Taken as a duplicate, the job would report success and keep no copy of
+        a scan paperless-ngx never filed.
+        """
+        with pytest.raises(PaperlessUnconfirmedError):
+            _poll_outcome(payload)
 
     @pytest.mark.parametrize(
         ("deleted_at", "in_trash"),
