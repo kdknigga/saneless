@@ -79,7 +79,10 @@ outcome rather than as a working connection.
 saneless asks for API version 9 on its first request, which every paperless-ngx from 2.16
 on allows, and for version 10 once an answer has said the server allows it (paperless-ngx
 3.x does). A paperless-ngx before 2.16 allows only versions up to 7, so it answers `406`,
-reported here as `incompatible_version`.
+reported here as `incompatible_version`. If a server that allowed 10 answers `406` to it
+later, for example after paperless-ngx is rolled back from 3.x to 2.x, saneless goes back
+to version 9: an upload or a list fetch asks again at once with 9, and every later request
+starts at 9.
 
 The result is shared and reused for 2 seconds; concurrent calls do not each contact
 paperless-ngx. A call inside that window gets the same status code and body as the call

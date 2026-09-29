@@ -4659,6 +4659,38 @@ class _VersionedServer:
         return httpx2.Response(200, json=body, headers=headers)
 
 
+class _RolledBackServer:
+    """
+    Answer like a paperless-ngx 3.x that is then rolled back to 2.x.
+
+    Before the rollback every answer announces 10.  After it, a request for
+    10 is refused with a 406 that names no version, as paperless-ngx sends
+    it, and a request for 9 is answered and announces 9.
+    """
+
+    def __init__(self) -> None:
+        """Start on 3.x with no requests seen."""
+        self.rolled_back = False
+        self.requests: list[tuple[str | None, str]] = []
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        """Record the Accept header and path, and answer as the version allows."""
+        accept = request.headers.get("accept")
+        self.requests.append((accept, request.url.path))
+        if self.rolled_back and accept == _ACCEPT_V10:
+            return httpx2.Response(406, json={"detail": 'Invalid version in "Accept".'})
+        headers = {"X-Api-Version": "9" if self.rolled_back else "10"}
+        if request.url.path == DOCUMENTS_PATH:
+            return httpx2.Response(200, json="t1", headers=headers)
+        body = {
+            "count": 1,
+            "next": None,
+            "previous": None,
+            "results": [{"id": 1, "name": "one"}],
+        }
+        return httpx2.Response(200, json=body, headers=headers)
+
+
 def _advertising(*values: str | None) -> tuple[list[str | None], PaperlessClient]:
     """
     Build a client whose n-th answer advertises the n-th value.
@@ -4852,6 +4884,85 @@ class TestApiVersionNegotiation:
         assert noun not in str(exc_info.value)
         assert "Invalid version" not in str(exc_info.value)
         assert exc_info.value.__cause__ is None
+        assert handler.calls == 1
+
+    def test_a_406_to_10_after_a_rollback_is_asked_again_with_9(
+        self, sample_pdf: Path, upload_clock: FakeClock
+    ) -> None:
+        """
+        A server that announced 10 and was then rolled back to 2.x still works.
+
+        The rolled-back server refuses every request for 10 with a 406 that
+        names no version.  Without forgetting the 10 the client would ask for
+        it until the process restarted and every upload would fail as
+        incompatible; instead each refused request is asked once more with 9,
+        and every later one starts at 9.
+        """
+        server = _RolledBackServer()
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            transport=_make_transport(server),
+            timing=PaperlessTiming(clock=upload_clock.now, sleep=upload_clock.sleep),
+        )
+        try:
+            client.test_connection()
+            assert client.api_version == 10
+            server.rolled_back = True
+            delivery = client.upload_document(sample_pdf, title="Rolled back")
+            assert client.api_version == 9
+            client.test_connection()
+        finally:
+            client.close()
+        assert delivery == ApiDelivery(task_id="t1")
+        assert [
+            (accept, path == DOCUMENTS_PATH) for accept, path in server.requests
+        ] == [
+            (_ACCEPT_V9, False),
+            (_ACCEPT_V10, True),
+            (_ACCEPT_V9, True),
+            (_ACCEPT_V9, False),
+        ]
+
+    @pytest.mark.parametrize(("method", "_noun"), _METADATA_METHODS)
+    def test_a_metadata_406_to_10_after_a_rollback_is_asked_again_with_9(
+        self, method: str, _noun: str
+    ) -> None:
+        """The metadata fetch recovers the same way, one page at a time."""
+        server = _RolledBackServer()
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            transport=_make_transport(server),
+        )
+        try:
+            client.test_connection()
+            server.rolled_back = True
+            items = getattr(client, method)()
+        finally:
+            client.close()
+        assert items == [{"id": 1, "name": "one"}]
+        assert [accept for accept, _path in server.requests] == [
+            _ACCEPT_V9,
+            _ACCEPT_V10,
+            _ACCEPT_V9,
+        ]
+
+    def test_a_406_to_9_is_not_asked_again(self, sample_pdf: Path) -> None:
+        """A server that refuses 9 as well is incompatible after one request."""
+        handler = _CountingHandler(
+            _answering(httpx2.Response(406, json={"detail": "Invalid version"}))
+        )
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            transport=_make_transport(handler),
+        )
+        try:
+            with pytest.raises(PaperlessIncompatibleError):
+                client.upload_document(sample_pdf, title="Too old")
+        finally:
+            client.close()
         assert handler.calls == 1
 
     @pytest.mark.parametrize(

@@ -67,6 +67,11 @@ logger = logging.getLogger(__name__)
 # supported server allows, and its answer says whether 10 may follow.
 _SUPPORTED_API_VERSIONS: Final = (9, 10)
 _ACCEPT_TEMPLATE: Final = "application/json; version={version}"
+# The Accept header of a request that asked for the newest version.  What was
+# learned from an announcement can go out of date -- paperless-ngx rolled back
+# from 3.x to 2.x, or another server answering at the same address -- and the
+# only sign of it is a 406 to exactly this header.
+_NEWEST_ACCEPT: Final = _ACCEPT_TEMPLATE.format(version=_SUPPORTED_API_VERSIONS[-1])
 # One to three ASCII digits, the whole value: a longer, signed, spaced or
 # non-ASCII value is not a version and is never read.  ``[0-9]``, not ``\d``,
 # which also matches digits from other scripts that ``int()`` accepts.
@@ -630,6 +635,29 @@ def _retry_decision(exc: httpx2.HTTPError) -> _RetryDecision:
     return _RetryDecision.UNEXPECTED
 
 
+def _refused_newest_version(response: httpx2.Response) -> bool:
+    """
+    Say whether ``response`` is a 406 to a request that asked for version 10.
+
+    Such a refusal means the announcement the client learned 10 from no longer
+    holds, so asking once more with 9 can succeed.  A 406 is decided from the
+    ``Accept`` header before the server reads anything else, so the request
+    stored nothing and asking again cannot duplicate a document.
+
+    Args:
+        response: An answer, whatever its status.
+
+    Returns:
+        True only for a 406 answering a request whose ``Accept`` named the
+        newest supported version.
+
+    """
+    return (
+        response.status_code == httpx2.codes.NOT_ACCEPTABLE
+        and response.request.headers.get("Accept") == _NEWEST_ACCEPT
+    )
+
+
 def _status_decision(response: httpx2.Response) -> _RetryDecision:
     """
     Classify a non-2xx answer for ``_retry_decision``.
@@ -1036,7 +1064,9 @@ class PaperlessClient:
       so ``paperless.url`` can be corrected), and any other ``httpx2.HTTPError``.
       A 406 is a server that does not accept API version 9 or 10, reported as
       a ``PaperlessIncompatibleError``; it refuses before it reads the upload,
-      so nothing was stored.
+      so nothing was stored.  A 406 to a request that asked for 10 is first
+      asked once more with 9, since the server that announced 10 may have
+      been rolled back.
     * **Not sendable**, with no further attempt: a ``paperless.url`` that is
       unset or has no usable scheme (``httpx2.UnsupportedProtocol``), and a
       request the transport refused to put on the wire
@@ -1223,10 +1253,19 @@ class PaperlessClient:
         attribute write, so racing answers from one server can only write the
         same value.
 
+        A 406 to a request that asked for 10 forgets what was learned, so the
+        next request asks for 9 again.  Without it a client that once saw 10
+        announced -- by a paperless-ngx since rolled back to 2.x, or by another
+        server at the same address -- would ask for 10 until the process
+        restarted, and every request would be refused.
+
         Args:
             response: The answer just received.
 
         """
+        if _refused_newest_version(response):
+            self._server_max = None
+            return
         value = response.headers.get("X-Api-Version")
         if value is None or not _API_VERSION_HEADER.fullmatch(value):
             return
@@ -1428,21 +1467,14 @@ class PaperlessClient:
         Any ``httpx2.HTTPError`` from the request or from ``raise_for_status``
         propagates: ``upload_document`` decides which of those to retry.
 
+        A 406 to a request that asked for API version 10 is asked once more:
+        the response hook has forgotten the 10, so the second request asks for
+        9 (see ``_refused_newest_version`` for why that cannot duplicate).
+
         """
-        # Only the open is guarded: an OSError here is the PDF itself, while
-        # the request below raises httpx2's own types, which upload_document
-        # sorts into retries.
-        try:
-            pdf_file = pdf_path.open("rb")
-        except OSError as exc:
-            raise _unreadable_pdf(pdf_path, exc) from exc
-        with pdf_file as f:
-            response = self._client.post(
-                "/api/documents/post_document/",
-                data=data,
-                files={"document": (pdf_path.name, f, "application/pdf")},
-                timeout=timeout,
-            )
+        response = self._send_document(pdf_path, data, timeout)
+        if _refused_newest_version(response):
+            response = self._send_document(pdf_path, data, timeout)
         response.raise_for_status()
         try:
             task_id = response.json()
@@ -1462,6 +1494,42 @@ class PaperlessClient:
             )
             raise PaperlessUncertainSendError(msg)
         return task_id
+
+    def _send_document(
+        self,
+        pdf_path: Path,
+        data: dict[str, str | list[str]],
+        timeout: httpx2.Timeout,
+    ) -> httpx2.Response:
+        """
+        Send the upload request once and return the answer, whatever its status.
+
+        Args:
+            pdf_path: Path to the PDF file to upload.
+            data: The multipart form fields.
+            timeout: The request's timeout, scaled to the PDF's size.
+
+        Returns:
+            The answer, not yet checked.
+
+        Raises:
+            PaperlessError: If the PDF cannot be opened.
+
+        """
+        # Only the open is guarded: an OSError here is the PDF itself, while
+        # the request below raises httpx2's own types, which upload_document
+        # sorts into retries.
+        try:
+            pdf_file = pdf_path.open("rb")
+        except OSError as exc:
+            raise _unreadable_pdf(pdf_path, exc) from exc
+        with pdf_file as f:
+            return self._client.post(
+                "/api/documents/post_document/",
+                data=data,
+                files={"document": (pdf_path.name, f, "application/pdf")},
+                timeout=timeout,
+            )
 
     def _answer_text(self, response: httpx2.Response) -> str:
         """
@@ -2186,6 +2254,9 @@ class PaperlessClient:
         """
         Request one metadata page and return its decoded JSON body.
 
+        A 406 to a request that asked for API version 10 is asked once more,
+        with 9, as ``_post_document`` does.
+
         Args:
             path: The collection endpoint, e.g. ``/api/tags/``.
             page: The page number to ask for.
@@ -2210,12 +2281,20 @@ class PaperlessClient:
                 ValueError unless that cause's chain quotes the token.
 
         """
-        try:
-            response = self._client.get(
+
+        def _get() -> httpx2.Response:
+            return self._client.get(
                 path,
                 params={"page": page, "page_size": _METADATA_PAGE_SIZE},
                 timeout=timeout if timeout is not None else httpx2.USE_CLIENT_DEFAULT,
             )
+
+        try:
+            response = _get()
+            if _refused_newest_version(response):
+                # Asked once more, now for 9: the response hook has forgotten
+                # the 10 a server that no longer allows it once announced.
+                response = _get()
             response.raise_for_status()
         except httpx2.HTTPError as exc:
             decision = _retry_decision(exc)
