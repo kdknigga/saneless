@@ -7,6 +7,7 @@ import logging
 import secrets
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 
 from fastapi import APIRouter, Depends, Form, Query, Request
@@ -129,6 +130,19 @@ longer cannot be a filter and is either a mistake or an attempt to make the
 server do work for nothing.  ``Query(max_length=...)`` turns it into a 422
 before the handler body runs, which is the same "validate at the boundary"
 shape ``MetadataResource`` uses for ``resource``.
+"""
+
+PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS: Final = 5.0
+"""
+The per-request budget for a list fetched to answer a profile change.
+
+The tag list and the correspondent select follow the Profile select by their
+own requests, and until those land they still show the previous profile's
+defaults.  On a cold cache with paperless-ngx slow or down, the client's own
+30 s budget per page would hold that window open for half a minute or more.
+The scan no longer files the stale values (see ``start_scan``), but the page
+should still catch up in seconds, so these fetches use the short budget the
+check before a scan uses.
 """
 
 # The only metadata resources the cache holds.  A runtime alias, not a
@@ -550,6 +564,8 @@ def _cached_list_or_none(
     cache: MetadataCache,
     paperless: PaperlessClient,
     resource: MetadataResource,
+    *,
+    timeout: float | None = None,
 ) -> list[dict[str, object]] | None:
     """
     Retrieve metadata from cache or paperless-ngx, or None when it is unknown.
@@ -566,12 +582,15 @@ def _cached_list_or_none(
         cache: Metadata cache instance.
         paperless: Paperless-ngx API client.
         resource: Resource name ('tags' or 'correspondents').
+        timeout: The per-request budget in seconds for a fetch on a miss, or
+            None for the client's own default.
 
     Returns:
         The list, fresh or the last good one, or None when neither exists.
 
     """
-    fetch = paperless.get_tags if resource == "tags" else paperless.get_correspondents
+    getter = paperless.get_tags if resource == "tags" else paperless.get_correspondents
+    fetch = getter if timeout is None else partial(getter, timeout=timeout)
     try:
         return cache.get_or_fetch(resource, fetch)
     except (PaperlessError, ConfigError) as exc:
@@ -651,7 +670,7 @@ def _unnamed_rows(
 
 
 def _tag_list_context(
-    state: State, *, q: str, selected: list[int]
+    state: State, *, q: str, selected: list[int], timeout: float | None = None
 ) -> dict[str, object]:
     """
     Build the tag checkbox list's context: the filtered list and pinned ticks.
@@ -682,6 +701,8 @@ def _tag_list_context(
         state: Application state, for the metadata cache and Paperless client.
         q: The filter text, matched case-insensitively against tag names.
         selected: The tag ids the request reports as currently ticked.
+        timeout: The per-request budget for a fetch on a cache miss, or None
+            for the client's own default.
 
     Returns:
         The context ``partials/tags.html`` renders: the stale and unlisted
@@ -707,7 +728,7 @@ def _tag_list_context(
             "selected_tags": set(),
             "any_tags": False,
         }
-    listed = _cached_list_or_none(state.cache, state.paperless, "tags")
+    listed = _cached_list_or_none(state.cache, state.paperless, "tags", timeout=timeout)
     # The same rule the pre-scan check applies, so the page and the scan
     # agree on which ids paperless-ngx still has.
     known_ids = metadata_ids(listed)
@@ -746,7 +767,7 @@ def _tag_list_context(
 
 
 def _correspondent_options_context(
-    state: State, selected: int | None
+    state: State, selected: int | None, *, timeout: float | None = None
 ) -> dict[str, object]:
     """
     Build the correspondent options' context, with one of them chosen.
@@ -760,13 +781,17 @@ def _correspondent_options_context(
     Args:
         state: Application state, for the metadata cache and Paperless client.
         selected: The correspondent id to show chosen, or None for none.
+        timeout: The per-request budget for a fetch on a cache miss, or None
+            for the client's own default.
 
     Returns:
         The context ``partials/correspondents.html`` renders: the list, the
         chosen id, and the extra option or None.
 
     """
-    listed = _cached_list_or_none(state.cache, state.paperless, "correspondents")
+    listed = _cached_list_or_none(
+        state.cache, state.paperless, "correspondents", timeout=timeout
+    )
     known_ids = metadata_ids(listed)
     correspondents = listed if listed is not None and known_ids is not None else []
     extra_option: dict[str, object] | None = None
@@ -2478,7 +2503,12 @@ def get_profile_tags(request: Request, profile: str) -> Response:
         request,
         "partials/tags.html",
         {
-            **_tag_list_context(state, q="", selected=list(found.default_tags)),
+            **_tag_list_context(
+                state,
+                q="",
+                selected=list(found.default_tags),
+                timeout=PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS,
+            ),
             # The list's profile marker rides along out-of-band, so the scan
             # can tell whose defaults the ticks are (see ``start_scan``).
             "follows_profile": profile,
@@ -2515,7 +2545,11 @@ def get_profile_correspondent(request: Request, profile: str) -> Response:
         request,
         "partials/correspondent_select.html",
         {
-            **_correspondent_options_context(state, found.default_correspondent),
+            **_correspondent_options_context(
+                state,
+                found.default_correspondent,
+                timeout=PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS,
+            ),
             "follows_profile": profile,
         },
     )

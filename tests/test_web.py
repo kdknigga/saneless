@@ -3251,9 +3251,89 @@ def _pre_ticked_app(
         },
     )
     app = create_app(settings, StubScannerBackend())
-    app.state.paperless.get_tags = lambda: list(_KNOWN_TAG_ROWS)
-    app.state.paperless.get_correspondents = lambda: list(_PRE_TICK_CORRESPONDENT_ROWS)
+    # Keyword-only ``timeout``, as the real client takes it: the page asks
+    # without one, and a profile change and the check before a scan ask with
+    # one.
+    app.state.paperless.get_tags = _TimedList(_KNOWN_TAG_ROWS)
+    app.state.paperless.get_correspondents = _TimedList(_PRE_TICK_CORRESPONDENT_ROWS)
     return app
+
+
+class _TimedList:
+    """A stand-in for ``get_tags`` or ``get_correspondents`` that notes timeouts."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        """
+        Answer with ``rows`` and note nothing yet.
+
+        Args:
+            rows: The list every call answers with a copy of.
+
+        """
+        self._rows = rows
+        self.timeouts: list[float | None] = []
+
+    def __call__(self, *, timeout: float | None = None) -> list[dict[str, object]]:
+        """
+        Note the budget the caller asked for and answer a copy of the list.
+
+        Args:
+            timeout: The per-request budget, or None for the client default.
+
+        Returns:
+            A copy of the rows.
+
+        """
+        self.timeouts.append(timeout)
+        return list(self._rows)
+
+
+class TestProfileChangeFetchesAreShort:
+    """
+    A profile change never waits the client's 30 s on a cold cache.
+
+    Until the swap lands the form still shows the previous profile's
+    defaults, so both profile-change routes fetch with the short budget; the
+    full page keeps the client default.
+    """
+
+    @pytest.mark.parametrize(
+        ("route", "getter"),
+        [
+            ("/api/profiles/tags", "get_tags"),
+            ("/api/profiles/correspondent", "get_correspondents"),
+        ],
+    )
+    def test_a_profile_change_fetches_with_the_short_budget(
+        self, tmp_path: Path, route: str, getter: str
+    ) -> None:
+        """The cold-cache fetch behind the swap carries the short timeout."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.cache.invalidate("tags")
+            app.state.cache.invalidate("correspondents")
+            fetch: _TimedList = getattr(app.state.paperless, getter)
+            fetch.timeouts.clear()
+            response = client.get(route, params={"profile": "other"})
+
+        assert response.status_code == 200
+        assert fetch.timeouts == [routes_module.PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS]
+
+    def test_the_full_page_keeps_the_client_default(self, tmp_path: Path) -> None:
+        """Only the swap is shortened; the page load is unchanged."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.cache.invalidate("tags")
+            app.state.cache.invalidate("correspondents")
+            tags: _TimedList = app.state.paperless.get_tags
+            correspondents: _TimedList = app.state.paperless.get_correspondents
+            tags.timeouts.clear()
+            correspondents.timeouts.clear()
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert tags.timeouts == [None]
+        assert correspondents.timeouts == [None]
 
 
 class TestProfileDefaultsArePreTicked:
