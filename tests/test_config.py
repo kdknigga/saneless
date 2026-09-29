@@ -1226,13 +1226,13 @@ class TestConfigErrorsNeverEchoValues:
         Invalid JSON for a whole section is a ConfigError, not a SettingsError.
 
         pydantic-settings raises ``SettingsError`` before validation (Pitfall
-        2); its message names the field and source, never the value.
+        2); the loader names the variable with fixed text, never the value.
         """
         value = "notjson"
         monkeypatch.setenv("SANELESS_PAPERLESS", value)
         with pytest.raises(ConfigError) as exc_info:
             load_settings()
-        assert "paperless" in str(exc_info.value)
+        assert "'SANELESS_PAPERLESS'" in str(exc_info.value)
         self._assert_value_absent(exc_info.value, value)
 
     def test_never_echoes_token_whatever_wording_upstream_carries(
@@ -2519,6 +2519,120 @@ class TestEnvironmentAttribution:
         line = _env_line(err, "SANELESS_PAPERLESS__URL__X")
         assert "url in [paperless]" in line
         assert not any(line.startswith("  [paperless]") for line in _error_lines(err))
+
+
+_ENV_JSON_RULE = "must be JSON (a list or table is written as JSON, for example [3, 7])"
+"""The fixed text a variable holding invalid JSON is refused with."""
+
+
+def _json_line(variable: str) -> str:
+    """
+    Return the rendered line refusing ``variable`` for invalid JSON.
+
+    Args:
+        variable: The environment variable name, as spelled.
+
+    Returns:
+        The indented line, as it appears in the ConfigError.
+
+    """
+    return f"  environment variable {variable!r}: {_ENV_JSON_RULE}"
+
+
+class TestEnvironmentJson:
+    """
+    A variable holding invalid JSON is named, and the file is still checked.
+
+    pydantic-settings refuses such a variable before any field is validated,
+    with a message naming the field but not the variable. The loader used to
+    turn that into one anonymous line and stop, so a CSV ``default_tags``
+    variable hid every error in the file beside it.
+    """
+
+    def test_bad_json_variable_is_named_beside_every_file_error(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A CSV list variable, a key typo and a bad port give three lines."""
+        variable = "SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS"
+        monkeypatch.setenv(variable, "3,7")
+        config_file = tmp_config_dir / "json_and_file.toml"
+        err = _load_error(
+            config_file,
+            '[paperless]\ntokne = "x"\n\n[output]\nweb_port = 70000\n\n'
+            "[profiles.default]\n",
+        )
+        assert _error_lines(err) == [
+            f"Configuration error in {config_file}:",
+            "  [output] web_port: Input should be less than or equal to 65535",
+            "  [paperless] unknown key 'tokne' (did you mean 'token'?); "
+            "valid keys: url, token, consume_dir",
+            _json_line(variable),
+        ]
+
+    def test_two_bad_json_variables_are_each_named(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each bad variable gets its own line, sorted with the file's lines."""
+        monkeypatch.setenv("SANELESS_WEB__ALLOWED_HOSTS", "scan.example.com")
+        monkeypatch.setenv("SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS", "3,7")
+        config_file = tmp_config_dir / "two_json.toml"
+        err = _load_error(config_file, "[output]\nweb_port = 70000\n")
+        assert _error_lines(err) == [
+            f"Configuration error in {config_file}:",
+            "  [output] web_port: Input should be less than or equal to 65535",
+            _json_line("SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS"),
+            _json_line("SANELESS_WEB__ALLOWED_HOSTS"),
+        ]
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_bad_json_section_holding_the_token_never_shows_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A malformed JSON ``[paperless]`` variable is named, its token is not."""
+        monkeypatch.setenv("SANELESS_PAPERLESS", '{"token": "sekrit"')
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert _error_lines(exc_info.value) == [
+            "Configuration error (defaults and environment):",
+            _json_line("SANELESS_PAPERLESS"),
+        ]
+        assert "sekrit" not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_bad_json_variable_is_named_with_no_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no file loaded, the line sits under the defaults header."""
+        variable = "SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS"
+        monkeypatch.setenv(variable, "3,7")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert _error_lines(exc_info.value) == [
+            "Configuration error (defaults and environment):",
+            _json_line(variable),
+        ]
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_good_json_variable_still_loads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A JSON list in the same variable loads as the list."""
+        monkeypatch.setenv("SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS", "[3, 7]")
+        settings = load_settings()
+        assert settings.profiles["default"].default_tags == [3, 7]
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_lowercase_bad_json_variable_is_named_as_spelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lower-case variable is read, so it is refused under its own name."""
+        variable = "saneless_profiles__default__default_tags"
+        monkeypatch.setenv(variable, "3,7")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert _json_line(variable) in _error_lines(exc_info.value)
 
 
 class TestUnknownEnvironmentVariables:
