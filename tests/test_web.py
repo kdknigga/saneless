@@ -1885,7 +1885,7 @@ class TestQueueLine:
 
 def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) -> None:
     """
-    Replace the worker's profile set, under its own lock (D-19).
+    Replace the worker's profile set, under its own lock.
 
     The worker can refuse a set, so the answer is asserted: a refused set must
     fail the test that built it, never leave the test passing against
