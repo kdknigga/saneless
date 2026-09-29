@@ -325,19 +325,83 @@ class TestPickClosestResolutionHonoursARange:
 
 
 class TestPickPreferredMode:
-    """Mode selection logic."""
+    """
+    Scan modes are ranked by what they mean, not by an exact spelling.
 
-    def test_preferred_available(self) -> None:
-        """Returns Color when available."""
-        assert pick_preferred_mode(["Color", "Gray"], preferred="Color") == "Color"
+    SANE backends do not agree on how to spell colour: brother4 offers
+    ``24bit Color``, some drivers say ``Colour``, and the standard names include
+    ``Color Lineart``. Their first entry is usually black-and-white, so falling
+    back to it whenever the exact word ``Color`` is missing hands a colour
+    scanner a black-and-white profile.
+    """
 
-    def test_preferred_not_available(self) -> None:
-        """Returns first mode when preferred not available."""
-        assert pick_preferred_mode(["Gray", "Lineart"], preferred="Color") == "Gray"
+    @pytest.mark.parametrize(
+        ("modes", "expected"),
+        [
+            (
+                [
+                    "Black & White",
+                    "Gray[Error Diffusion]",
+                    "True Gray",
+                    "24bit Color",
+                    "24bit Color[Fast]",
+                ],
+                "24bit Color",
+            ),
+            (
+                [
+                    "Black & White",
+                    "Gray[Error Diffusion]",
+                    "True Gray",
+                    "24bit Color[Fast]",
+                ],
+                "24bit Color[Fast]",
+            ),
+            (["Lineart", "Gray", "Color"], "Color"),
+            (["Lineart", "Halftone", "Gray", "Color"], "Color"),
+            (
+                [
+                    "Color",
+                    "Gray",
+                    "Negative color",
+                    "Negative gray",
+                    "Infrared",
+                    "48 bits color",
+                    "16 bits gray",
+                    "Lineart",
+                ],
+                "Color",
+            ),
+            (["Color Lineart", "Color Halftone", "Colour"], "Colour"),
+            (["Negative color", "Color Lineart", "24bit Color"], "24bit Color"),
+            (["Color Lineart", "Gray"], "Color Lineart"),
+            (["Lineart", "Gray"], "Gray"),
+            (["Black & White", "Gray[Error Diffusion]", "True Gray"], "True Gray"),
+            (["Grey", "Lineart"], "Grey"),
+            (["Black & White"], "Black & White"),
+        ],
+        ids=[
+            "brother4-ads",
+            "brother4-mfc",
+            "epson2-and-escl",
+            "fujitsu",
+            "pixma",
+            "british-spelling-is-an-exact-colour-name",
+            "degraded-colour-modes-lose-the-tie-break",
+            "any-colour-mode-beats-gray",
+            "no-colour-falls-back-to-gray",
+            "brother4-no-colour-skips-the-dithered-gray",
+            "british-grey",
+            "neither-colour-nor-gray-takes-the-first-entry",
+        ],
+    )
+    def test_preferred_mode_by_meaning(self, modes: list[str], expected: str) -> None:
+        """Each backend's list yields the mode a person would have chosen."""
+        assert pick_preferred_mode(modes) == expected
 
-    def test_empty_returns_preferred(self) -> None:
-        """Returns preferred when no modes available."""
-        assert pick_preferred_mode([], preferred="Color") == "Color"
+    def test_preferred_mode_empty_list_is_color(self) -> None:
+        """A device reporting no modes gets the conventional colour name."""
+        assert pick_preferred_mode([]) == "Color"
 
 
 class TestIsBareDefault:
