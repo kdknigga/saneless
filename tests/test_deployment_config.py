@@ -97,6 +97,12 @@ from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
 from saneless import worker as worker_module
+from saneless.auto_profiles import (
+    _NO_SOURCE_LABEL,
+    ProfileWriteResult,
+    _profile_description,
+    _profile_label,
+)
 from saneless.checks import CheckKey, check_name
 from saneless.config import (
     OutputConfig,
@@ -402,6 +408,145 @@ def test_deploy_doc_keeps_the_single_file_mount_heading() -> None:
     text, name = _read(DEPLOY_HOWTO)
     assert text.count(f"\n{heading}\n") == 1, (
         f"{name} lost the {heading!r} heading the write errors link to"
+    )
+
+
+# The newest upgrade section on each page an upgrading operator reads. The
+# Docker how-to holds the full note; the bare-metal how-to and the Docker
+# reference carry the same points in their own words.
+DOCKER_UPGRADE_HEADING = "### Upgrading: settings are checked when saneless loads"
+UPGRADE_SECTIONS = (
+    (DEPLOY_HOWTO, DOCKER_UPGRADE_HEADING),
+    (INSTALL_BARE_METAL, "### Upgrading from an earlier release"),
+    (DOCKER_REFERENCE, "### Upgrading from an earlier release"),
+)
+
+
+@pytest.mark.parametrize(
+    ("page", "heading"),
+    UPGRADE_SECTIONS,
+    ids=[page.name for page, _ in UPGRADE_SECTIONS],
+)
+def test_upgrade_notes_cover_this_release(page: Path, heading: str) -> None:
+    """
+    Each page's newest upgrade section names what now changes on upgrade.
+
+    A ``0`` that used to mean "no limit" now stops saneless loading, so the
+    note gives the replacement value; relative paths now follow the config
+    file; generated labels change only on ``auto-profiles --force``; and free
+    space is counted in decimal megabytes. An operator who is not told finds
+    each of these out from an error or a changed page.
+    """
+    text, name = _read(page)
+    section = _subsection(text, heading, name)
+    offenders = [
+        f"does not mention {needle!r}"
+        for needle in (
+            "`history_retention_days`",
+            "36500",
+            "`history_max_rows`",
+            "1000000",
+            "auto-profiles --force",
+            "1,000,000 bytes",
+        )
+        if needle not in section
+    ]
+    if not any(
+        "relative" in sentence and "config file" in sentence
+        for sentence in _sentences(section)
+    ):
+        offenders.append("does not say relative paths now follow the config file")
+    assert not offenders, f"{name} {heading}:\n" + "\n".join(offenders)
+
+
+def test_docker_upgrade_note_merges_the_volume_file_before_deleting_it() -> None:
+    """
+    The Docker upgrade note finds an old volume config, merges it, then deletes it.
+
+    The file an earlier ``auto-profiles`` left in the data volume may hold the
+    only copy of settings the operator added by hand, so the note must say to
+    merge it into ``./config/saneless.toml`` before it says to delete it. The
+    Docker reference points at the note rather than repeating the commands.
+    """
+    text, name = _read(DEPLOY_HOWTO)
+    section = _subsection(text, DOCKER_UPGRADE_HEADING, name)
+    assert AUTO_PROFILES_CONTAINER_PATH in section, (
+        f"{name} {DOCKER_UPGRADE_HEADING} does not name the leftover "
+        f"{AUTO_PROFILES_CONTAINER_PATH}"
+    )
+    merge, delete = section.find("merge"), section.find("delete")
+    assert -1 < merge < delete, (
+        f"{name} {DOCKER_UPGRADE_HEADING} does not say to merge the volume file "
+        "before deleting it"
+    )
+    reference, reference_name = _read(DOCKER_REFERENCE)
+    anchor = (
+        "deploy-docker-compose.md#upgrading-settings-are-checked-when-saneless-loads"
+    )
+    assert anchor in reference, (
+        f"{reference_name} does not link to the Docker upgrade note ({anchor})"
+    )
+
+
+def test_profile_howto_says_how_to_refresh_a_hand_written_default() -> None:
+    """
+    The profiles how-to gives the advice that works for a hand-written default.
+
+    ``default`` cannot be renamed or deleted like other profiles, so the page
+    must show the skip line ``auto-profiles`` prints for it -- rendered here by
+    the code itself -- and say how to hand it back. It must also show the label
+    wording generation now uses, and say that a generated ``default`` that is a
+    copy of another profile is offered once on the scan page.
+    """
+    text, name = _read(PROFILE_HOWTO)
+    section = _section(text, "## Auto-generated profiles", name)
+    skip_line = ProfileWriteResult(
+        Path("saneless.toml"), skipped_not_generated=("default",)
+    ).describe()[0]
+    offenders = [
+        f"does not mention {needle!r}"
+        for needle in (
+            skip_line,
+            _profile_label("ADF Front"),
+            _profile_label("ADF Back"),
+            f"{_profile_label('ADF')} 2",
+            _NO_SOURCE_LABEL,
+        )
+        if needle not in section
+    ]
+    sentences = _sentences(section)
+    if not any(
+        "`auto_generated = true`" in sentence
+        and "`default`" in sentence
+        and "--force" in sentence
+        for sentence in sentences
+    ):
+        offenders.append("does not say how to hand a written default back")
+    if not any(
+        "`default`" in sentence and "once" in sentence and "scan page" in sentence
+        for sentence in sentences
+    ):
+        offenders.append("does not say a copied default is offered once")
+    assert not offenders, f"{name} ## Auto-generated profiles:\n" + "\n".join(offenders)
+
+
+def test_first_scan_tutorial_example_is_a_description() -> None:
+    """
+    The tutorial's description example is a description, not a label.
+
+    The line beneath the profile dropdown is a sentence; the dropdown shows
+    the label. The page also says which profile it opens on, which is now
+    true: ``default``, or the profile standing in for it.
+    """
+    text, name = _read(FIRST_WEB_UI_SCAN)
+    assert f'"{_profile_label("ADF Duplex")}"' not in text, (
+        f"{name} still gives a label as the example of a description"
+    )
+    assert _profile_description("ADF Duplex") in text, (
+        f"{name} does not give a real description as the example"
+    )
+    assert 'The profile named "default" is selected when the page loads' in text, (
+        f"{name} no longer says which profile the page opens on"
     )
 
 
