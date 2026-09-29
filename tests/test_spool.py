@@ -685,10 +685,10 @@ class TestSpooledPageSinkModes:
     @pytest.mark.parametrize(
         ("mode", "size", "required_mb"),
         [
-            # Four bands arrive and three are written: 3 MiB, not 4.
-            ("RGBA", (1024, 1024), 3),
-            # Two bytes a pixel arrive and one is written: 2 MiB, not 4.
-            ("I;16", (2048, 1024), 2),
+            # Four bands arrive and three are written: 3 MB, not 4.
+            ("RGBA", (1000, 1000), 3),
+            # Two bytes a pixel arrive and one is written: 2 MB, not 4.
+            ("I;16", (2000, 1000), 2),
         ],
     )
     def test_the_room_estimate_is_of_the_normalised_page(

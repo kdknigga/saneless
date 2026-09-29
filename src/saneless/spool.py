@@ -60,14 +60,14 @@ if TYPE_CHECKING:
 
     from PIL import Image
 
-__all__ = ["SpooledPageSink"]
+__all__ = ["BYTES_PER_MB", "SpooledPageSink"]
 
 logger = logging.getLogger(__name__)
 
-# One megabyte, as the free-space arithmetic counts them.  Matches
-# ``pipeline._check_disk_space``, so the per-page shortfall and the up-front
-# one are reported in the same units.
-_BYTES_PER_MB: Final[int] = 1024 * 1024
+# One megabyte, 10**6 bytes, as the ``min_free_space_mb`` key name, the docs
+# and every message count it.  Shared by the spool, the pipeline's up-front
+# check and preservation, so every shortfall is reported in the same unit.
+BYTES_PER_MB: Final[int] = 1_000_000
 
 # The modes a page is spooled in exactly as it arrived.  "L" and "RGB" are
 # what a SANE snap produces; "1" is lineart, which the thumbnail, the PNG
@@ -407,10 +407,10 @@ class SpooledPageSink(PageSink):
         # with three.  For "1" it overstates eightfold, which errs on the
         # safe side.
         decoded_bytes = image.size[0] * image.size[1] * len(image.getbands())
-        page_mb = (decoded_bytes + _BYTES_PER_MB - 1) // _BYTES_PER_MB
+        page_mb = (decoded_bytes + BYTES_PER_MB - 1) // BYTES_PER_MB
         required_mb = page_mb + self._min_free_space_mb
         try:
-            free_mb = shutil.disk_usage(self._directory).free // _BYTES_PER_MB
+            free_mb = shutil.disk_usage(self._directory).free // BYTES_PER_MB
         except OSError as exc:
             measure_msg = (
                 f"Could not measure free space for page {sequence} in "
