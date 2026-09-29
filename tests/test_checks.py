@@ -2335,6 +2335,7 @@ def _discovery(
     *,
     loaded: int | None = None,
     stale: tuple[int, ...] = (),
+    also_found: tuple[int, ...] = (),
 ) -> ConfigDiscovery:
     """
     Record a real search over three temporary candidates.
@@ -2352,6 +2353,8 @@ def _discovery(
         loaded: The index whose current-name file exists, or None for a search
             that found nothing to load.
         stale: The indexes whose directories also hold a superseded-name file.
+        also_found: The indexes whose current-name file also exists, after
+            ``loaded`` in search order, so the search finds more than one.
 
     Returns:
         The recording that search produced.
@@ -2360,6 +2363,8 @@ def _discovery(
     candidates = _candidates(tmp_path / "search")
     if loaded is not None:
         candidates[loaded].write_text("", encoding="utf-8")
+    for index in also_found:
+        candidates[index].write_text("", encoding="utf-8")
     for index in stale:
         _write_stale(candidates[index])
     return discover_config(candidates)
@@ -7850,6 +7855,130 @@ class TestConfigurationRow:
         assert row.message == (
             "No config file; running on defaults and environment variables."
         )
+
+    def test_a_shadowed_file_is_amber_and_named(self, tmp_path: Path) -> None:
+        """
+        A second config file is amber, and the row says which one won.
+
+        Two files can be deliberate -- a per-user file overriding the system
+        one -- so nothing failed.  But the file an operator edits may be the
+        one that is not read, and nothing else on the strip would say so.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, loaded=0, also_found=(2,))
+        )
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            f"Using ./{CONFIG_FILENAME}; /etc/saneless/{CONFIG_FILENAME} "
+            "is also there and is not read."
+        )
+        assert row.next_step == (
+            "If that is not deliberate, move anything you still need from "
+            f"/etc/saneless/{CONFIG_FILENAME} into ./{CONFIG_FILENAME}, then "
+            f"delete /etc/saneless/{CONFIG_FILENAME} and restart saneless."
+        )
+        assert str(tmp_path) not in row.message
+        assert str(tmp_path) not in row.next_step
+
+    def test_three_files_name_every_unread_one(self, tmp_path: Path) -> None:
+        """
+        Every file that is not read is named, and the sentence says so plainly.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, loaded=0, also_found=(1, 2))
+        )
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.WARN
+        unread = (
+            f"$XDG_CONFIG_HOME/saneless/{CONFIG_FILENAME} and "
+            f"/etc/saneless/{CONFIG_FILENAME}"
+        )
+        assert row.message == (
+            f"Using ./{CONFIG_FILENAME}; {unread} are also there and are not read."
+        )
+        assert row.next_step == (
+            "If that is not deliberate, move anything you still need from "
+            f"{unread} into ./{CONFIG_FILENAME}, then delete them and restart "
+            "saneless."
+        )
+        assert str(tmp_path) not in row.message
+        assert str(tmp_path) not in row.next_step
+
+    def test_shadowed_row_absolute_spelling(self, tmp_path: Path) -> None:
+        """
+        The terminal form is the same sentences with both files absolute.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        discovery = _discovery(tmp_path, loaded=0, also_found=(1,))
+        settings = _with_discovery(_settings(tmp_path), discovery)
+        used, unread = (str(path.absolute()) for path in discovery.found)
+        row = checks.configuration_check(settings, absolute_paths=True)
+        assert row.state is CheckState.WARN
+        assert row.message == f"Using {used}; {unread} is also there and is not read."
+        assert row.next_step == (
+            "If that is not deliberate, move anything you still need from "
+            f"{unread} into {used}, then delete {unread} and restart saneless."
+        )
+
+    def test_shadowed_takes_precedence_over_a_leftover(self, tmp_path: Path) -> None:
+        """
+        A shadowed file outranks an old-name leftover on the one row.
+
+        The leftover is a trap for the next edit; the shadowed file may be
+        the edit already made and not read.  The leftover is still named in
+        full by the leftover row's own function.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path),
+            _discovery(tmp_path, loaded=0, also_found=(2,), stale=(1,)),
+        )
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.WARN
+        assert row.message.endswith("is also there and is not read.")
+        leftover = checks.leftover_config_check(settings)
+        assert leftover is not None
+        assert leftover.state is CheckState.WARN
+        assert leftover.message == (
+            "Using saneless.toml; an old config.toml is being ignored."
+        )
+        assert (
+            f"$XDG_CONFIG_HOME/saneless/{LEGACY_CONFIG_FILENAME}" in leftover.next_step
+        )
+
+    def test_no_leftover_row_without_a_leftover(self, tmp_path: Path) -> None:
+        """
+        The leftover row is only for a loaded file with an old-name file beside it.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        loaded_only = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, loaded=0, also_found=(2,))
+        )
+        assert checks.leftover_config_check(loaded_only) is None
+        other = tmp_path / "other"
+        other.mkdir()
+        nothing_loaded = _with_discovery(
+            _settings(other), _discovery(other, stale=(0,))
+        )
+        assert checks.leftover_config_check(nothing_loaded) is None
 
     def test_the_terminal_form_names_the_absolute_path(self, tmp_path: Path) -> None:
         """

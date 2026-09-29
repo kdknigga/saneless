@@ -2041,6 +2041,44 @@ class TestConfigDiscovery:
             is vocabulary_mod.ConfigFileState.LOADED_WITH_LEFTOVER
         )
 
+    def test_state_loaded_with_shadowed(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """A second distinct config file makes the shadowed state."""
+        (patched_search_paths.cwd / config_mod.CONFIG_FILENAME).write_text(
+            _MINIMAL_TOML
+        )
+        (patched_search_paths.etc / config_mod.CONFIG_FILENAME).write_text(
+            _MINIMAL_TOML
+        )
+        settings = load_settings()
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED_WITH_SHADOWED
+        )
+
+    def test_shadowed_takes_precedence_over_a_leftover(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """
+        Two config files and an old-name leftover is still the shadowed state.
+
+        The shadowed file may be the edit an operator already made and is not
+        read; the leftover is only a trap for the next one.
+        """
+        (patched_search_paths.cwd / config_mod.CONFIG_FILENAME).write_text(
+            _MINIMAL_TOML
+        )
+        (patched_search_paths.etc / config_mod.CONFIG_FILENAME).write_text(
+            _MINIMAL_TOML
+        )
+        self._stale_in(patched_search_paths.xdg).write_text(_MINIMAL_TOML)
+        settings = load_settings()
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED_WITH_SHADOWED
+        )
+
     def test_state_not_found(self, patched_search_paths: _SearchDirs) -> None:
         """Nothing anywhere is NOT_FOUND, which is a supported deployment (D-07)."""
         assert patched_search_paths.cwd.is_dir()
@@ -2628,6 +2666,108 @@ class TestConfigSources:
         """
         with caplog.at_level(logging.INFO, logger="saneless.config"):
             config_mod.log_config_sources(settings)
+
+    def test_configuration_line_is_absolute(
+        self,
+        patched_search_paths: _SearchDirs,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The file found through the relative first candidate is logged absolute."""
+        loaded = patched_search_paths.cwd / config_mod.CONFIG_FILENAME
+        loaded.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        messages = self._info(caplog)
+        assert len(messages) == 1
+        assert messages[0].startswith(f"Configuration: {loaded}; ")
+
+    def test_configuration_line_absolutizes_a_recorded_relative_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A path recorded relative is still logged absolute.
+
+        Settings built directly may carry any path; the log line is read
+        without the working directory, so it never prints a relative one.
+        """
+        monkeypatch.chdir(tmp_path)
+        settings = Settings()
+        settings._config_path = Path(config_mod.CONFIG_FILENAME)
+
+        self._emit(settings, caplog)
+
+        messages = self._info(caplog)
+        assert len(messages) == 1
+        expected = tmp_path / config_mod.CONFIG_FILENAME
+        assert messages[0].startswith(f"Configuration: {expected}; ")
+
+    def test_shadowed_config_logs_a_warning_naming_both(
+        self,
+        patched_search_paths: _SearchDirs,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        One WARNING per config file that is not read, naming it and the winner.
+
+        Both absolute, because the log is read on the machine, where the
+        path is the half an operator can act on.
+        """
+        loaded = patched_search_paths.cwd / config_mod.CONFIG_FILENAME
+        unread = patched_search_paths.etc / config_mod.CONFIG_FILENAME
+        loaded.write_text(_MINIMAL_TOML)
+        unread.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        assert self._warnings(caplog) == [
+            f"Not reading {unread}: {loaded} is in use and was found first; "
+            f"move anything you still need from it into {loaded}, or delete "
+            "it if it is not deliberate"
+        ]
+
+    def test_every_unread_config_file_gets_its_own_warning(
+        self,
+        patched_search_paths: _SearchDirs,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Three files found gives two warnings, in search order."""
+        for directory in patched_search_paths:
+            (directory / config_mod.CONFIG_FILENAME).write_text(_MINIMAL_TOML)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 2
+        assert warnings[0].startswith(
+            f"Not reading {patched_search_paths.xdg / config_mod.CONFIG_FILENAME}:"
+        )
+        assert warnings[1].startswith(
+            f"Not reading {patched_search_paths.etc / config_mod.CONFIG_FILENAME}:"
+        )
+
+    def test_one_file_seen_twice_logs_no_shadow_warning(
+        self,
+        patched_search_paths: _SearchDirs,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Running from inside the XDG directory finds one file and warns of none."""
+        monkeypatch.chdir(patched_search_paths.xdg)
+        (patched_search_paths.xdg / config_mod.CONFIG_FILENAME).write_text(
+            _MINIMAL_TOML
+        )
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        assert self._warnings(caplog) == []
 
     @pytest.mark.usefixtures("patched_search_paths")
     def test_no_config_logs_every_searched_path_absolute(
