@@ -4342,6 +4342,179 @@ class TestDataDir:
         assert settings.output.db_path == override / "saneless.db"
 
 
+class _RelativeLayout(NamedTuple):
+    """A config directory and a different working directory to load it from."""
+
+    conf: Path
+    elsewhere: Path
+
+
+def _write_relative_config(directory: Path, body: str) -> Path:
+    """
+    Write ``saneless.toml`` into ``directory`` with a default profile.
+
+    Args:
+        directory: Where the file goes; created if missing.
+        body: TOML to put before the ``[profiles.default]`` table.
+
+    Returns:
+        The written file.
+
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    config_file = directory / config_mod.CONFIG_FILENAME
+    config_file.write_text(f"{body}\n[profiles.default]\n")
+    return config_file
+
+
+class TestRelativePaths:
+    """
+    A relative path setting is pinned absolute at load, next to its config file.
+
+    A relative ``data_dir`` used to be taken relative to whatever directory a
+    command ran in, so ``saneless jobs`` from another directory opened -- and
+    created -- an empty database there. File and environment values follow
+    the same rule: the directory of the loaded file, or the working directory
+    when no file was loaded.
+    """
+
+    @pytest.fixture
+    def layout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> _RelativeLayout:
+        """
+        Make a config directory and run from a different, empty one.
+
+        Returns:
+            The config directory and the working directory.
+
+        """
+        conf = tmp_path / "conf"
+        elsewhere = tmp_path / "elsewhere"
+        conf.mkdir()
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        return _RelativeLayout(conf=conf, elsewhere=elsewhere)
+
+    def test_relative_data_dir_follows_the_config_file(
+        self, layout: _RelativeLayout
+    ) -> None:
+        """``data_dir = "state"`` lands beside the file, not in the working dir."""
+        config_file = _write_relative_config(
+            layout.conf, '[output]\ndata_dir = "state"\n'
+        )
+
+        settings = load_settings(str(config_file))
+
+        assert settings.output.data_dir == layout.conf / "state"
+        assert settings.output.db_path == layout.conf / "state" / "saneless.db"
+
+    def test_relative_data_dir_gives_one_database_from_any_directory(
+        self, layout: _RelativeLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Two working directories open the same database.
+
+        The location compared is the one a command would open: the recorded
+        path taken against the working directory it ran in.
+        """
+        config_file = _write_relative_config(
+            layout.conf, '[output]\ndata_dir = "state"\n'
+        )
+        opened: list[Path] = []
+        for directory in (layout.elsewhere, layout.conf):
+            monkeypatch.chdir(directory)
+            opened.append(Path.cwd() / load_settings(str(config_file)).output.db_path)
+
+        assert opened == [layout.conf / "state" / "saneless.db"] * 2
+
+    def test_every_relative_path_setting_follows_the_config_file(
+        self, layout: _RelativeLayout
+    ) -> None:
+        """``tmp_dir``, ``log_file`` and ``consume_dir`` are pinned the same way."""
+        config_file = _write_relative_config(
+            layout.conf,
+            '[output]\ntmp_dir = "t"\nlog_file = "logs/saneless.log"\n\n'
+            '[paperless]\nconsume_dir = "consume"\n',
+        )
+
+        settings = load_settings(str(config_file))
+
+        assert settings.output.tmp_dir == layout.conf / "t"
+        assert settings.output.log_file == layout.conf / "logs" / "saneless.log"
+        assert settings.paperless.consume_dir == layout.conf / "consume"
+
+    def test_relative_data_dir_in_a_discovered_file_follows_that_file(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """A file found by the search is the anchor, not the working directory."""
+        _write_relative_config(
+            patched_search_paths.xdg, '[output]\ndata_dir = "state"\n'
+        )
+
+        settings = load_settings()
+
+        assert settings.output.data_dir == patched_search_paths.xdg / "state"
+
+    def test_relative_environment_value_follows_the_loaded_file(
+        self, layout: _RelativeLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__DATA_DIR=state`` with a file loaded lands beside it."""
+        config_file = _write_relative_config(layout.conf, "")
+        monkeypatch.setenv("SANELESS_OUTPUT__DATA_DIR", "state")
+
+        settings = load_settings(str(config_file))
+
+        assert settings.output.data_dir == layout.conf / "state"
+
+    def test_relative_environment_value_without_a_file_follows_the_working_directory(
+        self, no_discovered_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no file loaded, the working directory is the anchor, pinned at load."""
+        monkeypatch.setenv("SANELESS_OUTPUT__DATA_DIR", "state")
+
+        settings = load_settings()
+
+        assert settings.config_path is None
+        assert settings.output.data_dir == no_discovered_config / "state"
+        assert settings.output.data_dir.is_absolute()
+
+    def test_relative_rule_leaves_home_and_absolute_paths_alone(
+        self, layout: _RelativeLayout
+    ) -> None:
+        """``~`` still means the home directory and an absolute path is kept."""
+        absolute = layout.elsewhere / "abs" / "x"
+        config_file = _write_relative_config(
+            layout.conf, f'[output]\ndata_dir = "~/x"\ntmp_dir = "{absolute}"\n'
+        )
+
+        settings = load_settings(str(config_file))
+
+        assert settings.output.data_dir == Path.home() / "x"
+        assert settings.output.tmp_dir == absolute
+
+    @pytest.mark.usefixtures("layout")
+    def test_relative_data_dir_follows_the_directory_a_symlinked_file_was_found_in(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A symlinked config anchors at the link's directory, not the target's.
+
+        That is the directory the operator named, and the one the log prints.
+        """
+        real = _write_relative_config(
+            tmp_path / "real", '[output]\ndata_dir = "state"\n'
+        )
+        link_dir = tmp_path / "link"
+        link_dir.mkdir()
+        link = link_dir / config_mod.CONFIG_FILENAME
+        link.symlink_to(real)
+
+        settings = load_settings(str(link))
+
+        assert settings.output.data_dir == link_dir / "state"
+
+
 class TestPlaceholderToken:
     """
     ``is_placeholder_token`` is an exact-match predicate, not a heuristic (D-14).
