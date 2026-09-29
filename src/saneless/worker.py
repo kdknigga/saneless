@@ -1333,16 +1333,29 @@ class ScanWorker:
         This is the one place the profiles are rebound: startup generation
         swaps through it too, with its bare-default re-check as ``only_if``.
 
+        A set without ``default`` is refused.  Every scan that names no profile
+        resolves ``default``, so swapping such a set in would leave the
+        appliance unable to scan until it was restarted.  The refusal is
+        logged and answered rather than raised, because this runs on the
+        worker thread, where an exception would stop the loop that takes jobs.
+
         Args:
             profiles: The complete new set of profiles.
             only_if: A check on the current settings, run under the same lock
                 as the swap; when it returns ``False`` nothing is replaced.
 
         Returns:
-            Whether the profiles were replaced.
+            Whether the profiles were replaced: ``False`` when the new set has
+            no ``default`` profile or ``only_if`` refused the swap.
 
         """
         replacement = dict(profiles)
+        if "default" not in replacement:
+            logger.warning(
+                "Not replacing the scan profiles: the new set has no 'default' "
+                "profile, which every scan without a named profile uses"
+            )
+            return False
         with self._profiles_lock:
             if only_if is not None and not only_if(self._settings):
                 return False
