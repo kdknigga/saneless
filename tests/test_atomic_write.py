@@ -26,17 +26,28 @@ Its contract, which every test below pins down:
   an ACL survives exactly and the owning group is never handed the ACL mask.
   An attribute that cannot be copied refuses the rewrite; a filesystem with
   no extended attribute support has nothing to copy.
+* An owner or group that cannot be kept is logged at WARNING with its ids.
+* Temp files a killed writer left beside the target -- regular, owned by this
+  user, older than ten minutes -- are removed before the next rewrite; a
+  fresh one, another user's, and a symlink are left alone.
+* The mount errors cite the published deployment guide, and that URL maps to
+  an existing page and heading under ``docs/``.
+* A new file takes its directory's owner and group when this process may set
+  them, and stays 0600 either way.
 """
 
 from __future__ import annotations
 
 import errno
+import logging
 import os
+import re
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -46,6 +57,14 @@ from saneless.exceptions import ConfigError
 
 _ORIGINAL = "[profiles.default]\nsource = 'Flatbed'\n"
 _NEW = "a = 1\r\n# café\n"
+
+# Where the mount errors send the operator: the published page, because a
+# reader of the error has the site, not the repository.
+_PUBLISHED_DOCS_URL = (
+    "https://kdknigga.github.io/saneless/how-to/deploy-docker-compose/"
+    "#moving-from-a-single-file-config-mount"
+)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The Linux ``system.posix_acl_access`` value: a little-endian version word,
 # then one (tag, permissions, id) entry per ACL line. Building it by hand lets
@@ -423,7 +442,8 @@ class TestReadOnlyMount:
         assert str(target.resolve()) in message
         assert "bind-mounted as a single file" in message
         assert "Mount its directory instead" in message
-        assert "docs/how-to/deploy-docker-compose.md" in message
+        assert _PUBLISHED_DOCS_URL in message
+        assert "docs/how-to/" not in message
         assert "Permission denied" not in message
         assert target.read_bytes() == _ORIGINAL.encode("utf-8")
         assert directories == [], "a temp file was created before refusing"
@@ -443,7 +463,8 @@ class TestReadOnlyMount:
         assert str(target.resolve()) in message
         assert "read-only mount" in message
         assert "read-write" in message
-        assert "docs/how-to/deploy-docker-compose.md" in message
+        assert _PUBLISHED_DOCS_URL in message
+        assert "docs/how-to/" not in message
         assert target.read_bytes() == _ORIGINAL.encode("utf-8")
 
     def test_writable_mount_read_only_file_is_still_permission_error(
@@ -611,6 +632,74 @@ class TestModeAndOwner:
             (-1, original.st_gid),
         ]
         assert target.stat().st_gid == original.st_gid
+
+    def test_refused_owner_copy_is_a_warning_naming_the_ids(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A rewrite that changes who owns the file says so at WARNING.
+
+        The write still happens, but the file now belongs to the writer; an
+        operator who later cannot edit it without sudo needs to see why.
+        """
+
+        def refused_fchown(fd: int, uid: int, gid: int) -> None:
+            """Refuse every ownership change, as for a non-root caller."""
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+        monkeypatch.setattr(os, "fchown", refused_fchown)
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        original = target.stat()
+        caplog.set_level(logging.DEBUG, logger="saneless.atomic_write")
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 2, warnings
+        owner_warning, group_warning = warnings
+        assert str(original.st_uid) in owner_warning
+        assert str(original.st_gid) in owner_warning
+        assert str(original.st_gid) in group_warning
+
+    def test_refused_owner_with_kept_group_is_one_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A lost owner warns once; the group that was kept adds nothing."""
+        real_fchown = os.fchown
+
+        def owner_refused(fd: int, uid: int, gid: int) -> None:
+            """Refuse an owner change; allow a group-only change."""
+            if uid != -1:
+                raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+            real_fchown(fd, uid, gid)
+
+        monkeypatch.setattr(os, "fchown", owner_refused)
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        original = target.stat()
+        caplog.set_level(logging.DEBUG, logger="saneless.atomic_write")
+
+        replace_file_atomically(target, _NEW)
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1, warnings
+        assert str(original.st_uid) in warnings[0]
 
     def test_atomic_fchmod_unsupported_does_not_fail_the_write(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -889,6 +978,290 @@ class TestExtendedAttributes:
         assert target.read_bytes() == _NEW.encode("utf-8")
 
 
+_STALE_AGE_SECONDS = 11 * 60
+
+
+def _age(path: Path, seconds: float) -> None:
+    """Set ``path``'s own times ``seconds`` into the past, not a link target's."""
+    then = time.time() - seconds
+    os.utime(path, (then, then), follow_symlinks=False)
+
+
+def _info_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the INFO messages ``saneless.atomic_write`` logged."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "saneless.atomic_write" and record.levelno == logging.INFO
+    ]
+
+
+class TestStaleTempSweep:
+    """
+    A temp file a killed writer left behind is removed by the next rewrite.
+
+    It is a stray copy of the config, possibly holding the Paperless token.
+    Only this helper's own leftovers go: a matching name, a regular file this
+    user owns, and old enough that no rewrite can still be writing it -- the
+    worker's start-up generation and a CLI run may overlap.
+    """
+
+    def test_old_own_temp_is_removed_and_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An eleven-minute-old ``.saneless.toml.XXXXXXXX.tmp`` is swept."""
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        stale = tmp_path / ".saneless.toml.abcd1234.tmp"
+        stale.write_text("token = 'left by a killed writer'\n", encoding="utf-8")
+        _age(stale, _STALE_AGE_SECONDS)
+        caplog.set_level(logging.INFO, logger="saneless.atomic_write")
+
+        replace_file_atomically(target, _NEW)
+
+        assert not stale.exists()
+        assert any(stale.name in message for message in _info_messages(caplog))
+        assert sorted(entry.name for entry in tmp_path.iterdir()) == ["saneless.toml"]
+
+    def test_fresh_temp_is_kept(self, tmp_path: Path) -> None:
+        """A temp written just now may belong to a rewrite still in progress."""
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        fresh = tmp_path / ".saneless.toml.abcd1234.tmp"
+        fresh.write_text("in flight\n", encoding="utf-8")
+
+        replace_file_atomically(target, _NEW)
+
+        assert fresh.read_text(encoding="utf-8") == "in flight\n"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            ".other.toml.abcd1234.tmp",
+            ".saneless.toml.abc1234.tmp",
+            ".saneless.toml.abcd1234.tmp.bak",
+            "saneless.toml.abcd1234.tmp",
+        ],
+    )
+    def test_names_outside_the_temp_pattern_are_kept(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        """Only the exact temp name of *this* target is ever swept."""
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        bystander = tmp_path / name
+        bystander.write_text("not ours\n", encoding="utf-8")
+        _age(bystander, _STALE_AGE_SECONDS)
+
+        replace_file_atomically(target, _NEW)
+
+        assert bystander.read_text(encoding="utf-8") == "not ours\n"
+
+    def test_another_users_temp_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A temp this user does not own is some other writer's business."""
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        foreign = tmp_path / ".saneless.toml.abcd1234.tmp"
+        foreign.write_text("theirs\n", encoding="utf-8")
+        _age(foreign, _STALE_AGE_SECONDS)
+        # The file is ours, so the writer is made to look like someone else.
+        other_uid = os.geteuid() + 1
+        monkeypatch.setattr(os, "geteuid", lambda: other_uid)
+
+        replace_file_atomically(target, _NEW)
+
+        assert foreign.read_text(encoding="utf-8") == "theirs\n"
+
+    def test_symlink_with_the_temp_name_is_kept_and_its_target_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """A planted symlink is neither removed nor followed."""
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        victim = tmp_path / "victim.txt"
+        victim.write_text("keep me\n", encoding="utf-8")
+        _age(victim, _STALE_AGE_SECONDS)
+        link = tmp_path / ".saneless.toml.zzzz9999.tmp"
+        link.symlink_to(victim)
+        _age(link, _STALE_AGE_SECONDS)
+
+        replace_file_atomically(target, _NEW)
+
+        assert link.is_symlink()
+        assert victim.read_text(encoding="utf-8") == "keep me\n"
+
+
+def _mkdocs_slug(heading: str) -> str:
+    """Slug a heading the way Python-Markdown's default ``toc`` does."""
+    text = re.sub(r"[^\w\s-]", "", heading).strip().lower()
+    return re.sub(r"[-\s]+", "-", text)
+
+
+class TestPublishedDocsUrl:
+    """The URL the mount errors cite is a real page and heading in ``docs/``."""
+
+    def test_published_docs_url_names_an_existing_page_and_heading(self) -> None:
+        """
+        The URL's path is a page under ``docs/``; its fragment is a heading.
+
+        Checked offline against the sources the site is built from, so moving
+        the page or renaming the heading fails here rather than in front of
+        an operator.
+        """
+        mkdocs = (_REPO_ROOT / "mkdocs.yml").read_text(encoding="utf-8")
+        site_url = re.search(r"^site_url:\s*(\S+)\s*$", mkdocs, re.MULTILINE)
+        assert site_url is not None
+        base = site_url.group(1)
+        assert _PUBLISHED_DOCS_URL.startswith(base)
+        page_path, _, fragment = _PUBLISHED_DOCS_URL.removeprefix(base).partition("#")
+
+        page = _REPO_ROOT / "docs" / f"{page_path.rstrip('/')}.md"
+
+        assert page == _REPO_ROOT / "docs" / "how-to" / "deploy-docker-compose.md"
+        assert page.is_file()
+        prose = re.sub(
+            r"^```.*?^```",
+            "",
+            page.read_text(encoding="utf-8"),
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        slugs = {
+            _mkdocs_slug(match.group(1))
+            for match in re.finditer(r"^#{1,6}\s+(.+?)\s*$", prose, re.MULTILINE)
+        }
+        assert fragment in slugs, sorted(slugs)
+
+
+def _fake_directory_owner(
+    monkeypatch: pytest.MonkeyPatch, directory: Path, uid: int, gid: int
+) -> None:
+    """
+    Make ``os.stat`` report ``directory`` as owned by ``uid``:``gid``.
+
+    Every other path, and every other field, is answered for real. Nothing is
+    chowned: a non-root test cannot give a directory away.
+    """
+    real_stat = os.stat
+    faked = os.fspath(directory.resolve())
+
+    def fake_stat(
+        path: int | str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        """Return the real status, with the directory's owner replaced."""
+        result = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if isinstance(path, int) or os.fspath(path) != faked:
+            return result
+        fields = list(result)
+        fields[stat.ST_UID] = uid
+        fields[stat.ST_GID] = gid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+
+def _record_fchown(
+    monkeypatch: pytest.MonkeyPatch, *, refuse: bool
+) -> list[tuple[int, int]]:
+    """
+    Record every ``fchown`` without performing it; optionally refuse it.
+
+    Not performing it stands in for root, who may give the file away; the
+    refusal stands in for everyone else.
+    """
+    calls: list[tuple[int, int]] = []
+
+    def fchown(fd: int, uid: int, gid: int) -> None:
+        """Note the requested owner; refuse it when asked to."""
+        calls.append((uid, gid))
+        if refuse:
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+    monkeypatch.setattr(os, "fchown", fchown)
+    return calls
+
+
+class TestNewFileOwner:
+    """
+    A config this process creates belongs to its directory's owner.
+
+    A root ``docker compose exec`` writing into the service's config
+    directory must leave a file the service can read. The mode stays 0600
+    whoever ends up owning it, because a new config may hold the token.
+    """
+
+    def test_new_file_takes_the_directory_owner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The temp file is given the directory's uid and gid before the rename."""
+        dir_uid, dir_gid = os.geteuid() + 1, os.getegid() + 1
+        _fake_directory_owner(monkeypatch, tmp_path, dir_uid, dir_gid)
+        calls = _record_fchown(monkeypatch, refuse=False)
+        target = tmp_path / "saneless.toml"
+
+        replace_file_atomically(target, _NEW)
+
+        assert calls == [(dir_uid, dir_gid)]
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    def test_refused_directory_owner_keeps_the_writer_and_still_writes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A writer that may not give the file away still writes it, as itself."""
+        dir_uid, dir_gid = os.geteuid() + 1, os.getegid() + 1
+        _fake_directory_owner(monkeypatch, tmp_path, dir_uid, dir_gid)
+        calls = _record_fchown(monkeypatch, refuse=True)
+        target = tmp_path / "saneless.toml"
+        caplog.set_level(logging.DEBUG, logger="saneless.atomic_write")
+
+        replace_file_atomically(target, _NEW)
+
+        assert calls == [(dir_uid, dir_gid)]
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        written = target.stat()
+        assert written.st_uid == os.geteuid()
+        assert stat.S_IMODE(written.st_mode) == 0o600
+        records = [r for r in caplog.records if r.name == "saneless.atomic_write"]
+        assert [r.levelno for r in records] == [logging.DEBUG]
+        assert str(dir_uid) in records[0].getMessage()
+        _leftovers(tmp_path)
+
+    def test_directory_owned_by_the_writer_needs_no_chown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The file already belongs to the directory's owner: nothing to change."""
+        _fake_directory_owner(monkeypatch, tmp_path, os.geteuid(), os.getegid())
+        calls = _record_fchown(monkeypatch, refuse=False)
+        target = tmp_path / "saneless.toml"
+
+        replace_file_atomically(target, _NEW)
+
+        assert calls == []
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    def test_existing_file_keeps_its_own_owner_not_the_directorys(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rewrite copies the original's owner; the directory's is not asked."""
+        target = tmp_path / "saneless.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        original = target.stat()
+        _fake_directory_owner(monkeypatch, tmp_path, os.geteuid() + 1, os.getegid() + 1)
+        calls = _record_fchown(monkeypatch, refuse=False)
+
+        replace_file_atomically(target, _NEW)
+
+        assert calls == [(original.st_uid, original.st_gid)]
+
+
 class TestBindMount:
     """A single-file bind mount fails clearly (D-08); a directory mount works."""
 
@@ -918,7 +1291,8 @@ class TestBindMount:
         assert str(target.resolve()) in message
         assert "bind-mounted as a single file" in message
         assert "Mount its directory instead" in message
-        assert "docs/how-to/deploy-docker-compose.md" in message
+        assert _PUBLISHED_DOCS_URL in message
+        assert "docs/how-to/" not in message
         assert target.read_bytes() == _ORIGINAL.encode("utf-8")
         _leftovers(tmp_path)
 
