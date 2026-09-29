@@ -416,7 +416,8 @@ class ExitCode(IntEnum):
 
     ``DISK_SPACE`` (10) means the server ran out of disk space for the scan,
     while scanning or while assembling the PDF.  The error line names the
-    folder and how much space is needed.  It is kept apart from ``SCAN`` and
+    folder, and how much space is needed when the shortfall was found before
+    a write.  It is kept apart from ``SCAN`` and
     ``PDF`` because neither the scanner nor the images were at fault, and
     freeing space is the fix.
 
@@ -3089,11 +3090,13 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
         case ErrorCategory.DISK_SPACE:
             advice = ErrorAdvice(
                 # Path-free and number-free: the error beside it names the
-                # folder and how much space is needed.
+                # folder.  Only a shortfall found before a write names how much
+                # space is needed; a write the disk refused names none, so the
+                # advice promises the folder alone.
                 message="The server ran out of disk space for this scan.",
                 next_step=(
-                    "Free space on the server (the error names the folder and "
-                    "how much is needed), then start the scan again."
+                    "Free space on the server (the error names the folder), "
+                    "then start the scan again."
                 ),
             )
         case ErrorCategory.REJECTED:

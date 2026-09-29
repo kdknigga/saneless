@@ -510,7 +510,10 @@ The line starts with `Disk space:`. The server ran out of room while scanning, w
 page, or while assembling the PDF. The scanner and the pages are fine, so neither is the thing to
 check.
 
-The line names the folder that is full and how much space the scan needs. Free that much space on
+The line names the folder that is full. When saneless found the shortfall before writing -- the
+checks before a scan, before each page and before assembling the PDF -- it also names how much
+space the scan needs. When the disk refused a write partway through, it names only the folder and
+the system's reason (`No space left on device`, or a disk quota). Free space on
 the filesystem holding the folder, or point the folder at a filesystem with room: `tmp_dir` for
 the scan in progress, or `data_dir` for the job database and `failed/`. Then scan again.
 

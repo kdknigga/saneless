@@ -961,6 +961,14 @@ class TestErrorAdvice:
                 ErrorCategory.UNKNOWN,
                 "Start the scan again. If it keeps failing, check the saneless log.",
             ),
+            # Promises the folder and nothing more: a write the disk refused
+            # names no amount, so "how much is needed" would point at a
+            # figure the error beside it does not carry.
+            (
+                ErrorCategory.DISK_SPACE,
+                "Free space on the server (the error names the folder), then "
+                "start the scan again.",
+            ),
         ],
     )
     def test_error_next_step_strings(
