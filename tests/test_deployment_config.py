@@ -103,6 +103,8 @@ from saneless.config import (
     ProfileConfig,
     WebConfig,
     is_placeholder_token,
+    load_settings,
+    validate_settings_dirs,
 )
 from saneless.pages import (
     EDGE_TRIM,
@@ -3632,6 +3634,57 @@ def test_the_example_config_does_not_ship_a_live_web_port() -> None:
         "is fixed and you remap on the host, so a live value here can only "
         "move the server away from the port the image's healthcheck "
         "probes:\n" + "\n".join(offenders)
+    )
+
+
+def test_example_config_loads_and_its_directories_validate() -> None:
+    """
+    ``saneless.toml.example`` loads and passes the start-up directory checks.
+
+    It is the file an operator copies to start from, so it has to be a config
+    saneless accepts as it stands. ``consume_dir`` is the optional fallback and
+    names a real paperless-ngx directory only on the operator's machine, so the
+    example leaves it commented out rather than shipping a path that does not
+    exist.
+    """
+    settings = load_settings(str(TOML_EXAMPLE))
+
+    assert settings.paperless.consume_dir is None, (
+        f"{TOML_EXAMPLE.relative_to(REPO_ROOT)} sets consume_dir live"
+    )
+    validate_settings_dirs(settings)
+
+
+def _complete_example(text: str) -> str:
+    """Return the TOML fence under the configuration reference's Complete Example."""
+    _, heading, after = text.partition("## Complete Example")
+    assert heading, "the configuration reference has no Complete Example heading"
+    match = re.search(r"^```toml\n(?P<body>.*?)^```", after, re.MULTILINE | re.DOTALL)
+    assert match is not None, "the Complete Example has no TOML fence"
+    return match.group("body")
+
+
+def test_complete_example_loads_and_names_every_output_key(tmp_path: Path) -> None:
+    """
+    The configuration reference's Complete Example loads and names every key.
+
+    A reader copies it as a whole. It has to be a file saneless accepts, and a
+    key missing from ``[output]`` is a setting the reader never learns exists.
+    """
+    body = _complete_example(CONFIG_REFERENCE.read_text(encoding="utf-8"))
+    config = tmp_path / CONFIG_NAME
+    config.write_text(body, encoding="utf-8")
+
+    load_settings(str(config))
+
+    missing = [
+        key
+        for key in OutputConfig.model_fields
+        if not re.search(rf"^#?\s*{key}\s*=", body, re.MULTILINE)
+    ]
+    assert not missing, (
+        f"{CONFIG_REFERENCE.relative_to(REPO_ROOT)}'s Complete Example does not "
+        f"name these [output] keys: {', '.join(missing)}"
     )
 
 

@@ -6,6 +6,7 @@ import errno
 import logging
 import os
 import pwd
+import re
 import stat
 import tempfile
 import time
@@ -13,7 +14,7 @@ import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, NamedTuple, TypedDict, Unpack
+from typing import IO, TYPE_CHECKING, Any, Final, NamedTuple, TypedDict, Unpack
 
 import pytest
 from click.testing import CliRunner
@@ -4864,6 +4865,83 @@ class TestRelativePaths:
         assert settings.output.data_dir == link_dir / "state"
 
 
+# The shipped files an operator copies a token stand-in out of.
+_STAND_IN_ROOT: Final = Path(__file__).resolve().parents[1]
+# ``token = "..."`` inside a fenced TOML block, commented out or not.
+_TOML_TOKEN_LINE: Final = re.compile(r'^\s*#?\s*token\s*=\s*"(?P<value>[^"]*)"')
+# ``SANELESS_PAPERLESS__TOKEN=...`` anywhere on a line, so the ``export ``,
+# ``- `` and ``#`` prefixes of shell, compose and commented forms all match;
+# the value may be quoted.
+_TOKEN_VARIABLE_VALUE: Final = re.compile(
+    r"""SANELESS_PAPERLESS__TOKEN=(?P<quote>["']?)(?P<value>[^"'\s`]*)(?P=quote)"""
+)
+# A Markdown table row naming the variable in its first cell.
+_TOKEN_VARIABLE_CELL: Final = "`SANELESS_PAPERLESS__TOKEN`"
+# The headings the reference tables give their example-value column.
+_EXAMPLE_COLUMN_HEADINGS: Final = frozenset({"example", "typical value"})
+_TABLE_SEPARATOR: Final = re.compile(r"^\|\s*:?-{3,}")
+
+
+def _table_cells(line: str) -> list[str]:
+    """Split a Markdown table row into its stripped cells."""
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _documented_token_stand_ins() -> list[tuple[str, str]]:
+    """
+    Collect every paperless-ngx token value the docs, README and compose show.
+
+    Three forms are read: ``token = "..."`` in a fenced TOML block of a doc
+    page or the README; ``SANELESS_PAPERLESS__TOKEN=...`` in any of those
+    files or in ``docker-compose.yml``; and the example column of a Markdown
+    table row whose first cell is the variable. Each value is returned with
+    ``file:line`` so a failure names where it is.
+
+    Returns:
+        ``(location, value)`` pairs, in file and line order.
+
+    """
+    pages = [
+        *sorted((_STAND_IN_ROOT / "docs").rglob("*.md")),
+        _STAND_IN_ROOT / "README.md",
+    ]
+    found: list[tuple[str, str]] = []
+    for page in [*pages, _STAND_IN_ROOT / "docker-compose.yml"]:
+        name = page.relative_to(_STAND_IN_ROOT)
+        fence: str | None = None
+        header: list[str] = []
+        previous = ""
+        for number, line in enumerate(page.read_text(encoding="utf-8").splitlines(), 1):
+            where = f"{name}:{number}"
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                fence = None if fence is not None else stripped[3:].strip().lower()
+                continue
+            if fence == "toml" and (match := _TOML_TOKEN_LINE.match(line)):
+                found.append((where, match.group("value")))
+            found.extend(
+                (where, match.group("value"))
+                for match in _TOKEN_VARIABLE_VALUE.finditer(line)
+            )
+            if _TABLE_SEPARATOR.match(stripped):
+                header = [cell.lower() for cell in _table_cells(previous)]
+            elif stripped.startswith("|"):
+                cells = _table_cells(stripped)
+                if cells[0] == _TOKEN_VARIABLE_CELL:
+                    column = next(
+                        (
+                            index
+                            for index, heading in enumerate(header)
+                            if heading in _EXAMPLE_COLUMN_HEADINGS
+                        ),
+                        None,
+                    )
+                    assert column is not None, f"{where}: no example column"
+                    found.append((where, cells[column].strip("`")))
+            previous = stripped
+    return found
+
+
 class TestPlaceholderToken:
     """
     ``is_placeholder_token`` is an exact-match predicate, not a heuristic (D-14).
@@ -4938,6 +5016,30 @@ class TestPlaceholderToken:
         shipped = example["paperless"]["token"]
         assert shipped in PLACEHOLDER_TOKENS
         assert is_placeholder_token(shipped) is True
+
+    def test_every_documented_token_stand_in_is_a_placeholder(self) -> None:
+        """
+        Every token value the docs, README and compose file show is a stand-in.
+
+        An operator copies these verbatim. A value the predicate does not
+        recognise is taken for a real token, so the appliance tries to upload
+        with it and reports an authentication failure instead of saying the
+        token was never set. The count floor keeps the collector honest: a
+        pattern that stopped matching would otherwise pass on nothing.
+        """
+        found = _documented_token_stand_ins()
+        assert len(found) >= 12, (
+            f"the collector found only {len(found)} token values: {found}"
+        )
+        offenders = [
+            f"{where}: {value!r}"
+            for where, value in found
+            if not is_placeholder_token(value)
+        ]
+        assert not offenders, (
+            "documented token values that are not recognised placeholders; "
+            "use 'your-api-token-here':\n" + "\n".join(offenders)
+        )
 
     def test_predicate_is_annotated_to_take_a_plain_string(self) -> None:
         """
