@@ -65,6 +65,30 @@ _EMPTY_SLUG_FALLBACK = "source"
 # accepted trade.
 _PLATEN_DEVICE_TYPES: Final = ("flatbed", "all-in-one", "multi-function")
 
+# The mode a generated profile asks for when the device reported no modes at
+# all -- the conventional SANE name, which is what every profile used before
+# modes were ranked.
+_FALLBACK_MODE: Final = "Color"
+
+# Words that mark a scan mode as colour, and as gray, when found in a mode name.
+# Matched case-insensitively, as whole names first and then as substrings,
+# because backends decorate them ("24bit Color", "True Gray") and some use the
+# British spelling.
+_COLOUR_WORDS: Final = ("color", "colour")
+_GRAY_WORDS: Final = ("gray", "grey")
+
+# Words that mark a mode as a degraded rendering of its colour or gray family --
+# one or two bits per pixel, a dither, or an inverted image. A mode naming one
+# of these is chosen only when nothing cleaner in the same family exists.
+_DEGRADED_MODE_WORDS: Final = (
+    "lineart",
+    "halftone",
+    "negative",
+    "dither",
+    "binary",
+    "diffusion",
+)
+
 
 def _slugify(source: str) -> str:
     """
@@ -195,25 +219,61 @@ def pick_closest_resolution(
     return target
 
 
-def pick_preferred_mode(
-    modes: list[str],
-    preferred: str = "Color",
-) -> str:
+def _first_mode_containing(modes: Sequence[str], words: tuple[str, ...]) -> str | None:
     """
-    Pick preferred scan mode, falling back to first available.
+    Pick the cleanest mode whose name contains one of the given words.
 
     Args:
-        modes: Available scan modes from scanner.
-        preferred: Preferred mode name (defaults to "Color").
+        modes: Available scan modes, in the order the device reported them.
+        words: Lowercase words marking the family wanted (colour or gray).
 
     Returns:
-        The matched mode string, or first available, or preferred if empty.
+        The first mode in the family that names no degraded rendering, else the
+        first mode in the family at all, else None when the family is absent.
+
+    """
+    family = [m for m in modes if any(w in m.casefold() for w in words)]
+    for mode in family:
+        if not any(w in mode.casefold() for w in _DEGRADED_MODE_WORDS):
+            return mode
+    return family[0] if family else None
+
+
+def pick_preferred_mode(modes: list[str]) -> str:
+    """
+    Pick the scan mode a person would choose, ranked by what each mode means.
+
+    SANE backends do not agree on how to spell colour: brother4 offers
+    ``24bit Color``, some drivers say ``Colour``, and the SANE standard names
+    include ``Color Lineart``. A backend's first entry is usually its
+    black-and-white mode, so matching only the exact word ``Color`` and falling
+    back to the first entry handed colour scanners black-and-white profiles.
+
+    The tiers, each scanning the modes in the order the device reported them
+    and matching case-insensitively:
+
+    1. A mode whose whole name is a colour word (``Color``, ``Colour``).
+    2. A mode containing a colour word, preferring one that names no degraded
+       rendering (lineart, halftone, negative, dither, binary, diffusion).
+    3. The same rule for gray (``Gray``, ``Grey``), so a device without colour
+       still scans in gray rather than in dithered black-and-white.
+    4. The first mode the device reported.
+
+    Args:
+        modes: Available scan modes from the scanner.
+
+    Returns:
+        The chosen mode, or ``_FALLBACK_MODE`` when the device reported none.
 
     """
     for mode in modes:
-        if mode.lower() == preferred.lower():
+        if mode.casefold() in _COLOUR_WORDS:
             return mode
-    return modes[0] if modes else preferred
+    for words in (_COLOUR_WORDS, _GRAY_WORDS):
+        chosen = _first_mode_containing(modes, words)
+        if chosen is not None:
+            return chosen
+    return modes[0] if modes else _FALLBACK_MODE
 
 
 def is_bare_default(settings: Settings) -> bool:
@@ -558,7 +618,7 @@ def generate_profiles(
         target=DEFAULT_RESOLUTION,
         resolution_range=capabilities.resolution_range,
     )
-    mode = pick_preferred_mode(capabilities.modes, preferred="Color")
+    mode = pick_preferred_mode(capabilities.modes)
     # Two independent witnesses to one fact, OR-ed rather than ranked: a named
     # Flatbed source, or a declared device type that has a glass. Either alone
     # is enough, because each covers the other's blind spot -- a backend can
