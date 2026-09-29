@@ -1056,6 +1056,90 @@ log_level = "TRACE"
         assert len(lines) == 2
 
 
+_PROFILE_VALID_KEYS = ", ".join(
+    field.alias or name for name, field in ProfileConfig.model_fields.items()
+)
+"""A profile table's valid keys, as the unknown-key line lists them."""
+
+_WRITE_AS_TITLE = (
+    "unknown key 'default_title' in [profiles.default] (write it as 'title'); "
+    f"valid keys: {_PROFILE_VALID_KEYS}"
+)
+"""The environment form of the ``default_title`` refusal, after the name."""
+
+
+class TestTitleSpelling:
+    """
+    A profile's title key has one spelling: ``title``.
+
+    ``default_title`` is the field's name in code, not a config key. It used
+    to be accepted as a second spelling, so a table holding both loaded one
+    of them without a word about the other.
+    """
+
+    def test_default_title_alone_says_to_write_title(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``default_title`` on its own is refused with the key to write."""
+        err = _load_error(
+            tmp_config_dir / "default_title.toml",
+            '[profiles.default]\ndefault_title = "x"\n',
+        )
+        assert _error_lines(err)[1:] == [
+            "  [profiles.default] unknown key 'default_title' "
+            f"(write it as 'title'); valid keys: {_PROFILE_VALID_KEYS}"
+        ]
+        assert "default_title" not in _PROFILE_VALID_KEYS.split(", ")
+
+    def test_default_title_beside_title_is_refused_the_same_way(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """Both spellings in one table never silently pick one."""
+        err = _load_error(
+            tmp_config_dir / "both_titles.toml",
+            '[profiles.default]\ntitle = "a"\ndefault_title = "b"\n',
+        )
+        assert _error_lines(err)[1:] == [
+            "  [profiles.default] unknown key 'default_title' "
+            f"(write it as 'title'); valid keys: {_PROFILE_VALID_KEYS}"
+        ]
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_default_title_variable_says_to_write_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The environment form names the variable and the same fix."""
+        variable = "SANELESS_PROFILES__DEFAULT__DEFAULT_TITLE"
+        monkeypatch.setenv(variable, "x")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert _env_line(exc_info.value, variable) == (
+            f"  environment variable {variable!r}: {_WRITE_AS_TITLE}"
+        )
+
+    def test_title_alone_loads_into_the_title_field(self, tmp_config_dir: Path) -> None:
+        """``title`` is the spelling that loads."""
+        config_file = tmp_config_dir / "title_only.toml"
+        config_file.write_text('[profiles.default]\ntitle = "a"\n')
+        profile = load_settings(config_path=str(config_file)).profiles["default"]
+        assert profile.default_title == "a"
+
+    def test_a_typo_near_default_title_suggests_title(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A near miss of the field's code name is pointed at ``title``."""
+        err = _load_error(
+            tmp_config_dir / "default_titel.toml",
+            '[profiles.default]\ndefault_titel = "x"\n',
+        )
+        (line,) = _error_lines(err)[1:]
+        assert "'default_title'" not in line
+        assert line.startswith(
+            "  [profiles.default] unknown key 'default_titel' "
+            "(did you mean 'title'?); valid keys: "
+        )
+
+
 class TestTomlKeyCaseContract:
     """
     TOML section and key names are matched byte-exactly (DEP-02, DEP-03, D-06).
