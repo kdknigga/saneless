@@ -799,8 +799,11 @@ class ProfileConfig(BaseModel):
 
     # extra="forbid" is safe alongside the legacy-duplex
     # before-validator: it only ever adds ``duplex``, which is a real field.
-    # populate_by_name keeps both ``title`` and ``default_title`` accepted.
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    # The title key is spelled ``title``, its alias. ``default_title`` is the
+    # field's name in code, not a config key, so it is not accepted by name:
+    # a table holding both spellings would otherwise load one of them
+    # without a word about the other.
+    model_config = ConfigDict(extra="forbid")
 
     # The profile's human name and the sentence beneath it in the dropdown.
     # Declared first so a human opening the file reads the human name before
@@ -1569,6 +1572,11 @@ def _describe_unknown_key(
     """
     Describe an unknown key inside a section or profile table.
 
+    A key that is the code name of a field with a different config spelling
+    (``default_title``, spelled ``title``) is told which key to write. A
+    close-match suggestion is always given in its config spelling too, and
+    never suggests the unknown key back to itself.
+
     Args:
         label: The section label, e.g. ``paperless`` or ``profiles.default``.
         key: The unknown key.
@@ -1587,10 +1595,18 @@ def _describe_unknown_key(
     owner = _section_owning(key, exclude=model)
     if owner is not None:
         return f"{subject}; it belongs in [{owner}]"
-    hint = difflib.get_close_matches(key, _match_candidates(model), n=1)
-    did_you_mean = f" (did you mean {hint[0]!r}?)" if hint else ""
+    spelled = {name: field.alias for name, field in model.model_fields.items()}
+    alias = spelled.get(key)
+    if alias is not None and alias != key:
+        hint_text = f" (write it as {alias!r})"
+    else:
+        candidates = [name for name in _match_candidates(model) if name != key]
+        hint = difflib.get_close_matches(key, candidates, n=1)
+        hint_text = (
+            f" (did you mean {(spelled.get(hint[0]) or hint[0])!r}?)" if hint else ""
+        )
     valid = ", ".join(_valid_keys(model))
-    return f"{subject}{did_you_mean}; valid keys: {valid}"
+    return f"{subject}{hint_text}; valid keys: {valid}"
 
 
 def _describe_unknown_top_level(name: str) -> str:
