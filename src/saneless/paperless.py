@@ -16,6 +16,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import traceback
@@ -1360,7 +1361,9 @@ class PaperlessClient:
                 or answers with a redirect (``Paperless redirected the upload
                 (<status> <reason>) to <location>; check paperless.url``);
                 if the send budget is spent and no consume directory is
-                configured (``could not connect for <N>s``); if the transport
+                configured (``could not connect for <N>s``, or ``could not
+                deliver the upload for <N>s`` when the last failure came after
+                connecting); if the transport
                 refuses to send a request built from a sendable URL and token
                 (fixed text, no cause, nothing retried or copied); if any
                 other httpx2 error occurs; if the PDF cannot be read; or if
@@ -1659,8 +1662,18 @@ class PaperlessClient:
         """
         if self._consume_dir is not None:
             return self._fall_back_to_consume_dir(pdf_path, self._consume_dir)
+        # Named by the last failure: a refused or timed-out connection never
+        # connected, but a stalled body write did connect, and no free pooled
+        # connection is not a connect failure either.
+        failed = (
+            "could not connect"
+            if isinstance(
+                exc, httpx2.ConnectError | httpx2.ConnectTimeout | httpx2.ProxyError
+            )
+            else "could not deliver the upload"
+        )
         msg = (
-            f"Upload to Paperless{self._at_url} could not connect for "
+            f"Upload to Paperless{self._at_url} {failed} for "
             f"{self._send_budget:.0f}s: {self._reason(exc)}"
         )
         raise PaperlessError(msg) from self._cause(exc)
@@ -1713,14 +1726,28 @@ class PaperlessClient:
             A FolderDelivery naming the file the PDF was copied to.
 
         Raises:
-            PaperlessError: If the directory does not exist (or is not a
-                directory), or, chained to the OSError, if the copy fails.
+            PaperlessError: If the directory does not exist, is not a
+                directory, or cannot be examined -- each worded for its own
+                cause -- or, chained to the OSError, if the copy fails.
 
         """
-        if not dest_dir.is_dir():
+        try:
+            mode = dest_dir.stat().st_mode
+        except FileNotFoundError, NotADirectoryError:
             msg = (
                 f"consume directory {dest_dir} does not exist — "
                 "is the paperless-ngx volume mounted?"
+            )
+            raise PaperlessError(msg) from None
+        except OSError as exc:
+            # Permission refused on the path, or an I/O error: the directory
+            # may well exist, so "not mounted" would be the wrong lead.
+            msg = f"consume directory {dest_dir} cannot be read: {describe(exc)}"
+            raise PaperlessError(msg) from exc
+        if not stat.S_ISDIR(mode):
+            msg = (
+                f"consume directory {dest_dir} is not a directory; set "
+                "paperless.consume_dir to the folder paperless-ngx consumes from"
             )
             raise PaperlessError(msg)
         dest = dest_dir / pdf_path.name

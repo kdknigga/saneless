@@ -246,7 +246,9 @@ The line starts with `Paperless error:`.
   tunnel, or sending the file times out. If that goes on for the whole time and a consume
   directory is configured, the PDF is saved there instead and the scan exits 6, not 3 -- see
   [Saved to the consume folder](#saved-to-the-consume-folder-exit-6). Without one, the scan
-  fails, and the line says it could not connect for 60s. An upload that failed after the whole
+  fails, and the line says it could not connect for 60s -- or could not deliver the upload for
+  60s, when the last attempt had connected and then stalled sending the file, or found no free
+  connection. An upload that failed after the whole
   file was sent, or that got a 5xx, is not this case and is never sent again: it is
   [exit 9](#the-document-may-already-be-in-paperless-ngx-exit-9). That includes a paperless-ngx
   restart behind a reverse proxy: the proxy answers `502` or `503` while paperless-ngx is down,
@@ -314,7 +316,10 @@ The line starts with `Paperless error:`.
   paperless-ngx volume mounted?`. The upload could not get through, and the fallback found no
   directory at `consume_dir`. saneless never creates it, because a directory made where the mount
   should be is one paperless-ngx never looks at. Mount paperless-ngx's consume volume there, or
-  correct `consume_dir`, and import the kept PDF.
+  correct `consume_dir`, and import the kept PDF. Two nearby lines name other causes: `consume
+  directory <dir> is not a directory` means a file is in its place, and `consume directory <dir>
+  cannot be read: ...` means saneless could not examine the path -- usually a permission on it or
+  a parent -- so the folder may well be there.
 - **A duplicate is not a failure.** When paperless-ngx refuses the upload as a duplicate of a
   document it already holds, the scan ends **Uploaded with a warning** (exit 7), not here; see
   [Uploaded with a warning](#uploaded-with-a-warning-exit-7).

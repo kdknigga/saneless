@@ -519,6 +519,17 @@ _BEFORE_SEND_CASES = [
     pytest.param(httpx2.WriteTimeout, id="write-timeout"),
 ]
 
+# What the spent budget's message says each of those failed to do.  Only a
+# connection that was never made "could not connect"; a stalled body write had
+# connected, and a pool with no free connection never tried.
+_BUDGET_SPENT_WORDING: dict[type[httpx2.TransportError], str] = {
+    httpx2.ConnectError: "could not connect",
+    httpx2.ConnectTimeout: "could not connect",
+    httpx2.PoolTimeout: "could not deliver the upload",
+    httpx2.ProxyError: "could not connect",
+    httpx2.WriteTimeout: "could not deliver the upload",
+}
+
 # Errors after which paperless-ngx may hold the document.
 _AFTER_SEND_TRANSPORT_CASES = [
     pytest.param(httpx2.ReadTimeout, id="read-timeout"),
@@ -1013,8 +1024,8 @@ class TestUploadFailureTranslation:
         finally:
             client.close()
         assert str(exc_info.value) == (
-            "Upload to Paperless at http://paperless:8000 could not connect for "
-            "60s: upstream went away"
+            f"Upload to Paperless at http://paperless:8000 "
+            f"{_BUDGET_SPENT_WORDING[exc_type]} for 60s: upstream went away"
         )
         assert type(exc_info.value) is PaperlessError
         assert exc_info.value.__cause__ is failure
@@ -4579,10 +4590,15 @@ class TestConsumeDir:
         assert not (tmp_path / "missing").exists()
         assert sorted(entry.name for entry in tmp_path.iterdir()) == before
 
-    def test_consume_dir_missing_when_a_file_is_in_its_place(
+    def test_consume_dir_is_a_file_says_so(
         self, sample_pdf: Path, tmp_path: Path
     ) -> None:
-        """A regular file where the directory should be is not a directory."""
+        """
+        A regular file where the directory should be is not a directory.
+
+        Reported as "does not exist -- is the volume mounted?" it would send
+        the operator after a mount that is fine.
+        """
         consume_dir = tmp_path / "consume"
         consume_dir.write_bytes(b"occupied")
 
@@ -4600,9 +4616,46 @@ class TestConsumeDir:
             client.close()
 
         message = str(exc_info.value)
-        assert "does not exist" in message
-        assert "is the paperless-ngx volume mounted?" in message
+        assert message == (
+            f"consume directory {consume_dir} is not a directory; set "
+            "paperless.consume_dir to the folder paperless-ngx consumes from"
+        )
         assert consume_dir.read_bytes() == b"occupied"
+
+    def test_consume_dir_that_cannot_be_examined_says_so(
+        self, sample_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A permission refusal is not "does not exist": the folder may be there."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        # The concrete class, read from an instance: the annotations' Path is
+        # imported for type checking only.
+        path_class = type(consume_dir)
+        real_stat = path_class.stat
+
+        def _refused(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path == consume_dir:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_stat(path, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(path_class, "stat", _refused)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            consume_dir=consume_dir,
+            transport=_make_transport(_always_refused),
+            timing=PaperlessTiming(send_budget=0.0),
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Refused")
+        finally:
+            client.close()
+
+        message = str(exc_info.value)
+        assert message.startswith(f"consume directory {consume_dir} cannot be read: ")
+        assert "Permission denied" in message
+        assert "does not exist" not in message
 
     def test_staging_leaves_a_symlink_at_the_old_name_untouched(
         self, sample_pdf: Path, tmp_path: Path
