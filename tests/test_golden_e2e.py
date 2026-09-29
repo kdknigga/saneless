@@ -99,7 +99,10 @@ _EXPECTED_FIELD_NAMES = sorted(["title", "correspondent", "tags", "tags", "docum
 
 # Two scanning profiles plus the "default" the settings require.  A profile set
 # of exactly one untouched "default" would make the worker generate profiles
-# from the scanner at startup and swap them in under the test.
+# from the scanner at startup and swap them in under the test.  ``default``
+# scans as the simplex profile does: it is the one ``saneless scan`` uses when
+# no ``--profile`` is named, and the one the web page opens on.
+_DEFAULT = "default"
 _SIMPLEX = "golden-simplex"
 _DUPLEX = "golden-duplex"
 
@@ -177,6 +180,15 @@ _SIMPLEX_RUN = _Scenario(
     document_order=(0, 1, 2),
     warning=None,
 )
+# The same simplex scan under ``default``, the profile no one has to name.
+_DEFAULT_RUN = _Scenario(
+    label="default",
+    profile=_DEFAULT,
+    passes=((0, 1, 2),),
+    rejected=(),
+    document_order=(0, 1, 2),
+    warning=None,
+)
 # Fronts first; then the operator flips the stack face-down, so the last
 # front's back feeds first.  Document order is the interleave, 0 through 5.
 _DUPLEX_RUN = _Scenario(
@@ -224,20 +236,24 @@ def _settings(
 
     Args:
         tmp_path: pytest's per-test directory.
-        profile_metadata: Give both scanning profiles the golden tags and
-            correspondent.  The command line has no tag or correspondent
-            option, so the CLI takes them from here; the web scan leaves the
-            profiles bare, so only the form can supply them.
+        profile_metadata: Give ``default`` and both scanning profiles the
+            golden tags and correspondent.  The command line has no tag or
+            correspondent option, so the CLI takes them from here; the web
+            scan leaves the profiles bare, so only the form can supply them.
         consume_dir: The paperless-ngx consume folder, if the run has one.
 
     Returns:
-        Settings with a simplex profile and a manual-duplex feeder profile.
+        Settings with a simplex profile, a manual-duplex feeder profile, and a
+        ``default`` that scans as the simplex one does.
 
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     metadata: dict[str, object] = (
-        {"default_tags": [3, 7], "default_correspondent": 12}
+        {
+            "default_tags": list(GOLDEN_TAG_IDS),
+            "default_correspondent": GOLDEN_CORRESPONDENT_IDS[0],
+        }
         if profile_metadata
         else {}
     )
@@ -254,11 +270,13 @@ def _settings(
             log_file=str(tmp_path / "logs" / "saneless.log"),
         ),
         profiles={
-            "default": ProfileConfig(),
             _SIMPLEX: ProfileConfig.model_validate({"source": "Flatbed", **metadata}),
             _DUPLEX: ProfileConfig.model_validate(
                 {"source": "ADF", "duplex": "manual", **metadata}
             ),
+            # Listed last, so a page that opened on its first option would
+            # submit the simplex profile rather than this one.
+            _DEFAULT: ProfileConfig.model_validate({"source": "Flatbed", **metadata}),
         },
     )
 
@@ -697,6 +715,9 @@ def _run_cli(
     """
     Run ``saneless scan --title "Quarterly Report"`` against the golden fakes.
 
+    The scenario's profile is named with ``--profile``, except ``default``:
+    a scenario on ``default`` names none, which is how the command reaches it.
+
     Only what a test cannot have is replaced: the configuration file, the
     logging setup, the python-sane import check, the scanner hardware and
     paperless-ngx.  The command, the pipeline and the client are the real ones.
@@ -749,7 +770,8 @@ def _run_cli(
     monkeypatch.setattr("saneless.cli.require_sane", require_sane)
     monkeypatch.setattr("saneless.cli.SaneBackend", sane_backend)
     monkeypatch.setattr("saneless.cli.PaperlessClient", cli_client_builder(recorder))
-    args = ["scan", "--profile", scenario.profile, "--title", _TITLE]
+    named = [] if scenario.profile == _DEFAULT else ["--profile", scenario.profile]
+    args = ["scan", *named, "--title", _TITLE]
     typed: str | None = None
     if scenario.flips:
         # "y" on stdin is the operator confirming the stack is flipped.
@@ -1293,9 +1315,9 @@ def _untouched_web_upload(
     """
     Scan once through the web app, submitting the form exactly as it opened.
 
-    The simplex profile, with the golden defaults, is the first profile, so it
-    is the one the page opens on.  Only the title is typed; the profile, the
-    ticked tags and the chosen correspondent are read from the rendered page.
+    The page opens on ``default``, which carries the golden defaults though it
+    is not the only profile.  Only the title is typed; the profile, the ticked
+    tags and the chosen correspondent are read from the rendered page.
 
     Args:
         tmp_path: The directory this run keeps its files under.
@@ -1307,11 +1329,7 @@ def _untouched_web_upload(
     """
     recorder = RecordingPaperless()
     settings = _settings(tmp_path, profile_metadata=True)
-    opening = {_SIMPLEX: settings.profiles[_SIMPLEX]}
-    settings = settings.model_copy(
-        update={"profiles": opening | settings.profiles}, deep=True
-    )
-    scanner = DistinctPageScanner(passes=_SIMPLEX_RUN.passes, rejected=())
+    scanner = DistinctPageScanner(passes=_DEFAULT_RUN.passes, rejected=())
     monkeypatch.setattr(
         "saneless.web.app.PaperlessClient", web_client_builder(recorder)
     )
@@ -1340,18 +1358,20 @@ def test_twin_metadata_untouched_form_matches_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    The form as it opens sends what ``saneless scan --profile`` sends.
+    The form as it opens sends what ``saneless scan`` with no profile sends.
 
-    The profile's ``default_tags`` and ``default_correspondent`` reach the
-    web upload only if the page renders them ticked and selected; the command
-    line takes them from the profile.  Everything but the document itself is
-    the same, part for part.
+    Both reach ``default`` without anyone naming it: the page by opening on
+    it, the command line by using it when no ``--profile`` is given.  Its
+    ``default_tags`` and ``default_correspondent`` reach the web upload only
+    if the page renders them ticked and selected; the command line takes them
+    from the profile.  Everything but the document itself is the same, part
+    for part.
     """
     web, form = _untouched_web_upload(tmp_path / "web", monkeypatch)
-    cli_run = _run_cli(tmp_path / "cli", monkeypatch, _SIMPLEX_RUN)
+    cli_run = _run_cli(tmp_path / "cli", monkeypatch, _DEFAULT_RUN)
 
     assert cli_run.result.exit_code == 0, cli_run.result.output
-    assert form["profile"] == _SIMPLEX
+    assert form["profile"] == _DEFAULT
     assert len(web.uploads()) == 1
     assert len(cli_run.recorder.uploads()) == 1
     web_fields = Counter(

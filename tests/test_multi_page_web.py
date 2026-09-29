@@ -74,7 +74,8 @@ if TYPE_CHECKING:
 # the process: nothing reaches the network.
 pytestmark = pytest.mark.usefixtures("offline_paperless")
 
-# The flatbed is the default profile, which every configuration must have.
+# The flatbed is the default profile, which every configuration must have and
+# the page opens on.
 FLATBED = "default"
 FEEDER = "feeder"
 DUPLEX = "duplex"
@@ -126,20 +127,21 @@ class _Served:
         return store
 
 
-def _profiles(*, duplex_first: bool = False) -> dict[str, ProfileConfig]:
+def _profiles(*, duplex_opens: bool = False) -> dict[str, ProfileConfig]:
     """
     Return a flatbed, a feeder and a manual-duplex profile.
 
-    The flatbed makes the device read as having a glass, so the select keeps
-    configuration order and ``duplex_first`` decides which profile the page
-    opens on.
+    The page opens on ``default``, wherever it is listed, so ``duplex_opens``
+    decides which of the flatbed and the manual-duplex profile carries that
+    name.  The other one keeps a name of its own, and the feeder is the same
+    either way.
     """
-    others = {
-        FLATBED: ProfileConfig(),
-        FEEDER: ProfileConfig(source="ADF"),
-    }
-    duplex = {DUPLEX: ProfileConfig(source="ADF Front", duplex="manual")}
-    return {**duplex, **others} if duplex_first else {**others, **duplex}
+    flatbed = ProfileConfig()
+    feeder = ProfileConfig(source="ADF")
+    duplex = ProfileConfig(source="ADF Front", duplex="manual")
+    if duplex_opens:
+        return {"glass": flatbed, FEEDER: feeder, "default": duplex}
+    return {FLATBED: flatbed, FEEDER: feeder, DUPLEX: duplex}
 
 
 def _serve(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Served]:
@@ -157,16 +159,16 @@ def _serve(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Ser
 def served(
     make_settings: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[_Served]:
-    """Serve the three profiles, opening on the flatbed one."""
+    """Serve the three profiles, opening on the flatbed, which is ``default``."""
     yield from _serve(make_settings(profiles=_profiles()), monkeypatch)
 
 
 @pytest.fixture
-def duplex_first(
+def duplex_opens(
     make_settings: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[_Served]:
-    """Serve the three profiles, opening on the manual-duplex one."""
-    yield from _serve(make_settings(profiles=_profiles(duplex_first=True)), monkeypatch)
+    """Serve the three profiles, the manual-duplex one named ``default``."""
+    yield from _serve(make_settings(profiles=_profiles(duplex_opens=True)), monkeypatch)
 
 
 def _checkbox_tag(markup: str) -> str:
@@ -225,10 +227,12 @@ class TestTheFormCarriesTheCheckbox:
         assert description < field_at < title
 
     def test_a_page_opening_on_manual_duplex_disables_it_with_the_reason(
-        self, duplex_first: _Served
+        self, duplex_opens: _Served
     ) -> None:
         """The real ``disabled`` attribute, and the reason as visible text."""
-        page = duplex_first.client.get("/").text
+        page = duplex_opens.client.get("/").text
+
+        assert '<option value="default" selected>' in page
 
         attributes = _checkbox(page)
         assert "disabled" in attributes
