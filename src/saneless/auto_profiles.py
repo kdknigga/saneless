@@ -505,6 +505,46 @@ def _duplex(source: str) -> Literal["none", "hardware"]:
     return "none"
 
 
+# Whole lowercase words of a feeder source name that say which one side it
+# scans, mapped to that side. Wording only: this is never consulted for routing,
+# and ``classify_source`` remains the only rule that says what a source is.
+# Real backends spell these "ADF Front" and "ADF Back" (fujitsu, canon_dr,
+# kodak, epjitsu, avision, epsonds); none spells "Rear".
+_FEEDER_SIDE_WORDS: Final[dict[str, Literal["front", "back"]]] = {
+    "front": "front",
+    "back": "back",
+}
+
+
+def _feeder_side(source: str) -> Literal["front", "back"] | None:
+    """
+    Name the one side a single-sided feeder source scans, for its wording only.
+
+    Reached only from the ``SourceKind.FEEDER`` arm of ``_profile_label`` and
+    ``_profile_description``, after ``classify_source`` has already decided the
+    source is a feeder, so it refines the words a feeder is described with and
+    never which path a scan takes. A name without a feeder word ("Card Front")
+    therefore never gets here.
+
+    A side counts only when it is a whole word of the name, so "Backlit" names
+    no side. A name that names both sides, or neither, gets None and keeps the
+    plain single-sided wording.
+
+    Args:
+        source: A SANE source name that classifies as ``SourceKind.FEEDER``.
+
+    Returns:
+        ``"front"`` or ``"back"`` -- a constant, never text from the name -- or
+        None when the name does not name exactly one side.
+
+    """
+    words = set(re.findall(r"[a-z]+", source.lower()))
+    sides = {side for word, side in _FEEDER_SIDE_WORDS.items() if word in words}
+    if len(sides) != 1:
+        return None
+    return sides.pop()
+
+
 def _profile_label(source: str) -> str:
     """
     Return the short human name a generated profile carries.
@@ -513,7 +553,12 @@ def _profile_label(source: str) -> str:
     the one classification rule reports -- so there is no new probe of the
     device and no new config key to fill in. The three feeder and glass forms
     have fixed, agreed wording; ``Auto`` and an unrecognised name get their own
-    so that no profile is ever offered under a blank name.
+    so that no profile is ever offered under a blank name. A single-sided
+    feeder whose name says which one side it scans reads as that side, which
+    ``_feeder_side`` decides inside the feeder arm only, after classification.
+
+    The label is the base text for the source alone. ``generate_profiles``
+    appends an ordinal when two sources of a set share it.
 
     Every returned string is a developer-authored constant. The SANE source
     name is never interpolated into it, so a vendor-chosen source string
@@ -534,7 +579,13 @@ def _profile_label(source: str) -> str:
     kind = classify_source(source)
     match kind:
         case SourceKind.FEEDER:
-            label = "Feeder, single-sided"
+            match _feeder_side(source):
+                case "front":
+                    label = "Feeder, front side only"
+                case "back":
+                    label = "Feeder, back side only"
+                case None:
+                    label = "Feeder, single-sided"
         case SourceKind.FEEDER_DUPLEX:
             label = "Feeder, double-sided"
         case SourceKind.FLATBED:
@@ -548,17 +599,28 @@ def _profile_label(source: str) -> str:
     return label
 
 
-def _profile_description(source: str) -> str:
+def _profile_description(
+    source: str, *, auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
+) -> str:
     """
     Return the one-sentence explanation a generated profile carries.
 
     The sentence beneath the profile dropdown. Like ``_profile_label`` it is
-    derived from the ``SourceKind`` alone: no new probe, no new config key, and
-    the SANE source name is never interpolated into the result, so every string
-    here is a developer-authored constant.
+    derived from the ``SourceKind``, refined for a feeder by the side
+    ``_feeder_side`` reads: no new probe, no new config key, and the SANE
+    source name is never interpolated into the result, so every string here is
+    a developer-authored constant.
+
+    An ``Auto`` source is the exception to "the kind alone": what it does
+    depends on how it is routed, so its sentence follows ``auto_source_mode``.
+    Routed as a feeder on a platen-less device it takes every page loaded;
+    routed as a single page it takes one, from wherever the scanner chooses.
 
     Args:
         source: The SANE source name the profile will carry.
+        auto_source_mode: How the profile routes an ``Auto`` source, as
+            ``_auto_source_mode`` decided it. Read only for an ``Auto``
+            source. Keyword-only, so it cannot be confused with the source.
 
     Returns:
         One plain sentence, within ``PROFILE_DESCRIPTION_MAX_LENGTH``.
@@ -571,13 +633,30 @@ def _profile_description(source: str) -> str:
     kind = classify_source(source)
     match kind:
         case SourceKind.FEEDER:
-            description = "Scans one side of every page using the document feeder."
+            match _feeder_side(source):
+                case "front":
+                    description = (
+                        "Scans only the front of every page using the document feeder."
+                    )
+                case "back":
+                    description = (
+                        "Scans only the back of every page using the document feeder."
+                    )
+                case None:
+                    description = (
+                        "Scans one side of every page using the document feeder."
+                    )
         case SourceKind.FEEDER_DUPLEX:
             description = "Scans both sides of every page using the document feeder."
         case SourceKind.FLATBED:
             description = "Scans one page at a time from the glass."
+        case SourceKind.AUTO if auto_source_mode == "adf":
+            description = (
+                "Scans every page in the document feeder; "
+                "the scanner decides how it feeds them."
+            )
         case SourceKind.AUTO:
-            description = "Lets the scanner choose where the page comes from."
+            description = "Scans one page; the scanner picks the glass or the feeder."
         case SourceKind.UNKNOWN:
             description = "Uses the scanner source this profile names."
         case _:
@@ -602,6 +681,12 @@ def generate_profiles(
     reporting success and exiting 0 over an unusable installation. A flatbed
     backs it when the device has one; on a sheet-fed scanner the device's own
     first reported source does, which is the only honest candidate available.
+    The default is a copy of the profile generated for that source, so the two
+    compare equal as whole models.
+
+    Labels are unique within the set: a source whose label another source
+    already holds gets an ordinal, so "Feeder, single-sided" is followed by
+    "Feeder, single-sided 2".
 
     Every question this function asks about a source name is answered by
     ``classify_source``. It previously carried three rules of its own -- an
@@ -662,38 +747,47 @@ def generate_profiles(
     if default_source is not None:
         claimed["default"] = default_source
 
+    # How many profiles so far carry each base label. The first holder of a
+    # label keeps it and the n-th reads "<label> n", so no two options in the
+    # dropdown share a name -- brother4 reports two feeders that name no side,
+    # epson2 two sources the classifier does not recognise. The ordinal is an
+    # int appended to a constant, so no text from the source name gets in.
+    # The walk follows ``capabilities.sources`` order, like the slug tie-break,
+    # so the numbering follows the device's own ordering. Only the label
+    # takes the ordinal: the description stays the base sentence, which is
+    # true of every holder, and it is the dropdown text that must differ.
+    holders: dict[str, int] = {}
+    default_slug: str | None = None
     for source in capabilities.sources:
         slug = _claim_slug(source, claimed)
+        if default_slug is None and source == default_source:
+            default_slug = slug
+        auto_source_mode = _auto_source_mode(source, has_platen=has_platen)
+        base_label = _profile_label(source)
+        holders[base_label] = holders.get(base_label, 0) + 1
+        ordinal = holders[base_label]
         profiles[slug] = ProfileConfig(
             source=source,
             resolution=resolution,
             mode=mode,
             auto_generated=True,
-            auto_source_mode=_auto_source_mode(source, has_platen=has_platen),
+            auto_source_mode=auto_source_mode,
             duplex=_duplex(source),
-            label=_profile_label(source),
-            description=_profile_description(source),
+            label=base_label if ordinal == 1 else f"{base_label} {ordinal}",
+            description=_profile_description(source, auto_source_mode=auto_source_mode),
         )
 
-    if default_source is not None:
-        profiles["default"] = ProfileConfig(
-            source=default_source,
-            resolution=resolution,
-            mode=mode,
-            auto_generated=True,
-            # Mirrors the loop rather than defaulting to "flatbed": a default
-            # backed by an Auto source on a platen-less device would otherwise
-            # route a whole stack as a single page, disagreeing with the very
-            # profile it was copied from.
-            auto_source_mode=_auto_source_mode(default_source, has_platen=has_platen),
-            # Mirrors the loop for the same reason: the default duplicates a
-            # source profile and must not claim a different duplex strategy.
-            duplex=_duplex(default_source),
-            # Mirrors the loop again: the human text describes the source, so
-            # the default must read the way the profile it copies reads.
-            label=_profile_label(default_source),
-            description=_profile_description(default_source),
-        )
+    if default_slug is not None:
+        # A copy of the profile it duplicates rather than a second build from
+        # the same inputs, so every field agrees by construction: an Auto
+        # source on a platen-less device keeps the stack routing of the profile
+        # it was copied from, the duplex strategy is the same, and the human
+        # text -- ordinal included, which the source name alone cannot
+        # reproduce -- reads the way that profile reads. A fresh default is
+        # therefore equal to its backing profile as a whole model, which is
+        # what lets the scan page recognise it as a twin. Deep, so that no
+        # mutable field is shared between the two entries.
+        profiles["default"] = profiles[default_slug].model_copy(deep=True)
 
     return profiles
 
@@ -893,11 +987,14 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
         # is what makes the prune rule -- an owned key a fresh generation does
         # not write is deleted from the table -- unreachable for these two, so a
         # free-text field a human reads can never be silently pruned by a
-        # refresh. Derived from the source rather than copied from the model, so
-        # a refresh also corrects a profile whose stored text no longer matches
-        # the source it carries.
-        "label": _profile_label(profile.source),
-        "description": _profile_description(profile.source),
+        # refresh. Copied from the model rather than derived from the source:
+        # a label's ordinal depends on the whole source set, which the source
+        # name alone cannot reproduce, so re-deriving here would write two
+        # feeders of a pair under one name. A refresh still corrects a table
+        # whose stored text no longer matches its source, because the profiles
+        # passed in come from a fresh generation.
+        "label": profile.label,
+        "description": profile.description,
         "source": profile.source,
         "resolution": profile.resolution,
         "mode": profile.mode,
@@ -1277,9 +1374,12 @@ def write_profiles_to_config(
     else:
         new_text = _render_checked(config_path, doc, original_text)
         target = replace_file_atomically(config_path, new_text)
-        if target != config_path.absolute():
+        if config_path.is_symlink():
             # The operator edits the link, the write lands on the target;
-            # naming both explains which file changed.
+            # naming both explains which file changed. Asked of the path
+            # itself: a regular file reached through a linked directory is
+            # the file written, and calling it a symlink would send the
+            # operator looking for a link that does not exist.
             logger.info("Wrote profiles to %s (symlink to %s)", config_path, target)
         if pinned is not None:
             # Logged once the file holds it; %r because the id is untrusted.
