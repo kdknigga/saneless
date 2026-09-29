@@ -2985,6 +2985,412 @@ class TestWebPort:
             load_settings(config_path=str(config_file))
 
 
+def _output_bound_line(
+    tmp_config_dir: Path, key: str, value: int, name: str
+) -> list[str]:
+    """
+    Load ``[output] <key> = <value>`` and return the rendered error lines.
+
+    Args:
+        tmp_config_dir: Where to write the TOML.
+        key: The ``[output]`` key to set.
+        value: The out-of-range value to give it.
+        name: The config file's stem.
+
+    Returns:
+        The load's ConfigError message, split into lines.
+
+    """
+    err = _load_error(
+        tmp_config_dir / f"{name}.toml",
+        f"[output]\n{key} = {value}\n\n[profiles.default]\n",
+    )
+    return _error_lines(err)
+
+
+class TestHistoryRetentionDays:
+    """
+    OutputConfig history_retention_days is bounded to 1..36,500.
+
+    The worker prunes finished jobs older than this many days.  Zero would
+    prune every finished job on the next pass, and a huge value overflows the
+    prune's date arithmetic on every pass.  About a century is how "keep
+    forever" is spelled.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1, 36_501])
+    def test_history_retention_days_out_of_range_rejected(self, value: int) -> None:
+        """Zero, a negative value and anything above about a century fail."""
+        with pytest.raises(ValidationError, match="history_retention_days"):
+            OutputConfig(history_retention_days=value)
+
+    @pytest.mark.parametrize("value", [1, 36_500])
+    def test_history_retention_days_bounds_accepted(self, value: int) -> None:
+        """One day and 36,500 days are the inclusive bounds."""
+        output = OutputConfig(history_retention_days=value)
+        assert output.history_retention_days == value
+
+    def test_history_retention_days_zero_in_toml_rejected(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A TOML ``history_retention_days = 0`` fails at load, naming the key."""
+        lines = _output_bound_line(
+            tmp_config_dir, "history_retention_days", 0, "retention_zero"
+        )
+        assert (
+            "  [output] history_retention_days: "
+            "Input should be greater than or equal to 1"
+        ) in lines
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_history_retention_days_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__HISTORY_RETENTION_DAYS`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__HISTORY_RETENTION_DAYS", "42")
+        assert load_settings().output.history_retention_days == 42
+
+
+class TestHistoryMaxRows:
+    """
+    OutputConfig history_max_rows is bounded to 1..1,000,000.
+
+    Zero would delete the whole job history on the next prune, and a value
+    past SQLite's integer range makes every prune raise.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1, 1_000_001])
+    def test_history_max_rows_out_of_range_rejected(self, value: int) -> None:
+        """Zero, a negative value and anything above a million fail."""
+        with pytest.raises(ValidationError, match="history_max_rows"):
+            OutputConfig(history_max_rows=value)
+
+    @pytest.mark.parametrize("value", [1, 1_000_000])
+    def test_history_max_rows_bounds_accepted(self, value: int) -> None:
+        """One row and a million rows are the inclusive bounds."""
+        assert OutputConfig(history_max_rows=value).history_max_rows == value
+
+    def test_history_max_rows_zero_in_toml_rejected(self, tmp_config_dir: Path) -> None:
+        """A TOML ``history_max_rows = 0`` fails at load, naming the key."""
+        lines = _output_bound_line(
+            tmp_config_dir, "history_max_rows", 0, "max_rows_zero"
+        )
+        assert (
+            "  [output] history_max_rows: Input should be greater than or equal to 1"
+        ) in lines
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_history_max_rows_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__HISTORY_MAX_ROWS`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__HISTORY_MAX_ROWS", "42")
+        assert load_settings().output.history_max_rows == 42
+
+
+class TestPaperlessTaskTimeout:
+    """
+    OutputConfig paperless_task_timeout is bounded to one second..one day.
+
+    Zero fails every accepted upload as unconfirmed the moment its first
+    poll comes back without a terminal status.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1, 86_401])
+    def test_paperless_task_timeout_out_of_range_rejected(self, value: int) -> None:
+        """Zero, a negative value and anything above a day fail."""
+        with pytest.raises(ValidationError, match="paperless_task_timeout"):
+            OutputConfig(paperless_task_timeout=value)
+
+    @pytest.mark.parametrize("value", [1, 86_400])
+    def test_paperless_task_timeout_bounds_accepted(self, value: int) -> None:
+        """One second and exactly one day are the inclusive bounds."""
+        output = OutputConfig(paperless_task_timeout=value)
+        assert output.paperless_task_timeout == value
+
+    def test_paperless_task_timeout_zero_in_toml_rejected(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A TOML ``paperless_task_timeout = 0`` fails at load, naming the key."""
+        lines = _output_bound_line(
+            tmp_config_dir, "paperless_task_timeout", 0, "task_timeout_zero"
+        )
+        assert (
+            "  [output] paperless_task_timeout: "
+            "Input should be greater than or equal to 1"
+        ) in lines
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_paperless_task_timeout_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__PAPERLESS_TASK_TIMEOUT`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__PAPERLESS_TASK_TIMEOUT", "42")
+        assert load_settings().output.paperless_task_timeout == 42
+
+
+class TestLogMaxBytesBound:
+    """
+    OutputConfig log_max_bytes is at least one byte.
+
+    Zero is the rotating handler's "never rotate", so the log file would grow
+    without bound; it is not a way to spell that here.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_log_max_bytes_out_of_range_rejected(self, value: int) -> None:
+        """Zero and a negative size fail."""
+        with pytest.raises(ValidationError, match="log_max_bytes"):
+            OutputConfig(log_max_bytes=value)
+
+    @pytest.mark.parametrize("value", [1])
+    def test_log_max_bytes_bounds_accepted(self, value: int) -> None:
+        """One byte is the inclusive floor."""
+        assert OutputConfig(log_max_bytes=value).log_max_bytes == value
+
+    def test_log_max_bytes_zero_in_toml_rejected(self, tmp_config_dir: Path) -> None:
+        """A TOML ``log_max_bytes = 0`` fails at load, naming the key."""
+        lines = _output_bound_line(tmp_config_dir, "log_max_bytes", 0, "max_bytes")
+        assert (
+            "  [output] log_max_bytes: Input should be greater than or equal to 1"
+        ) in lines
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_log_max_bytes_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__LOG_MAX_BYTES`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__LOG_MAX_BYTES", "42")
+        assert load_settings().output.log_max_bytes == 42
+
+
+class TestLogBackupCount:
+    """
+    OutputConfig log_backup_count is bounded to 1..1,000.
+
+    Zero keeps no backup at all, and a huge count makes every rollover walk
+    that many file names.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1, 1_001])
+    def test_log_backup_count_out_of_range_rejected(self, value: int) -> None:
+        """Zero, a negative count and anything above a thousand fail."""
+        with pytest.raises(ValidationError, match="log_backup_count"):
+            OutputConfig(log_backup_count=value)
+
+    @pytest.mark.parametrize("value", [1, 1_000])
+    def test_log_backup_count_bounds_accepted(self, value: int) -> None:
+        """One backup and a thousand backups are the inclusive bounds."""
+        assert OutputConfig(log_backup_count=value).log_backup_count == value
+
+    def test_log_backup_count_zero_in_toml_rejected(self, tmp_config_dir: Path) -> None:
+        """A TOML ``log_backup_count = 0`` fails at load, naming the key."""
+        lines = _output_bound_line(
+            tmp_config_dir, "log_backup_count", 0, "backup_count_zero"
+        )
+        assert (
+            "  [output] log_backup_count: Input should be greater than or equal to 1"
+        ) in lines
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_log_backup_count_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__LOG_BACKUP_COUNT`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__LOG_BACKUP_COUNT", "42")
+        assert load_settings().output.log_backup_count == 42
+
+
+class TestMinFreeSpaceMb:
+    """
+    OutputConfig min_free_space_mb is never negative.
+
+    Zero is a real setting (no reserve); a negative reserve means nothing.
+    """
+
+    @pytest.mark.parametrize("value", [-1])
+    def test_min_free_space_mb_out_of_range_rejected(self, value: int) -> None:
+        """A negative reserve fails."""
+        with pytest.raises(ValidationError, match="min_free_space_mb"):
+            OutputConfig(min_free_space_mb=value)
+
+    @pytest.mark.parametrize("value", [0])
+    def test_min_free_space_mb_bounds_accepted(self, value: int) -> None:
+        """Zero is the inclusive floor."""
+        assert OutputConfig(min_free_space_mb=value).min_free_space_mb == value
+
+    def test_min_free_space_mb_negative_in_toml_rejected(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A TOML ``min_free_space_mb = -1`` fails at load, naming the key."""
+        lines = _output_bound_line(
+            tmp_config_dir, "min_free_space_mb", -1, "free_space_negative"
+        )
+        assert (
+            "  [output] min_free_space_mb: Input should be greater than or equal to 0"
+        ) in lines
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_min_free_space_mb_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__MIN_FREE_SPACE_MB`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__MIN_FREE_SPACE_MB", "42")
+        assert load_settings().output.min_free_space_mb == 42
+
+
+class TestPaperlessCacheTtlBound:
+    """
+    OutputConfig paperless_cache_ttl_seconds is never negative.
+
+    Zero is a real setting (never cache); a negative lifetime means nothing.
+    """
+
+    @pytest.mark.parametrize("value", [-1])
+    def test_paperless_cache_ttl_out_of_range_rejected(self, value: int) -> None:
+        """A negative lifetime fails."""
+        with pytest.raises(ValidationError, match="paperless_cache_ttl_seconds"):
+            OutputConfig(paperless_cache_ttl_seconds=value)
+
+    @pytest.mark.parametrize("value", [0])
+    def test_paperless_cache_ttl_bounds_accepted(self, value: int) -> None:
+        """Zero is the inclusive floor."""
+        output = OutputConfig(paperless_cache_ttl_seconds=value)
+        assert output.paperless_cache_ttl_seconds == value
+
+    def test_paperless_cache_ttl_negative_in_toml_rejected(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A TOML ``paperless_cache_ttl_seconds = -1`` fails at load."""
+        lines = _output_bound_line(
+            tmp_config_dir, "paperless_cache_ttl_seconds", -1, "cache_ttl_negative"
+        )
+        assert (
+            "  [output] paperless_cache_ttl_seconds: "
+            "Input should be greater than or equal to 0"
+        ) in lines
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_paperless_cache_ttl_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT__PAPERLESS_CACHE_TTL_SECONDS`` sets the field."""
+        monkeypatch.setenv("SANELESS_OUTPUT__PAPERLESS_CACHE_TTL_SECONDS", "42")
+        assert load_settings().output.paperless_cache_ttl_seconds == 42
+
+
+class TestResolutionBound:
+    """
+    ProfileConfig resolution is bounded to 1..12,800 dpi.
+
+    Zero or a negative resolution cannot be scanned at all.  12,800 dpi is
+    the highest value any SANE backend offers, so the ceiling refuses no real
+    device.
+    """
+
+    @pytest.mark.parametrize("value", [0, -1, 12_801])
+    def test_resolution_out_of_range_rejected(self, value: int) -> None:
+        """Zero, a negative value and anything above 12,800 dpi fail."""
+        with pytest.raises(ValidationError, match="resolution"):
+            ProfileConfig(resolution=value)
+
+    @pytest.mark.parametrize("value", [1, 12_800])
+    def test_resolution_bounds_accepted(self, value: int) -> None:
+        """One dpi and 12,800 dpi are the inclusive bounds."""
+        assert ProfileConfig(resolution=value).resolution == value
+
+    def test_resolution_zero_in_toml_rejected(self, tmp_config_dir: Path) -> None:
+        """A TOML ``resolution = 0`` fails at load, naming the profile."""
+        err = _load_error(
+            tmp_config_dir / "resolution_zero.toml",
+            "[profiles.default]\nresolution = 0\n",
+        )
+        assert (
+            "  [profiles.default] resolution: "
+            "Input should be greater than or equal to 1"
+        ) in _error_lines(err)
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_resolution_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``SANELESS_PROFILES__DEFAULT__RESOLUTION`` sets the field."""
+        monkeypatch.setenv("SANELESS_PROFILES__DEFAULT__RESOLUTION", "600")
+        assert load_settings().profiles["default"].resolution == 600
+
+
+_BOOL_NOT_NUMBER = "must be a number, not true or false"
+"""The fixed refusal every numeric setting gives a TOML boolean."""
+
+
+class TestBoolIsNotANumber:
+    """
+    A TOML boolean is refused by every numeric setting.
+
+    pydantic's lax mode reads ``true`` as 1, so ``web_port = true`` used to
+    bind port 1 and ``resolution = true`` scanned at 1 dpi.  The refusal is a
+    fixed sentence that carries no value, and the plain strings the
+    ``SANELESS_*`` variables supply still load.
+    """
+
+    @pytest.mark.parametrize(
+        ("toml_content", "expected"),
+        [
+            pytest.param(
+                "[output]\nweb_port = true\n\n[profiles.default]\n",
+                f"  [output] web_port: {_BOOL_NOT_NUMBER}",
+                id="web_port",
+            ),
+            pytest.param(
+                "[output]\nhistory_max_rows = false\n\n[profiles.default]\n",
+                f"  [output] history_max_rows: {_BOOL_NOT_NUMBER}",
+                id="history_max_rows",
+            ),
+            pytest.param(
+                "[profiles.default]\nresolution = true\n",
+                f"  [profiles.default] resolution: {_BOOL_NOT_NUMBER}",
+                id="resolution",
+            ),
+            pytest.param(
+                "[profiles.default]\ndefault_tags = [true]\n",
+                f"  [profiles.default] default_tags[0]: {_BOOL_NOT_NUMBER}",
+                id="default_tags",
+            ),
+            pytest.param(
+                "[profiles.default]\ndefault_correspondent = true\n",
+                f"  [profiles.default] default_correspondent: {_BOOL_NOT_NUMBER}",
+                id="default_correspondent",
+            ),
+            pytest.param(
+                "[profiles.default]\nempty_page_coverage_threshold = true\n",
+                "  [profiles.default] empty_page_coverage_threshold: "
+                f"{_BOOL_NOT_NUMBER}",
+                id="empty_page_coverage_threshold",
+            ),
+        ],
+    )
+    def test_toml_boolean_is_refused(
+        self, tmp_config_dir: Path, toml_content: str, expected: str
+    ) -> None:
+        """The boolean is refused with one fixed line that echoes no value."""
+        err = _load_error(tmp_config_dir / "bool.toml", toml_content)
+        lines = _error_lines(err)
+        assert expected in lines
+        detail = lines[1:]
+        assert all("Value error" not in line for line in detail)
+        assert all("True" not in line and "False" not in line for line in detail)
+        assert all(not line.endswith(("= true", "= false")) for line in detail)
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_environment_strings_still_load(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The string values ``SANELESS_*`` variables supply are not refused."""
+        monkeypatch.setenv("SANELESS_OUTPUT__WEB_PORT", "8080")
+        monkeypatch.setenv("SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS", " 7 ")
+        settings = load_settings()
+        assert settings.output.web_port == 8080
+        assert settings.output.operator_wait_timeout_seconds == 7
+
+
 class TestDuplexField:
     """ProfileConfig duplex field validation (DPLX-01)."""
 
