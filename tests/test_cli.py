@@ -43,6 +43,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
     discover_config,
+    load_settings,
 )
 from saneless.exceptions import (
     AllPagesBlankError,
@@ -4104,6 +4105,59 @@ class TestAutoProfiles:
         for name in ("default", "flatbed", "adf"):
             assert repr(name) in line
         assert "Added: " not in result.output
+
+    def test_auto_profiles_force_unchanged_reports_no_changes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        --force over a file that already matches the generation changes nothing.
+
+        The command says so, names nothing as refreshed, and leaves the file
+        where it was rather than replacing it with identical text.
+        """
+        config_file = tmp_path / "saneless.toml"
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+        first = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+        assert first.exit_code == 0, first.output
+        inode = config_file.stat().st_ino
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "auto-profiles", "--force"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert f"No changes to {config_file.resolve()}." in result.output
+        assert "Refreshed" not in result.output
+        assert config_file.stat().st_ino == inode
+
+    def test_auto_profiles_no_source_device_keeps_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A scanner with no source option adds default and prunes nothing.
+
+        Such a device generates only ``default``, so a flagged ``flatbed`` left
+        by an earlier run cannot be judged orphaned: the scanner said nothing
+        about where pages come from. The operator's table, with its
+        ``default_tags``, survives, and the file the command leaves behind loads.
+        """
+        config_file = tmp_path / "saneless.toml"
+        self._flatbed_config(config_file, flagged=True)
+        no_source = DeviceCapabilities(
+            sources=[], resolutions=[150, 300], modes=["Gray", "Color"]
+        )
+        runner, _ = _patch_cli(
+            monkeypatch, scanner_cls=self._make_auto_scanner(caps=no_source)
+        )
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert self._group_line(result.output, "Added: ") == "Added: 'default'"
+        assert "Removed" not in result.output
+        settings = load_settings(str(config_file))
+        assert "default" in settings.profiles
+        assert settings.profiles["flatbed"].default_tags == [4]
 
     @staticmethod
     def _two_devices() -> list[DeviceInfo]:

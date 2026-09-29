@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Final, Literal, assert_never, cast
 import tomlkit
 from pydantic import TypeAdapter, ValidationError
 from tomlkit.exceptions import ParseError, TOMLKitError
-from tomlkit.items import InlineTable
+from tomlkit.items import InlineTable, Item
 
 from saneless.atomic_write import replace_file_atomically
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
@@ -664,6 +664,15 @@ def _profile_description(
     return description
 
 
+# The human text of the ``default`` generated for a device with no ``source``
+# option. There is no source to describe, so neither phrase names an input; the
+# description says why the operator sees no other profile to choose from.
+_NO_SOURCE_LABEL: Final = "Standard scan"
+_NO_SOURCE_DESCRIPTION: Final = (
+    "Scans from the scanner, which offers no choice of where the page comes from."
+)
+
+
 def generate_profiles(
     capabilities: DeviceCapabilities,
     device_type: str = "",
@@ -674,15 +683,18 @@ def generate_profiles(
     Creates one profile per scanner source, plus a "default" profile. All
     generated profiles have auto_generated=True.
 
-    The "default" profile is emitted whenever the device reports any source at
-    all, and that is not a preference: ``Settings.validate_default_profile``
-    makes the key mandatory, so a generated set without it is written to disk
-    and then refused by saneless on the next load, with ``auto-profiles``
-    reporting success and exiting 0 over an unusable installation. A flatbed
-    backs it when the device has one; on a sheet-fed scanner the device's own
-    first reported source does, which is the only honest candidate available.
-    The default is a copy of the profile generated for that source, so the two
-    compare equal as whole models.
+    The "default" profile is always emitted, and that is not a preference:
+    ``Settings.validate_default_profile`` makes the key mandatory, so a
+    generated set without it is written to disk and then refused by saneless
+    on the next load, with ``auto-profiles`` reporting success and exiting 0
+    over an unusable installation. A flatbed backs it when the device has one;
+    on a sheet-fed scanner the device's own first reported source does, which
+    is the only honest candidate available. The default is then a copy of the
+    profile generated for that source, so the two compare equal as whole
+    models. A device that reports no source at all -- it has no SANE
+    ``source`` option -- gets a ``default`` that names no source: the backend
+    assigns none to such a device and routes by the model default's source, so
+    the profile scans from wherever the scanner feeds.
 
     Labels are unique within the set: a source whose label another source
     already holds gets an ordinal, so "Feeder, single-sided" is followed by
@@ -777,7 +789,20 @@ def generate_profiles(
             description=_profile_description(source, auto_source_mode=auto_source_mode),
         )
 
-    if default_slug is not None:
+    if default_slug is None:
+        # No source to copy: the device offers no choice of input. ``source``
+        # is left unset on purpose. The backend assigns nothing to a device
+        # without the option and routes by the model default's classification,
+        # and a table that names no source says so, where "Flatbed" would claim
+        # a platen the scanner never reported.
+        profiles["default"] = ProfileConfig(
+            resolution=resolution,
+            mode=mode,
+            auto_generated=True,
+            label=_NO_SOURCE_LABEL,
+            description=_NO_SOURCE_DESCRIPTION,
+        )
+    else:
         # A copy of the profile it duplicates rather than a second build from
         # the same inputs, so every field agrees by construction: an Auto
         # source on a platen-less device keeps the stack routing of the profile
@@ -874,6 +899,13 @@ _NOT_GENERATED_REASON: Final = (
     "rename or delete it to regenerate"
 )
 
+# The same skip, for ``default``. It cannot be renamed or deleted like any other
+# profile -- saneless requires it -- so the generic advice is wrong for it; the
+# flag is the one way to hand it back to the tool.
+_DEFAULT_NOT_GENERATED_REASON: Final = (
+    "add auto_generated = true to its table to let auto-profiles --force refresh it"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ProfileWriteResult:
@@ -887,6 +919,9 @@ class ProfileWriteResult:
         path: The config file the result describes.
         added: Generated names the file did not have, now written.
         refreshed: Flagged profiles whose owned keys ``force`` rewrote.
+        unchanged: Flagged profiles ``force`` found already matching the
+            generation, key for key; neither rewritten nor reported, since
+            nothing about them changed.
         skipped_not_generated: Same-name profiles without a truthy
             ``auto_generated``, never touched, under ``force`` too.
         skipped_existing: Flagged profiles left alone because ``force`` was
@@ -900,6 +935,7 @@ class ProfileWriteResult:
     path: Path
     added: tuple[str, ...] = ()
     refreshed: tuple[str, ...] = ()
+    unchanged: tuple[str, ...] = ()
     skipped_not_generated: tuple[str, ...] = ()
     skipped_existing: tuple[str, ...] = ()
     removed: tuple[str, ...] = ()
@@ -908,7 +944,7 @@ class ProfileWriteResult:
     @property
     def persisted(self) -> frozenset[str]:
         """Names whose file table now matches the generated profile."""
-        return frozenset(self.added + self.refreshed)
+        return frozenset(self.added + self.refreshed + self.unchanged)
 
     def groups(self) -> list[tuple[str, tuple[str, ...]]]:
         """
@@ -919,16 +955,31 @@ class ProfileWriteResult:
 
         Returns:
             ``(line, written_names)`` in the fixed order Added, Refreshed,
-            Skipped (not auto-generated), Skipped (already exists), Removed,
-            then the pinned device, if any, whose line names no profiles.
+            Skipped (not auto-generated) -- ``default`` on a line of its own
+            first, since the advice differs, then the rest -- Skipped (already
+            exists), Removed, then the pinned device, if any, whose line names
+            no profiles. Unchanged tables have no line: nothing happened to
+            them.
 
         """
+        skipped_default = tuple(
+            name for name in self.skipped_not_generated if name in _UNPRUNABLE
+        )
+        skipped_others = tuple(
+            name for name in self.skipped_not_generated if name not in _UNPRUNABLE
+        )
         labelled = (
             ("Added", self.added, "", True),
             ("Refreshed", self.refreshed, "", True),
             (
                 "Skipped (not auto-generated)",
-                self.skipped_not_generated,
+                skipped_default,
+                f" -- {_DEFAULT_NOT_GENERATED_REASON}",
+                False,
+            ),
+            (
+                "Skipped (not auto-generated)",
+                skipped_others,
                 f" -- {_NOT_GENERATED_REASON}",
                 False,
             ),
@@ -971,7 +1022,8 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     Insertion order is the file's key order for a new table. Only non-default
     values of ``auto_source_mode`` and ``duplex`` are included, so a refreshed
     table reads the way a freshly generated one does. ``label`` and
-    ``description`` are the exception: they are always written.
+    ``description`` are the exception: they are always written. ``source`` is
+    written only when the profile was given one.
 
     Args:
         profile: A generated profile.
@@ -995,10 +1047,14 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
         # passed in come from a fresh generation.
         "label": profile.label,
         "description": profile.description,
-        "source": profile.source,
-        "resolution": profile.resolution,
-        "mode": profile.mode,
     }
+    # Only a source the profile was given. A no-source device's default
+    # carries none, so its table names none, and a --force refresh deletes a
+    # stale one, as it does any owned key the generation omits.
+    if "source" in profile.model_fields_set:
+        values["source"] = profile.source
+    values["resolution"] = profile.resolution
+    values["mode"] = profile.mode
     if profile.auto_source_mode != "flatbed":
         values["auto_source_mode"] = profile.auto_source_mode
     # Written only when non-default, like auto_source_mode. In a generated set
@@ -1147,8 +1203,28 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
 
 
 _MergeOutcome = Literal[
-    "added", "refreshed", "skipped_not_generated", "skipped_existing"
+    "added", "refreshed", "unchanged", "skipped_not_generated", "skipped_existing"
 ]
+
+
+def _same_value(stored: object, generated: object) -> bool:
+    """
+    Report whether a stored owned value is exactly the one a generation writes.
+
+    Type and value are both compared, so ``300.0`` against ``300`` and ``1``
+    against ``True`` are changes, though Python calls each pair equal: a
+    refresh must replace such a value with the generation's own.
+
+    Args:
+        stored: The value from the parsed table, a tomlkit item or plain data.
+        generated: The value ``_generated_values`` would write.
+
+    Returns:
+        True only when the unwrapped value has the same type and is equal.
+
+    """
+    value = stored.unwrap() if isinstance(stored, Item) else stored
+    return type(value) is type(generated) and value == generated
 
 
 def _merge_profile(
@@ -1197,6 +1273,14 @@ def _merge_profile(
     # this generation omits is deleted, so a stale ``duplex = "hardware"`` does
     # not outlive the source that produced it.
     owned = cast("MutableMapping[str, object]", existing)
+    # Compared first, so a table that already reads as the generation is left
+    # as it is and not reported refreshed. A key on one side only is a change.
+    if all(
+        (key in owned) == (key in values)
+        and (key not in values or _same_value(owned[key], values[key]))
+        for key in _OWNED_KEYS
+    ):
+        return "unchanged"
     for key in _OWNED_KEYS:
         if key in values:
             owned[key] = values[key]
@@ -1270,7 +1354,9 @@ def write_profiles_to_config(
     * present and flagged, without ``force``: skipped as already existing;
     * present and flagged, with ``force``: the owned keys (``_OWNED_KEYS``) are
       written onto the existing table and any the generation omits are
-      deleted, so every other key and every comment survives.
+      deleted, so every other key and every comment survives -- unless every
+      owned key already matches in type and value, when the table is left
+      alone and counted as unchanged rather than refreshed.
 
     Auto-generated profiles that the freshly generated set no longer names are
     pruned first, so renaming does not strand the profiles it replaced. The
@@ -1340,13 +1426,23 @@ def write_profiles_to_config(
         raise ConfigError(msg)
     profiles_section = cast("dict[str, object]", section)
 
-    orphans = [
-        name
-        for name, table in profiles_section.items()
-        if name not in profiles
-        and name not in _UNPRUNABLE
-        and _is_auto_generated(table)
-    ]
+    # Generation always emits ``default``, so "only default was generated" is
+    # the signal that the scanner reported no sources, and then nothing can be
+    # judged orphaned: the device said nothing about where pages come from,
+    # so a flagged profile is not absent, merely unasked about. A guard on an
+    # empty set would never fire, and the prune would delete every flagged
+    # profile together with the operator's own keys on it.
+    orphans = (
+        []
+        if set(profiles) <= _UNPRUNABLE
+        else [
+            name
+            for name, table in profiles_section.items()
+            if name not in profiles
+            and name not in _UNPRUNABLE
+            and _is_auto_generated(table)
+        ]
+    )
     for name in orphans:
         logger.info(
             "Removing auto-generated profile %r: the scanner's sources no "
@@ -1358,6 +1454,7 @@ def write_profiles_to_config(
     outcomes: dict[_MergeOutcome, list[str]] = {
         "added": [],
         "refreshed": [],
+        "unchanged": [],
         "skipped_not_generated": [],
         "skipped_existing": [],
     }
@@ -1365,14 +1462,18 @@ def write_profiles_to_config(
         outcome = _merge_profile(profiles_section, name, profile, force=force)
         outcomes[outcome].append(name)
 
-    if not (
+    changed = bool(
         outcomes["added"] or outcomes["refreshed"] or orphans or pinned is not None
-    ):
+    )
+    new_text = _render_checked(config_path, doc, original_text) if changed else ""
+    if not changed or new_text == original_text:
         # Nothing changed, so nothing is replaced -- and a legacy single-file
-        # mount gets no EBUSY error for a run that had nothing to write.
+        # mount gets no EBUSY error for a run that had nothing to write. The
+        # text comparison backs up the outcome bookkeeping: identical bytes
+        # are never swapped in, so the file keeps its inode, and with it any
+        # ACL or ownership set on it by hand.
         target = config_path.resolve()
     else:
-        new_text = _render_checked(config_path, doc, original_text)
         target = replace_file_atomically(config_path, new_text)
         if config_path.is_symlink():
             # The operator edits the link, the write lands on the target;
@@ -1389,6 +1490,7 @@ def write_profiles_to_config(
         path=target,
         added=tuple(outcomes["added"]),
         refreshed=tuple(outcomes["refreshed"]),
+        unchanged=tuple(outcomes["unchanged"]),
         skipped_not_generated=tuple(outcomes["skipped_not_generated"]),
         skipped_existing=tuple(outcomes["skipped_existing"]),
         removed=tuple(orphans),

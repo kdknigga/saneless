@@ -1828,6 +1828,105 @@ auto_generated = true
         assert "adf-duplex" in settings.profiles
 
 
+class TestNoSourceDevice:
+    """
+    A scanner with no SANE ``source`` option still gets a working ``default``.
+
+    Such a device feeds without being told where from, and the backend assigns
+    no source to it. Generating nothing for it left a config that saneless
+    refuses to load, and let the prune delete every flagged profile an earlier
+    run had written, together with the operator's ``default_tags``.
+    """
+
+    _CAPS = DeviceCapabilities(
+        sources=[], resolutions=[150, 300], modes=["Gray", "Color"]
+    )
+
+    # What an earlier run against a flatbed scanner leaves behind, with an
+    # operator's own key added to the flagged profile.
+    _PREVIOUS_RUN = """\
+[profiles.default]
+source = "Flatbed"
+resolution = 300
+mode = "Color"
+auto_generated = true
+
+[profiles.flatbed]
+source = "Flatbed"
+resolution = 300
+mode = "Color"
+default_tags = [4]
+auto_generated = true
+"""
+
+    def test_no_source_device_generates_only_default(self) -> None:
+        """Generation emits exactly ``default``, flagged, at the chosen settings."""
+        profiles = generate_profiles(self._CAPS)
+
+        assert set(profiles) == {"default"}
+        default = profiles["default"]
+        assert default.resolution == 300
+        assert default.mode == "Color"
+        assert default.auto_generated is True
+
+    def test_no_source_default_names_no_source(self) -> None:
+        """The source is the model default, never one the device did not report."""
+        default = generate_profiles(self._CAPS)["default"]
+        assert "source" not in default.model_fields_set
+
+    def test_no_source_default_text(self) -> None:
+        """The human text says the scanner offers no choice of input."""
+        default = generate_profiles(self._CAPS)["default"]
+        assert default.label == "Standard scan"
+        assert default.description == (
+            "Scans from the scanner, which offers no choice of where the page "
+            "comes from."
+        )
+
+    def test_no_source_default_is_written_without_a_source_key(
+        self, tmp_path: Path
+    ) -> None:
+        """The new file's ``default`` table carries no ``source``, and loads."""
+        config_file = tmp_path / "saneless.toml"
+        write_profiles_to_config(config_file, generate_profiles(self._CAPS))
+
+        table = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert "source" not in table
+        assert table["auto_generated"] is True
+        settings = load_settings(str(config_file))
+        assert "default" in settings.profiles
+
+    def test_no_source_device_prunes_nothing(self, tmp_path: Path) -> None:
+        """A flagged ``flatbed`` and its ``default_tags`` survive the run."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(self._PREVIOUS_RUN)
+
+        result = write_profiles_to_config(config_file, generate_profiles(self._CAPS))
+
+        assert result.removed == ()
+        settings = load_settings(str(config_file))
+        assert settings.profiles["flatbed"].default_tags == [4]
+
+    def test_no_source_force_drops_a_stale_source(self, tmp_path: Path) -> None:
+        """
+        ``--force`` deletes the ``source`` an earlier run wrote into ``default``.
+
+        The generation owns ``source`` and no longer writes one, so a refresh
+        removes it, as it does any owned key a fresh generation omits.
+        """
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(self._PREVIOUS_RUN)
+
+        result = write_profiles_to_config(
+            config_file, generate_profiles(self._CAPS), force=True
+        )
+
+        assert result.refreshed == ("default",)
+        profiles = tomllib.loads(config_file.read_text())["profiles"]
+        assert "source" not in profiles["default"]
+        assert profiles["flatbed"]["default_tags"] == [4]
+
+
 class TestTomlWriting:
     """TOML config file writing with comment preservation."""
 
@@ -2128,10 +2227,129 @@ auto_generated = true
             "auto_generated = true\n"
         ) in config_file.read_text()
 
-    def test_merge_persisted_is_added_plus_refreshed(self, tmp_path: Path) -> None:
-        """``persisted`` names exactly the tables that now match the generation."""
-        _, result = self._write(tmp_path, force=True, extra=True)
-        assert result.persisted == frozenset({"fresh", "scan"})
+    def test_merge_persisted_is_added_refreshed_and_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        ``persisted`` names exactly the tables that now match the generation.
+
+        That is every table added or refreshed, and every flagged table
+        ``force`` found already matching: a second forced run changes nothing,
+        yet the file still holds the generated profiles.
+        """
+        config_file, first = self._write(tmp_path, force=True, extra=True)
+        assert first.persisted == frozenset({"fresh", "scan"})
+
+        second = write_profiles_to_config(
+            config_file, self._generated(extra=True), force=True
+        )
+        assert second.refreshed == ()
+        assert set(second.unchanged) == {"fresh", "scan"}
+        assert second.persisted == frozenset({"fresh", "scan"})
+
+    def test_force_on_an_unchanged_file_keeps_the_inode(self, tmp_path: Path) -> None:
+        """
+        A forced run over a file that already matches does not rewrite it.
+
+        The file keeps its inode and its bytes, nothing is reported as
+        refreshed, and the tables still count as persisted.
+        """
+        config_file = tmp_path / "saneless.toml"
+        generated = generate_profiles(
+            DeviceCapabilities(
+                sources=["Flatbed", "ADF", "ADF Duplex"],
+                resolutions=[150, 300, 600],
+                modes=["Gray", "Color"],
+            )
+        )
+        write_profiles_to_config(config_file, generated)
+        inode = config_file.stat().st_ino
+        before = config_file.read_bytes()
+
+        result = write_profiles_to_config(config_file, generated, force=True)
+
+        assert config_file.stat().st_ino == inode
+        assert config_file.read_bytes() == before
+        assert result.refreshed == ()
+        assert set(result.unchanged) == set(generated)
+        assert result.persisted == frozenset(generated)
+        assert result.describe() == []
+
+    @pytest.mark.parametrize(
+        ("stored", "key"),
+        [
+            ("resolution = 300.0", "resolution"),
+            ("resolution = 300", "auto_generated"),
+        ],
+        ids=["float-for-int", "int-for-bool"],
+    )
+    def test_force_compares_type_as_well_as_value(
+        self, tmp_path: Path, stored: str, key: str
+    ) -> None:
+        """
+        An owned key equal in value but not in type is a change, and refreshed.
+
+        ``300 == 300.0`` and ``1 == True`` hold in Python, so a comparison by
+        value alone would leave a float resolution, or a numeric flag, in the
+        file for good.
+        """
+        flag = "auto_generated = 1" if key == "auto_generated" else ""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'label = "Glass (flatbed)"\n'
+            'description = "Scans one page at a time from the glass."\n'
+            'source = "Flatbed"\n'
+            f"{stored}\n"
+            'mode = "Color"\n'
+            f"{flag or 'auto_generated = true'}\n"
+        )
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+                label="Glass (flatbed)",
+                description="Scans one page at a time from the glass.",
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated, force=True)
+
+        assert result.refreshed == ("default",)
+        table = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert type(table[key]) is type(getattr(generated["default"], key))
+
+    def test_force_treats_an_extra_owned_key_as_a_change(self, tmp_path: Path) -> None:
+        """An owned key only the file holds is a change: the refresh deletes it."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'label = "Glass (flatbed)"\n'
+            'description = "Scans one page at a time from the glass."\n'
+            'source = "Flatbed"\n'
+            "resolution = 300\n"
+            'mode = "Color"\n'
+            'duplex = "none"\n'
+            "auto_generated = true\n"
+        )
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+                label="Glass (flatbed)",
+                description="Scans one page at a time from the glass.",
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated, force=True)
+
+        assert result.refreshed == ("default",)
+        table = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert "duplex" not in table
 
     def test_merge_result_describe_lists_groups_in_order(self, tmp_path: Path) -> None:
         """One line per non-empty group, in a fixed order, names shown with repr."""
@@ -2139,18 +2357,62 @@ auto_generated = true
             path=tmp_path / "saneless.toml",
             added=("a", "b"),
             refreshed=("c",),
-            skipped_not_generated=("default",),
+            skipped_not_generated=("d", "default"),
             skipped_existing=("e",),
             removed=("f",),
         )
         assert result.describe() == [
             "Added: 'a', 'b'",
             "Refreshed: 'c'",
-            "Skipped (not auto-generated): 'default' -- not created by "
+            "Skipped (not auto-generated): 'default' -- add auto_generated = "
+            "true to its table to let auto-profiles --force refresh it",
+            "Skipped (not auto-generated): 'd' -- not created by "
             "auto-profiles (no auto_generated = true); rename or delete it to "
             "regenerate",
             "Skipped (already exists; use --force to refresh): 'e'",
             "Removed (scanner no longer offers it): 'f'",
+        ]
+
+    def test_default_gets_its_own_skip_line(self, tmp_path: Path) -> None:
+        """
+        A hand-written ``default`` is told how to hand it back, on its own line.
+
+        ``default`` cannot be renamed or deleted -- saneless requires it -- so
+        the advice every other skipped profile gets would not work for it.
+        """
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            skipped_not_generated=("default", "receipts"),
+        )
+        assert result.describe() == [
+            "Skipped (not auto-generated): 'default' -- add auto_generated = "
+            "true to its table to let auto-profiles --force refresh it",
+            "Skipped (not auto-generated): 'receipts' -- not created by "
+            "auto-profiles (no auto_generated = true); rename or delete it to "
+            "regenerate",
+        ]
+
+    def test_skip_line_without_default_is_unchanged(self, tmp_path: Path) -> None:
+        """With no ``default`` among the skipped, the one generic line remains."""
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            skipped_not_generated=("receipts",),
+        )
+        assert result.describe() == [
+            "Skipped (not auto-generated): 'receipts' -- not created by "
+            "auto-profiles (no auto_generated = true); rename or delete it to "
+            "regenerate",
+        ]
+
+    def test_skip_line_for_default_alone(self, tmp_path: Path) -> None:
+        """A skipped ``default`` alone gets its line and no empty generic one."""
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            skipped_not_generated=("default",),
+        )
+        assert result.describe() == [
+            "Skipped (not auto-generated): 'default' -- add auto_generated = "
+            "true to its table to let auto-profiles --force refresh it",
         ]
 
     def test_merge_result_describe_omits_empty_groups(self, tmp_path: Path) -> None:
@@ -2420,6 +2682,24 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
         )
         return config_file
 
+    @staticmethod
+    def _generated_with_a_source() -> dict[str, ProfileConfig]:
+        """
+        Build a generated set that names a source besides ``default``.
+
+        A set holding only ``default`` is what a scanner with no source option
+        generates, and the prune never runs for it; these tests are about how
+        the prune reads the flag, so the set must be one the prune runs for.
+        """
+        return {
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+            "flatbed": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
     @pytest.mark.parametrize("flag", _FALSY_STRINGS)
     def test_loader_and_writer_agree_the_profile_is_hand_written(
         self, tmp_path: Path, flag: str
@@ -2458,11 +2738,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
     ) -> None:
         """An orphan flagged ``"no"`` is not the tool's, so it is not removed."""
         config_file = self._config(tmp_path, "zzz", flag)
-        generated = {
-            "default": ProfileConfig(
-                source="Flatbed", resolution=300, mode="Color", auto_generated=True
-            ),
-        }
+        generated = self._generated_with_a_source()
 
         result = write_profiles_to_config(config_file, generated, force=force)
 
@@ -2473,11 +2749,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
     def test_a_string_true_flag_is_still_owned(self, tmp_path: Path) -> None:
         """``"yes"`` loads as True, so the writer owns and prunes it too."""
         config_file = self._config(tmp_path, "zzz", "yes")
-        generated = {
-            "default": ProfileConfig(
-                source="Flatbed", resolution=300, mode="Color", auto_generated=True
-            ),
-        }
+        generated = self._generated_with_a_source()
 
         result = write_profiles_to_config(config_file, generated)
 
@@ -2490,11 +2762,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
             '[profiles.default]\nsource = "Flatbed"\n\n'
             '[profiles.zzz]\nsource = "mine"\nauto_generated = "maybe"\n'
         )
-        generated = {
-            "default": ProfileConfig(
-                source="Flatbed", resolution=300, mode="Color", auto_generated=True
-            ),
-        }
+        generated = self._generated_with_a_source()
 
         result = write_profiles_to_config(config_file, generated)
 
