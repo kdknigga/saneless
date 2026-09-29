@@ -1828,6 +1828,105 @@ auto_generated = true
         assert "adf-duplex" in settings.profiles
 
 
+class TestNoSourceDevice:
+    """
+    A scanner with no SANE ``source`` option still gets a working ``default``.
+
+    Such a device feeds without being told where from, and the backend assigns
+    no source to it. Generating nothing for it left a config that saneless
+    refuses to load, and let the prune delete every flagged profile an earlier
+    run had written, together with the operator's ``default_tags``.
+    """
+
+    _CAPS = DeviceCapabilities(
+        sources=[], resolutions=[150, 300], modes=["Gray", "Color"]
+    )
+
+    # What an earlier run against a flatbed scanner leaves behind, with an
+    # operator's own key added to the flagged profile.
+    _PREVIOUS_RUN = """\
+[profiles.default]
+source = "Flatbed"
+resolution = 300
+mode = "Color"
+auto_generated = true
+
+[profiles.flatbed]
+source = "Flatbed"
+resolution = 300
+mode = "Color"
+default_tags = [4]
+auto_generated = true
+"""
+
+    def test_no_source_device_generates_only_default(self) -> None:
+        """Generation emits exactly ``default``, flagged, at the chosen settings."""
+        profiles = generate_profiles(self._CAPS)
+
+        assert set(profiles) == {"default"}
+        default = profiles["default"]
+        assert default.resolution == 300
+        assert default.mode == "Color"
+        assert default.auto_generated is True
+
+    def test_no_source_default_names_no_source(self) -> None:
+        """The source is the model default, never one the device did not report."""
+        default = generate_profiles(self._CAPS)["default"]
+        assert "source" not in default.model_fields_set
+
+    def test_no_source_default_text(self) -> None:
+        """The human text says the scanner offers no choice of input."""
+        default = generate_profiles(self._CAPS)["default"]
+        assert default.label == "Standard scan"
+        assert default.description == (
+            "Scans from the scanner, which offers no choice of where the page "
+            "comes from."
+        )
+
+    def test_no_source_default_is_written_without_a_source_key(
+        self, tmp_path: Path
+    ) -> None:
+        """The new file's ``default`` table carries no ``source``, and loads."""
+        config_file = tmp_path / "saneless.toml"
+        write_profiles_to_config(config_file, generate_profiles(self._CAPS))
+
+        table = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert "source" not in table
+        assert table["auto_generated"] is True
+        settings = load_settings(str(config_file))
+        assert "default" in settings.profiles
+
+    def test_no_source_device_prunes_nothing(self, tmp_path: Path) -> None:
+        """A flagged ``flatbed`` and its ``default_tags`` survive the run."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(self._PREVIOUS_RUN)
+
+        result = write_profiles_to_config(config_file, generate_profiles(self._CAPS))
+
+        assert result.removed == ()
+        settings = load_settings(str(config_file))
+        assert settings.profiles["flatbed"].default_tags == [4]
+
+    def test_no_source_force_drops_a_stale_source(self, tmp_path: Path) -> None:
+        """
+        ``--force`` deletes the ``source`` an earlier run wrote into ``default``.
+
+        The generation owns ``source`` and no longer writes one, so a refresh
+        removes it, as it does any owned key a fresh generation omits.
+        """
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(self._PREVIOUS_RUN)
+
+        result = write_profiles_to_config(
+            config_file, generate_profiles(self._CAPS), force=True
+        )
+
+        assert result.refreshed == ("default",)
+        profiles = tomllib.loads(config_file.read_text())["profiles"]
+        assert "source" not in profiles["default"]
+        assert profiles["flatbed"]["default_tags"] == [4]
+
+
 class TestTomlWriting:
     """TOML config file writing with comment preservation."""
 
