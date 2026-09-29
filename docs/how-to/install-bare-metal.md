@@ -64,7 +64,7 @@ Create `saneless.toml` in your working directory (or `$XDG_CONFIG_HOME/saneless/
 ```toml
 [paperless]
 url = "http://paperless.local:8000"
-token = "your-paperless-api-token"
+token = "your-api-token-here"
 
 [profiles.default]
 source = "Flatbed"

@@ -68,7 +68,7 @@ services:
       # old name is no longer read at all, and until you rename it the status
       # page's first row, Configuration, is red and names the file.
       # - SANELESS_PAPERLESS__URL=http://paperless:8000
-      # - SANELESS_PAPERLESS__TOKEN=<your paperless-ngx API token>
+      # - SANELESS_PAPERLESS__TOKEN=your-api-token-here
       # Uncomment to discover scanners on a remote host via SANE net backend:
       # - SANELESS_SCANNER__HOST=192.168.1.50
       # Multiple hosts use colons: SANELESS_SCANNER__HOST=192.168.1.50:192.168.1.51

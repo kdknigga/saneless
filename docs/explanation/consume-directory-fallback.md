@@ -25,7 +25,7 @@ Set the consume directory in your TOML config file:
 ```toml
 [paperless]
 url = "http://paperless.local:8000"
-token = "abc123def456"
+token = "your-api-token-here"
 consume_dir = "/path/to/paperless/consume"
 ```
 

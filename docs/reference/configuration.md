@@ -220,9 +220,11 @@ device = ""
 
 [paperless]
 url = "http://paperless:8000"
-token = "abc123def456ghi789"
+token = "your-api-token-here"
 consume_dir = ""
 
+# The absolute paths below are the container layout. A bare-metal install
+# keeps the default paths: leave tmp_dir, data_dir and log_file out.
 [output]
 tmp_dir = "/tmp/saneless-1000"
 data_dir = "/var/lib/saneless"
@@ -234,6 +236,7 @@ history_retention_days = 7
 history_max_rows = 500
 paperless_task_timeout = 300
 paperless_cache_ttl_seconds = 60
+operator_wait_timeout_seconds = 600
 min_free_space_mb = 500
 web_host = "0.0.0.0"
 web_port = 8080

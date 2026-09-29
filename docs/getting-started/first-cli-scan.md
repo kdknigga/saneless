@@ -76,7 +76,7 @@ Create a file called `saneless.toml` in your current directory with your paperle
 ```toml
 [paperless]
 url = "http://192.168.1.50:8000"
-token = "abc123def456"
+token = "your-api-token-here"
 ```
 
 Replace the URL and token with your actual paperless-ngx address and API token.

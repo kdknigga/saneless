@@ -34,7 +34,7 @@ Settings are resolved in this order (highest to lowest priority):
 | Variable | Config Path | Type | Example |
 |----------|-------------|------|---------|
 | `SANELESS_PAPERLESS__URL` | `paperless.url` | string | `http://paperless:8000` |
-| `SANELESS_PAPERLESS__TOKEN` | `paperless.token` | string | `abc123def456` |
+| `SANELESS_PAPERLESS__TOKEN` | `paperless.token` | string | `your-api-token-here` |
 | `SANELESS_PAPERLESS__CONSUME_DIR` | `paperless.consume_dir` | string | `/consume` |
 
 ### Output
