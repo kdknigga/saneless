@@ -21,6 +21,11 @@ Its contract, which every test below pins down:
   a ``ConfigError`` that tells the operator to mount the directory, and there
   is no non-atomic fallback (D-08). A config inside a mounted *directory*, the
   documented ``./config:/etc/saneless`` layout, is replaced normally (CFG-09).
+* Every extended attribute except the ``security.*`` LSM labels -- a POSIX
+  ACL included -- is copied onto the temp file before its owner and mode, so
+  an ACL survives exactly and the owning group is never handed the ACL mask.
+  An attribute that cannot be copied refuses the rewrite; a filesystem with
+  no extended attribute support has nothing to copy.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -40,6 +46,60 @@ from saneless.exceptions import ConfigError
 
 _ORIGINAL = "[profiles.default]\nsource = 'Flatbed'\n"
 _NEW = "a = 1\r\n# café\n"
+
+# The Linux ``system.posix_acl_access`` value: a little-endian version word,
+# then one (tag, permissions, id) entry per ACL line. Building it by hand lets
+# the ACL tests run without ``setfacl`` and on tmpfs, which accepts POSIX ACLs
+# but refuses ``user.*`` attributes.
+ACL_XATTR = "system.posix_acl_access"
+ACL_VERSION = 2
+ACL_USER_OBJ = 0x01
+ACL_USER = 0x02
+ACL_GROUP_OBJ = 0x04
+ACL_MASK = 0x10
+ACL_OTHER = 0x20
+ACL_UNDEFINED_ID = 0xFFFFFFFF
+_ACL_HEADER = struct.Struct("<I")
+_ACL_ENTRY = struct.Struct("<HHI")
+
+
+def acl_blob(entries: list[tuple[int, int, int]]) -> bytes:
+    """
+    Encode ``entries`` as a ``system.posix_acl_access`` attribute value.
+
+    Args:
+        entries: ``(tag, permissions, id)`` triples, in the kernel's order
+            (owner, named users, owning group, mask, other); ``id`` is
+            ``ACL_UNDEFINED_ID`` for every entry but a named user or group.
+
+    Returns:
+        The bytes ``os.setxattr`` takes to set that ACL.
+
+    """
+    return _ACL_HEADER.pack(ACL_VERSION) + b"".join(
+        _ACL_ENTRY.pack(tag, perm, ident) for tag, perm, ident in entries
+    )
+
+
+def decode_acl(blob: bytes) -> list[tuple[int, int, int]]:
+    """Decode a ``system.posix_acl_access`` value into its entries."""
+    (version,) = _ACL_HEADER.unpack_from(blob)
+    assert version == ACL_VERSION
+    return list(_ACL_ENTRY.iter_unpack(blob[_ACL_HEADER.size :]))
+
+
+# ``u::rw- u:65534:rw- g::r-- m::rw- o::---``: a named user may write, the
+# owning group may only read. The mode's group bits show the mask (rw-), so a
+# rewrite that copies the mode but drops the ACL hands the group write access.
+_SHARED_ACL = acl_blob(
+    [
+        (ACL_USER_OBJ, 6, ACL_UNDEFINED_ID),
+        (ACL_USER, 6, 65534),
+        (ACL_GROUP_OBJ, 4, ACL_UNDEFINED_ID),
+        (ACL_MASK, 6, ACL_UNDEFINED_ID),
+        (ACL_OTHER, 0, ACL_UNDEFINED_ID),
+    ]
+)
 
 
 def _leftovers(directory: Path) -> list[str]:
@@ -600,6 +660,233 @@ class TestModeAndOwner:
 
         assert calls == []
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+class _XattrRecorder:
+    """
+    Stand-ins for ``os.listxattr``/``getxattr``/``setxattr`` that log each call.
+
+    tmpfs, where ``tmp_path`` lives on many hosts, refuses ``user.*``
+    attributes, so the attribute tests fake the three calls and read the
+    log. ``setxattr`` records without setting anything.
+    """
+
+    def __init__(
+        self, attributes: dict[str, bytes], refused: frozenset[str] = frozenset()
+    ) -> None:
+        """Serve ``attributes`` from the original; refuse to set ``refused``."""
+        self.attributes = attributes
+        self.refused = refused
+        self.calls: list[tuple[str, ...]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace the three ``os`` functions with this recorder's."""
+        monkeypatch.setattr(os, "listxattr", self.listxattr)
+        monkeypatch.setattr(os, "getxattr", self.getxattr)
+        monkeypatch.setattr(os, "setxattr", self.setxattr)
+
+    def listxattr(
+        self,
+        path: int | str | os.PathLike[str] | None = None,
+        *,
+        follow_symlinks: bool = True,
+    ) -> list[str]:
+        """List the served attribute names."""
+        self.calls.append(("listxattr",))
+        return list(self.attributes)
+
+    def getxattr(
+        self,
+        path: int | str | os.PathLike[str],
+        attribute: str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> bytes:
+        """Return a served attribute's value."""
+        self.calls.append(("getxattr", attribute))
+        return self.attributes[attribute]
+
+    def setxattr(
+        self,
+        path: int | str | os.PathLike[str],
+        attribute: str,
+        value: bytes,
+        flags: int = 0,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        """Log the call, noting whether it targets a descriptor; maybe refuse."""
+        on_fd = "fd" if isinstance(path, int) else "path"
+        self.calls.append(("setxattr", attribute, on_fd))
+        if attribute in self.refused:
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+
+class TestExtendedAttributes:
+    """
+    ACLs and other extended attributes survive the rewrite, or it is refused.
+
+    ``chmod`` on a file with an ACL sets the ACL *mask* from the group bits,
+    and an ACL'd file's group bits already show the mask. Copying the mode
+    without the ACL therefore hands the owning group whatever the mask
+    allowed a named user.
+    """
+
+    def test_posix_acl_survives_the_rewrite_exactly(self, tmp_path: Path) -> None:
+        """The ACL comes back byte-identical, and the owning group stays r--."""
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        target.chmod(0o600)
+        try:
+            os.setxattr(target, ACL_XATTR, _SHARED_ACL)
+        except OSError as exc:
+            if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise
+            pytest.skip(f"{tmp_path} does not support POSIX ACLs")
+        original_acl = os.getxattr(target, ACL_XATTR)
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        rewritten_acl = os.getxattr(target, ACL_XATTR)
+        assert rewritten_acl == original_acl
+        group_perms = [
+            perm for tag, perm, _ in decode_acl(rewritten_acl) if tag == ACL_GROUP_OBJ
+        ]
+        assert group_perms == [4], (
+            "the owning group's ACL entry changed; it must stay r--, never "
+            "take the mask's rw-"
+        )
+        _leftovers(tmp_path)
+
+    def test_user_xattr_is_copied_to_the_temp_fd_and_security_is_not(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``user.comment`` is copied onto the temp file; the LSM label is left.
+
+        The new file takes its ``security.*`` label from the directory's
+        policy, and setting one needs a relabel permission a confined
+        container lacks.
+        """
+        recorder = _XattrRecorder(
+            {
+                "user.comment": b"scanned by the office",
+                "security.selinux": b"system_u:object_r:etc_t:s0\x00",
+            }
+        )
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+
+        replace_file_atomically(target, _NEW)
+
+        assert ("getxattr", "user.comment") in recorder.calls
+        assert ("setxattr", "user.comment", "fd") in recorder.calls
+        touched = [call for call in recorder.calls if "security.selinux" in call]
+        assert touched == []
+        assert target.read_bytes() == _NEW.encode("utf-8")
+
+    def test_attribute_that_cannot_be_copied_refuses_the_rewrite(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refused attribute stops the write: the original and nothing else remain."""
+        recorder = _XattrRecorder(
+            {"user.comment": b"scanned by the office"},
+            refused=frozenset({"user.comment"}),
+        )
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+
+        with pytest.raises(ConfigError) as excinfo:
+            replace_file_atomically(target, _NEW)
+
+        message = str(excinfo.value)
+        assert str(target.resolve()) in message
+        assert "'user.comment'" in message
+        assert "rewrite it as its owner or remove the attribute" in message
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
+        _leftovers(tmp_path)
+
+    def test_filesystem_without_xattr_support_still_rewrites(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``listxattr`` answering ENOTSUP means there is nothing to copy."""
+
+        def unsupported(
+            path: int | str | os.PathLike[str] | None = None,
+            *,
+            follow_symlinks: bool = True,
+        ) -> list[str]:
+            """Refuse the way a filesystem without xattrs does."""
+            raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP))
+
+        monkeypatch.setattr(os, "listxattr", unsupported)
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        _leftovers(tmp_path)
+
+    def test_attributes_are_set_before_owner_and_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Every attribute is copied, then the owner, then the mode.
+
+        Setting ``user.*`` needs write permission on the file, which the
+        writer may no longer have once the original's owner and mode are on
+        it; and ``fchmod`` after the ACL keeps the group bits on the mask.
+        """
+        recorder = _XattrRecorder(
+            {
+                "user.comment": b"scanned by the office",
+                "user.origin": b"host",
+            }
+        )
+        real_fchown = os.fchown
+        real_fchmod = os.fchmod
+
+        def recording_fchown(fd: int, uid: int, gid: int) -> None:
+            """Log the owner change, then make it."""
+            recorder.calls.append(("fchown",))
+            real_fchown(fd, uid, gid)
+
+        def recording_fchmod(fd: int, mode: int) -> None:
+            """Log the mode change, then make it."""
+            recorder.calls.append(("fchmod",))
+            real_fchmod(fd, mode)
+
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+        monkeypatch.setattr(os, "fchown", recording_fchown)
+        monkeypatch.setattr(os, "fchmod", recording_fchmod)
+
+        replace_file_atomically(target, _NEW)
+
+        on_temp = [
+            call[0]
+            for call in recorder.calls
+            if call[0] in {"setxattr", "fchown", "fchmod"}
+        ]
+        assert on_temp == ["setxattr", "setxattr", "fchown", "fchmod"]
+
+    def test_new_file_copies_no_attributes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no original there is nothing to read attributes from."""
+        recorder = _XattrRecorder({"user.comment": b"scanned by the office"})
+        recorder.install(monkeypatch)
+        target = tmp_path / "saneless.toml"
+
+        replace_file_atomically(target, _NEW)
+
+        assert recorder.calls == []
+        assert target.read_bytes() == _NEW.encode("utf-8")
 
 
 class TestBindMount:
