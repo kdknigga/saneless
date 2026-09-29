@@ -23,6 +23,7 @@ import httpx2
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     PrivateAttr,
@@ -31,6 +32,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 from pydantic_settings import (
     BaseSettings,
     EnvSettingsSource,
@@ -110,12 +112,53 @@ PROFILE_LABEL_MAX_LENGTH: Final = 64
 PROFILE_DESCRIPTION_MAX_LENGTH: Final = 200
 """The longest ``profiles.<name>.description`` a config may carry."""
 
+# The pydantic error type and the fixed message a boolean in a numeric setting
+# gets.  The message names no value, so the rendered ``[section] key:`` line
+# stays free of whatever the config held, and a custom error carries no
+# "Value error," prefix the way a raised ValueError would.
+_BOOL_NOT_NUMBER_TYPE: Final = "bool_not_number"
+_BOOL_NOT_NUMBER_MESSAGE: Final = "must be a number, not true or false"
+
+
+def _refuse_bool(value: object) -> object:
+    """
+    Refuse a boolean before pydantic's lax mode reads it as 0 or 1.
+
+    ``bool`` is a subclass of ``int``, so without this ``web_port = true``
+    binds port 1 and ``resolution = true`` scans at 1 dpi.
+
+    Args:
+        value: The raw input, before int or float coercion.
+
+    Returns:
+        The input, unchanged, when it is not a boolean.
+
+    Raises:
+        PydanticCustomError: The input is ``True`` or ``False``.
+
+    """
+    if isinstance(value, bool):
+        raise PydanticCustomError(_BOOL_NOT_NUMBER_TYPE, _BOOL_NOT_NUMBER_MESSAGE)
+    return value
+
+
+# A whole-number setting that refuses a TOML boolean.  pydantic's strict
+# integer type and strict mode are not used: they also refuse a string, and
+# every SANELESS_* environment variable arrives as one, so "8080" must still
+# read as 8080.
+WholeNumber = Annotated[int, BeforeValidator(_refuse_bool)]
+
+# The float counterpart, for the same reason: strict mode would refuse the
+# string an environment variable supplies, not only the boolean.
+RealNumber = Annotated[float, BeforeValidator(_refuse_bool)]
+
 # A paperless-ngx tag or correspondent id, as a profile or a request may carry
 # one.  paperless-ngx keys are 32-bit auto-increment integers, so anything
 # outside 1..MAX_PAPERLESS_ID -- zero, a negative, a 22-digit number -- cannot
 # name a tag or correspondent.  It is refused where it enters (a load-time
 # ConfigError for a profile, a 422 for a form or query), never stored or sent.
-PaperlessId = Annotated[int, Field(ge=1, le=MAX_PAPERLESS_ID)]
+# A boolean is refused too, rather than read as tag 1.
+PaperlessId = Annotated[WholeNumber, Field(ge=1, le=MAX_PAPERLESS_ID)]
 
 
 def _dedupe_ids(values: list[int]) -> list[int]:
@@ -682,7 +725,13 @@ class ProfileConfig(BaseModel):
     description: str = Field(default="", max_length=PROFILE_DESCRIPTION_MAX_LENGTH)
 
     source: str = "Flatbed"
-    resolution: int = DEFAULT_RESOLUTION
+    # Bounded at load: zero or a negative resolution cannot be scanned.  12,800
+    # dpi is the highest value any SANE backend offers (epson2, for the
+    # Perfection 4870 and 4990), so the ceiling refuses no real device.
+    # Whether a page at a high resolution fits Pillow's pixel limit when the
+    # PDF is assembled depends on the page size too, so it is a scan-time
+    # property documented in configuration.md, not a load bound.
+    resolution: WholeNumber = Field(default=DEFAULT_RESOLUTION, ge=1, le=12_800)
     mode: str = "color"
     auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
     # How the profile scans both sides of a sheet. "manual" drives the two-pass
@@ -713,7 +762,7 @@ class ProfileConfig(BaseModel):
     # blank costs a page, dropping content costs the only copy.  Bounded to a
     # percentage; the edge trim and the darkness margin are constants in
     # saneless.pages, deliberately not settings.
-    empty_page_coverage_threshold: float = Field(default=0.001, ge=0.0, le=100.0)
+    empty_page_coverage_threshold: RealNumber = Field(default=0.001, ge=0.0, le=100.0)
     auto_generated: bool = False
 
     @model_validator(mode="before")
@@ -800,12 +849,28 @@ class OutputConfig(BaseModel):
     # modes.
     log_file: Path = Field(default_factory=_default_log_file)
     log_level: LogLevel = "INFO"
-    log_max_bytes: int = 10_485_760
-    log_backup_count: int = 5
-    history_retention_days: int = 7
-    history_max_rows: int = 500
-    paperless_task_timeout: int = 300
-    paperless_cache_ttl_seconds: int = 60
+    # The rotating handler reads 0 as "never rotate", so the log would grow
+    # without bound; at least one byte is required.
+    log_max_bytes: WholeNumber = Field(default=10_485_760, ge=1)
+    # At least one backup is kept.  A huge count makes every rollover walk that
+    # many file names, so a thousand is the ceiling.
+    log_backup_count: WholeNumber = Field(default=5, ge=1, le=1_000)
+    # The job-history prune deletes finished jobs older than this many days.
+    # Zero would delete every finished job on the next pass; there is no
+    # "unlimited" value.  About a century serves "keep forever", and a larger
+    # value overflows the prune's date arithmetic on every pass.
+    history_retention_days: WholeNumber = Field(default=7, ge=1, le=36_500)
+    # The job-history prune keeps at most this many finished jobs.  Zero would
+    # wipe the history on the next pass, and 2**63 overflows SQLite's integer
+    # so that every prune raises.
+    history_max_rows: WholeNumber = Field(default=500, ge=1, le=1_000_000)
+    # How long poll_task waits for paperless-ngx to finish consuming an
+    # upload.  Zero fails every accepted upload as unconfirmed the moment its
+    # first poll comes back unfinished; one day is far beyond any real task.
+    paperless_task_timeout: WholeNumber = Field(default=300, ge=1, le=86_400)
+    # How long the web UI's MetadataCache keeps what it fetched from
+    # paperless-ngx.  0 means never cached; a negative lifetime means nothing.
+    paperless_cache_ttl_seconds: WholeNumber = Field(default=60, ge=0)
     # The one bound on every wait for a person: the manual-duplex flip, and
     # each prompt of a multi-page scan. The outcomes differ: a flip that times
     # out fails the job, while a multi-page wait that times out finishes the
@@ -817,13 +882,15 @@ class OutputConfig(BaseModel):
     # would fail every manual-duplex job right after pass A, and a value above
     # threading.TIMEOUT_MAX makes Event.wait raise OverflowError at the same
     # point. One day is the ceiling -- far beyond any real wait.
-    operator_wait_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
-    min_free_space_mb: int = 500
+    operator_wait_timeout_seconds: WholeNumber = Field(default=600, ge=1, le=86_400)
+    # The free-space reserve a scan must leave on the working disk.  0 means
+    # no reserve; a negative reserve means nothing.
+    min_free_space_mb: WholeNumber = Field(default=500, ge=0)
     web_host: str = "0.0.0.0"
     # A TCP port number. Bounded at load because the resolver truncates a
     # service number to 16 bits, so 70000 would quietly bind port 4464 and
     # 65536 an OS-chosen one. 0 stays valid: it asks the OS for a free port.
-    web_port: int = Field(default=8080, ge=0, le=65_535)
+    web_port: WholeNumber = Field(default=8080, ge=0, le=65_535)
 
     @field_validator("tmp_dir", "data_dir", "log_file", mode="after")
     @classmethod
