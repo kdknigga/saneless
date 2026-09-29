@@ -4106,6 +4106,30 @@ class TestAutoProfiles:
             assert repr(name) in line
         assert "Added: " not in result.output
 
+    def test_auto_profiles_force_unchanged_reports_no_changes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        --force over a file that already matches the generation changes nothing.
+
+        The command says so, names nothing as refreshed, and leaves the file
+        where it was rather than replacing it with identical text.
+        """
+        config_file = tmp_path / "saneless.toml"
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+        first = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+        assert first.exit_code == 0, first.output
+        inode = config_file.stat().st_ino
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "auto-profiles", "--force"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert f"No changes to {config_file.resolve()}." in result.output
+        assert "Refreshed" not in result.output
+        assert config_file.stat().st_ino == inode
+
     def test_auto_profiles_no_source_device_keeps_default(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

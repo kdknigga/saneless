@@ -2227,10 +2227,129 @@ auto_generated = true
             "auto_generated = true\n"
         ) in config_file.read_text()
 
-    def test_merge_persisted_is_added_plus_refreshed(self, tmp_path: Path) -> None:
-        """``persisted`` names exactly the tables that now match the generation."""
-        _, result = self._write(tmp_path, force=True, extra=True)
-        assert result.persisted == frozenset({"fresh", "scan"})
+    def test_merge_persisted_is_added_refreshed_and_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        ``persisted`` names exactly the tables that now match the generation.
+
+        That is every table added or refreshed, and every flagged table
+        ``force`` found already matching: a second forced run changes nothing,
+        yet the file still holds the generated profiles.
+        """
+        config_file, first = self._write(tmp_path, force=True, extra=True)
+        assert first.persisted == frozenset({"fresh", "scan"})
+
+        second = write_profiles_to_config(
+            config_file, self._generated(extra=True), force=True
+        )
+        assert second.refreshed == ()
+        assert set(second.unchanged) == {"fresh", "scan"}
+        assert second.persisted == frozenset({"fresh", "scan"})
+
+    def test_force_on_an_unchanged_file_keeps_the_inode(self, tmp_path: Path) -> None:
+        """
+        A forced run over a file that already matches does not rewrite it.
+
+        The file keeps its inode and its bytes, nothing is reported as
+        refreshed, and the tables still count as persisted.
+        """
+        config_file = tmp_path / "saneless.toml"
+        generated = generate_profiles(
+            DeviceCapabilities(
+                sources=["Flatbed", "ADF", "ADF Duplex"],
+                resolutions=[150, 300, 600],
+                modes=["Gray", "Color"],
+            )
+        )
+        write_profiles_to_config(config_file, generated)
+        inode = config_file.stat().st_ino
+        before = config_file.read_bytes()
+
+        result = write_profiles_to_config(config_file, generated, force=True)
+
+        assert config_file.stat().st_ino == inode
+        assert config_file.read_bytes() == before
+        assert result.refreshed == ()
+        assert set(result.unchanged) == set(generated)
+        assert result.persisted == frozenset(generated)
+        assert result.describe() == []
+
+    @pytest.mark.parametrize(
+        ("stored", "key"),
+        [
+            ("resolution = 300.0", "resolution"),
+            ("resolution = 300", "auto_generated"),
+        ],
+        ids=["float-for-int", "int-for-bool"],
+    )
+    def test_force_compares_type_as_well_as_value(
+        self, tmp_path: Path, stored: str, key: str
+    ) -> None:
+        """
+        An owned key equal in value but not in type is a change, and refreshed.
+
+        ``300 == 300.0`` and ``1 == True`` hold in Python, so a comparison by
+        value alone would leave a float resolution, or a numeric flag, in the
+        file for good.
+        """
+        flag = "auto_generated = 1" if key == "auto_generated" else ""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'label = "Glass (flatbed)"\n'
+            'description = "Scans one page at a time from the glass."\n'
+            'source = "Flatbed"\n'
+            f"{stored}\n"
+            'mode = "Color"\n'
+            f"{flag or 'auto_generated = true'}\n"
+        )
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+                label="Glass (flatbed)",
+                description="Scans one page at a time from the glass.",
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated, force=True)
+
+        assert result.refreshed == ("default",)
+        table = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert type(table[key]) is type(getattr(generated["default"], key))
+
+    def test_force_treats_an_extra_owned_key_as_a_change(self, tmp_path: Path) -> None:
+        """An owned key only the file holds is a change: the refresh deletes it."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'label = "Glass (flatbed)"\n'
+            'description = "Scans one page at a time from the glass."\n'
+            'source = "Flatbed"\n'
+            "resolution = 300\n"
+            'mode = "Color"\n'
+            'duplex = "none"\n'
+            "auto_generated = true\n"
+        )
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+                label="Glass (flatbed)",
+                description="Scans one page at a time from the glass.",
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated, force=True)
+
+        assert result.refreshed == ("default",)
+        table = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert "duplex" not in table
 
     def test_merge_result_describe_lists_groups_in_order(self, tmp_path: Path) -> None:
         """One line per non-empty group, in a fixed order, names shown with repr."""
@@ -2238,18 +2357,62 @@ auto_generated = true
             path=tmp_path / "saneless.toml",
             added=("a", "b"),
             refreshed=("c",),
-            skipped_not_generated=("default",),
+            skipped_not_generated=("d", "default"),
             skipped_existing=("e",),
             removed=("f",),
         )
         assert result.describe() == [
             "Added: 'a', 'b'",
             "Refreshed: 'c'",
-            "Skipped (not auto-generated): 'default' -- not created by "
+            "Skipped (not auto-generated): 'default' -- add auto_generated = "
+            "true to its table to let auto-profiles --force refresh it",
+            "Skipped (not auto-generated): 'd' -- not created by "
             "auto-profiles (no auto_generated = true); rename or delete it to "
             "regenerate",
             "Skipped (already exists; use --force to refresh): 'e'",
             "Removed (scanner no longer offers it): 'f'",
+        ]
+
+    def test_default_gets_its_own_skip_line(self, tmp_path: Path) -> None:
+        """
+        A hand-written ``default`` is told how to hand it back, on its own line.
+
+        ``default`` cannot be renamed or deleted -- saneless requires it -- so
+        the advice every other skipped profile gets would not work for it.
+        """
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            skipped_not_generated=("default", "receipts"),
+        )
+        assert result.describe() == [
+            "Skipped (not auto-generated): 'default' -- add auto_generated = "
+            "true to its table to let auto-profiles --force refresh it",
+            "Skipped (not auto-generated): 'receipts' -- not created by "
+            "auto-profiles (no auto_generated = true); rename or delete it to "
+            "regenerate",
+        ]
+
+    def test_skip_line_without_default_is_unchanged(self, tmp_path: Path) -> None:
+        """With no ``default`` among the skipped, the one generic line remains."""
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            skipped_not_generated=("receipts",),
+        )
+        assert result.describe() == [
+            "Skipped (not auto-generated): 'receipts' -- not created by "
+            "auto-profiles (no auto_generated = true); rename or delete it to "
+            "regenerate",
+        ]
+
+    def test_skip_line_for_default_alone(self, tmp_path: Path) -> None:
+        """A skipped ``default`` alone gets its line and no empty generic one."""
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            skipped_not_generated=("default",),
+        )
+        assert result.describe() == [
+            "Skipped (not auto-generated): 'default' -- add auto_generated = "
+            "true to its table to let auto-profiles --force refresh it",
         ]
 
     def test_merge_result_describe_omits_empty_groups(self, tmp_path: Path) -> None:
