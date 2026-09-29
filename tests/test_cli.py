@@ -20,7 +20,7 @@ import time
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, NamedTuple, NoReturn
 
 import click
 import pytest
@@ -31,6 +31,7 @@ from fastapi import FastAPI
 from PIL import Image, ImageDraw
 
 import saneless.cli as cli_module
+import saneless.config as config_module
 import saneless.vocabulary as vocabulary_module
 from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
@@ -4240,6 +4241,62 @@ def _leftover_discovery(tmp_path: Path) -> ConfigDiscovery:
     return discover_config((directory / CONFIG_FILENAME,))
 
 
+class _SearchFiles(NamedTuple):
+    """The three config search candidates of one test, each spelled absolute."""
+
+    cwd: Path
+    xdg: Path
+    etc: Path
+
+
+@pytest.fixture
+def patched_search_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> _SearchFiles:
+    """
+    Redirect the three config search candidates into ``tmp_path``.
+
+    The real third candidate is ``/etc/saneless``, which no test may create or
+    write, so the search list itself is replaced.  The working directory is
+    moved into the first candidate's directory and that candidate stays
+    relative, exactly as the real one is.  Only the directories the first two
+    candidates need to exist are created: the XDG base, but not its
+    ``saneless`` directory, and nothing under ``etc`` -- whether those exist is
+    what several tests are about.
+
+    A test attaches ``_searched()`` to its settings, which is what the real
+    loader records.
+
+    Returns:
+        The three candidate files, absolute, in search order.
+
+    """
+    files = _SearchFiles(
+        cwd=tmp_path / "cwd" / CONFIG_FILENAME,
+        xdg=tmp_path / "xdg" / "saneless" / CONFIG_FILENAME,
+        etc=tmp_path / "etc" / "saneless" / CONFIG_FILENAME,
+    )
+    files.cwd.parent.mkdir(parents=True)
+    files.xdg.parent.parent.mkdir(parents=True)
+    monkeypatch.chdir(files.cwd.parent)
+    monkeypatch.setattr(
+        "saneless.config.config_search_paths",
+        lambda: (Path(CONFIG_FILENAME), files.xdg, files.etc),
+    )
+    return files
+
+
+def _searched() -> ConfigDiscovery:
+    """
+    Record the (patched) search as the real loader would, right now.
+
+    Returns:
+        The recording of a search over ``config_search_paths()``.
+
+    """
+    return discover_config(config_module.config_search_paths())
+
+
 class TestAutoProfilesRefusesAStaleOnlyConfig:
     """
     D-15: the one CLI write refuses while a superseded-name file is the only one.
@@ -4531,6 +4588,61 @@ class TestStaleConfigWarningReachesTheTerminal:
         assert f"an old {LEGACY_CONFIG_FILENAME} is being ignored" in warnings[0]
         assert f"Move anything you still need from {stale.absolute()}" in warnings[0]
         assert warnings[0].index("Move") < warnings[0].index("then delete")
+
+    def test_shadowed_config_is_warned_on_stderr(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        Two config files: the terminal names the one in use and the one not read.
+
+        A second file is the Docker trap in its settled form -- the file the
+        operator edits is not the one saneless reads -- and a one-shot command's
+        log is not in front of the person who just ran it.
+        """
+        files = patched_search_paths
+        files.cwd.write_text("# in use\n")
+        files.etc.parent.mkdir(parents=True)
+        files.etc.write_text("# not read\n")
+
+        result = self._devices(monkeypatch, tmp_path, _searched())
+
+        assert result.exit_code == 0, result.output
+        warnings = self._warnings(result)
+        assert len(warnings) == 1, result.stderr
+        assert warnings[0].startswith("Warning: Using ")
+        assert str(files.cwd) in warnings[0]
+        assert str(files.etc) in warnings[0]
+
+    def test_shadowed_and_leftover_are_both_warned(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        A shadowing file must not hide an old-name file that may hold the token.
+
+        The Configuration row can show only one of the two situations, and the
+        shadowed one wins there; the terminal has room for both lines.
+        """
+        files = patched_search_paths
+        files.cwd.write_text("# in use\n")
+        files.etc.parent.mkdir(parents=True)
+        files.etc.write_text("# not read\n")
+        stale = files.cwd.with_name(LEGACY_CONFIG_FILENAME)
+        stale.write_text(_STALE_TEXT)
+
+        result = self._devices(monkeypatch, tmp_path, _searched())
+
+        warnings = self._warnings(result)
+        assert len(warnings) == 2, result.stderr
+        assert warnings[0].startswith("Warning: Using ")
+        assert str(files.etc) in warnings[0]
+        assert f"an old {LEGACY_CONFIG_FILENAME} is being ignored" in warnings[1]
+        assert f"Move anything you still need from {stale}" in warnings[1]
 
     def test_a_loaded_file_with_nothing_beside_it_prints_no_warning(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
