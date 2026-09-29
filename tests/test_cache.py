@@ -625,6 +625,53 @@ def test_cached_lookup_failed_first_fetch_is_unavailable() -> None:
     assert cache.get("tags") is None
 
 
+def test_cached_lookup_never_overwrites_a_refresh_that_ran_during_its_fetch() -> None:
+    """
+    An older fetch finishing after a Refresh leaves the refreshed list cached.
+
+    The scan's fetch starts; the operator adds a tag in paperless-ngx and
+    presses Refresh, which invalidates the cache and stores the new list; then
+    the scan's fetch returns the list as it was.  Stored, that older list would
+    hide the new tag from the picker for a whole TTL and become the last good
+    copy.
+    """
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    older: _Rows = [{"id": 3}]
+    refreshed: _Rows = [{"id": 3}, {"id": 9}]
+
+    class _RefreshedMidFetch:
+        """A client whose tag fetch overlaps the operator's Refresh."""
+
+        def get_tags(self, *, timeout: float | None = None) -> _Rows:
+            """Let the Refresh run to completion, then answer the older list."""
+            del timeout
+            cache.invalidate("tags")
+            cache.get_or_fetch("tags", lambda: refreshed)
+            return older
+
+        def get_correspondents(self, *, timeout: float | None = None) -> _Rows:
+            """Not asked for in this test."""
+            del timeout
+            return []
+
+    ids = CachedMetadataLookup(cache, _RefreshedMidFetch()).tag_ids(fresh=True)
+
+    assert ids == frozenset({3})
+    assert cache.get("tags") is refreshed
+
+
+def test_store_if_current_declines_after_an_invalidate() -> None:
+    """The guard itself: a generation read before an invalidate stores nothing."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    generation = cache.generation("tags")
+    cache.invalidate("tags")
+
+    assert cache.store_if_current("tags", [{"id": 1}], generation) is False
+    assert cache.get("tags") is None
+    assert cache.store_if_current("tags", [{"id": 1}], cache.generation("tags"))
+    assert cache.get("tags") == [{"id": 1}]
+
+
 def test_cached_lookup_never_caches_a_non_list() -> None:
     """A stub's answer that is not a list is 'cannot tell', and is not stored."""
     cache = MetadataCache(ttl=60, clock=_FakeClock())

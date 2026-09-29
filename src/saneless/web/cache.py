@@ -99,6 +99,49 @@ class MetadataCache:
         self._store[key] = (self._clock(), data)
         self._last_good[key] = data
 
+    def generation(self, key: str) -> int:
+        """
+        Read the key's generation, to hand back to :meth:`store_if_current`.
+
+        Read it before a fetch starts: an :meth:`invalidate` during the fetch
+        bumps it, and the store then declines.
+
+        Args:
+            key: Cache key.
+
+        Returns:
+            The key's current generation.
+
+        """
+        with self._locks_guard:
+            return self._generations.get(key, 0)
+
+    def store_if_current(
+        self, key: str, data: list[dict[str, object]], generation: int
+    ) -> bool:
+        """
+        Store a fetch's result only if no invalidate ran while it was in flight.
+
+        The guard :meth:`get_or_fetch` applies to its own fetch, for a caller
+        that fetched by itself.  Without it, a fetch that started before the
+        operator's Refresh could finish after it and overwrite the refreshed
+        list, and become the last good copy, with the older data.
+
+        Args:
+            key: Cache key.
+            data: The fetched list.
+            generation: What :meth:`generation` read before the fetch started.
+
+        Returns:
+            Whether the list was stored.
+
+        """
+        with self._locks_guard:
+            if self._generations.get(key, 0) != generation:
+                return False
+            self.set(key, data)
+            return True
+
     def get_or_fetch(
         self, key: str, fetch: Callable[[], list[dict[str, object]]]
     ) -> list[dict[str, object]]:
@@ -148,8 +191,7 @@ class MetadataCache:
             cached = self.get(key)
             if cached is not None:
                 return cached
-            with self._locks_guard:
-                generation = self._generations.get(key, 0)
+            generation = self.generation(key)
             try:
                 data = fetch()
             except Exception as exc:
@@ -168,9 +210,7 @@ class MetadataCache:
                 else:
                     logger.warning(_STALE_NOT_RE_ARMED, key, reason)
                 return stale
-            with self._locks_guard:
-                if self._generations.get(key, 0) == generation:
-                    self.set(key, data)
+            self.store_if_current(key, data, generation)
             return data
 
     def _re_arm(
@@ -224,7 +264,10 @@ class CachedMetadataLookup:
     the cache's own fetch serves the last good copy when paperless-ngx is
     down, and that copy would make an unreachable paperless-ngx look like
     proof the id is still missing.  Every list the client returns is stored,
-    so the pickers see it too; a failed fetch stores nothing and answers None.
+    so the pickers see it too, unless the cache was invalidated while the
+    fetch was in flight: a Refresh that ran meanwhile stored a newer list, and
+    this older one must not replace it.  A failed fetch stores nothing and
+    answers None.
 
     Args:
         cache: The web tier's metadata cache.
@@ -251,8 +294,9 @@ class CachedMetadataLookup:
             cached = self._cache.get(kind)
             if cached is not None:
                 return metadata_ids(cached)
+        generation = self._cache.generation(kind)
         rows = fetch_metadata(self._client, kind)
         if rows is None:
             return None
-        self._cache.set(kind, rows)
+        self._cache.store_if_current(kind, rows, generation)
         return metadata_ids(rows)
