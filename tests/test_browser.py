@@ -3176,7 +3176,9 @@ def tagged_server(browser_server: _BrowserServer) -> Iterator[_BrowserServer]:
     """
     paperless = browser_server.app.state.paperless
     original = paperless.get_tags
-    paperless.get_tags = lambda: list(_BROWSER_TAGS)
+    # The keyword is the real client's: the page asks without one, and the
+    # check a scan makes before it starts asks with a timeout.
+    paperless.get_tags = lambda *, timeout=None: list(_BROWSER_TAGS)
     browser_server.app.state.cache.invalidate("tags")
     try:
         yield browser_server
@@ -3317,6 +3319,317 @@ class TestTagFilterInChromium:
             assert box is not None, index
             assert box["height"] >= 44, box
             assert box["width"] >= list_box["width"] - 2, (box, list_box)
+
+
+# ---------------------------------------------------------------------------
+# A profile's default tags and correspondent, in a real browser.
+#
+# The lists paperless-ngx is patched to answer.  Tag 99 is in neither, so the
+# profile that names it has a default paperless-ngx no longer has.
+# ---------------------------------------------------------------------------
+
+_DEFAULTS_TAGS: list[dict[str, object]] = [
+    {"id": 31, "name": "bank"},
+    {"id": 32, "name": "school"},
+    {"id": 33, "name": "garden"},
+]
+_DEFAULTS_CORRESPONDENTS: list[dict[str, object]] = [
+    {"id": 41, "name": "Acme Water"},
+    {"id": 42, "name": "Globex Power"},
+]
+# The second profile, whose defaults differ from the first's in every id, and
+# the third, whose one default tag paperless-ngx does not list.
+_RECEIPTS = "receipts"
+_ORPHANED = "orphaned"
+_GONE_TAG = 99
+# What the operator reads, spelled out rather than imported: the row's label
+# before Scan, and the job's warning after it.
+_GONE_TAG_LABEL = "tag 99 (no longer in paperless-ngx; will be skipped)"
+_GONE_TAG_WARNING = "tag 99 no longer exists in paperless-ngx and was not applied."
+
+
+def _answer_list(
+    items: list[dict[str, object]],
+) -> Callable[..., list[dict[str, object]]]:
+    """
+    Build a stand-in for ``get_tags`` or ``get_correspondents``.
+
+    Args:
+        items: The list it answers with.
+
+    Returns:
+        A callable taking the real client's keyword-only ``timeout``: the page
+        asks without one, and the check a scan makes before it starts asks
+        with one.
+
+    """
+
+    def _answer(*, timeout: float | None = None) -> list[dict[str, object]]:
+        """Answer a copy of the list, whatever the timeout."""
+        return list(items)
+
+    return _answer
+
+
+@pytest.fixture
+def defaults_server(
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app whose profiles carry different metadata defaults.
+
+    ``default`` ticks tag 31 and picks correspondent 41; ``receipts`` ticks
+    32 and 33 and picks 42; ``orphaned`` ticks only tag 99, which paperless-ngx
+    does not list, and picks no correspondent.  Both lists are patched in and
+    every upload is delivered at once, so a real scan can finish.  Private,
+    because the session server's profiles carry no defaults.
+    """
+    base = _browser_test_settings(tmp_path)
+    profiles = {
+        "default": ProfileConfig(
+            description=_FLATBED_DESCRIPTION,
+            default_tags=[31],
+            default_correspondent=41,
+        ),
+        _RECEIPTS: ProfileConfig(default_tags=[32, 33], default_correspondent=42),
+        _ORPHANED: ProfileConfig(default_tags=[_GONE_TAG]),
+    }
+    settings = base.model_copy(update={"profiles": profiles})
+    with _serve(settings, _BrowserTestScanner()) as server:
+        egress_allowlist.append(server.url)
+        paperless = server.app.state.paperless
+        monkeypatch.setattr(paperless, "get_tags", _answer_list(_DEFAULTS_TAGS))
+        monkeypatch.setattr(
+            paperless, "get_correspondents", _answer_list(_DEFAULTS_CORRESPONDENTS)
+        )
+        server.app.state.cache.invalidate("tags")
+        server.app.state.cache.invalidate("correspondents")
+        _make_paperless_deliver(server.app, monkeypatch)
+        yield server
+
+
+def _ticked_tags(page: Page) -> list[str]:
+    """
+    Return the value of every ticked tag box, in page order.
+
+    Args:
+        page: The browser page.
+
+    Returns:
+        The ticked boxes' values.
+
+    """
+    return page.locator("#tags-list input[type=checkbox]").evaluate_all(
+        "boxes => boxes.filter(box => box.checked).map(box => box.value)"
+    )
+
+
+def _choose_profile_defaults(page: Page, profile: str) -> None:
+    """
+    Choose ``profile`` and wait until the tag list and the select are replaced.
+
+    Both are swapped whole, so each is marked first and the wait is for the
+    marks to be gone, then for htmx to have settled the new elements, as
+    ``_choose_profile`` waits for the Multiple pages field.
+
+    Args:
+        page: The browser page.
+        profile: The profile to choose.
+
+    """
+    for target in ("#tags-list", "#correspondent-select"):
+        page.locator(target).evaluate("node => node.setAttribute('data-stale', '')")
+    page.select_option("#profile-select", profile)
+    expect(page.locator("#tags-list[data-stale]")).to_have_count(0)
+    expect(page.locator("#correspondent-select[data-stale]")).to_have_count(0)
+    expect(
+        page.locator("#tags-list.htmx-added, #correspondent-select.htmx-added")
+    ).to_have_count(0)
+
+
+def _captured_submit(page: Page) -> dict[str, list[str]]:
+    """
+    Press Scan and return what the browser posted, without starting a scan.
+
+    Args:
+        page: The browser page.
+
+    Returns:
+        The posted form, field by field.
+
+    """
+    submitted: list[str] = []
+
+    def _capture(route: Route) -> None:
+        submitted.append(route.request.post_data or "")
+        route.fulfill(status=200, body="")
+
+    page.route("**/api/scan", _capture)
+    with page.expect_request("**/api/scan"):
+        page.click("#scan-btn")
+    assert submitted, "no scan submit was captured"
+    return parse_qs(submitted[0], keep_blank_values=True)
+
+
+@pytest.mark.browser
+class TestProfileDefaultsInTheBrowser:
+    """The form opens on, follows, keeps and submits a profile's defaults."""
+
+    def test_first_paint_ticks_the_defaults_and_an_untouched_submit_sends_them(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """The first profile's tag is ticked, its correspondent chosen, and both sent."""
+        page.goto(defaults_server.url)
+
+        expect(page.locator("#profile-select")).to_have_value("default")
+        expect(page.locator('#tags-list input[value="31"]')).to_be_checked()
+        assert _ticked_tags(page) == ["31"]
+        expect(page.locator("#correspondent-select")).to_have_value("41")
+
+        fields = _captured_submit(page)
+
+        assert fields["profile"] == ["default"], fields
+        assert fields["tags"] == ["31"], fields
+        assert fields["correspondent"] == ["41"], fields
+
+    def test_choosing_another_profile_swaps_to_its_defaults(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        The new profile's defaults replace the first's, ticks and choice alike.
+
+        Tag 31 is unticked by the change, not by the operator: a profile's
+        defaults are what the untouched form means, so the form never shows a
+        mix of two profiles' answers.
+        """
+        page.goto(defaults_server.url)
+
+        _choose_profile_defaults(page, _RECEIPTS)
+
+        assert _ticked_tags(page) == ["32", "33"]
+        expect(page.locator('#tags-list input[value="31"]')).not_to_be_checked()
+        expect(page.locator("#correspondent-select")).to_have_value("42")
+
+        _choose_profile_defaults(page, "default")
+
+        assert _ticked_tags(page) == ["31"]
+        expect(page.locator("#correspondent-select")).to_have_value("41")
+
+        _choose_profile_defaults(page, _RECEIPTS)
+        fields = _captured_submit(page)
+
+        assert fields["profile"] == [_RECEIPTS], fields
+        assert fields["tags"] == ["32", "33"], fields
+        assert fields["correspondent"] == ["42"], fields
+
+    @pytest.mark.parametrize("served", ["as-served", "without-no-store"])
+    def test_firefox_reload_restores_the_server_rendered_defaults(
+        self,
+        playwright: Playwright,
+        defaults_server: _BrowserServer,
+        egress_allowlist: list[str],
+        served: Literal["as-served", "without-no-store"],
+    ) -> None:
+        """
+        A reload shows the profile's defaults, not what was changed by hand.
+
+        Firefox restores form state on reload unless something stops it, and
+        Chromium does not, so Firefox is the browser that can tell.  As in the
+        Multiple pages reload test, the second case strips ``no-store`` from
+        the page on its way to the browser, so ``autocomplete="off"`` on the
+        box and on the select is all that stands between the reload and an
+        untick the operator made, or a correspondent they picked, coming back
+        over the server's defaults.
+
+        The reads after the reload are single reads, not retrying assertions,
+        so they cannot pass on a moment before a restore.
+        """
+        url = defaults_server.url
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        firefox = playwright.firefox.launch()
+        try:
+            ctx = firefox.new_context()
+            ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            if served == "without-no-store":
+                ctx.route(f"{url}/", _drop_cache_control)
+            _make_csp_gate(ctx, violations)
+            page = ctx.new_page()
+            page.goto(url)
+            box = page.locator('#tags-list input[value="31"]')
+            select = page.locator("#correspondent-select")
+            expect(box).to_be_checked()
+            box.uncheck()
+            select.select_option("42")
+            expect(box).not_to_be_checked()
+            expect(select).to_have_value("42")
+
+            page.reload()
+
+            expect(box).to_have_count(1)
+            assert box.is_checked(), "Firefox restored the untick on reload"
+            assert select.input_value() == "41", "Firefox restored the choice"
+        finally:
+            firefox.close()
+        assert seen, "the hand-built context's gate handled no request"
+        assert blocked == [], f"a page tried to reach the network: {blocked}"
+        assert violations == [], (
+            f"a page violated its Content-Security-Policy: {violations}"
+        )
+
+    def test_stale_defaults_stay_ticked_with_their_note_and_end_warned(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        A default paperless-ngx lost is shown, sent, dropped and named.
+
+        The row stays ticked so the untouched submit still carries the id;
+        the scan then drops it and the job ends as an upload with a warning
+        that names the tag.
+        """
+        page.goto(defaults_server.url)
+        _choose_profile_defaults(page, _ORPHANED)
+
+        stale = page.locator(f'#tags-list input[value="{_GONE_TAG}"]')
+        expect(stale).to_be_checked()
+        assert _ticked_tags(page) == [str(_GONE_TAG)]
+        # The row's own text is the label: the box inside it has none.
+        row = page.locator("#tags-list label.tag-option").filter(
+            has=page.locator(f'input[value="{_GONE_TAG}"]')
+        )
+        expect(row).to_have_text(_GONE_TAG_LABEL)
+        page.fill("#title-input", "Stale Default")
+
+        with page.expect_request("**/api/scan") as submitted:
+            page.click("#scan-btn")
+
+        fields = parse_qs(submitted.value.post_data or "")
+        assert fields["tags"] == [str(_GONE_TAG)], fields
+        status = page.locator("#status-area")
+        expect(status.locator(".status-fallback").first).to_be_visible(timeout=15_000)
+        expect(status).to_contain_text("Uploaded with a warning: Stale Default")
+        expect(status).to_contain_text(_GONE_TAG_WARNING)
+        expect(status).not_to_contain_text("Done: Stale Default")
+
+    def test_unticked_stale_defaults_are_not_sent_and_end_clean(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """Unticked, the id is not submitted and the scan is a plain Done."""
+        page.goto(defaults_server.url)
+        _choose_profile_defaults(page, _ORPHANED)
+        page.uncheck(f'#tags-list input[value="{_GONE_TAG}"]')
+        page.fill("#title-input", "Cleared Default")
+
+        with page.expect_request("**/api/scan") as submitted:
+            page.click("#scan-btn")
+
+        fields = parse_qs(submitted.value.post_data or "")
+        assert "tags" not in fields, fields
+        status = page.locator("#status-area")
+        expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
+        expect(status).to_contain_text("Done: Cleared Default")
+        expect(status).not_to_contain_text(_GONE_TAG_WARNING)
 
 
 # ---------------------------------------------------------------------------
