@@ -268,7 +268,11 @@ later` (exit 3). Upgrade paperless-ngx first.
 
 - An upload is sent again only when it cannot have reached paperless-ngx, for
   about 60 seconds, so a paperless-ngx restart is ridden out before the
-  consume-directory fallback is used. An upload that may have arrived is never
+  consume-directory fallback is used -- when saneless reaches paperless-ngx
+  directly. Behind a reverse proxy, a restarting paperless-ngx usually shows
+  up as a `502` or `503` from the proxy, which is treated as an upload that
+  may have arrived: amber, exit 9, the PDF in `failed/`, no retry and no
+  consume-folder copy. An upload that may have arrived is never
   resent or copied: it ends amber, **May be in paperless-ngx**, with the PDF
   in `failed/`, and `saneless scan` exits 9. Check paperless-ngx before you
   scan again.

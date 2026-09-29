@@ -248,7 +248,9 @@ The line starts with `Paperless error:`.
   [Saved to the consume folder](#saved-to-the-consume-folder-exit-6). Without one, the scan
   fails, and the line says it could not connect for 60s. An upload that failed after the whole
   file was sent, or that got a 5xx, is not this case and is never sent again: it is
-  [exit 9](#the-document-may-already-be-in-paperless-ngx-exit-9). Check that
+  [exit 9](#the-document-may-already-be-in-paperless-ngx-exit-9). That includes a paperless-ngx
+  restart behind a reverse proxy: the proxy answers `502` or `503` while paperless-ngx is down,
+  so the scan ends amber rather than being retried here. Check that
   `paperless.url` is reachable from where saneless runs. A `https://` certificate that this
   machine does not trust also arrives here, reported as unreachable in both the log and the web
   UI -- see **TLS certificate not trusted** below before you go looking at the network.
