@@ -38,6 +38,7 @@ from saneless.exceptions import (
     NoScannerFoundError,
     PaperlessError,
     PaperlessTimeoutError,
+    PaperlessUncertainSendError,
     PaperlessUnconfirmedError,
     PdfError,
     ScanCancelledError,
@@ -7813,6 +7814,41 @@ class TestRunGuard:
             f"{kept[0]}. {kept[0].name} had already been accepted by paperless-ngx "
             f"as task task-uuid-1, which had not confirmed it was consumed, so "
             f"check paperless-ngx before uploading it again"
+        )
+
+    def test_run_guard_cautions_the_copy_of_an_upload_with_no_answer(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
+        """
+        An upload sent whole with no usable answer puts the caution on the copy.
+
+        That is where a duplicate is likeliest, so the kept sentence -- which
+        is all some surfaces show -- has to say to check paperless-ngx first,
+        as it does for an interrupted send.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = PaperlessUncertainSendError("Timed out reading the answer")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = original
+
+        with pytest.raises(PaperlessUncertainSendError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Answer", job_id="job-guard-7"
+                ),
+            )
+
+        assert excinfo.value is original
+        paperless.poll_task.assert_not_called()
+        kept = list(failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        assert failure_text(excinfo.value) == (
+            f"Timed out reading the answer. The scan was preserved at {kept[0]}. "
+            f"{kept[0].name} was sent to paperless-ngx without a usable answer and "
+            f"may have arrived, so check paperless-ngx before uploading it again"
         )
 
     def test_run_guard_keeps_the_pages_of_an_interrupted_run(

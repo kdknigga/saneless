@@ -26,6 +26,7 @@ from saneless.exceptions import (
     ConfigError,
     DiskSpaceError,
     NoScannerFoundError,
+    PaperlessUncertainSendError,
     PaperlessUnconfirmedError,
     ScanCancelledError,
     ScanError,
@@ -992,6 +993,14 @@ def _require_pages(batch: ScanBatch) -> None:
 # was being sent: the request left, and no answer said whether it landed.
 _MAY_HAVE_ARRIVED: Final = (
     "was being sent to paperless-ngx when the scan was interrupted and may have arrived"
+)
+
+# How a kept PDF reached paperless-ngx when the whole upload was sent and no
+# usable answer came back: a read timeout, a 5xx, a 200 without a task id.
+# This is the case where a duplicate is likeliest, so the kept copy carries the
+# caution even where only the kept sentence is read.
+_SENT_WITHOUT_ANSWER: Final = (
+    "was sent to paperless-ngx without a usable answer and may have arrived"
 )
 
 
@@ -3298,7 +3307,8 @@ class _PipelineRun:
         # say so, or following the usual advice to upload it would make a
         # duplicate.  An interruption while the request is on its way is the
         # same risk unconfirmed: paperless-ngx may have created the document
-        # before the answer was cut off.  The record is made inside the try,
+        # before the answer was cut off, and so is an upload that was sent
+        # whole and got no usable answer.  The record is made inside the try,
         # so a signal landing between the two is still caught.
         try:
             upload = self.paperless.upload_document(
@@ -3307,6 +3317,9 @@ class _PipelineRun:
             self.artefacts.accepted[pdf_path] = _accepted_how(upload)
         except ScanInterrupted:
             self.artefacts.accepted.setdefault(pdf_path, _MAY_HAVE_ARRIVED)
+            raise
+        except PaperlessUncertainSendError:
+            self.artefacts.accepted.setdefault(pdf_path, _SENT_WITHOUT_ANSWER)
             raise
         return upload
 
