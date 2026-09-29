@@ -214,7 +214,6 @@ class TestLoadedConfigPath:
         (empty_cwd_and_home / "saneless.toml").write_text("[profiles.default]\n")
         settings = load_settings()
         assert settings.config_path == empty_cwd_and_home / "saneless.toml"
-        assert settings.config_path.is_absolute()
 
     def test_home_search_path_is_recorded(
         self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch

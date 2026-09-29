@@ -12,6 +12,7 @@ import difflib
 import logging
 import os
 import re
+import stat
 import tempfile
 import tomllib
 from collections.abc import Mapping
@@ -219,13 +220,30 @@ class ConfigDiscovery:
     An explicit ``--config`` path searches nothing, so it records ``explicit``
     with empty ``searched`` and ``stale``.
 
+    Every path is recorded absolute, made so against the working directory at
+    load and never resolved through symlinks: a relative path means nothing to
+    a reader who does not know that directory, and the path the operator wrote
+    is the one they will recognise.
+
+    One file is one file.  Running from inside the XDG directory makes the
+    relative first candidate name the same file as the second, and a
+    ``./saneless.toml`` may be a symlink to either of the others.  Such an
+    alias is recorded in ``duplicates`` and kept out of ``found``, so the file
+    in use is never also reported as a file that was not read.
+
     Attributes:
         explicit: The path given on the command line, or None when the search
             list was used.
-        searched: Every candidate looked at, in search order.
-        found: The candidates that are regular files, in search order.
+        searched: Every candidate looked at, in search order.  An alias stays
+            here, because ``documented_spelling`` and ``doctor``'s table read
+            this tuple by position.
+        found: The candidates that are regular files, in search order, each
+            file once.
         loaded: The candidate the settings came from, or None.
         stale: Existing superseded-name files beside a candidate, in search
+            order, each file once.
+        duplicates: Candidates that exist but are the same file as an earlier
+            entry of ``found``, reached through another spelling, in search
             order.
 
     """
@@ -235,6 +253,7 @@ class ConfigDiscovery:
     found: tuple[Path, ...]
     loaded: Path | None
     stale: tuple[Path, ...]
+    duplicates: tuple[Path, ...] = ()
 
     def documented_spelling(self, path: Path) -> str:
         """
@@ -264,15 +283,73 @@ class ConfigDiscovery:
         raise ValueError(msg)
 
 
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """
+    Say which regular file a path names, without opening it.
+
+    ``stat()`` follows symlinks, so a link and its target give the same
+    answer, which is the point: the answer is the file, not the spelling.
+
+    Args:
+        path: The path to look at.
+
+    Returns:
+        The file's ``(st_dev, st_ino)``, or None when nothing can be stat-ed
+        there or what is there is not a regular file.
+
+    """
+    try:
+        status = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(status.st_mode):
+        return None
+    return (status.st_dev, status.st_ino)
+
+
+def _first_of_each_file(
+    paths: tuple[Path, ...],
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """
+    Split the paths that name a regular file into first sightings and aliases.
+
+    Args:
+        paths: The paths to look at, in search order.
+
+    Returns:
+        The first path to each distinct file, then every later path to a file
+        already seen; both in search order, and neither holding a path to
+        nothing.
+
+    """
+    seen: set[tuple[int, int]] = set()
+    first: list[Path] = []
+    again: list[Path] = []
+    for path in paths:
+        identity = _file_identity(path)
+        if identity is None:
+            continue
+        if identity in seen:
+            again.append(path)
+        else:
+            seen.add(identity)
+            first.append(path)
+    return tuple(first), tuple(again)
+
+
 def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
     """
     Look for a configuration file, and for superseded-name files beside one.
 
     The whole search, in one place, so what was found is recorded once rather
-    than re-derived by each surface that reports it.  Only ``is_file()`` is
-    called, on the candidates and on their superseded-name siblings alike: a
-    sibling that is invalid TOML must not break the load, and a live token in
-    one must not reach the settings.
+    than re-derived by each surface that reports it.  Each candidate and each
+    superseded-name sibling is ``stat()``-ed once, to learn whether it is a
+    regular file and which file it is, and none is ever opened: a sibling that
+    is invalid TOML must not break the load, and a live token in one must not
+    reach the settings.  A path that cannot be stat-ed counts as not found.
+
+    The candidates are made absolute first, so the recording carries no path
+    whose meaning depends on the working directory.
 
     Args:
         candidates: The paths to search, in priority order.
@@ -281,20 +358,18 @@ def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
         The recording, with the first existing candidate as ``loaded``.
 
     """
-    found = tuple(candidate for candidate in candidates if candidate.is_file())
-    stale = tuple(
-        sibling
-        for sibling in (
-            candidate.with_name(LEGACY_CONFIG_FILENAME) for candidate in candidates
-        )
-        if sibling.is_file()
+    searched = tuple(candidate.absolute() for candidate in candidates)
+    found, duplicates = _first_of_each_file(searched)
+    stale, _ = _first_of_each_file(
+        tuple(candidate.with_name(LEGACY_CONFIG_FILENAME) for candidate in searched)
     )
     return ConfigDiscovery(
         explicit=None,
-        searched=candidates,
+        searched=searched,
         found=found,
         loaded=found[0] if found else None,
         stale=stale,
+        duplicates=duplicates,
     )
 
 
@@ -2094,7 +2169,8 @@ def load_settings(config_path: str | None = None) -> Settings:
     Returns:
         Fully validated Settings instance carrying ``config_path``: the
         explicit path with ``~`` expanded, else the first search path that is
-        a regular file, else None when no file was found.
+        a regular file, else None when no file was found.  A path is always
+        recorded absolute.
 
     Raises:
         ConfigError: If an explicit path is empty, cannot have its ``~``
@@ -2123,6 +2199,10 @@ def load_settings(config_path: str | None = None) -> Settings:
         if not explicit.is_file():
             msg = f"Config file not found or not a regular file: {explicit}"
             raise ConfigError(msg)
+        # Recorded absolute, as the searched paths are: every surface that
+        # names this file reads the recording, and a relative path means
+        # nothing without the directory it was relative to.
+        explicit = explicit.absolute()
         path = explicit
         # An explicit path searches nothing, so it detects nothing: there is
         # no search list for a superseded-name file to sit beside.
