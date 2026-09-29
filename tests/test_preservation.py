@@ -43,7 +43,7 @@ _TITLE = "Kept Scan"
 # What build_pdf_filename makes of the job id and title above, after the
 # timestamp: every name this module writes for the run ends with it.
 _NAME_TAIL = "job-pres-kept-scan"
-_MIB = 1024 * 1024
+_MB = 1_000_000
 _PRIVATE_FILE_MODE = 0o600
 
 
@@ -855,7 +855,7 @@ class TestTheTwiceTheSpoolRule:
     def _need(self, records: tuple[PageRecord, ...], reserve_mb: int) -> int:
         """Return the bytes the rule asks for."""
         spooled = sum(record.path.stat().st_size for record in records)
-        return 2 * spooled + reserve_mb * _MIB
+        return 2 * spooled + reserve_mb * _MB
 
     def test_one_byte_short_is_a_disk_space_refusal_with_the_numbers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -876,8 +876,8 @@ class TestTheTwiceTheSpoolRule:
         assert classify_error(excinfo.value) is ErrorCategory.DISK_SPACE
         message = str(excinfo.value)
         assert message.startswith("Not enough free disk space to assemble 3 page(s)")
-        assert f"{math.ceil(need / _MIB)} MB needed" in message
-        assert f"{(need - 1) // _MIB} MB free" in message
+        assert f"{math.ceil(need / _MB)} MB needed" in message
+        assert f"{(need - 1) // _MB} MB free" in message
         assert "3 page(s)" in message
         assert str(tmp_path) in message
         assert "min_free_space_mb" in message

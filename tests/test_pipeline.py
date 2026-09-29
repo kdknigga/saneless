@@ -4550,7 +4550,8 @@ class TestFailedDirWarning:
             if str(failed_dir) in record.getMessage()
         )
         assert str(FAILED_DIR_WARN_THRESHOLD) in message
-        assert "MiB" in message
+        assert " MB)" in message
+        assert "MiB" not in message
         assert str(failed_dir) in message
 
     def test_failed_dir_warning_is_silent_below_the_threshold(
@@ -4569,7 +4570,7 @@ class TestFailedDirWarning:
         assert [
             record.getMessage()
             for record in caplog.records
-            if "MiB" in record.getMessage()
+            if "have accumulated in" in record.getMessage()
         ] == []
 
     def test_failed_dir_warning_deletes_nothing(
@@ -5240,7 +5241,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         )
         # Below the reserve alone, so below twice the spool plus the reserve.
         monkeypatch.setattr(
-            preservation_module, "_free_bytes", lambda _directory: 1024 * 1024
+            preservation_module, "_free_bytes", lambda _directory: 1_000_000
         )
         assembling = MagicMock()
 
@@ -5389,10 +5390,11 @@ class TestFailedDirCountsPreservedPageDirectories:
             if str(failed_dir) in record.getMessage()
         )
         assert str(FAILED_DIR_WARN_THRESHOLD) in message
-        # 2 x 110 KiB of page files plus 19 x 512 bytes of PDFs.  A size sum
-        # that skipped the directories, or walked only their top level, would
-        # report 0.0 or 0.1 here.
-        assert "0.2 MiB" in message
+        # 2 x 110 KiB of page files plus 19 x 512 bytes of PDFs: 235,008
+        # bytes.  A size sum that skipped the directories, or walked only
+        # their top level, would report 0.0 or 0.1 here.
+        assert "0.2 MB" in message
+        assert "MiB" not in message
 
     def test_failed_dir_stays_silent_below_the_threshold_with_directories(
         self,
@@ -5410,7 +5412,7 @@ class TestFailedDirCountsPreservedPageDirectories:
         assert [
             record.getMessage()
             for record in caplog.records
-            if "MiB" in record.getMessage()
+            if "have accumulated in" in record.getMessage()
         ] == []
 
     def test_failed_dir_counts_directories_never_raises_on_a_vanished_walk(
