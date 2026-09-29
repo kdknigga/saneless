@@ -152,9 +152,14 @@ def _snap_into_range(target: int, resolution_range: tuple[float, float, float]) 
     Clamp a target into a reported range and snap it onto the range's step.
 
     Clamping alone is not enough. A range says the device accepts values from
-    its minimum to its maximum *in increments of its step*, so a value inside
+    its minimum *in increments of its step* up to its maximum, so a value inside
     the span but off the grid is still one the device never offered, and SANE
-    would silently substitute something else for it.
+    would silently substitute something else for it. The maximum itself need
+    not lie on the grid, so the ceiling used is the largest on-grid value not
+    above it -- clamping to the raw maximum could land off the grid.
+
+    Between two grid values the higher wins a tie, so an equidistant pick is
+    never below the target a profile asked for.
 
     A step of zero is not a defect to guard against but a documented SANE
     meaning -- the range is continuous and any value within it is acceptable --
@@ -171,13 +176,20 @@ def _snap_into_range(target: int, resolution_range: tuple[float, float, float]) 
 
     """
     low, high, step = resolution_range
-    clamped = min(max(float(target), low), high)
     if step > 0:
-        # Snap relative to the minimum, which is where the grid starts.
-        clamped = min(max(low + round((clamped - low) / step) * step, low), high)
-    # round() on a float already yields an int, which is the coercion this
-    # function exists to perform.
-    return round(clamped)
+        # The grid starts at the minimum; its top is the largest grid value
+        # that does not exceed the maximum.
+        top = low + math.floor((high - low) / step) * step
+        clamped = min(max(float(target), low), top)
+        below = low + math.floor((clamped - low) / step) * step
+        above = below + step
+        value = above if clamped - below >= above - clamped else below
+        value = min(value, top)
+    else:
+        value = min(max(float(target), low), high)
+    # Half-up coercion to whole dpi. Python's built-in rounding takes a .5 to
+    # the nearest even number, a rule about accumulated error, not scanners.
+    return math.floor(value + 0.5)
 
 
 def pick_closest_resolution(
