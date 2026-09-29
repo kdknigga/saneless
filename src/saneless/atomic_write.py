@@ -5,9 +5,10 @@ Durable, all-or-nothing replacement of a config file.
 file the operator owns. It writes the new text beside the real file, fsyncs
 it, and renames it into place, so a crash, a full disk, or a killed process
 leaves either the old file or the new one -- never a truncated config.
-It keeps the original's mode and owner, follows symlinks to the real file,
-and reports a single-file bind mount -- which cannot be renamed over -- as a
-``ConfigError`` naming the fix.
+It keeps the original's mode and owner, and its extended attributes and POSIX
+ACL -- refusing the rewrite when one of those cannot be kept -- follows
+symlinks to the real file, and reports a single-file bind mount -- which
+cannot be renamed over -- as a ``ConfigError`` naming the fix.
 
 The module knows nothing about TOML: callers produce the text, this module
 only makes the write durable.
@@ -146,6 +147,79 @@ def refused_mode_change(exc: OSError) -> bool:
     return exc.errno in _REFUSED
 
 
+# Extended attributes in this namespace are not copied: they are LSM labels
+# (SELinux, Smack, IMA), which the new file already receives from its
+# directory's policy, and setting one needs a relabel permission a confined
+# container lacks.
+_SKIPPED_XATTR_PREFIX: Final = "security."
+
+# ``listxattr`` fails with these when the filesystem has no extended
+# attributes at all, so there is nothing to copy.
+_NO_XATTR_SUPPORT: Final = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP})
+
+
+def _copy_xattrs(fd: int, target: Path) -> None:
+    """
+    Copy ``target``'s extended attributes, POSIX ACLs included, onto ``fd``.
+
+    On Linux a POSIX ACL is the ``system.posix_acl_access`` attribute, so
+    copying attributes carries it. Every name except the ``security.*`` LSM
+    labels is copied. Unlike the owner and mode, an attribute that cannot be
+    copied is not skipped: dropping an ACL can widen who reads the file, so
+    the rewrite is refused instead.
+
+    Args:
+        fd: The open temp file, still owned by this process with mode 0600.
+        target: The existing file being replaced.
+
+    Raises:
+        ConfigError: An attribute could not be read or set on the temp file.
+        OSError: Listing the attributes failed for a reason other than the
+            filesystem lacking extended attribute support.
+
+    """
+    try:
+        names = os.listxattr(target)
+    except OSError as exc:
+        if exc.errno in _NO_XATTR_SUPPORT:
+            return
+        raise
+    for name in names:
+        if name.startswith(_SKIPPED_XATTR_PREFIX):
+            continue
+        try:
+            value = os.getxattr(target, name)
+        except OSError as exc:
+            if exc.errno == errno.ENODATA:
+                # Removed since it was listed: there is nothing to drop.
+                continue
+            raise _xattr_refusal(target, name, exc) from exc
+        try:
+            os.setxattr(fd, name, value)
+        except OSError as exc:
+            raise _xattr_refusal(target, name, exc) from exc
+
+
+def _xattr_refusal(target: Path, name: str, exc: OSError) -> ConfigError:
+    """
+    Word the refusal for an extended attribute that cannot be kept.
+
+    Args:
+        target: The file being replaced.
+        name: The attribute that could not be copied.
+        exc: The error reading or setting it; its strerror names no content.
+
+    Returns:
+        The error naming the file, the attribute and the fix.
+
+    """
+    return ConfigError(
+        f"Cannot rewrite {target} without dropping its access control list or "
+        f"extended attribute {name!r} ({exc.strerror}); rewrite it as its owner "
+        "or remove the attribute, then run again"
+    )
+
+
 def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
     """
     Give the temp file the original's owner, group and permission bits.
@@ -209,6 +283,16 @@ def replace_file_atomically(path: Path, text: str) -> Path:
       neither changes who can edit the file nor widens who can read it. A
       refused change is skipped, never a failed write. A new file keeps
       mkstemp's 0600.
+    * An existing file's extended attributes -- its POSIX ACL included -- are
+      copied onto the temp file **first**, before the owner and mode.
+      Setting a ``user.*`` attribute needs write permission the writer may
+      lose once the original's owner and mode are applied; and ``fchmod`` on
+      a file with an ACL sets the ACL mask from the group bits, which on the
+      original already are its mask, so the owning group's own entry is kept
+      and is never handed the mask. Unlike a refused owner or mode, an
+      attribute that cannot be copied refuses the rewrite, because dropping
+      an ACL can widen who reads the file. ``security.*`` LSM labels are not
+      copied; the new file is labelled by its directory's policy.
     * The temp file is fsynced **before** the rename; renaming unsynced data
       can leave a zero-length file after a crash.
     * A rename refused with EBUSY means the file is a single-file bind mount;
@@ -237,7 +321,8 @@ def replace_file_atomically(path: Path, text: str) -> Path:
             read-only file mount), so it cannot be replaced, and the message
             tells the operator to mount its directory instead; or the file is
             on a read-only directory mount, and the message says to mount it
-            read-write.
+            read-write; or an extended attribute or ACL of the existing file
+            could not be copied, and the file is left as it was.
         PermissionError: The existing file, on a writable mount, is not
             writable by this process.
         OSError: Any other filesystem failure, re-raised after the temp file
@@ -269,6 +354,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     try:
         with os.fdopen(fd, "wb") as handle:
             if original is not None:
+                _copy_xattrs(handle.fileno(), target)
                 _copy_owner_and_mode(handle.fileno(), original)
             # A new file keeps mkstemp's 0600: it may hold the Paperless token.
             handle.write(text.encode("utf-8"))
