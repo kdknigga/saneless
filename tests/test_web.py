@@ -1884,8 +1884,14 @@ class TestQueueLine:
 
 
 def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) -> None:
-    """Replace the worker's profile set, under its own lock (D-19)."""
-    _app(client).state.worker._set_profiles(profiles)
+    """
+    Replace the worker's profile set, under its own lock (D-19).
+
+    The worker can refuse a set, so the answer is asserted: a refused set must
+    fail the test that built it, never leave the test passing against
+    whatever profiles happened to be there before.
+    """
+    assert _app(client).state.worker._set_profiles(profiles)
 
 
 class TestProfileDescriptionRoute:
@@ -1897,7 +1903,10 @@ class TestProfileDescriptionRoute:
         """The body is the sentence with no wrapper element around it."""
         _configure_profiles(
             client,
-            {"glass": ProfileConfig(description="Scans one page from the glass.")},
+            {
+                "glass": ProfileConfig(description="Scans one page from the glass."),
+                "default": ProfileConfig(),
+            },
         )
 
         response = client.get("/api/profiles/description", params={"profile": "glass"})
@@ -1909,7 +1918,9 @@ class TestProfileDescriptionRoute:
         self, client: TestClient
     ) -> None:
         """The name is validated against the profile set, never used as a path."""
-        _configure_profiles(client, {"glass": ProfileConfig()})
+        _configure_profiles(
+            client, {"glass": ProfileConfig(), "default": ProfileConfig()}
+        )
 
         response = client.get(
             "/api/profiles/description", params={"profile": "../../etc/passwd"}
@@ -1929,7 +1940,9 @@ class TestProfileDescriptionRoute:
         self, client: TestClient
     ) -> None:
         """A byte-empty body is what lets the :empty CSS rule hide the slot."""
-        _configure_profiles(client, {"bare": ProfileConfig()})
+        _configure_profiles(
+            client, {"bare": ProfileConfig(), "default": ProfileConfig()}
+        )
 
         response = client.get("/api/profiles/description", params={"profile": "bare"})
 
@@ -1942,7 +1955,10 @@ class TestProfileDescriptionRoute:
         """Config free text is autoescaped and never marked safe (T-30-70)."""
         _configure_profiles(
             client,
-            {"evil": ProfileConfig(description="<script>alert(1)</script>")},
+            {
+                "evil": ProfileConfig(description="<script>alert(1)</script>"),
+                "default": ProfileConfig(),
+            },
         )
 
         response = client.get("/api/profiles/description", params={"profile": "evil"})
@@ -1976,7 +1992,8 @@ class TestProfileOrdering:
                     source="ADF",
                     label="Feeder, single-sided",
                     description="Feeds a stack of sheets.",
-                )
+                ),
+                "default": ProfileConfig(source="ADF"),
             },
         )
 
@@ -1988,15 +2005,22 @@ class TestProfileOrdering:
                 label="Feeder, single-sided",
                 description="Feeds a stack of sheets.",
             ),
+            _ProfileOption(name="default", label="default", description=""),
         )
 
     def test_a_blank_label_falls_back_to_the_profile_name(
         self, client: TestClient
     ) -> None:
         """A config written before this phase never shows a blank option (A-3)."""
-        _configure_profiles(client, {"adf-duplex": ProfileConfig(source="ADF Duplex")})
+        _configure_profiles(
+            client,
+            {
+                "adf-duplex": ProfileConfig(source="ADF Duplex"),
+                "default": ProfileConfig(source="ADF Duplex"),
+            },
+        )
 
-        (option,) = _profile_options(_app(client).state.worker)
+        option, _ = _profile_options(_app(client).state.worker)
 
         assert option.label == "adf-duplex"
 
@@ -2009,12 +2033,13 @@ class TestProfileOrdering:
             {
                 "pick": ProfileConfig(source="Auto"),
                 "stack": ProfileConfig(source="ADF"),
+                "default": ProfileConfig(source="Auto"),
             },
         )
 
         options = _profile_options(_app(client).state.worker)
 
-        assert [option.name for option in options] == ["stack", "pick"]
+        assert [option.name for option in options] == ["stack", "pick", "default"]
 
     def test_an_automatic_document_feeder_source_takes_the_feeder_ordering(
         self, client: TestClient
@@ -2031,12 +2056,13 @@ class TestProfileOrdering:
             {
                 "mystery": ProfileConfig(source="Whatever"),
                 "feeder": ProfileConfig(source="Automatic Document Feeder"),
+                "default": ProfileConfig(source="Whatever"),
             },
         )
 
         options = _profile_options(_app(client).state.worker)
 
-        assert [option.name for option in options] == ["feeder", "mystery"]
+        assert [option.name for option in options] == ["feeder", "mystery", "default"]
 
     def test_config_order_survives_inside_each_group_of_the_sheet_fed_ordering(
         self, client: TestClient
@@ -2049,6 +2075,7 @@ class TestProfileOrdering:
                 "stack-1": ProfileConfig(source="ADF"),
                 "pick-2": ProfileConfig(source="Auto"),
                 "stack-2": ProfileConfig(source="ADF Duplex"),
+                "default": ProfileConfig(source="Auto"),
             },
         )
 
@@ -2059,6 +2086,7 @@ class TestProfileOrdering:
             "stack-2",
             "pick-1",
             "pick-2",
+            "default",
         ]
 
     def test_a_flatbed_source_anywhere_leaves_the_ordering_alone(
@@ -2070,19 +2098,27 @@ class TestProfileOrdering:
             {
                 "glass": ProfileConfig(source="Flatbed"),
                 "stack": ProfileConfig(source="ADF"),
+                "default": ProfileConfig(),
             },
         )
 
         options = _profile_options(_app(client).state.worker)
 
-        assert [option.name for option in options] == ["glass", "stack"]
+        assert [option.name for option in options] == ["glass", "stack", "default"]
 
     def test_a_profile_that_disappears_mid_build_is_dropped_from_the_ordering(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A profile rewritten between the two locked calls is skipped, not None."""
         worker = _app(client).state.worker
-        _configure_profiles(client, {"stays": ProfileConfig(), "goes": ProfileConfig()})
+        _configure_profiles(
+            client,
+            {
+                "stays": ProfileConfig(),
+                "goes": ProfileConfig(),
+                "default": ProfileConfig(),
+            },
+        )
         real_lookup = worker.get_profile
         monkeypatch.setattr(
             worker,
@@ -2092,7 +2128,7 @@ class TestProfileOrdering:
 
         options = _profile_options(worker)
 
-        assert [option.name for option in options] == ["stays"]
+        assert [option.name for option in options] == ["stays", "default"]
 
     def test_the_rendered_option_ordering_matches_the_rule(
         self, client: TestClient
@@ -2103,6 +2139,7 @@ class TestProfileOrdering:
             {
                 "pick": ProfileConfig(source="Auto"),
                 "stack": ProfileConfig(source="ADF"),
+                "default": ProfileConfig(source="Auto"),
             },
         )
 
@@ -2171,6 +2208,7 @@ class TestProfileSelectMarkup:
             {
                 "glass": ProfileConfig(source="Flatbed", label="Glass (flatbed)"),
                 "bare": ProfileConfig(source="Flatbed"),
+                "default": ProfileConfig(),
             },
         )
 
@@ -2201,7 +2239,8 @@ class TestProfileSelectMarkup:
             {
                 "glass": ProfileConfig(
                     source="Flatbed", description="Scans one page from the glass."
-                )
+                ),
+                "default": ProfileConfig(),
             },
         )
 

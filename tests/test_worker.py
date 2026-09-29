@@ -4525,11 +4525,12 @@ class TestWorkerProfileLock:
         store = JobStore()
         try:
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
-            worker._set_profiles(replacement)
+            swapped = worker._set_profiles(replacement)
             names = worker.profile_names()
         finally:
             store.close()
 
+        assert swapped is True
         assert names == ["default", "flatbed"]
         assert default_settings.profiles is not old
         assert default_settings.profiles is not replacement
@@ -4560,7 +4561,7 @@ class TestWorkerProfileLock:
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
             swapped_bare = worker._set_profiles(generated, only_if=is_bare_default)
             names_after_bare = worker.profile_names()
-            worker._set_profiles(customised)
+            customised_accepted = worker._set_profiles(customised)
             swapped_customised = worker._set_profiles(
                 generated, only_if=is_bare_default
             )
@@ -4570,6 +4571,7 @@ class TestWorkerProfileLock:
 
         assert swapped_bare is True
         assert names_after_bare == ["default", "adf"]
+        assert customised_accepted is True
         assert swapped_customised is False
         assert names_after_customised == ["default", "photo"]
 
@@ -4620,14 +4622,14 @@ class TestWorkerProfileLock:
             try:
                 barrier.wait(_STATE_BUDGET)
                 for round_number in range(_PROFILE_LOCK_ROUNDS):
-                    worker._set_profiles(second if round_number % 2 else first)
+                    assert worker._set_profiles(second if round_number % 2 else first)
             except Exception as exc:  # recorded and asserted on below
                 errors.append(exc)
 
         threads = [threading.Thread(target=reader) for _ in range(4)]
         threads.append(threading.Thread(target=writer))
         try:
-            worker._set_profiles(first)
+            assert worker._set_profiles(first)
             for thread in threads:
                 thread.start()
         finally:
