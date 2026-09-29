@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import logging
 import secrets
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -1219,9 +1220,31 @@ class _ProfileOption:
     manual_duplex: bool = False
 
 
-def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
+@dataclass(frozen=True, slots=True)
+class _ProfileChoices:
     """
-    Build the ordered option list the Profile select renders.
+    What the Profile select offers, and which option it opens on.
+
+    Attributes:
+        options: The options to render, in the order they are rendered.
+        opening: The name of the option the page opens on: ``default`` when
+            it is offered, else the profile standing in for a hidden
+            ``default``, else the first option; ``""`` when there are none.
+
+    """
+
+    options: tuple[_ProfileOption, ...]
+    opening: str
+
+
+# The profile ``saneless scan`` uses when no ``--profile`` is named, which is
+# the one the page has to open on for an untouched form to mean the same.
+_DEFAULT_PROFILE: Final = "default"
+
+
+def _profile_options(worker: ScanWorker) -> _ProfileChoices:
+    """
+    Build the ordered option list the Profile select renders, and its opening.
 
     Feeder profiles come first on a sheet-fed device, and this is
     where ``has_flatbed`` is read: sheet-fed means the device reports no
@@ -1238,15 +1261,24 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
     of the single-page group, and this function inherits that answer rather
     than asking again.
 
+    A generated ``default`` that equals another profile is not offered: it
+    would be a second option scanning the same way under the same words, and
+    the first profile it equals stands in for it, so the page still opens on
+    what ``saneless scan`` with no ``--profile`` does.  The name stays valid
+    everywhere else -- the CLI, the config and ``POST /api/scan`` all still
+    take it.  Any label two offered options still share then gets the profile
+    name after it, for every member of the group.
+
     Args:
         worker: The worker whose profile set is being rendered.
 
     Returns:
-        One option per configured profile, feeder-first when the device is
-        sheet-fed and in configuration order otherwise.
+        One option per offered profile, feeder-first when the device is
+        sheet-fed and in configuration order otherwise, and the name of the
+        option the page opens on.
 
     """
-    entries: list[tuple[_ProfileOption, SourceKind]] = []
+    read: dict[str, ProfileConfig] = {}
     for name in worker.profile_names():
         profile = worker.get_profile(name)
         if profile is None:
@@ -1256,29 +1288,108 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
             # be, and there is nothing to show under a name that no longer
             # names anything.
             continue
-        entries.append(
-            (
-                _ProfileOption(
-                    name=name,
-                    # A deployed config whose profiles predate the ``label``
-                    # key carries an empty human name: startup
-                    # generation only runs on a bare default config, so it is
-                    # skipped there, and a blank option is worse than a raw
-                    # profile name.  ``saneless auto-profiles --force`` is what
-                    # backfills the text, and the how-to says so.
-                    label=profile.label or name,
-                    description=profile.description,
-                    manual_duplex=_is_manual_duplex(profile),
-                ),
-                classify_source(profile.source),
-            )
+        read[name] = profile
+    # Over every profile read, the hidden twin included: a twin shares its
+    # stand-in's source, so leaving it out could never change the answer.
+    sheet_fed = not any(
+        classify_source(profile.source) is SourceKind.FLATBED
+        for profile in read.values()
+    )
+    stand_in = _default_stand_in(read)
+    if stand_in is not None:
+        del read[_DEFAULT_PROFILE]
+    entries = [
+        (
+            _ProfileOption(
+                name=name,
+                # A deployed config whose profiles predate the ``label`` key
+                # carries an empty human name: startup generation only runs on
+                # a bare default config, so it is skipped there, and a blank
+                # option is worse than a raw profile name.  ``saneless
+                # auto-profiles --force`` is what backfills the text, and the
+                # how-to says so.
+                label=profile.label or name,
+                description=profile.description,
+                manual_duplex=_is_manual_duplex(profile),
+            ),
+            classify_source(profile.source),
         )
-    sheet_fed = not any(kind is SourceKind.FLATBED for _, kind in entries)
+        for name, profile in read.items()
+    ]
     if sheet_fed:
         # A stable sort, so configuration order survives inside each group and
         # the only thing this changes is which group comes first.
         entries.sort(key=lambda entry: not entry[1].uses_feeder)
-    return tuple(option for option, _ in entries)
+    options = _distinct_labels(tuple(option for option, _ in entries))
+    names = [option.name for option in options]
+    if _DEFAULT_PROFILE in names:
+        opening = _DEFAULT_PROFILE
+    elif stand_in is not None:
+        opening = stand_in
+    else:
+        opening = names[0] if names else ""
+    return _ProfileChoices(options=options, opening=opening)
+
+
+def _default_stand_in(profiles: dict[str, ProfileConfig]) -> str | None:
+    """
+    Name the profile a generated ``default`` twin is hidden behind, if any.
+
+    The whole profile is compared rather than a hand-picked subset of its
+    fields, the rule ``is_bare_default`` follows, so a field added to the
+    model later cannot be silently left out of the comparison, and any edit
+    an operator makes to ``default`` -- default tags, a title, a mode --
+    shows it again.  Only a generated ``default`` is hidden: one an operator
+    wrote is theirs to show, even when it happens to match another profile.
+
+    Args:
+        profiles: The profiles read for this render, in configuration order.
+
+    Returns:
+        The first profile in configuration order that equals a generated
+        ``default``, or None when ``default`` is absent, hand-written or
+        equal to no other profile.
+
+    """
+    default = profiles.get(_DEFAULT_PROFILE)
+    if default is None or not default.auto_generated:
+        return None
+    return next(
+        (
+            name
+            for name, profile in profiles.items()
+            if name != _DEFAULT_PROFILE and profile == default
+        ),
+        None,
+    )
+
+
+def _distinct_labels(
+    options: tuple[_ProfileOption, ...],
+) -> tuple[_ProfileOption, ...]:
+    """
+    Append the profile name to every label two or more options share.
+
+    A household member must never see two options with the same text and no
+    way to tell which is which.  Generated labels are already unique, but a
+    hand-written config can still collide, and so can an edited ``default``
+    beside the profile it was copied from.  Every member of a shared group is
+    suffixed, not only the later ones, so none of them reads as the plain one.
+
+    Args:
+        options: The options in render order.
+
+    Returns:
+        The same options in the same order, with shared labels made distinct.
+
+    """
+    counts = Counter(option.label for option in options)
+    return tuple(
+        replace(option, label=f"{option.label} ({option.name})")
+        if counts[option.label] > 1
+        else option
+        for option in options
+    )
 
 
 def _is_manual_duplex(profile: ProfileConfig) -> bool:
@@ -1363,10 +1474,11 @@ def index(request: Request) -> Response:
 
     Populates profile selector from the worker's profile set (read under its
     profile lock), fetches tags and correspondents from cache or
-    paperless-ngx, and loads recent job history from the database.  The tag
-    list and the correspondent select open on the first profile's defaults,
-    ticked and selected, so an untouched submit scans with exactly what
-    ``saneless scan --profile`` would.
+    paperless-ngx, and loads recent job history from the database.  The page
+    opens on ``default``, or on the profile standing in for a hidden
+    ``default``, and the tag list and the correspondent select open on that
+    profile's defaults, ticked and selected, so an untouched submit scans with
+    exactly what ``saneless scan`` with no ``--profile`` would.
     """
     state = request.app.state
     # The refresher only probes while a page says someone is looking, so
@@ -1374,12 +1486,19 @@ def index(request: Request) -> Response:
     # lazy thread returns at its first guard for ever and the strip never
     # leaves its cold-start rows.
     state.refresher.note_watcher()
-    profiles = _profile_options(state.worker)
+    choices = _profile_options(state.worker)
+    # The option the page opens on, found by the name the choices chose, so the
+    # select, the sentence beneath it and the Multiple pages field all read the
+    # same profile.  None only when there are no options at all.
+    opening_option = next(
+        (option for option in choices.options if option.name == choices.opening),
+        None,
+    )
     # The profile the page opens on, looked up once under the worker's lock as
     # ``start_scan`` looks it up.  None when there is no profile, or when the
     # set was rewritten between listing and reading it; the page then opens
     # with nothing ticked, which is what a profile without defaults means too.
-    opening = state.worker.get_profile(profiles[0].name) if profiles else None
+    opening = state.worker.get_profile(choices.opening) if choices.opening else None
     # A full page render is the unfiltered case of the same context the filter
     # route builds, ticked with the opening profile's defaults, so it goes
     # through the same function rather than a second shape the two could
@@ -1416,20 +1535,24 @@ def index(request: Request) -> Response:
         request,
         "index.html",
         {
-            "profiles": profiles,
+            "profiles": choices.options,
             # Which option the page opens on, and the sentence that goes with
-            # it.  A browser selects the first option when none is marked, so
-            # naming the first one here is the only way the highlighted option
-            # and the description beneath it cannot disagree on first paint --
-            # and after the feeder-first regrouping the first option is no longer
-            # necessarily the first profile in the config file.
-            "selected": profiles[0].name if profiles else "",
-            "selected_description": profiles[0].description if profiles else "",
+            # it: the profile ``saneless scan`` uses with no ``--profile``, or
+            # the profile standing in for it, wherever it sits in the list.  A
+            # browser selects the first option when none is marked, and the
+            # first option is seldom ``default``, so the option is named here
+            # and the highlighted option and the description beneath it cannot
+            # disagree on first paint.
+            "selected": choices.opening,
+            "selected_description": (
+                opening_option.description if opening_option is not None else ""
+            ),
             # The Multiple pages field for the profile the page opens on, and
             # never ticked: the choice is made per scan, so a page load starts
             # it afresh.
             **_multi_page_field(
-                manual_duplex=bool(profiles) and profiles[0].manual_duplex,
+                manual_duplex=opening_option is not None
+                and opening_option.manual_duplex,
                 ticked=False,
             ),
             **tag_list,

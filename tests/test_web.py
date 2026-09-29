@@ -1999,7 +1999,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker)
+        options = _profile_options(_app(client).state.worker).options
 
         assert options == (
             _ProfileOption(
@@ -2022,7 +2022,7 @@ class TestProfileOrdering:
             },
         )
 
-        option, _ = _profile_options(_app(client).state.worker)
+        option, _ = _profile_options(_app(client).state.worker).options
 
         assert option.label == "adf-duplex"
 
@@ -2039,7 +2039,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker)
+        options = _profile_options(_app(client).state.worker).options
 
         assert [option.name for option in options] == ["stack", "pick", "default"]
 
@@ -2062,7 +2062,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker)
+        options = _profile_options(_app(client).state.worker).options
 
         assert [option.name for option in options] == ["feeder", "mystery", "default"]
 
@@ -2081,7 +2081,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker)
+        options = _profile_options(_app(client).state.worker).options
 
         assert [option.name for option in options] == [
             "stack-1",
@@ -2104,7 +2104,7 @@ class TestProfileOrdering:
             },
         )
 
-        options = _profile_options(_app(client).state.worker)
+        options = _profile_options(_app(client).state.worker).options
 
         assert [option.name for option in options] == ["glass", "stack", "default"]
 
@@ -2128,7 +2128,7 @@ class TestProfileOrdering:
             lambda name: None if name == "goes" else real_lookup(name),
         )
 
-        options = _profile_options(worker)
+        options = _profile_options(worker).options
 
         assert [option.name for option in options] == ["stays", "default"]
 
@@ -2474,10 +2474,9 @@ class TestProfileSelectMarkup:
 
         response = client.get("/")
 
-        assert (
-            '<option value="glass" selected>Glass (flatbed)</option>' in response.text
-        )
+        assert '<option value="glass">Glass (flatbed)</option>' in response.text
         assert '<option value="bare">bare</option>' in response.text
+        assert '<option value="default" selected>default</option>' in response.text
 
     def test_the_profile_select_is_followed_by_the_live_description_slot(
         self, client: TestClient
@@ -2500,7 +2499,7 @@ class TestProfileSelectMarkup:
                 "glass": ProfileConfig(
                     source="Flatbed", description="Scans one page from the glass."
                 ),
-                "default": ProfileConfig(),
+                "default": ProfileConfig(description="Scans the everyday way."),
             },
         )
 
@@ -2508,7 +2507,7 @@ class TestProfileSelectMarkup:
 
         assert (
             '<small id="profile-description" aria-live="polite">'
-            "Scans one page from the glass.</small>" in response.text
+            "Scans the everyday way.</small>" in response.text
         )
         assert response.text.count('id="profile-description"') == 1
 
@@ -3491,11 +3490,13 @@ class TestProfileDefaultsFollowTheFormShape:
             assert _newest_job(client).title.startswith("Scan ")
 
 
-# The scenario the pre-ticking tests drive: the page opens on ``receipts``,
-# whose defaults are all in paperless-ngx; ``other`` has different ones, and
-# ``gone`` names a tag and a correspondent paperless-ngx no longer has.
-_RECEIPTS_TAGS = [3, 7]
-_RECEIPTS_CORRESPONDENT = 12
+# The scenario the pre-ticking tests drive: the page opens on ``default``,
+# listed last, whose defaults are all in paperless-ngx; ``plain``, listed
+# first, has none, so a page that opened on the first option would tick
+# nothing; ``other`` has different ones, and ``gone`` names a tag and a
+# correspondent paperless-ngx no longer has.
+_OPENING_TAGS = [3, 7]
+_OPENING_CORRESPONDENT = 12
 _OTHER_TAGS = [7]
 _OTHER_CORRESPONDENT = 14
 _PRE_TICK_CORRESPONDENT_ROWS: list[dict[str, object]] = [
@@ -3520,7 +3521,7 @@ def _pre_ticked_app(
     tmp_path: Path, *, show_tags: bool = True, show_correspondent: bool = True
 ) -> FastAPI:
     """
-    Build an app whose first profile carries default tags and a correspondent.
+    Build an app whose opening profile carries default tags and a correspondent.
 
     Args:
         tmp_path: Where the app writes its database and files.
@@ -3539,16 +3540,16 @@ def _pre_ticked_app(
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
         profiles={
-            "receipts": ProfileConfig(
-                default_tags=_RECEIPTS_TAGS,
-                default_correspondent=_RECEIPTS_CORRESPONDENT,
-            ),
+            "plain": ProfileConfig(),
             "other": ProfileConfig(
                 default_tags=_OTHER_TAGS,
                 default_correspondent=_OTHER_CORRESPONDENT,
             ),
             "gone": ProfileConfig(default_tags=[3, 99], default_correspondent=98),
-            "default": ProfileConfig(),
+            "default": ProfileConfig(
+                default_tags=_OPENING_TAGS,
+                default_correspondent=_OPENING_CORRESPONDENT,
+            ),
         },
     )
     app = create_app(settings, StubScannerBackend())
@@ -3651,13 +3652,13 @@ class TestProfileDefaultsArePreTicked:
     def test_profile_defaults_are_ticked_and_selected_on_first_paint(
         self, tmp_path: Path
     ) -> None:
-        """The first profile's tags are ticked and its correspondent chosen."""
+        """The opening profile's tags are ticked and its correspondent chosen."""
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             page = client.get("/").text
 
         assert "checked" in _checkbox(page, 3)
         assert "checked" in _checkbox(page, 7)
-        assert "selected" in _option(page, _RECEIPTS_CORRESPONDENT)
+        assert "selected" in _option(page, _OPENING_CORRESPONDENT)
         assert "selected" not in _option(page, _OTHER_CORRESPONDENT)
 
     def test_profile_defaults_controls_opt_out_of_form_state_restore(
@@ -3716,17 +3717,17 @@ class TestProfileDefaultsArePreTicked:
         """A profile with no defaults means none, so the swap ticks nothing."""
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             tags = client.get(
-                "/api/profiles/tags", params={"profile": "default", "tags": [3]}
+                "/api/profiles/tags", params={"profile": "plain", "tags": [3]}
             )
             select = client.get(
-                "/api/profiles/correspondent", params={"profile": "default"}
+                "/api/profiles/correspondent", params={"profile": "plain"}
             )
 
         assert tags.status_code == 200
         assert select.status_code == 200
         assert _checkbox(tags.text, 3)
         assert "checked" not in tags.text
-        assert _option(select.text, _RECEIPTS_CORRESPONDENT)
+        assert _option(select.text, _OPENING_CORRESPONDENT)
         assert "selected" not in select.text
 
     def test_profile_change_correspondent_renders_the_whole_select(
@@ -3746,7 +3747,7 @@ class TestProfileDefaultsArePreTicked:
         for attribute in _PROFILE_CHANGE_ATTRIBUTES:
             assert attribute in select.group(0), attribute
         assert "selected" in _option(response.text, _OTHER_CORRESPONDENT)
-        assert "selected" not in _option(response.text, _RECEIPTS_CORRESPONDENT)
+        assert "selected" not in _option(response.text, _OPENING_CORRESPONDENT)
         assert response.text.rstrip().endswith("</select>")
 
     def test_profile_change_shows_a_stale_default_ticked_with_the_note(
@@ -3791,11 +3792,11 @@ class TestProfileDefaultsArePreTicked:
             page = client.get("/").text
             response = client.post(
                 "/api/cache/invalidate?resource=correspondents",
-                data={"correspondent": str(_RECEIPTS_CORRESPONDENT)},
+                data={"correspondent": str(_OPENING_CORRESPONDENT)},
             )
 
         assert response.status_code == 200
-        assert "selected" in _option(response.text, _RECEIPTS_CORRESPONDENT)
+        assert "selected" in _option(response.text, _OPENING_CORRESPONDENT)
         button = re.search(
             r'<button[^>]*hx-post="/api/cache/invalidate\?resource=correspondents"'
             r"[^>]*>",
@@ -3829,7 +3830,7 @@ class TestProfileDefaultsArePreTicked:
             )
 
         assert response.status_code == 200
-        assert _option(response.text, _RECEIPTS_CORRESPONDENT)
+        assert _option(response.text, _OPENING_CORRESPONDENT)
         assert "selected" not in response.text
 
     def test_profile_defaults_route_answers_with_the_tag_control_hidden(
@@ -3914,7 +3915,7 @@ class TestMetadataFollowsTheSubmittedProfile:
 
         for name in ("tags_profile", "correspondent_profile"):
             marker = _marker(page, name)
-            assert 'value="receipts"' in marker, marker
+            assert 'value="default"' in marker, marker
             assert 'autocomplete="off"' in marker, marker
             assert "hx-swap-oob" not in marker, marker
 
@@ -3972,10 +3973,10 @@ class TestMetadataFollowsTheSubmittedProfile:
         self, tmp_path: Path
     ) -> None:
         """
-        The regression: ``other`` submitted with ``receipts``' metadata.
+        The regression: ``other`` submitted with ``default``'s metadata.
 
         This is what a restored Profile select or an unfinished swap sends,
-        and before the marker it filed ``receipts``' tags and correspondent
+        and before the marker it filed ``default``'s tags and correspondent
         under ``other`` with no warning.
         """
         with TestClient(_pre_ticked_app(tmp_path)) as client:
@@ -3984,10 +3985,10 @@ class TestMetadataFollowsTheSubmittedProfile:
                 data={
                     "profile": "other",
                     "title": "Out of step",
-                    "tags": [str(tag) for tag in _RECEIPTS_TAGS],
-                    "correspondent": str(_RECEIPTS_CORRESPONDENT),
-                    "tags_profile": "receipts",
-                    "correspondent_profile": "receipts",
+                    "tags": [str(tag) for tag in _OPENING_TAGS],
+                    "correspondent": str(_OPENING_CORRESPONDENT),
+                    "tags_profile": "default",
+                    "correspondent_profile": "default",
                 },
             )
 
@@ -4004,9 +4005,9 @@ class TestMetadataFollowsTheSubmittedProfile:
                 data={
                     "profile": "other",
                     "title": "Half swapped",
-                    "tags": [str(tag) for tag in _RECEIPTS_TAGS],
-                    "correspondent": str(_RECEIPTS_CORRESPONDENT),
-                    "tags_profile": "receipts",
+                    "tags": [str(tag) for tag in _OPENING_TAGS],
+                    "correspondent": str(_OPENING_CORRESPONDENT),
+                    "tags_profile": "default",
                     "correspondent_profile": "other",
                 },
             )
@@ -4014,7 +4015,7 @@ class TestMetadataFollowsTheSubmittedProfile:
             assert response.status_code == 200
             job = _newest_job(client)
             assert job.tags == _OTHER_TAGS
-            assert job.correspondent == _RECEIPTS_CORRESPONDENT
+            assert job.correspondent == _OPENING_CORRESPONDENT
 
     @pytest.mark.parametrize("marked", [True, False])
     def test_values_marked_for_this_profile_or_unmarked_are_taken_as_given(
@@ -4024,8 +4025,8 @@ class TestMetadataFollowsTheSubmittedProfile:
         data: dict[str, str | list[str]] = {
             "profile": "other",
             "title": "In step",
-            "tags": [str(tag) for tag in _RECEIPTS_TAGS],
-            "correspondent": str(_RECEIPTS_CORRESPONDENT),
+            "tags": [str(tag) for tag in _OPENING_TAGS],
+            "correspondent": str(_OPENING_CORRESPONDENT),
         }
         if marked:
             data |= {"tags_profile": "other", "correspondent_profile": "other"}
@@ -4034,8 +4035,8 @@ class TestMetadataFollowsTheSubmittedProfile:
 
             assert response.status_code == 200
             job = _newest_job(client)
-            assert job.tags == _RECEIPTS_TAGS
-            assert job.correspondent == _RECEIPTS_CORRESPONDENT
+            assert job.tags == _OPENING_TAGS
+            assert job.correspondent == _OPENING_CORRESPONDENT
 
 
 def _unreachable(*, timeout: float | None = None) -> NoReturn:
