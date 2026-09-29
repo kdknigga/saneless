@@ -3940,20 +3940,31 @@ class TestAutoProfiles:
         assert config_file.exists()
         assert not (tmp_path / "saneless.toml").exists()
 
-    def test_auto_profiles_without_loaded_file_writes_cwd_default(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    def test_auto_profiles_without_loaded_file_never_writes_the_cwd(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
     ) -> None:
-        """With no config file loaded, auto-profiles keeps ./saneless.toml."""
-        monkeypatch.chdir(tmp_path)
-        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+        """
+        With no config file loaded, ./saneless.toml is never the target.
+
+        It is the first file the next start looks at, so a file created there
+        would outrank every documented location, and the output names the
+        file that was written by its absolute path.
+        """
+        files = patched_search_paths
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = _searched()
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, scanner_cls=self._make_auto_scanner()
+        )
 
         result = runner.invoke(cli, ["auto-profiles"])
 
-        assert result.exit_code == 0
-        assert (tmp_path / "saneless.toml").exists()
-        # Orchestrator resolution 2: the relative default is named absolutely.
-        resolved = (tmp_path / "saneless.toml").resolve()
-        assert f"Profiles in {resolved}:" in result.output
+        assert result.exit_code == 0, result.output
+        assert not files.cwd.exists()
+        assert f"Profiles in {files.xdg}:" in result.output
 
     def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """
@@ -4301,13 +4312,12 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
     """
     D-15: the one CLI write refuses while a superseded-name file is the only one.
 
-    ``auto-profiles``'s target with nothing loaded is ``./saneless.toml``, and
-    that file is the *first* thing the next start looks at.  Writing a
-    ``saneless.toml`` while an unread ``config.toml`` still holds the only
-    copy of the Paperless URL and token would not lose those values but would
-    permanently shadow them: the search would stop at the new file and the row
-    saying to rename the old one would go green, with the appliance still
-    running on defaults.
+    With nothing loaded, ``auto-profiles`` creates a ``saneless.toml`` in a
+    searched directory, and the next start loads it.  Writing one while an
+    unread ``config.toml`` still holds the only copy of the Paperless URL and
+    token would not lose those values but would permanently shadow them: the
+    search would stop at the new file and the row saying to rename the old one
+    would go green, with the appliance still running on defaults.
 
     So the refusal is not tidiness -- it is the difference between a fixable
     situation and one whose evidence has been buried.
@@ -4453,7 +4463,7 @@ class TestAutoProfilesWriteTargetFollowsTheSearch:
     """
     CFG-05/D-13: the write goes to the file the search loaded, under its new name.
 
-    ``--config`` was already covered; these are the two paths where no explicit
+    ``--config`` was already covered; these are the paths where no explicit
     path was given and the recording is the only thing that says where the
     configuration lives.
     """
@@ -4480,15 +4490,16 @@ class TestAutoProfilesWriteTargetFollowsTheSearch:
         assert "flatbed" in tomllib.loads(loaded.read_text())["profiles"]
         assert not (tmp_path / CONFIG_FILENAME).exists()
 
-    def test_a_search_that_found_nothing_writes_the_cwd_default(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    def test_a_search_that_found_nothing_writes_no_cwd_file(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
     ) -> None:
-        """With nothing loaded and nothing stale, the new name in the cwd is the target."""
-        monkeypatch.chdir(tmp_path)
+        """With nothing loaded and nothing stale, the cwd is still not the target."""
+        files = patched_search_paths
         settings = _make_settings(tmp_path)
-        settings._config_discovery = discover_config(
-            (tmp_path / "etc" / CONFIG_FILENAME,)
-        )
+        settings._config_discovery = _searched()
         runner, _ = _patch_cli(
             monkeypatch,
             settings=settings,
@@ -4498,8 +4509,229 @@ class TestAutoProfilesWriteTargetFollowsTheSearch:
         result = runner.invoke(cli, ["auto-profiles"])
 
         assert result.exit_code == 0, result.output
-        written = tmp_path / CONFIG_FILENAME
-        assert "flatbed" in tomllib.loads(written.read_text())["profiles"]
+        assert "flatbed" in tomllib.loads(files.xdg.read_text())["profiles"]
+        assert not files.cwd.exists()
+
+
+class TestAutoProfilesTarget:
+    """
+    With no config file loaded, the new file goes where no later search shadows.
+
+    The search reads ``./saneless.toml`` first, and in the container the
+    working directory is the data directory, so a file created there outranks
+    the ``/etc/saneless`` file the documentation tells the operator to mount --
+    the command that was meant to help would build the trap itself.  The target
+    is therefore the last documented location saneless may write: the system
+    directory when it already exists and is writable, else the per-user XDG
+    one.  saneless never creates the system directory.
+
+    Every test redirects the search into ``tmp_path``; no test may touch the
+    real ``/etc/saneless``.
+    """
+
+    @staticmethod
+    def _run(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        args: tuple[str, ...] = ("auto-profiles",),
+    ) -> Result:
+        """
+        Run ``auto-profiles`` over the patched search with nothing loaded.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            args: The command line.
+
+        Returns:
+            The runner's result.
+
+        """
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = _searched()
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+        return runner.invoke(cli, list(args))
+
+    def test_the_target_is_an_existing_writable_etc_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """The container's mounted ``./config`` is that directory."""
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        assert files.etc.stat().st_mode & 0o777 == 0o600
+        assert not files.cwd.exists()
+        assert not files.xdg.exists()
+        assert str(files.etc) in result.stdout
+
+    def test_the_target_is_xdg_without_an_etc_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        No system directory: the per-user one, created private, and nothing else.
+
+        The ``saneless`` directory under the XDG base is created 0700, because
+        the file it holds may later carry the Paperless token.
+        """
+        files = patched_search_paths
+        assert not files.xdg.parent.exists()
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.xdg.exists()
+        assert files.xdg.parent.stat().st_mode & 0o777 == 0o700
+        assert files.xdg.stat().st_mode & 0o777 == 0o600
+        assert not files.etc.parent.exists()
+        assert not files.cwd.exists()
+        assert str(files.xdg) in result.stdout
+
+    def test_the_target_is_xdg_when_etc_is_not_writable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        An admin-owned system directory is left alone for a non-root user.
+
+        ``os.access`` is patched for that one directory, so the test does not
+        depend on whether it runs as root.
+        """
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        real_access = os.access
+
+        def _access(path: str | Path, mode: int) -> bool:
+            """
+            Refuse write access to the system directory only.
+
+            Returns:
+                False for writing the system directory, else the real answer.
+
+            """
+            if Path(path) == files.etc.parent and mode == os.W_OK:
+                return False
+            return real_access(path, mode)
+
+        monkeypatch.setattr(os, "access", _access)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.xdg.exists()
+        assert not files.etc.exists()
+        assert not files.cwd.exists()
+
+    def test_a_target_directory_that_cannot_be_created_exits_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        The container's HOME may not exist: a configuration error, not a crash.
+
+        The message names the file that could not be written, so the operator
+        can create the directory or mount ``/etc/saneless``.
+        """
+        files = patched_search_paths
+        refused = files.xdg.parent
+        real_mkdir = Path.mkdir
+
+        def _mkdir(
+            path: Path,
+            mode: int = 0o777,
+            *,
+            parents: bool = False,
+            exist_ok: bool = False,
+        ) -> None:
+            """
+            Refuse to create the XDG ``saneless`` directory only.
+
+            Raises:
+                PermissionError: For that directory.
+
+            """
+            if path == refused:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        monkeypatch.setattr(Path, "mkdir", _mkdir)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"Cannot write {files.xdg}" in result.stderr
+        assert "Traceback" not in result.output
+        assert not files.cwd.exists()
+
+    def test_an_explicit_config_is_the_target_whatever_else_exists(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """``--config`` names the file, and a writable system directory is ignored."""
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        given = tmp_path / "given" / CONFIG_FILENAME
+        given.parent.mkdir()
+
+        result = self._run(
+            monkeypatch, tmp_path, ("--config", str(given), "auto-profiles")
+        )
+
+        assert result.exit_code == 0, result.output
+        assert given.exists()
+        assert not files.etc.exists()
+        assert not files.xdg.exists()
+        assert not files.cwd.exists()
+
+    def test_the_target_without_a_recording_uses_the_documented_search(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        Settings built without a load carry no recording; the search list stands in.
+
+        The CLI's own name for the search list is patched, as the module-level
+        fixture patches the loader's.
+        """
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        monkeypatch.setattr(
+            cli_module,
+            "config_search_paths",
+            lambda: (Path(CONFIG_FILENAME), files.xdg, files.etc),
+        )
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_make_settings(tmp_path),
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+
+        result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        assert not files.cwd.exists()
 
 
 class TestStaleConfigWarningReachesTheTerminal:
@@ -6196,13 +6428,14 @@ class TestScanTokenRefusal:
 
         assert result.exit_code == 0, result.output
 
+    @pytest.mark.usefixtures("patched_search_paths")
     def test_auto_profiles_is_unaffected_by_a_placeholder_token(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """``auto-profiles`` only reads the scanner, so it still exits 0."""
-        runner, _ = _patch_cli(
-            monkeypatch, settings=_token_settings(tmp_path, "changeme")
-        )
+        settings = _token_settings(tmp_path, "changeme")
+        settings._config_discovery = _searched()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["auto-profiles"])
 
