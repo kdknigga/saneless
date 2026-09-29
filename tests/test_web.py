@@ -30,6 +30,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+from saneless.auto_profiles import generate_profiles
 from saneless.checks import (
     check_name,
     check_row_class,
@@ -46,6 +47,7 @@ from saneless.config import (
 )
 from saneless.job import JobState, JobStore
 from saneless.paperless import PaperlessClient
+from saneless.scanner.base import DeviceCapabilities
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     TOKEN_UNSET_JOB_ERROR,
@@ -2147,6 +2149,264 @@ class TestProfileOrdering:
 
         rendered = re.findall(r'<option value="([^"]+)"', response.text)
         assert rendered[:2] == ["stack", "pick"]
+
+
+def _generated(*sources: str) -> dict[str, ProfileConfig]:
+    """
+    Return the profile set ``generate_profiles`` builds for a device's sources.
+
+    Built by the generator itself rather than by hand, so the ``default`` these
+    tests hide is the one a real installation carries, twin and all.
+    """
+    return generate_profiles(
+        DeviceCapabilities(sources=list(sources), resolutions=[300], modes=["Color"])
+    )
+
+
+def _rendered_options(page: str) -> dict[str, str]:
+    """Map each rendered profile option's value to its text."""
+    select = page.split('id="profile-select"', 1)[1].split("</select>", 1)[0]
+    return dict(re.findall(r'<option value="([^"]+)"[^>]*>([^<]*)</option>', select))
+
+
+class TestProfileChoices:
+    """
+    Each distinct profile is offered once, with its own text.
+
+    A generated ``default`` that scans exactly as another profile does would
+    be a second option doing the same thing under the same words, so the
+    first profile it equals stands in for it.  Only a generated twin is
+    hidden, and any label two rendered options still share gets the profile
+    name, so a household member never meets two options reading the same.
+    """
+
+    def test_a_generated_default_twin_is_hidden_behind_its_stand_in(
+        self, client: TestClient
+    ) -> None:
+        """The first profile equal to the generated default opens the page."""
+        profiles = _generated("Flatbed", "ADF")
+        assert profiles["default"] == profiles["flatbed"]
+        _configure_profiles(client, profiles)
+
+        choices = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in choices.options] == ["flatbed", "adf"]
+        assert choices.opening == "flatbed"
+
+    def test_the_page_offers_no_hidden_twin_and_selects_its_stand_in(
+        self, client: TestClient
+    ) -> None:
+        """The rendered select has no ``default`` option and opens on the glass."""
+        _configure_profiles(client, _generated("Flatbed", "ADF"))
+
+        page = client.get("/").text
+
+        assert 'value="default"' not in page.split("</select>", 1)[0]
+        assert '<option value="flatbed" selected>' in page
+        assert _rendered_options(page) == {
+            "flatbed": "Glass (flatbed)",
+            "adf": "Feeder, single-sided",
+        }
+
+    def test_an_edited_default_is_shown_opens_the_page_and_reads_distinctly(
+        self, client: TestClient
+    ) -> None:
+        """Default tags of its own make the default more than a twin."""
+        profiles = _generated("Flatbed", "ADF")
+        profiles["default"] = profiles["default"].model_copy(
+            update={"default_tags": [1]}
+        )
+        _configure_profiles(client, profiles)
+
+        choices = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in choices.options] == [
+            "flatbed",
+            "adf",
+            "default",
+        ]
+        assert choices.opening == "default"
+        labels = {option.name: option.label for option in choices.options}
+        assert labels == {
+            "flatbed": "Glass (flatbed) (flatbed)",
+            "adf": "Feeder, single-sided",
+            "default": "Glass (flatbed) (default)",
+        }
+
+    def test_hand_written_duplicate_labels_each_carry_their_profile_name(
+        self, client: TestClient
+    ) -> None:
+        """Every member of a shared label is suffixed; a unique label is not."""
+        _configure_profiles(
+            client,
+            {
+                "a": ProfileConfig(label="Scan"),
+                "b": ProfileConfig(label="Scan"),
+                "default": ProfileConfig(label="Other"),
+            },
+        )
+
+        choices = _profile_options(_app(client).state.worker)
+        page = client.get("/").text
+
+        assert [option.label for option in choices.options] == [
+            "Scan (a)",
+            "Scan (b)",
+            "Other",
+        ]
+        assert choices.opening == "default"
+        assert _rendered_options(page) == {
+            "a": "Scan (a)",
+            "b": "Scan (b)",
+            "default": "Other",
+        }
+        assert '<option value="default" selected>Other</option>' in page
+
+    def test_a_hand_written_default_equal_to_another_profile_is_shown(
+        self, client: TestClient
+    ) -> None:
+        """Only a generated twin is hidden; an operator's own default stays."""
+        _configure_profiles(
+            client,
+            {
+                "glass": ProfileConfig(label="Glass"),
+                "default": ProfileConfig(label="Glass"),
+            },
+        )
+
+        choices = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in choices.options] == ["glass", "default"]
+        assert [option.label for option in choices.options] == [
+            "Glass (glass)",
+            "Glass (default)",
+        ]
+        assert choices.opening == "default"
+
+    def test_a_sheet_fed_twin_is_hidden_behind_its_feeder_stand_in(
+        self, client: TestClient
+    ) -> None:
+        """The feeder-first ordering is untouched by hiding the twin."""
+        profiles = _generated("ADF", "ADF Duplex")
+        assert profiles["default"] == profiles["adf"]
+        _configure_profiles(client, profiles)
+
+        choices = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in choices.options] == ["adf", "adf-duplex"]
+        assert choices.opening == "adf"
+
+    def test_no_profiles_gives_no_options_and_no_opening(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing to list is an empty select, and the page still renders."""
+        worker = _app(client).state.worker
+        monkeypatch.setattr(worker, "profile_names", list)
+
+        choices = _profile_options(worker)
+        response = client.get("/")
+
+        assert choices.options == ()
+        assert choices.opening == ""
+        assert response.status_code == 200
+        assert _rendered_options(response.text) == {}
+
+
+class TestPageOpensOnDefault:
+    """
+    The page opens on the profile ``saneless scan`` uses with no ``--profile``.
+
+    That is ``default``, wherever it sits in the list, and everything the page
+    shows for the opening profile comes from it rather than from whichever
+    option happens to be listed first.
+    """
+
+    @pytest.fixture
+    def default_last(self, client: TestClient) -> TestClient:
+        """Configure a first-listed profile and a ``default`` with defaults."""
+        _configure_profiles(
+            client,
+            {
+                "receipts": ProfileConfig(
+                    description="Scans receipts.", default_tags=[2]
+                ),
+                "default": ProfileConfig(
+                    description="Scans everyday post.",
+                    default_tags=[1],
+                    default_correspondent=1,
+                ),
+            },
+        )
+        return client
+
+    def test_the_default_option_is_the_selected_one(
+        self, default_last: TestClient
+    ) -> None:
+        """The select opens on ``default`` though it is listed last."""
+        page = default_last.get("/").text
+
+        assert '<option value="default" selected>' in page
+        assert '<option value="receipts" selected>' not in page
+
+    def test_the_description_beneath_the_select_is_the_defaults(
+        self, default_last: TestClient
+    ) -> None:
+        """The sentence on first paint belongs to the option the page opens on."""
+        page = default_last.get("/").text
+
+        assert (
+            '<small id="profile-description" aria-live="polite">'
+            "Scans everyday post.</small>" in page
+        )
+
+    def test_the_defaults_tags_are_the_pre_ticked_ones(
+        self, default_last: TestClient
+    ) -> None:
+        """The opening profile's tags are ticked, and the first option's are not."""
+        page = default_last.get("/").text
+
+        assert "checked" in _checkbox(page, 1)
+        assert "checked" not in _checkbox(page, 2)
+
+    def test_the_defaults_correspondent_is_pre_selected(
+        self, default_last: TestClient
+    ) -> None:
+        """The opening profile's correspondent is chosen on first paint."""
+        page = default_last.get("/").text
+
+        assert "selected" in _option(page, 1)
+
+    def test_the_multiple_pages_field_follows_the_defaults_manual_duplex(
+        self, client: TestClient
+    ) -> None:
+        """A manual-duplex default listed last disables the box on first paint."""
+        _configure_profiles(
+            client,
+            {
+                "glass": ProfileConfig(),
+                "default": ProfileConfig(source="ADF Front", duplex="manual"),
+            },
+        )
+
+        page = client.get("/").text
+
+        box = re.search(r'<input[^>]*\bid="multi-page"[^>]*>', page)
+        assert box is not None, page
+        assert re.search(r"\sdisabled(?=[\s>])", box.group(0)), box.group(0)
+
+    def test_a_hidden_twin_default_still_scans_when_posted(
+        self, client: TestClient
+    ) -> None:
+        """Hiding is the page's business; the name stays a valid submit."""
+        _configure_profiles(client, _generated("Flatbed", "ADF"))
+
+        response = client.post(
+            "/api/scan", data={"profile": "default", "title": "Hidden Twin"}
+        )
+
+        assert response.status_code == 200
+        job_store: JobStore = _app(client).state.job_store
+        assert job_store.list_recent(limit=1)[0].profile == "default"
 
 
 # The scan form element as it stood before plan 30-15, byte for byte.  The
