@@ -202,6 +202,14 @@ See [Upgrading from a pre-`data_dir` release](../how-to/deploy-docker-compose.md
 
 ### Upgrading from an earlier release
 
+This release checks more of `config/saneless.toml` at startup. [Upgrading: settings are checked when saneless loads](../how-to/deploy-docker-compose.md#upgrading-settings-are-checked-when-saneless-loads) has the details and the commands; in short:
+
+- A `0` or out-of-range number, or `true`/`false` in place of one, stops saneless loading (exit 2). Replace `history_retention_days = 0` with `36500` (about a century) and `history_max_rows = 0` with the number of jobs to keep, up to `1000000`.
+- A relative path setting is resolved against the directory of the config file that loaded, `/etc/saneless` in the container, instead of the working directory `/var/lib/saneless`. Write it absolute to keep the old location.
+- Generated profile labels and descriptions change only when you run `saneless auto-profiles --force`, which rewrites only tables marked `auto_generated = true`.
+- `min_free_space_mb` counts a megabyte as 1,000,000 bytes, so the reserve is about 5% smaller.
+- A `/var/lib/saneless/saneless.toml` that an earlier release's `auto-profiles` left in the data volume loads ahead of `./config`. Merge anything you need from it into `config/saneless.toml`, then delete it.
+
 saneless now keeps what it writes under `/var/lib/saneless` to its own user.
 The image's `/var/lib/saneless` is `0700`, and a new volume starts with that
 mode. A new job database (`saneless.db`, with its `-wal` and `-shm` files) is created

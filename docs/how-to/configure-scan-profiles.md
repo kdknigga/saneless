@@ -53,7 +53,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `label` | string | `""` | The name shown in the web UI's profile dropdown. `auto-profiles` fills this in -- `Feeder, single-sided`, `Feeder, double-sided` or `Glass (flatbed)` -- and owns it; see [Auto-generated profiles](#auto-generated-profiles). A profile with an empty label is listed under its profile name |
+| `label` | string | `""` | The name shown in the web UI's profile dropdown. `auto-profiles` fills this in -- `Feeder, single-sided`, `Feeder, double-sided`, `Feeder, front side only`, `Glass (flatbed)` or, on a scanner with no choice of source, `Standard scan` -- and owns it; see [Auto-generated profiles](#auto-generated-profiles). A profile with an empty label is listed under its profile name. When two profiles on the scan page would show the same label, each is followed by its profile name in brackets |
 | `description` | string | `""` | The sentence shown beneath the profile dropdown, such as `Scans both sides of every page using the document feeder.`. Also filled in and owned by `auto-profiles` |
 | `source` | string | `"Flatbed"` | Paper source: `"Flatbed"`, `"ADF"`, or `"ADF Duplex"` |
 | `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow. `"hardware"` scans both sides through the source: most scanners do that because of the source's name, and on scanners with a separate ADF mode option (`adf-mode`) saneless sets it to `Duplex`; see [ADF Hardware Duplex](set-up-adf-duplex.md#adf-hardware-duplex) |
@@ -191,6 +191,13 @@ saneless auto-profiles
 
 Profile names come from your scanner's own source names, lowercased and reduced to letters, digits and hyphens. A scanner reporting `Flatbed` and `Automatic Document Feeder` gets profiles named `flatbed` and `automatic-document-feeder`.
 
+The labels shown in the web UI are saneless's own wording, chosen from the kind of source, and never repeat the scanner's source name:
+
+- A feeder reads `Feeder, single-sided`, or `Feeder, double-sided` when it scans both sides. A feeder source that names one side -- such as `ADF Front` or `ADF Back` -- reads `Feeder, front side only` or `Feeder, back side only`.
+- The glass reads `Glass (flatbed)`, an `Auto` source `Automatic`, and a source saneless cannot place `Scanner source`.
+- When two sources would get the same label, the second gets a number: `Feeder, single-sided`, then `Feeder, single-sided 2`. The description beneath the dropdown stays the same for both.
+- A scanner with no choice of source at all gets a single `default` profile labelled `Standard scan`, with no `source` key.
+
 If `auto-profiles` creates the config file from scratch, it creates it with mode `0600`, readable only by you, because the file may hold your paperless-ngx token. Rewriting an existing file keeps its permission bits, owner and group, each when saneless is permitted to set it: a non-root user cannot give the file back to another owner, but keeps the group if it belongs to it, and a filesystem without Unix permissions keeps none of them.
 
 Without `--force`, a profile that already exists is left alone. Use `--force` to refresh the profiles `auto-profiles` created earlier:
@@ -204,7 +211,8 @@ saneless auto-profiles --force
 - It refreshes only profiles that carry `auto_generated = true`. In those, only the generated keys (`label`, `description`, `source`, `resolution`, `mode`, `auto_source_mode`, `duplex`, `auto_generated`) are rewritten in place, and a generated key the new run no longer writes is removed.
 - Everything else in the profile is kept: `default_tags`, `default_correspondent`, `title`, `paper_size`, the empty-page settings, and your comments.
 - A hand edit to a generated key, such as `resolution = 600`, is overwritten. To keep your edits, delete the `auto_generated` line from that profile.
-- A profile without `auto_generated = true` is never changed, even with `--force`. It is listed as `Skipped (not auto-generated)`; rename or delete it to let `auto-profiles` regenerate it.
+- A profile without `auto_generated = true` is never changed, even with `--force`. It is listed as `Skipped (not auto-generated)`; rename or delete it to let `auto-profiles` regenerate it -- except `default`, which saneless requires and which you therefore cannot rename or delete. `default` gets a skip line of its own, `Skipped (not auto-generated): 'default' -- add auto_generated = true to its table to let auto-profiles --force refresh it`. To hand a `default` you wrote back to the tool, add `auto_generated = true` to its `[profiles.default]` table and run `saneless auto-profiles --force`.
+- A flagged profile that already matches what the scanner reports is left as it is and not listed as `Refreshed`. When nothing changes at all, the file is not rewritten, and the command prints `No changes to` and the file's path.
 
 `label` and `description` are ordinary generated keys, and they are the first ones that hold text you might want to write yourself. The rule is the same for them as for `resolution`: if a profile still carries `auto_generated = true`, a name you typed by hand is replaced the next time you run `saneless auto-profiles --force`. To keep your own wording, delete the `auto_generated` line from that profile -- that hands the profile to you permanently and `auto-profiles` never touches it again.
 
@@ -225,7 +233,9 @@ When `[scanner] device` is empty, `auto-profiles` also writes the id of the devi
 
 Regenerating can rename profiles, so if you pass `--profile` in a script or a cron entry, check the name still matches.
 
-`auto-profiles` always writes a `default` profile -- backed by your scanner's flatbed if it has one, and otherwise by the first source the scanner reports -- and regenerating never removes it. saneless requires that profile, and a config without it is one saneless refuses to load. Every other auto-generated profile a new run no longer produces is removed, so a rename does not leave a stale duplicate behind.
+`auto-profiles` always writes a `default` profile -- a copy of your scanner's flatbed profile if it has one, otherwise of the profile for the first source the scanner reports, and on a scanner with no choice of source the `Standard scan` profile -- and regenerating never removes it. saneless requires that profile, and a config without it is one saneless refuses to load. Every other auto-generated profile a new run no longer produces is removed, so a rename does not leave a stale duplicate behind; on a scanner with no choice of source nothing is removed at all.
+
+Because the generated `default` is an exact copy of another profile, the scan page offers that profile only once: `default` is left out of the dropdown while it still carries `auto_generated = true` and matches another profile in every key, and the first such profile stands in for it. The page opens on `default`, or on the profile standing in for it, so an untouched form scans exactly as `saneless scan` does when you give no `--profile`. Once you change anything in `[profiles.default]` -- add `default_tags`, say -- it is no longer a copy, and the scan page lists it as a profile of its own. `saneless scan --profile default` and the web API accept `default` either way.
 
 See [CLI Commands](../reference/cli-commands.md) for full `auto-profiles` documentation.
 

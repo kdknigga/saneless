@@ -442,9 +442,9 @@ def test_upgrade_notes_cover_this_release(page: Path, heading: str) -> None:
     offenders = [
         f"does not mention {needle!r}"
         for needle in (
-            "`history_retention_days`",
+            "history_retention_days = 0",
             "36500",
-            "`history_max_rows`",
+            "history_max_rows = 0",
             "1000000",
             "auto-profiles --force",
             "1,000,000 bytes",

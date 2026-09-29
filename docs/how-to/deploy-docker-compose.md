@@ -257,6 +257,65 @@ docker compose pull saneless
 docker compose up -d
 ```
 
+### Upgrading: settings are checked when saneless loads
+
+This release checks more of `config/saneless.toml` when saneless starts, and
+changes how a few settings are read. Go through this list before you start the
+new image.
+
+- **A `0` or out-of-range number now stops saneless loading.** Every numeric
+  setting has a range, listed in the [configuration reference](../reference/configuration.md#output):
+  `history_retention_days`, `history_max_rows`, `paperless_task_timeout`,
+  `log_max_bytes`, `log_backup_count` and a profile's `resolution` among them.
+  A value outside it, or `true`/`false` in place of a number, stops saneless
+  with exit 2 and a line naming the key, such as
+  `[output] history_retention_days: Input should be greater than or equal to 1`.
+  There is no "no limit" value:
+    - replace `history_retention_days = 0` with `history_retention_days = 36500`
+      to keep history for about a century;
+    - replace `history_max_rows = 0`, which erased the history, with the
+      number of jobs you want kept, up to `1000000`.
+- **Relative paths now follow the config file.** A relative `data_dir`,
+  `tmp_dir`, `log_file` or `consume_dir` is resolved against the directory of
+  the config file that loaded, not the directory saneless was started from.
+  In the container that is `/etc/saneless`, so `data_dir = "data"` now means
+  `/etc/saneless/data`. Write the path absolute, such as
+  `data_dir = "/var/lib/saneless/data"`, to keep the old location. Nothing is
+  moved for you.
+- **Generated profile names change only when you ask.** Profiles that
+  `auto-profiles` generated earlier keep their old `label` and `description`
+  until you run `docker compose exec saneless saneless auto-profiles --force`.
+  That rewrites only the tables marked `auto_generated = true`, keeps your
+  `default_tags`, `title` and other keys, and leaves a profile without the
+  marker alone. See [Auto-generated profiles](configure-scan-profiles.md#auto-generated-profiles)
+  for the new wording.
+- **Free space is counted in decimal megabytes.** `min_free_space_mb` now
+  counts a megabyte as 1,000,000 bytes, as every figure saneless prints about
+  free space does, so the same number reserves about 5% less than before.
+- **The job database gains an index when saneless opens it.** Its schema
+  version does not change, so an earlier release still opens the database if
+  you roll back.
+- **Look for a config file in the data volume.** An earlier release's
+  `auto-profiles`, run with no `config/saneless.toml`, created
+  `/var/lib/saneless/saneless.toml` in the data volume, and that file loads
+  ahead of `./config`. This release never creates it and reports it: while
+  both files exist, the Configuration row is amber and names both, and a file
+  in the volume alone loads without a warning, so check either way:
+
+    ```bash
+    docker compose exec saneless cat /var/lib/saneless/saneless.toml
+    ```
+
+    If it exists, merge anything you still need from it into
+    `config/saneless.toml` on the host -- the Configuration row's own advice
+    runs the other way, because it keeps the file in use, but the file to keep
+    is the one in `./config`. Only then delete it and restart:
+
+    ```bash
+    docker compose exec saneless rm /var/lib/saneless/saneless.toml
+    docker compose restart saneless
+    ```
+
 ### Upgrading: paperless-ngx 2.16 or later
 
 This release needs paperless-ngx 2.16 or later. It speaks API version 9, and
