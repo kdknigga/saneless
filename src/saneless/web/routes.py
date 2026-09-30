@@ -6,6 +6,7 @@ import hashlib
 import html
 import logging
 import secrets
+import uuid
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -43,6 +44,7 @@ from saneless.scanner.base import SourceKind, classify_source
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
+    LOST_CONTACT_LINE,
     MULTI_PAGE_DISABLED_REASON,
     MULTI_PAGE_HELP,
     MULTI_PAGE_LABEL,
@@ -1307,9 +1309,28 @@ def _status_token(request: Request, context: Mapping[str, object]) -> str:
             "terminal_reload": True,
         }
     )
+    return _keyed_digest(request, canonical)
+
+
+def _keyed_digest(request: Request, text: str) -> str:
+    """
+    Hash a rendering with the process key, as a status poll token.
+
+    This is the one definition of the token that both the real status
+    rendering and the lost-contact fallback carry, so the two cannot drift on
+    the key or the digest size.
+
+    Args:
+        request: The incoming request, for the app's ``status_token_key``.
+        text: The rendering to hash.
+
+    Returns:
+        The token, as hex.
+
+    """
     return hashlib.blake2b(
-        canonical.encode(),
-        key=state.status_token_key,
+        text.encode(),
+        key=request.app.state.status_token_key,
         digest_size=_STATUS_TOKEN_BYTES,
     ).hexdigest()
 
@@ -1362,6 +1383,138 @@ def _unchanged(seen: str, token: str) -> bool:
     if not seen or len(seen) > _SEEN_MAX_LENGTH:
         return False
     return secrets.compare_digest(seen.encode(), token.encode())
+
+
+STATUS_BACKOFF_SECONDS: Final = (2, 5, 15)
+"""
+The intervals a status poll that cannot read its job steps through, in seconds.
+
+A failing poll's first retry comes after 2 s, its second after 5 s, and every
+later one after 15 s.  The first step is short because the common failure is a
+moment's lock contention on the job store, and the cap is long because a store
+that stays broken gains nothing from a browser asking every second.
+
+Polling never stops: the page has no script of its own to restart it, so a
+poll that gave up would leave the area frozen on the fallback line after the
+store healed.  At the cap the fallback is the same every time, so its poll is
+answered 204 and the area is not re-swapped or re-announced.
+
+Read at call time rather than bound into a default, so a test can shorten it.
+"""
+
+
+def _confirmed_job_id(job_id: str | None) -> str | None:
+    """
+    Return a path job id in canonical form if it is a UUID, else None.
+
+    The lost-contact fallback cannot ask the store whether the id names a job,
+    so it echoes back only something that is well-formed: job ids are
+    ``str(uuid.uuid4())``, and anything else falls back to the current route.
+
+    Args:
+        job_id: The id from the poll's path, or None for the current route.
+
+    Returns:
+        The parsed id as its canonical string, or None.
+
+    """
+    if job_id is None:
+        return None
+    try:
+        return str(uuid.UUID(job_id))
+    except ValueError:
+        return None
+
+
+def _lost_contact_fallback(
+    request: Request, job_id: str | None, *, attempt: int, seen: str
+) -> Response:
+    """
+    Answer a status poll that could not read or render its job.
+
+    Built in Python without a template, so a template fault cannot reach the
+    one path that has to survive it.  The body is the status area with a
+    fixed line and no exception text; the text goes to the server log only.
+    It carries no out-of-band Scan button, no ``#status-message`` clear and no
+    ``<title>``: nothing the poll could not read is asserted, and the alert
+    slot is left to the operator's own failed actions.
+
+    The next poll URL carries the next backoff step as ``attempt`` and the
+    fallback's own token as ``seen``.  The token hashes the markup built with
+    an empty ``seen``, the same shape ``_status_token`` hashes, so at the cap,
+    where the markup no longer changes, a poll presenting it gets a 204.
+
+    Args:
+        request: The incoming request, for the token key.
+        job_id: The id from the poll's path, or None for the current route.
+        attempt: The failing poll's clamped attempt count.
+        seen: The token the poll presented.
+
+    Returns:
+        The fallback at 200, or an empty 204 when the poll already shows it.
+
+    """
+    step = min(attempt + 1, len(STATUS_BACKOFF_SECONDS))
+    interval = STATUS_BACKOFF_SECONDS[step - 1]
+    followed = _confirmed_job_id(job_id)
+    line = html.escape(LOST_CONTACT_LINE)
+
+    def body(token: str) -> str:
+        poll_url = html.escape(_poll_url(followed, seen=token, attempt=step))
+        return (
+            f'<div id="status-area" tabindex="-1" hx-get="{poll_url}" '
+            f'hx-trigger="every {interval}s" hx-swap="outerHTML">\n'
+            f'  <p class="status-fallback">&#9888; {line}</p>\n'
+            "</div>\n"
+        )
+
+    token = _keyed_digest(request, body(""))
+    if _unchanged(seen, token):
+        return Response(status_code=204)
+    return HTMLResponse(status_code=200, content=body(token))
+
+
+def _answer_status_poll(
+    request: Request, job_id: str | None, *, seen: str, attempt: int
+) -> Response:
+    """
+    Render a status poll for the followed job, falling back when that fails.
+
+    Both poll routes answer through here, so they cannot differ in how they
+    fail.  The render happens inside the guard as well as the context build,
+    because ``TemplateResponse`` renders in its constructor.
+
+    Args:
+        request: The incoming request.
+        job_id: The followed job's id, or None for the current route.
+        seen: The token the poll presented.
+        attempt: The poll's attempt count, straight from the query string.
+
+    Returns:
+        The status partial, the lost-contact fallback, or an empty 204.
+
+    """
+    counted = min(max(attempt, 0), len(STATUS_BACKOFF_SECONDS))
+    state = request.app.state
+    try:
+        token, context = _with_poll(
+            request,
+            _status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(request, followed_job_id=job_id),
+            ),
+        )
+        if _unchanged(seen, token):
+            return Response(status_code=204)
+        return state.templates.TemplateResponse(
+            request,
+            "partials/status_response.html",
+            {**context, "terminal_reload": True},
+        )
+    except Exception:
+        logger.exception("Failed to render the job status")
+        return _lost_contact_fallback(request, job_id, attempt=counted, seen=seen)
 
 
 def _pass_wait_context(
@@ -2500,7 +2653,9 @@ def start_scan(
 
 @router.get("/api/jobs/current/status")
 def current_job_status(
-    request: Request, seen: Annotated[str, Query()] = ""
+    request: Request,
+    seen: Annotated[str, Query()] = "",
+    attempt: Annotated[int, Query()] = 0,
 ) -> Response:
     """
     Poll the current or most recent job status.
@@ -2519,35 +2674,40 @@ def current_job_status(
     its URL, because htmx does not re-process an element it did not swap, so
     every later poll presents the same token until something changes.
 
+    A poll that cannot build or render its status never reaches
+    ``render_error``, for the reason ``get_checks`` gives: an error response is
+    the one thing a polling element cannot usefully receive.  Retargeted into
+    ``#status-message`` it would re-write the page's one alert on every tick
+    and leave it standing above "Done" once the store healed.  The failure is
+    logged and answered with ``_lost_contact_fallback`` instead: a fixed line
+    inside the status area that polls again on the ``STATUS_BACKOFF_SECONDS``
+    schedule and never stops.  The status area is deliberately not added to
+    ``render_error``'s own-target exemption, as the strip is: swapping
+    ``error.html`` over ``#status-area`` would delete the element the scan
+    form targets.
+
     Args:
         request: The incoming HTTP request.
         seen: The token of the rendering the polling element shows.
+        attempt: How many polls in a row have failed, as the previous fallback
+            named it.  Clamped into ``0..len(STATUS_BACKOFF_SECONDS)``, never
+            refused, and reset by the first poll that succeeds, whose URL
+            carries none.
 
     Returns:
-        The status partial, or an empty 204 when nothing has changed.
+        The status partial, the lost-contact fallback, or an empty 204 when
+        nothing has changed.
 
     """
-    state = request.app.state
-    token, context = _with_poll(
-        request,
-        _status_context(
-            state.worker,
-            state.job_store,
-            _status_facts(request, followed_job_id=None),
-        ),
-    )
-    if _unchanged(seen, token):
-        return Response(status_code=204)
-    return state.templates.TemplateResponse(
-        request,
-        "partials/status_response.html",
-        {**context, "terminal_reload": True},
-    )
+    return _answer_status_poll(request, None, seen=seen, attempt=attempt)
 
 
 @router.get("/api/jobs/{job_id}/status")
 def followed_job_status(
-    request: Request, job_id: str, seen: Annotated[str, Query()] = ""
+    request: Request,
+    job_id: str,
+    seen: Annotated[str, Query()] = "",
+    attempt: Annotated[int, Query()] = 0,
 ) -> Response:
     """
     Poll the status of the job this browser submitted.
@@ -2565,34 +2725,25 @@ def followed_job_status(
 
     Everything else matches ``current_job_status``: the Scan button rides along
     out-of-band, ``#status-message`` is left alone, and a poll presenting the
-    token of what it would render now is answered 204 with no body.
+    token of what it would render now is answered 204 with no body.  A failure
+    to build or render the status is answered with the same backing-off
+    fallback, never through ``render_error``.  The fallback cannot confirm the
+    id against the store, so it echoes it only after it parses as a UUID, and
+    otherwise polls the current route.
 
     Args:
         request: The incoming HTTP request.
         job_id: The job this browser is following.
         seen: The token of the rendering the polling element shows.
+        attempt: How many polls in a row have failed, clamped as
+            ``current_job_status`` clamps it.
 
     Returns:
-        The status partial rendered for that job, or an empty 204 when nothing
-        has changed.
+        The status partial rendered for that job, the lost-contact fallback,
+        or an empty 204 when nothing has changed.
 
     """
-    state = request.app.state
-    token, context = _with_poll(
-        request,
-        _status_context(
-            state.worker,
-            state.job_store,
-            _status_facts(request, followed_job_id=job_id),
-        ),
-    )
-    if _unchanged(seen, token):
-        return Response(status_code=204)
-    return state.templates.TemplateResponse(
-        request,
-        "partials/status_response.html",
-        {**context, "terminal_reload": True},
-    )
+    return _answer_status_poll(request, job_id, seen=seen, attempt=attempt)
 
 
 @router.get("/api/checks")
