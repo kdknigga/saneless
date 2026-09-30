@@ -45,7 +45,7 @@ Each control has one line of help text beneath it. The form has up to five field
 
 ## Start the scan
 
-Click the **Scan** button at the bottom of the form. The button disables and shows "Scanning..." while the job runs. Do not close the browser tab during scanning.
+Click the **Scan** button at the bottom of the form. The button disables and reads **Queued…** until the scanner starts on your job, then **Scanning…** while it runs. Do not close the browser tab during scanning.
 
 ## Monitor progress
 
@@ -60,6 +60,10 @@ The status area below the form updates as the scan progresses through these stag
 - **Done** -- The document has been successfully uploaded.
 
 When a scan finishes, a line beneath the result sums up what happened to the paper -- "12 pages scanned, 2 blank removed, 10 uploaded". A scan that ended in an error or was cancelled has no counts to show, and shows none.
+
+The browser tab's title follows the status too -- "Scanning — saneless", then "Done — saneless" -- so you can see how the scan is going from another tab. It names the stage and never the document.
+
+Once a scan has finished, reloading the page, or opening it later on another device, shows it as the last scan rather than as news: "Ready to scan." with a quieter line beneath it such as "Last scan: ✓ Done: Electricity Bill March 2026 — started 2026-09-30 14:03 CDT". The time is when the scan started, and another device sees "Scan (title hidden)" in place of the title. A scan that failed or finished with a warning keeps a second line saying what went wrong, and the page counts stay in **Job History**.
 
 If another scan is already running when you press Scan, the status area keeps following *your* job rather than switching to whichever one is current, and tells you where you are in the queue -- "Waiting for 'Tax return' to finish (1 ahead of you)". The running scan is named only if your browser started it too; otherwise it reads "Waiting for 'Scan (title hidden)' to finish". Reloading the page keeps following the scan this browser started, and so does answering a flip prompt or a multi-page question.
 

@@ -109,6 +109,7 @@ from saneless.vocabulary import (
     MULTI_PAGE_HELP,
     MULTI_PAGE_LABEL,
     NOTHING_TO_FINISH,
+    SCAN_BLOCKED_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
@@ -1223,6 +1224,77 @@ class TestServerOwnedScanButton:
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
         self._assert_released(page)
 
+    def test_document_title_follows_state_and_not_204(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        The tab names the stage, keeps it across unchanged polls, and ends idle.
+
+        While the scan is held every poll is answered 204, and a 204 swaps
+        nothing, so a title the page set by hand survives two of them: a poll
+        answered 200 would put the state's title back.  The scan ending is a
+        change, and it names the outcome; a reload reports the scan as past,
+        and the tab is plain ``saneless`` again.
+        """
+        scanner = scan_harness.server.scanner
+        page.goto(scan_harness.server.url)
+        expect(page).to_have_title("saneless")
+        scanner.gate.clear()
+        try:
+            page.locator("#scan-btn").click()
+            expect(page).to_have_title("Scanning — saneless", timeout=5_000)
+
+            page.evaluate("() => { document.title = 'untouched by a 204'; }")
+            for _ in range(2):
+                with page.expect_response(
+                    lambda r: "/api/jobs/" in r.url and "/status" in r.url,
+                    timeout=5_000,
+                ) as polled:
+                    pass
+                assert polled.value.status == HTTPStatus.NO_CONTENT
+            assert page.title() == "untouched by a 204"
+        finally:
+            scanner.gate.set()
+
+        expect(page).to_have_title("Done — saneless", timeout=15_000)
+        page.reload()
+        expect(page).to_have_title("saneless")
+        expect(page.locator("#status-area .last-scan")).to_contain_text(
+            "Last scan: ✓ Done: "
+        )
+
+    def test_queued_button_reads_queued_in_the_browser(
+        self, page: Page, context: BrowserContext, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        A scan pressed while another is held reads Queued, not Scanning.
+
+        The second tab opened on the idle page before the first scan began,
+        so its Scan button was still enabled: pressing it queues a job behind
+        the held one, and that tab's button and title say so.
+        """
+        scanner = scan_harness.server.scanner
+        second = context.new_page()
+        page.goto(scan_harness.server.url)
+        second.goto(scan_harness.server.url)
+        scanner.gate.clear()
+        try:
+            page.locator("#scan-btn").click()
+            expect(page.locator("#scan-btn")).to_have_text("Scanning…", timeout=5_000)
+
+            second.locator("#scan-btn").click()
+            queued = second.locator("#scan-btn")
+            expect(queued).to_have_text("Queued…", timeout=5_000)
+            expect(queued).to_be_disabled()
+            expect(second).to_have_title("Queued — saneless")
+            expect(second.locator("#status-area")).to_contain_text("next in line")
+        finally:
+            scanner.gate.set()
+
+        expect(second.locator("#status-area .status-done")).to_be_visible(
+            timeout=15_000
+        )
+
     def test_page_loaded_during_an_active_job_keeps_the_button_disabled(
         self,
         page: Page,
@@ -1309,6 +1381,26 @@ _SWAP_STATUS_AREA = """
 () => htmx.ajax("GET", "/api/jobs/current/status",
                 {target: "#status-area", swap: "outerHTML"})
 """
+
+
+def _show_the_live_outcome(page: Page, selector: str) -> None:
+    """
+    Swap in the outcome a poll that watched the job end would have shown.
+
+    A page loaded after a job ended reports it as the last scan, muted and
+    with no alert, so the live outcome's colour and markup are reached the
+    way the operator who watched the scan reached them: through a status
+    response.
+
+    Args:
+        page: A page already loaded over a finished job.
+        selector: What the live outcome renders, to wait for.
+
+    """
+    expect(page.locator("#status-area .last-scan").first).to_be_visible()
+    page.evaluate(_SWAP_STATUS_AREA)
+    page.wait_for_selector(selector)
+
 
 # Reads the page surface from the root element. Pico paints its background on
 # :root, so <html> is where the scheme shows up; <body> is transparent in both
@@ -1604,7 +1696,7 @@ class TestFallbackStatusRendering:
         """Load the page under an emulated OS colour-scheme preference."""
         page.emulate_media(color_scheme=scheme)
         page.goto(url)
-        page.wait_for_selector("#status-area .status-fallback")
+        _show_the_live_outcome(page, "#status-area .status-fallback")
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])
     def test_fallback_copy_and_class_render(
@@ -1756,7 +1848,7 @@ class TestWarnedDoneStatusRendering:
         """
         warned_done_page.emulate_media(color_scheme=scheme)
         warned_done_page.goto(browser_server.url)
-        warned_done_page.wait_for_selector("#status-area .status-fallback")
+        _show_the_live_outcome(warned_done_page, "#status-area .status-fallback")
 
         status = warned_done_page.locator("#status-area")
         text = status.inner_text()
@@ -1822,7 +1914,7 @@ class TestCancelledStatusRendering:
         """Load the page under an emulated OS colour-scheme preference."""
         page.emulate_media(color_scheme=scheme)
         page.goto(url)
-        page.wait_for_selector("#status-area .status-cancelled")
+        _show_the_live_outcome(page, "#status-area .status-cancelled")
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])
     def test_cancelled_copy_renders_without_an_alert(
@@ -1880,6 +1972,9 @@ class TestCancelledStatusRendering:
         no polling trigger, and -- the behaviour the attribute stands for -- no
         status request goes out across more than two poll intervals.
         """
+        self._goto(cancelled_page, browser_server.url, "light")
+        # Installed after the one status request the live outcome was swapped
+        # in with, so what it counts is polling alone.
         polls: list[str] = []
         cancelled_page.on(
             "request",
@@ -1889,7 +1984,6 @@ class TestCancelledStatusRendering:
                 else None
             ),
         )
-        self._goto(cancelled_page, browser_server.url, "light")
 
         scan_btn = cancelled_page.locator("#scan-btn")
         assert scan_btn.is_enabled()
@@ -5066,6 +5160,7 @@ class TestErrorRenderingInChromium:
         worker._current_job_id = job.id
         try:
             page.goto(server.url)
+            _show_the_live_outcome(page, '#status-area [role="alert"]')
 
             alert = page.locator('#status-area [role="alert"]')
             expect(alert).to_have_count(1)
@@ -5152,7 +5247,7 @@ class TestAmberErrorRenderingInChromium:
         try:
             worker._current_job_id = amber_id
             page.goto(server.url)
-            page.wait_for_selector("#status-area p.status-fallback")
+            _show_the_live_outcome(page, "#status-area p.status-fallback")
 
             expect(page.locator('#status-area [role="alert"]')).to_have_count(0)
             expect(page.locator("#status-area .status-error")).to_have_count(0)
@@ -5182,6 +5277,7 @@ class TestAmberErrorRenderingInChromium:
 
             worker._current_job_id = upload_id
             page.goto(server.url)
+            _show_the_live_outcome(page, '#status-area [role="alert"]')
             alert = page.locator('#status-area [role="alert"]')
             expect(alert).to_have_count(1)
             expect(alert).to_contain_text(error_message(ErrorCategory.UPLOAD))
@@ -5248,7 +5344,7 @@ class TestPageCountsInChromium:
         worker._current_job_id = job.id
         try:
             page.goto(server.url)
-            expect(page.locator("#status-area .status-done")).to_be_visible()
+            _show_the_live_outcome(page, "#status-area .status-done")
 
             if expected is None:
                 expect(page.locator(".page-counts")).to_have_count(0)
@@ -6289,6 +6385,19 @@ class TestOnlyTheOwnerSeesTheScan:
             page.goto(browser_server.url)
             viewer_page.goto(browser_server.url)
 
+            # A fresh page names the finished scan as the last one, under the
+            # title the owner gate allows each browser.
+            expect(page.locator("#status-area .last-scan")).to_contain_text(
+                _OWNED_TITLE
+            )
+            expect(viewer_page.locator("#status-area .last-scan")).to_contain_text(
+                HIDDEN_JOB_TITLE
+            )
+            # The outcome as the poll that watched it end shows it, preview
+            # and all -- for the owner alone.
+            _show_the_live_outcome(page, "#status-area .status-done")
+            _show_the_live_outcome(viewer_page, "#status-area .status-done")
+
             expect(page.locator("#status-area")).to_contain_text(_OWNED_TITLE)
             expect(page.locator("#status-area img.thumbnail")).to_have_count(1)
             expect(page.locator("#history-body")).to_contain_text(_OWNED_TITLE)
@@ -6595,8 +6704,9 @@ class TestTheGuardBehindTheBlockedButton:
         # Told why, in the slot phase 26 reserved for request errors (D-02).
         expect(page.locator(_SLOT_MESSAGE)).to_have_text(_TOKEN_UNSET_SLOT_TEXT)
         # And nothing started: the status area was never the target of this
-        # response, and it still says what an idle appliance says.
-        expect(page.locator("#status-area")).to_have_text("Ready to scan.")
+        # response, and it still says what this idle appliance says -- why no
+        # scan can start, not that one can.
+        expect(page.locator("#status-area")).to_have_text(SCAN_BLOCKED_REASON)
         expect(page.locator("#status-area [aria-busy]")).to_have_count(0)
 
         status_cell = page.locator("#history-body tr").first.locator("td").nth(3)
@@ -6711,7 +6821,7 @@ class TestRemovedBlankPagesRendering:
         """
         removed_blank_page.emulate_media(color_scheme=scheme)
         removed_blank_page.goto(browser_server.url)
-        removed_blank_page.wait_for_selector("#status-area .status-done")
+        _show_the_live_outcome(removed_blank_page, "#status-area .status-done")
 
         status = removed_blank_page.locator("#status-area")
         expect(status.locator("p.page-counts", has_text=_REMOVED_NOTE)).to_be_visible()
@@ -6750,6 +6860,7 @@ class TestRemovedBlankPagesRendering:
         assert "empty_page_coverage_threshold" in next_step
 
         page.goto(browser_server.url)
+        _show_the_live_outcome(page, "#status-area p.status-error")
         status = page.locator("#status-area")
         expect(status.locator("p.status-error")).to_contain_text(message)
         expect(status).to_contain_text(next_step)
@@ -6768,6 +6879,7 @@ class TestRemovedBlankPagesRendering:
             _make_csp_gate(viewer_ctx, violations)
             viewer_page = viewer_ctx.new_page()
             viewer_page.goto(browser_server.url)
+            _show_the_live_outcome(viewer_page, "#status-area p.status-error")
 
             viewer_status = viewer_page.locator("#status-area")
             expect(viewer_status.locator("p.status-error")).to_contain_text(message)
@@ -7760,6 +7872,27 @@ def _reflow_settling_strip(stage: _Stage) -> Generator[None]:
 
 
 @contextmanager
+def _reflow_last_scan_failed(stage: _Stage) -> Generator[None]:
+    """
+    Load the idle page over a failed scan whose title has no spaces.
+
+    Both "Last scan" lines render: the outcome naming the title, and the
+    category's message and next step beneath it.
+    """
+    job_store: JobStore = stage.server.app.state.job_store
+    with _parked(stage, JobState.ERROR, "W" * TITLE_MAX_LENGTH) as job_id:
+        job_store.update_state(
+            job_id,
+            JobState.ERROR,
+            error="disk on fire",
+            error_category=ErrorCategory.SCANNER,
+        )
+        _open_on(stage, "Last scan: ")
+        expect(stage.page.locator("#status-area .last-scan")).to_have_count(2)
+        yield
+
+
+@contextmanager
 def _reflow_lost_contact(stage: _Stage) -> Generator[None]:
     """Break the store's job reads under a scan, so the poll shows its fallback."""
     job_store: JobStore = stage.server.app.state.job_store
@@ -7797,6 +7930,7 @@ _REFLOW_ROWS: dict[str, Callable[[_Stage], AbstractContextManager[None]]] = {
     "pass-acknowledgement": _reflow_pass_acknowledgement,
     "settling-strip": _reflow_settling_strip,
     "lost-contact": _reflow_lost_contact,
+    "last-scan-failed": _reflow_last_scan_failed,
 }
 
 
