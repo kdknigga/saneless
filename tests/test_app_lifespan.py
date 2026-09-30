@@ -190,14 +190,21 @@ def test_startup_fails_every_active_job_with_the_restart_reason(
 
 
 def test_recovered_row_is_what_the_status_area_shows(settings: Settings) -> None:
-    """The newest recovered row renders as a settled error, not a poll (T9)."""
+    """
+    The newest recovered row renders as a settled error, not a poll (T9).
+
+    The page reports it as the last scan -- a failure with the restart as
+    its detail, and no alert -- since it ended before the page was loaded.
+    """
     _seed_crashed_store(settings)
     app = _build_app(settings)
     with TestClient(app) as client:
         client.cookies.set("saneless_owner", _SEEDING_BROWSER)
         response = client.get("/")
     assert response.status_code == 200
-    assert f"&#10007; Error: {RESTART_REASON}" in response.text
+    assert '<p class="last-scan">Last scan: \u2717 Failed: ' in response.text
+    assert f'<p class="last-scan">{RESTART_REASON}</p>' in response.text
+    assert "&#10007; Error:" not in response.text
     match = _STATUS_AREA.search(response.text)
     assert match is not None
     assert "hx-trigger" not in match["attrs"]
