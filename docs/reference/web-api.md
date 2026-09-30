@@ -148,12 +148,13 @@ Returns the current or most recent job status. Used by HTMX polling to update th
 
 What the partial shows depends on who asks. The browser that started the job sees its title, preview and error or warning text. Every other client sees the state, the outcome and the page counts under the title `Scan (title hidden)`, with no preview and a fixed sentence in place of the text. See [who can read what](#what-an-unauthenticated-client-can-read).
 
-**Query parameters:** both are written by saneless into the poll URL it hands the page. A client never needs to compose them.
+**Query parameters:** all three are written by saneless into the poll URL it hands the page. A client never needs to compose them.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `seen` | string, optional | A token for what the polling element is showing. When nothing the viewer would see has changed, the poll is answered `204` with no body, and htmx leaves the element and anything focused inside it in place. The token is a keyed hash, so it is meaningless outside the running server. A value that is missing, wrong or longer than any token is ignored and the full partial is returned; it is never refused. |
 | `attempt` | integer, optional | Which step of the lost-contact backoff this poll is on (see below). A value out of range is clamped rather than refused with a `422`. |
+| `focus` | string, optional | `scan` after an Abort: the first partial whose Scan button is enabled marks that button `autofocus`, so keyboard focus lands on Scan once the stopped job has ended. Any other value is ignored and never echoed back. |
 
 **When the job cannot be read.** If saneless cannot read the job from its job store, or cannot render the partial, the poll is still answered `200`, never with an error. The response is a status indicator holding one amber line, `Cannot read the scan's progress right now — retrying...`, with no Scan button, no job text and no page title, and the page's message area is left alone. Its poll URL carries the next `attempt`, and its interval steps from 2 seconds to 5 and then to 15, where it stays. At 15 seconds the line no longer changes, so each poll from then on is answered `204`. Polling never stops: once the job can be read again, the next poll returns the real partial and the backoff starts over. The cause goes to the server log only.
 
@@ -463,6 +464,8 @@ Every error response saneless renders -- a refused scan, a validation failure, a
 | Anything else | `{"status": "error", "detail": "<message>"}` | none |
 
 A `429` carries `Retry-After: 30` in both forms.
+
+A refused `POST /api/scan` from the web UI also carries the Scan button out-of-band, enabled and marked `autofocus`, so keyboard focus returns to the button that was pressed rather than being left on the page body. Focus is never moved into the message area. A refusal because the paperless-ngx token or address is unset carries no button: the button is disabled on such an appliance, so there is nothing to return focus to.
 
 The message is a fixed sentence chosen by saneless for the kind of error. It never echoes request input or internal exception text. One refusal repeats one value beside the sentence: a `421` names the `Host` it refused, so you know which name to add to `[web] allowed_hosts`. The value is shown under Technical details in the HTML fragment and as a separate `"host"` field in the JSON form (`{"status": "error", "detail": "<message>", "host": "<host>"}`). Control characters in it are shown as visible escapes, and it is cut to at most 255 characters. The error from [`GET /api/paperless/test`](#get-apipaperlesstest) and the `503` bodies from [`GET /health`](#get-health) keep their own shapes, documented above.
 
