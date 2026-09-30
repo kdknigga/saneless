@@ -15,7 +15,13 @@ if TYPE_CHECKING:
 
     from saneless.scan_metadata import MetadataKind, MetadataSource
 
-__all__ = ["CachedList", "CachedMetadataLookup", "MetadataCache"]
+__all__ = [
+    "NEGATIVE_TTL_SECONDS",
+    "CachedList",
+    "CachedMetadataLookup",
+    "MetadataCache",
+    "MetadataUnavailableError",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +36,27 @@ _STALE_NOT_RE_ARMED: Final = (
     "Refreshing %s from paperless-ngx failed; "
     "serving the last good copy, and the next request fetches again: %s"
 )
+
+
+NEGATIVE_TTL_SECONDS: Final = 15.0
+"""
+How long a failed fetch with no last good copy is remembered, in seconds.
+
+Short, so a page left open on a hallway tablet recovers soon after
+paperless-ngx comes back; long enough that the requests arriving meanwhile
+answer at once instead of each waiting out a connect timeout.  Never longer
+than the cache's own TTL, and nothing at all when the cache is disabled.
+"""
+
+
+class MetadataUnavailableError(Exception):
+    """
+    A metadata list cannot be had right now, and no fetch was attempted.
+
+    Raised when a fetch for the list failed a moment ago and there is no last
+    good copy to serve, or when this caller could not take its turn to fetch
+    within the time it was given because another fetch is still in flight.
+    """
 
 
 class CachedList(NamedTuple):
@@ -78,6 +105,10 @@ class MetadataCache:
         # never expires and invalidate() leaves it alone: invalidating means
         # "fetch again", not "forget what Paperless last said".
         self._last_good: dict[str, list[dict[str, object]]] = {}
+        # When a failed fetch with no last good copy stops being remembered.
+        # Kept apart from _store: CachedMetadataLookup._ids reads get(), and an
+        # empty list there would read as "paperless-ngx has none".
+        self._failed_until: dict[str, float] = {}
         # Guards creation of the per-key locks, the generation counters, and
         # the store-if-unchanged checks below; never a fetch.
         self._locks_guard = threading.Lock()
@@ -179,7 +210,11 @@ class MetadataCache:
         return self.get_or_fetch_list(key, fetch).rows
 
     def get_or_fetch_list(
-        self, key: str, fetch: Callable[[], list[dict[str, object]]]
+        self,
+        key: str,
+        fetch: Callable[[], list[dict[str, object]]],
+        *,
+        lock_timeout: float | None = None,
     ) -> CachedList:
         """
         Return a fresh cached value, fetching it once when it is missing.
@@ -203,11 +238,19 @@ class MetadataCache:
         when an invalidate stops it, the copy is still returned but the
         warning says the next request fetches again rather than promising
         another TTL.  When there is no last good copy, the exception
-        propagates, nothing is cached, and the next call fetches again.
+        propagates and no list is cached, but the failure is remembered for
+        ``min(ttl, NEGATIVE_TTL_SECONDS)``: until then every call, including
+        the threads queued behind the failed fetch, raises
+        :class:`MetadataUnavailableError` at once and logs nothing, so an
+        unreachable Paperless is asked once per window rather than once per
+        waiting thread.  :meth:`invalidate` forgets the failure, a zero TTL
+        never records one, and an invalidate during the failing fetch stops
+        it from being recorded.
 
-        Known limitation: while Paperless is unreachable and there is no last
-        good copy, the waiting threads retry the fetch one after another, each
-        paying the connect timeout.
+        A caller that must answer within a budget passes ``lock_timeout``:
+        when another thread's fetch holds the key for longer than that, the
+        call raises :class:`MetadataUnavailableError` instead of waiting it
+        out, which bounds a fetch stuck resolving the host name.
 
         The answer says which it is: a last good copy -- served now, or
         re-armed by an earlier failure and still within its extra TTL -- is
@@ -216,28 +259,43 @@ class MetadataCache:
         Args:
             key: Cache key.
             fetch: Callable producing the value on a miss.
+            lock_timeout: The longest to wait, in seconds, for another
+                thread's fetch of the same key; None waits for as long as
+                it takes.
 
         Returns:
             The cached, freshly fetched, or last good list, and whether it is
             current.
 
+        Raises:
+            MetadataUnavailableError: A fetch for the key failed within the
+                negative TTL and there is no last good copy, or the key's
+                lock was not free within ``lock_timeout``.
+
         """
         cached = self._served(key)
         if cached is not None:
             return cached
+        self._raise_if_failed_recently(key)
         with self._locks_guard:
             key_lock = self._key_locks.setdefault(key, threading.Lock())
-        with key_lock:
-            # Another thread may have filled the entry while this one waited.
+        if not key_lock.acquire(timeout=-1 if lock_timeout is None else lock_timeout):
+            msg = f"Another request is still fetching {key} from paperless-ngx"
+            raise MetadataUnavailableError(msg)
+        try:
+            # Another thread may have filled the entry while this one waited,
+            # or found paperless-ngx unreachable.
             cached = self._served(key)
             if cached is not None:
                 return cached
+            self._raise_if_failed_recently(key)
             generation = self.generation(key)
             try:
                 data = fetch()
             except Exception as exc:
                 stale, re_armed = self._re_arm(key, generation)
                 if stale is None:
+                    self._remember_failure(key, generation)
                     raise
                 # The web tier's client-exception rule, stated above
                 # routes._get_cached_or_fetch.
@@ -253,6 +311,47 @@ class MetadataCache:
                 return CachedList(stale, current=False)
             self.store_if_current(key, data, generation)
             return CachedList(data, current=True)
+        finally:
+            key_lock.release()
+
+    def _raise_if_failed_recently(self, key: str) -> None:
+        """
+        Refuse at once while a failed fetch for ``key`` is still remembered.
+
+        Args:
+            key: Cache key.
+
+        Raises:
+            MetadataUnavailableError: The key's negative entry has not expired.
+
+        """
+        failed_until = self._failed_until.get(key)
+        if failed_until is not None and self._clock() < failed_until:
+            msg = f"Could not fetch {key} from paperless-ngx a moment ago"
+            raise MetadataUnavailableError(msg)
+
+    def _remember_failure(self, key: str, generation: int) -> None:
+        """
+        Remember that fetching ``key`` just failed with nothing to fall back on.
+
+        Nothing is recorded when the cache is disabled, or when an
+        :meth:`invalidate` ran since ``generation`` was read: the Refresh that
+        invalidated asked for a fresh attempt, and a failure that predates it
+        must not refuse that attempt.  The negative TTL is read here, not
+        bound at import, so it can be changed at run time.
+
+        Args:
+            key: Cache key whose fetch failed.
+            generation: The key's generation when the fetch started.
+
+        """
+        if self._ttl <= 0:
+            return
+        with self._locks_guard:
+            if self._generations.get(key, 0) != generation:
+                return
+            window = min(self._ttl, NEGATIVE_TTL_SECONDS)
+            self._failed_until[key] = self._clock() + window
 
     def _served(self, key: str) -> CachedList | None:
         """
@@ -304,7 +403,8 @@ class MetadataCache:
         """
         Remove a specific key from the cache.
 
-        A fetch already in flight for the key will not cache its result.  The
+        A fetch already in flight for the key will not cache its result, and a
+        remembered failure is forgotten, so the next call fetches at once.  The
         key's last good copy is kept, so a refetch that fails can still serve it.
 
         Args:
@@ -314,6 +414,7 @@ class MetadataCache:
         with self._locks_guard:
             self._generations[key] = self._generations.get(key, 0) + 1
             self._store.pop(key, None)
+            self._failed_until.pop(key, None)
 
 
 class CachedMetadataLookup:
