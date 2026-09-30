@@ -236,6 +236,40 @@ class TestLoadedConfigPath:
         settings = load_settings()
         assert settings.config_path is None
 
+    def test_a_deleted_working_directory_is_a_config_error(
+        self, empty_cwd_and_home: Path
+    ) -> None:
+        """
+        A shell left in a removed directory gets a sentence, not a crash.
+
+        The search spells its first candidate relative to the working
+        directory, and making it absolute asks the kernel for a directory that
+        is gone.  The raw FileNotFoundError named no file and reached the
+        "saneless bug" exit.
+        """
+        gone = empty_cwd_and_home / "gone"
+        gone.mkdir()
+        os.chdir(gone)
+        gone.rmdir()
+
+        with pytest.raises(ConfigError, match="working directory no longer exists"):
+            load_settings()
+
+    def test_an_explicit_config_loads_from_a_deleted_working_directory(
+        self, empty_cwd_and_home: Path
+    ) -> None:
+        """An absolute ``--config`` needs no working directory, so it still loads."""
+        config_file = empty_cwd_and_home / "x.toml"
+        config_file.write_text("[profiles.default]\n")
+        gone = empty_cwd_and_home / "gone"
+        gone.mkdir()
+        os.chdir(gone)
+        gone.rmdir()
+
+        settings = load_settings(str(config_file))
+
+        assert settings.config_path == config_file
+
     def test_toml_config_path_key_is_rejected(self, tmp_path: Path) -> None:
         """A top-level TOML ``config_path`` key is an unknown section (D-16)."""
         config_file = tmp_path / "forged.toml"

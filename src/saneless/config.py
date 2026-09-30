@@ -337,6 +337,32 @@ def _first_of_each_file(
     return tuple(first), tuple(again)
 
 
+def _working_directory() -> Path:
+    """
+    Return the working directory, as a configuration error when it is gone.
+
+    A shell can sit in a directory another process has since removed, and
+    then ``os.getcwd`` raises a FileNotFoundError that names no file.  The
+    search's first candidate and an unanchored relative path both need this
+    directory, so its absence is said once, with the way out.
+
+    Returns:
+        The absolute working directory.
+
+    Raises:
+        ConfigError: The working directory no longer exists.
+
+    """
+    try:
+        return Path.cwd()
+    except FileNotFoundError:
+        msg = (
+            "The working directory no longer exists; cd to an existing "
+            "directory or pass --config"
+        )
+        raise ConfigError(msg) from None
+
+
 def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
     """
     Look for a configuration file, and for superseded-name files beside one.
@@ -357,8 +383,20 @@ def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
     Returns:
         The recording, with the first existing candidate as ``loaded``.
 
+    Raises:
+        ConfigError: A candidate is relative and the working directory it is
+            relative to no longer exists.
+
     """
-    searched = tuple(candidate.absolute() for candidate in candidates)
+    cwd = (
+        _working_directory()
+        if any(not candidate.is_absolute() for candidate in candidates)
+        else None
+    )
+    searched = tuple(
+        candidate if cwd is None or candidate.is_absolute() else cwd / candidate
+        for candidate in candidates
+    )
     found, duplicates = _first_of_each_file(searched)
     stale, _ = _first_of_each_file(
         tuple(candidate.with_name(LEGACY_CONFIG_FILENAME) for candidate in searched)
@@ -2357,10 +2395,11 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     Raises:
         ConfigError: If an explicit path is empty, cannot have its ``~``
-            expanded, is missing or is not a regular file, if the file
-            cannot be read, is not UTF-8 or is not valid TOML (chained to the
-            OSError, UnicodeDecodeError or TOMLDecodeError), or if the
-            configuration fails validation.
+            expanded, is missing or is not a regular file, if no explicit
+            path was given and the working directory no longer exists, if
+            the file cannot be read, is not UTF-8 or is not valid TOML
+            (chained to the OSError, UnicodeDecodeError or TOMLDecodeError),
+            or if the configuration fails validation.
 
     """
     path: Path | None
@@ -2404,7 +2443,9 @@ def load_settings(config_path: str | None = None) -> Settings:
     # With no path, only defaults + env vars are used.
     settings = _build_settings(toml_file=path)
     # ``path`` is already absolute, so its parent is too.
-    _pin_relative_paths(settings, path.parent if path is not None else Path.cwd())
+    _pin_relative_paths(
+        settings, path.parent if path is not None else _working_directory()
+    )
     settings._config_path = path
     settings._config_discovery = discovery
     return settings
