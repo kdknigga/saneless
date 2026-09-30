@@ -39,6 +39,8 @@ __all__ = [
     "ACTIVE_STATES",
     "BACKS_SUFFIX",
     "BUSY_STATES",
+    "CORRESPONDENTS_LOADING",
+    "CORRESPONDENTS_UNAVAILABLE",
     "FALLBACK_NOT_UPLOADED_LINE",
     "FRONTS_SUFFIX",
     "HIDDEN_ERROR_DETAIL",
@@ -55,6 +57,11 @@ __all__ = [
     "MULTI_PAGE_NEEDS_TERMINAL",
     "MULTI_PAGE_OPTION_HELP",
     "NOTHING_TO_FINISH",
+    "NO_SCRIPT_BACK_LINK",
+    "NO_SCRIPT_BODY",
+    "NO_SCRIPT_HEADING",
+    "NO_SCRIPT_LINE",
+    "NO_SCRIPT_PAGE_TITLE",
     "PAPERLESS_TITLE_LIMIT",
     "PARTIAL_SUFFIX",
     "PASS_WAIT_STATES",
@@ -63,6 +70,9 @@ __all__ = [
     "RESTART_UPLOADING_REASON",
     "SCAN_BLOCKED_REASON",
     "SCAN_BLOCKED_URL_REASON",
+    "TAGS_LOADING",
+    "TAGS_UNAVAILABLE",
+    "TAG_FILTER_LABEL",
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
     "TITLE_SUFFIX_SEPARATOR",
@@ -151,6 +161,7 @@ __all__ = [
     "root_owned_config_note",
     "root_per_user_config_note",
     "scan_button_label",
+    "scan_hold_reason",
     "scan_page_description",
     "sixteen_bit_error",
     "source_not_offered_error",
@@ -924,6 +935,88 @@ def dropped_ids_warning(tags: Sequence[int], correspondent: int | None) -> str |
     return f"{subject} {predicate}"
 
 
+# The placeholders the scan page shows while it fetches the tag and
+# correspondent lists after the page has loaded: the tag list's only line, and
+# the correspondent select's help line.  The page itself makes no
+# paperless-ngx call, so it never waits on one.  Three ASCII periods, as on
+# every in-progress sentence.
+TAGS_LOADING: Final = "Loading tags from paperless-ngx..."
+CORRESPONDENTS_LOADING: Final = "Loading correspondents from paperless-ngx..."
+
+# What each list says when paperless-ngx could not be read.  An amber warning,
+# not a red failure: the page keeps retrying on its own, and the ↻ button
+# beside the heading retries at once.  Neither names the paperless-ngx address
+# or the reason the read failed; the log has both.
+TAGS_UNAVAILABLE: Final = (
+    "Tags could not be loaded from paperless-ngx. saneless keeps trying; "
+    "press ↻ to try now."
+)
+CORRESPONDENTS_UNAVAILABLE: Final = (
+    "Correspondents could not be loaded from paperless-ngx. saneless keeps "
+    "trying; press ↻ to try now."
+)
+
+# The tag filter's accessible name, from a visually hidden label.  It is the
+# placeholder's words exactly, so a speech-input user can say what they see
+# and reach the field.
+TAG_FILTER_LABEL: Final = "Filter tags"
+
+
+def scan_hold_reason(*, tags: bool, correspondents: bool) -> str | None:
+    """
+    Return why the Scan button is held while the scan page's lists load.
+
+    Scan stays disabled until the lists it would file the scan with have
+    arrived or failed, so a scan is never started with a default the page has
+    not shown.  The reason names only the lists the page shows.  Muted, not
+    red, because a short wait is not an error.
+
+    Args:
+        tags: Whether the page shows the tag list.
+        correspondents: Whether the page shows the correspondent select.
+
+    Returns:
+        The reason, or None when neither list is shown and nothing is held.
+
+    """
+    if tags and correspondents:
+        waiting_for = "the tags and correspondents"
+    elif tags:
+        waiting_for = "the tags"
+    elif correspondents:
+        waiting_for = "the correspondents"
+    else:
+        return None
+    return f"Scan waits for {waiting_for} to load..."
+
+
+# The line a browser with JavaScript turned off shows under the Scan heading,
+# before any control, saying why nothing on the page will work and what to do
+# instead.
+NO_SCRIPT_LINE: Final = (
+    "Scanning from this page needs JavaScript, which is turned off in this "
+    "browser. Turn it on and reload the page, or run saneless scan on the "
+    "server."
+)
+
+# The browser tab's title: the product name alone with no job in flight, and
+# after what is happening otherwise.  ``page_title`` and the refusal page
+# below both end with the suffix, so every tab reads the same way.
+_PRODUCT_NAME: Final = "saneless"
+_PAGE_TITLE_SUFFIX: Final = f" — {_PRODUCT_NAME}"
+
+# The page a browser without JavaScript lands on when it submits the scan
+# form as a plain post.  No scan is started and no field is echoed back.
+NO_SCRIPT_HEADING: Final = "Scan not started"
+NO_SCRIPT_PAGE_TITLE: Final = f"{NO_SCRIPT_HEADING}{_PAGE_TITLE_SUFFIX}"
+NO_SCRIPT_BODY: Final = (
+    "Scanning from this page needs JavaScript, which is turned off in this "
+    "browser, so no scan was started. Turn it on and reload the page, or run "
+    "saneless scan on the server."
+)
+NO_SCRIPT_BACK_LINK: Final = "Back to the scan page"
+
+
 # The note on a ticked id the form shows but paperless-ngx's list, read just
 # now, does not hold.  It sits in the row's own label rather than on a line
 # below, so it is announced with the checkbox and leaves with it when the box
@@ -1143,11 +1236,6 @@ _WARNING_GLYPH: Final = "⚠"
 _FALLBACK_GLYPH: Final = "→"
 _CANCELLED_GLYPH: Final = "⊘"
 _FAILED_GLYPH: Final = "✗"
-
-# The browser tab's title: the product name alone with no job in flight, and
-# after a job's state label otherwise.
-_PRODUCT_NAME: Final = "saneless"
-_PAGE_TITLE_SUFFIX: Final = f" — {_PRODUCT_NAME}"
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
