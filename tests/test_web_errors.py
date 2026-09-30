@@ -2253,3 +2253,121 @@ def test_status_message_children_are_inset_like_the_status_area() -> None:
     body = rules[0]
     assert "padding-left: 1rem;" in body
     assert "border-left: var(--pico-border-width) solid transparent;" in body
+
+
+# --- Focus after a refused Scan ----------------------------------------------
+
+# The Scan button a refused htmx submit carries out-of-band, captured whole.
+_OOB_SCAN_BUTTON = re.compile(
+    r'<button type="submit" id="scan-btn" hx-swap-oob="true"(?P<attrs>[^>]*)>'
+)
+_AUTOFOCUS = re.compile(r"\sautofocus\b")
+
+# One refused submit per kind of refusal the button can recover from: the
+# worker's own refusal, a form the validator throws out, and a request the
+# route refuses before it writes anything.
+_RECOVERABLE_REFUSALS = {
+    "queue_full": (
+        {"profile": "default", "title": "Queue Full"},
+        RequestRejection.QUEUE_FULL,
+    ),
+    "invalid_title": (
+        {"profile": "default", "title": "x" * (TITLE_MAX_LENGTH + 1)},
+        RequestRejection.TITLE_TOO_LONG,
+    ),
+    "unknown_profile": (
+        {"profile": "no-such-profile", "title": "Unknown"},
+        RequestRejection.UNKNOWN_PROFILE,
+    ),
+}
+
+
+@pytest.mark.parametrize("refusal", list(_RECOVERABLE_REFUSALS))
+def test_rejected_scan_returns_focus_to_the_scan_button(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """
+    A refused Scan hands focus back to an enabled Scan button.
+
+    The press disabled the button while the request was in flight, which
+    dropped focus to the page body.  The refusal re-renders the button,
+    enabled, with ``autofocus``, so a keyboard user can correct and press
+    again.  Focus never moves into ``#status-message``: the slot speaks the
+    error from where it is.  A request that is not htmx still gets the JSON
+    shape and no markup.
+    """
+    data, rejection = _RECOVERABLE_REFUSALS[refusal]
+    _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
+
+    response = client.post("/api/scan", data=data, headers=HTMX_HEADERS)
+
+    status = 422 if refusal == "invalid_title" else rejection_status_code(rejection)
+    assert response.status_code == status
+    assert response.headers["HX-Retarget"] == "#status-message"
+    assert _error_paragraph(rejection) in response.text
+    buttons = _OOB_SCAN_BUTTON.findall(response.text)
+    assert len(buttons) == 1, response.text
+    assert _AUTOFOCUS.search(buttons[0]) is not None
+    assert "disabled" not in buttons[0]
+    assert response.text.count('id="scan-btn"') == 1
+
+    plain = client.post("/api/scan", data=data)
+    _assert_json_error(plain, rejection, status)
+
+
+@pytest.mark.parametrize(
+    ("credential", "url", "rejection"),
+    [
+        (_SHIPPED_PLACEHOLDER, None, RequestRejection.TOKEN_UNSET),
+        (_ACCEPTED_CREDENTIAL, "", RequestRejection.URL_UNSET),
+    ],
+    ids=["token_unset", "url_unset"],
+)
+def test_blocked_refusal_does_not_offer_the_scan_button(
+    web_settings: Settings,
+    web_scanner: StubScannerBackend,
+    credential: str,
+    url: str | None,
+    rejection: RequestRejection,
+) -> None:
+    """
+    On an appliance that cannot upload, the refusal carries no Scan button.
+
+    The button there is disabled by design, and a disabled button cannot take
+    focus, so there is nothing to hand focus back to.
+    """
+    with _appliance_with_credential(
+        web_settings, web_scanner, credential, url=url
+    ) as blocked:
+        response = blocked.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Blocked"},
+            headers=HTMX_HEADERS,
+        )
+
+    assert response.status_code == rejection_status_code(rejection)
+    assert _error_paragraph(rejection) in response.text
+    assert "scan-btn" not in response.text
+    assert _AUTOFOCUS.search(response.text) is None
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "data"),
+    [
+        ("GET", "/api/scan", None),
+        ("POST", "/api/flip/abort", {}),
+        ("POST", "/api/multi-page/answer", {"job_id": "x", "prompt": "0"}),
+        ("POST", f"/_test/reject/{RequestRejection.QUEUE_FULL.value}", None),
+    ],
+    ids=["scan_get", "flip_abort", "multi_page_answer", "other_route"],
+)
+def test_other_htmx_errors_carry_no_scan_button(
+    client: TestClient, method: str, path: str, data: dict[str, str] | None
+) -> None:
+    """Only a refused Scan press returns focus to Scan; no other error moves it."""
+    response = client.request(method, path, data=data, headers=HTMX_HEADERS)
+
+    assert response.status_code >= 400
+    assert response.headers["HX-Retarget"] == "#status-message"
+    assert "scan-btn" not in response.text
+    assert _AUTOFOCUS.search(response.text) is None

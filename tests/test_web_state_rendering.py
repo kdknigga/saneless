@@ -18,6 +18,7 @@ functions themselves.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import sqlite3
@@ -25,6 +26,7 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi import FastAPI
@@ -52,13 +54,16 @@ from saneless.vocabulary import (
     FlipOutcome,
     JobState,
     PassAnswer,
+    PassWait,
     RequestRejection,
+    SubmitResult,
     error_message,
     error_next_step,
     flip_answer_label,
     job_label,
     job_status_class,
     page_counts,
+    pass_wait_state,
     progress_label,
     rejection_message,
     state_label,
@@ -2919,3 +2924,321 @@ def test_stylesheet_has_no_dead_fallbacks_or_deprecated_clip(
     assert sr_only is not None, ".sr-only rule not found"
     assert "clip-path: inset(50%);" in sr_only.group("body")
     assert "clip: rect(" not in css
+
+
+# --- Where focus goes after an action (the focus map) -----------------------
+
+# The one value of the poll's ``focus`` parameter the server acts on.  Written
+# out rather than imported, so a renamed constant is a failing test and not a
+# silent change to every URL a browser already holds.
+_FOCUS_SCAN = "scan"
+
+# The multi-page answers after which focus goes to the status area.  Abort is
+# the one answer that sends it to the Scan button, and has its own tests.
+_STATUS_AREA_ANSWERS = (
+    PassAnswer.NEXT,
+    PassAnswer.RESCAN,
+    PassAnswer.SKIP_BLANKS,
+    PassAnswer.KEEP_BLANKS,
+    PassAnswer.FINISH,
+)
+
+# The actions whose first following poll is checked for a 204.
+_FOCUS_ACTIONS = ("scan", "continue", "abort", "multi-page answer")
+
+_HX_GET = re.compile(r'hx-get="(?P<url>[^"]*)"')
+_AUTOFOCUS = re.compile(r"\sautofocus\b")
+
+
+def _status_open_tag(markup: str) -> str:
+    """Return the status area's opening tag, failing when there is none."""
+    match = _STATUS_OPEN.search(markup)
+    assert match is not None, markup
+    return match.group(0)
+
+
+def _status_poll_url(markup: str) -> str:
+    """Return the URL the status area polls, as the browser would request it."""
+    match = _HX_GET.search(_status_open_tag(markup))
+    assert match is not None, markup
+    return html.unescape(match.group("url"))
+
+
+def _status_poll_query(markup: str) -> dict[str, list[str]]:
+    """Return the query the status area's poll URL carries."""
+    return parse_qs(urlsplit(_status_poll_url(markup)).query)
+
+
+def _takes_focus(tag_or_attrs: str) -> bool:
+    """Report whether an opening tag, or a tag's attributes, carry ``autofocus``."""
+    return _AUTOFOCUS.search(tag_or_attrs) is not None
+
+
+def _accept_every_submit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the worker accept every submit without running a scan."""
+
+    def accept(*_args: object, **_kwargs: object) -> SubmitResult:
+        return SubmitResult.ACCEPTED
+
+    monkeypatch.setattr(_app(client).state.worker, "submit", accept)
+
+
+def _arm_flip(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, job_id: str
+) -> WorkerFlipCoordinator:
+    """
+    Give the worker an armed flip wait for ``job_id``, as a scan would.
+
+    Set through ``monkeypatch``, so the worker has no flip wait again once the
+    test ends.
+
+    Returns:
+        The armed coordinator.
+
+    """
+    coordinator = WorkerFlipCoordinator(job_id)
+    coordinator.arm()
+    monkeypatch.setattr(_app(client).state.worker, "_flip_coordinator", coordinator)
+    return coordinator
+
+
+def _post_answer(client: TestClient, job_id: str, answer: PassAnswer) -> str:
+    """Post one multi-page answer as a prompt button would; return the 200 body."""
+    response = client.post(
+        "/api/multi-page/answer",
+        data={"job_id": job_id, "prompt": "1", "answer": answer.value},
+        headers=_HX_REQUEST,
+    )
+    assert response.status_code == 200, response.text
+    return response.text
+
+
+def _flip_answer_response(client: TestClient, job_id: str, answer: str) -> str:
+    """Post a flip answer, ``continue`` or ``abort``; return the 200 body."""
+    response = client.post(
+        f"/api/flip/{answer}", data={"job_id": job_id}, headers=_HX_REQUEST
+    )
+    assert response.status_code == 200, response.text
+    return response.text
+
+
+class TestFocusEmission:
+    """
+    The server places focus where the focus map says, and nowhere else.
+
+    Focus moves with no script of the page's own: htmx focuses an element
+    carrying ``autofocus`` in the content it has just swapped in, after it has
+    restored focus by id.  So an action's response puts ``autofocus`` on the
+    status area, an Abort asks for it on the Scan button through its poll URL
+    once that button can take it, and neither a page load nor a plain poll
+    moves focus at all.
+    """
+
+    def test_focus_map_scan_autofocuses_the_status_area(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An accepted Scan moves focus to the status area and asks for no more."""
+        _accept_every_submit(client, monkeypatch)
+
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Focus Test"},
+            headers=_HX_REQUEST,
+        )
+
+        assert response.status_code == 200, response.text
+        assert _takes_focus(_status_open_tag(response.text))
+        assert not _takes_focus(_only_scan_button(response.text).group("attrs"))
+        assert "focus" not in _status_poll_query(response.text)
+
+    def test_focus_map_continue_autofocuses_the_status_area(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A claimed Continue moves focus to the status area."""
+        job_id = _job_in_state(client, JobState.AWAITING_FLIP)
+        _arm_flip(client, monkeypatch, job_id)
+
+        text = _flip_answer_response(client, job_id, "continue")
+
+        assert str(escape(flip_answer_label(FlipOutcome.CONTINUED))) in text
+        assert _takes_focus(_status_open_tag(text))
+        assert "focus" not in _status_poll_query(text)
+
+    @pytest.mark.parametrize("answer", _STATUS_AREA_ANSWERS, ids=str)
+    def test_focus_map_multi_page_answers_autofocus_the_status_area(
+        self, client: TestClient, answer: PassAnswer
+    ) -> None:
+        """Scan next, Re-scan, Skip, Keep and Finish move focus to the status area."""
+        job_id = _job_in_state(client, pass_wait_state(PassWait.NEXT_PASS))
+
+        text = _post_answer(client, job_id, answer)
+
+        assert _takes_focus(_status_open_tag(text))
+        assert "focus" not in _status_poll_query(text)
+        assert not _takes_focus(_only_scan_button(text).group("attrs"))
+
+    def test_focus_map_claimed_abort_bakes_focus_scan(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A claimed Abort focuses the status area and asks its poll for Scan.
+
+        The Scan button is still disabled while the scan winds down, and a
+        disabled button cannot take focus, so the response holds focus on the
+        status area for the interim and the poll carries the request on.
+        """
+        job_id = _job_in_state(client, JobState.AWAITING_FLIP)
+        _arm_flip(client, monkeypatch, job_id)
+
+        text = _flip_answer_response(client, job_id, "abort")
+
+        assert str(escape(flip_answer_label(FlipOutcome.ABORTED))) in text
+        assert _takes_focus(_status_open_tag(text))
+        assert _status_poll_query(text)["focus"] == [_FOCUS_SCAN]
+        button = _only_scan_button(text).group("attrs")
+        assert "disabled" in button
+        assert not _takes_focus(button)
+
+    def test_focus_map_unclaimed_abort_bakes_nothing(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An Abort this browser may not give asks nobody for Scan.
+
+        The job is somebody else's, so the answer is dropped and the scan goes
+        on; nothing asks for the Scan button, now or on a later poll.
+        """
+        job_id = _flip_job(client, _OWNING_BROWSER)
+        _arm_flip(client, monkeypatch, job_id)
+
+        text = _flip_answer_response(client, job_id, "abort")
+
+        assert _app(client).state.worker.flip_answer(job_id) is None
+        assert "focus" not in _status_poll_query(text)
+        assert not _takes_focus(_only_scan_button(text).group("attrs"))
+
+    def test_an_abort_claimed_after_the_job_ended_focuses_scan_at_once(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        When the rendered Scan button is already enabled, it takes focus now.
+
+        htmx focuses the main swap's ``autofocus`` after the out-of-band
+        ones, so a status area asking for focus as well would win; it asks
+        for none.
+        """
+        job_id = _job_in_state(client, JobState.AWAITING_FLIP)
+        _arm_flip(client, monkeypatch, job_id)
+        store: JobStore = _app(client).state.job_store
+        store.update_state(job_id, JobState.CANCELLED)
+
+        text = _flip_answer_response(client, job_id, "abort")
+
+        button = _only_scan_button(text).group("attrs")
+        assert "disabled" not in button
+        assert _takes_focus(button)
+        assert not _takes_focus(_status_open_tag(text))
+
+    def test_focus_scan_autofocuses_an_enabled_scan_button_only(
+        self, client: TestClient
+    ) -> None:
+        """
+        ``focus=scan`` focuses Scan on the first rendering that can take it.
+
+        While the job is active the button is disabled, so the request is
+        carried on in the next poll URL; once the job has ended the button is
+        enabled and takes focus.  A poll that did not ask never moves it.
+        """
+        active = _job_in_state(client, JobState.AWAITING_FLIP)
+        waiting = client.get(
+            f"/api/jobs/{active}/status", params={"focus": _FOCUS_SCAN}
+        ).text
+        waiting_button = _only_scan_button(waiting).group("attrs")
+        assert "disabled" in waiting_button
+        assert not _takes_focus(waiting_button)
+        assert _status_poll_query(waiting)["focus"] == [_FOCUS_SCAN]
+
+        ended = _job_in_state(client, JobState.CANCELLED)
+        asked = client.get(
+            f"/api/jobs/{ended}/status", params={"focus": _FOCUS_SCAN}
+        ).text
+        asked_button = _only_scan_button(asked).group("attrs")
+        assert "disabled" not in asked_button
+        assert _takes_focus(asked_button)
+        assert not _takes_focus(_status_open_tag(asked))
+
+        plain = client.get(f"/api/jobs/{ended}/status").text
+        assert "autofocus" not in plain
+
+    @pytest.mark.parametrize(
+        "value", ["SCAN", "zz-focus-probe", '"><b>zz</b>', "scan,scan"], ids=repr
+    )
+    def test_unknown_focus_value_is_ignored(
+        self, client: TestClient, value: str
+    ) -> None:
+        """Only the one constant is acted on, and no value is ever echoed."""
+        active = _job_in_state(client, JobState.AWAITING_FLIP)
+        waiting = client.get(f"/api/jobs/{active}/status", params={"focus": value})
+        ended = _job_in_state(client, JobState.CANCELLED)
+        asked = client.get(f"/api/jobs/{ended}/status", params={"focus": value})
+
+        assert waiting.status_code == asked.status_code == 200
+        assert "focus" not in _status_poll_query(waiting.text)
+        assert not _takes_focus(_only_scan_button(asked.text).group("attrs"))
+        for text in (waiting.text, asked.text):
+            assert value not in text
+            assert str(escape(value)) not in text
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_page_and_plain_polls_never_autofocus(
+        self, client: TestClient, state: JobState
+    ) -> None:
+        """
+        A page load moves no focus, and a plain poll never focuses the area.
+
+        A poll that focused the status area would pull focus out of the Title
+        box once a second while a scan runs.
+        """
+        job_id = _job_in_state(client, state)
+
+        assert "autofocus" not in client.get("/").text
+        for url in ("/api/jobs/current/status", f"/api/jobs/{job_id}/status"):
+            text = client.get(url).text
+            assert not _takes_focus(_status_open_tag(text))
+            assert not _takes_focus(_only_scan_button(text).group("attrs"))
+
+    @pytest.mark.parametrize("action", _FOCUS_ACTIONS)
+    def test_first_poll_after_an_action_is_still_204(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, action: str
+    ) -> None:
+        """
+        An action's focus attribute does not make the following poll swap.
+
+        The token is taken from the rendering a poll would produce, with no
+        action-only attribute, so the poll after an action that changed
+        nothing is answered with no content and focus is left where the action
+        put it.  After an Abort that poll carries ``focus=scan``, and is still
+        answered 204 while the Scan button cannot take focus yet.
+        """
+        match action:
+            case "scan":
+                _accept_every_submit(client, monkeypatch)
+                response = client.post(
+                    "/api/scan",
+                    data={"profile": "default", "title": "Focus Test"},
+                    headers=_HX_REQUEST,
+                )
+                assert response.status_code == 200, response.text
+                text = response.text
+            case "multi-page answer":
+                job_id = _job_in_state(client, pass_wait_state(PassWait.NEXT_PASS))
+                text = _post_answer(client, job_id, PassAnswer.NEXT)
+            case _:
+                job_id = _job_in_state(client, JobState.AWAITING_FLIP)
+                _arm_flip(client, monkeypatch, job_id)
+                text = _flip_answer_response(client, job_id, action)
+
+        poll = client.get(_status_poll_url(text), headers=_HX_REQUEST)
+
+        assert _takes_focus(_status_open_tag(text))
+        assert poll.status_code == 204, poll.text
