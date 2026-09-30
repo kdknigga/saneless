@@ -68,6 +68,7 @@ from saneless.vocabulary import (
     rejection_message,
 )
 from saneless.web import app as app_module
+from saneless.web import cache as cache_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
@@ -5058,3 +5059,238 @@ class TestWebLogsNoClientSecret:
         ]
         assert [record.exc_info for record in web_records] == [None]
         assert logged in web_records[0].getMessage()
+
+
+# The lazy list load's out-of-band Scan button, and the emptied hold reason.
+_METADATA_SCAN_BUTTON = re.compile(
+    r'<button type="submit" id="scan-btn" hx-swap-oob="true"[^>]*>'
+)
+_EMPTIED_HOLD_REASON = '<small id="scan-hold-reason" hx-swap-oob="true"></small>'
+
+
+def _retry_element(seconds: int) -> str:
+    """
+    Return the element the lazy list load leaves while a list is unavailable.
+
+    Args:
+        seconds: The retry interval it carries.
+
+    Returns:
+        The element's exact markup.
+
+    """
+    return (
+        '<div id="metadata-loader" class="htmx-hidden"'
+        ' hx-get="/api/metadata?retry=1"'
+        ' hx-include="#tag-filter, #tags-list, #correspondent-select"'
+        f' hx-trigger="every {seconds}s" hx-swap="outerHTML"></div>'
+    )
+
+
+def _metadata_scan_button(markup: str) -> str:
+    """
+    Return the one out-of-band Scan button opening tag in ``markup``.
+
+    Args:
+        markup: The lazy list load's response.
+
+    Returns:
+        The button's opening tag.
+
+    """
+    found = _METADATA_SCAN_BUTTON.findall(markup)
+    assert len(found) == 1, markup
+    return found[0]
+
+
+def _has_retry_element(markup: str) -> bool:
+    """
+    Say whether ``markup`` carries the lazy list load's retry element.
+
+    Args:
+        markup: A response body.
+
+    Returns:
+        True when the loader element is in it.
+
+    """
+    return 'id="metadata-loader"' in markup
+
+
+class TestMetadataRoute:
+    """
+    One lazy request renders both lists, their markers, and releases Scan.
+
+    Only the server knows when both lists are done, so one request fetches
+    both and answers with everything that depends on them out of band.  The
+    primary swap target is the loader itself, which the response removes, or
+    replaces with a slow retry while a list could not be loaded.
+    """
+
+    def test_metadata_initial_mode_renders_both_lists_and_markers(
+        self, tmp_path: Path
+    ) -> None:
+        """The profile's defaults arrive ticked and chosen, markers and all."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            tags: _TimedList = app.state.paperless.get_tags
+            correspondents: _TimedList = app.state.paperless.get_correspondents
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert response.status_code == 200
+        text = response.text
+        wrapper = _TAGS_WRAPPER.search(text)
+        assert wrapper is not None, text
+        assert 'hx-swap-oob="true"' in wrapper.group(0)
+        assert "checked" in _checkbox(text, 3)
+        assert "checked" in _checkbox(text, 7)
+        select = _CORRESPONDENT_SELECT_TAG.search(text)
+        assert select is not None, text
+        assert 'hx-swap-oob="true"' in select.group(0)
+        assert "selected" in _option(text, _OPENING_CORRESPONDENT)
+        for name in ("tags_profile", "correspondent_profile"):
+            marker = _marker(text, name)
+            assert 'value="default"' in marker
+            assert 'hx-swap-oob="true"' in marker
+        assert _HELP_OOB_NORMAL in text
+        assert "disabled" not in _metadata_scan_button(text)
+        assert _EMPTIED_HOLD_REASON in text
+        assert 'id="metadata-loader"' not in text
+        assert tags.timeouts == [_REQUEST_BUDGET]
+        assert correspondents.timeouts == [_REQUEST_BUDGET]
+
+    def test_metadata_unavailable_list_leaves_a_retry_element(
+        self, tmp_path: Path
+    ) -> None:
+        """A list that failed says so, releases Scan, and asks again later."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.paperless.get_tags = _FailingList()
+            _cold(app)
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert response.status_code == 200
+        text = response.text
+        assert _TAGS_UNAVAILABLE_LINE in text
+        assert "checked" in _checkbox(text, 3)
+        assert "checked" in _checkbox(text, 7)
+        assert "disabled" not in _metadata_scan_button(text)
+        assert _EMPTIED_HOLD_REASON in text
+        assert text.count('id="metadata-loader"') == 1
+        assert _retry_element(15) in text
+
+    def test_metadata_retry_interval_follows_the_negative_ttl(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The interval is the cache's memory of a failure, rounded up, read now."""
+        monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 2.5)
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.paperless.get_correspondents = _FailingList()
+            _cold(app)
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert _HELP_OOB_UNAVAILABLE in response.text
+        assert _retry_element(3) in response.text
+
+    def test_metadata_retry_carries_ticks_and_choice(self, tmp_path: Path) -> None:
+        """A retry keeps what the form shows and leaves the markers alone."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = client.get(
+                "/api/metadata",
+                params={"retry": "1", "tags": ["3", "5"], "correspondent": "41"},
+            )
+
+        assert response.status_code == 200
+        text = response.text
+        assert "checked" in _checkbox(text, 3)
+        assert "checked" in _checkbox(text, 5)
+        assert "checked" not in _checkbox(text, 7)
+        assert "selected" in _option(text, 41)
+        assert "selected" not in _option(text, _OPENING_CORRESPONDENT)
+        assert 'name="tags_profile"' not in text
+        assert 'name="correspondent_profile"' not in text
+        assert 'id="metadata-loader"' not in text
+
+    def test_metadata_scan_button_respects_an_active_job(self, tmp_path: Path) -> None:
+        """A scan in flight keeps the button disabled after the lists land."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            job_store: JobStore = app.state.job_store
+            job = job_store.create_job(profile="default", title="In Flight")
+            job_store.update_state(job.id, JobState.SCANNING)
+            app.state.worker._current_job_id = job.id
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert response.status_code == 200
+        assert "disabled" in _metadata_scan_button(response.text)
+        assert _EMPTIED_HOLD_REASON in response.text
+
+    def test_metadata_scan_button_respects_a_blocked_appliance(
+        self, tmp_path: Path
+    ) -> None:
+        """An appliance that cannot upload keeps the button disabled, and says why."""
+        with TestClient(_simple_form_app(tmp_path, credential="changeme")) as client:
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert response.status_code == 200
+        button = _metadata_scan_button(response.text)
+        assert "disabled" in button
+        assert 'aria-describedby="scan-blocked-reason"' in button
+
+    @pytest.mark.parametrize(
+        ("hidden", "absent", "getter"),
+        [
+            pytest.param("show_tags", 'id="tags-list"', "get_tags", id="tags"),
+            pytest.param(
+                "show_correspondent",
+                'id="correspondent-select"',
+                "get_correspondents",
+                id="correspondent",
+            ),
+        ],
+    )
+    def test_metadata_respects_hidden_lists(
+        self, tmp_path: Path, hidden: str, absent: str, getter: str
+    ) -> None:
+        """A hidden list is neither fetched nor rendered, and holds nothing up."""
+        app = _pre_ticked_app(tmp_path, **{hidden: False})
+        with TestClient(app) as client:
+            app.state.paperless.get_tags = _FailingList()
+            app.state.paperless.get_correspondents = _FailingList()
+            _cold(app)
+            fetch: _TimedList = getattr(app.state.paperless, getter)
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert response.status_code == 200
+        assert fetch.timeouts == []
+        assert absent not in response.text
+        if hidden == "show_correspondent":
+            assert 'id="correspondent-help"' not in response.text
+        # The list that is shown failed, so the retry element stays.
+        assert _has_retry_element(response.text)
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            pytest.param({"profile": "nope"}, id="unknown-profile"),
+            pytest.param({}, id="no-profile"),
+            pytest.param({"profile": "default", "q": "a" * 500}, id="long-filter"),
+            pytest.param({"profile": "default", "tags": ["x"]}, id="bad-tag"),
+        ],
+    )
+    def test_metadata_rejects_an_unknown_profile(
+        self, tmp_path: Path, params: dict[str, str | list[str]]
+    ) -> None:
+        """A profile nobody configured, or an input out of bounds, is a 422."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = client.get("/api/metadata", params=params)
+
+        assert response.status_code == 422
+        tags: _TimedList = app.state.paperless.get_tags
+        assert tags.timeouts == []
