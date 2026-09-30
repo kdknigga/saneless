@@ -8,11 +8,11 @@ leaves either the old file or the new one -- never a truncated config.
 It keeps the original's mode and owner (warning when the owner cannot be
 kept), and its extended attributes and POSIX ACL -- refusing the rewrite when
 one of those cannot be kept -- follows symlinks to the real file, but never to
-a file that does not exist yet, nor as root to a file the link's directory
-owner does not own, and reports a single-file bind mount -- which cannot be
-renamed over -- as a ``ConfigError`` naming the fix. A file it creates takes
-its directory's owner when permitted and stays 0600. Temp files left by a
-killed rewrite are swept on the next one.
+a file that does not exist yet, nor as root through a link another user made
+to a file that user does not own, and reports a single-file bind mount --
+which cannot be renamed over -- as a ``ConfigError`` naming the fix. A file
+it creates takes its directory's owner when permitted and stays 0600. Temp
+files left by a killed rewrite are swept on the next one.
 
 The module knows nothing about TOML: callers produce the text, this module
 only makes the write durable.
@@ -509,8 +509,8 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     * ``path`` is resolved first and the **real** file is replaced, so a
       dotfiles-style symlink keeps pointing at it. A symlink to nothing is
       refused rather than followed: it would create a file wherever the link
-      points. Root follows a link only to a file owned by the owner of the
-      link's directory, who chose where it points and could write that file
+      points. Root follows a link only when root made it, or when the link's
+      maker, who chose where it points, owns that file and could write it
       anyway.
     * The temp file comes from ``tempfile.mkstemp`` in the real file's **own
       directory**: ``rename(2)`` is atomic only within one filesystem, and a
@@ -577,8 +577,9 @@ def replace_file_atomically(path: Path, text: str) -> Path:
             on a read-only directory mount, and the message says to mount it
             read-write; or an extended attribute or ACL of the existing file
             could not be copied, and the file is left as it was; or ``path``
-            is a symlink to a file that does not exist, or, for root, to a
-            file not owned by the owner of the link's directory.
+            is a symlink to a file that does not exist, or, for root, a
+            symlink made by someone other than root who does not own the file
+            it points to.
         PermissionError: The existing file, on a writable mount, is not
             writable by this process.
         OSError: Any other filesystem failure, re-raised after the temp file
@@ -609,18 +610,22 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         original is not None
         and os.geteuid() == 0
         and path.is_symlink()
-        and original.st_uid != path.parent.stat().st_uid
+        and path.lstat().st_uid not in {0, original.st_uid}
     ):
         # The same reasoning reaches a link to a file that exists: root
         # following it would replace any file that parses as TOML -- an
         # empty one does -- keeping its owner and mode but not its contents.
-        # So root writes through a link only to a file owned by whoever owns
-        # the link's directory, who could have written that file anyway; a
-        # dotfiles link in the service's own directory keeps working.
+        # So root follows a link only when root made it, or when whoever
+        # made it owns the file and could have written it anyway: a dotfiles
+        # link keeps working, and so does a user's link in the compose
+        # ./config. Owning the link's directory is not enough, because a
+        # directory others may write through its group or an ACL lets them
+        # plant a link there too; the kernel's protected_symlinks rule judges
+        # a link by its owner for the same reason.
         msg = (
-            f"Cannot rewrite {path} as root: it is a symlink to {target}, whose "
-            "owner does not own the link's directory; run this as the owner of "
-            f"{target}, or replace the link with the file"
+            f"Cannot rewrite {path} as root: it is a symlink to {target}, and "
+            "whoever made the link does not own that file; run this as the "
+            f"owner of {target}, or replace the link with the file"
         )
         raise ConfigError(msg)
     if original is not None and (mount_error := _read_only_mount_error(target)):

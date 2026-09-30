@@ -186,6 +186,36 @@ def _deny_write_access(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
     monkeypatch.setattr("saneless.atomic_write.os.access", access)
 
 
+def _fake_link_owner(monkeypatch: pytest.MonkeyPatch, link: Path, uid: int) -> None:
+    """
+    Make ``os.lstat`` report the symlink ``link`` as made by ``uid``.
+
+    Every other path, and every other field, is answered for real, so the
+    link still reads as a link. Nothing is chowned: a non-root test cannot
+    give a link away.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        link: The symlink whose owner to fake; it is not resolved.
+        uid: The owner to report.
+
+    """
+    real_lstat = os.lstat
+    faked = os.fspath(link)
+
+    def fake_lstat(
+        path: str | os.PathLike[str], *, dir_fd: int | None = None
+    ) -> os.stat_result:
+        result = real_lstat(path, dir_fd=dir_fd)
+        if os.fspath(path) != faked:
+            return result
+        fields = list(result)
+        fields[stat.ST_UID] = uid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+
+
 def _is_directory_fd(fd: int) -> bool:
     """Return True when ``fd`` refers to a directory."""
     return stat.S_ISDIR(os.fstat(fd).st_mode)
@@ -438,16 +468,17 @@ class TestSymlinkAndReadonly:
         assert directories == [], "a temp file was created before refusing"
         _leftovers(elsewhere)
 
-    def test_root_does_not_rewrite_a_file_the_links_directory_owner_does_not_own(
+    def test_root_does_not_rewrite_a_file_the_links_maker_does_not_own(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
         A planted link to an existing file cannot aim a root rewrite at it.
 
-        Whoever can write the link's directory chose where the link points.
-        Followed as root, it would replace any file that parses as TOML --
-        an empty one does -- so root writes through a link only to a file
-        the link's directory owner owns, which that owner could write anyway.
+        Whoever made the link chose where it points. Followed as root, it
+        would replace any file that parses as TOML -- an empty one does -- so
+        root writes through a link only to a file the link's maker owns, and
+        could therefore write anyway. Here the link's directory is the
+        maker's too, and the file is someone else's.
         """
         conf = tmp_path / "conf"
         conf.mkdir()
@@ -459,6 +490,7 @@ class TestSymlinkAndReadonly:
         link.symlink_to(victim)
         monkeypatch.setattr(os, "geteuid", lambda: 0)
         _fake_directory_owner(monkeypatch, conf, os.getuid() + 1, os.getgid())
+        _fake_link_owner(monkeypatch, link, os.getuid() + 1)
         directories = _record_mkstemp(monkeypatch)
 
         with pytest.raises(ConfigError) as excinfo:
@@ -471,10 +503,49 @@ class TestSymlinkAndReadonly:
         assert link.is_symlink()
         assert directories == [], "a temp file was created before refusing"
 
-    def test_root_writes_through_a_link_to_a_file_its_directory_owner_owns(
+    def test_root_does_not_follow_a_link_a_co_writer_planted_in_its_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A dotfiles link in the service's own directory still works as root."""
+        """
+        Owning the link's directory is not the same as making the link.
+
+        A root-owned config directory the service may also write, through its
+        group or an ACL, lets the service plant a link to a file the
+        directory's owner owns. The directory and the file then share an
+        owner, but the link's maker owns neither, so root refuses it.
+        """
+        conf = tmp_path / "conf"
+        conf.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        victim = elsewhere / "victim.conf"
+        victim.write_bytes(b"")
+        link = conf / "saneless.toml"
+        link.symlink_to(victim)
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        _fake_directory_owner(monkeypatch, conf, os.getuid(), os.getgid())
+        _fake_link_owner(monkeypatch, link, os.getuid() + 1)
+        directories = _record_mkstemp(monkeypatch)
+
+        with pytest.raises(ConfigError) as excinfo:
+            replace_file_atomically(link, _NEW)
+
+        message = str(excinfo.value)
+        assert str(link) in message
+        assert str(victim) in message
+        assert victim.read_bytes() == b""
+        assert link.is_symlink()
+        assert directories == [], "a temp file was created before refusing"
+
+    def test_root_writes_through_a_link_made_by_its_files_owner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A dotfiles link, or the compose ``./config`` one, still works as root.
+
+        The link and the file it points to share an owner, whoever owns the
+        link's directory, so root can reach only what that owner could write.
+        """
         conf = tmp_path / "conf"
         conf.mkdir()
         real = tmp_path / "dotfiles" / "saneless.toml"
@@ -483,6 +554,34 @@ class TestSymlinkAndReadonly:
         link = conf / "saneless.toml"
         link.symlink_to(real)
         monkeypatch.setattr(os, "geteuid", lambda: 0)
+        _fake_directory_owner(monkeypatch, conf, 0, 0)
+
+        result = replace_file_atomically(link, _NEW)
+
+        assert result == real.resolve()
+        assert real.read_bytes() == _NEW.encode("utf-8")
+        assert link.is_symlink()
+
+    def test_root_writes_through_its_own_link_to_another_users_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A link root made itself is followed wherever it points.
+
+        Root in its own ``/etc/saneless`` may link the config to a file a
+        user keeps; the choice of target was root's, so nothing is gained by
+        refusing it.
+        """
+        conf = tmp_path / "conf"
+        conf.mkdir()
+        real = tmp_path / "home" / "saneless.toml"
+        real.parent.mkdir()
+        real.write_text(_ORIGINAL, encoding="utf-8")
+        link = conf / "saneless.toml"
+        link.symlink_to(real)
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        _fake_directory_owner(monkeypatch, conf, 0, 0)
+        _fake_link_owner(monkeypatch, link, 0)
 
         result = replace_file_atomically(link, _NEW)
 
