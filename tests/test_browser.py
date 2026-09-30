@@ -36,6 +36,7 @@ import socket
 import threading
 import time
 from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
@@ -91,6 +92,7 @@ from saneless.config import (
     Settings,
     WebConfig,
     discover_config,
+    resolve_job_title,
 )
 from saneless.job import JobResult
 from saneless.paperless import ApiDelivery, TaskFiled, UploadResult
@@ -4370,6 +4372,49 @@ class TestStatusStripInChromium:
         # refreshed twice; a swap that dropped it would look fine once.
         expect(page.locator(".check-refresh")).to_have_count(1)
 
+    def test_htmx_request_timeout_is_configured(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        The loaded htmx really reads the 20 s timeout from the meta.
+
+        The template test proves the JSON says so; only the running library
+        proves the meta was merged, and that a stalled request will be let go
+        instead of holding its element for as long as the socket stays open.
+        """
+        page.goto(browser_server_url)
+        expect(page.locator("#checks-body")).to_have_count(1)
+
+        assert page.evaluate("() => htmx.config.timeout") == 20000
+
+    def test_focus_map_check_again_keeps_focus(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        A keyboard press on Check again leaves focus on the new Check again.
+
+        The button sits inside the body it replaces, so the element that had
+        focus is detached by its own swap.  htmx puts focus back on the element
+        with the same id, which is the only thing standing between a keyboard
+        user and a focus that has fallen to the top of the page.  The witness
+        proves the body really was replaced, so the focus assertion is about
+        the new button and not the old one surviving an in-place update.
+        """
+        server = cold_strip_server
+        _probe_now(server)
+        page.goto(server.url)
+        expect(page.locator("#checks-body:not([hx-trigger])")).to_have_count(1)
+        page.locator("#checks-body").evaluate(
+            "(el) => el.setAttribute('data-witness', 'before-refresh')"
+        )
+
+        page.focus("#checks-refresh")
+        with page.expect_response(lambda r: r.url.endswith("/api/checks/refresh")):
+            page.keyboard.press("Enter")
+
+        expect(page.locator("#checks-body:not([data-witness])")).to_have_count(1)
+        expect(page.locator("#checks-refresh")).to_be_focused()
+
     def test_the_strip_fits_a_320px_phone_without_a_sideways_scrollbar(
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
@@ -5197,6 +5242,138 @@ class TestPageCountsInChromium:
         finally:
             worker._current_job_id = None
             job_store.delete_job(job.id)
+
+
+# Every word in the history headers and in the Time, Profile and Status cells,
+# each measured as a Range: a word that fits on one line has exactly one client
+# rect, and a word split across lines has one per line.  A word is cut after
+# each hyphen it holds, so "2026-09-30" is measured as "2026-", "09-" and "30":
+# a line break straight after a printed hyphen is an ordinary one the browser
+# may take, and the reader sees the hyphen that says the word goes on.  What
+# is refused is a break with no hyphen to mark it, such as "Compl" and "ete".
+# The Title column is left out on purpose, because a title is user text of any
+# length and is the one cell allowed to break anywhere.  A function
+# expression, because the Content-Security-Policy refuses the eval a bare
+# expression would need.
+_SPLIT_HISTORY_WORDS = """
+() => {
+  const table = document.querySelector(".history-table-wrap table");
+  const cells = [
+    ...table.querySelectorAll("thead th"),
+    ...table.querySelectorAll(
+      "#history-body td:nth-child(1), #history-body td:nth-child(2), "
+        + "#history-body td:nth-child(4)"
+    ),
+  ];
+  const split = [];
+  let words = 0;
+  for (const cell of cells) {
+    const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      for (const match of node.data.matchAll(/[^\\s-]*-|[^\\s-]+/g)) {
+        const range = document.createRange();
+        range.setStart(node, match.index);
+        range.setEnd(node, match.index + match[0].length);
+        const lines = range.getClientRects().length;
+        words += 1;
+        if (lines !== 1) {
+          split.push([match[0], lines]);
+        }
+      }
+    }
+  }
+  return {cells: cells.length, words, split};
+}
+"""
+
+
+@pytest.mark.browser
+class TestHistoryTableOnAPhone:
+    """
+    The history table at 390 px keeps every word whole.
+
+    Whether a word breaks is a line-layout outcome of the cascade, the table
+    algorithm and the font together, so only a browser can say.  390 px is a
+    common phone width, and the rows staged here carry the longest Status
+    labels the table can show beside a default title.
+    """
+
+    def test_history_390_keeps_every_word_on_one_line(
+        self, page: Page, empty_history_server: _BrowserServer
+    ) -> None:
+        """
+        No header, time, profile or status word is split, and nothing scrolls.
+
+        Under a fixed table layout every column got a quarter of the width
+        whatever it held, so a long label was broken mid-word.  The document
+        width is checked as well, because keeping words whole by widening the
+        page would trade one failure for another.
+
+        A break straight after a printed hyphen is allowed, as
+        ``_SPLIT_HISTORY_WORDS`` explains: at this width the date and
+        "paperless-ngx" cannot both stay whole and leave the Title column
+        room for more than a few letters, and a hyphen at the line end shows
+        the reader the word goes on.
+        """
+        server = empty_history_server
+        job_store: JobStore = server.app.state.job_store
+        owner = _as_owner(page, server.url)
+        title = resolve_job_title(None, None, now=datetime.now(tz=UTC))
+        warning = "The scanner skipped a sheet."
+
+        waiting = job_store.create_job(
+            profile="default", title=title, owner_token=owner
+        )
+        job_store.update_state(waiting.id, JobState.AWAITING_RETRY)
+        unconfirmed = job_store.create_job(
+            profile="default", title=title, owner_token=owner
+        )
+        job_store.finish_job(
+            unconfirmed.id,
+            JobState.ERROR,
+            error=_ERROR_DETAIL,
+            error_category=ErrorCategory.UNCONFIRMED_SEND,
+        )
+        warned = job_store.create_job(profile="default", title=title, owner_token=owner)
+        job_store.finish_job(
+            warned.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=warning,
+                pages_scanned=None,
+                pages_removed=None,
+                pages_uploaded=None,
+            ),
+        )
+        try:
+            page.set_viewport_size({"width": 390, "height": 844})
+            page.goto(server.url)
+
+            statuses = page.locator("#history-body td:nth-child(4)")
+            expect(statuses).to_have_count(3)
+            for label in (
+                job_label(JobState.DONE, warning),
+                job_label(JobState.ERROR, None, ErrorCategory.UNCONFIRMED_SEND),
+                job_label(JobState.AWAITING_RETRY, None),
+            ):
+                expect(statuses.filter(has_text=label)).to_have_count(1)
+
+            measured = page.evaluate(_SPLIT_HISTORY_WORDS)
+            # Four headers and three cells in each of three rows, so an empty
+            # measurement cannot pass for a clean one.
+            assert measured["cells"] == 13, measured
+            assert measured["words"] > measured["cells"], measured
+            assert measured["split"] == [], measured["split"]
+
+            overflow = page.evaluate(
+                "() => document.documentElement.scrollWidth "
+                "- document.documentElement.clientWidth"
+            )
+            assert overflow <= 0, f"the page scrolls sideways by {overflow}px at 390px"
+        finally:
+            for job in (waiting, unconfirmed, warned):
+                job_store.delete_job(job.id)
 
 
 _FRONT_PAGES = 12
