@@ -13,6 +13,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, Literal
 
 from .auto_profiles import (
@@ -284,11 +285,36 @@ class WorkerFlipCoordinator(FlipCoordinator):
         self._job_id = job_id
         self._slot = FlipAnswerSlot()
         self._armed = threading.Event()
+        # Guards the first-arm reading below: arm() runs on the worker thread
+        # and, through interrupt_for_shutdown, on the stopping thread.
+        self._armed_at_lock = threading.Lock()
+        self._armed_at: datetime | None = None
 
     @property
     def job_id(self) -> str:
         """The id of the job whose flip this coordinator answers."""
         return self._job_id
+
+    @property
+    def armed_at(self) -> datetime | None:
+        """
+        When the flip wait began, in UTC, or ``None`` before the first ``arm()``.
+
+        Held in memory only, for the reason ``ScanWorker.front_pages`` is not a
+        ``Job`` column: the value matters for the length of one wait and is
+        meaningless once the job ends, and a restart fails every active job,
+        so there is nothing to persist.
+
+        The first ``arm()`` happens when the job announces ``AWAITING_FLIP``,
+        microseconds before ``wait_for_flip`` starts its clock, so a deadline
+        computed from this reading is at worst a hair early, never late.
+
+        Returns:
+            The aware UTC time of the first ``arm()``, or ``None``.
+
+        """
+        with self._armed_at_lock:
+            return self._armed_at
 
     @property
     def armed(self) -> bool:
@@ -301,7 +327,15 @@ class WorkerFlipCoordinator(FlipCoordinator):
         return self._slot.answer
 
     def arm(self) -> None:
-        """Open the flip prompt to signals.  Idempotent."""
+        """
+        Open the flip prompt to signals.  Idempotent.
+
+        The first call records ``armed_at``; later calls keep that reading, so
+        the wait's own backstop ``arm()`` does not restart the clock.
+        """
+        with self._armed_at_lock:
+            if self._armed_at is None:
+                self._armed_at = datetime.now(tz=UTC)
         self._armed.set()
 
     def signal_continue(self) -> bool:
@@ -1012,6 +1046,35 @@ class ScanWorker:
         if coordinator is None or coordinator.job_id != job_id:
             return None
         return coordinator.answer
+
+    def flip_deadline(self, job_id: str) -> datetime | None:
+        """
+        Report when ``job_id``'s flip wait times out, if it is the live job.
+
+        The coordinator is read once and compared on its own job id, the same
+        snapshot rule as ``flip_answer``.  The deadline is the wait's start
+        plus ``output.operator_wait_timeout_seconds``; see
+        ``WorkerFlipCoordinator.armed_at`` for why the start is held in memory
+        rather than on the job row, and why the deadline is conservative.
+
+        Args:
+            job_id: The job whose deadline is wanted.
+
+        Returns:
+            The aware UTC deadline when ``job_id`` is the job with the live
+            flip coordinator and that coordinator is armed, otherwise
+            ``None``.
+
+        """
+        coordinator = self._flip_coordinator
+        if coordinator is None or coordinator.job_id != job_id:
+            return None
+        armed_at = coordinator.armed_at
+        if armed_at is None:
+            return None
+        return armed_at + timedelta(
+            seconds=self._settings.output.operator_wait_timeout_seconds
+        )
 
     def _signal_flip(self, job_id: str, action: Literal["continue", "abort"]) -> bool:
         """

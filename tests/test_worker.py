@@ -2005,6 +2005,7 @@ class TestFlipDeadline:
             worker.stop()
             store.close()
 
+        assert deadline is not None
         assert deadline == armed_at + wait
         assert before + wait <= deadline <= after + wait
         assert ended is None
