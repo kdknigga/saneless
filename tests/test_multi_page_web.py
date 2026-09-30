@@ -1097,3 +1097,131 @@ class TestTheFlipPromptIsUntouched:
 
         assert "flip-prompt" in area
         assert "pages-prompt" not in area
+
+
+# The button each question's first appearance puts focus on: the first answer
+# it offers of Scan next, Retry and Skip.
+_PRIMARY_BUTTON = {
+    PassWait.NEXT_PASS: "mp-next",
+    PassWait.RETRY: "mp-retry",
+    PassWait.BLANK_DECISION: "mp-skip",
+}
+_AUTOFOCUS = re.compile(r"\sautofocus\b")
+_STATUS_AREA_OPEN = re.compile(r'<div id="status-area"[^>]*>', re.DOTALL)
+
+
+def _focused_ids(markup: str) -> list[str]:
+    """Return the id of every button in ``markup`` that carries ``autofocus``."""
+    return [
+        _button_id(attrs)
+        for attrs, _ in _buttons(markup)
+        if _AUTOFOCUS.search(attrs) is not None
+    ]
+
+
+def _poll_url_of(markup: str) -> str:
+    """Return the URL the status area polls, as the browser would request it."""
+    opening = _STATUS_AREA_OPEN.search(markup)
+    assert opening is not None, markup
+    url = re.search(r'hx-get="([^"]*)"', opening.group(0))
+    assert url is not None, opening.group(0)
+    return html.unescape(url.group(1))
+
+
+class TestFocus:
+    """
+    A new question puts focus on its primary button, for its owner only.
+
+    It is carried by the owner's poll rendering, and reaches the browser only
+    when that rendering changes -- when the question first appears -- because
+    an unchanged poll is answered 204.  The full page never carries it.
+    """
+
+    @pytest.mark.parametrize("wait", list(PassWait))
+    def test_owner_pass_prompt_autofocuses_its_primary_button(
+        self, served: _Served, stager: _Stager, wait: PassWait
+    ) -> None:
+        """Exactly one button takes focus: Scan next, Retry or Skip."""
+        stager.prompt(_prompt_for(wait))
+
+        text = _status(served)
+
+        assert _focused_ids(text) == [_PRIMARY_BUTTON[wait]]
+        opening = _STATUS_AREA_OPEN.search(text)
+        assert opening is not None
+        assert _AUTOFOCUS.search(opening.group(0)) is None
+
+    def test_nothing_kept_still_focuses_scan_next(
+        self, served: _Served, stager: _Stager
+    ) -> None:
+        """With nothing kept Finish is disabled; Scan next is offered and focused."""
+        stager.prompt(_next_pass(kept=0))
+
+        assert _focused_ids(_status(served)) == ["mp-next"]
+
+    @pytest.mark.parametrize("wait", list(PassWait))
+    @pytest.mark.parametrize("presented", [_STRANGER, None], ids=["stranger", "none"])
+    def test_non_owner_pass_prompt_is_never_autofocused(
+        self, served: _Served, stager: _Stager, wait: PassWait, presented: str | None
+    ) -> None:
+        """Another browser is sent no question, and so no focus request."""
+        stager.prompt(_prompt_for(wait))
+        served.client.cookies.clear()
+        if presented is not None:
+            served.client.cookies.set(OWNER_COOKIE, presented)
+
+        assert "autofocus" not in _status(served)
+
+    @pytest.mark.parametrize("wait", list(PassWait))
+    def test_page_render_never_autofocuses_the_pass_prompt(
+        self, served: _Served, stager: _Stager, wait: PassWait
+    ) -> None:
+        """The page shows the owner's open question and moves no focus to it."""
+        stager.prompt(_prompt_for(wait))
+
+        page = served.client.get("/").text
+
+        assert f'id="{_PRIMARY_BUTTON[wait]}"' in page
+        assert "autofocus" not in page
+
+    @pytest.mark.parametrize("wait", list(PassWait))
+    def test_first_poll_after_a_page_with_a_pass_prompt_is_204(
+        self, served: _Served, stager: _Stager, wait: PassWait
+    ) -> None:
+        """The page's token names the poll's rendering, autofocus and all."""
+        stager.prompt(_prompt_for(wait))
+
+        page = served.client.get("/").text
+        poll = served.client.get(_poll_url_of(page))
+
+        assert poll.status_code == 204, poll.text
+
+    def test_a_claimed_abort_bakes_focus_scan(
+        self, served: _Served, stager: _Stager
+    ) -> None:
+        """
+        Abort sends focus to the Scan button, as the flip prompt's Abort does.
+
+        The response focuses the status area while the scan winds down and
+        its poll carries ``focus=scan`` until the Scan button is enabled.
+        """
+        waiting = stager.prompt(_next_pass())
+
+        text = _answer(served, waiting.job_id, waiting.prompt.number, PassAnswer.ABORT)
+
+        assert waiting.asker.result() is PassAnswer.ABORT
+        opening = _STATUS_AREA_OPEN.search(text)
+        assert opening is not None
+        assert _AUTOFOCUS.search(opening.group(0)) is not None
+        assert "focus=scan" in _poll_url_of(text)
+
+    def test_any_other_claimed_answer_bakes_no_focus_scan(
+        self, served: _Served, stager: _Stager
+    ) -> None:
+        """Scan next leaves the next question's own button to take focus."""
+        waiting = stager.prompt(_next_pass())
+
+        text = _answer(served, waiting.job_id, waiting.prompt.number, PassAnswer.NEXT)
+
+        assert waiting.asker.result() is PassAnswer.NEXT
+        assert "focus=" not in _poll_url_of(text)

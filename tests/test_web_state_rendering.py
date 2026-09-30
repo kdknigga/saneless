@@ -3254,3 +3254,77 @@ class TestFocusEmission:
 
         assert _takes_focus(_status_open_tag(text))
         assert poll.status_code == 204, poll.text
+
+
+_BUTTON_TAG = re.compile(r"<button\b[^>]*>")
+
+
+def _focused_buttons(markup: str) -> list[str]:
+    """Return the id of every button in ``markup`` that carries ``autofocus``."""
+    focused = []
+    for tag in _BUTTON_TAG.findall(markup):
+        if _takes_focus(tag):
+            found = re.search(r'\bid="([^"]+)"', tag)
+            assert found is not None, tag
+            focused.append(found.group(1))
+    return focused
+
+
+class TestPromptAutofocus:
+    """
+    A prompt that appears through the poll puts focus on its primary button.
+
+    Only the owner's rendering carries it, since only the owner is sent the
+    prompt at all.  It reaches the browser only on the render where the prompt
+    first appears, because every later poll is answered 204 while nothing
+    changes.  The full page never carries it: a page load moves no focus.
+    """
+
+    def test_owner_flip_prompt_autofocuses_continue(self, client: TestClient) -> None:
+        """Continue takes focus; Abort, which asks first, does not."""
+        _job_in_state(client, JobState.AWAITING_FLIP)
+
+        text = client.get("/api/jobs/current/status").text
+
+        assert 'id="flip-abort"' in text
+        assert _focused_buttons(text) == ["flip-continue"]
+        assert "autofocus" not in _only_scan_button(text).group("attrs")
+        assert not _takes_focus(_status_open_tag(text))
+
+    @pytest.mark.parametrize("presented", [_OWNING_BROWSER + "-not", None])
+    def test_non_owner_prompt_is_never_autofocused(
+        self, client: TestClient, presented: str | None
+    ) -> None:
+        """Another browser is sent no prompt, and so no focus request."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        text = _as_browser(client, presented)
+
+        assert _NON_OWNER_LINE in text
+        assert "autofocus" not in text
+
+    def test_page_render_never_autofocuses_the_prompt(self, client: TestClient) -> None:
+        """The page shows the owner's open prompt and moves no focus to it."""
+        _job_in_state(client, JobState.AWAITING_FLIP)
+
+        page = client.get("/").text
+
+        assert 'id="flip-continue"' in page
+        assert "autofocus" not in page
+
+    def test_first_poll_after_a_page_with_a_prompt_is_204(
+        self, client: TestClient
+    ) -> None:
+        """
+        The page's token is the poll's, though only the poll carries autofocus.
+
+        A 200 here would re-render the prompt with ``autofocus`` a second after
+        the page loaded, and move focus the settled default says a page load
+        never moves.
+        """
+        _job_in_state(client, JobState.AWAITING_FLIP)
+
+        page = client.get("/").text
+        poll = client.get(_status_poll_url(page), headers=_HX_REQUEST)
+
+        assert poll.status_code == 204, poll.text
