@@ -3576,12 +3576,12 @@ def test_dockerfile_sets_a_workdir_in_the_runtime_stage() -> None:
     """
     The runtime stage anchors relative writes inside the durable volume (D-28).
 
-    With no ``WORKDIR`` the working directory is ``/``, so a relative write --
-    ``saneless auto-profiles`` with no config file loaded writes
-    ``./saneless.toml`` -- lands in the container's own writable layer, first
-    in the config search order and destroyed on the next recreation. Pointing
-    ``WORKDIR`` at the declared volume puts it somewhere durable and owned by
-    the app user instead.
+    With no ``WORKDIR`` the working directory is ``/``, so a relative write
+    lands in the container's own writable layer and is destroyed on the next
+    recreation. Pointing ``WORKDIR`` at the declared volume puts it somewhere
+    durable and owned by the app user instead. ``saneless auto-profiles`` is
+    not such a write: with no config file loaded it writes ``/etc/saneless``,
+    never the working directory, whose file would outrank that one.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)

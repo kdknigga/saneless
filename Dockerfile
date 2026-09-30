@@ -156,11 +156,11 @@ ENV XDG_STATE_HOME=/var/lib
 # at this path on first use, which is what the chown above buys. A bind mount
 # gets no such treatment -- hence the documented chown for the operator.
 VOLUME ["/var/lib/saneless"]
-# Relative writes land in the durable, owned data directory rather than in /.
-# `saneless auto-profiles` with no config file loaded writes ./saneless.toml;
-# without this it went to /saneless.toml, inside the container's own writable
-# layer, ahead of everything in the config search order and gone on the next
-# container recreation.
+# Relative writes land in the durable, owned data directory rather than in /,
+# the container's own writable layer, gone on the next recreation.
+# (`saneless auto-profiles` with no config loaded writes /etc/saneless, the
+# ./config mount, never the working directory -- a saneless.toml here would be
+# read ahead of /etc/saneless on every start.)
 WORKDIR /var/lib/saneless
 USER saneless
 # 8080 is fixed inside the container: the output.web_port setting is for
