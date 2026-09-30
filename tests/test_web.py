@@ -838,10 +838,11 @@ def test_paperless_test_error(client: TestClient) -> None:
 
     _app(client).state.paperless.test_connection = raise_exc
     response = client.get("/api/paperless/test")
-    assert response.status_code == 502
+    assert response.status_code == 500
     data = response.json()
     assert data["status"] == "error"
     assert data["detail"] == "RuntimeError"
+    assert "boom" not in response.text
 
 
 def test_scan_button_disabled_during_active_job(client: TestClient) -> None:
@@ -936,14 +937,14 @@ def test_css_spacing_normalized() -> None:
     assert "var(--pico-border-width)" in css_content
 
 
-def test_paperless_test_502_sanitizes_exception(client: TestClient) -> None:
-    """502 response returns exception class name, not raw message with secrets (RH-04)."""
+def test_paperless_test_500_sanitizes_exception(client: TestClient) -> None:
+    """500 response returns exception class name, not raw message with secrets (RH-04)."""
     sensitive_msg = "http://192.168.1.100:8000 token=abc123"
     _app(client).state.paperless.test_connection = _raise_factory(
         ConnectionError, sensitive_msg
     )
     response = client.get("/api/paperless/test")
-    assert response.status_code == 502
+    assert response.status_code == 500
     data = response.json()
     assert data["detail"] == "ConnectionError"
     assert "192.168.1.100" not in response.text
@@ -4304,7 +4305,7 @@ class TestRouteLogsNameExceptionsOnly:
         with TestClient(app) as client, caplog.at_level(logging.WARNING):
             response = client.get("/api/paperless/test")
 
-        assert response.status_code == 502
+        assert response.status_code == 500
         assert response.json() == {"status": "error", "detail": "ConnectError"}
         for record in caplog.records:
             message = record.getMessage()
@@ -4453,7 +4454,7 @@ class TestWebLogsNoClientSecret:
         with TestClient(app) as client:
             response = client.get(path)
 
-        assert response.status_code in {200, 502}
+        assert response.status_code in {200, 500}
         assert _MARKER not in caplog.text
         assert "user:pass" not in caplog.text
         web_records = [
