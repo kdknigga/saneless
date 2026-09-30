@@ -43,17 +43,27 @@ from saneless.vocabulary import (
     ACTIVE_STATES,
     BACKS_SUFFIX,
     BUSY_STATES,
+    CORRESPONDENTS_LOADING,
+    CORRESPONDENTS_UNAVAILABLE,
     FALLBACK_NOT_UPLOADED_LINE,
     FRONTS_SUFFIX,
     IDLE_LINE,
     LOCAL_TIME_FORMAT,
     LOST_CONTACT_LINE,
+    NO_SCRIPT_BACK_LINK,
+    NO_SCRIPT_BODY,
+    NO_SCRIPT_HEADING,
+    NO_SCRIPT_LINE,
+    NO_SCRIPT_PAGE_TITLE,
     PAPERLESS_TITLE_LIMIT,
     PARTIAL_SUFFIX,
     PASS_WAIT_STATES,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     RESTART_UPLOADING_REASON,
+    TAG_FILTER_LABEL,
+    TAGS_LOADING,
+    TAGS_UNAVAILABLE,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     TITLE_SUFFIX_SEPARATOR,
@@ -126,6 +136,7 @@ from saneless.vocabulary import (
     restart_category,
     restart_error,
     scan_button_label,
+    scan_hold_reason,
     scan_page_description,
     sixteen_bit_error,
     source_not_offered_error,
@@ -3255,3 +3266,86 @@ class TestFlipDeadlineNote:
         """A 90-second wait is named in seconds."""
         note = flip_deadline_note(deadline=None, timeout_seconds=90)
         assert "within 90 seconds," in note
+
+
+class TestListCopy:
+    """What the tag and correspondent lists say while they load or cannot."""
+
+    def test_tags_loading(self) -> None:
+        """The tag list's placeholder says it is loading, with an ellipsis."""
+        assert TAGS_LOADING == "Loading tags from paperless-ngx..."
+
+    def test_correspondents_loading(self) -> None:
+        """The correspondent help line says the list is loading."""
+        assert CORRESPONDENTS_LOADING == "Loading correspondents from paperless-ngx..."
+
+    def test_tags_unavailable(self) -> None:
+        """A tag list that could not load says it keeps trying and how to retry."""
+        assert TAGS_UNAVAILABLE == (
+            "Tags could not be loaded from paperless-ngx. saneless keeps trying; "
+            "press ↻ to try now."
+        )
+
+    def test_correspondents_unavailable(self) -> None:
+        """The correspondent twin of the unavailable line."""
+        assert CORRESPONDENTS_UNAVAILABLE == (
+            "Correspondents could not be loaded from paperless-ngx. saneless "
+            "keeps trying; press ↻ to try now."
+        )
+
+    def test_filter_label_matches_its_placeholder(self) -> None:
+        """The filter's accessible name is the words it visibly shows."""
+        assert TAG_FILTER_LABEL == "Filter tags"
+
+
+class TestScanHoldReason:
+    """Why the Scan button is held while the lists load."""
+
+    def test_both_lists(self) -> None:
+        """With both lists shown, the reason names both."""
+        assert scan_hold_reason(tags=True, correspondents=True) == (
+            "Scan waits for the tags and correspondents to load..."
+        )
+
+    def test_tags_only(self) -> None:
+        """With only tags shown, the reason names the tags."""
+        assert scan_hold_reason(tags=True, correspondents=False) == (
+            "Scan waits for the tags to load..."
+        )
+
+    def test_correspondents_only(self) -> None:
+        """With only correspondents shown, the reason names them."""
+        assert scan_hold_reason(tags=False, correspondents=True) == (
+            "Scan waits for the correspondents to load..."
+        )
+
+    def test_neither_list(self) -> None:
+        """With no list shown there is nothing to wait for."""
+        assert scan_hold_reason(tags=False, correspondents=False) is None
+
+
+class TestNoScriptCopy:
+    """What a browser with JavaScript turned off is told."""
+
+    def test_noscript_line(self) -> None:
+        """The line under the Scan heading says why nothing works and what to do."""
+        assert NO_SCRIPT_LINE == (
+            "Scanning from this page needs JavaScript, which is turned off in "
+            "this browser. Turn it on and reload the page, or run saneless scan "
+            "on the server."
+        )
+
+    def test_refusal_page(self) -> None:
+        """The page a form post without JavaScript lands on says no scan started."""
+        assert NO_SCRIPT_PAGE_TITLE == "Scan not started — saneless"
+        assert NO_SCRIPT_HEADING == "Scan not started"
+        assert NO_SCRIPT_BODY == (
+            "Scanning from this page needs JavaScript, which is turned off in "
+            "this browser, so no scan was started. Turn it on and reload the "
+            "page, or run saneless scan on the server."
+        )
+        assert NO_SCRIPT_BACK_LINK == "Back to the scan page"
+
+    def test_refusal_title_is_its_heading(self) -> None:
+        """The tab and the heading say the same thing."""
+        assert f"{NO_SCRIPT_HEADING} — saneless" == NO_SCRIPT_PAGE_TITLE
