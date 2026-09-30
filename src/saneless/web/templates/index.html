@@ -185,8 +185,8 @@
                     title="Refresh correspondents"
                     aria-label="Refresh correspondents">&#x21bb;<span class="sr-only">Refresh correspondents</span></button>
         </label>
-        {% include "partials/correspondent_select.html" %}
-        <small id="correspondent-help">Who sent this document? Optional.</small>
+        {% with help_elsewhere = true %}{% include "partials/correspondent_select.html" %}{% endwith %}
+        {% include "partials/correspondent_help.html" %}
         {# After the help line, never between it and the select: the select
            has to stay the element directly before its help line. #}
         {% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = selected %}{% include "partials/profile_marker.html" %}{% endwith %}

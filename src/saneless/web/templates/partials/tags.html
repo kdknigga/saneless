@@ -20,7 +20,11 @@
       never be dropped from the next submit.
    4. The filtered list.  A tag that is both ticked and matched is rendered
       by this loop alone, so it appears once rather than twice.
-   The empty-state lines render only when there is no row of any kind.
+   The empty-state lines render only when there is no row of any kind, and
+   never when the list could not be loaded: then the amber unavailable line
+   comes first instead, and the ticked ids still follow as unlisted rows,
+   because "paperless-ngx has no tags" and "paperless-ngx could not be asked"
+   are different facts.
 
    Every box turns autocomplete off: a browser that restores form state on
    reload would otherwise re-tick or untick boxes over what the server
@@ -54,6 +58,9 @@
      hx-include="#profile-select"
      hx-target="this"
      hx-swap="outerHTML">
+    {%- if tags_unavailable %}
+    <small class="status-fallback">&#9888; {{ TAGS_UNAVAILABLE }}</small>
+    {%- endif %}
     {%- for row in stale %}
     <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
     {%- endfor %}
@@ -66,7 +73,7 @@
     {%- for tag in tags %}
     <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" autocomplete="off"{% if tag.id in selected_tags %} checked{% endif %}> {{ tag.name }}</label>
     {%- endfor %}
-    {%- if not stale and not unlisted and not pinned and not tags %}
+    {%- if not tags_unavailable and not stale and not unlisted and not pinned and not tags %}
     {% if any_tags %}<small>No tags match that filter.</small>{% else %}<small>No tags in paperless-ngx yet.</small>{% endif %}
     {%- endif %}
 </div>

@@ -14,6 +14,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 from urllib.parse import urlencode
 
+import httpx2
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator
@@ -34,6 +35,8 @@ from saneless.checks import (
     POLL_GAVE_UP_LINE,
     POLL_PROBE_ATTEMPT_CAP,
     POLL_STILL_CHECKING_LINE,
+    PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
     CheckKey,
 )
 from saneless.config import PaperlessId, is_placeholder_token, resolve_job_title
@@ -82,6 +85,7 @@ from saneless.vocabulary import (
     unlisted_tag_label,
     worker_health_detail,
 )
+from saneless.web.cache import MetadataUnavailableError
 from saneless.web.errors import (
     RETRY_AFTER_SECONDS,
     TITLE_CONTROL_TYPE,
@@ -153,17 +157,22 @@ before the handler body runs, which is the same "validate at the boundary"
 shape ``MetadataResource`` uses for ``resource``.
 """
 
-PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS: Final = 5.0
+_REQUEST_FETCH_TIMEOUT: Final = httpx2.Timeout(
+    PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS
+)
 """
-The per-request budget for a list fetched to answer a profile change.
+The budget for a list fetched to answer a request: 2 s to connect, 5 s to read.
 
-The tag list and the correspondent select follow the Profile select by their
-own requests, and until those land they still show the previous profile's
-defaults.  On a cold cache with paperless-ngx slow or down, the client's own
-30 s budget per page would hold that window open for half a minute or more.
-The scan no longer files the stale values (see ``start_scan``), but the page
-should still catch up in seconds, so these fetches use the short budget the
-check before a scan uses.
+A page or a click must never wait on the client's own 30 s per page.  On a cold
+cache with paperless-ngx slow or down that would hold the tag list, the
+correspondent select and a profile change open for half a minute or more, and
+the page is only told what the lists hold once they answer.  The status strip's
+probe already decides whether paperless-ngx is answering with these two
+numbers, so they are the codebase's one measure of "answering", and every list
+route fetches with them: the tag list and its filter, the correspondent
+options, both refreshes and both profile-change swaps.  A list that does not
+answer within them is reported as not loaded, and is asked again when the
+cache's short memory of the failure runs out.
 """
 
 # The only metadata resources the cache holds.  A runtime alias, not a
@@ -584,20 +593,41 @@ def _checks_fallback_context() -> dict[str, object]:
     }
 
 
+def _lock_wait(timeout: httpx2.Timeout | None) -> float | None:
+    """
+    Say how long a request waits its turn to fetch, given its fetch budget.
+
+    A request queued behind another request's fetch of the same list waits at
+    most as long as that fetch may take to connect and read, then answers the
+    list unavailable.  Without a budget it waits as long as it takes, which is
+    the full page's behaviour today.
+
+    Args:
+        timeout: The request's fetch budget, or None for the client default.
+
+    Returns:
+        The seconds to wait for the cache's per-key lock, or None for no bound.
+
+    """
+    if timeout is None:
+        return None
+    return (timeout.connect or 0.0) + (timeout.read or 0.0)
+
+
 # How the web tier logs an exception from the Paperless client, here, in
-# paperless_test and in web/cache.py.  A PaperlessError or ConfigError is logged
-# by its message, which the client builds from fixed words, the credential-free
-# display URL and a token-redacted reason.  Anything else on those paths is
-# logged by class name only and without a traceback, because third-party
-# exception text can carry a URL, a header or a token.  Tracebacks remain only
-# for failures of saneless's own store and templates, which never receive a
-# client exception.
+# paperless_test and in web/cache.py: the client-exception rule.  A
+# PaperlessError or ConfigError is logged by its message, which the client
+# builds from fixed words, the credential-free display URL and a token-redacted
+# reason.  Anything else on those paths is logged by class name only and
+# without a traceback, because third-party exception text can carry a URL, a
+# header or a token.  Tracebacks remain only for failures of saneless's own
+# store and templates, which never receive a client exception.
 def _cached_list_or_none(
     cache: MetadataCache,
     paperless: PaperlessClient,
     resource: MetadataResource,
     *,
-    timeout: float | None = None,
+    timeout: httpx2.Timeout | None = None,
 ) -> CachedList | None:
     """
     Retrieve metadata from cache or paperless-ngx, or None when it is unknown.
@@ -609,14 +639,23 @@ def _cached_list_or_none(
     reach this function, which logs its cause and answers None.  None and an
     empty list are different facts: paperless-ngx that has no tags can prove a
     ticked id gone, and one that could not be asked cannot.  Nor can the last
-    good copy, which predates anything created or deleted since.
+    good copy, which predates anything created or deleted since.  The page
+    says which it is: an empty list is "no tags yet", None is "could not be
+    loaded".
+
+    The cache remembers a failure with no last good copy for a short while.
+    A request inside that window, or one that waited longer than its budget
+    for another request's fetch, gets ``MetadataUnavailableError`` without a
+    fetch, and answers None without logging: the failure was logged once,
+    when it happened.
 
     Args:
         cache: Metadata cache instance.
         paperless: Paperless-ngx API client.
         resource: Resource name ('tags' or 'correspondents').
-        timeout: The per-request budget in seconds for a fetch on a miss, or
-            None for the client's own default.
+        timeout: The fetch budget on a miss, which also bounds the wait for
+            another request's fetch, or None for the client's own default and
+            no bound.
 
     Returns:
         The list, fresh or the last good one, with whether it is current, or
@@ -626,45 +665,24 @@ def _cached_list_or_none(
     getter = paperless.get_tags if resource == "tags" else paperless.get_correspondents
     fetch = getter if timeout is None else partial(getter, timeout=timeout)
     try:
-        return cache.get_or_fetch_list(resource, fetch)
+        return cache.get_or_fetch_list(
+            resource, fetch, lock_timeout=_lock_wait(timeout)
+        )
+    except MetadataUnavailableError:
+        return None
     except (PaperlessError, ConfigError) as exc:
         logger.warning(
-            "Failed to fetch %s from paperless-ngx, using empty list: %s",
+            "Failed to fetch %s from paperless-ngx, answering unavailable: %s",
             resource,
             describe(exc),
         )
     except Exception as exc:
         logger.warning(
-            "Failed to fetch %s from paperless-ngx, using empty list: %s",
+            "Failed to fetch %s from paperless-ngx, answering unavailable: %s",
             resource,
             type(exc).__name__,
         )
     return None
-
-
-def _get_cached_or_fetch(
-    cache: MetadataCache,
-    paperless: PaperlessClient,
-    resource: MetadataResource,
-) -> list[dict[str, object]]:
-    """
-    Retrieve metadata from cache or fetch from paperless-ngx.
-
-    ``_cached_list_or_none`` with an unknown list read as an empty one, for
-    the callers that only need rows to render, so the UI always loads even
-    when paperless-ngx is down.
-
-    Args:
-        cache: Metadata cache instance.
-        paperless: Paperless-ngx API client.
-        resource: Resource name ('tags' or 'correspondents').
-
-    Returns:
-        List of metadata dicts: fresh, the last good list, or empty.
-
-    """
-    data = _cached_list_or_none(cache, paperless, resource)
-    return [] if data is None else data.rows
 
 
 def _unnamed_rows(
@@ -707,7 +725,11 @@ def _unnamed_rows(
 
 
 def _tag_list_context(
-    state: State, *, q: str, selected: list[int], timeout: float | None = None
+    state: State,
+    *,
+    q: str,
+    selected: list[int],
+    timeout: httpx2.Timeout | None = None,
 ) -> dict[str, object]:
     """
     Build the tag checkbox list's context: the filtered list and pinned ticks.
@@ -738,13 +760,13 @@ def _tag_list_context(
         state: Application state, for the metadata cache and Paperless client.
         q: The filter text, matched case-insensitively against tag names.
         selected: The tag ids the request reports as currently ticked.
-        timeout: The per-request budget for a fetch on a cache miss, or None
-            for the client's own default.
+        timeout: The fetch budget on a cache miss, or None for the client's
+            own default.
 
     Returns:
         The context ``partials/tags.html`` renders: the stale and unlisted
-        ticks, the pinned ticks, the filtered list, the ticked ids, and
-        whether any tag exists at all.
+        ticks, the pinned ticks, the filtered list, the ticked ids, whether
+        any tag exists at all, and whether the list could not be loaded.
 
     """
     # With ``[web] show_tags`` off the tag markup is never emitted, so
@@ -764,6 +786,7 @@ def _tag_list_context(
             "tags": [],
             "selected_tags": set(),
             "any_tags": False,
+            "tags_unavailable": False,
         }
     cached = _cached_list_or_none(state.cache, state.paperless, "tags", timeout=timeout)
     listed = cached.rows if cached is not None else None
@@ -802,11 +825,15 @@ def _tag_list_context(
         # has no tags" and "your filter matched none of them" are different
         # facts and only one of them is the reader's to fix.
         "any_tags": bool(everything),
+        # A third fact, and not an empty state at all: paperless-ngx could not
+        # be asked and there is no last good copy.  The list says so instead
+        # of claiming there are no tags, and still shows the ticked ids.
+        "tags_unavailable": known_ids is None,
     }
 
 
 def _correspondent_options_context(
-    state: State, selected: int | None, *, timeout: float | None = None
+    state: State, selected: int | None, *, timeout: httpx2.Timeout | None = None
 ) -> dict[str, object]:
     """
     Build the correspondent options' context, with one of them chosen.
@@ -820,14 +847,31 @@ def _correspondent_options_context(
     Args:
         state: Application state, for the metadata cache and Paperless client.
         selected: The correspondent id to show chosen, or None for none.
-        timeout: The per-request budget for a fetch on a cache miss, or None
-            for the client's own default.
+        timeout: The fetch budget on a cache miss, or None for the client's
+            own default.
 
     Returns:
         The context ``partials/correspondents.html`` renders: the list, the
-        chosen id, and the extra option or None.
+        chosen id, the extra option or None, whether the list could not be
+        loaded, and whether the control is shown at all.
 
     """
+    # With ``[web] show_correspondent`` off the select is never emitted, so a
+    # fetch buys nothing, and it is a token-bearing request for data nobody
+    # can be shown.  The guard sits here, as the tag list's does, so it covers
+    # every caller: the page, the options, the refresh and the profile
+    # change.  The keys are the normal path's, emptied, because the page
+    # spreads this with ``**`` and a missing key would leave an undefined
+    # name in a template.  ``show_correspondent`` rides along so the partials
+    # leave out the help line a hidden control does not have.
+    if not state.settings.web.show_correspondent:
+        return {
+            "correspondents": [],
+            "selected_correspondent": None,
+            "extra_option": None,
+            "correspondents_unavailable": False,
+            "show_correspondent": False,
+        }
     cached = _cached_list_or_none(
         state.cache, state.paperless, "correspondents", timeout=timeout
     )
@@ -848,6 +892,10 @@ def _correspondent_options_context(
         "correspondents": correspondents,
         "selected_correspondent": selected,
         "extra_option": extra_option,
+        # Read by the help line under the select, which says the list could
+        # not be loaded; a select cannot hold a sentence.
+        "correspondents_unavailable": known_ids is None,
+        "show_correspondent": True,
     }
 
 
@@ -2144,22 +2192,10 @@ def index(request: Request) -> Response:
         q="",
         selected=list(opening.default_tags) if opening is not None else [],
     )
-    # The correspondent half of the same saving.  ``show_correspondent``
-    # off means the select is left out of the markup, so this fetch would be a
-    # second cold-cache round trip for a list nobody can be shown.  The keys
-    # stay in the context either way: the template reaches for them inside its
-    # own ``{% if %}``, and an absent key would be a different kind of bug from
-    # an empty one.
-    correspondent_options = (
-        _correspondent_options_context(
-            state, opening.default_correspondent if opening is not None else None
-        )
-        if state.settings.web.show_correspondent
-        else {
-            "correspondents": [],
-            "selected_correspondent": None,
-            "extra_option": None,
-        }
+    # The correspondent half, which skips its fetch the same way when the
+    # control is hidden (see ``_correspondent_options_context``).
+    correspondent_options = _correspondent_options_context(
+        state, opening.default_correspondent if opening is not None else None
     )
 
     # The page follows the newest active job this browser owns, so a reload
@@ -2280,7 +2316,7 @@ def _paperless_test_error(exc: BaseException) -> _PaperlessTestAnswer:
     A failure while running the test is a failure inside saneless, so it is a
     server error rather than a bad gateway: an answer paperless-ngx gave is
     reported as a 200 status instead.  Class name only, by the
-    client-exception rule above _get_cached_or_fetch.
+    client-exception rule above _cached_list_or_none.
 
     Args:
         exc: What stopped the test from producing a status.
@@ -3211,8 +3247,11 @@ def get_tags(
     Render the tag checkbox list, optionally narrowed by a filter.
 
     Uses cached data when available, falling back to a fresh fetch from
-    paperless-ngx; an API error renders the last list fetched successfully, or
-    an empty list if there has never been one, rather than an error.
+    paperless-ngx within the short request budget; an API error renders the
+    last list fetched successfully, or, if there has never been one, a line
+    saying the tags could not be loaded, with any ticked ids still ticked,
+    rather than an error.  It never claims paperless-ngx has no tags when it
+    could not ask.
 
     The response is the whole swap target, wrapper included, because the filter
     swaps it ``outerHTML``.  Both parameters arrive from the same
@@ -3231,7 +3270,7 @@ def get_tags(
     return state.templates.TemplateResponse(
         request,
         "partials/tags.html",
-        _tag_list_context(state, q=q, selected=tags),
+        _tag_list_context(state, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT),
     )
 
 
@@ -3240,15 +3279,18 @@ def get_correspondents(request: Request) -> Response:
     """
     Fetch correspondent options for the dropdown selector.
 
-    Uses cached data when available, falling back to a fresh fetch
-    from paperless-ngx. On an API error it returns the last list fetched
-    successfully, or empty options if there has never been one.
+    Uses cached data when available, falling back to a fresh fetch from
+    paperless-ngx within the short request budget.  On an API error it returns
+    the last list fetched successfully, or, if there has never been one, only
+    the option that means none.  Either way the help line under the select
+    rides along out of band, saying the list could not be loaded when there
+    was no list to show.  With the control hidden nothing is fetched.
     """
     state = request.app.state
     return state.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
-        _correspondent_options_context(state, None),
+        _correspondent_options_context(state, None, timeout=_REQUEST_FETCH_TIMEOUT),
     )
 
 
@@ -3373,7 +3415,7 @@ def get_profile_tags(request: Request, profile: str) -> Response:
                 state,
                 q="",
                 selected=list(found.default_tags),
-                timeout=PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS,
+                timeout=_REQUEST_FETCH_TIMEOUT,
             ),
             # The list's profile marker rides along out-of-band, so the scan
             # can tell whose defaults the ticks are (see ``start_scan``).
@@ -3414,7 +3456,7 @@ def get_profile_correspondent(request: Request, profile: str) -> Response:
             **_correspondent_options_context(
                 state,
                 found.default_correspondent,
-                timeout=PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS,
+                timeout=_REQUEST_FETCH_TIMEOUT,
             ),
             "follows_profile": profile,
         },
@@ -3437,10 +3479,13 @@ def invalidate_cache(
     before the cache is touched.
 
     Invalidating means "fetch again", not "forget": when the refetch fails,
-    the partial is rendered from the last list fetched successfully (empty
-    if there has never been one) and the failure is logged.  The response
-    itself does not say the list is stale; the checks strip is what reports
-    Paperless unreachable.
+    the partial is rendered from the last list fetched successfully and the
+    failure is logged.  If there has never been one, the partial says the list
+    could not be loaded: in the tag list itself, and for correspondents in the
+    help line under the select, out of band.  The invalidate also clears the
+    cache's short memory of a failed fetch, so a press retries at once.  The
+    response does not say a served list is stale; the checks strip is what
+    reports Paperless unreachable.
 
     The tag refresh renders the same partial the filter does, from the same
     context, so a refresh mid-filter comes back filtered and still ticked.  The
@@ -3476,13 +3521,17 @@ def invalidate_cache(
         return state.templates.TemplateResponse(
             request,
             "partials/tags.html",
-            _tag_list_context(state, q=q, selected=tags),
+            _tag_list_context(
+                state, q=q, selected=tags, timeout=_REQUEST_FETCH_TIMEOUT
+            ),
         )
 
     return state.templates.TemplateResponse(
         request,
         "partials/correspondents.html",
-        _correspondent_options_context(state, correspondent),
+        _correspondent_options_context(
+            state, correspondent, timeout=_REQUEST_FETCH_TIMEOUT
+        ),
     )
 
 

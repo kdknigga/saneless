@@ -391,8 +391,9 @@ class _MetadataCounter:
         self.rows = rows
         self.calls = 0
 
-    def __call__(self) -> list[dict[str, object]]:
-        """Count the call and answer a copy of the rows."""
+    def __call__(self, *, timeout: object = None) -> list[dict[str, object]]:
+        """Count the call and answer a copy of the rows, whatever the budget."""
+        del timeout
         self.calls += 1
         return list(self.rows)
 

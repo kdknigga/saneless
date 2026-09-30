@@ -98,8 +98,12 @@ def app(web_settings: Settings) -> FastAPI:
     500 it causes is the response most likely to miss a header.
     """
     application = create_app(web_settings, StubScannerBackend())
-    application.state.paperless.get_tags = lambda: [{"id": 1, "name": "receipt"}]
-    application.state.paperless.get_correspondents = lambda: [{"id": 1, "name": "ACME"}]
+    application.state.paperless.get_tags = lambda *, timeout=None: [
+        {"id": 1, "name": "receipt"}
+    ]
+    application.state.paperless.get_correspondents = lambda *, timeout=None: [
+        {"id": 1, "name": "ACME"}
+    ]
     application.add_api_route(_BOOM_PATH, _boom)
     return application
 

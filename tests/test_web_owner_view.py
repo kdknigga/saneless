@@ -100,8 +100,12 @@ def view_settings(make_settings: Callable[..., Settings], tmp_path: Path) -> Set
 def app(view_settings: Settings) -> FastAPI:
     """Create the app over the stub scanner, with fixed tag and correspondent lists."""
     built = create_app(view_settings, StubScannerBackend())
-    built.state.paperless.get_tags = lambda: [{"id": 1, "name": "receipt"}]
-    built.state.paperless.get_correspondents = lambda: [{"id": 1, "name": "ACME"}]
+    built.state.paperless.get_tags = lambda *, timeout=None: [
+        {"id": 1, "name": "receipt"}
+    ]
+    built.state.paperless.get_correspondents = lambda *, timeout=None: [
+        {"id": 1, "name": "ACME"}
+    ]
     return built
 
 

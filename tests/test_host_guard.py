@@ -190,8 +190,12 @@ def web_settings(make_settings: Callable[..., Settings]) -> Settings:
 def client(web_settings: Settings) -> Iterator[TestClient]:
     """TestClient over the production app, with its lifespan running."""
     app = create_app(web_settings, StubScannerBackend())
-    app.state.paperless.get_tags = lambda: [{"id": 1, "name": "receipt"}]
-    app.state.paperless.get_correspondents = lambda: [{"id": 1, "name": "ACME"}]
+    app.state.paperless.get_tags = lambda *, timeout=None: [
+        {"id": 1, "name": "receipt"}
+    ]
+    app.state.paperless.get_correspondents = lambda *, timeout=None: [
+        {"id": 1, "name": "ACME"}
+    ]
     with TestClient(app) as tc:
         yield tc
 

@@ -59,8 +59,10 @@ def app(make_settings: Callable[..., Settings]) -> FastAPI:
     assert settings.web.show_tags
     assert settings.web.show_correspondent
     application = create_app(settings, StubScannerBackend())
-    application.state.paperless.get_tags = lambda: [{"id": 1, "name": _HOSTILE_NAME}]
-    application.state.paperless.get_correspondents = lambda: [
+    application.state.paperless.get_tags = lambda *, timeout=None: [
+        {"id": 1, "name": _HOSTILE_NAME}
+    ]
+    application.state.paperless.get_correspondents = lambda *, timeout=None: [
         {"id": 2, "name": _HOSTILE_NAME}
     ]
     return application

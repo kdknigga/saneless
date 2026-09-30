@@ -298,7 +298,7 @@ class MetadataCache:
                     self._remember_failure(key, generation)
                     raise
                 # The web tier's client-exception rule, stated above
-                # routes._get_cached_or_fetch.
+                # routes._cached_list_or_none.
                 reason = (
                     describe(exc)
                     if isinstance(exc, PaperlessError | ConfigError)

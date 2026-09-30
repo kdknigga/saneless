@@ -1,0 +1,14 @@
+{# The ONLY copy of the help line under the Correspondent select.  index.html
+   includes it in place, directly after the select, whose aria-describedby
+   names it.  Every response that re-renders the correspondent options -- the
+   options, the refresh, the profile change and the lazy list load -- carries
+   it again with oob = true, so the line always describes the list the select
+   now holds.
+
+   A select cannot hold a sentence, so this line is where the list says it
+   could not be loaded: the amber status-fallback line with the warning sign,
+   read by the select's aria-describedby.  While the list is still loading it
+   says so; otherwise it is the plain help sentence.  The copy comes from
+   vocabulary by name; this file composes no prose of its own beyond the help
+   sentence. #}
+<small id="correspondent-help"{% if oob %} hx-swap-oob="true"{% endif %}{% if correspondents_unavailable %} class="status-fallback"{% endif %}>{% if correspondents_unavailable %}&#9888; {{ CORRESPONDENTS_UNAVAILABLE }}{% elif correspondents_loading %}{{ CORRESPONDENTS_LOADING }}{% else %}Who sent this document? Optional.{% endif %}</small>

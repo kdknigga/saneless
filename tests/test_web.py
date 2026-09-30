@@ -4337,7 +4337,10 @@ class TestProfileDefaultsArePreTicked:
             assert attribute in select.group(0), attribute
         assert "selected" in _option(response.text, _OTHER_CORRESPONDENT)
         assert "selected" not in _option(response.text, _OPENING_CORRESPONDENT)
-        assert response.text.rstrip().endswith("</select>")
+        # The select is the one element left for the main swap: all that
+        # follows it is the help line, out of band.
+        _, _, after = response.text.rpartition("</select>")
+        assert after.strip() == _HELP_OOB_NORMAL
 
     def test_profile_change_shows_a_stale_default_ticked_with_the_note(
         self, tmp_path: Path
@@ -4438,7 +4441,7 @@ class TestProfileDefaultsArePreTicked:
     def test_profile_defaults_route_answers_with_the_correspondent_hidden(
         self, tmp_path: Path
     ) -> None:
-        """No select on the page, and the route still renders one."""
+        """No select on the page, and the route still renders an empty one."""
         with TestClient(_pre_ticked_app(tmp_path, show_correspondent=False)) as client:
             page = client.get("/").text
             response = client.get(
@@ -4447,7 +4450,9 @@ class TestProfileDefaultsArePreTicked:
 
         assert 'id="correspondent-select"' not in page
         assert response.status_code == 200
-        assert "selected" in _option(response.text, _OTHER_CORRESPONDENT)
+        assert 'id="correspondent-select"' in response.text
+        assert _option(response.text, _OTHER_CORRESPONDENT) == ""
+        assert "selected" not in response.text
 
 
 _PROFILE_SELECT_TAG = re.compile(r'<select name="profile" id="profile-select"[^>]*>')

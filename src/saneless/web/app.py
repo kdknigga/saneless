@@ -26,7 +26,11 @@ from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
 from saneless.private_dirs import ensure_private_dir, make_private_dir
 from saneless.vocabulary import (
+    CORRESPONDENTS_LOADING,
+    CORRESPONDENTS_UNAVAILABLE,
     PASS_WAIT_STATES,
+    TAGS_LOADING,
+    TAGS_UNAVAILABLE,
     JobState,
     error_message,
     error_next_step,
@@ -151,6 +155,17 @@ def _build_templates() -> Jinja2Templates:
     # a template never lists the states by hand and cannot drift from it.
     pass_wait_states_global: Any = PASS_WAIT_STATES
     templates.env.globals["pass_wait_states"] = pass_wait_states_global
+    # What the tag and correspondent lists say while they load and when they
+    # could not be loaded.  Vocabulary owns the copy and the templates read it
+    # by name, so no template spells a sentence out, and every rendering of a
+    # list, whichever route sends it, says the same thing.
+    list_copy: dict[str, Any] = {
+        "TAGS_LOADING": TAGS_LOADING,
+        "TAGS_UNAVAILABLE": TAGS_UNAVAILABLE,
+        "CORRESPONDENTS_LOADING": CORRESPONDENTS_LOADING,
+        "CORRESPONDENTS_UNAVAILABLE": CORRESPONDENTS_UNAVAILABLE,
+    }
+    templates.env.globals.update(list_copy)
     return templates
 
 

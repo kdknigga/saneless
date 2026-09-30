@@ -25,8 +25,9 @@
 
    The profile-change response alone also carries the select's profile marker
    out-of-band (see partials/profile_marker.html), so the marker names the new
-   profile in the same swap that selects its default.  It comes first so the
-   select stays the last element of the response. #}
+   profile in the same swap that selects its default.  It comes first, and the
+   out-of-band help line comes after the select, so the select is the one
+   element left for the main swap. #}
 {% if follows_profile %}{% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
 <select name="correspondent" id="correspondent-select"
         aria-describedby="correspondent-help"
@@ -36,5 +37,11 @@
         hx-include="#profile-select"
         hx-target="this"
         hx-swap="outerHTML">
-    {% include "partials/correspondents.html" %}
+    {% with help_elsewhere = true %}{% include "partials/correspondents.html" %}{% endwith %}
 </select>
+{# The help line follows the select out of band, from the same context, so it
+   says whether this list could be loaded.  The page renders it in place
+   instead (it sets help_elsewhere), directly after the select, and a hidden
+   control has none.  oob is scoped to this one include so the profile marker
+   above never reads it. #}
+{% if show_correspondent and not help_elsewhere %}{% with oob = true %}{% include "partials/correspondent_help.html" %}{% endwith %}{% endif %}

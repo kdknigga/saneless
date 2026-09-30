@@ -10,3 +10,11 @@
 <option value="">No correspondent</option>
 {% if extra_option %}<option value="{{ extra_option.id }}" selected>{{ extra_option.label }}</option>{% endif %}
 {% for c in correspondents %}<option value="{{ c.id }}"{% if c.id == selected_correspondent %} selected{% endif %}>{{ c.name }}</option>{% endfor %}
+{# The help line under the select rides along out of band, so it follows the
+   options it describes: it says the list could not be loaded, or goes back to
+   the plain help sentence once it could.  Not when this file is included
+   inside the select (help_elsewhere): whoever renders the select renders the
+   line, and an element inside a select would not survive the parser.  Nor
+   for a hidden control, whose page has no help line to replace.  oob is
+   scoped to the include, so nothing else in this file reads it. #}
+{% if show_correspondent and not help_elsewhere %}{% with oob = true %}{% include "partials/correspondent_help.html" %}{% endwith %}{% endif %}

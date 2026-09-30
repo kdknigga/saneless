@@ -7,8 +7,8 @@ moves.  Two cases matter to the operator:
 
 * the lists were fetched once and Paperless then went away: the page keeps
   showing the last good lists, and the log says why once per TTL;
-* the lists were never fetched: the page renders them empty, and the log
-  now says why.
+* the lists were never fetched: the page says they could not be loaded,
+  and the log says why.
 
 Nothing in this file sleeps.
 """
@@ -16,6 +16,7 @@ Nothing in this file sleeps.
 from __future__ import annotations
 
 import functools
+import html
 import logging
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from saneless.vocabulary import TAGS_UNAVAILABLE
 from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.cache import MetadataCache
@@ -101,7 +103,7 @@ def test_an_outage_keeps_the_last_good_tag_list(
     client, clock = clocked
     paperless = _app(client).state.paperless
     offline_get_tags = paperless.get_tags
-    paperless.get_tags = lambda: [{"id": 1, "name": "receipt"}]
+    paperless.get_tags = lambda *, timeout=None: [{"id": 1, "name": "receipt"}]
     assert "receipt" in client.get("/api/tags").text
 
     paperless.get_tags = offline_get_tags
@@ -120,10 +122,10 @@ def test_an_outage_keeps_the_last_good_tag_list(
     assert _warnings(caplog, "saneless.web.routes") == []
 
 
-def test_tags_never_fetched_render_empty_and_log_the_cause(
+def test_tags_never_fetched_say_so_and_log_the_cause(
     clocked: _Clocked, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """With no previous list the tags render empty, and the warning says why."""
+    """With no previous list the tags say they could not load, and the log why."""
     client, _clock = clocked
 
     with caplog.at_level(logging.WARNING):
@@ -131,10 +133,12 @@ def test_tags_never_fetched_render_empty_and_log_the_cause(
 
     assert response.status_code == 200
     assert "receipt" not in response.text
+    assert html.escape(TAGS_UNAVAILABLE) in response.text
+    assert "No tags in paperless-ngx yet." not in response.text
     records = _warnings(caplog, "saneless.web.routes")
     assert len(records) == 1
     message = records[0].getMessage()
-    assert "using empty list" in message
+    assert "answering unavailable" in message
     assert _CAUSE in message
     assert "Token" not in message
     assert records[0].exc_info is None

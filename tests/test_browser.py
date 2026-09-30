@@ -3240,8 +3240,8 @@ class TestPageLoadAsksForNoList:
         with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
             egress_allowlist.append(server.url)
             paperless = server.app.state.paperless
-            paperless.get_tags = lambda: list(tags)
-            paperless.get_correspondents = lambda: list(correspondents)
+            paperless.get_tags = lambda *, timeout=None: list(tags)
+            paperless.get_correspondents = lambda *, timeout=None: list(correspondents)
 
             page.on("request", _record)
             page.goto(server.url)

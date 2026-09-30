@@ -173,11 +173,11 @@ def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
 @pytest.fixture
 def mock_paperless(app: FastAPI) -> object:
     """Patch paperless client methods to return test data without network calls."""
-    app.state.paperless.get_tags = lambda: [
+    app.state.paperless.get_tags = lambda *, timeout=None: [
         {"id": 1, "name": "receipt"},
         {"id": 2, "name": "invoice"},
     ]
-    app.state.paperless.get_correspondents = lambda: [
+    app.state.paperless.get_correspondents = lambda *, timeout=None: [
         {"id": 1, "name": "ACME Corp"},
     ]
     return app.state.paperless
