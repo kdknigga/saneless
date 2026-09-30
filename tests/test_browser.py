@@ -2234,8 +2234,9 @@ class TestRequestErrorSlot:
         Covers ROBU-02's visible message, D-02 (errors go to the slot, not the
         status area), D-05 (the rejected attempt is recorded) and the UI-SPEC
         accessibility contract: the slot itself is the alert, so the message
-        must not carry a second ``role="alert"``, and focus stays where the user
-        left it.
+        must not carry a second ``role="alert"``.  Focus returns to the Scan
+        button the refused press came from, enabled, and never moves into
+        ``#status-message``: the slot speaks the error from where it is.
         """
         page = queue_full_page()
         slot = page.locator("#status-message")
@@ -2243,6 +2244,8 @@ class TestRequestErrorSlot:
         expect(slot.locator('[role="alert"]')).to_have_count(0)
         expect(page.locator("#status-area")).to_have_count(1)
         expect(page.locator("#scan-btn")).to_be_enabled()
+        expect(page.locator("#scan-btn")).to_be_focused()
+        expect(page.locator("#scan-btn")).to_have_count(1)
         focus_in_slot = page.evaluate(
             "document.getElementById('status-message').contains(document.activeElement)"
         )
@@ -7850,3 +7853,262 @@ class TestStatusReflow:
 
             page.emulate_media(reduced_motion="reduce")
             assert spinner.evaluate(read) == "none"
+
+
+def _accept_the_confirmation(page: Page) -> None:
+    """Answer the next native confirmation on ``page`` with OK."""
+
+    def _on_dialog(dialog: Dialog) -> None:
+        dialog.accept()
+
+    page.once("dialog", _on_dialog)
+
+
+def _end_the_flip(
+    server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
+) -> None:
+    """
+    Bring a flip job a test started to an end before the server shuts down.
+
+    An Abort after an answer has already won is dropped, so this ends a job
+    left at the prompt and leaves an answered one to finish on its own.
+
+    Args:
+        server: The private flip server.
+        job_id: The job to end.
+        wait_for_state: The conftest waiter, polling the job store.
+
+    """
+    job_store: JobStore = server.app.state.job_store
+    server.app.state.worker.abort_flip(job_id)
+    wait_for_state(job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT)
+
+
+@pytest.mark.browser
+class TestFocusMap:
+    """
+    Every row of the focus map, asserted on ``document.activeElement``.
+
+    Focus is placed by the server alone: an action's response carries
+    ``autofocus`` on the status area, a claimed Abort asks for the Scan button
+    through its poll URL, and a prompt's first appearance carries it on its
+    primary button, all applied by htmx with no script of the page's own.
+    ``to_be_focused`` retries, so each assertion waits for the swap that moves
+    focus rather than for a fixed time.  Check again's row lives with the
+    strip's tests.
+    """
+
+    def test_focus_map_scan(self, page: Page, scan_harness: _ScanHarness) -> None:
+        """
+        Scan pressed from the keyboard moves focus to the status area.
+
+        The scan is held in SCANNING, so the polls that follow change nothing
+        and leave focus where the press put it.
+        """
+        server = scan_harness.server
+        page.goto(server.url)
+        server.scanner.gate.clear()
+        try:
+            page.locator("#scan-btn").focus()
+            page.keyboard.press("Enter")
+            area = page.locator("#status-area")
+            expect(area).to_be_focused()
+            expect(area).to_contain_text(progress_label(JobState.SCANNING))
+            _await_status_poll(page)
+            expect(area).to_be_focused()
+        finally:
+            server.scanner.gate.set()
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+
+    def test_focus_map_prompt_appears_for_the_owner(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The flip prompt arriving through the poll puts focus on Continue.
+
+        The submit put focus on the status area; the owner's poll rendering of
+        the new prompt moves it on to the button the operator needs next, and
+        the unchanged polls after it leave it there.
+        """
+        job_id = _drive_to_flip_prompt(
+            page, flip_server, wait_for_state, "Focus Prompt"
+        )
+        try:
+            expect(page.locator("#flip-continue")).to_be_focused(timeout=10_000)
+            _await_status_poll(page)
+            expect(page.locator("#flip-continue")).to_be_focused()
+        finally:
+            _end_the_flip(flip_server, job_id, wait_for_state)
+
+    def test_focus_map_flip_continue(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """Continue, pressed with Enter, moves focus to the status area."""
+        job_id = _drive_to_flip_prompt(
+            page, flip_server, wait_for_state, "Focus Continue"
+        )
+        try:
+            expect(page.locator("#flip-continue")).to_be_focused(timeout=10_000)
+            page.keyboard.press("Enter")
+            expect(page.locator("#status-area")).to_be_focused()
+        finally:
+            _end_the_flip(flip_server, job_id, wait_for_state)
+
+    def test_focus_map_flip_abort(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A confirmed Abort ends with focus on the Scan button.
+
+        The response focuses the status area while the scan winds down, and
+        the first poll whose Scan button is enabled moves focus onto it.
+        """
+        job_id = _drive_to_flip_prompt(page, flip_server, wait_for_state, "Focus Abort")
+        try:
+            expect(page.locator("#flip-abort")).to_be_visible(timeout=10_000)
+            _accept_the_confirmation(page)
+            page.locator("#flip-abort").focus()
+            page.keyboard.press("Enter")
+            scan = page.locator("#scan-btn")
+            expect(scan).to_be_enabled(timeout=10_000)
+            expect(scan).to_be_focused()
+            expect(page.locator("#status-area .status-cancelled")).to_be_visible()
+        finally:
+            _end_the_flip(flip_server, job_id, wait_for_state)
+
+    def test_focus_map_multi_page_scan_next_then_next_question(
+        self,
+        page: Page,
+        multi_page_scan_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Scan next focuses the status area, then the next question's Scan next.
+
+        The next pass is held at the scanner, so the status area's focus is
+        seen before the next question arrives and takes it.
+        """
+        server = multi_page_scan_server
+        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Next")
+        try:
+            expect(page.locator("#mp-next")).to_be_focused(timeout=10_000)
+            server.scanner.gate.clear()
+            page.keyboard.press("Enter")
+            area = page.locator("#status-area")
+            expect(area).to_be_focused()
+            expect(area.locator(".pages-prompt")).to_have_count(0)
+            server.scanner.gate.set()
+            expect(area.locator(".pages-prompt")).to_contain_text(
+                "2 pages kept so far.", timeout=10_000
+            )
+            expect(page.locator("#mp-next")).to_be_focused()
+        finally:
+            server.scanner.gate.set()
+            _abort_the_document(server, job_id, wait_for_state)
+
+    def test_focus_map_multi_page_finish(
+        self,
+        page: Page,
+        multi_page_scan_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """Finish moves focus to the status area, and it stays through Done."""
+        server = multi_page_scan_server
+        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Finish")
+        try:
+            page.locator("#mp-finish").focus()
+            page.keyboard.press("Enter")
+            area = page.locator("#status-area")
+            expect(area).to_be_focused()
+            expect(area.locator(".status-done")).to_be_visible(timeout=15_000)
+            expect(area).to_be_focused()
+        finally:
+            _abort_the_document(server, job_id, wait_for_state)
+
+    def test_focus_map_multi_page_abort(
+        self,
+        page: Page,
+        multi_page_scan_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A confirmed Abort of the document ends with focus on the Scan button."""
+        server = multi_page_scan_server
+        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Drop")
+        try:
+            _accept_the_confirmation(page)
+            page.locator("#mp-abort").focus()
+            page.keyboard.press("Enter")
+            scan = page.locator("#scan-btn")
+            expect(scan).to_be_enabled(timeout=10_000)
+            expect(scan).to_be_focused()
+            expect(page.locator("#status-area .status-cancelled")).to_be_visible()
+        finally:
+            _abort_the_document(server, job_id, wait_for_state)
+
+    def test_focus_map_non_owner_is_not_autofocused(
+        self,
+        page: Page,
+        browser: Browser,
+        flip_server: _BrowserServer,
+        egress_allowlist: list[str],
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A prompt appearing for somebody else's scan moves no focus of mine.
+
+        The viewer is typing a title while the owner's scan runs.  When the
+        scan reaches the flip, the viewer's poll brings the waiting line and
+        focus stays in the Title box; the owner, polling at the same moment,
+        is moved to Continue.  The viewer's context is built by hand, installs
+        the egress gate and the policy recorder itself, and is checked after
+        it closes.
+        """
+        server = flip_server
+        job_store: JobStore = server.app.state.job_store
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        page.goto(server.url)
+        page.select_option("#profile-select", "duplex")
+        page.fill("#title-input", "Not Yours To Flip")
+        server.scanner.gate.clear()
+        job_id = ""
+        viewer_ctx = browser.new_context()
+        try:
+            with page.expect_response(lambda r: r.url.endswith("/api/scan")):
+                page.click("#scan-btn")
+            job_id = job_store.list_recent(1)[0].id
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(viewer_ctx, violations)
+            viewer = viewer_ctx.new_page()
+            viewer.goto(server.url)
+            viewer_status = viewer.locator("#status-area")
+            expect(viewer_status).to_contain_text(progress_label(JobState.SCANNING))
+            title = viewer.locator("#title-input")
+            title.focus()
+            server.scanner.gate.set()
+            wait_for_state(job_store, job_id, JobState.AWAITING_FLIP, timeout=20.0)
+            expect(viewer_status).to_contain_text(_WAITING_LINE)
+            _await_status_poll(viewer)
+            expect(title).to_be_focused()
+            assert viewer.evaluate("document.activeElement.id") == "title-input"
+            expect(page.locator("#flip-continue")).to_be_focused(timeout=10_000)
+        finally:
+            viewer_ctx.close()
+            server.scanner.gate.set()
+            if job_id:
+                _end_the_flip(server, job_id, wait_for_state)
+            assert seen, "the hand-built context's gate handled no request"
+            assert blocked == [], f"a page tried to reach the network: {blocked}"
+            assert violations == [], (
+                f"a page violated its Content-Security-Policy: {violations}"
+            )
