@@ -2324,13 +2324,12 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         # This command is the only thing in saneless that creates a config
         # file, and with nothing loaded its target is a saneless.toml in a
         # searched directory -- which the next start loads.  Writing it now
-        # would not lose
-        # the old file's URL and token but would permanently shadow them: the
-        # search would stop at the new file, the row telling the operator to
-        # rename the old one would go green, and the appliance would keep
-        # running on defaults with nothing left saying why.  Refusing costs a
-        # rename; writing costs the evidence.  Exit 2 through the group guard,
-        # as a configuration error.
+        # would not lose the old file's URL and token but would bury them: the
+        # search would stop at the new file, the red row telling the operator
+        # to rename the old one would drop to amber, and the appliance would
+        # keep running on defaults.  Refusing costs a rename; writing costs
+        # the evidence.  Exit 2 through the group guard, as a configuration
+        # error.
         row = configuration_check(settings, absolute_paths=True)
         msg = f"{row.message} {row.next_step}"
         raise ConfigError(msg)
