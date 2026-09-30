@@ -77,6 +77,7 @@ __all__ = [
     "ScannerConfig",
     "Settings",
     "WebConfig",
+    "absolute_or_as_spelled",
     "config_file_state",
     "config_search_paths",
     "discover_config",
