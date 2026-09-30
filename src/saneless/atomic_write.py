@@ -247,11 +247,12 @@ def _keep_label(fd: int, target: Path, name: str, value: bytes) -> None:
     an SELinux type an admin set with ``chcon``, a Smack label -- is copied,
     because falling back to the label a new file gets (the directory's default
     under SELinux; under Smack the writer's own label, unless the directory
-    transmutes its own) can change who may read the file. When the kernel refuses the copy the rewrite still goes ahead,
-    with a WARNING naming the file and the attribute but never the label: a
-    container rewriting a config its host user created is refused that
-    user's label although the two differ only in the SELinux user, which
-    grants no access, and refusing the rewrite would break that common case.
+    transmutes its own) can change who may read the file. When the kernel
+    refuses the copy the rewrite still goes ahead, with a WARNING naming the
+    file and the attribute but never the label: a container rewriting a
+    config its host user created is refused that user's label although the
+    two differ only in the SELinux user, which grants no access, and refusing
+    the rewrite would break that common case.
 
     Args:
         fd: The open temp file.
