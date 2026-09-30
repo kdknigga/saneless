@@ -102,6 +102,8 @@ from saneless.job import JobResult
 from saneless.paperless import ApiDelivery, TaskFiled, UploadResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.vocabulary import (
+    CORRESPONDENTS_LOADING,
+    CORRESPONDENTS_UNAVAILABLE,
     HIDDEN_JOB_TITLE,
     HIDDEN_PRESERVED_ERROR,
     LOST_CONTACT_LINE,
@@ -110,6 +112,8 @@ from saneless.vocabulary import (
     MULTI_PAGE_LABEL,
     NOTHING_TO_FINISH,
     SCAN_BLOCKED_REASON,
+    TAGS_LOADING,
+    TAGS_UNAVAILABLE,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
@@ -132,7 +136,10 @@ from saneless.vocabulary import (
     non_owner_wait_line,
     pass_answer_label,
     progress_label,
+    scan_hold_reason,
 )
+from saneless.web import cache as cache_module
+from saneless.web import routes as routes_module
 from saneless.web.app import TEMPLATE_DIR, create_app
 from saneless.worker import WorkerFlipCoordinator, WorkerPassCoordinator
 from tests.conftest import StubScannerBackend, poll_until, scan_batch
@@ -1140,16 +1147,56 @@ document.addEventListener("htmx:afterSettle", (event) => {
 """
 
 
+# True once the lazy list load has landed and htmx has settled it: the hold
+# line is emptied (or the page has none), neither list still says it is
+# loading, and nothing new is still carrying htmx's added class.  The last
+# part matters: htmx wires a swapped-in element's own triggers only when it
+# settles, so a profile change made before then is heard by nothing.
+_LISTS_SETTLED = """
+([tagsLoading, correspondentsLoading]) => {
+    const text = (id) => {
+        const node = document.getElementById(id);
+        return node === null ? "" : node.textContent;
+    };
+    const hold = document.getElementById("scan-hold-reason");
+    return (hold === null || hold.textContent === "")
+        && !text("tags-list").includes(tagsLoading)
+        && !text("correspondent-help").includes(correspondentsLoading)
+        && document.querySelector(".htmx-added") === null;
+}
+"""
+
+
+def _await_the_lists(page: Page) -> None:
+    """
+    Wait until the page's lazy list load has landed and settled.
+
+    ``/`` renders the lists loading and Scan held; one request after the page
+    brings both and releases Scan.  A test that reads a tick, an option, a
+    profile marker or the Scan button once, rather than with a retrying
+    ``expect``, reads it after this.
+
+    Args:
+        page: A page already loaded on the scan form.
+
+    """
+    page.wait_for_function(_LISTS_SETTLED, arg=[TAGS_LOADING, CORRESPONDENTS_LOADING])
+
+
 def _refresh_both_lists(page: Page) -> None:
     """
     Click the tags and the correspondents refresh buttons and wait for both swaps.
 
-    Needs ``_RECORD_CONTROL_SWAPS`` installed before the page loaded.
+    Needs ``_RECORD_CONTROL_SWAPS`` installed before the page loaded.  The
+    lazy list load lands first, and its own swaps are not counted: the wait
+    is for two more.
 
     Args:
         page: The browser page, already on the scan form.
 
     """
+    _await_the_lists(page)
+    before = page.evaluate("() => window.__controlSwapsFinished")
     for resource in ("tags", "correspondents"):
         with page.expect_response(
             lambda r, name=resource: r.url.endswith(f"resource={name}")
@@ -1158,7 +1205,9 @@ def _refresh_both_lists(page: Page) -> None:
         assert refreshed.value.status == 200, resource
     # A function, not a bare expression: Playwright evals a bare expression
     # inside the page, and the page's Content-Security-Policy refuses eval.
-    page.wait_for_function("() => window.__controlSwapsFinished >= 2")
+    page.wait_for_function(
+        "(before) => window.__controlSwapsFinished >= before + 2", arg=before
+    )
 
 
 @pytest.mark.browser
@@ -1401,6 +1450,9 @@ def _show_the_live_outcome(page: Page, selector: str) -> None:
 
     """
     expect(page.locator("#status-area .last-scan").first).to_be_visible()
+    # The lists land first, so the Scan button a test reads next is released
+    # or held by the job alone, never by the page's own wait for its lists.
+    _await_the_lists(page)
     page.evaluate(_SWAP_STATUS_AREA)
     page.wait_for_selector(selector)
 
@@ -2836,8 +2888,14 @@ class TestBlockedScanButtonInABrowser:
     def test_a_configured_appliance_shows_no_reason_line(
         self, page: Page, browser_server: _BrowserServer
     ) -> None:
-        """The courtesy is absent when there is nothing to be courteous about."""
+        """
+        The courtesy is absent when there is nothing to be courteous about.
+
+        Read once the lists have landed: until then the page holds Scan for
+        them, with its own reason.
+        """
         page.goto(browser_server.url)
+        _await_the_lists(page)
 
         assert page.locator(_BLOCKED_REASON_SELECTOR).count() == 0
         assert page.locator("#scan-btn").get_attribute("aria-describedby") is None
@@ -3212,23 +3270,24 @@ _PAGE_LOAD_CORRESPONDENTS: list[dict[str, object]] = [
 @pytest.mark.browser
 class TestPageLoadAsksForNoList:
     """
-    The page renders the tag list and the correspondent options itself.
+    The page asks for both lists once, together, after it has rendered.
 
-    Both come from the metadata cache the full page render reads, so a load
-    trigger asking ``/api/tags`` or ``/api/correspondents`` for them again would
-    only repeat the page's own work.  This proves nothing on the page still
-    depends on such a trigger: the lists are there without one, and each
-    refresh button still fetches and swaps.
+    ``/`` renders the lists loading, and its one loader asks
+    ``/api/metadata`` for both: only the server can tell when both are done,
+    which is when Scan is released.  So a load asks that route exactly once
+    and never ``/api/tags`` or ``/api/correspondents``, and each refresh
+    button still fetches and swaps its own list.
     """
 
-    def test_no_list_request_on_load_and_both_refreshes_still_swap(
+    def test_one_metadata_request_on_load_and_both_refreshes_still_swap(
         self, page: Page, tmp_path: Path, egress_allowlist: list[str]
     ) -> None:
         """
         Load the page, record every request, then refresh each list.
 
         The refresh requests are recorded by the same listener, so the empty
-        load-time record is not a listener that heard nothing at all.
+        record of per-list requests at load is not a listener that heard
+        nothing at all; nor is it, since the one lazy request is in it.
         """
         tags = list(_PAGE_LOAD_TAGS)
         correspondents = list(_PAGE_LOAD_CORRESPONDENTS)
@@ -3245,14 +3304,15 @@ class TestPageLoadAsksForNoList:
 
             page.on("request", _record)
             page.goto(server.url)
+            _await_the_lists(page)
             page.wait_for_load_state("networkidle")
 
             on_load = [
                 path
                 for path in requested
-                if path in {"/api/tags", "/api/correspondents"}
+                if path in {"/api/tags", "/api/correspondents", "/api/metadata"}
             ]
-            assert on_load == [], on_load
+            assert on_load == ["/api/metadata"], on_load
             expect(page.locator("label.tag-option")).to_have_count(len(tags))
             expect(
                 page.locator('#correspondent-select option[value="41"]')
@@ -3293,8 +3353,9 @@ def tagged_server(browser_server: _BrowserServer) -> Iterator[_BrowserServer]:
     """
     paperless = browser_server.app.state.paperless
     original = paperless.get_tags
-    # The keyword is the real client's: the page asks without one, and the
-    # check a scan makes before it starts asks with a timeout.
+    # The keyword is the real client's: every list route, the page's lazy
+    # list load among them, and the check a scan makes before it starts ask
+    # with a timeout.
     paperless.get_tags = lambda *, timeout=None: list(_BROWSER_TAGS)
     browser_server.app.state.cache.invalidate("tags")
     try:
@@ -3475,9 +3536,8 @@ def _answer_list(
         items: The list it answers with.
 
     Returns:
-        A callable taking the real client's keyword-only ``timeout``: the page
-        asks without one, and the check a scan makes before it starts asks
-        with one.
+        A callable taking the real client's keyword-only ``timeout``, which
+        every list route and the check a scan makes before it starts pass.
 
     """
 
@@ -3547,13 +3607,16 @@ def _choose_profile_defaults(page: Page, profile: str) -> None:
 
     Both are swapped whole, so each is marked first and the wait is for the
     marks to be gone, then for htmx to have settled the new elements, as
-    ``_choose_profile`` waits for the Multiple pages field.
+    ``_choose_profile`` waits for the Multiple pages field.  The page's lazy
+    list load lands first: it replaces both elements too, and would take the
+    marks with it.
 
     Args:
         page: The browser page.
         profile: The profile to choose.
 
     """
+    _await_the_lists(page)
     for target in ("#tags-list", "#correspondent-select"):
         page.locator(target).evaluate("node => node.setAttribute('data-stale', '')")
     page.select_option("#profile-select", profile)
@@ -3735,7 +3798,7 @@ class TestProfileDefaultsInTheBrowser:
 
             page.reload()
 
-            expect(page.locator("#tags-list")).to_have_count(1)
+            _await_the_lists(page)
             profile = page.locator("#profile-select").input_value()
             ticks = _ticked_tags(page)
             correspondent = page.locator("#correspondent-select").input_value()
@@ -3769,6 +3832,7 @@ class TestProfileDefaultsInTheBrowser:
         ``receipts``' own defaults rather than the ticks on screen.
         """
         page.goto(defaults_server.url)
+        _await_the_lists(page)
         page.route("**/api/profiles/tags*", lambda route: route.abort())
         page.route("**/api/profiles/correspondent*", lambda route: route.abort())
         with page.expect_request("**/api/profiles/correspondent*"):
@@ -3845,6 +3909,372 @@ class TestProfileDefaultsInTheBrowser:
         expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
         expect(status).to_contain_text("Done: Cleared Default")
         expect(status).not_to_contain_text(_GONE_TAG_WARNING)
+
+
+# ---------------------------------------------------------------------------
+# The lists arrive after the page.
+#
+# ``/`` asks paperless-ngx for nothing: it renders each list loading and Scan
+# held, and one lazy request brings both lists and releases Scan, whether they
+# arrived or could not be loaded.  A list that could not be loaded asks again
+# by itself until it can.
+# ---------------------------------------------------------------------------
+
+# A budget short enough that a fetch into the black hole gives up within the
+# test, and long enough that the held page can be read first.
+_SHORT_FETCH_BUDGET = httpx2.Timeout(2.0, connect=2.0)
+
+# The limit the page must render within with paperless-ngx black-holed.
+_PAGE_RENDER_LIMIT_MS = 1000
+
+# Seconds to wait for the page's lazy list load to reach a test's route.
+_HELD_LOAD_BUDGET = 10.0
+
+
+@pytest.fixture
+def black_holed_paperless() -> Iterator[socket.socket]:
+    """
+    Listen on a loopback port and never accept, so paperless-ngx never answers.
+
+    The kernel completes each connection into the listen queue, so a client
+    connects and sends its request, and then waits for an answer that never
+    comes: a paperless-ngx that is up but hung, the worst case for a page
+    that asks it anything.  Server-side only, so the browser's egress gate
+    is unaffected.  Closed at teardown, if the test did not close it first.
+
+    Yields:
+        The listening socket.
+
+    """
+    hole = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    hole.bind(("127.0.0.1", 0))
+    hole.listen()
+    try:
+        yield hole
+    finally:
+        hole.close()
+
+
+@contextmanager
+def _serve_black_holed(
+    hole: socket.socket, tmp_path: Path, egress_allowlist: list[str]
+) -> Generator[_BrowserServer]:
+    """
+    Serve a private app whose paperless-ngx is ``hole``, with nothing cached.
+
+    The hole is closed before the server stops: the kernel then resets every
+    connection still queued on it, so a fetch still waiting fails at once
+    rather than holding the shutdown for its whole budget.
+
+    Args:
+        hole: The black-holed paperless-ngx.
+        tmp_path: Where the app keeps its files.
+        egress_allowlist: The browser gate's list, which the server joins.
+
+    Yields:
+        The running server.
+
+    """
+    url = f"http://127.0.0.1:{hole.getsockname()[1]}"
+    base = _browser_test_settings(tmp_path)
+    settings = base.model_copy(
+        update={"paperless": PaperlessConfig(url=url, token="fake-token")}
+    )
+    with _serve(settings, _BrowserTestScanner()) as server:
+        egress_allowlist.append(server.url)
+        try:
+            yield server
+        finally:
+            hole.close()
+
+
+def _hold_the_list_load(page: Page) -> list[Route]:
+    """
+    Hold every lazy list load the page sends, unanswered, until released.
+
+    Each held request is kept, so a test can read the page as it stands
+    while the lists are loading and then let the answer through with
+    ``continue_``.
+
+    Args:
+        page: The browser page, before it loads.
+
+    Returns:
+        The held requests, in order, filled as they are sent.
+
+    """
+    held: list[Route] = []
+
+    def _hold(route: Route) -> None:
+        held.append(route)
+
+    page.route(lambda url: urlsplit(url).path == "/api/metadata", _hold)
+    return held
+
+
+def _await_the_held_load(page: Page, held: list[Route]) -> Route:
+    """
+    Wait until the page's loader has sent its request, and return it held.
+
+    Args:
+        page: The browser page, loading.
+        held: What ``_hold_the_list_load`` returned.
+
+    Returns:
+        The one held request.
+
+    """
+    expect(page.locator("#metadata-loader")).to_have_class(
+        re.compile(r"\bhtmx-request\b")
+    )
+
+    def _delivered() -> bool:
+        # The page marks the loader before the request reaches the route, and
+        # a synchronous Playwright client delivers the route to its handler
+        # only while it talks to the browser, so each check is a round trip.
+        page.evaluate("() => true")
+        return bool(held)
+
+    assert poll_until(_delivered, _HELD_LOAD_BUDGET), "the list load was never held"
+    assert len(held) == 1, held
+    return held[0]
+
+
+def _flagged_list(
+    answering: threading.Event, items: list[dict[str, object]]
+) -> Callable[..., list[dict[str, object]]]:
+    """
+    Build a list fetch that fails until ``answering`` is set, then answers.
+
+    Args:
+        answering: Set when paperless-ngx comes back.
+        items: What it answers with then.
+
+    Returns:
+        A stand-in for ``get_tags`` taking the real client's ``timeout``.
+
+    """
+
+    def _fetch(
+        *, timeout: float | httpx2.Timeout | None = None
+    ) -> list[dict[str, object]]:
+        """Fail as an unreachable paperless-ngx does, or answer the list."""
+        del timeout
+        if not answering.is_set():
+            msg = "paperless unreachable"
+            raise ConnectionError(msg)
+        return list(items)
+
+    return _fetch
+
+
+@pytest.mark.browser
+class TestLazyListsInTheBrowser:
+    """
+    The page renders at once, holds Scan for its lists, and recovers by itself.
+
+    With paperless-ngx up but hung the page still renders within a second,
+    because it asks paperless-ngx nothing.  Scan says why it waits, and one
+    answer, lists or no lists, releases it.  A list that could not be loaded
+    says so, and fills in by itself once paperless-ngx answers.
+    """
+
+    def test_index_renders_under_a_second_with_paperless_black_holed(
+        self,
+        page: Page,
+        tmp_path: Path,
+        egress_allowlist: list[str],
+        black_holed_paperless: socket.socket,
+    ) -> None:
+        """The first request after start, nothing cached, renders in under 1 s."""
+        with _serve_black_holed(
+            black_holed_paperless, tmp_path, egress_allowlist
+        ) as server:
+            assert server.app.state.cache.get("tags") is None
+            assert server.app.state.cache.get("correspondents") is None
+            page.goto(server.url)
+            loaded = page.evaluate(
+                "() => performance.getEntriesByType('navigation')[0]"
+                ".domContentLoadedEventEnd"
+            )
+            expect(page.locator("#tags-list")).to_have_text(TAGS_LOADING)
+            expect(page.locator("#scan-btn")).to_be_disabled()
+
+        assert 0 < loaded < _PAGE_RENDER_LIMIT_MS, loaded
+
+    def test_lists_loading_holds_scan_then_releases_it(
+        self,
+        page: Page,
+        tmp_path: Path,
+        egress_allowlist: list[str],
+        black_holed_paperless: socket.socket,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Scan waits, says why, and is released by lists that could not load.
+
+        The fetch budget is shortened so the black hole's answer, none, lands
+        within the test: a failed list releases Scan exactly as an arrived
+        one does.
+        """
+        monkeypatch.setattr(
+            routes_module, "_REQUEST_FETCH_TIMEOUT", _SHORT_FETCH_BUDGET
+        )
+        with _serve_black_holed(
+            black_holed_paperless, tmp_path, egress_allowlist
+        ) as server:
+            page.goto(server.url)
+            scan = page.locator("#scan-btn")
+            hold = page.locator("#scan-hold-reason")
+
+            expect(scan).to_be_disabled()
+            expect(scan).to_have_attribute("aria-describedby", "scan-hold-reason")
+            expect(hold).to_be_visible()
+            expect(hold).to_have_text(
+                scan_hold_reason(tags=True, correspondents=True) or ""
+            )
+            expect(page.locator("#tags-list")).to_have_text(TAGS_LOADING)
+            expect(page.locator("#correspondent-help")).to_have_text(
+                CORRESPONDENTS_LOADING
+            )
+
+            expect(page.locator("#tags-list")).to_contain_text(
+                TAGS_UNAVAILABLE, timeout=15_000
+            )
+            expect(page.locator("#correspondent-help")).to_contain_text(
+                CORRESPONDENTS_UNAVAILABLE
+            )
+            expect(hold).to_be_empty()
+            expect(hold).to_be_hidden()
+            expect(scan).to_be_enabled()
+            expect(scan).not_to_have_attribute("aria-describedby", re.compile(".*"))
+            # The loader stays, as the slow retry, while a list is unavailable.
+            expect(page.locator("#metadata-loader")).to_have_attribute(
+                "hx-trigger", re.compile(r"^every \d+s$")
+            )
+
+    def test_unavailable_lists_recover_without_a_click(
+        self,
+        page: Page,
+        defaults_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Once paperless-ngx answers, the tag rows appear and the retry stops.
+
+        The failure is remembered for one second here, not fifteen, so the
+        retry asks paperless-ngx again within the test.  What the operator
+        changed while the list was unavailable is carried through the
+        recovery: the default tag they unticked stays unticked, and the
+        correspondent they chose stays chosen.
+        """
+        monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
+        answering = threading.Event()
+        paperless = defaults_server.app.state.paperless
+        monkeypatch.setattr(
+            paperless, "get_tags", _flagged_list(answering, _DEFAULTS_TAGS)
+        )
+        defaults_server.app.state.cache.invalidate("tags")
+
+        page.goto(defaults_server.url)
+        tags_list = page.locator("#tags-list")
+        expect(tags_list).to_contain_text(TAGS_UNAVAILABLE)
+        _await_the_lists(page)
+        expect(page.locator("#metadata-loader")).to_have_attribute(
+            "hx-trigger", "every 1s"
+        )
+        expect(page.locator("#scan-btn")).to_be_enabled()
+        default_tag = page.locator('#tags-list input[value="31"]')
+        expect(default_tag).to_be_checked()
+        default_tag.uncheck()
+        page.select_option("#correspondent-select", "42")
+
+        answering.set()
+
+        expect(tags_list.locator("label.tag-option")).to_have_count(
+            len(_DEFAULTS_TAGS), timeout=15_000
+        )
+        expect(tags_list).not_to_contain_text(TAGS_UNAVAILABLE)
+        expect(page.locator("#metadata-loader")).to_have_count(0)
+        expect(page.locator('#tags-list input[value="31"]')).not_to_be_checked()
+        expect(page.locator("#correspondent-select")).to_have_value("42")
+        assert _ticked_tags(page) == []
+
+    def test_opening_profile_defaults_arrive_ticked(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        The page shows the lists loading, then the opening profile's defaults.
+
+        The lazy request is held, so the loading state is read for certain
+        rather than raced; released, it ticks ``default``'s tag and selects
+        its correspondent, with both profile markers naming it.
+        """
+        held = _hold_the_list_load(page)
+        page.goto(defaults_server.url)
+        load = _await_the_held_load(page, held)
+
+        expect(page.locator("#tags-list")).to_have_text(TAGS_LOADING)
+        expect(page.locator("#correspondent-select option")).to_have_count(1)
+        expect(page.locator("#scan-btn")).to_be_disabled()
+
+        load.continue_()
+
+        expect(page.locator('#tags-list input[value="31"]')).to_be_checked()
+        expect(page.locator("#correspondent-select")).to_have_value("41")
+        _await_the_lists(page)
+        assert _ticked_tags(page) == ["31"]
+        expect(page.locator("#tags-profile")).to_have_value("default")
+        expect(page.locator("#correspondent-profile")).to_have_value("default")
+        expect(page.locator("#scan-btn")).to_be_enabled()
+        expect(page.locator("#metadata-loader")).to_have_count(0)
+
+    def test_profile_change_during_the_load_keeps_list_and_marker_in_step(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        A profile chosen before the lists land never files another's defaults.
+
+        The lazy request, asked for ``default``, is held while ``receipts``
+        is chosen and its profile-change swaps land; released, it lands last.
+        Whatever it shows, each list and its marker agree, and the scan files
+        ``receipts``' own defaults because the markers name another profile.
+        """
+        held = _hold_the_list_load(page)
+        page.goto(defaults_server.url)
+        load = _await_the_held_load(page, held)
+
+        page.select_option("#profile-select", _RECEIPTS)
+        expect(page.locator("#tags-profile")).to_have_value(_RECEIPTS)
+        expect(page.locator("#correspondent-profile")).to_have_value(_RECEIPTS)
+        expect(page.locator('#tags-list input[value="32"]')).to_be_checked()
+
+        load.continue_()
+        _await_the_lists(page)
+
+        ticks = _ticked_tags(page)
+        marker = page.locator("#tags-profile").input_value()
+        correspondent = page.locator("#correspondent-select").input_value()
+        correspondent_marker = page.locator("#correspondent-profile").input_value()
+        expected = {"default": (["31"], "41"), _RECEIPTS: (["32", "33"], "42")}
+        assert (ticks, correspondent) == expected[marker], (ticks, marker)
+        assert correspondent_marker == marker
+        page.fill("#title-input", "Changed While Loading")
+
+        with page.expect_request("**/api/scan"):
+            page.click("#scan-btn")
+
+        status = page.locator("#status-area")
+        expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
+        job_store: JobStore = defaults_server.app.state.job_store
+        job = next(
+            job
+            for job in job_store.list_recent(100)
+            if job.title == "Changed While Loading"
+        )
+        assert job.profile == _RECEIPTS
+        assert job.tags == [32, 33]
+        assert job.correspondent == 42
 
 
 # ---------------------------------------------------------------------------
@@ -6797,6 +7227,10 @@ class TestTheGuardBehindTheBlockedButton:
         server = private_blocked_server
         job_store: JobStore = server.app.state.job_store
         page.goto(server.url)
+        # The lazy list load re-renders the button, still disabled because the
+        # appliance is blocked; the tamper has to come after it, or that
+        # answer puts the attribute back before the click.
+        _await_the_lists(page)
         button = page.locator("#scan-btn")
         expect(button).to_be_disabled()
 
@@ -8097,6 +8531,32 @@ def _reflow_non_owner_flip_wait(stage: _Stage) -> Generator[None]:
         job_store.delete_job(job.id)
 
 
+@contextmanager
+def _reflow_lists_loading(stage: _Stage) -> Generator[None]:
+    """Hold the lazy list load, so the page shows its placeholders and hold line."""
+    held = _hold_the_list_load(stage.page)
+    stage.page.goto(stage.server.url)
+    load = _await_the_held_load(stage.page, held)
+    expect(stage.page.locator("#scan-hold-reason")).to_be_visible()
+    expect(stage.page.locator("#tags-list")).to_have_text(TAGS_LOADING)
+    try:
+        yield
+    finally:
+        load.abort()
+
+
+@contextmanager
+def _reflow_lists_unavailable(stage: _Stage) -> Generator[None]:
+    """Let both lists fail, as they do against the stage's closed paperless-ngx."""
+    stage.page.goto(stage.server.url)
+    expect(stage.page.locator("#tags-list")).to_contain_text(TAGS_UNAVAILABLE)
+    expect(stage.page.locator("#correspondent-help")).to_contain_text(
+        CORRESPONDENTS_UNAVAILABLE
+    )
+    _await_the_lists(stage.page)
+    yield
+
+
 _REFLOW_ROWS: dict[str, Callable[[_Stage], AbstractContextManager[None]]] = {
     "queued-with-max-length-title": _reflow_queued,
     "starting": _reflow_starting,
@@ -8109,6 +8569,8 @@ _REFLOW_ROWS: dict[str, Callable[[_Stage], AbstractContextManager[None]]] = {
     "last-scan-failed": _reflow_last_scan_failed,
     "owner_flip_prompt": _reflow_owner_flip_prompt,
     "non_owner_flip_wait": _reflow_non_owner_flip_wait,
+    "lists_loading": _reflow_lists_loading,
+    "lists_unavailable": _reflow_lists_unavailable,
 }
 
 
@@ -8120,7 +8582,8 @@ class TestStatusReflow:
     A busy line used to carry ``aria-busy``, and Pico keeps any busy element on
     one line, so a queued line naming a long title pushed the whole page wider
     than a phone.  Each row here stages one busy state on a private server and
-    measures the document at 320 x 640.
+    measures the document at 320 x 640.  Two rows stage the form instead: its
+    lists loading, with Scan's hold line, and its lists unavailable.
     """
 
     @pytest.mark.parametrize("row", list(_REFLOW_ROWS))
@@ -8219,6 +8682,8 @@ class TestFocusMap:
         """
         server = scan_harness.server
         page.goto(server.url)
+        # A held button cannot take focus; the lists release it.
+        _await_the_lists(page)
         server.scanner.gate.clear()
         try:
             page.locator("#scan-btn").focus()
