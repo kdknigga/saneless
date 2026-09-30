@@ -12,6 +12,7 @@ cannot drift apart and no template or command has to compose prose of its own.
 from __future__ import annotations
 
 import dataclasses
+from datetime import UTC, datetime
 from typing import TypedDict, Unpack
 
 import pytest
@@ -32,6 +33,7 @@ from saneless.vocabulary import (
     cli_choice_hint,
     cli_pass_choices,
     cli_pass_question,
+    local_time,
     multi_page_manual_duplex_refusal,
     pass_prompt_copy,
 )
@@ -42,6 +44,9 @@ _NOTHING_TO_FINISH_TEXT = (
 )
 _FLIP_ABORT_QUESTION = "Abort this scan? It will stop and cannot be resumed."
 _ABORT_NOTHING = "Abort scan stops without uploading anything."
+# When an unanswered question gives up, as an aware instant; every expectation
+# renders it through ``local_time`` so the tests hold in any ``TZ``.
+_DEADLINE = datetime(2026, 9, 30, 19, 3, tzinfo=UTC)
 
 
 class _PromptFields(TypedDict, total=False):
@@ -198,6 +203,31 @@ class TestNextPassPrompt:
             "No answer within 90 seconds finishes the document with these 4 pages."
         )
 
+    def test_deadline_replaces_the_duration(self) -> None:
+        """A known deadline is named as a time in place of the duration."""
+        prompt = _prompt(PassWait.NEXT_PASS, pages_kept=4, timeout_seconds=90)
+        copy = pass_prompt_copy(prompt, deadline=_DEADLINE)
+        assert copy.notes[1] == (
+            f"No answer by {local_time(_DEADLINE)} finishes the document with "
+            "these 4 pages."
+        )
+        assert copy.notes[0] == pass_prompt_copy(prompt).notes[0]
+
+    def test_deadline_with_nothing_kept_ends_the_scan(self) -> None:
+        """With no page kept, the deadline form still says nothing is uploaded."""
+        copy = pass_prompt_copy(
+            _prompt(PassWait.NEXT_PASS, pages_kept=0), deadline=_DEADLINE
+        )
+        assert copy.notes[1] == (
+            f"No answer by {local_time(_DEADLINE)} ends the scan without "
+            "uploading anything."
+        )
+
+    def test_no_deadline_is_the_duration_form(self) -> None:
+        """An explicit None deadline is exactly the copy without one."""
+        prompt = _prompt(PassWait.NEXT_PASS, pages_kept=4)
+        assert pass_prompt_copy(prompt, deadline=None) == pass_prompt_copy(prompt)
+
 
 class TestAbortQuestion:
     """The confirmation Abort asks before it stops the scan."""
@@ -333,6 +363,37 @@ class TestBlankDecisionPrompt:
             "No answer within 90 seconds skips it and finishes the document."
         )
 
+    def test_deadline_replaces_the_duration(self) -> None:
+        """A known deadline is named as a time in place of the duration."""
+        prompt = _prompt(
+            PassWait.BLANK_DECISION,
+            pages_kept=2,
+            pass_pages=1,
+            blank_positions=(1,),
+            timeout_seconds=90,
+        )
+        copy = pass_prompt_copy(prompt, deadline=_DEADLINE)
+        assert copy.notes[-1] == (
+            f"No answer by {local_time(_DEADLINE)} skips it and finishes the document."
+        )
+        assert copy.notes[:-1] == pass_prompt_copy(prompt).notes[:-1]
+
+    def test_deadline_for_several_blank_pages(self) -> None:
+        """The several-page wording keeps its own verb in the deadline form."""
+        copy = pass_prompt_copy(
+            _prompt(
+                PassWait.BLANK_DECISION,
+                pages_kept=0,
+                pass_pages=6,
+                blank_positions=(2, 4, 6),
+            ),
+            deadline=_DEADLINE,
+        )
+        assert copy.notes[-1] == (
+            f"No answer by {local_time(_DEADLINE)} skips the blank pages and "
+            "finishes the document."
+        )
+
 
 class TestRetryPrompt:
     """The prompt after a pass that failed."""
@@ -379,6 +440,16 @@ class TestRetryPrompt:
         assert copy.notes[-1] == (
             "No answer within 90 seconds finishes the document with these 4 pages."
         )
+
+    def test_deadline_replaces_the_duration(self) -> None:
+        """A known deadline is named as a time in place of the duration."""
+        prompt = _prompt(PassWait.RETRY, pages_kept=4, error="jam", timeout_seconds=90)
+        copy = pass_prompt_copy(prompt, deadline=_DEADLINE)
+        assert copy.notes[-1] == (
+            f"No answer by {local_time(_DEADLINE)} finishes the document with "
+            "these 4 pages."
+        )
+        assert copy.notes[0] == pass_prompt_copy(prompt).notes[0]
 
 
 class TestFormAndOptionWording:

@@ -6,6 +6,7 @@ Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import signal
@@ -44,7 +45,9 @@ from saneless.vocabulary import (
     BUSY_STATES,
     FALLBACK_NOT_UPLOADED_LINE,
     FRONTS_SUFFIX,
+    IDLE_LINE,
     LOCAL_TIME_FORMAT,
+    LOST_CONTACT_LINE,
     PAPERLESS_TITLE_LIMIT,
     PARTIAL_SUFFIX,
     PASS_WAIT_STATES,
@@ -94,19 +97,26 @@ from saneless.vocabulary import (
     exit_code_for_outcome,
     exit_code_for_signal,
     flip_answer_label,
+    flip_deadline_note,
+    flip_heading,
     half_delivery_error,
     half_title,
     is_amber_category,
     job_label,
     job_state_for,
     job_status_class,
+    last_scan_detail,
+    last_scan_line,
     local_time,
+    non_owner_wait_line,
     outcome_line,
     page_counts,
     page_timeout_error,
+    page_title,
     pages_phrase,
     pass_answer_label,
     pass_cap_warning,
+    pass_heading,
     pass_wait_state,
     progress_label,
     rejection_message,
@@ -115,6 +125,7 @@ from saneless.vocabulary import (
     removed_pages_note,
     restart_category,
     restart_error,
+    scan_button_label,
     scan_page_description,
     sixteen_bit_error,
     source_not_offered_error,
@@ -2867,3 +2878,380 @@ class TestJobActivityProperties:
         field_names = {f.name for f in fields(Job)}
         assert "is_active" not in field_names
         assert "is_busy" not in field_names
+
+
+# One aware instant for the status-area sentences below.  Every expectation
+# renders it through ``local_time``, so the tests hold in any ``TZ``.
+_STARTED = datetime(2026, 9, 30, 19, 3, tzinfo=UTC)
+
+# The label every job state puts on the Scan button, written out here rather
+# than read from ``scan_button_label`` so the table is pinned, not echoed.  A
+# new ``JobState`` member has no row, so the lookup below fails for it.
+_SCAN_BUTTON_LABELS: dict[JobState, str] = {
+    JobState.PENDING: "Queued…",
+    JobState.SCANNING: "Scanning…",
+    JobState.AWAITING_FLIP: "Waiting for flip…",
+    JobState.AWAITING_NEXT_PASS: "Waiting for you…",
+    JobState.AWAITING_BLANK_DECISION: "Waiting for you…",
+    JobState.AWAITING_RETRY: "Waiting for you…",
+    JobState.SCANNING_REVERSE: "Scanning…",
+    JobState.ASSEMBLING: "Scanning…",
+    JobState.UPLOADING: "Scanning…",
+    JobState.DONE: "Scan",
+    JobState.ERROR: "Scan",
+    JobState.FALLBACK: "Scan",
+    JobState.CANCELLED: "Scan",
+}
+
+
+class TestStatusAreaLines:
+    """The two fixed lines of the status area."""
+
+    def test_idle_line(self) -> None:
+        """With no job in flight and nothing blocking, the area says it is ready."""
+        assert IDLE_LINE == "Ready to scan."
+
+    def test_lost_contact_line(self) -> None:
+        """A poll that cannot read the store says so and that it keeps trying."""
+        assert LOST_CONTACT_LINE == (
+            "Cannot read the scan's progress right now — retrying..."
+        )
+
+
+class TestScanButtonLabel:
+    """The Scan button's label follows the state of the job in flight."""
+
+    def test_no_job_is_scan(self) -> None:
+        """With no job at all, the button offers a scan."""
+        assert scan_button_label(None) == "Scan"
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_every_state_has_its_label(self, state: JobState) -> None:
+        """Each state's label is the pinned one, and a new member fails here."""
+        assert scan_button_label(state) == _SCAN_BUTTON_LABELS[state]
+
+    def test_button_labels_use_the_ellipsis_character(self) -> None:
+        """A button label ends in U+2026, never in three ASCII periods."""
+        for state in JobState:
+            assert not scan_button_label(state).endswith("...")
+
+
+class TestPageTitle:
+    """The browser tab's title never names the job, only its state."""
+
+    def test_no_job(self) -> None:
+        """With no job in flight the tab is just the product name."""
+        assert page_title(None) == "saneless"
+
+    def test_pending_queued(self) -> None:
+        """A job waiting behind another says it is queued."""
+        assert page_title(JobState.PENDING, queued=True) == "Queued — saneless"
+
+    def test_pending_starting(self) -> None:
+        """A job next to run says it is starting."""
+        assert page_title(JobState.PENDING, queued=False) == "Starting — saneless"
+
+    @pytest.mark.parametrize("state", sorted(ACTIVE_STATES - {JobState.PENDING}))
+    def test_other_active_states_use_the_state_label(self, state: JobState) -> None:
+        """A running job is named by the history table's label for its state."""
+        assert page_title(state) == f"{state_label(state)} — saneless"
+
+    def test_done_clean(self) -> None:
+        """A clean upload says Done, as the outcome line does."""
+        assert page_title(JobState.DONE) == "Done — saneless"
+
+    def test_done_with_a_warning(self) -> None:
+        """A warned upload says so in the tab too."""
+        assert page_title(JobState.DONE, warning="a page was skipped") == (
+            "Uploaded with a warning — saneless"
+        )
+
+    def test_fallback(self) -> None:
+        """A scan kept in the folder says where it went."""
+        assert page_title(JobState.FALLBACK) == "Saved to folder — saneless"
+
+    def test_cancelled(self) -> None:
+        """A cancelled scan says it was cancelled."""
+        assert page_title(JobState.CANCELLED) == "Cancelled — saneless"
+
+    @pytest.mark.parametrize("category", [None, *list(ErrorCategory)])
+    def test_error_uses_the_job_label(self, category: ErrorCategory | None) -> None:
+        """A failure reads as the history row does, amber categories included."""
+        assert page_title(JobState.ERROR, category=category) == (
+            f"{job_label(JobState.ERROR, None, category)} — saneless"
+        )
+
+    def test_error_amber_category_is_not_failed(self) -> None:
+        """A failure that may be in paperless-ngx is not called Failed in the tab."""
+        assert page_title(JobState.ERROR, category=ErrorCategory.UNCONFIRMED_SEND) == (
+            f"{UNCONFIRMED_SEND_LABEL} — saneless"
+        )
+
+    def test_takes_no_title(self) -> None:
+        """No parameter can carry the job's title into the tab."""
+        assert not any(
+            "title" in name for name in inspect.signature(page_title).parameters
+        )
+
+    @pytest.mark.parametrize("state", [None, *list(JobState)])
+    def test_warning_text_never_reaches_the_tab(self, state: JobState | None) -> None:
+        """Only whether a warning exists is read, never its words."""
+        sentinel = "Sentinel title 7f3a"
+        for queued in (False, True):
+            for category in (None, *ErrorCategory):
+                rendered = page_title(
+                    state, warning=sentinel, category=category, queued=queued
+                )
+                assert sentinel not in rendered
+                assert rendered == "saneless" or rendered.endswith(" — saneless")
+
+
+class TestLastScanLine:
+    """The line under the idle line naming the previous scan's outcome."""
+
+    def _line(
+        self,
+        state: JobState,
+        *,
+        warning: str | None = None,
+        category: ErrorCategory | None = None,
+    ) -> str:
+        """
+        Return the line for a job titled "Tax" started at ``_STARTED``.
+
+        Args:
+            state: The job's state.
+            warning: The job's warning, if any.
+            category: The job's error category, if any.
+
+        Returns:
+            The rendered line.
+
+        """
+        return last_scan_line(
+            state, warning=warning, category=category, title="Tax", created_at=_STARTED
+        )
+
+    def test_done_clean(self) -> None:
+        """A clean upload has a tick and says Done."""
+        assert self._line(JobState.DONE) == (
+            f"Last scan: ✓ Done: Tax — started {local_time(_STARTED)}"
+        )
+
+    def test_done_with_a_warning(self) -> None:
+        """A warned upload has the warning sign and says so."""
+        assert self._line(JobState.DONE, warning="a page was skipped") == (
+            "Last scan: ⚠ Uploaded with a warning: Tax — started "
+            f"{local_time(_STARTED)}"
+        )
+
+    def test_fallback(self) -> None:
+        """A scan kept in the folder has the arrow and says where it went."""
+        assert self._line(JobState.FALLBACK) == (
+            f"Last scan: → Saved to folder: Tax — started {local_time(_STARTED)}"
+        )
+
+    def test_fallback_with_a_warning_keeps_the_arrow(self) -> None:
+        """A FALLBACK's warning goes on the detail line, not into the glyph."""
+        assert self._line(JobState.FALLBACK, warning="upload failed") == (
+            f"Last scan: → Saved to folder: Tax — started {local_time(_STARTED)}"
+        )
+
+    def test_cancelled(self) -> None:
+        """A cancelled scan has the stop sign."""
+        assert self._line(JobState.CANCELLED) == (
+            f"Last scan: ⊘ Cancelled: Tax — started {local_time(_STARTED)}"
+        )
+
+    def test_error_without_a_category(self) -> None:
+        """A failure with no category is red and says Failed."""
+        assert self._line(JobState.ERROR) == (
+            f"Last scan: ✗ Failed: Tax — started {local_time(_STARTED)}"
+        )
+
+    @pytest.mark.parametrize("category", sorted(set(ErrorCategory) - _AMBER_CATEGORIES))
+    def test_error_red_category(self, category: ErrorCategory) -> None:
+        """Every failure that did not deliver the scan says Failed."""
+        assert self._line(JobState.ERROR, category=category) == (
+            f"Last scan: ✗ Failed: Tax — started {local_time(_STARTED)}"
+        )
+
+    @pytest.mark.parametrize("category", sorted(_AMBER_CATEGORIES))
+    def test_error_amber_category(self, category: ErrorCategory) -> None:
+        """A failure that may be in paperless-ngx has the warning sign and label."""
+        label = job_label(JobState.ERROR, None, category)
+        assert label != "Failed"
+        assert self._line(JobState.ERROR, category=category) == (
+            f"Last scan: ⚠ {label}: Tax — started {local_time(_STARTED)}"
+        )
+
+    def test_reuses_the_outcome_line(self) -> None:
+        """The delivered outcomes read exactly as the live outcome line does."""
+        for state in (JobState.DONE, JobState.FALLBACK):
+            for warning in (None, "w"):
+                assert outcome_line(state, warning, "Tax") in self._line(
+                    state, warning=warning
+                )
+
+    @pytest.mark.parametrize("state", sorted(ACTIVE_STATES))
+    def test_active_state_is_refused(self, state: JobState) -> None:
+        """A job still in flight has no last-scan line."""
+        with pytest.raises(ValueError, match="terminal"):
+            self._line(state)
+
+
+class TestLastScanDetail:
+    """The optional second line under the last-scan line."""
+
+    def test_done_clean_has_none(self) -> None:
+        """A clean upload needs no second line."""
+        detail = last_scan_detail(
+            JobState.DONE, warning=None, category=None, error=None
+        )
+        assert detail is None
+
+    def test_done_warning(self) -> None:
+        """A warned upload shows its warning."""
+        detail = last_scan_detail(
+            JobState.DONE, warning="w1", category=None, error=None
+        )
+        assert detail == "w1"
+
+    def test_fallback_warning(self) -> None:
+        """A scan kept in the folder shows why it was not uploaded."""
+        detail = last_scan_detail(
+            JobState.FALLBACK, warning="w2", category=None, error=None
+        )
+        assert detail == "w2"
+
+    def test_fallback_without_a_warning_has_none(self) -> None:
+        """With nothing to add, a FALLBACK has no second line."""
+        detail = last_scan_detail(
+            JobState.FALLBACK, warning=None, category=None, error=None
+        )
+        assert detail is None
+
+    def test_cancelled_has_none(self) -> None:
+        """A cancel is a deliberate stop with nothing more to say."""
+        detail = last_scan_detail(
+            JobState.CANCELLED, warning="w", category=None, error="e"
+        )
+        assert detail is None
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_with_a_category(self, category: ErrorCategory) -> None:
+        """A categorised failure shows its two advice sentences, one space apart."""
+        detail = last_scan_detail(
+            JobState.ERROR, warning=None, category=category, error="raw text"
+        )
+        assert detail == f"{error_message(category)} {error_next_step(category)}"
+
+    def test_error_without_a_category(self) -> None:
+        """An uncategorised failure shows its error text."""
+        detail = last_scan_detail(
+            JobState.ERROR, warning=None, category=None, error="raw text"
+        )
+        assert detail == "raw text"
+
+    @pytest.mark.parametrize("state", sorted(ACTIVE_STATES))
+    def test_active_state_is_refused(self, state: JobState) -> None:
+        """A job still in flight has no last-scan detail."""
+        with pytest.raises(ValueError, match="terminal"):
+            last_scan_detail(state, warning=None, category=None, error=None)
+
+
+# The four lines a viewer who did not start a waiting scan reads, with the
+# deadline and without it, as the product copy states them.
+_WAIT_LINES: dict[JobState, tuple[str, str]] = {
+    JobState.AWAITING_FLIP: (
+        "Waiting for the stack to be flipped. It can be continued from the "
+        "device that started this scan — it stops at {deadline} if nobody does.",
+        "Waiting for the stack to be flipped. It can be continued from the "
+        "device that started this scan.",
+    ),
+    JobState.AWAITING_NEXT_PASS: (
+        "Waiting for the next page. It can be answered from the device that "
+        "started this scan — it stops waiting at {deadline} if nobody does.",
+        "Waiting for the next page. It can be answered from the device that "
+        "started this scan.",
+    ),
+    JobState.AWAITING_BLANK_DECISION: (
+        "Waiting for a decision about blank pages. It can be answered from the "
+        "device that started this scan — it stops waiting at {deadline} if "
+        "nobody does.",
+        "Waiting for a decision about blank pages. It can be answered from the "
+        "device that started this scan.",
+    ),
+    JobState.AWAITING_RETRY: (
+        "The last scan failed; waiting for a decision. It can be answered from "
+        "the device that started this scan — it stops waiting at {deadline} if "
+        "nobody does.",
+        "The last scan failed; waiting for a decision. It can be answered from "
+        "the device that started this scan.",
+    ),
+}
+
+
+class TestNonOwnerWaitLine:
+    """What a viewer who cannot answer a waiting scan is told."""
+
+    @pytest.mark.parametrize("state", list(_WAIT_LINES))
+    def test_with_a_deadline(self, state: JobState) -> None:
+        """The line names when the wait ends, in local time with its zone."""
+        expected = _WAIT_LINES[state][0].format(deadline=local_time(_STARTED))
+        assert non_owner_wait_line(state, deadline=_STARTED) == expected
+
+    @pytest.mark.parametrize("state", list(_WAIT_LINES))
+    def test_without_a_deadline(self, state: JobState) -> None:
+        """Before the wait's start is recorded, the line names no time."""
+        assert non_owner_wait_line(state, deadline=None) == _WAIT_LINES[state][1]
+
+    @pytest.mark.parametrize("state", list(_WAIT_LINES))
+    def test_no_trailing_ellipsis(self, state: JobState) -> None:
+        """A waiting line is a full stop, never an in-progress ellipsis."""
+        for deadline in (None, _STARTED):
+            line = non_owner_wait_line(state, deadline=deadline)
+            assert not line.endswith(("...", "…"))
+
+    @pytest.mark.parametrize("state", sorted(set(JobState) - set(_WAIT_LINES)))
+    def test_other_states_are_refused(self, state: JobState) -> None:
+        """Only the four waits for a person have a waiting line."""
+        with pytest.raises(ValueError, match="not waiting"):
+            non_owner_wait_line(state, deadline=None)
+
+
+class TestPromptHeadings:
+    """The first line of each owner prompt names the job."""
+
+    def test_flip_heading(self) -> None:
+        """The flip prompt names the scan in curly quotes."""
+        assert flip_heading("Tax") == "Flip the stack for “Tax”"
+
+    def test_pass_heading(self) -> None:
+        """The multi-page prompt names the document in curly quotes."""
+        assert pass_heading("Tax") == "Adding pages to “Tax”"
+
+
+class TestFlipDeadlineNote:
+    """The note under the flip prompt's buttons saying what a timeout does."""
+
+    def test_with_a_deadline(self) -> None:
+        """The note names the time the wait ends."""
+        assert flip_deadline_note(deadline=_STARTED, timeout_seconds=600) == (
+            f"If nobody presses Continue by {local_time(_STARTED)}, the scan "
+            "stops, nothing is uploaded, and the front sides already scanned "
+            "are kept in failed/."
+        )
+
+    def test_without_a_deadline(self) -> None:
+        """Before the wait's start is recorded, the note names the duration."""
+        assert flip_deadline_note(deadline=None, timeout_seconds=600) == (
+            "If nobody presses Continue within 10 minutes, the scan stops, "
+            "nothing is uploaded, and the front sides already scanned are kept "
+            "in failed/."
+        )
+
+    def test_duration_is_named_in_its_own_unit(self) -> None:
+        """A 90-second wait is named in seconds."""
+        note = flip_deadline_note(deadline=None, timeout_seconds=90)
+        assert "within 90 seconds," in note
