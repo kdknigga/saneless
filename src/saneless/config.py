@@ -1548,7 +1548,12 @@ def _valid_keys(model: type[BaseModel]) -> list[str]:
 
 def _match_candidates(model: type[BaseModel]) -> list[str]:
     """
-    List every spelling a section accepts: field names plus aliases.
+    List the spellings a close-match suggestion is drawn from.
+
+    The field names are included beside the aliases so a near miss of a
+    field's code name (``default_titel``) is still recognised; the caller
+    turns a matched field name into the alias the section accepts. Only
+    ``_valid_keys`` lists what a section accepts.
 
     Args:
         model: The section's model.
@@ -1561,16 +1566,22 @@ def _match_candidates(model: type[BaseModel]) -> list[str]:
     return names + [field.alias for field in model.model_fields.values() if field.alias]
 
 
-def _section_owning(key: str, *, exclude: type[BaseModel] | None) -> str | None:
+def _owner_hint(key: str, *, exclude: type[BaseModel] | None) -> str | None:
     """
-    Name the section a misplaced key really belongs in.
+    Say which section a misplaced key really belongs in, and how it is written.
+
+    A key that is the code name of a field with a different config spelling
+    (``default_title``, written ``title``) is sent on with that spelling, so
+    the next load does not trade this refusal for the owner's.
 
     Args:
         key: The unknown key.
         exclude: The section model the key was found in, which cannot own it.
 
     Returns:
-        A plain section name, ``profiles.<name>`` for a profile key, or None.
+        ``it belongs in [section]``, with `` as 'spelling'`` appended when the
+        key is written differently there; ``profiles.<name>`` names a profile
+        key's section. None when no section owns the key.
 
     """
     owners: list[tuple[str, type[BaseModel]]] = [
@@ -1578,8 +1589,14 @@ def _section_owning(key: str, *, exclude: type[BaseModel] | None) -> str | None:
         (_PROFILE_LABEL, ProfileConfig),
     ]
     for label, model in owners:
-        if model is not exclude and key in _match_candidates(model):
-            return label
+        if model is exclude:
+            continue
+        for name, field in model.model_fields.items():
+            spelling = field.alias or name
+            if key == spelling:
+                return f"it belongs in [{label}]"
+            if key == name:
+                return f"it belongs in [{label}] as {spelling!r}"
     return None
 
 
@@ -1630,9 +1647,9 @@ def _describe_unknown_key(
         if variable is None
         else f"environment variable {variable!r}: unknown key {key!r} in [{label}]"
     )
-    owner = _section_owning(key, exclude=model)
+    owner = _owner_hint(key, exclude=model)
     if owner is not None:
-        return f"{subject}; it belongs in [{owner}]"
+        return f"{subject}; {owner}"
     spelled = {name: field.alias for name, field in model.model_fields.items()}
     alias = spelled.get(key)
     if alias is not None and alias != key:
@@ -1667,9 +1684,9 @@ def _describe_unknown_top_level(name: str) -> str:
     for section in sections:
         if name.casefold() == section:
             return f"unknown section {name!r} (did you mean [{section}]?)"
-    owner = _section_owning(name, exclude=None)
+    owner = _owner_hint(name, exclude=None)
     if owner is not None:
-        return f"unknown key {name!r} at the top level; it belongs in [{owner}]"
+        return f"unknown key {name!r} at the top level; {owner}"
     hints = [f"[{match}]" for match in difflib.get_close_matches(name, sections, n=1)]
     hints.append(f"[profiles.{_escape_name(name)}]")
     return (

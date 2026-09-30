@@ -1152,6 +1152,52 @@ class TestTitleSpelling:
             f"  environment variable {variable!r}: {_WRITE_AS_TITLE}"
         )
 
+    def test_default_title_in_another_section_is_sent_to_title(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        Pointed at the profile table, it is told the spelling that loads there.
+
+        Sending it on as ``default_title`` would only trade this refusal for
+        the profile table's.
+        """
+        err = _load_error(
+            tmp_config_dir / "misplaced_title.toml",
+            '[output]\ndefault_title = "x"\n\n[profiles.default]\n',
+        )
+        assert _error_lines(err)[1:] == [
+            "  [output] unknown key 'default_title'; "
+            "it belongs in [profiles.<name>] as 'title'"
+        ]
+
+    def test_default_title_at_the_top_level_is_sent_to_title(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """The top-level form gives the same owner and spelling."""
+        err = _load_error(
+            tmp_config_dir / "top_level_title.toml",
+            'default_title = "x"\n\n[profiles.default]\n',
+        )
+        matching = [
+            line for line in _error_lines(err) if "unknown key 'default_title'" in line
+        ]
+        assert matching == [
+            "  unknown key 'default_title' at the top level; "
+            "it belongs in [profiles.<name>] as 'title'"
+        ]
+
+    def test_title_in_another_section_is_sent_as_itself(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A key already in its owner's spelling needs no second name."""
+        err = _load_error(
+            tmp_config_dir / "misplaced_alias.toml",
+            '[output]\ntitle = "x"\n\n[profiles.default]\n',
+        )
+        assert _error_lines(err)[1:] == [
+            "  [output] unknown key 'title'; it belongs in [profiles.<name>]"
+        ]
+
     def test_title_alone_loads_into_the_title_field(self, tmp_config_dir: Path) -> None:
         """``title`` is the spelling that loads."""
         config_file = tmp_config_dir / "title_only.toml"
