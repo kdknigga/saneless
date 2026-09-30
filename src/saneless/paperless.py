@@ -2143,14 +2143,19 @@ class PaperlessClient:
         logger.warning("Unexpected paperless status %s", response.status_code)
         return ConnectionStatus.SERVER_ERROR
 
-    def get_tags(self, *, timeout: float | None = None) -> list[dict[str, object]]:
+    def get_tags(
+        self, *, timeout: float | httpx2.Timeout | None = None
+    ) -> list[dict[str, object]]:
         """
         Fetch all tags from paperless-ngx.
 
         Args:
-            timeout: The per-request budget in seconds, sent on every page
-                request, or None to use the client's own 30 s default.  A
-                check made before a scan starts passes a short one, so a
+            timeout: The per-request budget, sent on every page request, or
+                None to use the client's own 30 s default.  A float bounds
+                every phase of the request alike; an ``httpx2.Timeout``
+                carries separate connect and read budgets, so a host that
+                does not answer at all is given up on sooner than a slow one.
+                A check made before a scan starts passes a short one, so a
                 paperless-ngx that is down is reported in seconds.
 
         Returns:
@@ -2172,15 +2177,18 @@ class PaperlessClient:
         return self._fetch_collection("/api/tags/", "tags", timeout=timeout)
 
     def get_correspondents(
-        self, *, timeout: float | None = None
+        self, *, timeout: float | httpx2.Timeout | None = None
     ) -> list[dict[str, object]]:
         """
         Fetch all correspondents from paperless-ngx.
 
         Args:
-            timeout: The per-request budget in seconds, sent on every page
-                request, or None to use the client's own 30 s default.  A
-                check made before a scan starts passes a short one, so a
+            timeout: The per-request budget, sent on every page request, or
+                None to use the client's own 30 s default.  A float bounds
+                every phase of the request alike; an ``httpx2.Timeout``
+                carries separate connect and read budgets, so a host that
+                does not answer at all is given up on sooner than a slow one.
+                A check made before a scan starts passes a short one, so a
                 paperless-ngx that is down is reported in seconds.
 
         Returns:
@@ -2204,7 +2212,11 @@ class PaperlessClient:
         )
 
     def _fetch_collection(
-        self, path: str, noun: str, *, timeout: float | None = None
+        self,
+        path: str,
+        noun: str,
+        *,
+        timeout: float | httpx2.Timeout | None = None,
     ) -> list[dict[str, object]]:
         """
         Fetch every page of one metadata collection.
@@ -2237,8 +2249,9 @@ class PaperlessClient:
         Args:
             path: The collection endpoint, e.g. ``/api/tags/``.
             noun: What the collection holds, for the message.
-            timeout: The per-request budget in seconds for every page, or
-                None for the client's default.
+            timeout: The per-request budget for every page -- seconds, or
+                an ``httpx2.Timeout`` with separate connect and read
+                budgets -- or None for the client's default.
 
         Returns:
             The ``results`` of every page in order.
@@ -2297,7 +2310,12 @@ class PaperlessClient:
             page += 1
 
     def _fetch_page(
-        self, path: str, page: int, prefix: str, *, timeout: float | None = None
+        self,
+        path: str,
+        page: int,
+        prefix: str,
+        *,
+        timeout: float | httpx2.Timeout | None = None,
     ) -> object:
         """
         Request one metadata page and return its decoded JSON body.
@@ -2309,8 +2327,9 @@ class PaperlessClient:
             path: The collection endpoint, e.g. ``/api/tags/``.
             page: The page number to ask for.
             prefix: The message prefix naming the collection and base URL.
-            timeout: The request's budget in seconds, or None for the
-                client's default.
+            timeout: The request's budget -- seconds, or an
+                ``httpx2.Timeout`` with separate connect and read budgets --
+                or None for the client's default.
 
         Returns:
             The decoded body, whatever its shape.

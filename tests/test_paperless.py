@@ -4038,6 +4038,12 @@ class TestMetadataResponseShape:
         assert len(handler.requests) == 1
 
 
+# A connect bound shorter than the read bound: a black-holed host is given up
+# on in two seconds, while a slow but answering one gets five.
+_SPLIT_BUDGET = httpx2.Timeout(5.0, connect=2.0)
+_SPLIT_BUDGET_SENT = {"connect": 2.0, "read": 5.0, "write": 5.0, "pool": 5.0}
+
+
 class TestMetadataTimeout:
     """
     A metadata fetch can carry a shorter timeout than the client's 30 s.
@@ -4106,6 +4112,51 @@ class TestMetadataTimeout:
         ]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
         assert parameter.default is None
+
+    @staticmethod
+    def _recording_client() -> tuple[PaperlessClient, list[dict[str, float | None]]]:
+        """
+        Build a client whose transport records each page request's timeout.
+
+        Returns:
+            The client, answering two pages, and the list it records into.
+
+        """
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request.extensions["timeout"])
+            page = int(request.url.params["page"])
+            return httpx2.Response(
+                200,
+                json={
+                    "count": 2,
+                    "next": "more" if page == 1 else None,
+                    "results": [{"id": page, "name": f"item {page}"}],
+                },
+            )
+
+        return _poll_client(handler), seen
+
+    def test_get_tags_passes_a_connect_and_read_budget(self) -> None:
+        """An ``httpx2.Timeout`` reaches every page with its own connect bound."""
+        client, seen = self._recording_client()
+        try:
+            items = client.get_tags(timeout=_SPLIT_BUDGET)
+        finally:
+            client.close()
+        assert [item["id"] for item in items] == [1, 2]
+        assert seen == [_SPLIT_BUDGET_SENT, _SPLIT_BUDGET_SENT]
+
+    def test_get_correspondents_passes_a_connect_and_read_budget(self) -> None:
+        """The correspondent list carries the same split budget on every page."""
+        client, seen = self._recording_client()
+        try:
+            items = client.get_correspondents(timeout=_SPLIT_BUDGET)
+        finally:
+            client.close()
+        assert [item["id"] for item in items] == [1, 2]
+        assert seen == [_SPLIT_BUDGET_SENT, _SPLIT_BUDGET_SENT]
 
 
 class _EndlessHandler:
