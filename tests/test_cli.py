@@ -4993,6 +4993,67 @@ class TestAutoProfilesRootOwnedNewConfig:
         assert f"{files.etc} is owned by root" in notes[0]
         assert "chown" not in result.stdout
 
+    def test_a_new_root_owned_per_user_file_is_not_told_to_chown_in_place(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        Root's own per-user file is not in another user's search at all.
+
+        With no system directory, root's target is the file under its own
+        home.  A ``chown`` there fixes nothing: another user never searches
+        that home, and its saneless would quietly run on defaults.  The note
+        says so and gives the moves that do work.
+        """
+        files = patched_search_paths
+        _fake_file_owner(monkeypatch, files.xdg, 0)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.xdg.exists()
+        notes = [line for line in result.stderr.splitlines() if "chown" in line]
+        assert len(notes) == 1, result.stderr
+        note = notes[0]
+        assert f"{files.xdg} is owned by root" in note
+        assert f"chown <user>: {files.xdg}" not in note
+        assert "any other user will not read it" in note
+        assert f"mv {files.xdg} {files.etc.parent}/" in note
+        assert f"chown <user>: {files.etc}" in note
+        assert "`saneless auto-profiles` as that user" in note
+
+    def test_a_new_per_user_directory_takes_its_parents_owner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        Root with an ordinary user's HOME leaves no root-only directory there.
+
+        ``sudo -E`` keeps HOME, so the per-user target is in the invoking
+        user's home.  The ``saneless`` directory it creates takes that home's
+        owner, the rule the new file already follows, so the file follows it
+        too and the user can reach both.
+        """
+        files = patched_search_paths
+        base = files.xdg.parent.parent.stat()
+        monkeypatch.setattr(os, "geteuid", lambda: base.st_uid + 1)
+        given: list[tuple[int, int, int]] = []
+
+        def fchown(fd: int, uid: int, gid: int) -> None:
+            given.append((os.fstat(fd).st_ino, uid, gid))
+
+        monkeypatch.setattr(os, "fchown", fchown)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        directory = files.xdg.parent.stat()
+        assert (directory.st_ino, base.st_uid, base.st_gid) in given
+
     def test_a_new_file_owned_by_another_user_says_nothing(
         self,
         monkeypatch: pytest.MonkeyPatch,

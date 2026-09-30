@@ -32,7 +32,12 @@ from typing import Final
 
 from .exceptions import ConfigError
 
-__all__ = ["is_read_only_mount", "refused_mode_change", "replace_file_atomically"]
+__all__ = [
+    "is_read_only_mount",
+    "make_config_directory",
+    "refused_mode_change",
+    "replace_file_atomically",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -407,7 +412,9 @@ def _sweep_stale_temps(target: Path) -> None:
         )
 
 
-def _adopt_directory_owner(fd: int, directory: Path) -> None:
+def _adopt_directory_owner(
+    fd: int, directory: Path, what: str = "the new config file"
+) -> None:
     """
     Give a newly created file its directory's owner and group, when permitted.
 
@@ -418,8 +425,10 @@ def _adopt_directory_owner(fd: int, directory: Path) -> None:
     process as the owner and is logged at DEBUG; the write goes ahead.
 
     Args:
-        fd: The open temp file.
-        directory: The directory the file is being created in.
+        fd: The open temp file, or a directory ``make_config_directory``
+            just created.
+        directory: The directory it is being created in.
+        what: How the DEBUG line names what was not given away.
 
     Raises:
         OSError: The ownership change failed for a reason other than a
@@ -435,11 +444,58 @@ def _adopt_directory_owner(fd: int, directory: Path) -> None:
         if not refused_mode_change(exc):
             raise
         logger.debug(
-            "Not giving the new config file its directory's owner (uid %d, gid %d): %s",
+            "Not giving %s its directory's owner (uid %d, gid %d): %s",
+            what,
             status.st_uid,
             status.st_gid,
             exc.strerror,
         )
+
+
+def make_config_directory(directory: Path) -> None:
+    """
+    Create a config file's directory, each new level owned like its parent.
+
+    The rule a new config file follows, one level up. Root running with an
+    ordinary user's HOME (``sudo -E``, or a sudoers that keeps HOME) targets
+    that user's per-user file; a ``saneless`` directory it left root-only
+    would hide the file from the user, who could not even look inside, and
+    refuse the user's own later ``auto-profiles``. So every directory created
+    here, a missing ``~/.config`` included, takes its parent's owner and group
+    when this process may set them, and a refusal keeps this process as the
+    owner, logged at DEBUG.
+
+    The directory itself is created 0700, because the file it will hold may
+    carry the Paperless token; a missing parent gets ``mkdir``'s default mode,
+    as ``mkdir -p`` gives it. Only a directory this call created is changed:
+    one that already exists, or that another process created first, is left
+    as it is. Each new directory is opened without following a symlink before
+    its owner is set, so a link swapped in after the ``mkdir`` is never
+    followed.
+
+    Args:
+        directory: The directory to create, absolute.
+
+    Raises:
+        OSError: A directory could not be created or opened, or its owner
+            could not be set for a reason other than a refusal.
+
+    """
+    missing: list[Path] = []
+    probe = directory
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        probe = probe.parent
+    for level in reversed(missing):
+        try:
+            level.mkdir(mode=0o700 if level == directory else 0o777)
+        except FileExistsError:
+            continue
+        fd = os.open(level, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _adopt_directory_owner(fd, level.parent, str(level))
+        finally:
+            os.close(fd)
 
 
 def replace_file_atomically(path: Path, text: str) -> Path:

@@ -30,7 +30,7 @@ from uuid import uuid4
 import click
 import uvicorn
 
-from .atomic_write import is_read_only_mount
+from .atomic_write import is_read_only_mount, make_config_directory
 from .auto_profiles import (
     device_type_of,
     generate_profiles,
@@ -128,6 +128,7 @@ from .vocabulary import (
     rejection_message,
     removed_pages_note,
     root_owned_config_note,
+    root_per_user_config_note,
     state_label,
 )
 from .web.app import create_app
@@ -2244,7 +2245,7 @@ def _echo_write_result(
             )
 
 
-def _note_root_owned_config(path: Path) -> None:
+def _note_root_owned_config(path: Path, system: Path) -> None:
     """
     Say on stderr when a config file this command created belongs to root.
 
@@ -2252,19 +2253,27 @@ def _note_root_owned_config(path: Path) -> None:
     ``/etc/saneless`` -- the usual bare-metal layout -- leaves the file root's,
     mode 0600.  saneless running as an ordinary user would then find it on the
     next start and fail to read it, so the operator is told which file to give
-    to that user.  A file owned by anyone else needs nothing, and a status
-    that cannot be read is not worth failing a write that succeeded.
+    to that user.  With no writable system directory, root's file is instead
+    the per-user one under its own home, which no other user searches; a
+    ``chown`` there would fix nothing, so that note gives the moves that do.
+    A file owned by anyone else needs nothing, and a status that cannot be
+    read is not worth failing a write that succeeded.
 
     Args:
-        path: The file just created.
+        path: The file just created, absolute.
+        system: The system config file, absolute.
 
     """
     try:
         owner = path.stat().st_uid
     except OSError:
         return
-    if owner == 0:
-        click.echo(root_owned_config_note(path.absolute()), err=True)
+    if owner != 0:
+        return
+    if path == system:
+        click.echo(root_owned_config_note(path), err=True)
+    else:
+        click.echo(root_per_user_config_note(path, system), err=True)
 
 
 def _new_config_target(settings: Settings) -> Path:
@@ -2424,10 +2433,12 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         # Only a new file's directory is created: the system target's
         # directory exists by construction, so this is only ever the XDG
         # ``saneless`` directory, made private because the file may later
-        # hold the Paperless token.  The file itself is 0600 and takes its
-        # directory's owner, which the atomic writer sees to.
+        # hold the Paperless token, and owned like its parent so root with a
+        # user's HOME leaves nothing in it that the user cannot reach.  The
+        # file itself is 0600 and takes its directory's owner, which the
+        # atomic writer sees to.
         if settings.config_path is None and not config_path.parent.is_dir():
-            config_path.parent.mkdir(mode=0o700, parents=True)
+            make_config_directory(config_path.parent)
         result = write_profiles_to_config(
             config_path, profiles, force=force, device=pin
         )
@@ -2442,7 +2453,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         ctx.exit(ExitCode.CONFIG)
     _echo_write_result(result, profiles)
     if created:
-        _note_root_owned_config(result.path)
+        _note_root_owned_config(
+            config_path, _new_config_candidates(settings)[0].absolute()
+        )
 
 
 def _state_marker(state: CheckState) -> str:

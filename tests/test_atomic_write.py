@@ -54,7 +54,11 @@ from pathlib import Path
 
 import pytest
 
-from saneless.atomic_write import refused_mode_change, replace_file_atomically
+from saneless.atomic_write import (
+    make_config_directory,
+    refused_mode_change,
+    replace_file_atomically,
+)
 from saneless.exceptions import ConfigError
 
 _ORIGINAL = "[profiles.default]\nsource = 'Flatbed'\n"
@@ -1465,6 +1469,101 @@ class TestNewFileOwner:
         replace_file_atomically(target, _NEW)
 
         assert calls == [(original.st_uid, original.st_gid)]
+
+
+def _record_directory_fchown(
+    monkeypatch: pytest.MonkeyPatch, *, refuse: bool
+) -> list[tuple[int, int, int]]:
+    """
+    Record every ``fchown`` by inode, without performing it; optionally refuse.
+
+    The inode says which directory each call was for.
+    """
+    calls: list[tuple[int, int, int]] = []
+
+    def fchown(fd: int, uid: int, gid: int) -> None:
+        """Note the directory and the requested owner; refuse it when asked to."""
+        calls.append((os.fstat(fd).st_ino, uid, gid))
+        if refuse:
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+    monkeypatch.setattr(os, "fchown", fchown)
+    return calls
+
+
+class TestNewDirectoryOwner:
+    """
+    A config directory this process creates belongs to its parent's owner.
+
+    The rule a new config file follows for its directory, one level up: root
+    running with an ordinary user's HOME must not leave a root-only directory
+    in that user's home, where it would hide the file from the user and
+    refuse the user's own later writes.
+    """
+
+    def test_each_new_directory_takes_its_parents_owner(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing parent and the directory itself are each given away."""
+        owner, group = os.geteuid(), os.getegid()
+        monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+        calls = _record_directory_fchown(monkeypatch, refuse=False)
+        directory = tmp_path / "config" / "saneless"
+
+        make_config_directory(directory)
+
+        assert calls == [
+            (directory.parent.stat().st_ino, owner, group),
+            (directory.stat().st_ino, owner, group),
+        ]
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+    def test_a_directory_owned_like_the_writer_needs_no_chown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The usual case: the writer owns the home it is writing into."""
+        calls = _record_directory_fchown(monkeypatch, refuse=False)
+        directory = tmp_path / "config" / "saneless"
+
+        make_config_directory(directory)
+
+        assert calls == []
+        assert directory.is_dir()
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+    def test_a_refused_owner_change_still_creates_the_directory(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A writer that may not give a directory away keeps it, as the file rule does."""
+        _fake_directory_owner(monkeypatch, tmp_path, os.geteuid() + 1, os.getegid())
+        calls = _record_directory_fchown(monkeypatch, refuse=True)
+        directory = tmp_path / "saneless"
+        caplog.set_level(logging.DEBUG, logger="saneless.atomic_write")
+
+        make_config_directory(directory)
+
+        assert len(calls) == 1
+        assert directory.is_dir()
+        records = [r for r in caplog.records if r.name == "saneless.atomic_write"]
+        assert [r.levelno for r in records] == [logging.DEBUG]
+        assert str(directory) in records[0].getMessage()
+
+    def test_an_existing_directory_is_left_as_it_is(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a directory this call created is given away."""
+        monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+        calls = _record_directory_fchown(monkeypatch, refuse=False)
+        directory = tmp_path / "saneless"
+        directory.mkdir(mode=0o755)
+
+        make_config_directory(directory)
+
+        assert calls == []
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o755
 
 
 class TestBindMount:

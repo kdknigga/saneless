@@ -140,6 +140,7 @@ __all__ = [
     "restart_category",
     "restart_error",
     "root_owned_config_note",
+    "root_per_user_config_note",
     "scan_page_description",
     "sixteen_bit_error",
     "source_not_offered_error",
@@ -2528,12 +2529,13 @@ def multi_page_manual_duplex_refusal(profile: str) -> str:
 
 def root_owned_config_note(path: Path) -> str:
     """
-    Return the note for a config file root created and could not give away.
+    Return the note for a system config file root created and could not give away.
 
     A new config takes its directory's owner; when that owner is root too, the
     file stays root's with mode 0600, and saneless running as any other user
     finds it on the next start and cannot read it.  This is the one source of
-    that note's wording.
+    that note's wording.  It is for the system file only, which every user
+    searches; ``root_per_user_config_note`` covers the per-user one.
 
     Args:
         path: The created file, absolute.
@@ -2546,6 +2548,37 @@ def root_owned_config_note(path: Path) -> str:
         f"Note: {path} is owned by root with mode 0600, so only root can read "
         "it. If saneless runs as another user, give the file to that user "
         f"before starting saneless: chown <user>: {path}"
+    )
+
+
+def root_per_user_config_note(path: Path, system: Path) -> str:
+    """
+    Return the note for a per-user config file root created and still owns.
+
+    With no writable system directory, root's target is the per-user file
+    under its own home.  Another user never searches that home, so a
+    ``chown`` in place would fix nothing and that user's saneless would run on
+    defaults without a word.  The note says so and offers the two moves that
+    do work: put the file where every user looks, or generate one as that
+    user.
+
+    Args:
+        path: The created file, absolute.
+        system: The system config file, absolute: the one every user
+            searches.
+
+    Returns:
+        The note, naming the file, the move to the system directory and the
+        ``chown`` that goes with it.
+
+    """
+    return (
+        f"Note: {path} is owned by root with mode 0600, and it is a per-user "
+        "config file, so saneless running as any other user will not read it. "
+        "To use it for another user, move it where every user looks and give "
+        f"it to them: mkdir -p {system.parent} && mv {path} {system.parent}/ "
+        f"&& chown <user>: {system} -- or run `saneless auto-profiles` as "
+        "that user instead."
     )
 
 

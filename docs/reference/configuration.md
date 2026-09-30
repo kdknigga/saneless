@@ -17,7 +17,7 @@ If no file is found, defaults and environment variables are used.
 
 Only one file is ever read. If more than one `saneless.toml` is found, the first one in this list is read and the others are not: the log warns once for each file it is not reading, and the [Configuration check](#the-configuration-check) is amber and names the file in use and every file that is not read. One file reached twice -- through a symlink, or because the working directory is one of the other locations -- counts once.
 
-When no config file was loaded, `saneless auto-profiles` writes `/etc/saneless/saneless.toml` if the `/etc/saneless` directory already exists and is writable (in the container, the mounted `./config` directory), otherwise `$XDG_CONFIG_HOME/saneless/saneless.toml`, and never `./saneless.toml`, which would be read ahead of both. It creates a missing XDG directory with mode `0700`, and it never creates `/etc/saneless`.
+When no config file was loaded, `saneless auto-profiles` writes `/etc/saneless/saneless.toml` if the `/etc/saneless` directory already exists and is writable (in the container, the mounted `./config` directory), otherwise `$XDG_CONFIG_HOME/saneless/saneless.toml`, and never `./saneless.toml`, which would be read ahead of both. It creates a missing XDG directory with mode `0700`, owned like the directory it is created in when the command may set that (so `sudo -E` leaves nothing root-only in your home), and it never creates `/etc/saneless`.
 
 A path that is not a regular file (for example a directory) is skipped. An explicit `--config PATH` that does not exist, or is not a regular file, is an error (exit code 2). A leading `~` in `--config` is expanded to your home directory.
 

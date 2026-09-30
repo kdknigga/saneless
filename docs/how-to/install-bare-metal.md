@@ -82,6 +82,8 @@ If you run `sudo saneless auto-profiles` and `/etc/saneless` belongs to root, th
 sudo chown "$USER": /etc/saneless/saneless.toml
 ```
 
+Without an `/etc/saneless` directory, `sudo saneless auto-profiles` creates root's own per-user file instead, usually `/root/.config/saneless/saneless.toml`. saneless running as any other user never reads that file, and a `chown` does not change that, so the note printed then gives the commands that move it into `/etc/saneless` and give it to that user. Alternatively, run `saneless auto-profiles` as the user saneless runs as. If `sudo` keeps your `HOME` (`sudo -E`), the file goes to your own `~/.config/saneless` instead, and the directories it creates there and the file itself take the owner of the directory they are created in, so they stay yours.
+
 Scans in progress are written under `tmp_dir`, by default `$TMPDIR/saneless-<uid>` (for example `/tmp/saneless-1000`), which saneless creates so that only your user can enter it; see [`[output]`](../reference/configuration.md#output) for what it refuses at startup. Upgrading from an earlier release? The old `/tmp/saneless` directory is no longer used and may be deleted, once any `saneless.db` a release older than `data_dir` left in it has been moved to `data_dir`.
 
 ### Upgrading from an earlier release
