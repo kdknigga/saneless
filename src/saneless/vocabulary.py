@@ -39,13 +39,17 @@ __all__ = [
     "ACTIVE_STATES",
     "BACKS_SUFFIX",
     "BUSY_STATES",
+    "CORRESPONDENTS_LOADING",
+    "CORRESPONDENTS_UNAVAILABLE",
     "FALLBACK_NOT_UPLOADED_LINE",
     "FRONTS_SUFFIX",
     "HIDDEN_ERROR_DETAIL",
     "HIDDEN_JOB_TITLE",
     "HIDDEN_PRESERVED_ERROR",
     "HIDDEN_WARNING_LINE",
+    "IDLE_LINE",
     "LOCAL_TIME_FORMAT",
+    "LOST_CONTACT_LINE",
     "MAX_PAPERLESS_ID",
     "MULTI_PAGE_DISABLED_REASON",
     "MULTI_PAGE_HELP",
@@ -53,6 +57,11 @@ __all__ = [
     "MULTI_PAGE_NEEDS_TERMINAL",
     "MULTI_PAGE_OPTION_HELP",
     "NOTHING_TO_FINISH",
+    "NO_SCRIPT_BACK_LINK",
+    "NO_SCRIPT_BODY",
+    "NO_SCRIPT_HEADING",
+    "NO_SCRIPT_LINE",
+    "NO_SCRIPT_PAGE_TITLE",
     "PAPERLESS_TITLE_LIMIT",
     "PARTIAL_SUFFIX",
     "PASS_WAIT_STATES",
@@ -61,6 +70,9 @@ __all__ = [
     "RESTART_UPLOADING_REASON",
     "SCAN_BLOCKED_REASON",
     "SCAN_BLOCKED_URL_REASON",
+    "TAGS_LOADING",
+    "TAGS_UNAVAILABLE",
+    "TAG_FILTER_LABEL",
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
     "TITLE_SUFFIX_SEPARATOR",
@@ -115,21 +127,28 @@ __all__ = [
     "exit_code_for_outcome",
     "exit_code_for_signal",
     "flip_answer_label",
+    "flip_deadline_note",
+    "flip_heading",
     "half_delivery_error",
     "half_title",
     "is_amber_category",
     "job_label",
     "job_state_for",
     "job_status_class",
+    "last_scan_detail",
+    "last_scan_line",
     "local_time",
     "multi_page_manual_duplex_refusal",
+    "non_owner_wait_line",
     "outcome_line",
     "page_counts",
     "page_timeout_error",
+    "page_title",
     "pages_phrase",
     "pass_answer_label",
     "pass_cap_note",
     "pass_cap_warning",
+    "pass_heading",
     "pass_prompt_copy",
     "pass_wait_state",
     "progress_label",
@@ -141,6 +160,8 @@ __all__ = [
     "restart_error",
     "root_owned_config_note",
     "root_per_user_config_note",
+    "scan_button_label",
+    "scan_hold_reason",
     "scan_page_description",
     "sixteen_bit_error",
     "source_not_offered_error",
@@ -824,6 +845,17 @@ SCAN_BLOCKED_URL_REASON: Final = (
     "The paperless-ngx address has not been set — see System status above."
 )
 
+# The status area's first line when no job is in flight and nothing blocks a
+# scan.  When one of the two reasons above does block it, the reason takes
+# this line's place, so the area never says "ready" beside a disabled button.
+IDLE_LINE: Final = "Ready to scan."
+
+# What the status area says when a poll cannot read the job store.  The scan
+# itself may be running fine -- only its progress cannot be read -- so this is
+# a warning, not a failure, and it promises only what the page does: poll
+# again.  Three ASCII periods, as on every in-progress sentence.
+LOST_CONTACT_LINE: Final = "Cannot read the scan's progress right now — retrying..."
+
 # How a job the previous process left in flight, or a server stop interrupted,
 # begins its error, before the sentence naming what was kept.  The first is for
 # a job that had not started its upload.  The second is for one that had: the
@@ -901,6 +933,88 @@ def dropped_ids_warning(tags: Sequence[int], correspondent: int | None) -> str |
         else "no longer exist in paperless-ngx and were not applied."
     )
     return f"{subject} {predicate}"
+
+
+# The placeholders the scan page shows while it fetches the tag and
+# correspondent lists after the page has loaded: the tag list's only line, and
+# the correspondent select's help line.  The page itself makes no
+# paperless-ngx call, so it never waits on one.  Three ASCII periods, as on
+# every in-progress sentence.
+TAGS_LOADING: Final = "Loading tags from paperless-ngx..."
+CORRESPONDENTS_LOADING: Final = "Loading correspondents from paperless-ngx..."
+
+# What each list says when paperless-ngx could not be read.  An amber warning,
+# not a red failure: the page keeps retrying on its own, and the ↻ button
+# beside the heading retries at once.  Neither names the paperless-ngx address
+# or the reason the read failed; the log has both.
+TAGS_UNAVAILABLE: Final = (
+    "Tags could not be loaded from paperless-ngx. saneless keeps trying; "
+    "press ↻ to try now."
+)
+CORRESPONDENTS_UNAVAILABLE: Final = (
+    "Correspondents could not be loaded from paperless-ngx. saneless keeps "
+    "trying; press ↻ to try now."
+)
+
+# The tag filter's accessible name, from a visually hidden label.  It is the
+# placeholder's words exactly, so a speech-input user can say what they see
+# and reach the field.
+TAG_FILTER_LABEL: Final = "Filter tags"
+
+
+def scan_hold_reason(*, tags: bool, correspondents: bool) -> str | None:
+    """
+    Return why the Scan button is held while the scan page's lists load.
+
+    Scan stays disabled until the lists it would file the scan with have
+    arrived or failed, so a scan is never started with a default the page has
+    not shown.  The reason names only the lists the page shows.  Muted, not
+    red, because a short wait is not an error.
+
+    Args:
+        tags: Whether the page shows the tag list.
+        correspondents: Whether the page shows the correspondent select.
+
+    Returns:
+        The reason, or None when neither list is shown and nothing is held.
+
+    """
+    if tags and correspondents:
+        waiting_for = "the tags and correspondents"
+    elif tags:
+        waiting_for = "the tags"
+    elif correspondents:
+        waiting_for = "the correspondents"
+    else:
+        return None
+    return f"Scan waits for {waiting_for} to load..."
+
+
+# The line a browser with JavaScript turned off shows under the Scan heading,
+# before any control, saying why nothing on the page will work and what to do
+# instead.
+NO_SCRIPT_LINE: Final = (
+    "Scanning from this page needs JavaScript, which is turned off in this "
+    "browser. Turn it on and reload the page, or run saneless scan on the "
+    "server."
+)
+
+# The browser tab's title: the product name alone with no job in flight, and
+# after what is happening otherwise.  ``page_title`` and the refusal page
+# below both end with the suffix, so every tab reads the same way.
+_PRODUCT_NAME: Final = "saneless"
+_PAGE_TITLE_SUFFIX: Final = f" — {_PRODUCT_NAME}"
+
+# The page a browser without JavaScript lands on when it submits the scan
+# form as a plain post.  No scan is started and no field is echoed back.
+NO_SCRIPT_HEADING: Final = "Scan not started"
+NO_SCRIPT_PAGE_TITLE: Final = f"{NO_SCRIPT_HEADING}{_PAGE_TITLE_SUFFIX}"
+NO_SCRIPT_BODY: Final = (
+    "Scanning from this page needs JavaScript, which is turned off in this "
+    "browser, so no scan was started. Turn it on and reload the page, or run "
+    "saneless scan on the server."
+)
+NO_SCRIPT_BACK_LINK: Final = "Back to the scan page"
 
 
 # The note on a ticked id the form shows but paperless-ngx's list, read just
@@ -1106,6 +1220,22 @@ _INTERRUPTED_ACKNOWLEDGEMENT: Final = (
 
 _SECONDS_PER_MINUTE: Final = 60
 _SECONDS_PER_HOUR: Final = 3600
+
+# The headline word of a clean upload, shared by ``outcome_line`` and
+# ``page_title`` so the status area and the browser tab say the same thing.
+_DONE_LABEL: Final = "Done"
+
+# The glyphs that lead an outcome line, as the status partial draws them:
+# a tick for a clean upload, the warning sign for a warned upload or a failure
+# that may be in paperless-ngx, an arrow for a scan kept in the folder, the
+# circled slash for a cancel and a cross for a failure.  They are part of the
+# vocabulary string wherever one sits mid-sentence, because templates compose
+# no prose.
+_DONE_GLYPH: Final = "✓"
+_WARNING_GLYPH: Final = "⚠"
+_FALLBACK_GLYPH: Final = "→"
+_CANCELLED_GLYPH: Final = "⊘"
+_FAILED_GLYPH: Final = "✗"
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
@@ -1546,7 +1676,7 @@ def outcome_line(state: JobState, warning: str | None, title: str) -> str:
     """
     match state:
         case JobState.DONE:
-            prefix = WARNED_UPLOAD_LABEL if warning else "Done"
+            prefix = WARNED_UPLOAD_LABEL if warning else _DONE_LABEL
         case JobState.FALLBACK:
             prefix = state_label(JobState.FALLBACK)
         case _:
@@ -1675,6 +1805,121 @@ def busy_line(
     return label
 
 
+def scan_button_label(state: JobState | None) -> str:
+    """
+    Return the Scan button's label while a job is, or is not, in flight.
+
+    The button names what the machine is doing, so a second press is never
+    invited while one scan waits: a job still in the queue is ``Queued…``, a
+    running one ``Scanning…``, and a wait for a person names what it waits
+    for.  With no job, or once the job has an outcome, the button offers a
+    scan again.
+
+    Button labels end in U+2026, unlike the in-progress sentences elsewhere
+    here, which use three ASCII periods.
+
+    Args:
+        state: The state of the job in flight, or None when there is none.
+
+    Returns:
+        The label, e.g. ``"Waiting for flip…"``.
+
+    Raises:
+        AssertionError: If the value is neither None nor a JobState member.
+
+    """
+    match state:
+        case (
+            None
+            | JobState.DONE
+            | JobState.ERROR
+            | JobState.FALLBACK
+            | JobState.CANCELLED
+        ):
+            label = "Scan"
+        case JobState.PENDING:
+            label = "Queued…"
+        case (
+            JobState.SCANNING
+            | JobState.SCANNING_REVERSE
+            | JobState.ASSEMBLING
+            | JobState.UPLOADING
+        ):
+            label = "Scanning…"
+        case JobState.AWAITING_FLIP:
+            label = "Waiting for flip…"
+        case (
+            JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+        ):
+            label = "Waiting for you…"
+        case _:
+            assert_never(state)
+    return label
+
+
+def page_title(
+    state: JobState | None,
+    *,
+    warning: str | None = None,
+    category: ErrorCategory | None = None,
+    queued: bool = False,
+) -> str:
+    """
+    Return the browser tab's title for the status area's current rendering.
+
+    The title names the job's state and never its title: a tab's title is
+    read out by screen readers, shown in the task switcher and kept in the
+    browser's history, none of which the owner gate reaches.  That is why
+    this function takes no title at all.  A warning is read only for whether
+    there is one.
+
+    A running job is named by the history table's ``state_label``, except a
+    PENDING one, which says whether it is queued behind another job or
+    starting.  A finished one is named by its outcome, as the status area's
+    headline names it: ``Done`` for a clean upload, and ``job_label`` for the
+    rest, so a failure that may be in paperless-ngx is not called Failed.
+
+    Args:
+        state: The state of the job shown, or None when none is.
+        warning: The job's warning, if any.  An empty string is no warning.
+        category: The job's error category, if any.  Only an ERROR reads it.
+        queued: For a PENDING job, whether it waits behind another one.
+
+    Returns:
+        E.g. ``"saneless"``, ``"Queued — saneless"`` or
+        ``"Uploaded with a warning — saneless"``.
+
+    Raises:
+        AssertionError: If the value is neither None nor a JobState member.
+
+    """
+    match state:
+        case None:
+            return _PRODUCT_NAME
+        case JobState.PENDING:
+            label = "Queued" if queued else "Starting"
+        case (
+            JobState.SCANNING
+            | JobState.AWAITING_FLIP
+            | JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+            | JobState.SCANNING_REVERSE
+            | JobState.ASSEMBLING
+            | JobState.UPLOADING
+        ):
+            label = state_label(state)
+        case JobState.DONE:
+            label = WARNED_UPLOAD_LABEL if warning else _DONE_LABEL
+        case JobState.ERROR | JobState.FALLBACK | JobState.CANCELLED:
+            label = job_label(state, warning, category)
+        case _:
+            assert_never(state)
+    return f"{label}{_PAGE_TITLE_SUFFIX}"
+
+
 def local_time(value: datetime) -> str:
     """
     Render a timestamp in the server's local zone, with the zone named.
@@ -1709,6 +1954,149 @@ def local_time(value: datetime) -> str:
 
     """
     return value.astimezone().strftime(LOCAL_TIME_FORMAT).rstrip()
+
+
+def _no_last_scan(state: JobState) -> ValueError:
+    """
+    Return the error for asking a job still in flight for its last-scan copy.
+
+    Args:
+        state: The job's state, one of ``ACTIVE_STATES``.
+
+    Returns:
+        The error to raise.
+
+    """
+    return ValueError(f"{state.value} is not terminal, so has no last-scan line")
+
+
+def last_scan_line(
+    state: JobState,
+    *,
+    warning: str | None,
+    category: ErrorCategory | None,
+    title: str,
+    created_at: datetime,
+) -> str:
+    """
+    Return the line naming the previous scan's outcome under the idle line.
+
+    It is built from the same words as the live outcome: ``outcome_line`` for
+    a delivered scan and ``job_label`` for a failure, so this line, the live
+    status area and the history row can never disagree.  The glyph leads the
+    outcome as the status partial draws it.  The time is when the job was
+    created -- a job records no finish time -- so the line says "started".
+
+    ``title`` is the only user data here.  The caller passes the title the
+    owner gate allows (the real one or ``HIDDEN_JOB_TITLE``); it is returned as
+    plain text and escaped by Jinja's autoescape at render time.
+
+    Args:
+        state: The job's terminal state.
+        warning: The job's warning, if any.  An empty string is no warning.
+        category: The job's error category, if any.  Only an ERROR reads it.
+        title: The title to show.
+        created_at: When the job was created.  Must be aware.
+
+    Returns:
+        E.g. ``"Last scan: ✓ Done: Tax — started 2026-09-30 14:03 CDT"``.
+
+    Raises:
+        ValueError: If ``state`` is not terminal.  A job still in flight has
+            no last-scan line.
+        AssertionError: If the value is not a JobState member.
+
+    """
+    match state:
+        case JobState.DONE:
+            glyph = _WARNING_GLYPH if warning else _DONE_GLYPH
+            outcome = outcome_line(state, warning, title)
+        case JobState.FALLBACK:
+            glyph = _FALLBACK_GLYPH
+            outcome = outcome_line(state, warning, title)
+        case JobState.CANCELLED:
+            glyph = _CANCELLED_GLYPH
+            outcome = f"{state_label(state)}: {title}"
+        case JobState.ERROR:
+            amber = category is not None and is_amber_category(category)
+            glyph = _WARNING_GLYPH if amber else _FAILED_GLYPH
+            outcome = f"{job_label(state, warning, category)}: {title}"
+        case (
+            JobState.PENDING
+            | JobState.SCANNING
+            | JobState.AWAITING_FLIP
+            | JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+            | JobState.SCANNING_REVERSE
+            | JobState.ASSEMBLING
+            | JobState.UPLOADING
+        ):
+            raise _no_last_scan(state)
+        case _:
+            assert_never(state)
+    return f"Last scan: {glyph} {outcome} — started {local_time(created_at)}"
+
+
+def last_scan_detail(
+    state: JobState,
+    *,
+    warning: str | None,
+    category: ErrorCategory | None,
+    error: str | None,
+) -> str | None:
+    """
+    Return the optional second line under the last-scan line.
+
+    A delivered scan with a warning shows the warning.  A failure with a
+    category shows that category's message and next step, the two sentences
+    the live status area shows, joined by one space.  A failure with no
+    category shows its error text.  A clean upload and a cancel have nothing
+    more to say.
+
+    The caller passes the warning and error the owner gate allows, as the job
+    view renders them; this function only chooses between them.
+
+    Args:
+        state: The job's terminal state.
+        warning: The job's warning, if any.  An empty string is no warning.
+        category: The job's error category, if any.  Only an ERROR reads it.
+        error: The job's error text, if any.  Only an uncategorised ERROR
+            shows it.
+
+    Returns:
+        The line, or None when there is none.
+
+    Raises:
+        ValueError: If ``state`` is not terminal.
+        AssertionError: If the value is not a JobState member.
+
+    """
+    match state:
+        case JobState.DONE | JobState.FALLBACK:
+            detail = warning or None
+        case JobState.CANCELLED:
+            detail = None
+        case JobState.ERROR:
+            if category is None:
+                detail = error
+            else:
+                detail = f"{error_message(category)} {error_next_step(category)}"
+        case (
+            JobState.PENDING
+            | JobState.SCANNING
+            | JobState.AWAITING_FLIP
+            | JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+            | JobState.SCANNING_REVERSE
+            | JobState.ASSEMBLING
+            | JobState.UPLOADING
+        ):
+            raise _no_last_scan(state)
+        case _:
+            assert_never(state)
+    return detail
 
 
 def page_counts(job: PageCounted) -> str | None:
@@ -1962,6 +2350,134 @@ def duration_phrase(seconds: float) -> str:
     if whole and whole % _SECONDS_PER_MINUTE == 0:
         return _counted(whole // _SECONDS_PER_MINUTE, "minute")
     return _counted(whole, "second")
+
+
+def non_owner_wait_line(state: JobState, *, deadline: datetime | None) -> str:
+    """
+    Return what a viewer who cannot answer a waiting scan is told.
+
+    Only the device that started a scan can flip its stack or answer its
+    multi-page question, so everyone else is told what the scan waits for,
+    where it can be answered, and -- once the worker has recorded when the
+    wait began -- when it gives up.  No title is named: the viewer is not the
+    owner.  The line ends in a full stop, not an in-progress ellipsis, because
+    nothing is happening on this viewer's behalf.
+
+    A flip wait "stops" at its deadline, because a flip timeout ends the scan.
+    A multi-page wait "stops waiting", because its timeout finishes the
+    document or ends the scan depending on the pages kept, which this line
+    does not know.  "Stops waiting" is true either way.
+
+    The three multi-page waits open with their progress prose, less its
+    ellipsis, so the waiting line and the progress line say the same thing.
+
+    Args:
+        state: The job's state: ``AWAITING_FLIP`` or one of
+            ``PASS_WAIT_STATES``.
+        deadline: When the wait gives up, if known.  Must be aware.
+
+    Returns:
+        The line, naming the deadline in local time when it is given.
+
+    Raises:
+        ValueError: If ``state`` is not a wait for a person.
+        AssertionError: If the value is not a JobState member.
+
+    """
+    match state:
+        case JobState.AWAITING_FLIP:
+            waiting = "Waiting for the stack to be flipped."
+            done_by, stops = "continued", "stops"
+        case (
+            JobState.AWAITING_NEXT_PASS
+            | JobState.AWAITING_BLANK_DECISION
+            | JobState.AWAITING_RETRY
+        ):
+            waiting = f"{_pass_wait_progress_label(state).removesuffix('...')}."
+            done_by, stops = "answered", "stops waiting"
+        case (
+            JobState.PENDING
+            | JobState.SCANNING
+            | JobState.SCANNING_REVERSE
+            | JobState.ASSEMBLING
+            | JobState.UPLOADING
+            | JobState.DONE
+            | JobState.ERROR
+            | JobState.FALLBACK
+            | JobState.CANCELLED
+        ):
+            msg = f"{state.value} is not waiting for a person, so has no waiting line"
+            raise ValueError(msg)
+        case _:
+            assert_never(state)
+    line = f"{waiting} It can be {done_by} from the device that started this scan"
+    if deadline is None:
+        return f"{line}."
+    return f"{line} — it {stops} at {local_time(deadline)} if nobody does."
+
+
+def flip_heading(title: str) -> str:
+    """
+    Return the first line of the owner's flip prompt, naming the scan.
+
+    ``title`` is the title the owner gate allows, returned as plain text and
+    escaped by Jinja's autoescape at render time.
+
+    Args:
+        title: The scan's title.
+
+    Returns:
+        E.g. ``"Flip the stack for “Tax”"``.
+
+    """
+    return f"Flip the stack for “{title}”"
+
+
+def pass_heading(title: str) -> str:
+    """
+    Return the first line of the owner's multi-page prompt, naming the document.
+
+    ``title`` is the title the owner gate allows, returned as plain text and
+    escaped by Jinja's autoescape at render time.
+
+    Args:
+        title: The document's title.
+
+    Returns:
+        E.g. ``"Adding pages to “Tax”"``.
+
+    """
+    return f"Adding pages to “{title}”"
+
+
+def flip_deadline_note(*, deadline: datetime | None, timeout_seconds: float) -> str:
+    """
+    Return the note under the flip prompt's buttons saying what a timeout does.
+
+    The promise is the timeout path as it runs: an unanswered flip raises, the
+    job ends ERROR, nothing is uploaded, and the preservation guard keeps the
+    front sides already scanned as a partial PDF in the failed folder.
+    ``failed/`` is how the owner's rendering already names that folder, so it
+    is not a host path.
+
+    Args:
+        deadline: When the wait gives up, once the worker has recorded when
+            it began.  Must be aware.
+        timeout_seconds: The flip wait's bound, named when no deadline is
+            known yet.
+
+    Returns:
+        The note, naming the deadline in local time or else the duration.
+
+    """
+    if deadline is None:
+        when = f"within {duration_phrase(timeout_seconds)}"
+    else:
+        when = f"by {local_time(deadline)}"
+    return (
+        f"If nobody presses Continue {when}, the scan stops, nothing is "
+        "uploaded, and the front sides already scanned are kept in failed/."
+    )
 
 
 def timeout_finish_warning(pages_kept: int, timeout_seconds: float) -> str:
@@ -2612,19 +3128,43 @@ def _these_pages(pages_kept: int) -> str:
     return "this page" if pages_kept == 1 else f"these {pages_kept} pages"
 
 
-def _finish_timeout_note(prompt: PassPrompt) -> str:
+def _no_answer(prompt: PassPrompt, deadline: datetime | None) -> str:
+    """
+    Return the opening of a timeout note: when an unanswered question gives up.
+
+    The deadline, once the page knows it, replaces the duration inside the one
+    note rather than adding a second one, so nothing is said twice.  Until
+    then -- and always in the terminal, which reads only the headline -- the
+    note names the duration.
+
+    Args:
+        prompt: The open question.
+        deadline: When the question gives up, if known.  Must be aware.
+
+    Returns:
+        E.g. ``"No answer within 10 minutes"`` or
+        ``"No answer by 2026-09-30 14:23 CDT"``.
+
+    """
+    if deadline is None:
+        return f"No answer within {duration_phrase(prompt.timeout_seconds)}"
+    return f"No answer by {local_time(deadline)}"
+
+
+def _finish_timeout_note(prompt: PassPrompt, deadline: datetime | None) -> str:
     """
     Return what an unanswered next-page or failed-pass question will do.
 
     Args:
         prompt: The open question.
+        deadline: When the question gives up, if known.
 
     Returns:
         The timeout note: it finishes with the pages kept, or, with none,
         ends the scan.
 
     """
-    within = f"No answer within {duration_phrase(prompt.timeout_seconds)}"
+    within = _no_answer(prompt, deadline)
     if prompt.pages_kept < 1:
         return f"{within} {_ENDS_WITHOUT_UPLOAD}"
     return f"{within} finishes the document with {_these_pages(prompt.pages_kept)}."
@@ -2646,12 +3186,13 @@ def _last_pass(prompt: PassPrompt) -> str:
     return "page"
 
 
-def _next_pass_copy(prompt: PassPrompt) -> PassPromptCopy:
+def _next_pass_copy(prompt: PassPrompt, deadline: datetime | None) -> PassPromptCopy:
     """
     Return the wording of the question whether there is another page.
 
     Args:
         prompt: The open next-page question.
+        deadline: When the question gives up, if known.
 
     Returns:
         Its copy.
@@ -2683,7 +3224,7 @@ def _next_pass_copy(prompt: PassPrompt) -> PassPromptCopy:
             (PassAnswer.ABORT, _ABORT_LABEL),
         ),
         finish_blocked=None if finish_offered else NOTHING_TO_FINISH,
-        notes=(consequence, _finish_timeout_note(prompt)),
+        notes=(consequence, _finish_timeout_note(prompt, deadline)),
         abort_question=abort_question(kept),
     )
 
@@ -2708,7 +3249,7 @@ def _blank_list(prompt: PassPrompt) -> str:
     return f"Pages {listed} of the {prompt.pass_pages} just scanned look blank."
 
 
-def _blank_copy(prompt: PassPrompt) -> PassPromptCopy:
+def _blank_copy(prompt: PassPrompt, deadline: datetime | None) -> PassPromptCopy:
     """
     Return the wording of the question what to do about blank-looking pages.
 
@@ -2716,6 +3257,7 @@ def _blank_copy(prompt: PassPrompt) -> PassPromptCopy:
 
     Args:
         prompt: The open blank-page question.
+        deadline: When the question gives up, if known.
 
     Returns:
         Its copy.
@@ -2723,7 +3265,7 @@ def _blank_copy(prompt: PassPrompt) -> PassPromptCopy:
     """
     blanks = len(prompt.blank_positions)
     survivors = prompt.pages_kept + prompt.pass_pages - blanks
-    within = f"No answer within {duration_phrase(prompt.timeout_seconds)}"
+    within = _no_answer(prompt, deadline)
     if prompt.pass_pages <= 1:
         headline = "This page looks blank."
         skip, keep, rescan = "Skip page", "Keep page", "Re-scan page"
@@ -2770,7 +3312,9 @@ def _blank_copy(prompt: PassPrompt) -> PassPromptCopy:
     )
 
 
-def _retry_copy(prompt: PassPrompt, error: str | None) -> PassPromptCopy:
+def _retry_copy(
+    prompt: PassPrompt, error: str | None, deadline: datetime | None
+) -> PassPromptCopy:
     """
     Return the wording of the question what to do after a pass failed.
 
@@ -2779,6 +3323,7 @@ def _retry_copy(prompt: PassPrompt, error: str | None) -> PassPromptCopy:
     Args:
         prompt: The open failed-pass question.
         error: What the scanner reported, as it should be shown.
+        deadline: When the question gives up, if known.
 
     Returns:
         Its copy.
@@ -2802,13 +3347,18 @@ def _retry_copy(prompt: PassPrompt, error: str | None) -> PassPromptCopy:
         notes=(
             f"{_FINISH_LABEL} uploads the {pages_phrase(kept)} kept. "
             f"{_ABORT_UPLOADS_NOTHING}",
-            _finish_timeout_note(prompt),
+            _finish_timeout_note(prompt, deadline),
         ),
         abort_question=abort_question(kept),
     )
 
 
-def pass_prompt_copy(prompt: PassPrompt, *, error: str | None = None) -> PassPromptCopy:
+def pass_prompt_copy(
+    prompt: PassPrompt,
+    *,
+    error: str | None = None,
+    deadline: datetime | None = None,
+) -> PassPromptCopy:
     """
     Return every sentence the web page shows for an open multi-page question.
 
@@ -2821,6 +3371,10 @@ def pass_prompt_copy(prompt: PassPrompt, *, error: str | None = None) -> PassPro
         error: For a failed pass, the error text to show in place of
             ``prompt.error``.  ``prompt.error`` is unscrubbed, so the web
             passes the scrubbed text here.
+        deadline: When the question gives up, once the worker has recorded
+            when the wait began; must be aware.  Given, each timeout note
+            names it as a local time ("No answer by ...") in place of the
+            duration.  None keeps the duration form, byte for byte.
 
     Returns:
         The prompt's copy.
@@ -2831,11 +3385,13 @@ def pass_prompt_copy(prompt: PassPrompt, *, error: str | None = None) -> PassPro
     """
     match prompt.wait:
         case PassWait.NEXT_PASS:
-            copy = _next_pass_copy(prompt)
+            copy = _next_pass_copy(prompt, deadline)
         case PassWait.BLANK_DECISION:
-            copy = _blank_copy(prompt)
+            copy = _blank_copy(prompt, deadline)
         case PassWait.RETRY:
-            copy = _retry_copy(prompt, prompt.error if error is None else error)
+            copy = _retry_copy(
+                prompt, prompt.error if error is None else error, deadline
+            )
         case _:
             assert_never(prompt.wait)
     return copy
