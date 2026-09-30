@@ -18,6 +18,7 @@ Covers requirements: ROBU-02, ROBU-08.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -41,6 +42,7 @@ from saneless.config import (
 from saneless.job import REJECTED_HISTORY_ROWS
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
+    LOST_CONTACT_LINE,
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
@@ -1540,6 +1542,252 @@ def test_a_refused_attempt_whose_rejection_is_still_owed_is_not_shown_as_the_liv
     assert button is not None
     assert "disabled" not in button.group("attrs")
     assert refused.id in worker.owed_rejection_ids()
+
+
+# --- A status poll that cannot read its job backs off in place ---------------
+
+# A valid job id that names no row.  The broken store never gets to look it up,
+# and once healed the lookup finds nothing and falls back to the current job.
+_FOLLOWED_ID = "5d3f0c9e-7b1a-4c2e-9f4d-2a6b8e1c0d57"
+
+_AREA_TAG = re.compile(r'<div id="status-area"(?P<attrs>[^>]*)>')
+_HX_GET = re.compile(r'\bhx-get="(?P<url>[^"]*)"')
+_HX_TRIGGER = re.compile(r'\bhx-trigger="(?P<trigger>[^"]*)"')
+
+
+class _BrokenStore:
+    """
+    Make the job store's two status reads raise until ``heal`` is called.
+
+    ``get_job`` serves a followed or in-flight job and ``latest_run_job`` the
+    current route's fallback, so breaking both covers every status poll.  The
+    wrappers delegate once healed, so a test can watch the same page recover.
+    """
+
+    def __init__(self, store: JobStore, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Wrap the store's reads in place; ``monkeypatch`` restores them."""
+        self.broken = True
+        for name in ("get_job", "latest_run_job"):
+            monkeypatch.setattr(store, name, self._guard(getattr(store, name)))
+
+    def _guard(self, original: Callable[..., object]) -> Callable[..., object]:
+        """Return ``original``, raising a store error while broken."""
+
+        def guarded(*args: object, **kwargs: object) -> object:
+            if self.broken:
+                msg = "disk I/O error"
+                raise sqlite3.OperationalError(msg)
+            return original(*args, **kwargs)
+
+        return guarded
+
+    def heal(self) -> None:
+        """Let every later read through to the real store."""
+        self.broken = False
+
+
+@pytest.fixture
+def broken_store(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> _BrokenStore:
+    """Break the served app's job store reads for the length of a test."""
+    return _BrokenStore(_job_store(client), monkeypatch)
+
+
+def _area(body: str) -> tuple[str, str]:
+    """
+    Return the status area's poll URL, unescaped, and its trigger.
+
+    Args:
+        body: A status poll's response body.
+
+    Returns:
+        The URL the area polls next and its ``hx-trigger`` value.
+
+    """
+    tag = _AREA_TAG.search(body)
+    assert tag is not None, body
+    url = _HX_GET.search(tag.group("attrs"))
+    trigger = _HX_TRIGGER.search(tag.group("attrs"))
+    assert url is not None, body
+    assert trigger is not None, body
+    return html.unescape(url.group("url")), trigger.group("trigger")
+
+
+def _assert_fallback(response: httpx2.Response) -> tuple[str, str]:
+    """
+    Assert a poll answered the lost-contact line inside the status area.
+
+    Args:
+        response: The poll's response.
+
+    Returns:
+        The fallback's next poll URL and its trigger.
+
+    """
+    assert response.status_code == 200, response.text
+    assert "HX-Retarget" not in response.headers
+    assert "HX-Reswap" not in response.headers
+    body = response.text
+    assert 'id="status-area"' in body
+    assert 'tabindex="-1"' in body
+    assert 'class="status-fallback"' in body
+    assert f"&#9888; {html.escape(LOST_CONTACT_LINE)}" in body
+    for forbidden in ("status-message", "scan-btn", "<title>", "disk I/O error"):
+        assert forbidden not in body, forbidden
+    return _area(body)
+
+
+class TestStatusPollBacksOff:
+    """
+    A status poll that cannot read its job stays inside the status area.
+
+    It answers 200 with a fixed amber line, never an error for the alert slot:
+    a poll that failed into ``#status-message`` would re-write the page's one
+    alert every second and leave it standing above "Done" once the store
+    healed.  The interval steps out to a cap, where the unchanged fallback is
+    answered 204, and the poll never stops, so a healed store is picked up.
+    """
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_failure_renders_the_fallback(
+        self, client: TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The first failing poll renders the line and polls again in 2 s."""
+        with caplog.at_level(logging.ERROR, logger="saneless.web.routes"):
+            response = client.get(
+                f"/api/jobs/{_FOLLOWED_ID}/status", headers=HTMX_HEADERS
+            )
+        url, trigger = _assert_fallback(response)
+        assert trigger == "every 2s"
+        assert url.startswith(f"/api/jobs/{_FOLLOWED_ID}/status?")
+        assert "attempt=1" in url
+        assert "Failed to render the job status" in caplog.text
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_backs_off_2_5_15(self, client: TestClient) -> None:
+        """Each fallback's own URL steps the interval to 5 s, then 15 s."""
+        url, trigger = _assert_fallback(
+            client.get(f"/api/jobs/{_FOLLOWED_ID}/status", headers=HTMX_HEADERS)
+        )
+        triggers = [trigger]
+        for expected_attempt in (2, 3):
+            url, trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+            assert f"attempt={expected_attempt}" in url
+            assert url.startswith(f"/api/jobs/{_FOLLOWED_ID}/status?")
+            triggers.append(trigger)
+        assert triggers == ["every 2s", "every 5s", "every 15s"]
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_at_the_cap_answers_204(self, client: TestClient) -> None:
+        """At the cap the fallback is unchanged, so its own poll gets no body."""
+        url = f"/api/jobs/{_FOLLOWED_ID}/status"
+        for _ in range(3):
+            url, _trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+        capped = client.get(url, headers=HTMX_HEADERS)
+        assert capped.status_code == 204
+        assert capped.content == b""
+        assert client.get(url, headers=HTMX_HEADERS).status_code == 204
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_current_route_backs_off(self, client: TestClient) -> None:
+        """The current-job poll backs off the same way and keeps its own route."""
+        url = "/api/jobs/current/status"
+        triggers = []
+        for _ in range(3):
+            url, trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+            assert url.startswith("/api/jobs/current/status?")
+            triggers.append(trigger)
+        assert triggers == ["every 2s", "every 5s", "every 15s"]
+        assert client.get(url, headers=HTMX_HEADERS).status_code == 204
+
+    @pytest.mark.usefixtures("broken_store")
+    @pytest.mark.parametrize(
+        "job_id",
+        ["not-a-uuid", '"><img src=x onerror=alert(1)>'],
+        ids=["not_a_uuid", "markup"],
+    )
+    def test_status_poll_non_uuid_id_falls_back_to_current(
+        self, client: TestClient, job_id: str
+    ) -> None:
+        """An id the store could not confirm is echoed only if it is a UUID."""
+        response = client.get(f"/api/jobs/{job_id}/status", headers=HTMX_HEADERS)
+        url, _trigger = _assert_fallback(response)
+        assert url.startswith("/api/jobs/current/status?")
+        assert "onerror" not in response.text
+
+    @pytest.mark.usefixtures("broken_store")
+    def test_status_poll_echoes_the_canonical_uuid(self, client: TestClient) -> None:
+        """A UUID in another spelling is echoed in its canonical form."""
+        response = client.get(
+            f"/api/jobs/{_FOLLOWED_ID.upper()}/status", headers=HTMX_HEADERS
+        )
+        url, _trigger = _assert_fallback(response)
+        assert url.startswith(f"/api/jobs/{_FOLLOWED_ID}/status?")
+
+    def test_status_poll_heals_to_the_real_rendering(
+        self, client: TestClient, broken_store: _BrokenStore
+    ) -> None:
+        """A healed store's next poll is the real rendering, with no attempt."""
+        url = f"/api/jobs/{_FOLLOWED_ID}/status"
+        for _ in range(3):
+            url, _trigger = _assert_fallback(client.get(url, headers=HTMX_HEADERS))
+        broken_store.heal()
+        response = client.get(url, headers=HTMX_HEADERS)
+        assert response.status_code == 200
+        assert "HX-Retarget" not in response.headers
+        body = response.text
+        assert "Ready to scan." in body
+        assert 'id="scan-btn"' in body
+        assert _AREA_TAG.search(body) is not None
+        assert "status-fallback" not in body
+        assert "attempt=" not in body
+
+    def test_status_poll_render_failure_is_caught(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A template that fails to render is caught exactly as a store error is."""
+        app = client.app
+        assert isinstance(app, FastAPI)
+        templates = app.state.templates
+        original = templates.get_template
+
+        class _Exploding:
+            """A template whose every render raises."""
+
+            def render(self, *_args: object, **_kwargs: object) -> str:
+                """Raise, as a template bug would."""
+                msg = "template exploded"
+                raise RuntimeError(msg)
+
+        def get_template(name: str) -> object:
+            if name == "partials/status_response.html":
+                return _Exploding()
+            return original(name)
+
+        monkeypatch.setattr(templates, "get_template", get_template)
+        for route in ("current", _FOLLOWED_ID):
+            response = client.get(f"/api/jobs/{route}/status", headers=HTMX_HEADERS)
+            _url, trigger = _assert_fallback(response)
+            assert trigger == "every 2s"
+            assert "template exploded" not in response.text
+
+    @pytest.mark.usefixtures("broken_store")
+    @pytest.mark.parametrize(
+        ("attempt", "trigger", "next_attempt"),
+        [(-5, "every 2s", 1), (99, "every 15s", 3)],
+        ids=["below", "above"],
+    )
+    def test_status_poll_attempt_is_clamped(
+        self, client: TestClient, attempt: int, trigger: str, next_attempt: int
+    ) -> None:
+        """An out-of-range attempt is clamped, never refused with a 422."""
+        response = client.get(
+            "/api/jobs/current/status",
+            params={"attempt": str(attempt)},
+            headers=HTMX_HEADERS,
+        )
+        url, answered = _assert_fallback(response)
+        assert answered == trigger
+        assert f"attempt={next_attempt}" in url
 
 
 # --- The placeholder-token refusal (APPL-07, D-14, D-15) ---------------------
