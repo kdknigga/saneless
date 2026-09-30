@@ -2638,3 +2638,30 @@ def test_history_never_emits_an_empty_class(
 def test_page_title_defaults_to_saneless(client: TestClient) -> None:
     """The tab reads ``saneless`` unless a page sets its own title."""
     assert "<title>saneless</title>" in client.get("/").text
+
+
+def test_stylesheet_has_no_dead_fallbacks_or_deprecated_clip(
+    client: TestClient,
+) -> None:
+    """
+    The served stylesheet carries no dead or deprecated declaration.
+
+    Pico always defines its ins and del colours, so a named-colour fallback
+    behind them can never apply and only misleads a reader about what renders.
+    ``clip`` is deprecated in favour of ``clip-path``.  The fixed table layout
+    and ``word-break: break-word`` are what split history words across lines
+    on a phone, so neither may come back.
+    """
+    response = client.get("/static/app.css")
+    assert response.status_code == 200
+    css = response.text
+
+    assert ", green)" not in css
+    assert ", red)" not in css
+    assert "table-layout: fixed" not in css
+    assert "word-break: break-word" not in css
+
+    sr_only = re.search(r"^\.sr-only \{(?P<body>[^}]*)\}", css, re.MULTILINE)
+    assert sr_only is not None, ".sr-only rule not found"
+    assert "clip-path: inset(50%);" in sr_only.group("body")
+    assert "clip: rect(" not in css

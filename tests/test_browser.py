@@ -36,6 +36,7 @@ import socket
 import threading
 import time
 from contextlib import ExitStack, contextmanager
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
@@ -91,6 +92,7 @@ from saneless.config import (
     Settings,
     WebConfig,
     discover_config,
+    resolve_job_title,
 )
 from saneless.job import JobResult
 from saneless.paperless import ApiDelivery, TaskFiled, UploadResult
@@ -5240,6 +5242,127 @@ class TestPageCountsInChromium:
         finally:
             worker._current_job_id = None
             job_store.delete_job(job.id)
+
+
+# Every word in the history headers and in the Time, Profile and Status cells,
+# each measured as a Range: a word that fits on one line has exactly one client
+# rect, and a word split across lines has one per line.  The Title column is
+# left out on purpose, because a title is user text of any length and is the
+# one cell allowed to break inside a word.  A function expression, because the
+# Content-Security-Policy refuses the eval a bare expression would need.
+_SPLIT_HISTORY_WORDS = """
+() => {
+  const table = document.querySelector(".history-table-wrap table");
+  const cells = [
+    ...table.querySelectorAll("thead th"),
+    ...table.querySelectorAll(
+      "#history-body td:nth-child(1), #history-body td:nth-child(2), "
+        + "#history-body td:nth-child(4)"
+    ),
+  ];
+  const split = [];
+  let words = 0;
+  for (const cell of cells) {
+    const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      for (const match of node.data.matchAll(/\\S+/g)) {
+        const range = document.createRange();
+        range.setStart(node, match.index);
+        range.setEnd(node, match.index + match[0].length);
+        const lines = range.getClientRects().length;
+        words += 1;
+        if (lines !== 1) {
+          split.push([match[0], lines]);
+        }
+      }
+    }
+  }
+  return {cells: cells.length, words, split};
+}
+"""
+
+
+@pytest.mark.browser
+class TestHistoryTableOnAPhone:
+    """
+    The history table at 390 px keeps every word whole.
+
+    Whether a word breaks is a line-layout outcome of the cascade, the table
+    algorithm and the font together, so only a browser can say.  390 px is a
+    common phone width, and the rows staged here carry the longest Status
+    labels the table can show beside a default title.
+    """
+
+    def test_history_390_keeps_every_word_on_one_line(
+        self, page: Page, empty_history_server: _BrowserServer
+    ) -> None:
+        """
+        No header, time, profile or status word is split, and nothing scrolls.
+
+        Under a fixed table layout every column got a quarter of the width
+        whatever it held, so a long label was broken mid-word.  The document
+        width is checked as well, because keeping words whole by widening the
+        page would trade one failure for another.
+        """
+        server = empty_history_server
+        job_store: JobStore = server.app.state.job_store
+        owner = _as_owner(page, server.url)
+        title = resolve_job_title(None, None, now=datetime.now(tz=UTC))
+        warning = "The scanner skipped a sheet."
+
+        waiting = job_store.create_job(
+            profile="default", title=title, owner_token=owner
+        )
+        job_store.update_state(waiting.id, JobState.AWAITING_RETRY)
+        unconfirmed = job_store.create_job(
+            profile="default", title=title, owner_token=owner
+        )
+        job_store.finish_job(
+            unconfirmed.id,
+            JobState.ERROR,
+            error=_ERROR_DETAIL,
+            error_category=ErrorCategory.UNCONFIRMED_SEND,
+        )
+        warned = job_store.create_job(profile="default", title=title, owner_token=owner)
+        job_store.finish_job(
+            warned.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=warning,
+                pages_scanned=None,
+                pages_removed=None,
+                pages_uploaded=None,
+            ),
+        )
+        try:
+            page.set_viewport_size({"width": 390, "height": 844})
+            page.goto(server.url)
+
+            statuses = page.locator("#history-body td:nth-child(4)")
+            expect(statuses).to_have_count(3)
+            for label in (
+                job_label(JobState.DONE, warning),
+                job_label(JobState.ERROR, None, ErrorCategory.UNCONFIRMED_SEND),
+                job_label(JobState.AWAITING_RETRY, None),
+            ):
+                expect(statuses.filter(has_text=label)).to_have_count(1)
+
+            measured = page.evaluate(_SPLIT_HISTORY_WORDS)
+            # Four headers and three cells in each of three rows, so an empty
+            # measurement cannot pass for a clean one.
+            assert measured["cells"] == 13, measured
+            assert measured["words"] > measured["cells"], measured
+            assert measured["split"] == [], measured["split"]
+
+            overflow = page.evaluate(
+                "() => document.documentElement.scrollWidth "
+                "- document.documentElement.clientWidth"
+            )
+            assert overflow <= 0, f"the page scrolls sideways by {overflow}px at 390px"
+        finally:
+            for job in (waiting, unconfirmed, warned):
+                job_store.delete_job(job.id)
 
 
 _FRONT_PAGES = 12
