@@ -50,7 +50,9 @@ from saneless.job import JobState, JobStore
 from saneless.paperless import PaperlessClient
 from saneless.scanner.base import DeviceCapabilities
 from saneless.vocabulary import (
+    CORRESPONDENTS_UNAVAILABLE,
     QUEUE_FULL_JOB_ERROR,
+    TAGS_UNAVAILABLE,
     TOKEN_UNSET_JOB_ERROR,
     ErrorCategory,
     FlipOutcome,
@@ -88,6 +90,26 @@ def _app(client: TestClient) -> FastAPI:
     return app
 
 
+def _no_rows(
+    *, timeout: float | httpx2.Timeout | None = None
+) -> list[dict[str, object]]:
+    """
+    Stand in for a paperless-ngx list that answers with no rows.
+
+    Keyword-only ``timeout``, as the real client takes it: every list route
+    fetches with the short request budget.
+
+    Args:
+        timeout: The per-request budget, ignored.
+
+    Returns:
+        An empty list.
+
+    """
+    del timeout
+    return []
+
+
 @pytest.fixture
 def web_settings(make_settings: Callable[..., Settings]) -> Settings:
     """Build the web app's settings: the suite defaults plus a ``duplex`` profile."""
@@ -114,11 +136,11 @@ def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
 @pytest.fixture
 def mock_paperless(app: FastAPI) -> object:
     """Patch paperless client methods to return test data without network calls."""
-    app.state.paperless.get_tags = lambda: [
+    app.state.paperless.get_tags = lambda *, timeout=None: [
         {"id": 1, "name": "receipt"},
         {"id": 2, "name": "invoice"},
     ]
-    app.state.paperless.get_correspondents = lambda: [
+    app.state.paperless.get_correspondents = lambda *, timeout=None: [
         {"id": 1, "name": "ACME Corp"},
     ]
     return app.state.paperless
@@ -200,7 +222,8 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
     entered = threading.Event()
     app = _app(client)
 
-    def blocking_get_tags() -> list[dict[str, object]]:
+    def blocking_get_tags(*, timeout: object = None) -> list[dict[str, object]]:
+        del timeout
         entered.set()
         gate.wait(5)
         return []
@@ -221,11 +244,11 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
         slow.join(5)
 
 
-def test_metadata_fetch_failure_falls_back_to_an_empty_list(
+def test_metadata_fetch_failure_says_the_list_is_unavailable(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
-    A failure with no list fetched before renders empty options and logs why.
+    A failure with no list fetched before renders no rows and logs why.
 
     Nothing has fetched the tags in this app yet, so there is no previous list
     to fall back on (``tests/test_metadata_fallback.py`` covers the case where
@@ -234,7 +257,8 @@ def test_metadata_fetch_failure_falls_back_to_an_empty_list(
     """
     app = _app(client)
 
-    def failing_get_tags() -> list[dict[str, object]]:
+    def failing_get_tags(*, timeout: object = None) -> list[dict[str, object]]:
+        del timeout
         msg = "paperless unreachable"
         raise ConnectionError(msg)
 
@@ -248,10 +272,10 @@ def test_metadata_fetch_failure_falls_back_to_an_empty_list(
     records = [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING and "using empty list" in r.getMessage()
+        if r.levelno == logging.WARNING and "answering unavailable" in r.getMessage()
     ]
     assert len(records) == 1
-    assert records[0].getMessage().endswith("using empty list: ConnectionError")
+    assert records[0].getMessage().endswith("answering unavailable: ConnectionError")
     assert "paperless unreachable" not in caplog.text
     assert records[0].exc_info is None
 
@@ -320,8 +344,8 @@ def titled_client(
         profiles={"default": ProfileConfig(title="Receipt")},
     )
     app = create_app(settings, web_scanner)
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = _no_rows
+    app.state.paperless.get_correspondents = _no_rows
     monkeypatch.setattr(
         app.state.worker, "submit", lambda _job, _options: SubmitResult.ACCEPTED
     )
@@ -464,7 +488,8 @@ def test_cache_invalidate(client: TestClient) -> None:
     app.state.cache.set("tags", [{"id": 1, "name": "receipt"}])
     fetches: list[int] = []
 
-    def fresh_tags() -> list[dict[str, object]]:
+    def fresh_tags(*, timeout: object = None) -> list[dict[str, object]]:
+        del timeout
         fetches.append(1)
         return [{"id": 7, "name": "tax-return"}]
 
@@ -953,10 +978,10 @@ def test_paperless_test_500_sanitizes_exception(client: TestClient) -> None:
     assert "abc123" not in response.text
 
 
-def _raise_factory(exc_type: type[Exception], msg: str) -> Callable[[], NoReturn]:
+def _raise_factory(exc_type: type[Exception], msg: str) -> Callable[..., NoReturn]:
     """Create a callable that raises the given exception with the given message."""
 
-    def _raise() -> NoReturn:
+    def _raise(*_args: object, **_kwargs: object) -> NoReturn:
         raise exc_type(msg)
 
     return _raise
@@ -2924,7 +2949,7 @@ def _serve_tag_rows(client: TestClient) -> FastAPI:
 
     """
     app = _app(client)
-    app.state.paperless.get_tags = lambda: list(_TAG_ROWS)
+    app.state.paperless.get_tags = lambda *, timeout=None: list(_TAG_ROWS)
     app.state.cache.invalidate("tags")
     return app
 
@@ -3106,7 +3131,7 @@ class TestTagFilter:
     ) -> None:
         """No tags at all is its own sentence, not a blank box."""
         app = _app(client)
-        app.state.paperless.get_tags = list
+        app.state.paperless.get_tags = _no_rows
         app.state.cache.invalidate("tags")
 
         response = client.get("/api/tags")
@@ -3174,8 +3199,9 @@ _KNOWN_CORRESPONDENT_ROWS: list[dict[str, object]] = [
 _STALE_NOTE = "no longer in paperless-ngx"
 
 
-def _fail_fetch() -> NoReturn:
+def _fail_fetch(*, timeout: object = None) -> NoReturn:
     """Stand in for a paperless-ngx that cannot be reached."""
+    del timeout
     msg = "paperless unreachable"
     raise ConnectionError(msg)
 
@@ -3192,8 +3218,10 @@ def _serve_known_lists(client: TestClient) -> FastAPI:
 
     """
     app = _app(client)
-    app.state.paperless.get_tags = lambda: list(_KNOWN_TAG_ROWS)
-    app.state.paperless.get_correspondents = lambda: list(_KNOWN_CORRESPONDENT_ROWS)
+    app.state.paperless.get_tags = lambda *, timeout=None: list(_KNOWN_TAG_ROWS)
+    app.state.paperless.get_correspondents = lambda *, timeout=None: list(
+        _KNOWN_CORRESPONDENT_ROWS
+    )
     app.state.cache.invalidate("tags")
     app.state.cache.invalidate("correspondents")
     return app
@@ -3326,15 +3354,16 @@ class TestStaleDefaultAndUnlistedRows:
         assert _STALE_NOTE not in response.text
         assert "No tags" not in response.text
 
-    def test_unlisted_nothing_ticked_keeps_today_s_empty_line(
+    def test_unlisted_nothing_ticked_says_the_list_is_unavailable(
         self, client: TestClient
     ) -> None:
-        """With nothing ticked and no list, the empty line is what it was."""
+        """With nothing ticked and no list, the list says it could not load."""
         _serve_nothing(client)
 
         response = client.get("/api/tags")
 
-        assert "No tags in paperless-ngx yet." in response.text
+        assert html.escape(TAGS_UNAVAILABLE) in response.text
+        assert "No tags in paperless-ngx yet." not in response.text
         assert 'type="checkbox"' not in response.text
 
     def test_every_tag_checkbox_opts_out_of_form_state_restore_stale_default(
@@ -3476,8 +3505,8 @@ def _simple_form_app(
         },
     )
     app = create_app(settings, StubScannerBackend())
-    app.state.paperless.get_tags = lambda: list(_TAG_ROWS)
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: list(_TAG_ROWS)
+    app.state.paperless.get_correspondents = _no_rows
     return app
 
 
@@ -3880,9 +3909,11 @@ class _TimedList:
 
         """
         self._rows = rows
-        self.timeouts: list[float | None] = []
+        self.timeouts: list[float | httpx2.Timeout | None] = []
 
-    def __call__(self, *, timeout: float | None = None) -> list[dict[str, object]]:
+    def __call__(
+        self, *, timeout: float | httpx2.Timeout | None = None
+    ) -> list[dict[str, object]]:
         """
         Note the budget the caller asked for and answer a copy of the list.
 
@@ -3897,52 +3928,303 @@ class _TimedList:
         return list(self._rows)
 
 
-class TestProfileChangeFetchesAreShort:
-    """
-    A profile change never waits the client's 30 s on a cold cache.
+# The budget every list route asks paperless-ngx with: the probe's connect and
+# read seconds, never the client's 30 s.
+_REQUEST_BUDGET = httpx2.Timeout(5.0, connect=2.0)
 
-    Until the swap lands the form still shows the previous profile's
-    defaults, so both profile-change routes fetch with the short budget; the
-    full page keeps the client default.
+# The correspondent help line as each list response carries it out of band.
+_HELP_OOB_UNAVAILABLE = (
+    '<small id="correspondent-help" hx-swap-oob="true" class="status-fallback">'
+    f"&#9888; {html.escape(CORRESPONDENTS_UNAVAILABLE)}</small>"
+)
+_HELP_OOB_NORMAL = (
+    '<small id="correspondent-help" hx-swap-oob="true">'
+    "Who sent this document? Optional.</small>"
+)
+_TAGS_UNAVAILABLE_LINE = (
+    f'<small class="status-fallback">&#9888; {html.escape(TAGS_UNAVAILABLE)}</small>'
+)
+
+# The five list routes, each with the fetch it makes on a cold cache.  The
+# refresh is one route with two resources, so it appears twice.
+_LIST_ROUTES = [
+    pytest.param("GET", "/api/tags", {}, "get_tags", id="tags"),
+    pytest.param(
+        "GET", "/api/correspondents", {}, "get_correspondents", id="correspondents"
+    ),
+    pytest.param(
+        "POST",
+        "/api/cache/invalidate?resource=tags",
+        {},
+        "get_tags",
+        id="refresh-tags",
+    ),
+    pytest.param(
+        "POST",
+        "/api/cache/invalidate?resource=correspondents",
+        {},
+        "get_correspondents",
+        id="refresh-correspondents",
+    ),
+    pytest.param(
+        "GET", "/api/profiles/tags", {"profile": "other"}, "get_tags", id="profile-tags"
+    ),
+    pytest.param(
+        "GET",
+        "/api/profiles/correspondent",
+        {"profile": "other"},
+        "get_correspondents",
+        id="profile-correspondent",
+    ),
+]
+
+# The three routes that re-render the correspondent options.
+_CORRESPONDENT_ROUTES = [
+    pytest.param("GET", "/api/correspondents", {}, id="correspondents"),
+    pytest.param(
+        "POST",
+        "/api/cache/invalidate?resource=correspondents",
+        {},
+        id="refresh-correspondents",
+    ),
+    pytest.param(
+        "GET",
+        "/api/profiles/correspondent",
+        {"profile": "other"},
+        id="profile-correspondent",
+    ),
+]
+
+
+def _cold(app: FastAPI) -> None:
+    """Empty both cached lists and forget what the stand-ins were asked."""
+    app.state.cache.invalidate("tags")
+    app.state.cache.invalidate("correspondents")
+    for getter in (
+        app.state.paperless.get_tags,
+        app.state.paperless.get_correspondents,
+    ):
+        if isinstance(getter, _TimedList):
+            getter.timeouts.clear()
+
+
+def _ask(
+    client: TestClient, method: str, path: str, params: dict[str, str]
+) -> httpx2.Response:
+    """
+    Send one list request, as a GET query or a POST form.
+
+    Args:
+        client: The client to send it with.
+        method: ``GET`` or ``POST``.
+        path: The route, with any query string it always carries.
+        params: The query parameters of a GET.
+
+    Returns:
+        The response.
+
+    """
+    if method == "GET":
+        return client.get(path, params=params)
+    return client.post(path)
+
+
+class _FailingList(_TimedList):
+    """A stand-in list fetch that notes each call and always fails."""
+
+    def __init__(self) -> None:
+        """Start with nothing noted."""
+        super().__init__([])
+
+    def __call__(
+        self, *, timeout: float | httpx2.Timeout | None = None
+    ) -> list[dict[str, object]]:
+        """
+        Note the call, then fail the way an unreachable paperless-ngx does.
+
+        Args:
+            timeout: The per-request budget.
+
+        Raises:
+            ConnectionError: Always.
+
+        """
+        self.timeouts.append(timeout)
+        msg = "paperless unreachable"
+        raise ConnectionError(msg)
+
+
+class TestRequestFetchBudget:
+    """
+    No list route waits the client's 30 s on a cold cache.
+
+    Every one fetches with the status strip probe's budget, 2 s to connect and
+    5 s to read, so a page or a click answers promptly while paperless-ngx is
+    slow or down.  The full page keeps the client default until it loads its
+    lists lazily.
     """
 
-    @pytest.mark.parametrize(
-        ("route", "getter"),
-        [
-            ("/api/profiles/tags", "get_tags"),
-            ("/api/profiles/correspondent", "get_correspondents"),
-        ],
-    )
-    def test_a_profile_change_fetches_with_the_short_budget(
-        self, tmp_path: Path, route: str, getter: str
+    @pytest.mark.parametrize(("method", "path", "params", "getter"), _LIST_ROUTES)
+    def test_list_routes_use_the_probe_budget(
+        self,
+        tmp_path: Path,
+        method: str,
+        path: str,
+        params: dict[str, str],
+        getter: str,
     ) -> None:
-        """The cold-cache fetch behind the swap carries the short timeout."""
+        """The cold-cache fetch behind each route carries the short budget."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.cache.invalidate("tags")
-            app.state.cache.invalidate("correspondents")
+            _cold(app)
             fetch: _TimedList = getattr(app.state.paperless, getter)
-            fetch.timeouts.clear()
-            response = client.get(route, params={"profile": "other"})
+            response = _ask(client, method, path, params)
 
         assert response.status_code == 200
-        assert fetch.timeouts == [routes_module.PROFILE_CHANGE_FETCH_TIMEOUT_SECONDS]
+        assert fetch.timeouts == [_REQUEST_BUDGET]
+        budget = fetch.timeouts[0]
+        assert isinstance(budget, httpx2.Timeout)
+        assert budget.connect == 2.0
+        assert budget.read == 5.0
 
     def test_the_full_page_keeps_the_client_default(self, tmp_path: Path) -> None:
-        """Only the swap is shortened; the page load is unchanged."""
+        """Only the list routes are shortened; the page load is unchanged."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
-            app.state.cache.invalidate("tags")
-            app.state.cache.invalidate("correspondents")
+            _cold(app)
             tags: _TimedList = app.state.paperless.get_tags
             correspondents: _TimedList = app.state.paperless.get_correspondents
-            tags.timeouts.clear()
-            correspondents.timeouts.clear()
             response = client.get("/")
 
         assert response.status_code == 200
         assert tags.timeouts == [None]
         assert correspondents.timeouts == [None]
+
+
+class TestListsUnavailable:
+    """
+    A list that could not be loaded says so, and never claims to be empty.
+
+    "paperless-ngx has no tags" and "paperless-ngx could not be asked" are
+    different facts, and only the first is the empty-state line.
+    """
+
+    def test_tags_unavailable_is_not_empty(self, tmp_path: Path) -> None:
+        """The unavailable line renders first, and a ticked id stays ticked."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.paperless.get_tags = _FailingList()
+            _cold(app)
+            response = client.get("/api/tags", params={"tags": ["3"]})
+
+        assert response.status_code == 200
+        assert _TAGS_UNAVAILABLE_LINE in response.text
+        assert "No tags in paperless-ngx yet." not in response.text
+        assert "checked" in _checkbox(response.text, 3)
+        assert response.text.index(_TAGS_UNAVAILABLE_LINE) < response.text.index(
+            _checkbox(response.text, 3)
+        )
+
+    def test_tags_really_empty_says_so(self, tmp_path: Path) -> None:
+        """paperless-ngx answering with no tags is the empty-state line."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.paperless.get_tags = _TimedList([])
+            _cold(app)
+            response = client.get("/api/tags")
+
+        assert "No tags in paperless-ngx yet." in response.text
+        assert html.escape(TAGS_UNAVAILABLE) not in response.text
+
+    @pytest.mark.parametrize(("method", "path", "params"), _CORRESPONDENT_ROUTES)
+    def test_correspondents_unavailable_help_line(
+        self, tmp_path: Path, method: str, path: str, params: dict[str, str]
+    ) -> None:
+        """The help line under the select carries the unavailable sentence."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.paperless.get_correspondents = _FailingList()
+            _cold(app)
+            response = _ask(client, method, path, params)
+
+        assert response.status_code == 200
+        assert _HELP_OOB_UNAVAILABLE in response.text
+        assert response.text.count('id="correspondent-help"') == 1
+
+    @pytest.mark.parametrize(("method", "path", "params"), _CORRESPONDENT_ROUTES)
+    def test_correspondent_help_restored_on_success(
+        self, tmp_path: Path, method: str, path: str, params: dict[str, str]
+    ) -> None:
+        """A list that loads puts the normal help sentence back."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = _ask(client, method, path, params)
+
+        assert response.status_code == 200
+        assert _HELP_OOB_NORMAL in response.text
+        assert "status-fallback" not in response.text
+        assert response.text.count('id="correspondent-help"') == 1
+
+    def test_the_page_carries_one_help_line_in_place(self, tmp_path: Path) -> None:
+        """The full page renders the help line once, in the page, not out of band."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        assert page.count('id="correspondent-help"') == 1
+        assert (
+            '<small id="correspondent-help">Who sent this document? Optional.</small>'
+            in page
+        )
+
+    def test_the_page_says_when_correspondents_are_unavailable(
+        self, tmp_path: Path
+    ) -> None:
+        """The full page renders the same unavailable help line, in place."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            app.state.paperless.get_correspondents = _FailingList()
+            _cold(app)
+            page = client.get("/").text
+
+        assert page.count('id="correspondent-help"') == 1
+        assert (
+            '<small id="correspondent-help" class="status-fallback">'
+            f"&#9888; {html.escape(CORRESPONDENTS_UNAVAILABLE)}</small>"
+        ) in page
+
+    def test_negative_window_skips_the_fetch(self, tmp_path: Path) -> None:
+        """A second request inside the negative window asks nobody."""
+        app = _pre_ticked_app(tmp_path)
+        failing = _FailingList()
+        with TestClient(app) as client:
+            app.state.paperless.get_tags = failing
+            _cold(app)
+            first = client.get("/api/tags")
+            second = client.get("/api/tags")
+
+        assert len(failing.timeouts) == 1
+        assert _TAGS_UNAVAILABLE_LINE in first.text
+        assert _TAGS_UNAVAILABLE_LINE in second.text
+
+
+class TestShowCorrespondentOff:
+    """With the Correspondent control hidden, no route fetches correspondents."""
+
+    @pytest.mark.parametrize(("method", "path", "params"), _CORRESPONDENT_ROUTES)
+    def test_show_correspondent_off_fetches_nothing(
+        self, tmp_path: Path, method: str, path: str, params: dict[str, str]
+    ) -> None:
+        """The route answers without asking paperless-ngx for the list."""
+        app = _pre_ticked_app(tmp_path, show_correspondent=False)
+        with TestClient(app) as client:
+            _cold(app)
+            correspondents: _TimedList = app.state.paperless.get_correspondents
+            response = _ask(client, method, path, params)
+
+        assert response.status_code == 200
+        assert correspondents.timeouts == []
+        assert 'id="correspondent-help"' not in response.text
 
 
 class TestProfileDefaultsArePreTicked:
@@ -4734,7 +5016,7 @@ class TestWebLogsNoClientSecret:
             pytest.param(
                 _fetch_raises_a_foreign_exception,
                 "/api/tags",
-                "using empty list: RuntimeError",
+                "answering unavailable: RuntimeError",
                 id="fetch-other",
             ),
             pytest.param(
