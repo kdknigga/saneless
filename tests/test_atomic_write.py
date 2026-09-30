@@ -1113,8 +1113,9 @@ class TestExtendedAttributes:
         """
         On an SELinux host, a relabelled file keeps its type through the rewrite.
 
-        Skipped where the kernel has no SELinux labels or this user may not
-        relabel a file it owns.
+        Skipped where the kernel has no SELinux labels, where the policy has
+        no MLS field to carry over (a ``user:role:type`` context), or where
+        this user may not relabel a file it owns.
         """
         target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
@@ -1123,7 +1124,10 @@ class TestExtendedAttributes:
             current = os.getxattr(target, name)
         except OSError as exc:
             pytest.skip(f"no SELinux label on {tmp_path}: {exc.strerror}")
-        user, _role, type_, rest = current.split(b":", 3)
+        fields = current.split(b":", 3)
+        if len(fields) != 4:
+            pytest.skip(f"the SELinux context on {tmp_path} has no MLS field")
+        user, _role, type_, rest = fields
         replacement = b"user_home_t" if type_ != b"user_home_t" else b"user_tmp_t"
         relabelled = b":".join((user, b"object_r", replacement, rest))
         try:
