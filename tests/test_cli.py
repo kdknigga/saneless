@@ -4712,6 +4712,120 @@ class TestAutoProfilesTarget:
         assert "Traceback" not in result.output
         assert not files.cwd.exists()
 
+    @staticmethod
+    def _refuse_etc_and_xdg(
+        monkeypatch: pytest.MonkeyPatch, files: _SearchFiles
+    ) -> None:
+        """
+        Make the system directory unwritable and the XDG directory uncreatable.
+
+        ``os.access`` is patched for the system directory only, so the test
+        does not depend on whether it runs as root; the XDG ``saneless``
+        directory's creation is refused the way a missing HOME refuses it.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            files: The patched search candidates.
+
+        """
+        files.etc.parent.mkdir(parents=True)
+        real_access = os.access
+        real_mkdir = Path.mkdir
+
+        def _access(path: str | Path, mode: int) -> bool:
+            """
+            Refuse write access to the system directory only.
+
+            Returns:
+                False for writing the system directory, else the real answer.
+
+            """
+            if Path(path) == files.etc.parent and mode == os.W_OK:
+                return False
+            return real_access(path, mode)
+
+        def _mkdir(
+            path: Path,
+            mode: int = 0o777,
+            *,
+            parents: bool = False,
+            exist_ok: bool = False,
+        ) -> None:
+            """
+            Refuse to create the XDG ``saneless`` directory only.
+
+            Raises:
+                PermissionError: For that directory.
+
+            """
+            if path == files.xdg.parent:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        monkeypatch.setattr(os, "access", _access)
+        monkeypatch.setattr(Path, "mkdir", _mkdir)
+
+    def test_a_failed_fallback_names_the_unwritable_etc_directory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        The failure says why the system directory was passed over.
+
+        Otherwise the operator is told only about a per-user file they never
+        meant to use, and goes looking in the wrong place.
+        """
+        files = patched_search_paths
+        self._refuse_etc_and_xdg(monkeypatch, files)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        (line,) = [
+            line for line in result.stderr.splitlines() if "Cannot write" in line
+        ]
+        assert line.startswith(f"Cannot write {files.xdg}: ")
+        assert line.endswith(
+            f"({files.etc.parent} exists but is not writable by this user)"
+        )
+
+    def test_a_failed_fallback_names_a_read_only_etc_mount(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """A ``:ro`` mount is named as one, since its fix is not an ownership change."""
+        files = patched_search_paths
+        self._refuse_etc_and_xdg(monkeypatch, files)
+        monkeypatch.setattr(
+            cli_module, "is_read_only_mount", lambda path: path == files.etc.parent
+        )
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"({files.etc.parent} exists but is mounted read-only)" in result.stderr
+
+    def test_a_failed_write_with_no_etc_directory_adds_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """With no system directory there was nothing to pass over, so no aside."""
+        files = patched_search_paths
+        self._refuse_etc_and_xdg(monkeypatch, files)
+        files.etc.parent.rmdir()
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"Cannot write {files.xdg}: " in result.stderr
+        assert "exists but" not in result.stderr
+
     def test_a_dangling_symlink_at_the_target_exits_2_and_creates_nothing(
         self,
         monkeypatch: pytest.MonkeyPatch,

@@ -32,7 +32,7 @@ from typing import Final
 
 from .exceptions import ConfigError
 
-__all__ = ["refused_mode_change", "replace_file_atomically"]
+__all__ = ["is_read_only_mount", "refused_mode_change", "replace_file_atomically"]
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +82,13 @@ def _single_file_mount_message(target: Path) -> str:
     )
 
 
-def _is_read_only_mount(path: Path) -> bool:
+def is_read_only_mount(path: Path) -> bool:
     """
     Report whether ``path`` lives on a filesystem mounted read-only.
 
     A failed ``statvfs`` answers False, so the ordinary checks that follow
-    decide what to report.
+    decide what to report. Also serves ``auto-profiles``, which says why it
+    passed over a system config directory it could not write.
 
     Args:
         path: An existing file or directory.
@@ -121,9 +122,9 @@ def _read_only_mount_error(target: Path) -> ConfigError | None:
         The error naming the fix, or None when the file's mount is writable.
 
     """
-    if not _is_read_only_mount(target):
+    if not is_read_only_mount(target):
         return None
-    if not _is_read_only_mount(target.parent):
+    if not is_read_only_mount(target.parent):
         return ConfigError(_single_file_mount_message(target))
     return ConfigError(
         f"Cannot replace {target}: it is on a read-only mount. Mount its "

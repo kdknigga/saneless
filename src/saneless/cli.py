@@ -30,6 +30,7 @@ from uuid import uuid4
 import click
 import uvicorn
 
+from .atomic_write import is_read_only_mount
 from .auto_profiles import (
     device_type_of,
     generate_profiles,
@@ -2291,13 +2292,55 @@ def _new_config_target(settings: Settings) -> Path:
         The file to create, absolute.
 
     """
-    discovery = settings.config_discovery
-    searched = discovery.searched if discovery is not None else ()
-    candidates = searched if len(searched) > 1 else config_search_paths()
-    system, user = candidates[-1], candidates[1]
+    system, user = _new_config_candidates(settings)
     if system.parent.is_dir() and os.access(system.parent, os.W_OK):
         return system.absolute()
     return user.absolute()
+
+
+def _new_config_candidates(settings: Settings) -> tuple[Path, Path]:
+    """
+    Return the system and per-user config files ``auto-profiles`` may create.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+
+    Returns:
+        The last searched candidate (the system file) and the second (the
+        per-user XDG file), from the recorded search or else the search list.
+
+    """
+    discovery = settings.config_discovery
+    searched = discovery.searched if discovery is not None else ()
+    candidates = searched if len(searched) > 1 else config_search_paths()
+    return candidates[-1], candidates[1]
+
+
+def _passed_over_system_dir(settings: Settings) -> str:
+    """
+    Say why the system config directory was not the target, if it exists.
+
+    ``os.access`` refuses a read-only mount and a directory owned by someone
+    else alike, and either sends ``auto-profiles`` to the per-user file. When
+    that write then fails, its message would name only a file the operator
+    never meant to use; this names the directory that was passed over and
+    which of the two it is, because their fixes differ -- remount it
+    read-write, or change its owner.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+
+    Returns:
+        `` (<dir> exists but ...)`` to append to the failure, or an empty
+        string when the directory does not exist or is writable.
+
+    """
+    directory = _new_config_candidates(settings)[0].parent.absolute()
+    if not directory.is_dir() or os.access(directory, os.W_OK):
+        return ""
+    if is_read_only_mount(directory):
+        return f" ({directory} exists but is mounted read-only)"
+    return f" ({directory} exists but is not writable by this user)"
 
 
 @cli.command(name="auto-profiles")
@@ -2388,7 +2431,13 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
             config_path, profiles, force=force, device=pin
         )
     except OSError as exc:
-        click.echo(f"Cannot write {config_path}: {exc.strerror or exc}", err=True)
+        passed_over = (
+            _passed_over_system_dir(settings) if settings.config_path is None else ""
+        )
+        click.echo(
+            f"Cannot write {config_path}: {exc.strerror or exc}{passed_over}",
+            err=True,
+        )
         ctx.exit(ExitCode.CONFIG)
     _echo_write_result(result, profiles)
     if created:
