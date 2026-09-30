@@ -438,6 +438,58 @@ class TestSymlinkAndReadonly:
         assert directories == [], "a temp file was created before refusing"
         _leftovers(elsewhere)
 
+    def test_root_does_not_rewrite_a_file_the_links_directory_owner_does_not_own(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A planted link to an existing file cannot aim a root rewrite at it.
+
+        Whoever can write the link's directory chose where the link points.
+        Followed as root, it would replace any file that parses as TOML --
+        an empty one does -- so root writes through a link only to a file
+        the link's directory owner owns, which that owner could write anyway.
+        """
+        conf = tmp_path / "conf"
+        conf.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        victim = elsewhere / "victim.conf"
+        victim.write_bytes(b"")
+        link = conf / "saneless.toml"
+        link.symlink_to(victim)
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        _fake_directory_owner(monkeypatch, conf, os.getuid() + 1, os.getgid())
+        directories = _record_mkstemp(monkeypatch)
+
+        with pytest.raises(ConfigError) as excinfo:
+            replace_file_atomically(link, _NEW)
+
+        message = str(excinfo.value)
+        assert str(link) in message
+        assert str(victim) in message
+        assert victim.read_bytes() == b""
+        assert link.is_symlink()
+        assert directories == [], "a temp file was created before refusing"
+
+    def test_root_writes_through_a_link_to_a_file_its_directory_owner_owns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dotfiles link in the service's own directory still works as root."""
+        conf = tmp_path / "conf"
+        conf.mkdir()
+        real = tmp_path / "dotfiles" / "saneless.toml"
+        real.parent.mkdir()
+        real.write_text(_ORIGINAL, encoding="utf-8")
+        link = conf / "saneless.toml"
+        link.symlink_to(real)
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+        result = replace_file_atomically(link, _NEW)
+
+        assert result == real.resolve()
+        assert real.read_bytes() == _NEW.encode("utf-8")
+        assert link.is_symlink()
+
 
 class TestReadOnlyMount:
     """
