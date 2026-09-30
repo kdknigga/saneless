@@ -24,6 +24,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
@@ -64,9 +65,12 @@ from saneless.vocabulary import (
     error_message,
     error_next_step,
     flip_answer_label,
+    flip_deadline_note,
+    flip_heading,
     job_label,
     job_status_class,
     local_time,
+    non_owner_wait_line,
     page_counts,
     page_title,
     pass_wait_state,
@@ -1943,8 +1947,10 @@ _THUMBNAIL = "c3RhbmQtaW4="
 # cannot verify.
 _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
 
-# The copy a viewer who did not submit the job sees in place of the buttons.
-_NON_OWNER_LINE = "Waiting for the stack to be flipped"
+# The copy a viewer who did not submit the job sees in place of the buttons,
+# before the worker has recorded when the flip wait began: none of these tests
+# arms a flip coordinator, so none has a deadline to name.
+_NON_OWNER_LINE = non_owner_wait_line(JobState.AWAITING_FLIP, deadline=None)
 
 _STATUS_OPEN = re.compile(r'<div id="status-area"[^>]*>', re.DOTALL)
 _SEEN_TOKEN = re.compile(r"seen=[0-9a-f]+")
@@ -2191,6 +2197,220 @@ class TestOwnerGatedFlipPrompt:
         assert "hx-confirm" not in index
         assert 'hx-disinherit="hx-disabled-elt"' in form.group(0)
         assert flip.count("hx-confirm") == 1
+
+
+# A deadline a stubbed worker reports.  Aware, as the worker's always is, and
+# rendered through `local_time`, so the expected line is built the same way.
+_DEADLINE = datetime(2026, 9, 30, 19, 23, tzinfo=UTC)
+
+# The flip prompt's sentences that stay as they were, byte for byte, with the
+# template's own line breaks and indentation: the new lines are added around
+# them, and none of them is reworded.
+_FLIP_INSTRUCTIONS = (
+    "<p>\n"
+    "    Keep the pages in the same order, then flip the stack over the long edge\n"
+    "    (the left or right side, not the top or bottom).\n"
+    "  </p>\n"
+    "  <p>Place the flipped stack back in the feeder, then press Continue.</p>"
+)
+_FLIP_CAPTIONS = (
+    "<p><small>Long edge (correct)</small></p>",
+    "<p><small>Short edge (incorrect)</small></p>",
+)
+
+_FLIP_PROMPT_START = '<div class="flip-prompt">'
+_HIDDEN_SVG = re.compile(r"<svg\b[^>]*>")
+
+
+def _flip_prompt(markup: str) -> str:
+    """Return the flip prompt of a status response, from its opening tag on."""
+    assert _FLIP_PROMPT_START in markup, markup
+    return markup[markup.index(_FLIP_PROMPT_START) :]
+
+
+def _stub_pass_deadline(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, deadline: datetime | None
+) -> None:
+    """Make the worker report ``deadline`` for any job's multi-page question."""
+
+    def pass_deadline(_job_id: str) -> datetime | None:
+        return deadline
+
+    monkeypatch.setattr(_app(client).state.worker, "pass_deadline", pass_deadline)
+
+
+def _stub_flip_deadline(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, deadline: datetime | None
+) -> None:
+    """Make the worker report ``deadline`` for any job's flip wait."""
+
+    def flip_deadline(_job_id: str) -> datetime | None:
+        return deadline
+
+    monkeypatch.setattr(_app(client).state.worker, "flip_deadline", flip_deadline)
+
+
+class TestWaitingCopy:
+    """
+    What a waiting scan tells the person who can answer it, and everyone else.
+
+    Everyone else is told what the scan waits for, where it can be answered
+    and, once the worker knows it, when it gives up -- with no title, no
+    preview and no button.  The owner's prompt names the scan and says when
+    the wait ends and what happens then.  The deadline is a time and nothing
+    else, so it reaches every viewer; the title stays behind the owner gate.
+    """
+
+    def test_non_owner_flip_line_has_the_deadline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An armed flip wait gives another browser its way forward and deadline."""
+        job_id = _flip_job(client, _OWNING_BROWSER)
+        _arm_flip(client, monkeypatch, job_id)
+        deadline = _app(client).state.worker.flip_deadline(job_id)
+        assert deadline is not None
+
+        markup = _as_browser(client, None)
+
+        line = non_owner_wait_line(JobState.AWAITING_FLIP, deadline=deadline)
+        assert local_time(deadline) in line
+        assert f"<p>{escape(line)}</p>" in markup
+        assert "flip-continue" not in markup
+        assert "Flip Render" not in markup
+        assert "<img" not in markup
+
+    def test_non_owner_flip_line_without_a_deadline(self, client: TestClient) -> None:
+        """Before the wait's start is recorded, the line names no time."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, None)
+
+        line = non_owner_wait_line(JobState.AWAITING_FLIP, deadline=None)
+        assert f"<p>{escape(line)}</p>" in markup
+        assert "stops at" not in markup
+
+    @pytest.mark.parametrize("state", sorted(PASS_WAIT_STATES))
+    def test_non_owner_pass_lines_have_the_deadline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, state: JobState
+    ) -> None:
+        """Each multi-page wait gets the same shape, with its question's deadline."""
+        _job_in_state(client, state)
+        _stub_pass_deadline(client, monkeypatch, _DEADLINE)
+
+        markup = _as_browser(client, None)
+
+        line = non_owner_wait_line(state, deadline=_DEADLINE)
+        assert f"<p>{escape(line)}</p>" in markup
+        assert "<button" not in _status_area_of(markup)
+        assert "Render Test" not in markup
+
+    @pytest.mark.parametrize("state", sorted(PASS_WAIT_STATES))
+    def test_owner_before_the_question_keeps_the_busy_line(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, state: JobState
+    ) -> None:
+        """
+        The owner, before the question is published, sees the progress line.
+
+        That owner is about to be asked, so the waiting line meant for others
+        -- "it can be answered from the device that started this scan" -- would
+        be wrong for them.
+        """
+        _job_in_state(client, state)
+        _stub_pass_deadline(client, monkeypatch, _DEADLINE)
+
+        markup = _as_browser(client, _RENDERING_BROWSER)
+
+        assert f"<p>{escape(progress_label(state))}</p>" in markup
+        assert "started this scan" not in markup
+
+    def test_owner_flip_prompt_names_the_job_and_deadline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The prompt opens with the scan's title and ends with the deadline note."""
+        _flip_job(client, _OWNING_BROWSER)
+        _stub_flip_deadline(client, monkeypatch, _DEADLINE)
+        timeout = _app(client).state.settings.output.operator_wait_timeout_seconds
+
+        prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
+
+        heading = flip_heading("Flip Render")
+        assert heading == "Flip the stack for “Flip Render”"
+        assert prompt.startswith(
+            f'{_FLIP_PROMPT_START}\n  <p id="flip-heading"><strong>'
+            f"{escape(heading)}</strong></p>"
+        )
+        note = flip_deadline_note(deadline=_DEADLINE, timeout_seconds=timeout)
+        assert local_time(_DEADLINE) in note
+        assert f'<small class="prompt-note">{escape(note)}</small>' in prompt
+        assert prompt.index("prompt-note") > prompt.index('id="flip-abort"')
+
+    def test_owner_flip_note_names_the_duration_before_the_deadline_is_known(
+        self, client: TestClient
+    ) -> None:
+        """With no recorded start the note names how long the wait lasts."""
+        _flip_job(client, _OWNING_BROWSER)
+        timeout = _app(client).state.settings.output.operator_wait_timeout_seconds
+
+        prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
+
+        note = flip_deadline_note(deadline=None, timeout_seconds=timeout)
+        assert f'<small class="prompt-note">{escape(note)}</small>' in prompt
+
+    def test_flip_group_is_named_and_svgs_are_hidden(self, client: TestClient) -> None:
+        """
+        The pictures are silent and the buttons are named by the job line.
+
+        The captions under the pictures already say what each one shows, so
+        a label on the picture would be read twice.
+        """
+        _flip_job(client, _OWNING_BROWSER)
+
+        prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
+
+        svgs = _HIDDEN_SVG.findall(prompt)
+        assert len(svgs) == 2
+        for svg in svgs:
+            assert 'aria-hidden="true"' in svg
+            assert 'focusable="false"' in svg
+        assert "aria-label=" not in prompt
+        assert '<div role="group" aria-labelledby="flip-heading">' in prompt
+        assert prompt.count('id="flip-heading"') == 1
+
+    def test_null_owner_flip_heading_is_generic(self, client: TestClient) -> None:
+        """A job anyone may answer is named by the hidden title, not its own."""
+        _flip_job(client, None)
+
+        prompt = _flip_prompt(_as_browser(client, None))
+
+        assert (
+            f'<p id="flip-heading"><strong>{escape(flip_heading(HIDDEN_JOB_TITLE))}'
+            "</strong></p>"
+        ) in prompt
+        assert "Flip Render" not in prompt
+
+    def test_flip_prompt_unchanged_copy_is_byte_identical(
+        self, client: TestClient
+    ) -> None:
+        """The instructions, captions and Abort confirmation are as they were."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
+        template = (_TEMPLATES_DIR / "partials" / "flip.html").read_text(
+            encoding="utf-8"
+        )
+
+        for source in (prompt, template):
+            assert _FLIP_INSTRUCTIONS in source
+            for caption in _FLIP_CAPTIONS:
+                assert caption in source
+            assert f'hx-confirm="{_ABORT_CONFIRMATION}"' in source
+
+
+def _status_area_of(markup: str) -> str:
+    """Return a status response's status area, without the out-of-band button."""
+    button = _SCAN_BUTTON.search(markup)
+    assert button is not None
+    return markup[: button.start()]
 
 
 # --- S8: the blocked Scan button and its reason line (APPL-07, D-14, D-15) ---

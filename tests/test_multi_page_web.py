@@ -49,7 +49,10 @@ from saneless.vocabulary import (
     SubmitResult,
     abort_question,
     busy_line,
+    local_time,
+    non_owner_wait_line,
     pass_answer_label,
+    pass_heading,
     pass_prompt_copy,
     pass_wait_state,
     progress_label,
@@ -669,8 +672,21 @@ def _answer(
 
 
 def _waiting_line(state: JobState) -> str:
-    """Return the plain line anyone but the prompt's owner sees for ``state``."""
+    """Return the plain line the owner sees before the question is published."""
     return f"<p>{escape(progress_label(state))}</p>"
+
+
+def _non_owner_line(waiting: _Waiting) -> str:
+    """
+    Return the plain line anyone but the prompt's owner sees for ``waiting``.
+
+    The question is published, so the worker knows when it gives up, and the
+    line names that time.
+    """
+    deadline = waiting.coordinator.open_deadline
+    assert deadline is not None
+    state = pass_wait_state(waiting.prompt.wait)
+    return f"<p>{escape(non_owner_wait_line(state, deadline=deadline))}</p>"
 
 
 class TestThePromptTheOwnerSees:
@@ -685,7 +701,9 @@ class TestThePromptTheOwnerSees:
         Only Abort confirms: the others are the loop's normal moves.
         """
         waiting = stager.prompt(_next_pass(kept=4))
-        copy = pass_prompt_copy(waiting.prompt)
+        copy = pass_prompt_copy(
+            waiting.prompt, deadline=waiting.coordinator.open_deadline
+        )
 
         area = _status_area(_status(served))
 
@@ -825,6 +843,31 @@ class TestThePromptTheOwnerSees:
             "mp-abort",
         ]
 
+    @pytest.mark.parametrize("wait", list(PassWait))
+    def test_owner_pass_prompt_names_the_job_and_deadline(
+        self, served: _Served, stager: _Stager, wait: PassWait
+    ) -> None:
+        """
+        The prompt opens with the document's title and says when it gives up.
+
+        The deadline replaces the duration inside the one timeout note the
+        question already had, so the prompt says it once, not twice.
+        """
+        waiting = stager.prompt(_prompt_for(wait))
+        deadline = waiting.coordinator.open_deadline
+        assert deadline is not None
+
+        area = _status_area(_status(served))
+
+        heading = pass_heading("Multi-page")
+        assert heading == "Adding pages to “Multi-page”"
+        assert (
+            f'<div class="pages-prompt">\n  <p><strong>{escape(heading)}</strong></p>'
+        ) in area
+        assert area.count(f"No answer by {local_time(deadline)}") == 1
+        assert "No answer within" not in area
+        assert area.count("No answer") == 1
+
     @pytest.mark.parametrize("state", sorted(PASS_WAIT_STATES))
     def test_an_owner_before_the_prompt_opens_sees_the_waiting_line(
         self, served: _Served, stager: _Stager, state: JobState
@@ -874,14 +917,15 @@ class TestWhatEveryoneElseSees:
         self, served: _Served, stager: _Stager, wait: PassWait, presented: str | None
     ) -> None:
         """The buttons are not emitted at all, never hidden with CSS."""
-        stager.prompt(_prompt_for(wait))
+        waiting = stager.prompt(_prompt_for(wait))
         served.client.cookies.clear()
         if presented is not None:
             served.client.cookies.set(OWNER_COOKIE, presented)
 
         area = _status_area(_status(served))
 
-        assert _waiting_line(pass_wait_state(wait)) in area
+        assert _non_owner_line(waiting) in area
+        assert "Multi-page" not in area
         assert "<button" not in area
         assert "pages-prompt" not in area
         assert "aria-busy" not in area
@@ -995,7 +1039,7 @@ class TestTheAnswerRoute:
             assert 'class="pages-prompt"' in area
         else:
             assert "<button" not in area
-            assert _waiting_line(JobState.AWAITING_NEXT_PASS) in area
+            assert _non_owner_line(waiting) in area
 
     @pytest.mark.parametrize(
         ("number", "answer"),
