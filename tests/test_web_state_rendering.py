@@ -646,7 +646,7 @@ def test_a_flip_acknowledgement_is_a_busy_line(
         worker._flip_coordinator = None
 
     area = _element(text, "status-area")
-    label = escape(flip_answer_label(FlipOutcome.CONTINUE))
+    label = escape(flip_answer_label(FlipOutcome.CONTINUED))
     assert f'<p class="busy-line">{label}</p>' in area
     assert "aria-busy" not in area
 

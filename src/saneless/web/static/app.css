@@ -1,11 +1,74 @@
 /* saneless -- app-specific layout overrides for PicoCSS */
 
-/* Status area */
+/* Status area.  The scroll margin keeps the area's first line, and its focus
+   ring, off the viewport edge when autofocus scrolls it into view on a phone. */
 #status-area {
     margin: 1rem 0;
     padding: 1rem;
     border-left: var(--pico-border-width) solid var(--pico-primary);
     border-radius: var(--pico-border-radius);
+    scroll-margin-block: 1rem;
+}
+
+/* The status area takes focus after an action, and it is a div, so Pico gives
+   it no focus ring of its own.  A pointer user who clicked Scan sees none; a
+   keyboard user sees a 2px accent ring 4px outside the box, inside the area's
+   own margin, so it never overlaps the error slot or the next card.  The solid
+   primary is used rather than Pico's half-alpha focus colour, which blends to
+   about 1.6:1 on white and would fail the 3:1 non-text contrast floor. */
+#status-area:focus {
+    outline: none;
+}
+
+#status-area:focus-visible {
+    outline: 0.125rem solid var(--pico-primary);
+    outline-offset: 0.25rem;
+}
+
+/* A title with no spaces -- in the queued line, an outcome line -- breaks
+   instead of widening the page at 320px.  break-word rather than anywhere,
+   because it does not shrink min-content: the flip prompt's joined button
+   group is a flex row, and anywhere inherited into it could let Continue
+   shrink and split mid-word. */
+#status-area p {
+    overflow-wrap: break-word;
+}
+
+/* A status line the machine is working on.  The spinner is drawn from a class
+   rather than from aria-busy, because a busy subtree inside the role="status"
+   region may be held back by a screen reader.  It is Pico's own loading image
+   at Pico's own size, so it matches the Scan button's spinner exactly.  The
+   hanging indent makes a line that wraps -- the queued line with a long title
+   at 320px -- wrap under its own text, not under the spinner, and without
+   Pico's aria-busy nowrap the line wraps at all. */
+.busy-line {
+    padding-inline-start: calc(1em + 0.5rem);
+    text-indent: calc(-1em - 0.5rem);
+}
+
+.busy-line::before {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    margin-inline-end: 0.5rem;
+    vertical-align: -0.125em;
+    background-image: var(--pico-icon-loading);
+    background-size: 1em auto;
+    background-repeat: no-repeat;
+    content: "";
+}
+
+/* The loading image animates inside its own SVG, which no host-page animation
+   rule reaches, so reduced motion swaps it for a still, three-quarter ring in
+   the same 1em box: nothing moves and nothing shifts. */
+@media (prefers-reduced-motion: reduce) {
+    .busy-line::before {
+        box-sizing: border-box;
+        border: 0.125em solid var(--pico-muted-color);
+        border-inline-end-color: transparent;
+        border-radius: 50%;
+        background-image: none;
+    }
 }
 
 /* A request error sits just above the status area. Inset its text by the

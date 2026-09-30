@@ -9,15 +9,16 @@
       hx-disabled-elt cannot reach it.  No attribute is added to the
       form element; the inheritance fix below stays exactly as written.
    3. The error slot's invariant -- #status-message is the immediate sibling above
-      #status-area -- is preserved untouched.
-   #checks-strip is the persistent live region and #checks-body is the swap
-   target: the container survives every swap, which is what makes aria-live
-   work at all, and it is polite and never assertive because a health list must
-   not interrupt and the page is allowed exactly one assertive region -- the
-   #status-message slot below, which keeps it. #}
+      the status block -- is preserved untouched.
+   #checks-strip is silent: it is not a live region, and its rows stay reachable
+   by navigation.  A health list that spoke on its own would talk over the scan,
+   so the status area is the one thing on the page that speaks: #status-live
+   below is the page's one polite region and is never swapped, and the
+   #status-message slot stays the one assertive region.  #checks-body is still
+   the swap target, and #checks-strip the container that survives every swap. #}
 <article id="checks-card">
     <h2>System status</h2>
-    <div id="checks-strip" aria-live="polite">
+    <div id="checks-strip">
         {% include "partials/checks.html" %}
     </div>
 </article>
@@ -237,8 +238,18 @@
 </article>
 
 {# --- Section 2: Request errors, then status --- #}
+{# #status-live is the page's one polite region, and it is on the page before
+   anything inside it changes: a screen reader announces changes to a region it
+   already knows about, not a region that arrives with the change.  So it is
+   never a swap target and no response carries it; every status response swaps
+   #status-area inside it, and because an unchanged poll is answered 204, each
+   visible change is heard once.  role="status" already implies polite and
+   atomic, so neither is restated, and it carries no class: it is not styled.
+   #status-message stays its immediate previous sibling. #}
 <div id="status-message" role="alert"></div>
+<div id="status-live" role="status">
 {% include "partials/status.html" %}
+</div>
 
 {# --- Section 3: Job History --- #}
 <article>

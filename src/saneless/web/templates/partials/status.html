@@ -8,7 +8,14 @@
 
    The negative tabindex is on every rendering, in every state: the area is where
    focus goes after an action, and htmx restores focus by id only to an
-   element that can hold it. #}
+   element that can hold it.
+
+   The area is always rendered inside index.html's #status-live, the page's
+   polite region, and never carries that region itself.  So no line in here is
+   marked aria-busy: a screen reader may hold back a busy subtree inside a live
+   region until it stops being busy, and "Scanning..." would then never be
+   heard.  A line the machine is working on carries class="busy-line" instead,
+   and app.css draws the spinner from that class. #}
 <div id="status-area" tabindex="-1"
      {% if job and job.is_active %}
      hx-get="{{ poll_url }}"
@@ -22,7 +29,7 @@
          place for it to drift from the contract.  The line carries the queue
          position, the manual-duplex front count, or the plain in-flight prose,
          whichever applies. #}
-      <p aria-busy="true">{{ busy_line }}</p>
+      <p class="busy-line">{{ busy_line }}</p>
     {% elif job.state == JobState.AWAITING_FLIP %}
       {# Three-way, in this order.
 
@@ -50,13 +57,16 @@
          The last arm's copy deliberately ends without the three periods that
          in-progress copy normally carries.  It is locked copy, written that way
          twice, and the style exception is recorded here so a later tidy-up does
-         not "fix" it. #}
+         not "fix" it.  It is a plain line with no spinner, like the multi-page
+         waiting line below: the job waits for a person, not the machine.  The
+         acknowledgement in the first arm is a busy line, because the machine
+         is about to act on the answer. #}
       {% if flip_answer %}
-      <p aria-busy="true">{{ flip_answer | flip_answer_label }}</p>
+      <p class="busy-line">{{ flip_answer | flip_answer_label }}</p>
       {% elif is_owner %}
       {% include "partials/flip.html" %}
       {% else %}
-      <p aria-busy="true">Waiting for the stack to be flipped</p>
+      <p>Waiting for the stack to be flipped</p>
       {% endif %}
     {% elif job.state in pass_wait_states %}
       {# A multi-page document waiting on its operator.  Three arms, in the
@@ -76,11 +86,11 @@
          what anyone else sees, and what the owner sees for the moment before
          the worker publishes the question.  It is the same server-built line
          the busy branch renders, which for a waiting state is that state's
-         progress wording.  It deliberately carries no aria-busy: the job waits
-         for a person, not the machine, and a spinner here is exactly what
-         makes a waiting scan look hung. #}
+         progress wording.  It deliberately carries no busy-line class: the job
+         waits for a person, not the machine, and a spinner here is exactly
+         what makes a waiting scan look hung. #}
       {% if pass_answer %}
-      <p aria-busy="true">{{ pass_answer | pass_answer_label }}</p>
+      <p class="busy-line">{{ pass_answer | pass_answer_label }}</p>
       {% elif is_owner and pass_copy %}
       {% include "partials/pages_prompt.html" %}
       {% else %}
