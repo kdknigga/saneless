@@ -1,12 +1,18 @@
-{# The poll follows the job this browser submitted, when it submitted one: the
-   scan response bakes that id into this URL, so a second person's scan cannot
-   take the status area over.  A browser that submitted nothing -- or whose job
-   has since been pruned -- keeps the current-job URL and the inference behind
-   it, unchanged. #}
-<div id="status-area"
+{# The poll URL and its interval are built by one Python function,
+   routes._poll_url, and handed in as poll_url and poll_interval; this template
+   composes no URL.  The URL follows the job this browser submitted, answered
+   or owns, so a second person's scan cannot take the status area over, and it
+   carries the token of what this rendering shows, so a poll that would render
+   the same thing is answered 204 and leaves the area -- and the focus inside
+   it -- in place.
+
+   The negative tabindex is on every rendering, in every state: the area is where
+   focus goes after an action, and htmx restores focus by id only to an
+   element that can hold it. #}
+<div id="status-area" tabindex="-1"
      {% if job and job.is_active %}
-     {% if followed_job_id %}hx-get="/api/jobs/{{ followed_job_id }}/status"{% else %}hx-get="/api/jobs/current/status"{% endif %}
-     hx-trigger="every 1s"
+     hx-get="{{ poll_url }}"
+     hx-trigger="every {{ poll_interval }}s"
      hx-swap="outerHTML"
      {% endif %}>
   {% if job %}

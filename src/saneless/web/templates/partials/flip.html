@@ -50,10 +50,17 @@
 
      The wording is one question and one consequence.  It deliberately does not
      claim the pages already scanned are kept: that is a promise this contract
-     cannot verify, and the page makes no promise it cannot verify. #}
+     cannot verify, and the page makes no promise it cannot verify.
+
+     Both buttons carry fixed ids.  htmx moves focus back to the element with
+     the focused element's id after it swaps the status area, so a stable id
+     is what lets a keyboard-focused Continue survive a re-render; without one
+     focus falls to the page body.  The multi-page prompt's buttons carry ids
+     for the same reason. #}
   <div role="group">
-    <button hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
-    <button hx-post="/api/flip/abort"
+    <button id="flip-continue" hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
+    <button id="flip-abort"
+            hx-post="/api/flip/abort"
             hx-vals='{{ {"job_id": job.id} | tojson }}'
             hx-target="#status-area"
             hx-swap="outerHTML"

@@ -2009,18 +2009,24 @@ class TestStatusPollAnswersWhenChanged:
         """
         The owner's token proves nothing about what another browser was shown.
 
-        The owner sees the title; anyone else sees the generic one, so the
-        same job renders differently and the stranger's poll is answered.
+        The owner sees the preview; anyone else sees none, so the same job
+        renders differently and the stranger's poll is answered.  (Without a
+        preview a scanning job reads the same to everyone, and a 204 would be
+        right.)
         """
-        job_id = _running_job(client, "Owners Title", owner_token=_as_owner(client))
-        seen = _seen_in(client.get(f"/api/jobs/{job_id}/status").text)
+        job_id = _running_job(client, "Owners Scan", owner_token=_as_owner(client))
+        job_store: JobStore = _app(client).state.job_store
+        job_store.update_thumbnail(job_id, _THUMBNAIL)
+        owners = client.get(f"/api/jobs/{job_id}/status").text
+        seen = _seen_in(owners)
 
         stranger = _other_browser(client).get(
             f"/api/jobs/{job_id}/status", params={"seen": seen}
         )
 
+        assert _THUMBNAIL in owners
         assert stranger.status_code == 200
-        assert "Owners Title" not in stranger.text
+        assert _THUMBNAIL not in stranger.text
 
     @pytest.mark.parametrize("seen", ["f" * 10_000, "not a token at all"])
     def test_oversized_seen_answers_200(self, client: TestClient, seen: str) -> None:

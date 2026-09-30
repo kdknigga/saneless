@@ -14,7 +14,8 @@
       refresher's single-flight lock, because the probe's own worst case is
       minutes and a chain that ended first never collected it.  That is the
       in-tree idiom
-      (partials/status.html lines 1-6) and it is deliberately NOT HTTP 286,
+      (the conditional poll attributes on partials/status.html's #status-area)
+      and it is deliberately NOT HTTP 286,
       which would need a change to the tuned htmx-config meta in base.html.
    2. The strip asks only while something in flight will change the answer, and
       never otherwise.  There are two such things, and the route (`_checks_context`)

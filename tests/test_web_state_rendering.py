@@ -342,9 +342,6 @@ def test_status_area_polls_only_while_active(
     assert ('hx-trigger="every 1s"' in text) is (state in ACTIVE_STATES)
 
 
-_STATUS_AREA_OPEN = re.compile(r'<div id="status-area"[^>]*>')
-
-
 @pytest.mark.parametrize("state", list(JobState))
 def test_status_area_is_always_focusable(client: TestClient, state: JobState) -> None:
     """
@@ -362,7 +359,7 @@ def test_status_area_is_always_focusable(client: TestClient, state: JobState) ->
         client.post("/api/flip/continue", data={"job_id": job_id}).text,
     ]
     for text in renderings:
-        opening = _STATUS_AREA_OPEN.findall(text)
+        opening = _STATUS_OPEN.findall(text)
         assert len(opening) == 1, text
         assert 'tabindex="-1"' in opening[0]
 
@@ -1697,6 +1694,7 @@ _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
 _NON_OWNER_LINE = "Waiting for the stack to be flipped"
 
 _STATUS_OPEN = re.compile(r'<div id="status-area"[^>]*>', re.DOTALL)
+_SEEN_TOKEN = re.compile(r"seen=[0-9a-f]+")
 # The real element, not the prose reference to it in the comment above the
 # status card: the element carries at least one further attribute, so it is
 # the only one of the two whose open tag has whitespace after the URL.
@@ -1764,18 +1762,25 @@ def _around_the_flip_block(markup: str) -> tuple[str, str]:
     tag with its poll attributes, and the out-of-band Scan button -- is the
     same for every viewer, so the appliance reads as equally busy to all.
 
+    The poll's ``seen`` token is masked: it hashes what this viewer is shown,
+    so it differs exactly where the gate says the rendering does, and the
+    path and interval around it are what must match.
+
     Args:
         markup: The rendered response body.
 
     Returns:
-        The status area's opening tag, and the Scan button.
+        The status area's opening tag with its token masked, and the Scan
+        button.
 
     """
     opening = _STATUS_OPEN.search(markup)
     assert opening is not None
     button = _SCAN_BUTTON.search(markup)
     assert button is not None
-    return opening.group(0), button.group(0)
+    masked = _SEEN_TOKEN.sub("seen=<token>", opening.group(0))
+    assert masked != opening.group(0)
+    return masked, button.group(0)
 
 
 class TestOwnerGatedFlipPrompt:

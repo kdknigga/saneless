@@ -422,12 +422,15 @@ _HX_CONFIRM = re.compile(r'hx-confirm="(?P<question>[^"]*)"')
 
 # The flip prompt's template is a sibling of the multi-page prompt and must not
 # change because the multi-page prompt exists.  Its digest is recorded here as
-# the file stood before the multi-page prompt was added.
+# the file stood after its own last deliberate change -- the Continue and Abort
+# buttons gaining the stable ids that keep focus on them across a status swap.
+# A later deliberate change to the flip prompt re-records it; a multi-page
+# change never should.
 _FLIP_TEMPLATE = (
     Path(app_module.__file__).parent / "templates" / "partials" / "flip.html"
 )
 _FLIP_TEMPLATE_SHA256 = (
-    "f358466ccc167c17654d3c93766d881cd88052804707304e84cee5f6189c5e77"
+    "a86d0132d5e791e53960d04a3fc9ac77e8fd34380031774cfe5d29315104e0ed"
 )
 
 

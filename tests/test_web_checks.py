@@ -2748,4 +2748,8 @@ class TestWhichResponsesCarryWhat:
         """
         source = Path(routes_module.__file__).read_text(encoding="utf-8")
         assert source.count('"refresh_checks": True') == 1
-        assert source.count('"refresh_checks": False') == 1
+        # Defaulted off once in ``_status_context``, and forced off once more
+        # in the canonical poll rendering ``_status_token`` hashes.  That
+        # second one is the shape of a poll, never a response anybody is sent,
+        # so it cannot re-render the strip.
+        assert source.count('"refresh_checks": False') == 2

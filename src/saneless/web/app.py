@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -554,6 +555,12 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     app.state.paperless_test_result = SingleFlightResult(
         ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=PAPERLESS_TEST_WAIT_SECONDS
     )
+    # The key the status polls' "seen" tokens are hashed with.  Those tokens
+    # travel in URLs, and so into access logs; a key minted per process makes
+    # one unlinkable to the content it stands for and impossible to compute
+    # ahead of time.  A restart mints a new key, which costs each open page
+    # one full render on its next poll and nothing else.
+    app.state.status_token_key = secrets.token_bytes(32)
 
     app.mount(STATIC_PATH, StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)

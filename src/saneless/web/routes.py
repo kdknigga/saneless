@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import secrets
@@ -10,6 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import JSONResponse
@@ -79,7 +81,7 @@ from saneless.web.job_view import build_job_view, owns_detail, scrub_for_owner
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from starlette.datastructures import State
 
@@ -1198,6 +1200,170 @@ def _status_context(
     }
 
 
+_SEEN_MAX_LENGTH: Final = 64
+"""
+The longest ``seen`` value a status poll compares against its token.
+
+A token is 24 hex characters.  A longer value cannot match, so it is ignored
+and the poll is answered in full -- never refused with a 422.  A refused poll
+would reach the page's error handling, and a poll's failure must never land in
+``#status-message``, where it would read as the operator's own mistake.
+"""
+
+_POLL_INTERVAL_SECONDS: Final = 1
+"""How often an active status area polls, in seconds."""
+
+_STATUS_TOKEN_BYTES: Final = 12
+"""The token's digest size: 24 hex characters in the poll URL."""
+
+
+def _poll_url(followed_job_id: str | None, *, seen: str, attempt: int = 0) -> str:
+    """
+    Build the URL a status area polls, in the one place any URL for it is built.
+
+    Templates compose no poll URL of their own: the page, both polls, the three
+    answer routes, the scan submit and the template-free fallback all render
+    the one this function returns, so none of them can drift on the path or
+    the query.
+
+    Args:
+        followed_job_id: The job the area follows, or None to follow whatever
+            the current job is.
+        seen: The token of the rendering the poll's element shows; empty for
+            a rendering that has not been hashed, which no poll matches.
+        attempt: The poll's retry count, carried only when non-zero.
+
+    Returns:
+        The path and its query string, not yet HTML-escaped.
+
+    """
+    path = (
+        f"/api/jobs/{followed_job_id}/status"
+        if followed_job_id
+        else "/api/jobs/current/status"
+    )
+    params = {"seen": seen}
+    if attempt:
+        params["attempt"] = str(attempt)
+    return f"{path}?{urlencode(params)}"
+
+
+def _followed_in(context: Mapping[str, object]) -> str | None:
+    """
+    Return the followed job id a status context carries, if any.
+
+    Args:
+        context: A context built by ``_status_context``.
+
+    Returns:
+        The id ``_status_context`` found and echoed, or None.
+
+    """
+    followed = context.get("followed_job_id")
+    return followed if isinstance(followed, str) else None
+
+
+def _status_token(request: Request, context: Mapping[str, object]) -> str:
+    """
+    Hash what a status poll would show this viewer, as the poll's ``seen`` token.
+
+    The token is a hash of the rendered bytes rather than of a hand-picked set
+    of facts, because what the viewer sees changes in ways such a set misses:
+    a preview stored mid-scan while the busy line stays the same, the owner
+    gate, the question number a multi-page prompt carries, the queue
+    position.  The rendering covers every one of them, and any later change to
+    the templates, by construction.
+
+    It hashes the canonical *poll* rendering, never the calling route's own:
+    the empty ``seen``, the one-second interval, no focus attribute, no
+    message clear, no strip refresh, and the terminal reload every poll
+    carries.  A scan submit or an answer carries extras a poll never does, so
+    a token computed from its own rendering would never match the first poll
+    after it, and every action would be followed by one needless swap -- one
+    that replaces the focused button and speaks the area again.
+
+    The hash is keyed with the process's ``status_token_key``.  The token
+    travels in a URL, and so into access logs; keyed, it is unlinkable to the
+    content and cannot be computed by anyone else.
+
+    Args:
+        request: The incoming request, for the app's templates and key.
+        context: The status context ``_status_context`` built for this viewer.
+
+    Returns:
+        The token, as hex.
+
+    """
+    state = request.app.state
+    canonical = state.templates.get_template("partials/status_response.html").render(
+        {
+            **context,
+            "request": request,
+            "poll_url": _poll_url(_followed_in(context), seen=""),
+            "poll_interval": _POLL_INTERVAL_SECONDS,
+            "focus_status_area": False,
+            "clear_message": False,
+            "refresh_checks": False,
+            "terminal_reload": True,
+        }
+    )
+    return hashlib.blake2b(
+        canonical.encode(),
+        key=state.status_token_key,
+        digest_size=_STATUS_TOKEN_BYTES,
+    ).hexdigest()
+
+
+def _with_poll(
+    request: Request, context: Mapping[str, object]
+) -> tuple[str, dict[str, object]]:
+    """
+    Add the poll URL and interval to a status context, with its token baked in.
+
+    Every status rendering goes through here, so every one of them hands the
+    browser a poll URL whose ``seen`` names what it is showing.  htmx captures
+    an element's URL when it processes the element and never re-processes an
+    element a 204 left in place, so the URL a rendering bakes is the one every
+    poll from it presents until something changes.
+
+    Args:
+        request: The incoming request.
+        context: The status context ``_status_context`` built for this viewer.
+
+    Returns:
+        The token, and the context extended with ``poll_url`` and
+        ``poll_interval``.
+
+    """
+    token = _status_token(request, context)
+    return token, {
+        **context,
+        "poll_url": _poll_url(_followed_in(context), seen=token),
+        "poll_interval": _POLL_INTERVAL_SECONDS,
+    }
+
+
+def _unchanged(seen: str, token: str) -> bool:
+    """
+    Report whether a poll's ``seen`` names the rendering it would be sent.
+
+    A value longer than any token is ignored rather than compared, and the
+    comparison is constant-time, so neither its length nor its content can be
+    probed.  An empty ``seen`` never matches.
+
+    Args:
+        seen: The token the poll presented.
+        token: The token of what the poll would render now.
+
+    Returns:
+        True when the poll can be answered with no content.
+
+    """
+    if not seen or len(seen) > _SEEN_MAX_LENGTH:
+        return False
+    return secrets.compare_digest(seen.encode(), token.encode())
+
+
 def _pass_wait_context(
     worker: ScanWorker,
     job: Job | None,
@@ -1594,14 +1760,19 @@ def index(request: Request) -> Response:
 
     # The page follows the newest active job this browser owns, so a reload
     # while someone else's scan runs still reports the scan this person
-    # queued; with none of its own active, it reports the current job.
-    status = _status_context(
-        state.worker,
-        state.job_store,
-        _status_facts(
-            request,
-            followed_job_id=_owned_active_job_id(
-                state.worker, state.job_store, _presented_owner(request)
+    # queued; with none of its own active, it reports the current job.  Its
+    # poll URL carries the token of what the first poll would render, so that
+    # poll is answered 204 and the page's own rendering stays in place.
+    _, status = _with_poll(
+        request,
+        _status_context(
+            state.worker,
+            state.job_store,
+            _status_facts(
+                request,
+                followed_job_id=_owned_active_job_id(
+                    state.worker, state.job_store, _presented_owner(request)
+                ),
             ),
         ),
     )
@@ -2069,12 +2240,12 @@ def _queued_status_fallback(job_id: str) -> str:
         The response body.
 
     """
-    poll_url = html.escape(f"/api/jobs/{job_id}/status")
+    poll_url = html.escape(_poll_url(job_id, seen=""))
     line = html.escape(progress_label(JobState.PENDING))
     return (
-        f'<div id="status-area" hx-get="{poll_url}" hx-trigger="every 1s" '
-        f'hx-swap="outerHTML">\n'
-        f'  <p aria-busy="true">{line}</p>\n'
+        f'<div id="status-area" tabindex="-1" hx-get="{poll_url}" '
+        f'hx-trigger="every {_POLL_INTERVAL_SECONDS}s" hx-swap="outerHTML">\n'
+        f'  <p class="busy-line">{line}</p>\n'
         "</div>\n"
         '<div id="status-message" hx-swap-oob="innerHTML"></div>\n'
     )
@@ -2268,26 +2439,31 @@ def start_scan(
             # inside the TemplateResponse constructor, and the generic error it
             # would answer tells the operator to try again.
             try:
+                # The created job is the followed job, so the poll URL this
+                # browser is handed names it and the status area keeps
+                # reporting the scan this person started.  The token is built
+                # inside the guard too: it renders a template, and its
+                # failure must answer the fallback like any other.
+                _, status = _with_poll(
+                    request,
+                    _status_context(
+                        state.worker,
+                        state.job_store,
+                        replace(
+                            _status_facts(request, followed_job_id=job.id),
+                            # The token this submit is owned by, which is the
+                            # minted one when the browser presented none: the
+                            # cookie carrying it has not reached the browser
+                            # yet, so the request cannot present it.
+                            owner_token=owner,
+                        ),
+                    ),
+                )
                 response = state.templates.TemplateResponse(
                     request,
                     "partials/status_response.html",
                     {
-                        # The created job is the followed job, so the poll URL
-                        # this browser is handed names it and the status area
-                        # keeps reporting the scan this person started.
-                        **_status_context(
-                            state.worker,
-                            state.job_store,
-                            replace(
-                                _status_facts(request, followed_job_id=job.id),
-                                # The token this submit is owned by, which is
-                                # the minted one when the browser presented
-                                # none: the cookie carrying it has not reached
-                                # the browser yet, so the request cannot
-                                # present it.
-                                owner_token=owner,
-                            ),
-                        ),
+                        **status,
                         "clear_message": True,
                         "refresh_checks": True,
                         "terminal_reload": True,
@@ -2323,7 +2499,9 @@ def start_scan(
 
 
 @router.get("/api/jobs/current/status")
-def current_job_status(request: Request) -> Response:
+def current_job_status(
+    request: Request, seen: Annotated[str, Query()] = ""
+) -> Response:
     """
     Poll the current or most recent job status.
 
@@ -2334,24 +2512,43 @@ def current_job_status(request: Request) -> Response:
     The response re-renders the Scan button out-of-band from server state.
     It never clears ``#status-message``: a poll carrying that clear would erase
     a rejection shown mid-scan within a second.
+
+    A poll whose ``seen`` is the token of what it would render now is answered
+    204 with no body, which htmx leaves unswapped: the focused button, a
+    pressed key and the live region's text all survive it.  The element keeps
+    its URL, because htmx does not re-process an element it did not swap, so
+    every later poll presents the same token until something changes.
+
+    Args:
+        request: The incoming HTTP request.
+        seen: The token of the rendering the polling element shows.
+
+    Returns:
+        The status partial, or an empty 204 when nothing has changed.
+
     """
     state = request.app.state
+    token, context = _with_poll(
+        request,
+        _status_context(
+            state.worker,
+            state.job_store,
+            _status_facts(request, followed_job_id=None),
+        ),
+    )
+    if _unchanged(seen, token):
+        return Response(status_code=204)
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {
-            **_status_context(
-                state.worker,
-                state.job_store,
-                _status_facts(request, followed_job_id=None),
-            ),
-            "terminal_reload": True,
-        },
+        {**context, "terminal_reload": True},
     )
 
 
 @router.get("/api/jobs/{job_id}/status")
-def followed_job_status(request: Request, job_id: str) -> Response:
+def followed_job_status(
+    request: Request, job_id: str, seen: Annotated[str, Query()] = ""
+) -> Response:
     """
     Poll the status of the job this browser submitted.
 
@@ -2367,28 +2564,34 @@ def followed_job_status(request: Request, job_id: str) -> Response:
     a caller which ids exist.
 
     Everything else matches ``current_job_status``: the Scan button rides along
-    out-of-band and ``#status-message`` is left alone.
+    out-of-band, ``#status-message`` is left alone, and a poll presenting the
+    token of what it would render now is answered 204 with no body.
 
     Args:
         request: The incoming HTTP request.
         job_id: The job this browser is following.
+        seen: The token of the rendering the polling element shows.
 
     Returns:
-        The status partial rendered for that job.
+        The status partial rendered for that job, or an empty 204 when nothing
+        has changed.
 
     """
     state = request.app.state
+    token, context = _with_poll(
+        request,
+        _status_context(
+            state.worker,
+            state.job_store,
+            _status_facts(request, followed_job_id=job_id),
+        ),
+    )
+    if _unchanged(seen, token):
+        return Response(status_code=204)
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {
-            **_status_context(
-                state.worker,
-                state.job_store,
-                _status_facts(request, followed_job_id=job_id),
-            ),
-            "terminal_reload": True,
-        },
+        {**context, "terminal_reload": True},
     )
 
 
@@ -2904,21 +3107,22 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     claimed = False
     if _owner_answers(presented, state.job_store.get_job(job_id)):
         claimed = state.worker.continue_flip(job_id)
+    _, context = _with_poll(
+        request,
+        _status_context(
+            state.worker,
+            state.job_store,
+            _status_facts(
+                request,
+                followed_job_id=job_id,
+                claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
+            ),
+        ),
+    )
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {
-            **_status_context(
-                state.worker,
-                state.job_store,
-                _status_facts(
-                    request,
-                    followed_job_id=job_id,
-                    claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
-                ),
-            ),
-            "terminal_reload": True,
-        },
+        {**context, "terminal_reload": True},
     )
 
 
@@ -2949,21 +3153,22 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     claimed = False
     if _owner_answers(presented, state.job_store.get_job(job_id)):
         claimed = state.worker.abort_flip(job_id)
+    _, context = _with_poll(
+        request,
+        _status_context(
+            state.worker,
+            state.job_store,
+            _status_facts(
+                request,
+                followed_job_id=job_id,
+                claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+            ),
+        ),
+    )
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {
-            **_status_context(
-                state.worker,
-                state.job_store,
-                _status_facts(
-                    request,
-                    followed_job_id=job_id,
-                    claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
-                ),
-            ),
-            "terminal_reload": True,
-        },
+        {**context, "terminal_reload": True},
     )
 
 
@@ -3021,19 +3226,20 @@ def answer_multi_page(
     claimed = False
     if _owner_answers(presented, state.job_store.get_job(job_id)):
         claimed = state.worker.answer_pass(job_id, prompt, answer)
+    _, context = _with_poll(
+        request,
+        _status_context(
+            state.worker,
+            state.job_store,
+            _status_facts(
+                request,
+                followed_job_id=job_id,
+                claimed_pass=(job_id, answer) if claimed else None,
+            ),
+        ),
+    )
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {
-            **_status_context(
-                state.worker,
-                state.job_store,
-                _status_facts(
-                    request,
-                    followed_job_id=job_id,
-                    claimed_pass=(job_id, answer) if claimed else None,
-                ),
-            ),
-            "terminal_reload": True,
-        },
+        {**context, "terminal_reload": True},
     )
