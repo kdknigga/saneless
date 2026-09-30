@@ -1046,7 +1046,7 @@ class TestTheScanButtonAndBusyLine:
         button = _SCAN_BUTTON.search(_status(served))
 
         assert button is not None
-        assert button.group("text").strip() == "Waiting for you&#8230;"
+        assert button.group("text").strip() == "Waiting for you…"
         assert "disabled" in _attribute_names(button.group("attrs"))
         assert "aria-busy" not in button.group("attrs")
 
@@ -1059,7 +1059,7 @@ class TestTheScanButtonAndBusyLine:
         button = _SCAN_BUTTON.search(_status(served))
 
         assert button is not None
-        assert button.group("text").strip() == "Waiting for flip&#8230;"
+        assert button.group("text").strip() == "Waiting for flip…"
 
     def test_a_later_pass_leads_with_the_pages_kept(
         self, served: _Served, stager: _Stager

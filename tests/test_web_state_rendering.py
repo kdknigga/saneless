@@ -45,7 +45,11 @@ from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    HIDDEN_JOB_TITLE,
+    HIDDEN_WARNING_LINE,
     PASS_WAIT_STATES,
+    SCAN_BLOCKED_REASON,
+    SCAN_BLOCKED_URL_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
@@ -62,7 +66,9 @@ from saneless.vocabulary import (
     flip_answer_label,
     job_label,
     job_status_class,
+    local_time,
     page_counts,
+    page_title,
     pass_wait_state,
     progress_label,
     rejection_message,
@@ -982,14 +988,19 @@ def _scan_caption(state: JobState) -> str:
     Return the Scan button's exact caption while a job is in ``state``.
 
     A job waiting for a person says which person-shaped wait it is: the flip
-    has its own caption, and every multi-page wait shares one.
+    has its own caption, and every multi-page wait shares one.  A job still
+    in the queue is Queued, never Scanning: the button must not say the
+    scanner is at work while the status area says the job waits its turn.
+    The captions end in the U+2026 character, which Jinja does not escape.
     """
+    if state is JobState.PENDING:
+        return "Queued…"
     if state is JobState.AWAITING_FLIP:
-        return "Waiting for flip&#8230;"
+        return "Waiting for flip…"
     if state in PASS_WAIT_STATES:
-        return "Waiting for you&#8230;"
+        return "Waiting for you…"
     if state in BUSY_STATES:
-        return "Scanning&#8230;"
+        return "Scanning…"
     return "Scan"
 
 
@@ -1341,9 +1352,25 @@ def test_warned_done_renders_the_warning_on_the_status_poll(
 def test_warned_done_renders_the_warning_on_the_index_page(
     client: TestClient,
 ) -> None:
-    """A reload of the page says the same as the poll, not a stale green tick."""
+    """
+    A reload names the warned upload as the last scan, never a green tick.
+
+    The page reports a finished job as the past, so the amber headline is the
+    poll's; what the page must still never do is call a warned upload Done,
+    and it keeps the warning beneath, muted like the line above it.
+    """
     _job_in_state(client, JobState.DONE, warning=_SKIPPED_SHEET_WARNING)
-    _assert_warned_done(client.get("/").text)
+    area = _element(client.get("/").text, "status-area")
+
+    assert re.search(
+        r'<p class="last-scan">Last scan: \u26a0 Uploaded with a warning: '
+        r"Render Test \u2014 started [^<]+</p>",
+        area,
+    )
+    assert f'<p class="last-scan">{_SKIPPED_SHEET_WARNING}</p>' in area
+    assert "Done: Render Test" not in area
+    assert "status-done" not in area
+    assert 'role="alert"' not in area
 
 
 def test_warned_done_warning_is_escaped_not_injected(client: TestClient) -> None:
@@ -1647,13 +1674,21 @@ class TestRemovedPagesNote:
         assert '<p class="status-done">&#10003; Done: Render Test</p>' in text
         assert "status-fallback" not in text
 
-    def test_the_index_page_names_the_removed_pages(self, client: TestClient) -> None:
-        """A reload of the page shows the same note as the poll."""
+    def test_the_index_page_leaves_the_note_to_history(
+        self, client: TestClient
+    ) -> None:
+        """
+        A reload reports the scan as past, and its history row keeps the note.
+
+        The status area's last-scan rendering carries no counts, so the note
+        the operator needs to rescan by is the history row's, on the same page.
+        """
         _finished_job(client, JobState.DONE, _BLANK_BACKS)
         text = client.get("/").text
-        assert f'<p class="page-counts">{_BLANK_BACKS_NOTE}</p>' in text
-        assert 'class="status-done"' in text
-        assert "status-fallback" not in text
+        area = _element(text, "status-area")
+        assert "page-counts" not in area
+        assert '<p class="last-scan">Last scan: \u2713 Done: Render Test' in area
+        assert f'<span class="page-counts">{_BLANK_BACKS_NOTE}</span>' in text
 
     def test_the_note_follows_the_counts(self, client: TestClient) -> None:
         """The note reads after the counts sentence it explains."""
@@ -2550,7 +2585,7 @@ class TestScanButtonFollowsTheRenderedJob:
         match = _only_scan_button(client.get("/api/jobs/current/status").text)
 
         assert "disabled" in match.group("attrs")
-        assert match.group("text").strip() == "Scanning&#8230;"
+        assert match.group("text").strip() == "Scanning…"
 
     def test_the_button_never_describes_a_job_the_status_area_is_not_showing(
         self, client: TestClient
@@ -2562,7 +2597,7 @@ class TestScanButtonFollowsTheRenderedJob:
         text = client.get(f"/api/jobs/{finished}/status").text
 
         assert "Render Test" not in text
-        assert "Scanning&#8230;" not in text
+        assert "Scanning…" not in text
 
     def test_a_blocked_appliance_disables_even_a_finished_followed_job(
         self, blocked_client: TestClient
@@ -3328,3 +3363,469 @@ class TestPromptAutofocus:
         poll = client.get(_status_poll_url(page), headers=_HX_REQUEST)
 
         assert poll.status_code == 204, poll.text
+
+
+# --- A fresh page reports a finished job as the past (D-12, D-13, T-19) -------
+
+# One finished job per kind of outcome the "Last scan" line can name: the
+# state, the warning and the category it records, the start of the line it
+# must render, and the detail line under it (None for none).  The expected
+# lines are written out, so a change to the copy fails here as well as in
+# tests/test_vocabulary.py.
+_WARNED = "A sheet could not be read; rescan it."
+_LAST_SCAN_CASES: dict[
+    str, tuple[JobState, str | None, ErrorCategory | None, str, str | None]
+] = {
+    "done": (JobState.DONE, None, None, "Last scan: ✓ Done: Render Test", None),
+    "done-warned": (
+        JobState.DONE,
+        _WARNED,
+        None,
+        "Last scan: ⚠ Uploaded with a warning: Render Test",
+        _WARNED,
+    ),
+    "fallback": (
+        JobState.FALLBACK,
+        None,
+        None,
+        "Last scan: → Saved to folder: Render Test",
+        None,
+    ),
+    "cancelled": (
+        JobState.CANCELLED,
+        None,
+        None,
+        "Last scan: ⊘ Cancelled: Render Test",
+        None,
+    ),
+    "error-red": (
+        JobState.ERROR,
+        None,
+        ErrorCategory.SCANNER,
+        "Last scan: ✗ Failed: Render Test",
+        f"{error_message(ErrorCategory.SCANNER)} "
+        f"{error_next_step(ErrorCategory.SCANNER)}",
+    ),
+    "error-amber": (
+        JobState.ERROR,
+        None,
+        ErrorCategory.UNCONFIRMED_SEND,
+        f"Last scan: ⚠ {UNCONFIRMED_SEND_LABEL}: Render Test",
+        f"{error_message(ErrorCategory.UNCONFIRMED_SEND)} "
+        f"{error_next_step(ErrorCategory.UNCONFIRMED_SEND)}",
+    ),
+    "error-no-category": (
+        JobState.ERROR,
+        None,
+        None,
+        "Last scan: ✗ Failed: Render Test",
+        "disk on fire",
+    ),
+}
+
+# The idle line on an appliance that can scan.
+_IDLE_LINE = "<p>Ready to scan.</p>"
+
+# Every class the live outcome branches colour a line with.  None may reach a
+# past outcome: it is muted whatever it was.
+_LIVE_OUTCOME_CLASSES = (
+    "status-done",
+    "status-error",
+    "status-fallback",
+    "status-cancelled",
+)
+
+_TITLE_TAG = re.compile(r"<title>(?P<text>.*?)</title>", re.DOTALL)
+
+
+def _last_job(
+    client: TestClient,
+    case: str,
+    *,
+    owner: str | None = _RENDERING_BROWSER,
+    title: str = "Render Test",
+) -> str:
+    """
+    Finish a job as ``_LAST_SCAN_CASES[case]`` describes, with a preview and counts.
+
+    The preview and the counts are recorded so that their absence from the
+    "Last scan" rendering is a finding, not an accident of the staging.
+
+    Args:
+        client: The client whose app owns the store and worker.
+        case: A key of ``_LAST_SCAN_CASES``.
+        owner: The owner token to record, or None for an unowned row.
+        title: The job's title.
+
+    Returns:
+        The job's id.
+
+    """
+    state, warning, category, _, _ = _LAST_SCAN_CASES[case]
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title=title, owner_token=owner)
+    job_store.update_thumbnail(job.id, _THUMBNAIL)
+    job_store.finish_job(
+        job.id,
+        state,
+        result=JobResult(
+            outcome=None,
+            warning=warning,
+            pages_scanned=4,
+            pages_removed=2,
+            pages_uploaded=2,
+            removed_positions=(2, 4),
+        ),
+        error="disk on fire",
+        error_category=category,
+    )
+    _adopt_as_current_job(client, job.id)
+    return job.id
+
+
+def _started(client: TestClient, job_id: str) -> str:
+    """Return how the "Last scan" line spells the job's creation time."""
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.get_job(job_id)
+    assert job is not None
+    return local_time(job.created_at)
+
+
+def _page_as(client: TestClient, token: str | None) -> str:
+    """
+    Fetch the full page as a browser carrying ``token``, as ``_as_browser`` does.
+
+    Returns:
+        The rendered page.
+
+    """
+    client.cookies.clear()
+    headers = {} if token is None else {"Cookie": f"{_OWNER_COOKIE}={token}"}
+    response = client.get("/", headers=headers)
+    assert response.status_code == 200
+    return response.text
+
+
+class TestLastScanLine:
+    """A page loaded with no job active reports the last one as the past (D-12)."""
+
+    @pytest.mark.parametrize("case", list(_LAST_SCAN_CASES))
+    def test_last_scan_line_on_a_fresh_page(
+        self, client: TestClient, case: str
+    ) -> None:
+        """
+        The idle line comes first, then the muted outcome, title and start time.
+
+        A warned or failed job adds its detail line in the same style, and a
+        failure with a category keeps its disclosure.
+        """
+        state, _, category, line, detail = _LAST_SCAN_CASES[case]
+        job_id = _last_job(client, case)
+        area = _element(client.get("/").text, "status-area")
+
+        expected = f"{line} — started {_started(client, job_id)}"
+        assert f'<p class="last-scan">{escape(expected)}</p>' in area
+        assert area.index(_IDLE_LINE) < area.index('class="last-scan"')
+        if detail is None:
+            assert area.count('class="last-scan"') == 1
+        else:
+            assert f'<p class="last-scan">{escape(detail)}</p>' in area
+            assert area.count('class="last-scan"') == 2
+        details = _TECH_DETAILS.search(area)
+        assert (details is not None) is (
+            state is JobState.ERROR and category is not None
+        )
+        if details is not None:
+            assert "open" not in details.group("attrs")
+            assert "disk on fire" in details.group("body")
+            assert f"Category: {category}" in details.group("body")
+            assert f"Job: {job_id}" in details.group("body")
+
+    @pytest.mark.parametrize("case", list(_LAST_SCAN_CASES))
+    def test_last_scan_has_no_alert_or_thumbnail(
+        self, client: TestClient, case: str
+    ) -> None:
+        """
+        No alert, preview, counts, colour, reload or poll: it is not news.
+
+        The page's one assertive region stays the empty ``#status-message``.
+        """
+        _last_job(client, case)
+        page = client.get("/").text
+        area = _element(page, "status-area")
+
+        assert page.count('role="alert"') == 1
+        assert 'role="alert"' not in area
+        assert "<img" not in area
+        assert "page-counts" not in area
+        assert "hx-get" not in area
+        assert "hx-trigger" not in area
+        for name in _LIVE_OUTCOME_CLASSES:
+            assert name not in area
+        button = _only_scan_button(page)
+        assert "disabled" not in button.group("attrs")
+        assert button.group("text").strip() == "Scan"
+
+    @pytest.mark.parametrize(
+        ("recorded", "presented", "sees_detail"),
+        [
+            (_RENDERING_BROWSER, _RENDERING_BROWSER, True),
+            (_RENDERING_BROWSER, _RENDERING_BROWSER + "-not", False),
+            (_RENDERING_BROWSER, None, False),
+            (None, _RENDERING_BROWSER, False),
+        ],
+        ids=["owner", "other-browser", "no-token", "unowned-row"],
+    )
+    def test_last_scan_title_is_owner_gated(
+        self,
+        client: TestClient,
+        recorded: str | None,
+        presented: str | None,
+        *,
+        sees_detail: bool,
+    ) -> None:
+        """The real title and warning reach only the browser that started it."""
+        job_id = _last_job(
+            client, "done-warned", owner=recorded, title="Owner Only Marker"
+        )
+        area = _element(_page_as(client, presented), "status-area")
+
+        shown = "Owner Only Marker" if sees_detail else HIDDEN_JOB_TITLE
+        line = (
+            f"Last scan: ⚠ Uploaded with a warning: {shown}"
+            f" — started {_started(client, job_id)}"
+        )
+        warning = _WARNED if sees_detail else HIDDEN_WARNING_LINE
+        assert f'<p class="last-scan">{escape(line)}</p>' in area
+        assert f'<p class="last-scan">{escape(warning)}</p>' in area
+        assert ("Owner Only Marker" in area) is sees_detail
+        assert (_WARNED in area) is sees_detail
+
+    def test_no_job_ever_shows_the_idle_line_alone(self, client: TestClient) -> None:
+        """A fresh install has nothing to report but that it is ready."""
+        area = _element(client.get("/").text, "status-area")
+
+        assert _IDLE_LINE in area
+        assert area.count("<p") == 1
+        assert "last-scan" not in area
+
+    @pytest.mark.parametrize("route", ["current", "followed"])
+    def test_live_terminal_poll_keeps_the_alert(
+        self, client: TestClient, route: str
+    ) -> None:
+        """A poll that watches the job fail still announces it, in red."""
+        job_id = _last_job(client, "error-red")
+        path = (
+            "/api/jobs/current/status"
+            if route == "current"
+            else f"/api/jobs/{job_id}/status"
+        )
+        text = client.get(path).text
+
+        assert text.count('role="alert"') == 1
+        assert _ALERT_DIV.search(text) is not None
+        assert "last-scan" not in text
+        assert "Ready to scan." not in text
+        assert _HISTORY_RELOAD in text
+
+
+@pytest.mark.parametrize(
+    ("fixture", "reason"),
+    [
+        ("blocked_client", SCAN_BLOCKED_REASON),
+        ("url_unset_client", SCAN_BLOCKED_URL_REASON),
+    ],
+    ids=["token-unset", "url-unset"],
+)
+@pytest.mark.parametrize("path", ["/", "/api/jobs/current/status"])
+def test_blocked_idle_line_is_the_blocked_reason(
+    request: pytest.FixtureRequest, fixture: str, reason: str, path: str
+) -> None:
+    """
+    On an appliance that cannot upload, the idle line says why, not "Ready".
+
+    It is plain text: the red reason is under the button already, and a red
+    line in the status area with no alert role would read as a live failure.
+    """
+    blocked: TestClient = request.getfixturevalue(fixture)
+    area = _element(blocked.get(path).text, "status-area")
+
+    assert f"<p>{escape(reason)}</p>" in area
+    assert "Ready to scan." not in area
+    assert "status-error" not in area
+
+
+def _queued_behind_a_running_job(client: TestClient) -> str:
+    """
+    Stage a PENDING job this browser owns behind a SCANNING one.
+
+    Returns:
+        The queued job's id.
+
+    """
+    _job_in_state(client, JobState.SCANNING)
+    job_store: JobStore = _app(client).state.job_store
+    return job_store.create_job(
+        profile="default", title="Queued Render", owner_token=_RENDERING_BROWSER
+    ).id
+
+
+@pytest.mark.parametrize("queued", [True, False], ids=["queued", "starting"])
+def test_queued_button_reads_queued(client: TestClient, *, queued: bool) -> None:
+    """
+    A job still waiting to start makes the button say Queued, not Scanning.
+
+    Both a job behind another and one about to start alone are PENDING, and
+    neither is being scanned yet.
+    """
+    if queued:
+        job_id = _queued_behind_a_running_job(client)
+    else:
+        job_id = _job_in_state(client, JobState.PENDING)
+    for text in (client.get("/").text, client.get(f"/api/jobs/{job_id}/status").text):
+        button = _only_scan_button(text)
+        assert button.group("text").strip() == "Queued…"
+        assert "disabled" in button.group("attrs")
+        assert "Scanning…" not in text
+
+
+def _titles(markup: str) -> list[str]:
+    """Return the text of every ``<title>`` in the markup."""
+    return [match.group("text") for match in _TITLE_TAG.finditer(markup)]
+
+
+# The tab title each state's status response carries, written out.  An ERROR
+# row carries the module's default category, which is red.
+_STATE_TITLES = {
+    JobState.PENDING: "Starting — saneless",
+    JobState.SCANNING: "Scanning — saneless",
+    JobState.AWAITING_FLIP: "Waiting for flip — saneless",
+    JobState.AWAITING_NEXT_PASS: "Waiting for more pages — saneless",
+    JobState.AWAITING_BLANK_DECISION: "Waiting: blank pages found — saneless",
+    JobState.AWAITING_RETRY: "Waiting: last scan failed — saneless",
+    JobState.SCANNING_REVERSE: "Scanning backs — saneless",
+    JobState.ASSEMBLING: "Assembling — saneless",
+    JobState.UPLOADING: "Uploading — saneless",
+    JobState.DONE: "Done — saneless",
+    JobState.ERROR: "Failed — saneless",
+    JobState.FALLBACK: "Saved to folder — saneless",
+    JobState.CANCELLED: "Cancelled — saneless",
+}
+
+
+class TestPageTitle:
+    """The tab's title follows the status area's state, never the job's title."""
+
+    def test_every_state_has_a_title(self) -> None:
+        """The table covers every state, so a new one forces a decision here."""
+        assert set(_STATE_TITLES) == set(JobState)
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_status_response_title_by_state(
+        self, client: TestClient, state: JobState
+    ) -> None:
+        """
+        Each poll carries one title, at the top level, ahead of the area.
+
+        htmx reads a title only at the root of a response, so one inside the
+        status area would never reach the tab.
+        """
+        _job_in_state(client, state)
+        text = client.get("/api/jobs/current/status").text
+
+        expected = page_title(state, category=_DEFAULT_ERROR_CATEGORY, queued=False)
+        assert expected == _STATE_TITLES[state]
+        assert _titles(text) == [escape(expected)]
+        assert text.index("<title>") < text.index('<div id="status-area"')
+
+    def test_queued_and_starting_titles_differ(self, client: TestClient) -> None:
+        """A job behind another is Queued; one about to start alone, Starting."""
+        job_id = _queued_behind_a_running_job(client)
+        assert _titles(client.get(f"/api/jobs/{job_id}/status").text) == [
+            "Queued — saneless"
+        ]
+        starting = _job_in_state(client, JobState.PENDING)
+        assert _titles(client.get(f"/api/jobs/{starting}/status").text) == [
+            "Starting — saneless"
+        ]
+
+    def test_a_warned_upload_is_not_titled_done(self, client: TestClient) -> None:
+        """The tab names a warned upload as the status area heads it."""
+        _job_in_state(client, JobState.DONE, warning=_WARNED)
+        assert _titles(client.get("/api/jobs/current/status").text) == [
+            "Uploaded with a warning — saneless"
+        ]
+
+    @pytest.mark.usefixtures("offline_paperless")
+    @pytest.mark.parametrize("route", _STATUS_ROUTES)
+    def test_every_status_response_carries_one_title(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, route: str
+    ) -> None:
+        """
+        Every status response names the state; the lost-contact one names none.
+
+        The fallback knows nothing of the job, so it leaves the tab's title as
+        it was rather than guess.
+        """
+        text = _status_response(client, monkeypatch, route)
+
+        titles = _titles(text)
+        if route == "lost-contact fallback":
+            assert titles == []
+        else:
+            assert len(titles) == 1
+            assert titles[0].endswith(" — saneless")
+            assert text.index("<title>") < text.index('<div id="status-area"')
+
+    @pytest.mark.parametrize(
+        ("stage", "expected"),
+        [
+            ("none", "saneless"),
+            ("finished", "saneless"),
+            ("active", "Scanning — saneless"),
+        ],
+    )
+    def test_page_title_on_the_full_page(
+        self, client: TestClient, stage: str, expected: str
+    ) -> None:
+        """
+        The page's title is the rule the polls follow.
+
+        A finished job is the past, so the page is titled as idle.
+        """
+        if stage == "finished":
+            _last_job(client, "error-red")
+        elif stage == "active":
+            _job_in_state(client, JobState.SCANNING)
+
+        assert _titles(client.get("/").text) == [expected]
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_title_never_contains_the_job_title(
+        self, client: TestClient, state: JobState
+    ) -> None:
+        """
+        The owner's own title never reaches the tab, the switcher or history.
+
+        The page names the sentinel in its history row, which is what makes
+        its absence from the page's title mean something; a poll renders it
+        wherever its state shows the title.
+        """
+        sentinel = "Tab Title Sentinel"
+        job_store: JobStore = _app(client).state.job_store
+        job = job_store.create_job(
+            profile="default", title=sentinel, owner_token=_RENDERING_BROWSER
+        )
+        job_store.update_state(job.id, state)
+        _adopt_as_current_job(client, job.id)
+
+        page = client.get("/").text
+        assert sentinel in page
+        for text in (
+            page,
+            client.get("/api/jobs/current/status").text,
+            client.get(f"/api/jobs/{job.id}/status").text,
+        ):
+            titles = _titles(text)
+            assert titles
+            assert all(sentinel not in title for title in titles)

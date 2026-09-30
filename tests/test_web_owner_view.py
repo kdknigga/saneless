@@ -179,14 +179,20 @@ class TestOwnedRow:
     def test_the_owner_sees_the_title_and_preview_on_every_route(
         self, owner: TestClient
     ) -> None:
-        """The status area, both polls and history name the owner's own scan."""
+        """
+        The status area, both polls and history name the owner's own scan.
+
+        The preview rides with the live outcome on the polls.  The page reports
+        a finished scan as the last one, by title and with no preview, and
+        history never carries one.
+        """
         job = _done_row(_store(owner), owner_token=OWNER_TOKEN)
 
         for path in _job_status_routes(job.id):
             text = owner.get(path).text
             assert OWNER_TITLE in text, path
-            if path != "/api/jobs/history":
-                assert f"{PREVIEW};base64,{THUMBNAIL}" in text, path
+            previewed = path not in {"/", "/api/jobs/history"}
+            assert (f"{PREVIEW};base64,{THUMBNAIL}" in text) is previewed, path
 
     def test_another_browser_sees_the_generic_title_and_no_preview(
         self, owner: TestClient, other: TestClient
@@ -453,9 +459,10 @@ class TestTemplateContract:
         assert templates
         for template in templates:
             source = comment.sub("", template.read_text(encoding="utf-8"))
+            # ``last_job`` is the page's finished job, a view like ``job``.
             read.update(
                 (template.name, name)
-                for name in re.findall(r"\bjob\.([a-z_]+)", source)
+                for name in re.findall(r"\b(?:last_)?job\.([a-z_]+)", source)
             )
 
         assert read, "no template reads a job attribute; the pattern has broken"
@@ -464,7 +471,12 @@ class TestTemplateContract:
     def test_every_route_hands_templates_job_views(
         self, owner: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The status context's job and every history row are views, not rows."""
+        """
+        The status context's job and every history row are views, not rows.
+
+        The page hands a finished job over as ``last_job`` and sets ``job`` to
+        None, so both keys are read, and the one that is set must be a view.
+        """
         job = _done_row(_store(owner), owner_token=OWNER_TOKEN)
         templates = _app(owner).state.templates
         original = templates.TemplateResponse
@@ -484,7 +496,12 @@ class TestTemplateContract:
         for path in _job_status_routes(job.id):
             owner.get(path)
 
-        jobs = [context["job"] for context in contexts if "job" in context]
+        jobs = [
+            context[key]
+            for context in contexts
+            for key in ("job", "last_job")
+            if context.get(key) is not None
+        ]
         rows: list[object] = []
         for context in contexts:
             listed = context.get("jobs")
