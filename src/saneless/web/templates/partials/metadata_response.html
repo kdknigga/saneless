@@ -20,10 +20,13 @@
      status context, so an active job or a blocked appliance still disables
      it.  A failed list releases it exactly as a loaded one does.
    - the hold reason, emptied to a byte-empty element so :empty hides it.
+     Not for a blocked appliance: its page renders the blocked reason alone,
+     so there is no hold line to empty, and an out-of-band element with no
+     target is an htmx error.
 
    No title element: the lists change nothing the tab names. #}
 {% if (show_tags and tags_unavailable) or (show_correspondent and correspondents_unavailable) %}<div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata?retry=1" hx-include="#tag-filter, #tags-list, #correspondent-select" hx-trigger="every {{ retry_seconds }}s" hx-swap="outerHTML"></div>{% endif %}
 {% if show_tags %}{% with list_oob = true %}{% include "partials/tags.html" %}{% endwith %}{% endif %}
 {% if show_correspondent %}{% with list_oob = true %}{% include "partials/correspondent_select.html" %}{% endwith %}{% endif %}
 {% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}
-<small id="scan-hold-reason" hx-swap-oob="true"></small>
+{% if not scan_blocked %}<small id="scan-hold-reason" hx-swap-oob="true"></small>{% endif %}

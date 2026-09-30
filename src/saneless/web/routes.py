@@ -80,6 +80,7 @@ from saneless.vocabulary import (
     pass_heading,
     pass_prompt_copy,
     progress_label,
+    scan_hold_reason,
     stale_default_correspondent_label,
     stale_default_tag_label,
     unlisted_correspondent_label,
@@ -726,6 +727,57 @@ def _unnamed_rows(
     return [{"id": item, "label": stale_label(item)} for item in missing], []
 
 
+def _no_tag_list() -> dict[str, object]:
+    """
+    Return the tag list's context with no list in it and nothing ticked.
+
+    The key set is ``_tag_list_context``'s, emptied.  A hidden list renders
+    nothing from it, and the page, which loads its lists after it renders,
+    shows a loading line in their place.  Both spread it with ``**``, so a
+    missing key would leave an undefined name in a template.
+
+    Returns:
+        The emptied context: no rows, nothing ticked, and no verdict on
+        whether the list could be loaded, because nobody asked.
+
+    """
+    return {
+        "stale": [],
+        "unlisted": [],
+        "pinned": [],
+        "tags": [],
+        "selected_tags": set(),
+        "any_tags": False,
+        "tags_unavailable": False,
+    }
+
+
+def _no_correspondent_options(*, shown: bool) -> dict[str, object]:
+    """
+    Return the correspondent options' context with no list and no choice.
+
+    The key set is ``_correspondent_options_context``'s, emptied, for the
+    same two callers as ``_no_tag_list``: a hidden control, and the page,
+    whose select holds only the option that means none until the list
+    arrives.
+
+    Args:
+        shown: Whether the control is on the page.  It rides along so the
+            partials leave out the help line a hidden control does not have.
+
+    Returns:
+        The emptied context.
+
+    """
+    return {
+        "correspondents": [],
+        "selected_correspondent": None,
+        "extra_option": None,
+        "correspondents_unavailable": False,
+        "show_correspondent": shown,
+    }
+
+
 def _tag_list_context(
     state: State,
     *,
@@ -777,19 +829,10 @@ def _tag_list_context(
     # flag that decides whether the data can ever be seen.  The guard sits in
     # this function rather than in ``index`` so it covers every call site,
     # including the filter, refresh and profile-change routes, which have the
-    # same reason to skip.  The key set below is the normal path's, emptied:
-    # ``index`` spreads this with ``**``, so a missing key would leave an
-    # undefined name in a template that has nothing to do with tags.
+    # same reason to skip.  The key set is the normal path's, emptied (see
+    # ``_no_tag_list``).
     if not state.settings.web.show_tags:
-        return {
-            "stale": [],
-            "unlisted": [],
-            "pinned": [],
-            "tags": [],
-            "selected_tags": set(),
-            "any_tags": False,
-            "tags_unavailable": False,
-        }
+        return _no_tag_list()
     cached = _cached_list_or_none(state.cache, state.paperless, "tags", timeout=timeout)
     listed = cached.rows if cached is not None else None
     # The same rule the pre-scan check applies, so the page and the scan
@@ -861,19 +904,11 @@ def _correspondent_options_context(
     # With ``[web] show_correspondent`` off the select is never emitted, so a
     # fetch buys nothing, and it is a token-bearing request for data nobody
     # can be shown.  The guard sits here, as the tag list's does, so it covers
-    # every caller: the page, the options, the refresh and the profile
-    # change.  The keys are the normal path's, emptied, because the page
-    # spreads this with ``**`` and a missing key would leave an undefined
-    # name in a template.  ``show_correspondent`` rides along so the partials
-    # leave out the help line a hidden control does not have.
+    # every caller: the options, the refresh, the profile change and the
+    # lazy list load.  The keys are the normal path's, emptied (see
+    # ``_no_correspondent_options``).
     if not state.settings.web.show_correspondent:
-        return {
-            "correspondents": [],
-            "selected_correspondent": None,
-            "extra_option": None,
-            "correspondents_unavailable": False,
-            "show_correspondent": False,
-        }
+        return _no_correspondent_options(shown=False)
     cached = _cached_list_or_none(
         state.cache, state.paperless, "correspondents", timeout=timeout
     )
@@ -2159,12 +2194,20 @@ def index(request: Request) -> Response:
     Render the main page with scan form, status, and job history.
 
     Populates profile selector from the worker's profile set (read under its
-    profile lock), fetches tags and correspondents from cache or
-    paperless-ngx, and loads recent job history from the database.  The page
+    profile lock) and loads recent job history from the database.  The page
     opens on ``default``, or on the profile standing in for a hidden
-    ``default``, and the tag list and the correspondent select open on that
-    profile's defaults, ticked and selected, so an untouched submit scans with
-    exactly what ``saneless scan`` with no ``--profile`` would.
+    ``default``.
+
+    The page makes no paperless-ngx call, so a slow or unreachable
+    paperless-ngx never holds it up.  Where the tag list and the
+    correspondent select go it says each is loading, and a hidden loader
+    asks ``/api/metadata`` for both once the page has rendered, naming the
+    profile the select shows.  That answer ticks the profile's default tags
+    and selects its correspondent, so an untouched submit still scans with
+    exactly what ``saneless scan`` with no ``--profile`` would.  Until it
+    lands, Scan is held, with a line that says why: the lists it would file
+    the scan with have not arrived.  An answer that says a list could not be
+    loaded releases Scan just as one that brings the list does.
     """
     state = request.app.state
     # The refresher only probes while a page says someone is looking, so
@@ -2180,25 +2223,13 @@ def index(request: Request) -> Response:
         (option for option in choices.options if option.name == choices.opening),
         None,
     )
-    # The profile the page opens on, looked up once under the worker's lock as
-    # ``start_scan`` looks it up.  None when there is no profile, or when the
-    # set was rewritten between listing and reading it; the page then opens
-    # with nothing ticked, which is what a profile without defaults means too.
-    opening = state.worker.get_profile(choices.opening) if choices.opening else None
-    # A full page render is the unfiltered case of the same context the filter
-    # route builds, ticked with the opening profile's defaults, so it goes
-    # through the same function rather than a second shape the two could
-    # drift apart on.
-    tag_list = _tag_list_context(
-        state,
-        q="",
-        selected=list(opening.default_tags) if opening is not None else [],
-    )
-    # The correspondent half, which skips its fetch the same way when the
-    # control is hidden (see ``_correspondent_options_context``).
-    correspondent_options = _correspondent_options_context(
-        state, opening.default_correspondent if opening is not None else None
-    )
+    # Which lists the form shows, and so which ones the page waits for.  The
+    # lists themselves are never fetched here: the page carries the emptied
+    # contexts, the key sets the templates read, and the lazy list load
+    # brings the rows.
+    show_tags = state.settings.web.show_tags
+    show_correspondent = state.settings.web.show_correspondent
+    lists_loading = show_tags or show_correspondent
 
     # The page follows the newest active job this browser owns, so a reload
     # while someone else's scan runs still reports the scan this person
@@ -2249,8 +2280,24 @@ def index(request: Request) -> Response:
                 and opening_option.manual_duplex,
                 ticked=False,
             ),
-            **tag_list,
-            **correspondent_options,
+            **_no_tag_list(),
+            **_no_correspondent_options(shown=show_correspondent),
+            # The loading lines where the lists go, one per shown list.
+            "tags_loading": show_tags,
+            "correspondents_loading": show_correspondent,
+            # The third source of a disabled Scan button, beside an active job
+            # and a blocked appliance: a shown list has not arrived yet.  The
+            # lazy list load re-renders the button without it, and empties the
+            # hold line, whether the lists arrived or could not be loaded.
+            "lists_loading": lists_loading,
+            # Why Scan is held, naming only the lists the page shows.  A blocked
+            # appliance has its own reason, which still holds after the lists
+            # arrive, so the page renders that one alone.
+            "scan_hold_reason": (
+                None
+                if block is not None
+                else scan_hold_reason(tags=show_tags, correspondents=show_correspondent)
+            ),
             **status,
             **last_scan,
             **_checks_context(state),
@@ -2271,8 +2318,8 @@ def index(request: Request) -> Response:
             # control opens on the profile's defaults, and ``start_scan``
             # applies the same defaults for exactly the control that is not
             # on the page.
-            "show_tags": state.settings.web.show_tags,
-            "show_correspondent": state.settings.web.show_correspondent,
+            "show_tags": show_tags,
+            "show_correspondent": show_correspondent,
             # A page load moves no focus, even while a prompt is open: the
             # prompts leave their autofocus off when this is set.  No status
             # response sets it and the poll token never sees it, so the page's

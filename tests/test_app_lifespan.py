@@ -117,8 +117,8 @@ def settings(tmp_path: Path) -> Settings:
 def _build_app(settings: Settings) -> FastAPI:
     """Build the real app with a stub scanner and no Paperless network calls."""
     app = create_app(settings, StubScannerBackend())
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     return app
 
 
@@ -647,8 +647,8 @@ def test_shutdown_closes_resources_after_both_threads_stop(
     """
     scanner = StubScannerBackend()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     worker = app.state.worker
     refresher = app.state.refresher
     store: JobStore = app.state.job_store
@@ -979,8 +979,8 @@ def test_shutdown_leaves_resources_open_when_the_refresher_does_not_stop(
     """
     scanner = StubScannerBackend()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     refresher = app.state.refresher
     store: JobStore = app.state.job_store
     paperless = app.state.paperless
@@ -1115,8 +1115,8 @@ def test_shutdown_closes_the_scanner_after_the_store(
     """
     scanner = _ClosingScanner()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     store: JobStore = app.state.job_store
     paperless = app.state.paperless
     calls: list[str] = []
@@ -1156,8 +1156,8 @@ def test_shutdown_leaves_the_scanner_open_when_the_worker_does_not_stop(
     """
     scanner = _ClosingScanner()
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     worker = app.state.worker
     store: JobStore = app.state.job_store
     paperless = app.state.paperless
@@ -1475,8 +1475,8 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     assert fake.init_call_count == 1
 
     app = create_app(settings, scanner)
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     app.state.paperless.test_connection = lambda: "connected"
     app.state.paperless.upload_document = lambda *_a, **_k: ApiDelivery(
         task_id="d-19-proof"

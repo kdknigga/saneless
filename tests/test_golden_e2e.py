@@ -62,7 +62,7 @@ from saneless.vocabulary import (
     pass_wait_state,
 )
 from saneless.web.app import create_app
-from tests.conftest import poll_until, wait_for_state
+from tests.conftest import load_the_lists, poll_until, wait_for_state
 from tests.golden_support import (
     DOCUMENTS_PATH,
     GOLDEN_CORRESPONDENT_IDS,
@@ -1317,7 +1317,9 @@ def _untouched_web_upload(
 
     The page opens on ``default``, which carries the golden defaults though it
     is not the only profile.  Only the title is typed; the profile, the ticked
-    tags and the chosen correspondent are read from the rendered page.
+    tags and the chosen correspondent are read from the rendered page and the
+    lists its loader brings once it has rendered, in that order, as a browser
+    shows them.
 
     Args:
         tmp_path: The directory this run keeps its files under.
@@ -1339,6 +1341,7 @@ def _untouched_web_upload(
         assert page.status_code == 200, page.text
         form_state = _UntouchedForm()
         form_state.feed(page.text)
+        form_state.feed(load_the_lists(client, page.text))
         form: dict[str, str | list[str]] = {
             "profile": form_state.choice("profile"),
             "title": _TITLE,

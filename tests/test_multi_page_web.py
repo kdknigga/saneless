@@ -150,8 +150,8 @@ def _profiles(*, duplex_opens: bool = False) -> dict[str, ProfileConfig]:
 def _serve(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Served]:
     """Run an app for ``settings`` whose worker records every submit."""
     app = create_app(settings, StubScannerBackend())
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     submitted = _Recorded()
     monkeypatch.setattr(app.state.worker, "submit", submitted)
     with TestClient(app) as client:

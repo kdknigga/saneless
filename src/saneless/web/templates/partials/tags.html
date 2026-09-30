@@ -55,7 +55,12 @@
    The lazy list load (partials/metadata_response.html) sends the whole list
    out-of-band, because its own swap target is the loader, so it sets
    list_oob.  The name is not oob: the marker include above reads oob, and
-   the wrapper's flag must not decide the marker's. #}
+   the wrapper's flag must not decide the marker's.
+
+   The page itself asks paperless-ngx for nothing, so it renders the list
+   loading (tags_loading): the same wrapper with the same attributes, so a
+   profile change made before the lazy list load lands still refreshes it,
+   holding only the loading line.  The lazy list load replaces it whole. #}
 {% if follows_profile %}{% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
 <div id="tags-list" class="tag-list"{% if list_oob %} hx-swap-oob="true"{% endif %}
      hx-get="/api/profiles/tags"
@@ -63,6 +68,9 @@
      hx-include="#profile-select"
      hx-target="this"
      hx-swap="outerHTML">
+    {%- if tags_loading %}
+    <small>{{ TAGS_LOADING }}</small>
+    {%- else %}
     {%- if tags_unavailable %}
     <small class="status-fallback">&#9888; {{ TAGS_UNAVAILABLE }}</small>
     {%- endif %}
@@ -80,5 +88,6 @@
     {%- endfor %}
     {%- if not tags_unavailable and not stale and not unlisted and not pinned and not tags %}
     {% if any_tags %}<small>No tags match that filter.</small>{% else %}<small>No tags in paperless-ngx yet.</small>{% endif %}
+    {%- endif %}
     {%- endif %}
 </div>

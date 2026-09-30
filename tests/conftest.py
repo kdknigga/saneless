@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import functools
+import html
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
     from fastapi import FastAPI
+    from fastapi.testclient import TestClient
     from starlette.routing import BaseRoute
 
     from saneless.job import Job, JobStore
@@ -1296,3 +1299,45 @@ def _flatten_routes(routes: Sequence[BaseRoute]) -> list[BaseRoute]:
         else:
             found.append(route)
     return found
+
+
+# The page's hidden loader, and the option its Profile select opens on.  The
+# page is the only thing that renders either, so a test that means "what the
+# person sees once the page has loaded" reads both from the page it has.
+_LIST_LOADER = 'id="metadata-loader"'
+_OPENING_PROFILE = re.compile(
+    r'<select name="profile" id="profile-select".*?'
+    r'<option value="(?P<name>[^"]*)" selected>',
+    re.DOTALL,
+)
+
+
+def load_the_lists(client: TestClient, page: str) -> str:
+    """
+    Ask for the lists the way the page's loader does, and return the answer.
+
+    ``/`` renders the tag list and the correspondent select loading, and a
+    hidden loader asks ``/api/metadata`` for both, naming the profile the
+    Profile select shows.  This sends that request: an assertion about the
+    ticks, the options or the profile markers a person sees once the page has
+    loaded reads them from its answer.  A page with no loader, because it
+    shows neither list, asks nothing, and the answer is empty.
+
+    Args:
+        client: The browser that rendered ``page``.
+        page: The rendered ``/``.
+
+    Returns:
+        The lazy list load's response body, or ``""`` when the page has no
+        loader.
+
+    """
+    if _LIST_LOADER not in page:
+        return ""
+    opening = _OPENING_PROFILE.search(page)
+    assert opening is not None, "the page's Profile select opens on no option"
+    response = client.get(
+        "/api/metadata", params={"profile": html.unescape(opening.group("name"))}
+    )
+    assert response.status_code == 200, response.text
+    return response.text

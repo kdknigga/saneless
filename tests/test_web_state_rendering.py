@@ -40,12 +40,14 @@ from saneless.config import (
     ProfileConfig,
     ScannerConfig,
     Settings,
+    WebConfig,
 )
 from saneless.job import JobResult
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    CORRESPONDENTS_LOADING,
     HIDDEN_JOB_TITLE,
     HIDDEN_WARNING_LINE,
     PASS_WAIT_STATES,
@@ -81,10 +83,12 @@ from saneless.vocabulary import (
 from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.worker import WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, poll_until
+from tests.conftest import StubScannerBackend, load_the_lists, poll_until
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+
+    import httpx2
 
     from saneless.job import JobStore
 
@@ -173,6 +177,7 @@ def _make_app(
     *,
     credential: str = _REAL_CREDENTIAL,
     url: str = "http://localhost:8000",
+    show_lists: bool = True,
 ) -> FastAPI:
     """
     Build a real app with a stub scanner and no network calls, not yet started.
@@ -184,6 +189,9 @@ def _make_app(
             blocked-Scan-button case (UI-SPEC S8).
         url: The paperless-ngx address; empty means unset, which blocks the
             Scan button too.
+        show_lists: Whether the form shows the tag list and the correspondent
+            select.  With neither, the page waits for no list, so its Scan
+            button answers to the job and the appliance alone.
 
     Returns:
         The app, whose lifespan (and so its worker) starts with its TestClient.
@@ -208,11 +216,32 @@ def _make_app(
             "default": ProfileConfig(),
             "duplex": ProfileConfig(source="ADF Duplex"),
         },
+        web=WebConfig(show_tags=show_lists, show_correspondent=show_lists),
     )
     app = create_app(settings, _StubScanner())
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = _no_rows
+    app.state.paperless.get_correspondents = _no_rows
     return app
+
+
+def _no_rows(
+    *, timeout: float | httpx2.Timeout | None = None
+) -> list[dict[str, object]]:
+    """
+    Stand in for a paperless-ngx list that answers with no rows.
+
+    Keyword-only ``timeout``, as the real client takes it: the lazy list load
+    fetches with the short request budget.
+
+    Args:
+        timeout: The per-request budget, ignored.
+
+    Returns:
+        An empty list.
+
+    """
+    del timeout
+    return []
 
 
 @pytest.fixture
@@ -224,6 +253,20 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     status area and history render each row as its owner sees it.
     """
     with TestClient(_make_app(tmp_path)) as tc:
+        tc.cookies.set(_OWNER_COOKIE, _RENDERING_BROWSER)
+        yield tc
+
+
+@pytest.fixture
+def listless_client(tmp_path: Path) -> Iterator[TestClient]:
+    """
+    Yield the same browser over a form that shows neither list.
+
+    A page with a list on it holds Scan until the lists arrive, whatever the
+    job, so a test about what the job alone does to the page's Scan button
+    renders a page that waits for nothing.
+    """
+    with TestClient(_make_app(tmp_path, show_lists=False)) as tc:
         tc.cookies.set(_OWNER_COOKIE, _RENDERING_BROWSER)
         yield tc
 
@@ -975,9 +1018,11 @@ class TestAmberErrorRendering:
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_scan_button_disabled_and_busy_split(
-    client: TestClient, state: JobState
+    listless_client: TestClient, state: JobState
 ) -> None:
     """`disabled` follows is_active; `aria-busy` follows the narrower is_busy (UI-07)."""
+    # On a page that waits for no list, so the job is the only source.
+    client = listless_client
     _job_in_state(client, state)
     match = _SCAN_BUTTON.search(client.get("/").text)
     assert match is not None, "scan button markup not found"
@@ -1046,21 +1091,71 @@ def test_page_renders_one_inline_scan_button(client: TestClient) -> None:
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_poll_scan_button_matches_the_page_button(
-    client: TestClient, state: JobState
+    listless_client: TestClient, state: JobState
 ) -> None:
     """
     The poll's OOB button is the page's button plus the OOB flag (T2, ROBU-04).
 
     One template renders both, so for the same job the two copies must be
     byte-identical once ``hx-swap-oob`` is removed.  A second source of truth
-    for the button's state is exactly what C-10 was.
+    for the button's state is exactly what C-10 was.  On a page that waits
+    for no list; the next test pins what a page with lists adds.
     """
+    client = listless_client
     _job_in_state(client, state)
     page = _only_scan_button(client.get("/").text)
     poll = _only_scan_button(client.get("/api/jobs/current/status").text)
 
     assert _OOB_ATTR in poll.group("attrs")
     assert poll.group(0).replace(_OOB_ATTR, "", 1) == page.group(0)
+
+
+# What the page's button adds while its lists load: the third disabled source,
+# and the hold line it points at.
+_HOLD_ATTRS = frozenset({"disabled", 'aria-describedby="scan-hold-reason"'})
+
+
+@pytest.mark.parametrize("state", list(JobState))
+def test_page_button_differs_from_the_poll_only_by_the_hold(
+    client: TestClient, state: JobState
+) -> None:
+    """
+    With lists on the page, the page's button is the poll's plus the hold.
+
+    The page holds Scan until the lists arrive, which no status response
+    knows about, so the two copies may differ by exactly the hold's
+    attributes and the poll's OOB flag, and by nothing else: the label and
+    ``aria-busy`` still come from the job alone.
+    """
+    _job_in_state(client, state)
+    page = _only_scan_button(client.get("/").text)
+    poll = _only_scan_button(client.get("/api/jobs/current/status").text)
+    page_attrs = set(page.group("attrs").split())
+    poll_attrs = set(poll.group("attrs").split())
+
+    assert page_attrs - poll_attrs <= _HOLD_ATTRS
+    assert page_attrs >= _HOLD_ATTRS
+    assert poll_attrs - page_attrs == {_OOB_ATTR.strip()}
+    assert page.group("text") == poll.group("text")
+
+
+@pytest.mark.parametrize("state", list(JobState))
+def test_lazy_load_scan_button_matches_the_poll_button(
+    client: TestClient, state: JobState
+) -> None:
+    """
+    The lazy list load releases the hold and nothing else.
+
+    Its out-of-band button is rendered from the same status context the poll
+    renders from, so once the lists have landed the button is exactly what a
+    poll would show for the same job.
+    """
+    _job_in_state(client, state)
+    lists = load_the_lists(client, client.get("/").text)
+    loaded = _only_scan_button(lists)
+    poll = _only_scan_button(client.get("/api/jobs/current/status").text)
+
+    assert loaded.group(0) == poll.group(0)
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -1219,9 +1314,17 @@ def test_app_script_is_gone(client: TestClient) -> None:
 
 
 def test_idle_page_button_and_status(client: TestClient) -> None:
-    """With no job at all the button reads Scan and the status area is idle."""
-    match = _SCAN_BUTTON.search(client.get("/").text)
-    assert match is not None, "scan button markup not found"
+    """
+    With no job at all the button reads Scan and the status area is idle.
+
+    The page holds the button until its lists arrive; the lazy list load
+    releases it.
+    """
+    page = client.get("/").text
+    held = _only_scan_button(page)
+    assert held.group("text").strip() == "Scan"
+    assert "disabled" in held.group("attrs")
+    match = _only_scan_button(load_the_lists(client, page))
     assert match.group("text").strip() == "Scan"
     assert "disabled" not in match.group("attrs")
     assert "aria-busy" not in match.group("attrs")
@@ -2850,10 +2953,17 @@ _HELP_TEXT = {
     "correspondent-help": "Who sent this document? Optional.",
 }
 
+# The same lines as the page renders them before its lists arrive: the
+# correspondent's help line says the list is loading until the lazy list load
+# sends the sentence above in its place.
+_PAGE_HELP_TEXT = {**_HELP_TEXT, "correspondent-help": CORRESPONDENTS_LOADING}
+
 # The identified help slots the idle page renders, in document order. Profile's
 # leads because its control does; `#scan-blocked-reason` is absent because this
 # appliance's token is real, and the tag list's empty-state line carries no id
-# because it is a state of the list and not a help line for a control.
+# because it is a state of the list and not a help line for a control.  The
+# Scan button's hold line closes the list: it is the button's reason, like the
+# blocked one, and stands on the page until the lists arrive.
 _HELP_SLOT_IDS = [
     "profile-description",
     "multi-page-help",
@@ -2861,6 +2971,7 @@ _HELP_SLOT_IDS = [
     "tag-filter-help",
     "tags-help",
     "correspondent-help",
+    "scan-hold-reason",
 ]
 
 # Pico styles a help line through `:where(input,select,textarea,fieldset)+small`,
@@ -2903,12 +3014,25 @@ class TestFormHelpTextAndTagPicker:
     def test_every_control_has_one_help_line_wired_with_aria_describedby(
         self, client: TestClient
     ) -> None:
-        """Four sentences, four slots, four references -- one each (APPL-10)."""
-        page = client.get("/").text
+        """
+        Four sentences, four slots, four references -- one each (APPL-10).
 
-        for slot, sentence in _HELP_TEXT.items():
+        The correspondent's sentence reaches its slot with the lazy list load,
+        out of band; until then the slot says the list is loading.
+        """
+        page = client.get("/").text
+        lists = load_the_lists(client, page)
+
+        for slot, sentence in _PAGE_HELP_TEXT.items():
             assert page.count(f'<small id="{slot}">{sentence}</small>') == 1, slot
             assert page.count(f'aria-describedby="{slot}"') == 1, slot
+        help_line = _HELP_TEXT["correspondent-help"]
+        assert (
+            lists.count(
+                f'<small id="correspondent-help" hx-swap-oob="true">{help_line}</small>'
+            )
+            == 1
+        )
 
     def test_the_help_lines_are_the_only_identified_small_elements(
         self, client: TestClient
@@ -2996,11 +3120,11 @@ class TestFormHelpTextAndTagPicker:
         self, client: TestClient
     ) -> None:
         """
-        The page renders the list itself; the wrapper asks only on a change.
+        The page's loader brings the list; the wrapper asks only on a change.
 
-        The list comes from the same cache ``/api/tags`` reads, so a load
-        trigger here would only fetch what the page already holds.  Its one
-        request is the profile-change refresh, which ticks the new profile's
+        The page's one loader fetches both lists together, so a load trigger
+        on the wrapper would only fetch the same list again.  Its one request
+        is the profile-change refresh, which ticks the new profile's
         defaults.  The filter box, the refresh button and the filter form each
         keep their own.
         """
@@ -3020,24 +3144,30 @@ class TestFormHelpTextAndTagPicker:
         self, client: TestClient
     ) -> None:
         """
-        The options are server-rendered; the select asks only on a change.
+        The options arrive with the lists; the select asks only on a change.
 
-        The page reads the same cache ``/api/correspondents`` does, so asking
-        for the options again once the select is parsed would repeat the page's
-        own work.  The select's one request is the profile-change refresh,
-        which selects the new profile's default.
+        The page's one loader fetches both lists together, so the select
+        asking for its own options once parsed would repeat that work.  The
+        select's one request is the profile-change refresh, which selects the
+        new profile's default, and the lazy list load's select carries the
+        same wiring.
         """
         _app(client).state.cache.set("correspondents", [{"id": 7, "name": "Acme"}])
         page = client.get("/").text
-        match = _CORRESPONDENT_SELECT.search(page)
+        lists = load_the_lists(client, page)
 
-        assert match is not None, "correspondent select not rendered"
-        attrs = match.group("attrs")
-        assert re.findall(r'hx-trigger="([^"]*)"', attrs) == [
-            "change from:#profile-select"
-        ]
-        assert re.findall(r'hx-get="([^"]*)"', attrs) == ["/api/profiles/correspondent"]
-        assert '<option value="7">Acme</option>' in page
+        for markup in (page, lists):
+            match = _CORRESPONDENT_SELECT.search(markup)
+            assert match is not None, "correspondent select not rendered"
+            attrs = match.group("attrs")
+            assert re.findall(r'hx-trigger="([^"]*)"', attrs) == [
+                "change from:#profile-select"
+            ]
+            assert re.findall(r'hx-get="([^"]*)"', attrs) == [
+                "/api/profiles/correspondent"
+            ]
+        assert '<option value="7">Acme</option>' not in page
+        assert '<option value="7">Acme</option>' in lists
         assert 'hx-post="/api/cache/invalidate?resource=correspondents"' in page
 
     def test_the_tag_block_adds_no_attribute_to_the_scan_form(self) -> None:
@@ -3782,7 +3912,9 @@ class TestLastScanLine:
         assert "hx-trigger" not in area
         for name in _LIVE_OUTCOME_CLASSES:
             assert name not in area
-        button = _only_scan_button(page)
+        # The page holds Scan only for its lists; once they land, a finished
+        # job leaves it offered again.
+        button = _only_scan_button(load_the_lists(client, page))
         assert "disabled" not in button.group("attrs")
         assert button.group("text").strip() == "Scan"
 

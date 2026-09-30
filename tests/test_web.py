@@ -78,7 +78,7 @@ from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
 from saneless.web.routes import _profile_options, _ProfileOption
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, leaf_routes
+from tests.conftest import StubScannerBackend, leaf_routes, load_the_lists
 
 # Every app built in this module, fixture or helper, talks to a Paperless client
 # whose requests fail inside the process: nothing reaches localhost:8000.
@@ -181,14 +181,15 @@ def _as_owner(client: TestClient) -> str:
 
 
 def test_page_loads(client: TestClient) -> None:
-    """GET / returns 200 with form elements (UI-01)."""
+    """GET / returns 200 with form elements, and the tag boxes arrive after it."""
     response = client.get("/")
     assert response.status_code == 200
     assert "saneless" in response.text
     assert 'name="profile"' in response.text
     assert 'name="title"' in response.text
-    assert 'name="tags"' in response.text
+    assert 'id="tags-list"' in response.text
     assert 'id="scan-btn"' in response.text
+    assert 'name="tags"' in load_the_lists(client, response.text)
 
 
 def test_health_endpoint_ok(client: TestClient) -> None:
@@ -2698,19 +2699,24 @@ class TestPageOpensOnDefault:
     def test_the_defaults_tags_are_the_pre_ticked_ones(
         self, default_last: TestClient
     ) -> None:
-        """The opening profile's tags are ticked, and the first option's are not."""
-        page = default_last.get("/").text
+        """
+        The opening profile's tags are ticked, and the first option's are not.
 
-        assert "checked" in _checkbox(page, 1)
-        assert "checked" not in _checkbox(page, 2)
+        The ticks arrive from ``/api/metadata``, asked for the profile the
+        page's select opens on.
+        """
+        lists = load_the_lists(default_last, default_last.get("/").text)
+
+        assert "checked" in _checkbox(lists, 1)
+        assert "checked" not in _checkbox(lists, 2)
 
     def test_the_defaults_correspondent_is_pre_selected(
         self, default_last: TestClient
     ) -> None:
-        """The opening profile's correspondent is chosen on first paint."""
-        page = default_last.get("/").text
+        """The opening profile's correspondent is chosen once the lists load."""
+        lists = load_the_lists(default_last, default_last.get("/").text)
 
-        assert "selected" in _option(page, 1)
+        assert "selected" in _option(lists, 1)
 
     def test_the_multiple_pages_field_follows_the_defaults_manual_duplex(
         self, client: TestClient
@@ -3531,7 +3537,11 @@ class TestSimpleForm:
         """The fieldset, the filter, its form and both help lines all go."""
         with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
             page = client.get("/").text
+            # The page still loads the correspondent list, and that answer
+            # must not bring any part of the tag block back.
+            lists = load_the_lists(client, page)
 
+        assert 'id="correspondent-select"' in lists
         for fragment in (
             'id="tags-list"',
             'id="tag-filter"',
@@ -3541,6 +3551,7 @@ class TestSimpleForm:
             'name="tags"',
         ):
             assert fragment not in page, fragment
+            assert fragment not in lists, fragment
 
     def test_simple_form_without_correspondent_renders_no_part_of_it(
         self, tmp_path: Path
@@ -3548,7 +3559,9 @@ class TestSimpleForm:
         """The select, its refresh button and its help line all go."""
         with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
             page = client.get("/").text
+            lists = load_the_lists(client, page)
 
+        assert 'id="tags-list"' in lists
         for fragment in (
             'id="correspondent-select"',
             'id="correspondent-help"',
@@ -3556,6 +3569,7 @@ class TestSimpleForm:
             'name="correspondent"',
         ):
             assert fragment not in page, fragment
+            assert fragment not in lists, fragment
 
     def test_simple_form_with_both_off_is_profile_title_and_scan(
         self, tmp_path: Path
@@ -3893,9 +3907,8 @@ def _pre_ticked_app(
         },
     )
     app = create_app(settings, StubScannerBackend())
-    # Keyword-only ``timeout``, as the real client takes it: the page asks
-    # without one, and a profile change and the check before a scan ask with
-    # one.
+    # Keyword-only ``timeout``, as the real client takes it: every list route,
+    # the lazy list load included, and the check before a scan ask with one.
     app.state.paperless.get_tags = _TimedList(_KNOWN_TAG_ROWS)
     app.state.paperless.get_correspondents = _TimedList(_PRE_TICK_CORRESPONDENT_ROWS)
     return app
@@ -4064,8 +4077,8 @@ class TestRequestFetchBudget:
 
     Every one fetches with the status strip probe's budget, 2 s to connect and
     5 s to read, so a page or a click answers promptly while paperless-ngx is
-    slow or down.  The full page keeps the client default until it loads its
-    lists lazily.
+    slow or down.  The full page asks nothing, and its lists arrive from the
+    lazy list load on the same budget.
     """
 
     @pytest.mark.parametrize(("method", "path", "params", "getter"), _LIST_ROUTES)
@@ -4091,18 +4104,28 @@ class TestRequestFetchBudget:
         assert budget.connect == 2.0
         assert budget.read == 5.0
 
-    def test_the_full_page_keeps_the_client_default(self, tmp_path: Path) -> None:
-        """Only the list routes are shortened; the page load is unchanged."""
+    def test_the_full_page_loads_its_lists_on_the_short_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The page and its lazy list load ask once each, never on the 30 s.
+
+        ``/`` itself asks nothing; the lists arrive from ``/api/metadata``,
+        which fetches with the same budget as every other list route.
+        """
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
             tags: _TimedList = app.state.paperless.get_tags
             correspondents: _TimedList = app.state.paperless.get_correspondents
             response = client.get("/")
+            assert tags.timeouts == []
+            assert correspondents.timeouts == []
+            load_the_lists(client, response.text)
 
         assert response.status_code == 200
-        assert tags.timeouts == [None]
-        assert correspondents.timeouts == [None]
+        assert tags.timeouts == [_REQUEST_BUDGET]
+        assert correspondents.timeouts == [_REQUEST_BUDGET]
 
 
 class TestListsUnavailable:
@@ -4171,31 +4194,44 @@ class TestListsUnavailable:
         assert response.text.count('id="correspondent-help"') == 1
 
     def test_the_page_carries_one_help_line_in_place(self, tmp_path: Path) -> None:
-        """The full page renders the help line once, in the page, not out of band."""
+        """
+        The full page renders the help line once, in place, and the load swaps it.
+
+        On the page it says the list is loading; the lazy list load sends the
+        plain sentence out of band, once.
+        """
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             page = client.get("/").text
+            lists = load_the_lists(client, page)
 
         assert page.count('id="correspondent-help"') == 1
         assert (
-            '<small id="correspondent-help">Who sent this document? Optional.</small>'
-            in page
+            '<small id="correspondent-help">'
+            f"{html.escape(CORRESPONDENTS_LOADING)}</small>" in page
         )
+        assert lists.count('id="correspondent-help"') == 1
+        assert _HELP_OOB_NORMAL in lists
 
     def test_the_page_says_when_correspondents_are_unavailable(
         self, tmp_path: Path
     ) -> None:
-        """The full page renders the same unavailable help line, in place."""
+        """
+        The lazy list load swaps in the unavailable help line, once.
+
+        The page itself asks nothing, so it cannot know yet; the answer to
+        its loader says so.
+        """
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             app.state.paperless.get_correspondents = _FailingList()
             _cold(app)
             page = client.get("/").text
+            lists = load_the_lists(client, page)
 
         assert page.count('id="correspondent-help"') == 1
-        assert (
-            '<small id="correspondent-help" class="status-fallback">'
-            f"&#9888; {html.escape(CORRESPONDENTS_UNAVAILABLE)}</small>"
-        ) in page
+        assert html.escape(CORRESPONDENTS_UNAVAILABLE) not in page
+        assert lists.count('id="correspondent-help"') == 1
+        assert _HELP_OOB_UNAVAILABLE in lists
 
     def test_negative_window_skips_the_fetch(self, tmp_path: Path) -> None:
         """A second request inside the negative window asks nobody."""
@@ -4245,27 +4281,42 @@ class TestProfileDefaultsArePreTicked:
     def test_profile_defaults_are_ticked_and_selected_on_first_paint(
         self, tmp_path: Path
     ) -> None:
-        """The opening profile's tags are ticked and its correspondent chosen."""
-        with TestClient(_pre_ticked_app(tmp_path)) as client:
-            page = client.get("/").text
+        """
+        The opening profile's tags are ticked and its correspondent chosen.
 
-        assert "checked" in _checkbox(page, 3)
-        assert "checked" in _checkbox(page, 7)
-        assert "selected" in _option(page, _OPENING_CORRESPONDENT)
-        assert "selected" not in _option(page, _OTHER_CORRESPONDENT)
+        Both arrive from ``/api/metadata``, asked for the page's opening
+        profile, with both profile markers naming it.
+        """
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            lists = load_the_lists(client, client.get("/").text)
+
+        assert "checked" in _checkbox(lists, 3)
+        assert "checked" in _checkbox(lists, 7)
+        assert "selected" in _option(lists, _OPENING_CORRESPONDENT)
+        assert "selected" not in _option(lists, _OTHER_CORRESPONDENT)
+        for name in ("tags_profile", "correspondent_profile"):
+            assert 'value="default"' in _marker(lists, name)
 
     def test_profile_defaults_controls_opt_out_of_form_state_restore(
         self, tmp_path: Path
     ) -> None:
-        """A browser restoring form state must not override the defaults."""
+        """
+        A browser restoring form state must not override the defaults.
+
+        The select is on the page; the boxes arrive from ``/api/metadata``.
+        """
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             page = client.get("/").text
+            lists = load_the_lists(client, page)
 
-        select = _CORRESPONDENT_SELECT_TAG.search(page)
-        assert select is not None, page
-        assert 'autocomplete="off"' in select.group(0)
-        assert 'aria-describedby="correspondent-help"' in select.group(0)
-        for box in re.findall(r'<input type="checkbox" name="tags"[^>]*>', page):
+        for markup in (page, lists):
+            select = _CORRESPONDENT_SELECT_TAG.search(markup)
+            assert select is not None, markup
+            assert 'autocomplete="off"' in select.group(0)
+            assert 'aria-describedby="correspondent-help"' in select.group(0)
+        boxes = re.findall(r'<input type="checkbox" name="tags"[^>]*>', lists)
+        assert len(boxes) == len(_KNOWN_TAG_ROWS)
+        for box in boxes:
             assert 'autocomplete="off"' in box, box
 
     def test_profile_change_wrappers_are_on_the_first_paint(
@@ -4792,6 +4843,25 @@ def _counted_app(
     return app, counter
 
 
+def _load_page_and_lists(client: TestClient) -> str:
+    """
+    Load ``/`` and then its lists, as a browser does, and return the lists.
+
+    What a page load costs is the page and the lazy list load its loader
+    sends, so a count of paperless-ngx requests has to include both.
+
+    Args:
+        client: The browser.
+
+    Returns:
+        The lazy list load's answer, or ``""`` when the page has no loader.
+
+    """
+    response = client.get("/")
+    assert response.status_code == 200
+    return load_the_lists(client, response.text)
+
+
 class TestHiddenControlsCostNoMetadataFetch:
     """
     IN-01: an appliance does not pay for data its markup leaves out.
@@ -4807,9 +4877,10 @@ class TestHiddenControlsCostNoMetadataFetch:
         """A cold cache and no Tags fieldset means no ``/api/tags/`` fetch."""
         app, counter = _counted_app(tmp_path, show_tags=False)
         with TestClient(app) as client:
-            assert client.get("/").status_code == 200
+            _load_page_and_lists(client)
 
         assert counter.count(_TAGS_ENDPOINT) == 0
+        assert counter.count(_CORRESPONDENTS_ENDPOINT) == 1
 
     def test_a_hidden_correspondent_control_costs_no_fetch(
         self, tmp_path: Path
@@ -4817,9 +4888,10 @@ class TestHiddenControlsCostNoMetadataFetch:
         """The correspondent half of the same claim."""
         app, counter = _counted_app(tmp_path, show_correspondent=False)
         with TestClient(app) as client:
-            assert client.get("/").status_code == 200
+            _load_page_and_lists(client)
 
         assert counter.count(_CORRESPONDENTS_ENDPOINT) == 0
+        assert counter.count(_TAGS_ENDPOINT) == 1
 
     def test_the_shortest_form_costs_no_paperless_request_at_all(
         self, tmp_path: Path
@@ -4827,15 +4899,19 @@ class TestHiddenControlsCostNoMetadataFetch:
         """Both controls off: the page load reaches paperless-ngx never."""
         app, counter = _counted_app(tmp_path, show_tags=False, show_correspondent=False)
         with TestClient(app) as client:
-            assert client.get("/").status_code == 200
+            assert _load_page_and_lists(client) == ""
 
         assert counter.paths == []
 
     def test_the_full_form_still_fetches_both(self, tmp_path: Path) -> None:
-        """No fetch is lost: the default shape costs exactly what it did."""
+        """
+        No fetch is lost: the default shape costs exactly what it did.
+
+        The page asks nothing itself; its lazy list load asks once for each.
+        """
         app, counter = _counted_app(tmp_path)
         with TestClient(app) as client:
-            assert client.get("/").status_code == 200
+            _load_page_and_lists(client)
 
         assert counter.count(_TAGS_ENDPOINT) == 1
         assert counter.count(_CORRESPONDENTS_ENDPOINT) == 1
@@ -5235,7 +5311,12 @@ class TestMetadataRoute:
     def test_metadata_scan_button_respects_a_blocked_appliance(
         self, tmp_path: Path
     ) -> None:
-        """An appliance that cannot upload keeps the button disabled, and says why."""
+        """
+        An appliance that cannot upload keeps the button disabled, and says why.
+
+        Its page renders no hold line, so the answer empties none: an
+        out-of-band element with nothing to replace is an htmx error.
+        """
         with TestClient(_simple_form_app(tmp_path, credential="changeme")) as client:
             response = client.get("/api/metadata", params={"profile": "default"})
 
@@ -5243,6 +5324,7 @@ class TestMetadataRoute:
         button = _metadata_scan_button(response.text)
         assert "disabled" in button
         assert 'aria-describedby="scan-blocked-reason"' in button
+        assert 'id="scan-hold-reason"' not in response.text
 
     @pytest.mark.parametrize(
         ("hidden", "absent", "getter"),

@@ -39,10 +39,21 @@
    winds down, defers the request to the first rendering that shows it
    enabled.  scan_disabled is a top-level assignment so that
    partials/status_response.html can import this partial and ask it, rather
-   than restate the rule. #}
-{% set scan_disabled = scan_blocked or (job and job.is_active) %}
+   than restate the rule.
+
+   lists_loading is the third disabled source: the page renders before the
+   tag list and the correspondent select have arrived, and Scan waits for
+   the lists it would file the scan with.  Only the page sets it; the lazy
+   list load (partials/metadata_response.html) re-renders the button without
+   it once both lists have arrived or could not be loaded, and a failed list
+   releases the button exactly as an arrived one does.  The visible reason
+   is index.html's hold line, which the button names in aria-describedby
+   unless the appliance is blocked, whose reason outlasts the wait.  A status
+   poll knows nothing of the lists and may release the button early: that
+   is accepted, because the wait is bounded by the short request budget. #}
+{% set scan_disabled = scan_blocked or (job and job.is_active) or lists_loading %}
 <button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
-        {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% endif %}
+        {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% elif lists_loading %}aria-describedby="scan-hold-reason"{% endif %}
         {% if scan_disabled %}disabled{% endif %}{% if autofocus_scan and not scan_disabled %} autofocus{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
     {{ (job.state if job and job.is_active else none) | scan_button_label }}
 </button>

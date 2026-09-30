@@ -211,7 +211,36 @@
            element above, so the inheritance fix stays exactly as written.
            #}
         {% if scan_blocked %}<small id="scan-blocked-reason" class="status-error">{{ scan_blocked_reason }}</small>{% endif %}
+        {# Why the button is held while the lists load, by the same rule as the
+           blocked reason above: visible text in the reading order directly
+           after the button, because a disabled button can carry no tooltip.
+           Muted rather than red, since a short wait is not an error.  Unlike
+           the blocked reason it does not outlast the page: the lazy list load
+           empties it out of band, byte-empty so the stylesheet's :empty rule
+           hides it, once both lists have arrived or could not be loaded.  A
+           blocked appliance renders only its own reason, which still holds
+           the button after the lists arrive.  The sentence comes from
+           vocabulary.py through the route; this template composes no prose,
+           and adds no attribute to the form element. #}
+        {% if lists_loading and not scan_blocked %}<small id="scan-hold-reason">{{ scan_hold_reason }}</small>{% endif %}
     </form>
+
+    {# The lazy list load's trigger: once the page has rendered, it asks
+       /api/metadata for both lists, naming the profile the select shows, and
+       the answer replaces it -- with nothing, or with the slow retry while a
+       list could not be loaded -- and brings the lists, the profile markers,
+       a released Scan button and the emptied hold line out of band.  It
+       renders only while a shown list is loading, which is every page with a
+       list on it.
+
+       Outside the scan form, like the filter form below, so it inherits
+       nothing from the form and the form's attribute list stays exactly as
+       written.  It asks again every 20 s until an answer lands: a first
+       request lost to htmx's own timeout, which leaves the element in place,
+       must not hold Scan for good. #}
+    {% if lists_loading %}
+    <div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata" hx-include="#profile-select" hx-trigger="load, every 20s" hx-swap="outerHTML"></div>
+    {% endif %}
 
     {# The filter box belongs to this form, not to the scan form.  An input with
        a form attribute is owned by the form it names, so the filter text is

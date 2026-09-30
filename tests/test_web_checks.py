@@ -332,8 +332,8 @@ def _make_app(
         },
     )
     app = create_app(settings, _StubScanner())
-    app.state.paperless.get_tags = list
-    app.state.paperless.get_correspondents = list
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
     if stub_connection:
         # Offline, and CONNECTED so the Paperless row is not the one that
         # varies.

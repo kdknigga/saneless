@@ -84,7 +84,13 @@ def client(app: FastAPI) -> Iterator[TestClient]:
 @pytest.mark.parametrize(
     ("method", "path", "renders"),
     [
-        pytest.param("GET", "/", 2, id="index-renders-both-lists"),
+        # The page renders neither list itself; its lazy list load renders both.
+        pytest.param(
+            "GET",
+            "/api/metadata?profile=default",
+            2,
+            id="lazy-list-load-renders-both-lists",
+        ),
         pytest.param("GET", "/api/tags", 1, id="tags-partial"),
         pytest.param("GET", "/api/correspondents", 1, id="correspondents-partial"),
         pytest.param(

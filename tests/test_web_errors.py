@@ -1888,8 +1888,8 @@ def _appliance_with_credential(
         }
     )
     application = create_app(configured, scanner)
-    application.state.paperless.get_tags = list
-    application.state.paperless.get_correspondents = list
+    application.state.paperless.get_tags = lambda *, timeout=None: []
+    application.state.paperless.get_correspondents = lambda *, timeout=None: []
     with TestClient(application) as tc:
         yield tc
 

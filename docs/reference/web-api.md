@@ -37,6 +37,14 @@ Direct calls, such as from `curl` or a script, work too, but only those two JSON
 
 Renders the main web UI page with scan form, live status indicator, and job history table.
 
+The page asks paperless-ngx for nothing, so it renders at once even when paperless-ngx is
+slow or down. Where the tag list and the correspondent dropdown go, it says each is
+loading, and once the page has rendered it asks [`GET /api/metadata`](#get-apimetadata)
+for both, naming the profile the dropdown shows. Until that answer lands, the Scan button
+is disabled with a line beneath it saying it waits for the lists; the answer releases it
+whether the lists arrived or could not be loaded. A form that shows neither list waits for
+nothing.
+
 **Response:** HTML page.
 
 ---

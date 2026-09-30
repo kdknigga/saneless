@@ -380,6 +380,21 @@ details.tech-details > summary {
     margin-top: 0.5rem;
 }
 
+/* Why Scan is held while the tag and correspondent lists load: the same
+   visible-text rule, placement and 8px step as #scan-blocked-reason, but
+   muted, because a short wait is not an error. */
+#scan-hold-reason {
+    display: block;
+    margin-top: 0.5rem;
+    color: var(--pico-muted-color);
+}
+
+/* Emptied out of band once the lists have arrived or failed; the byte-empty
+   body is what lets :empty match, as with the profile's description slot. */
+#scan-hold-reason:empty {
+    display: none;
+}
+
 /* A profile with no description would otherwise leave Pico's help-text
    margins behind as a stray gap. The route answers with a byte-empty body for
    exactly this reason: a single whitespace text node is a child, and :empty
