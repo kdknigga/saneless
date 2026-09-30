@@ -3763,6 +3763,120 @@ class TestOwedWriteStreak:
         assert reset
         assert health is WorkerHealth.HEALTHY
 
+    @staticmethod
+    def _scripted_flush(
+        worker: ScanWorker, monkeypatch: pytest.MonkeyPatch, outcomes: list[bool]
+    ) -> list[bool]:
+        """
+        Make the worker's owed-write retries fail or land as scripted.
+
+        Each retry takes the next outcome, True for a retry that lands; once
+        the script runs out every retry lands.
+
+        Args:
+            worker: The worker whose retries are scripted.
+            monkeypatch: pytest's patcher.
+            outcomes: Whether each retry lands, in order.
+
+        Returns:
+            The outcomes of the retries made so far, appended as they run.
+
+        """
+        made: list[bool] = []
+
+        def flush() -> int:
+            """
+            Land or fail as the script says.
+
+            Returns:
+                No rows written: a landed retry had nothing owed.
+
+            Raises:
+                sqlite3.OperationalError: For a retry scripted to fail.
+
+            """
+            lands = outcomes[len(made)] if len(made) < len(outcomes) else True
+            made.append(lands)
+            if not lands:
+                raise sqlite3.OperationalError(_DISK_ERROR)
+            return 0
+
+        monkeypatch.setattr(worker, "_flush_unrecorded_failures", flush)
+        return made
+
+    def test_a_retry_failing_after_every_clean_job_warns_once(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        One failure episode is one WARNING, however many jobs it spans.
+
+        A clean job ends the streak that degrades the worker, so on a busy
+        queue every retry after a job is the first of a streak.  The WARNING
+        with its traceback must still not repeat after every scan while the
+        same write keeps failing: only a retry that lands ends the episode.
+        """
+        caplog.set_level(logging.DEBUG, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        worker = worker_for(store)
+        made = self._scripted_flush(worker, monkeypatch, [False, False, False])
+        try:
+            worker.start()
+            for _ in range(3):
+                job = _submit_jobs(worker, store, 1)[0]
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            retried = poll_until(lambda: len(made) >= 3, _STATE_BUDGET)
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert retried
+        assert health is WorkerHealth.HEALTHY
+        failures = "Owed job store writes failed"
+        assert len(_worker_records(caplog, logging.WARNING, failures)) == 1
+        assert len(_worker_records(caplog, logging.DEBUG, failures)) == 2
+
+    def test_a_retry_that_lands_ends_the_episode_and_rearms_the_warning(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A failure after a landed retry is a new episode, and is warned about."""
+        caplog.set_level(logging.DEBUG, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        worker = worker_for(store)
+        made = self._scripted_flush(worker, monkeypatch, [False, True, False])
+        try:
+            worker.start()
+            for _ in range(3):
+                job = _submit_jobs(worker, store, 1)[0]
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            retried = poll_until(lambda: len(made) >= 3, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert retried
+        failures = "Owed job store writes failed"
+        assert len(_worker_records(caplog, logging.WARNING, failures)) == 2
+        assert _worker_records(caplog, logging.DEBUG, failures) == []
+
     def test_owed_write_retries_failing_fewer_ticks_than_the_streak_never_degrade(
         self,
         worker_for: Callable[[JobStore], ScanWorker],

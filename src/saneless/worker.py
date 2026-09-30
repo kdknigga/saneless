@@ -720,6 +720,12 @@ class ScanWorker:
         # retry, recovery or cleanly recorded job in between.  Touched only by
         # the worker thread.
         self._failed_flush_ticks = 0
+        # Whether the current failure episode of the owed-write retry has
+        # been logged at WARNING.  Unlike the streak above, a clean job does
+        # not end an episode -- only a retry that lands, or recovery -- so a
+        # write that keeps failing on a busy queue is warned about once, not
+        # after every scan.  Touched only by the worker thread.
+        self._owed_failure_warned = False
         # When the idle loop last pruned.  Starts now: the startup prune is the
         # lifespan's, so the first idle prune is an interval away.
         self._last_prune = time.monotonic()
@@ -1867,10 +1873,12 @@ class ScanWorker:
         A failed retry is not a loop-level failure: the guard already counted
         the failure behind a guard debt.  But ``_OWED_RETRY_DEGRADED_AFTER``
         failed retries in a row degrade the worker, so a store that is not
-        healing reaches ``/health`` instead of only the logs.  The first
-        failure of a streak is logged at WARNING and the rest at DEBUG.  A
-        retry that lands ends the streak, and so does a job whose store writes
-        all landed.  A retry that writes at least one row also ends the run of
+        healing reaches ``/health`` instead of only the logs.  A retry that
+        lands ends the streak, and so does a job whose store writes all
+        landed.  The first failure of an episode is logged at WARNING and the
+        rest at DEBUG; the episode, unlike the streak, outlasts a clean job and
+        ends only when a retry lands or the worker recovers, so a busy queue
+        does not log the same traceback after every scan.  A retry that writes at least one row also ends the run of
         loop-level failures: the store just accepted a write.  One that had
         nothing to write touched no store, so it proves nothing and leaves the
         run alone.
@@ -1879,9 +1887,10 @@ class ScanWorker:
             written = self._flush_unrecorded_failures()
         except Exception:
             self._failed_flush_ticks += 1
-            # The first failure of a streak is worth an operator's eye; the
-            # rest of the same streak would only repeat it.
-            if self._failed_flush_ticks == 1:
+            # The first failure of an episode is worth an operator's eye; the
+            # rest of the same episode would only repeat it.
+            if not self._owed_failure_warned:
+                self._owed_failure_warned = True
                 logger.warning(
                     "Owed job store writes failed; retrying after the next job "
                     "or idle tick",
@@ -1903,6 +1912,7 @@ class ScanWorker:
                 )
         else:
             self._failed_flush_ticks = 0
+            self._owed_failure_warned = False
             if written:
                 self._consecutive_loop_failures = 0
 
@@ -1964,8 +1974,9 @@ class ScanWorker:
         category, by the state the row was left in.  Any raise leaves the
         worker degraded to try again next tick; it is not counted again, and
         whatever was written stays written.
-        Clearing degraded also ends any owed-write streak, so a returning fault
-        needs a fresh streak.
+        Clearing degraded also ends any owed-write streak and its warned
+        episode, so a returning fault needs a fresh streak and is warned about
+        again.
         """
         try:
             self._job_store.probe()
@@ -1991,6 +2002,7 @@ class ScanWorker:
             return
         self._consecutive_loop_failures = 0
         self._failed_flush_ticks = 0
+        self._owed_failure_warned = False
         self._degraded.clear()
         logger.info("Scan worker recovered: the job store accepted a write")
 
