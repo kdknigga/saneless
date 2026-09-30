@@ -433,9 +433,10 @@ def test_upgrade_notes_cover_this_release(page: Path, heading: str) -> None:
 
     A ``0`` that used to mean "no limit" now stops saneless loading, so the
     note gives the replacement value; relative paths now follow the config
-    file; generated labels change only on ``auto-profiles --force``; and free
-    space is counted in decimal megabytes. An operator who is not told finds
-    each of these out from an error or a changed page.
+    file; generated labels change only on ``auto-profiles --force``; free
+    space is counted in decimal megabytes; and a profile's ``default_title``,
+    which used to load, is now refused in favour of ``title``. An operator who
+    is not told finds each of these out from an error or a changed page.
     """
     text, name = _read(page)
     section = _subsection(text, heading, name)
@@ -448,6 +449,7 @@ def test_upgrade_notes_cover_this_release(page: Path, heading: str) -> None:
             "1000000",
             "auto-profiles --force",
             "1,000,000 bytes",
+            "`default_title`",
         )
         if needle not in section
     ]

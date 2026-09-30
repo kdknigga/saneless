@@ -295,6 +295,9 @@ new image.
 - **The job database gains an index when saneless opens it.** Its schema
   version does not change, so an earlier release still opens the database if
   you roll back.
+- **`default_title` in a profile is refused; write `title`.** An earlier
+  release also loaded a profile's title spelled `default_title`. That spelling
+  now stops saneless with exit 2 and a line saying to write it as `title`.
 - **Look for a config file in the data volume.** An earlier release's
   `auto-profiles`, run with no `config/saneless.toml`, created
   `/var/lib/saneless/saneless.toml` in the data volume, and that file loads

@@ -208,6 +208,7 @@ This release checks more of `config/saneless.toml` at startup. [Upgrading: setti
 - A relative path setting is resolved against the directory of the config file that loaded, `/etc/saneless` in the container, instead of the working directory `/var/lib/saneless`. Write it absolute to keep the old location.
 - Generated profile labels and descriptions change only when you run `saneless auto-profiles --force`, which rewrites only tables marked `auto_generated = true`.
 - `min_free_space_mb` counts a megabyte as 1,000,000 bytes, so the reserve is about 5% smaller.
+- `default_title` in a profile is refused (exit 2); write `title`.
 - A `/var/lib/saneless/saneless.toml` that an earlier release's `auto-profiles` left in the data volume loads ahead of `./config`. Merge anything you need from it into `config/saneless.toml`, then delete it.
 
 saneless now keeps what it writes under `/var/lib/saneless` to its own user.

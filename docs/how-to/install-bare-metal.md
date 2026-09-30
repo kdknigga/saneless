@@ -93,6 +93,7 @@ This release checks more of your config file when saneless starts, and changes h
 - **Generated profile names change only when you ask.** Profiles generated earlier keep their old `label` and `description` until you run `saneless auto-profiles --force`, which rewrites only the tables marked `auto_generated = true` and keeps your other keys. See [Auto-generated profiles](configure-scan-profiles.md#auto-generated-profiles).
 - **Free space is counted in decimal megabytes.** `min_free_space_mb` counts a megabyte as 1,000,000 bytes, so the same number reserves about 5% less than before.
 - **The job database gains an index when saneless opens it.** Its schema version does not change, so an earlier release still opens it if you roll back.
+- **`default_title` in a profile is refused; write `title`.** An earlier release also loaded a profile's title spelled `default_title`. That spelling now stops saneless with exit 2 and a line saying to write it as `title`.
 
 This release needs paperless-ngx 2.16 or later, which speaks API version 9 or 10; an older paperless-ngx refuses every upload with `406`, and the status strip reports `incompatible_version`. [Upgrading: paperless-ngx 2.16 or later](deploy-docker-compose.md#upgrading-paperless-ngx-216-or-later) lists what else changed about delivery and a scan's metadata; it applies to a bare-metal install too.
 
