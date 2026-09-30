@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 import tomllib
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1928,6 +1929,148 @@ class TestFlipSignalsAreJobScoped:
             f"Manual duplex: abort for job {job.id} dropped: already answered: "
             "CONTINUED",
         ]
+
+
+class TestFlipDeadline:
+    """
+    The flip wait remembers when it began, and the worker reports its deadline.
+
+    The deadline is what the status area states to an owner and to anyone
+    else watching, so it is reported for the job at the flip prompt only.
+    """
+
+    def test_armed_at_starts_unset(self) -> None:
+        """An unarmed coordinator has no wait under way."""
+        assert WorkerFlipCoordinator("j").armed_at is None
+
+    def test_arm_records_an_aware_utc_time(self) -> None:
+        """Arming records the moment, in UTC, between two readings of the clock."""
+        coordinator = WorkerFlipCoordinator("j")
+        before = datetime.now(tz=UTC)
+        coordinator.arm()
+        after = datetime.now(tz=UTC)
+
+        armed_at = coordinator.armed_at
+        assert armed_at is not None
+        assert armed_at.tzinfo is UTC
+        assert before <= armed_at <= after
+
+    def test_a_second_arm_keeps_the_first_time(self) -> None:
+        """Arming again, as the wait itself does, does not restart the clock."""
+        coordinator = WorkerFlipCoordinator("j")
+        coordinator.arm()
+        first = coordinator.armed_at
+        assert first is not None
+        # Let the clock move on, so a second reading would differ.
+        assert poll_until(lambda: datetime.now(tz=UTC) > first, _STATE_BUDGET)
+
+        coordinator.arm()
+
+        assert coordinator.armed_at == first
+
+    def test_flip_deadline_is_armed_at_plus_the_operator_wait(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """At the flip prompt the deadline is the wait's start plus its timeout."""
+        scanner = _GatedScanner(frozenset({1}))
+        settings = _manual_duplex_settings(default_settings)
+        wait = timedelta(seconds=settings.output.operator_wait_timeout_seconds)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Deadline")
+            worker.submit(job)
+
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+            before = datetime.now(tz=UTC)
+            scanner.gates[1].set()
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            after = datetime.now(tz=UTC)
+
+            coordinator = worker._flip_coordinator
+            assert coordinator is not None
+            armed_at = coordinator.armed_at
+            assert armed_at is not None
+            deadline = worker.flip_deadline(job.id)
+
+            assert worker.continue_flip(job.id) is True
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            ended = worker.flip_deadline(job.id)
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        assert deadline == armed_at + wait
+        assert before + wait <= deadline <= after + wait
+        assert ended is None
+
+    def test_flip_deadline_is_none_for_another_job(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """Only the job at the flip prompt has a deadline; no other id does."""
+        scanner = _GatedScanner(frozenset())
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            assert worker.flip_deadline("no-such-job") is None
+            worker.start()
+            job = store.create_job("duplex", "Someone Else's")
+            worker.submit(job)
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+
+            own = worker.flip_deadline(job.id)
+            other = worker.flip_deadline("other-id")
+
+            assert worker.continue_flip(job.id) is True
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        assert own is not None
+        assert other is None
+
+    def test_flip_deadline_is_none_before_arming(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """While pass A runs the job has a coordinator but no wait, so no deadline."""
+        scanner = _GatedScanner(frozenset({1}))
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Still Scanning")
+            worker.submit(job)
+
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+            has_coordinator = worker._flip_coordinator is not None
+            during_pass_a = worker.flip_deadline(job.id)
+
+            scanner.gates[1].set()
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            assert worker.continue_flip(job.id) is True
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        assert has_coordinator is True
+        assert during_pass_a is None
 
 
 # The queue depth ScanWorker keeps (not configurable).  Restated here so a
