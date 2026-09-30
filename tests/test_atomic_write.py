@@ -21,11 +21,13 @@ Its contract, which every test below pins down:
   a ``ConfigError`` that tells the operator to mount the directory, and there
   is no non-atomic fallback (D-08). A config inside a mounted *directory*, the
   documented ``./config:/etc/saneless`` layout, is replaced normally (CFG-09).
-* Every extended attribute except the ``security.*`` LSM labels -- a POSIX
-  ACL included -- is copied onto the temp file before its owner and mode, so
-  an ACL survives exactly and the owning group is never handed the ACL mask.
-  An attribute that cannot be copied refuses the rewrite; a filesystem with
-  no extended attribute support has nothing to copy.
+* Every extended attribute -- a POSIX ACL included -- is copied onto the temp
+  file before its owner and mode, so an ACL survives exactly and the owning
+  group is never handed the ACL mask. An attribute that cannot be copied
+  refuses the rewrite; a filesystem with no extended attribute support has
+  nothing to copy. A ``security.*`` label is copied only when the temp
+  file's differs, and one the kernel refuses to set is a WARNING, not a
+  refusal; IMA and EVM measurements are never copied.
 * An owner or group that cannot be kept is logged at WARNING with its ids.
 * Temp files a killed writer left beside the target -- regular, owned by this
   user, older than ten minutes -- are removed before the next rewrite; a
@@ -793,11 +795,23 @@ class _XattrRecorder:
     """
 
     def __init__(
-        self, attributes: dict[str, bytes], refused: frozenset[str] = frozenset()
+        self,
+        attributes: dict[str, bytes],
+        refused: frozenset[str] = frozenset(),
+        *,
+        on_temp: dict[str, bytes] | None = None,
+        refusal: int = errno.EPERM,
     ) -> None:
-        """Serve ``attributes`` from the original; refuse to set ``refused``."""
+        """
+        Serve ``attributes`` from the original and ``on_temp`` from the temp.
+
+        The temp file is the one read through a descriptor. Setting a name in
+        ``refused`` fails with ``refusal``.
+        """
         self.attributes = attributes
         self.refused = refused
+        self.on_temp = on_temp or {}
+        self.refusal = refusal
         self.calls: list[tuple[str, ...]] = []
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -823,7 +837,18 @@ class _XattrRecorder:
         *,
         follow_symlinks: bool = True,
     ) -> bytes:
-        """Return a served attribute's value."""
+        """
+        Return a served attribute's value, the temp file's when given a descriptor.
+
+        Raises:
+            OSError: ENODATA, for an attribute the temp file does not carry.
+
+        """
+        if isinstance(path, int):
+            self.calls.append(("getxattr", attribute, "fd"))
+            if attribute not in self.on_temp:
+                raise OSError(errno.ENODATA, os.strerror(errno.ENODATA))
+            return self.on_temp[attribute]
         self.calls.append(("getxattr", attribute))
         return self.attributes[attribute]
 
@@ -840,7 +865,7 @@ class _XattrRecorder:
         on_fd = "fd" if isinstance(path, int) else "path"
         self.calls.append(("setxattr", attribute, on_fd))
         if attribute in self.refused:
-            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+            raise OSError(self.refusal, os.strerror(self.refusal))
 
 
 class TestExtendedAttributes:
@@ -880,21 +905,21 @@ class TestExtendedAttributes:
         )
         _leftovers(tmp_path)
 
-    def test_user_xattr_is_copied_to_the_temp_fd_and_security_is_not(
+    def test_user_xattr_is_copied_and_a_matching_label_is_left_alone(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        ``user.comment`` is copied onto the temp file; the LSM label is left.
+        ``user.comment`` is copied onto the temp file; an equal label is not set.
 
         The new file takes its ``security.*`` label from the directory's
-        policy, and setting one needs a relabel permission a confined
-        container lacks.
+        policy, which is usually the original's already, and setting one needs
+        a relabel permission a confined container lacks -- so it is only asked
+        for when the labels differ.
         """
+        label = b"system_u:object_r:etc_t:s0\x00"
         recorder = _XattrRecorder(
-            {
-                "user.comment": b"scanned by the office",
-                "security.selinux": b"system_u:object_r:etc_t:s0\x00",
-            }
+            {"user.comment": b"scanned by the office", "security.selinux": label},
+            on_temp={"security.selinux": label},
         )
         target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
@@ -904,9 +929,157 @@ class TestExtendedAttributes:
 
         assert ("getxattr", "user.comment") in recorder.calls
         assert ("setxattr", "user.comment", "fd") in recorder.calls
-        touched = [call for call in recorder.calls if "security.selinux" in call]
-        assert touched == []
+        assert ("setxattr", "security.selinux", "fd") not in recorder.calls
         assert target.read_bytes() == _NEW.encode("utf-8")
+
+    def test_a_differing_label_is_copied_onto_the_temp_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A relabelled original keeps its label through the rewrite.
+
+        A file an admin gave a confined service's type must not fall back to
+        the directory's default type, which can change who may read it.
+        """
+        recorder = _XattrRecorder(
+            {"security.selinux": b"system_u:object_r:saneless_conf_t:s0\x00"},
+            on_temp={"security.selinux": b"system_u:object_r:etc_t:s0\x00"},
+        )
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+
+        replace_file_atomically(target, _NEW)
+
+        assert ("setxattr", "security.selinux", "fd") in recorder.calls
+        assert target.read_bytes() == _NEW.encode("utf-8")
+
+    def test_a_label_the_temp_file_lacks_is_copied_onto_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Smack labels a new file with the writer's label, or none at all."""
+        recorder = _XattrRecorder({"security.SMACK64": b"saneless\x00"})
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+
+        replace_file_atomically(target, _NEW)
+
+        assert ("setxattr", "security.SMACK64", "fd") in recorder.calls
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [errno.EACCES, errno.EPERM, errno.EINVAL],
+        ids=["EACCES", "EPERM", "EINVAL"],
+    )
+    def test_a_label_the_kernel_refuses_is_warned_about_not_fatal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        refusal: int,
+    ) -> None:
+        """
+        A confined writer that may not relabel still writes, and says so.
+
+        A container rewriting a config the host user created is refused the
+        host user's label although the two differ only in the SELinux user, so
+        refusing the rewrite would break the common case. The WARNING names
+        the file and the attribute, never the label itself.
+        """
+        original = b"unconfined_u:object_r:container_file_t:s0\x00"
+        recorder = _XattrRecorder(
+            {"security.selinux": original},
+            refused=frozenset({"security.selinux"}),
+            on_temp={"security.selinux": b"system_u:object_r:container_file_t:s0\x00"},
+            refusal=refusal,
+        )
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+        caplog.set_level(logging.WARNING, logger="saneless.atomic_write")
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.atomic_write"
+            and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert str(target.resolve()) in warnings[0]
+        assert "'security.selinux'" in warnings[0]
+        assert "container_file_t" not in warnings[0]
+        _leftovers(tmp_path)
+
+    def test_a_label_that_fails_for_another_reason_refuses_the_rewrite(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a refusal is survivable; an I/O error keeps the original."""
+        recorder = _XattrRecorder(
+            {"security.selinux": b"system_u:object_r:etc_t:s0\x00"},
+            refused=frozenset({"security.selinux"}),
+            refusal=errno.EIO,
+        )
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+
+        with pytest.raises(ConfigError, match=r"'security\.selinux'"):
+            replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
+        _leftovers(tmp_path)
+
+    @pytest.mark.parametrize("name", ["security.ima", "security.evm"])
+    def test_content_measurements_are_never_copied(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """
+        IMA's hash and EVM's HMAC describe the old bytes, not the new ones.
+
+        Copying one would stamp the rewritten file with a measurement it
+        fails, and the kernel computes the new file's own.
+        """
+        recorder = _XattrRecorder({name: b"\x04\x01measurement"})
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        recorder.install(monkeypatch)
+
+        replace_file_atomically(target, _NEW)
+
+        assert [call for call in recorder.calls if name in call] == []
+        assert target.read_bytes() == _NEW.encode("utf-8")
+
+    def test_a_real_selinux_label_survives_the_rewrite(self, tmp_path: Path) -> None:
+        """
+        On an SELinux host, a relabelled file keeps its type through the rewrite.
+
+        Skipped where the kernel has no SELinux labels or this user may not
+        relabel a file it owns.
+        """
+        target = tmp_path / "saneless.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        name = "security.selinux"
+        try:
+            current = os.getxattr(target, name)
+        except OSError as exc:
+            pytest.skip(f"no SELinux label on {tmp_path}: {exc.strerror}")
+        user, _role, type_, rest = current.split(b":", 3)
+        replacement = b"user_home_t" if type_ != b"user_home_t" else b"user_tmp_t"
+        relabelled = b":".join((user, b"object_r", replacement, rest))
+        try:
+            os.setxattr(target, name, relabelled)
+        except OSError as exc:
+            pytest.skip(f"this user may not relabel a file: {exc.strerror}")
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        assert os.getxattr(target, name) == relabelled
+        _leftovers(tmp_path)
 
     def test_attribute_that_cannot_be_copied_refuses_the_rewrite(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

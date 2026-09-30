@@ -159,11 +159,24 @@ def refused_mode_change(exc: OSError) -> bool:
     return exc.errno in _REFUSED
 
 
-# Extended attributes in this namespace are not copied: they are LSM labels
-# (SELinux, Smack, IMA), which the new file already receives from its
-# directory's policy, and setting one needs a relabel permission a confined
-# container lacks.
-_SKIPPED_XATTR_PREFIX: Final = "security."
+# Extended attributes in this namespace are LSM labels (SELinux, Smack) and
+# measurements. A label is copied only when the new file's differs, because
+# the directory's policy usually gives it the original's already and setting
+# one needs a relabel permission a confined container lacks.
+_LABEL_PREFIX: Final = "security."
+
+# Measurements of the file's bytes and metadata (IMA's hash, EVM's HMAC). The
+# old ones describe the old contents, so copying one would stamp the new file
+# with a measurement it fails; the kernel computes the new file's own.
+_MEASUREMENTS: Final = frozenset({"security.ima", "security.evm"})
+
+# The errnos with which the kernel refuses a label rather than fails to set
+# it: not permitted to relabel (EACCES from the LSM, EPERM without the
+# capability Smack wants), a label this policy does not know (EINVAL), or a
+# filesystem that stores none (ENOTSUP/EOPNOTSUPP).
+_LABEL_REFUSED: Final = frozenset(
+    {errno.EACCES, errno.EPERM, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+)
 
 # ``listxattr`` fails with these when the filesystem has no extended
 # attributes at all, so there is nothing to copy.
@@ -175,10 +188,14 @@ def _copy_xattrs(fd: int, target: Path) -> None:
     Copy ``target``'s extended attributes, POSIX ACLs included, onto ``fd``.
 
     On Linux a POSIX ACL is the ``system.posix_acl_access`` attribute, so
-    copying attributes carries it. Every name except the ``security.*`` LSM
-    labels is copied. Unlike the owner and mode, an attribute that cannot be
-    copied is not skipped: dropping an ACL can widen who reads the file, so
-    the rewrite is refused instead.
+    copying attributes carries it. Unlike the owner and mode, an attribute
+    that cannot be copied is not skipped: dropping an ACL can widen who reads
+    the file, so the rewrite is refused instead.
+
+    ``security.*`` labels are the exception, handled by ``_keep_label``: kept
+    when the kernel allows it, warned about when it refuses, because a
+    confined writer is refused a label that differs only in a way that grants
+    nothing. The IMA and EVM measurements are never copied.
 
     Args:
         fd: The open temp file, still owned by this process with mode 0600.
@@ -197,7 +214,7 @@ def _copy_xattrs(fd: int, target: Path) -> None:
             return
         raise
     for name in names:
-        if name.startswith(_SKIPPED_XATTR_PREFIX):
+        if name in _MEASUREMENTS:
             continue
         try:
             value = os.getxattr(target, name)
@@ -206,10 +223,58 @@ def _copy_xattrs(fd: int, target: Path) -> None:
                 # Removed since it was listed: there is nothing to drop.
                 continue
             raise _xattr_refusal(target, name, exc) from exc
+        if name.startswith(_LABEL_PREFIX):
+            _keep_label(fd, target, name, value)
+            continue
         try:
             os.setxattr(fd, name, value)
         except OSError as exc:
             raise _xattr_refusal(target, name, exc) from exc
+
+
+def _keep_label(fd: int, target: Path, name: str, value: bytes) -> None:
+    """
+    Give the temp file ``target``'s ``security.*`` label, when it differs.
+
+    A label the new file already carries is left alone. A differing one --
+    an SELinux type an admin set with ``chcon``, a Smack label -- is copied,
+    because falling back to the directory's default can change who may read
+    the file. When the kernel refuses the copy the rewrite still goes ahead,
+    with a WARNING naming the file and the attribute but never the label: a
+    container rewriting a config its host user created is refused that
+    user's label although the two differ only in the SELinux user, which
+    grants no access, and refusing the rewrite would break that common case.
+
+    Args:
+        fd: The open temp file.
+        target: The file being replaced.
+        name: The ``security.*`` attribute.
+        value: Its value on ``target``.
+
+    Raises:
+        ConfigError: Setting the label failed for a reason other than a
+            refusal.
+
+    """
+    try:
+        current: bytes | None = os.getxattr(fd, name)
+    except OSError:
+        current = None
+    if current == value:
+        return
+    try:
+        os.setxattr(fd, name, value)
+    except OSError as exc:
+        if exc.errno not in _LABEL_REFUSED:
+            raise _xattr_refusal(target, name, exc) from exc
+        logger.warning(
+            "Not keeping the security label %r of %s (%s); the rewritten file "
+            "carries the label its directory gives a new file, which may "
+            "change who can read it",
+            name,
+            target,
+            exc.strerror,
+        )
 
 
 def _xattr_refusal(target: Path, name: str, exc: OSError) -> ConfigError:
@@ -412,8 +477,10 @@ def replace_file_atomically(path: Path, text: str) -> Path:
       original already are its mask, so the owning group's own entry is kept
       and is never handed the mask. Unlike a refused owner or mode, an
       attribute that cannot be copied refuses the rewrite, because dropping
-      an ACL can widen who reads the file. ``security.*`` LSM labels are not
-      copied; the new file is labelled by its directory's policy.
+      an ACL can widen who reads the file. A ``security.*`` LSM label is
+      copied when the new file's differs; a label the kernel refuses to set
+      is logged at WARNING and the rewrite goes ahead. IMA and EVM
+      measurements are never copied.
     * Before the temp file is made, leftovers of a killed earlier rewrite --
       the exact mkstemp name for this file, a regular file this user owns,
       older than ten minutes -- are removed; a younger one may belong to a
