@@ -2229,8 +2229,16 @@ def _echo_write_result(
         click.echo(line)
         for name in written:
             p = profiles[name]
+            # A profile generated for a device with no source option leaves
+            # ``source`` unset, and the file names none; the model's Flatbed
+            # fallback would claim a platen the device never reported.
+            source = (
+                p.source
+                if "source" in p.model_fields_set
+                else "(none; the scanner's own)"
+            )
             click.echo(
-                f"  {name}: source={p.source}, resolution={p.resolution}, mode={p.mode}"
+                f"  {name}: source={source}, resolution={p.resolution}, mode={p.mode}"
             )
 
 

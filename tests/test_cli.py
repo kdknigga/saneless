@@ -4172,6 +4172,36 @@ class TestAutoProfiles:
         assert "default" in settings.profiles
         assert settings.profiles["flatbed"].default_tags == [4]
 
+    def test_auto_profiles_no_source_default_claims_no_source(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The detail line says what the file says: no source.
+
+        The written table has no ``source`` key, so the scanner uses its own.
+        Printing the model's ``Flatbed`` fallback would claim a platen the
+        device never reported.
+        """
+        config_file = tmp_path / "saneless.toml"
+        no_source = DeviceCapabilities(
+            sources=[], resolutions=[150, 300], modes=["Gray", "Color"]
+        )
+        runner, _ = _patch_cli(
+            monkeypatch, scanner_cls=self._make_auto_scanner(caps=no_source)
+        )
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        written = tomllib.loads(config_file.read_text())["profiles"]["default"]
+        assert "source" not in written
+        details = [
+            line for line in result.output.splitlines() if line.startswith("  default:")
+        ]
+        assert details == [
+            "  default: source=(none; the scanner's own), resolution=300, mode=Color"
+        ]
+
     @staticmethod
     def _two_devices() -> list[DeviceInfo]:
         """Two visible scanners, listed in the order discovery reports them."""
