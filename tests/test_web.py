@@ -50,8 +50,10 @@ from saneless.job import JobState, JobStore
 from saneless.paperless import PaperlessClient
 from saneless.scanner.base import DeviceCapabilities
 from saneless.vocabulary import (
+    CORRESPONDENTS_LOADING,
     CORRESPONDENTS_UNAVAILABLE,
     QUEUE_FULL_JOB_ERROR,
+    TAGS_LOADING,
     TAGS_UNAVAILABLE,
     TOKEN_UNSET_JOB_ERROR,
     ErrorCategory,
@@ -66,6 +68,7 @@ from saneless.vocabulary import (
     page_counts,
     progress_label,
     rejection_message,
+    scan_hold_reason,
 )
 from saneless.web import app as app_module
 from saneless.web import cache as cache_module
@@ -5294,3 +5297,177 @@ class TestMetadataRoute:
         assert response.status_code == 422
         tags: _TimedList = app.state.paperless.get_tags
         assert tags.timeouts == []
+
+
+# The page's hidden loader: it asks for both lists once the page has rendered,
+# carrying the profile the select shows, and again every 20 s until one
+# response lands and removes it.
+_LOADER = (
+    '<div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata"'
+    ' hx-include="#profile-select" hx-trigger="load, every 20s"'
+    ' hx-swap="outerHTML"></div>'
+)
+_TAGS_LIST_BODY = re.compile(r'<div id="tags-list"[^>]*>(?P<body>.*?)</div>', re.DOTALL)
+_CORRESPONDENT_SELECT_BODY = re.compile(
+    r'<select name="correspondent" id="correspondent-select"[^>]*>'
+    r"(?P<body>.*?)</select>",
+    re.DOTALL,
+)
+_PAGE_SCAN_BUTTON = re.compile(r'<button type="submit" id="scan-btn"[^>]*>')
+_LOADING_HELP = (
+    f'<small id="correspondent-help">{html.escape(CORRESPONDENTS_LOADING)}</small>'
+)
+
+
+def _page_scan_button(page: str) -> str:
+    """
+    Return the one Scan button opening tag on the page.
+
+    Args:
+        page: The rendered page.
+
+    Returns:
+        The button's opening tag.
+
+    """
+    found = _PAGE_SCAN_BUTTON.findall(page)
+    assert len(found) == 1, page
+    return found[0]
+
+
+def _hold_line(reason: str | None) -> str:
+    """
+    Return the hold reason line as the page renders it.
+
+    Args:
+        reason: The sentence, which a shown list always has.
+
+    Returns:
+        The element's exact markup.
+
+    """
+    assert reason is not None
+    return f'<small id="scan-hold-reason">{html.escape(reason)}</small>'
+
+
+def _scan_form_end(page: str) -> int:
+    """
+    Return where the scan form closes on the page.
+
+    Args:
+        page: The rendered page.
+
+    Returns:
+        The offset of the scan form's ``</form>``.
+
+    """
+    return page.index("</form>", page.index('<form hx-post="/api/scan"'))
+
+
+class TestLazyPageLoad:
+    """
+    The page renders at once, and the lists arrive after it.
+
+    ``/`` asks paperless-ngx for nothing, so a slow or dead paperless-ngx never
+    holds the page up.  Where each list goes it shows that the list is
+    loading, and a hidden loader outside the scan form asks
+    ``/api/metadata`` for both.  Until that answer lands, Scan is held, with
+    a visible line that says why; a blocked appliance says its own reason
+    instead, and a page that shows neither list holds nothing.
+    """
+
+    def test_index_makes_no_paperless_call(self, tmp_path: Path) -> None:
+        """A cold page load asks for neither list."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            tags: _TimedList = app.state.paperless.get_tags
+            correspondents: _TimedList = app.state.paperless.get_correspondents
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert tags.timeouts == []
+        assert correspondents.timeouts == []
+
+    def test_index_renders_placeholders_and_the_loader(self, tmp_path: Path) -> None:
+        """Each list says it is loading, and the loader sits outside the form."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            page = client.get("/").text
+
+        tags_list = _TAGS_LIST_BODY.search(page)
+        assert tags_list is not None, page
+        assert tags_list.group("body").strip() == (
+            f"<small>{html.escape(TAGS_LOADING)}</small>"
+        )
+        select = _CORRESPONDENT_SELECT_BODY.search(page)
+        assert select is not None, page
+        assert re.findall(r"<option[^>]*>[^<]*</option>", select.group("body")) == [
+            '<option value="">No correspondent</option>'
+        ]
+        assert _LOADING_HELP in page
+        assert page.count('id="correspondent-help"') == 1
+        assert page.count(_LOADER) == 1
+        assert page.index(_LOADER) > _scan_form_end(page)
+        for name in ("tags_profile", "correspondent_profile"):
+            assert 'value="default"' in _marker(page, name)
+
+    @pytest.mark.parametrize(
+        ("show_tags", "show_correspondent"),
+        [
+            pytest.param(True, True, id="both"),
+            pytest.param(True, False, id="tags-only"),
+            pytest.param(False, True, id="correspondents-only"),
+        ],
+    )
+    def test_lists_loading_holds_scan_with_a_reason(
+        self, tmp_path: Path, *, show_tags: bool, show_correspondent: bool
+    ) -> None:
+        """Scan is disabled, described by the line naming the shown lists."""
+        app = _pre_ticked_app(
+            tmp_path, show_tags=show_tags, show_correspondent=show_correspondent
+        )
+        with TestClient(app) as client:
+            page = client.get("/").text
+
+        button = _page_scan_button(page)
+        assert "disabled" in button
+        assert 'aria-describedby="scan-hold-reason"' in button
+        hold = _hold_line(
+            scan_hold_reason(tags=show_tags, correspondents=show_correspondent)
+        )
+        assert page.count('id="scan-hold-reason"') == 1
+        assert hold in page
+        assert page.index(hold) > page.index(button)
+        assert page.index(hold) < _scan_form_end(page)
+        assert page.count(_LOADER) == 1
+        assert (html.escape(TAGS_LOADING) in page) is show_tags
+        assert (_LOADING_HELP in page) is show_correspondent
+
+    def test_blocked_appliance_shows_no_hold(self, tmp_path: Path) -> None:
+        """The blocked reason explains the button, and no hold line competes."""
+        with TestClient(_simple_form_app(tmp_path, credential="changeme")) as client:
+            page = client.get("/").text
+
+        button = _page_scan_button(page)
+        assert "disabled" in button
+        assert 'aria-describedby="scan-blocked-reason"' in button
+        assert 'aria-describedby="scan-hold-reason"' not in button
+        assert 'id="scan-hold-reason"' not in page
+        assert 'id="scan-blocked-reason"' in page
+
+    def test_neither_list_shown_has_no_hold(self, tmp_path: Path) -> None:
+        """With no list on the page there is nothing to wait for."""
+        app = _pre_ticked_app(tmp_path, show_tags=False, show_correspondent=False)
+        with TestClient(app) as client:
+            _cold(app)
+            page = client.get("/").text
+
+        button = _page_scan_button(page)
+        assert "disabled" not in button
+        assert "aria-describedby" not in button
+        assert 'id="scan-hold-reason"' not in page
+        assert 'id="metadata-loader"' not in page
+        assert html.escape(TAGS_LOADING) not in page
+        assert html.escape(CORRESPONDENTS_LOADING) not in page
