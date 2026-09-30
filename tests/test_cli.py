@@ -4344,11 +4344,12 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
     D-15: the one CLI write refuses while a superseded-name file is the only one.
 
     With nothing loaded, ``auto-profiles`` creates a file in a searched
-    directory, and the next start loads it.  Writing a ``saneless.toml`` while
-    an unread ``config.toml`` still holds the only copy of the Paperless URL
-    and token would not lose those values but would bury them: the search
-    would stop at the new file and the red row saying to rename the old one
-    would drop to amber, with the appliance still running on defaults.
+    directory, and the next start loads it.  Writing
+    a ``saneless.toml`` while an unread ``config.toml`` still holds the only
+    copy of the Paperless URL and token would not lose those values but would
+    bury them: the search would stop at the new file and the red row saying to
+    rename the old one would drop to amber, with the appliance still running
+    on defaults.
 
     So the refusal is not tidiness -- it is the difference between a fixable
     situation and one whose evidence has been buried.
