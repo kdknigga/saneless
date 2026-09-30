@@ -400,6 +400,38 @@ class TestSymlinkAndReadonly:
         assert directories == [], "a temp file was created before refusing"
         _leftovers(tmp_path)
 
+    def test_a_dangling_symlink_is_refused_rather_than_followed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A new file is never created at the far end of a link.
+
+        Writing through a link is for a file the operator already has.  A link
+        to nothing names a file no load ever read, and whoever can write the
+        link's directory could point it anywhere -- a root writer would then
+        create that file and hand it to the far directory's owner.
+        """
+        conf = tmp_path / "conf"
+        conf.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        planted = elsewhere / "planted.conf"
+        link = conf / "saneless.toml"
+        link.symlink_to(planted)
+        directories = _record_mkstemp(monkeypatch)
+
+        with pytest.raises(ConfigError) as excinfo:
+            replace_file_atomically(link, _NEW)
+
+        message = str(excinfo.value)
+        assert str(link) in message
+        assert str(planted) in message
+        assert "symlink" in message
+        assert not planted.exists()
+        assert link.is_symlink()
+        assert directories == [], "a temp file was created before refusing"
+        _leftovers(elsewhere)
+
 
 class TestReadOnlyMount:
     """

@@ -4682,6 +4682,32 @@ class TestAutoProfilesTarget:
         assert "Traceback" not in result.output
         assert not files.cwd.exists()
 
+    def test_a_dangling_symlink_at_the_target_exits_2_and_creates_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """
+        The search counts a link to nothing as no file; the write must not follow it.
+
+        Whoever can write the system directory could plant the link, and a
+        root run would otherwise create the file it names.
+        """
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        planted = tmp_path / "elsewhere" / "planted.conf"
+        planted.parent.mkdir()
+        files.etc.symlink_to(planted)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 2
+        assert f"Cannot create {files.etc}: it is a symlink" in result.stderr
+        assert "Traceback" not in result.output
+        assert not planted.exists()
+        assert list(planted.parent.iterdir()) == []
+
     def test_an_explicit_config_is_the_target_whatever_else_exists(
         self,
         monkeypatch: pytest.MonkeyPatch,

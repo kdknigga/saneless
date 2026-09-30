@@ -7,11 +7,11 @@ it, and renames it into place, so a crash, a full disk, or a killed process
 leaves either the old file or the new one -- never a truncated config.
 It keeps the original's mode and owner (warning when the owner cannot be
 kept), and its extended attributes and POSIX ACL -- refusing the rewrite when
-one of those cannot be kept -- follows symlinks to the real file, and reports
-a single-file bind mount -- which cannot be renamed over -- as a
-``ConfigError`` naming the fix. A file it creates takes its directory's owner
-when permitted and stays 0600. Temp files left by a killed rewrite are swept
-on the next one.
+one of those cannot be kept -- follows symlinks to the real file, but never to
+a file that does not exist yet, and reports a single-file bind mount -- which
+cannot be renamed over -- as a ``ConfigError`` naming the fix. A file it
+creates takes its directory's owner when permitted and stays 0600. Temp files
+left by a killed rewrite are swept on the next one.
 
 The module knows nothing about TOML: callers produce the text, this module
 only makes the write durable.
@@ -383,7 +383,9 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     Load-bearing details:
 
     * ``path`` is resolved first and the **real** file is replaced, so a
-      dotfiles-style symlink keeps pointing at it.
+      dotfiles-style symlink keeps pointing at it. A symlink to nothing is
+      refused rather than followed: it would create a file wherever the link
+      points.
     * The temp file comes from ``tempfile.mkstemp`` in the real file's **own
       directory**: ``rename(2)`` is atomic only within one filesystem, and a
       mounted config directory is a separate one. mkstemp's random name and
@@ -446,7 +448,8 @@ def replace_file_atomically(path: Path, text: str) -> Path:
             tells the operator to mount its directory instead; or the file is
             on a read-only directory mount, and the message says to mount it
             read-write; or an extended attribute or ACL of the existing file
-            could not be copied, and the file is left as it was.
+            could not be copied, and the file is left as it was; or ``path``
+            is a symlink to a file that does not exist.
         PermissionError: The existing file, on a writable mount, is not
             writable by this process.
         OSError: Any other filesystem failure, re-raised after the temp file
@@ -462,6 +465,17 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         original: os.stat_result | None = target.stat()
     except FileNotFoundError:
         original = None
+    if original is None and path.is_symlink():
+        # That argument covers a file the operator already has. A link to
+        # nothing names a file no load ever read, and whoever can write the
+        # link's directory chose where it points: following it would create
+        # that file -- as root, anywhere -- and hand it to the far
+        # directory's owner.
+        msg = (
+            f"Cannot create {path}: it is a symlink to {target}, which does not "
+            "exist; remove the link or create the file it points to first"
+        )
+        raise ConfigError(msg)
     if original is not None and (mount_error := _read_only_mount_error(target)):
         raise mount_error
     if original is not None and not os.access(target, os.W_OK):
