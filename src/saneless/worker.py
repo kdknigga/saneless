@@ -465,11 +465,15 @@ class WorkerPassCoordinator(PassCoordinator):
         """Start with no prompt, bound to ``job_id``."""
         self._job_id = job_id
         self._stopping = stopping
-        # Guards the pair below, so a reader never sees one prompt's number
-        # with another prompt's slot.
+        # Guards the three below, so a reader never sees one prompt's number
+        # with another prompt's slot or another prompt's asked time.
         self._lock = threading.Lock()
         self._prompt: PassPrompt | None = None
         self._slot: AnswerSlot[PassAnswer] | None = None
+        # When the latest prompt was published, in UTC.  In memory only, for
+        # the reason ScanWorker.front_pages is not a Job column: it matters
+        # for one question and a restart fails every active job.
+        self._asked_at: datetime | None = None
         # Set once the run announces its next question, cleared when that
         # question is published: in between, the latest claim answers a
         # question the job has already moved past.
@@ -498,10 +502,30 @@ class WorkerPassCoordinator(PassCoordinator):
     @property
     def open_prompt(self) -> PassPrompt | None:
         """The prompt published and not yet answered, or ``None``."""
-        prompt, slot = self._snapshot()
+        prompt, slot, _asked_at = self._snapshot()
         if prompt is None or slot is None or slot.answer is not None:
             return None
         return prompt
+
+    @property
+    def open_deadline(self) -> datetime | None:
+        """
+        When the open prompt times out, in UTC, or ``None`` when none is open.
+
+        The prompt, its slot and its asked time come from one read, so the
+        deadline always belongs to the prompt it is reported for.
+
+        Returns:
+            The open prompt's asked time plus its ``timeout_seconds``, or
+            ``None`` before any prompt and once the latest one is answered.
+
+        """
+        prompt, slot, asked_at = self._snapshot()
+        if prompt is None or slot is None or asked_at is None:
+            return None
+        if slot.answer is not None:
+            return None
+        return asked_at + timedelta(seconds=prompt.timeout_seconds)
 
     @property
     def acknowledged(self) -> PassAnswer | None:
@@ -536,7 +560,7 @@ class WorkerPassCoordinator(PassCoordinator):
             while it is open; ``None`` when no prompt has been published.
 
         """
-        prompt, slot = self._snapshot()
+        prompt, slot, _asked_at = self._snapshot()
         if prompt is None or slot is None:
             return None
         return prompt, slot.answer
@@ -558,7 +582,7 @@ class WorkerPassCoordinator(PassCoordinator):
     @property
     def claimed(self) -> tuple[PassPrompt, PassAnswer] | None:
         """The latest prompt and its claimed answer, or ``None`` while unanswered."""
-        prompt, slot = self._snapshot()
+        prompt, slot, _asked_at = self._snapshot()
         if prompt is None or slot is None:
             return None
         answer = slot.answer
@@ -585,6 +609,7 @@ class WorkerPassCoordinator(PassCoordinator):
         with self._lock:
             self._prompt = prompt
             self._slot = slot
+            self._asked_at = datetime.now(tz=UTC)
             self._superseded = False
         # Checked again once the prompt is published.  stop() sets the flag
         # before it interrupts, so a stop that the check above missed either
@@ -611,7 +636,7 @@ class WorkerPassCoordinator(PassCoordinator):
             does not offer ``answer``, or it was already answered.
 
         """
-        prompt, slot = self._snapshot()
+        prompt, slot, _asked_at = self._snapshot()
         if prompt is None or slot is None:
             return False
         if prompt.number != number or answer not in prompt.offered:
@@ -630,21 +655,24 @@ class WorkerPassCoordinator(PassCoordinator):
             Whether this shutdown claimed an answer.
 
         """
-        _prompt, slot = self._snapshot()
+        _prompt, slot, _asked_at = self._snapshot()
         if slot is None:
             return False
         return slot.offer(PassAnswer.INTERRUPTED)
 
-    def _snapshot(self) -> tuple[PassPrompt | None, AnswerSlot[PassAnswer] | None]:
+    def _snapshot(
+        self,
+    ) -> tuple[PassPrompt | None, AnswerSlot[PassAnswer] | None, datetime | None]:
         """
-        Read the latest prompt and its slot together.
+        Read the latest prompt, its slot and when it was asked, together.
 
         Returns:
-            The latest prompt and its slot, or ``(None, None)`` before any.
+            The latest prompt, its slot and its aware UTC asked time, or
+            ``(None, None, None)`` before any.
 
         """
         with self._lock:
-            return self._prompt, self._slot
+            return self._prompt, self._slot, self._asked_at
 
 
 def _announce_pass_wait(
@@ -1208,6 +1236,27 @@ class ScanWorker:
         """
         coordinator = self._pass_coordinator_for(job_id)
         return None if coordinator is None else coordinator.acknowledged
+
+    def pass_deadline(self, job_id: str) -> datetime | None:
+        """
+        Report when ``job_id``'s open multi-page question times out.
+
+        Readable without the owner gate that ``pass_prompt``'s caller applies:
+        a deadline is a time and nothing else, with no title or other job
+        detail, which is what lets a non-owner's waiting line state it.  See
+        ``WorkerPassCoordinator.open_deadline`` for how it is read.
+
+        Args:
+            job_id: The job whose deadline is wanted.
+
+        Returns:
+            The open question's aware UTC deadline when ``job_id`` is the
+            running multi-page job, otherwise ``None`` -- including before
+            its first question and once a question is answered.
+
+        """
+        coordinator = self._pass_coordinator_for(job_id)
+        return None if coordinator is None else coordinator.open_deadline
 
     def _pass_coordinator_for(self, job_id: str) -> WorkerPassCoordinator | None:
         """
