@@ -244,10 +244,13 @@ class CheckRefresher:
         reads the worker's job record rather than trying the gate.
 
         The answer is a snapshot that may be false the instant it is returned,
-        and that is fine, because the only thing it decides is whether the page
-        asks once more.  A stale ``True`` costs one extra cache read; a stale
-        ``False`` costs nothing, because the probe that just finished has
-        already stored and the next body carries its results.
+        and the only thing it decides is whether the page asks once more.  A
+        stale ``True`` costs one extra cache read.  A stale ``False`` is
+        harmless only because ``_checks_context`` reads this before it reads
+        the cache: a probe that stored before the flag went false has stored
+        before the cache read too, so that same body carries its results.  Read
+        the other way round, a probe landing between the two reads leaves a
+        body with the old rows and no reason to ask again.
 
         Returns:
             True while a probe holds the single-flight lock.

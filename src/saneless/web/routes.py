@@ -493,6 +493,11 @@ def _checks_context(
         ``poll_attempt``.
 
     """
+    # Read once, so the two decisions below cannot disagree about it.  This is
+    # `Lock.locked()`: an observation, never an acquire.  It is read before the
+    # cache so that a probe finishing between the two reads is seen as in
+    # flight, which asks once more and collects what it stored.
+    probe_in_flight = state.refresher.probe_in_flight
     cached: CachedChecks = state.checks.current()
     # The worker's own record of a job in flight, not the scanner gate: reading
     # the gate would mean acquiring it, and a render is not allowed to contend
@@ -500,9 +505,6 @@ def _checks_context(
     scanning: bool = (
         state.worker.current_job_id is not None if scan_active is None else scan_active
     )
-    # Read once, so the two decisions below cannot disagree about it.  This is
-    # `Lock.locked()`: an observation, never an acquire.
-    probe_in_flight = state.refresher.probe_in_flight
     # Which cap applies is the probe's decision, and it is taken once from the
     # one read above so the line and the trigger cannot disagree about it.
     applicable_cap = POLL_PROBE_ATTEMPT_CAP if probe_in_flight else POLL_ATTEMPT_CAP
