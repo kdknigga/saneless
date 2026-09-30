@@ -70,7 +70,11 @@ from saneless.vocabulary import (
     unlisted_tag_label,
     worker_health_detail,
 )
-from saneless.web.errors import TITLE_CONTROL_TYPE, RequestRejected
+from saneless.web.errors import (
+    RETRY_AFTER_SECONDS,
+    TITLE_CONTROL_TYPE,
+    RequestRejected,
+)
 from saneless.web.job_view import build_job_view, owns_detail, scrub_for_owner
 from saneless.worker import ScanOptions
 
@@ -1612,21 +1616,24 @@ class _PaperlessTestAnswer:
 
 def _paperless_test_error(exc: BaseException) -> _PaperlessTestAnswer:
     """
-    Build the connection test's 502 answer, logging the class name only.
+    Build the connection test's 500 answer, logging the class name only.
 
-    Class name only, by the client-exception rule above _get_cached_or_fetch.
+    A failure while running the test is a failure inside saneless, so it is a
+    server error rather than a bad gateway: an answer paperless-ngx gave is
+    reported as a 200 status instead.  Class name only, by the
+    client-exception rule above _get_cached_or_fetch.
 
     Args:
         exc: What stopped the test from producing a status.
 
     Returns:
-        The 502 answer naming the exception class.
+        The 500 answer naming the exception class.
 
     """
     detail = type(exc).__name__
     logger.warning("Paperless connection test failed: %s", detail)
     return _PaperlessTestAnswer(
-        status_code=502, body={"status": "error", "detail": detail}
+        status_code=500, body={"status": "error", "detail": detail}
     )
 
 
@@ -1637,8 +1644,8 @@ def paperless_test(request: Request) -> JSONResponse:
 
     Returns 200 with one ``ConnectionStatus`` value as its status:
     connected, token_rejected, not_found, server_error, unreachable or
-    incompatible_version.  An unexpected failure is a 502 whose status is
-    error, with the exception's class name as its detail.
+    incompatible_version.  An unexpected failure inside saneless is a 500
+    whose status is error, with the exception's class name as its detail.
 
     The answer is shared and reused for ``MIN_MANUAL_REFRESH_SECONDS``, error
     included, so a loop against this unauthenticated endpoint costs one
@@ -1649,7 +1656,9 @@ def paperless_test(request: Request) -> JSONResponse:
     paperless-ngx the probe takes the client's full timeout.  Only the very
     first callers, before any answer exists, wait for the probe, two at most
     at a time; a wait that outlasts its bound, and a caller refused a place
-    to wait, answers the usual 502 naming ``TimeoutError``.
+    to wait, answers 503 naming ``TimeoutError``, with a ``Retry-After``
+    header saying when to ask again.  That answer is not shared: the caller
+    never got a turn, so there is no result to reuse.
     """
     state = request.app.state
 
@@ -1663,7 +1672,13 @@ def paperless_test(request: Request) -> JSONResponse:
     try:
         answer: _PaperlessTestAnswer = state.paperless_test_result.get(probe)
     except TimeoutError as exc:
-        answer = _paperless_test_error(exc)
+        detail = type(exc).__name__
+        logger.warning("Paperless connection test got no turn: %s", detail)
+        return JSONResponse(
+            {"status": "error", "detail": detail},
+            status_code=503,
+            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+        )
     return JSONResponse(answer.body, status_code=answer.status_code)
 
 
@@ -2781,7 +2796,7 @@ def job_history(request: Request) -> Response:
 
 
 @router.post("/api/flip/continue")
-def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
+def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     """
     Answer the named job's flip prompt with Continue, starting its pass B.
 
@@ -2829,7 +2844,7 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
 
 
 @router.post("/api/flip/abort")
-def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
+def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     """
     Answer the named job's flip prompt with Abort, failing it before pass B.
 

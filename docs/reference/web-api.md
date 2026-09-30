@@ -70,7 +70,8 @@ Tests the connection to the configured paperless-ngx instance.
 | 200 | `{"status": "server_error"}` | Server reachable, but answered 5xx or any other unclassified non-2xx |
 | 200 | `{"status": "unreachable"}` | Server is not reachable (connection refused, DNS failure, connect or read timeout) |
 | 200 | `{"status": "incompatible_version"}` | Server reachable, but refused the API version (406): saneless needs paperless-ngx 2.16 or later, which allows API version 9 or 10 |
-| 502 | `{"status": "error", "detail": "..."}` | Unexpected failure inside saneless while running the test |
+| 500 | `{"status": "error", "detail": "..."}` | Unexpected failure inside saneless while running the test |
+| 503 | `{"status": "error", "detail": "TimeoutError"}` | The caller could not get a turn to wait for a running test; carries a `Retry-After` header |
 
 The six 200 values are the complete set, and each is a stable wire contract: `connected`
 is returned for a 2xx and nothing else, so a 404 or a 500 is now reported as its own
@@ -86,13 +87,15 @@ starts at 9.
 
 The result is shared and reused for 2 seconds; concurrent calls do not each contact
 paperless-ngx. A call inside that window gets the same status code and body as the call
-that ran the test, the `502` included, so calling the endpoint in a loop sends at most one
+that ran the test, the `500` included, so calling the endpoint in a loop sends at most one
 request to paperless-ngx every 2 seconds. While a test is running, a caller that has a
 previous result to fall back on gets that result at once instead of waiting -- against an
 unreachable paperless-ngx a test can take the client's full 30-second timeout. Only the
 first callers after start-up, before any result exists, wait for the running test, and
 no more than two of them at a time. One that waits longer than 35 seconds, or that arrives
-while two others are already waiting, is answered `502` with `"detail": "TimeoutError"`.
+while two others are already waiting, is answered `503` with `"detail": "TimeoutError"`
+and a `Retry-After: 30` header. That answer is not shared: the caller never got a turn,
+so there is no result to share.
 
 ---
 
