@@ -50,9 +50,14 @@
    The profile-change response alone also carries the list's profile marker
    out-of-band (see partials/profile_marker.html), so the marker names the new
    profile in the same swap that ticks its defaults.  It comes first so the
-   wrapper stays the last element of the response. #}
+   wrapper stays the last element of the response.
+
+   The lazy list load (partials/metadata_response.html) sends the whole list
+   out-of-band, because its own swap target is the loader, so it sets
+   list_oob.  The name is not oob: the marker include above reads oob, and
+   the wrapper's flag must not decide the marker's. #}
 {% if follows_profile %}{% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
-<div id="tags-list" class="tag-list"
+<div id="tags-list" class="tag-list"{% if list_oob %} hx-swap-oob="true"{% endif %}
      hx-get="/api/profiles/tags"
      hx-trigger="change from:#profile-select"
      hx-include="#profile-select"

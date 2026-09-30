@@ -22,6 +22,7 @@ Direct calls, such as from `curl` or a script, work too, but only those two JSON
 | GET | `/api/profiles/multi-page` | The Multiple pages checkbox for one profile |
 | GET | `/api/profiles/tags` | The tag list ticked with one profile's default tags |
 | GET | `/api/profiles/correspondent` | The correspondent dropdown set to one profile's default |
+| GET | `/api/metadata` | Both metadata lists, their help, and the Scan button, in one answer |
 | POST | `/api/cache/invalidate` | Refresh cached metadata |
 | GET | `/api/jobs/history` | Job history table |
 | POST | `/api/flip/continue` | Continue manual duplex scan |
@@ -232,7 +233,11 @@ If the check registry itself fails, the previous results stay on the page rather
 
 ### `GET /api/tags`
 
-Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses cached data when available. If a refresh cannot reach paperless-ngx, the picker shows the last list fetched successfully, or an empty list if there has never been one, rather than an error; the cause is logged, and while paperless-ngx stays unreachable the refresh is retried, and the cause logged again, once per `paperless_cache_ttl_seconds` (60 by default).
+Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses cached data when available. Every list route asks paperless-ngx with a 2-second connect and 5-second read budget, the same budget the status strip's paperless-ngx check uses, so a list answers within seconds even when paperless-ngx is slow or down.
+
+If a refresh cannot reach paperless-ngx, the picker shows the last list fetched successfully, rather than an error; the cause is logged, and while paperless-ngx stays unreachable the refresh is retried, and the cause logged again, once per `paperless_cache_ttl_seconds` (60 by default).
+
+If there has never been a list, the picker says the tags could not be loaded from paperless-ngx, and never that there are none: `No tags in paperless-ngx yet.` appears only when paperless-ngx answered with no tags. The failure is logged once and remembered for up to 15 seconds, or for `paperless_cache_ttl_seconds` if that is shorter. Requests in the meantime answer at once without asking paperless-ngx again, and the first request after that asks again. The ↻ refresh button asks again at once.
 
 **Query parameters:**
 
@@ -253,9 +258,11 @@ page is showing the last list fetched successfully, which cannot show that a tag
 
 ### `GET /api/correspondents`
 
-Fetches paperless-ngx correspondents for the dropdown selector. Uses cached data when available. If a refresh cannot reach paperless-ngx, the dropdown offers the last list fetched successfully, or no correspondents if there has never been one, rather than an error.
+Fetches paperless-ngx correspondents for the dropdown selector. Uses cached data when available, with the same 2-second connect and 5-second read budget as `GET /api/tags`. If a refresh cannot reach paperless-ngx, the dropdown offers the last list fetched successfully, rather than an error. If there has never been one, it offers only `No correspondent`, and the help line under the dropdown says the correspondents could not be loaded from paperless-ngx. That failure is remembered and retried as described under `GET /api/tags`.
 
-**Response:** HTML partial (`<option>` elements for HTMX swap).
+With `show_correspondent = false` in `[web]`, no route fetches correspondents: this one, the refresh, the profile change and `GET /api/metadata` all answer without asking paperless-ngx.
+
+**Response:** HTML partial (`<option>` elements for HTMX swap), followed by the help line under the dropdown (`#correspondent-help`) out of band, so the line always describes the list the dropdown holds.
 
 ---
 
@@ -337,8 +344,63 @@ skipped)`; one that cannot be checked because paperless-ngx is unreachable reads
 
 | Status Code | Meaning |
 |-------------|---------|
-| 200 | HTML partial: the whole `<select>` element, which replaces the one on the page, and an out-of-band `correspondent_profile` field naming the profile (see [`POST /api/scan`](#post-apiscan)) |
+| 200 | HTML partial: the whole `<select>` element, which replaces the one on the page, an out-of-band `correspondent_profile` field naming the profile (see [`POST /api/scan`](#post-apiscan)), and the out-of-band help line, as under `GET /api/correspondents` |
 | 422 | The profile does not exist. |
+
+---
+
+### `GET /api/metadata`
+
+Renders both metadata lists, the help line under the correspondent dropdown and the Scan
+button, in one answer. It is built for a page that renders at once and loads its lists
+afterwards: one request, not one per list, because only the server knows when both lists
+are done, and the Scan button is held until they are. Both lists are fetched with the
+2-second connect and 5-second read budget described under `GET /api/tags`.
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile` | string | on the first load | The profile whose defaults to show. Validated against the configured profiles before anything else happens; an unknown name, or none on the first load, is rejected with `422` |
+| `retry` | boolean | no | `1` for a retry, which keeps the form's current ticks and choice instead of the profile's defaults |
+| `q` | string | no | The tag filter, bounded as for `GET /api/tags` |
+| `tags` | int[] | no | The tag ids currently ticked, bounded as for `GET /api/tags`. Read on a retry |
+| `correspondent` | int | no | The correspondent currently chosen, from 1 to 2147483647. Read on a retry |
+
+**Modes:**
+
+- **First load** (no `retry`): the tag list comes back with the profile's `default_tags`
+  ticked and the dropdown with its `default_correspondent` selected, and both profile
+  markers (`tags_profile`, `correspondent_profile`) come back naming the profile. The
+  markers are always sent again, so if Profile changes while this request is in flight,
+  whichever answer lands last leaves each list agreeing with its marker (see
+  [`POST /api/scan`](#post-apiscan)).
+- **Retry** (`retry=1`): the lists keep the ticks, filter and choice the request carries,
+  and no marker is sent, as a refresh does.
+
+**Response:** `200` with an HTML body whose main part replaces the loader element that
+asked. When every shown list loaded, the main part is empty and the loader is removed.
+While a shown list could not be loaded, it is a hidden retry element that asks again with
+`retry=1`, carrying the tag filter, the ticked tags and the chosen correspondent, every
+15 seconds, or every `paperless_cache_ttl_seconds` if that is shorter, but never more
+often than once a second: as often as the failure is forgotten, so each retry really asks
+paperless-ngx.
+The rest is out of band:
+
+| Element | When |
+|---------|------|
+| The tag list (`#tags-list`), whole | When `show_tags` is on. A list that could not be loaded says so, and the ticked ids still come back ticked |
+| The correspondent dropdown (`#correspondent-select`), whole, and its help line (`#correspondent-help`) | When `show_correspondent` is on. A list that could not be loaded says so in the help line |
+| The profile markers | On the first load, for each shown list |
+| The Scan button (`#scan-btn`) | Always. It is disabled only while a scan is active or the appliance is blocked, exactly as on the page: a list that could not be loaded releases it just as a loaded one does |
+| The Scan hold reason (`#scan-hold-reason`) | Always, emptied |
+
+A hidden list is neither fetched nor rendered.
+
+| Status Code | Meaning |
+|-------------|---------|
+| 200 | The HTML described above |
+| 422 | The profile does not exist, the first load named none, or a parameter is out of bounds |
 
 ---
 
@@ -346,7 +408,7 @@ skipped)`; one that cannot be checked because paperless-ngx is unreachable reads
 
 Invalidates a specific cache entry and returns fresh data from paperless-ngx.
 
-If paperless-ngx cannot be reached, the response is built from the last list that was fetched successfully, or is empty if there has never been one, and the failure is logged as a warning. The response does not mark the list as stale; the checks strip at the top of the page is what shows paperless-ngx as unreachable.
+If paperless-ngx cannot be reached, the response is built from the last list that was fetched successfully, and the failure is logged as a warning. If there has never been one, the response says the list could not be loaded, as `GET /api/tags` and `GET /api/correspondents` do, never that it is empty. A refresh clears the remembered failure, so it asks paperless-ngx again at once, within the floor below. The response does not mark a last good list as stale; the checks strip at the top of the page is what shows paperless-ngx as unreachable.
 
 **Query parameter:**
 

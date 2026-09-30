@@ -27,9 +27,13 @@
    out-of-band (see partials/profile_marker.html), so the marker names the new
    profile in the same swap that selects its default.  It comes first, and the
    out-of-band help line comes after the select, so the select is the one
-   element left for the main swap. #}
+   element left for the main swap.
+
+   The lazy list load (partials/metadata_response.html) sends the select
+   out-of-band too, because its own swap target is the loader, so it sets
+   list_oob.  The name is not oob, which the marker and the help line read. #}
 {% if follows_profile %}{% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
-<select name="correspondent" id="correspondent-select"
+<select name="correspondent" id="correspondent-select"{% if list_oob %} hx-swap-oob="true"{% endif %}
         aria-describedby="correspondent-help"
         autocomplete="off"
         hx-get="/api/profiles/correspondent"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import logging
+import math
 import secrets
 import uuid
 from collections import Counter
@@ -85,6 +86,7 @@ from saneless.vocabulary import (
     unlisted_tag_label,
     worker_health_detail,
 )
+from saneless.web import cache as web_cache
 from saneless.web.cache import MetadataUnavailableError
 from saneless.web.errors import (
     RETRY_AFTER_SECONDS,
@@ -170,9 +172,9 @@ the page is only told what the lists hold once they answer.  The status strip's
 probe already decides whether paperless-ngx is answering with these two
 numbers, so they are the codebase's one measure of "answering", and every list
 route fetches with them: the tag list and its filter, the correspondent
-options, both refreshes and both profile-change swaps.  A list that does not
-answer within them is reported as not loaded, and is asked again when the
-cache's short memory of the failure runs out.
+options, both refreshes, both profile-change swaps and the lazy list load.  A
+list that does not answer within them is reported as not loaded, and is asked
+again when the cache's short memory of the failure runs out.
 """
 
 # The only metadata resources the cache holds.  A runtime alias, not a
@@ -3459,6 +3461,180 @@ def get_profile_correspondent(request: Request, profile: str) -> Response:
                 timeout=_REQUEST_FETCH_TIMEOUT,
             ),
             "follows_profile": profile,
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _MetadataQuery:
+    """
+    What one lazy list load asks for.
+
+    Attributes:
+        profile: The profile whose defaults to show, or None; required on the
+            first load, optional on a retry.
+        retry: Whether this is the retry element asking again, which keeps
+            the form's ticks and choice, rather than the first load, which
+            shows the profile's defaults.
+        q: The tag filter currently in the box, if any.
+        tags: The tag ids currently ticked, read on a retry.
+        correspondent: The correspondent currently chosen, read on a retry.
+
+    """
+
+    profile: str | None
+    retry: bool
+    q: str
+    tags: list[int]
+    correspondent: int | None
+
+
+def _metadata_query(
+    *,
+    profile: Annotated[str | None, Query()] = None,
+    retry: Annotated[bool, Query()] = False,
+    q: Annotated[str, Query(max_length=TAG_FILTER_MAX_LENGTH)] = "",
+    tags: list[PaperlessId] = _TAGS_QUERY_DEFAULT,
+    correspondent: Annotated[PaperlessId | None, Query()] = None,
+) -> _MetadataQuery:
+    """
+    Read the lazy list load's query, bounded as the list routes bound it.
+
+    Keyword-only so the boolean is never a positional flag.  ``q`` over
+    ``TAG_FILTER_MAX_LENGTH``, more than ``TAGS_MAX_COUNT`` tags, or an id
+    that is not a paperless-ngx key is a 422 before the handler runs.
+
+    Args:
+        profile: The profile whose defaults the first load shows.
+        retry: Whether the retry element is asking.
+        q: The tag filter currently in the box.
+        tags: The tag ids currently ticked.
+        correspondent: The correspondent currently chosen.
+
+    Returns:
+        The five, together.
+
+    """
+    return _MetadataQuery(
+        profile=profile,
+        retry=retry,
+        q=q,
+        tags=list(tags),
+        correspondent=correspondent,
+    )
+
+
+def _metadata_retry_seconds(ttl: float) -> int:
+    """
+    Say how often a list that could not be loaded asks again, in seconds.
+
+    As often as the cache forgets the failure, so every retry is a real
+    fetch and none is answered from the cache's memory of it: the negative
+    TTL, or the cache's own TTL when that is shorter.  Rounded up to whole
+    seconds for htmx's trigger, and never under one.  The constant is read
+    here, at call time, not bound when the module loads.
+
+    Args:
+        ttl: The configured ``paperless_cache_ttl_seconds``.
+
+    Returns:
+        The retry element's interval.
+
+    """
+    return max(1, math.ceil(min(ttl, web_cache.NEGATIVE_TTL_SECONDS)))
+
+
+@router.get("/api/metadata")
+def get_metadata(
+    request: Request, query: Annotated[_MetadataQuery, Depends(_metadata_query)]
+) -> Response:
+    """
+    Render both lists, their help, the Scan button and the retry, in one answer.
+
+    The page renders at once with a loader where the lists go, and the loader
+    asks here after load.  One combined request, not one per list, because
+    only the server knows when both are done: Scan is held until they are,
+    and a page with no script of its own cannot count two responses.  So this
+    fetches both, within the short request budget, and answers with every
+    part that depends on them out of band (see
+    ``partials/metadata_response.html``).
+
+    The first load names the profile the page's select shows now, and shows
+    that profile's default ticks and correspondent with both profile markers
+    out of band.  The markers are sent again on purpose: a person who changes
+    Profile before this answer lands starts a profile-change swap of each
+    control, and the two responses can land in either order.  Whichever lands
+    last, its list and its marker agree, so the next submit never files one
+    profile's scan with another profile's defaults.  A retry carries the
+    form's current ticks, filter and choice instead, and sends no marker, as
+    a refresh does.
+
+    The Scan button comes from the same status context the page builds, for
+    the same job this browser follows, so an active job and a blocked
+    appliance still disable it; a list that could not be loaded releases it
+    just as a loaded one does.  A status poll can release it early too,
+    because a poll knows nothing of the lists: that window is accepted, since
+    it is bounded by the short budget and the profile-marker rule still
+    protects what the scan files.
+
+    The profile is validated as the profile routes validate it: one locked
+    lookup, and an unknown name is a 422 before any fetch.  The first load
+    needs one; a retry may omit it.
+
+    Args:
+        request: The incoming HTTP request.
+        query: The profile, the mode, and the form's filter, ticks and choice.
+
+    Returns:
+        The retry element or nothing, with the out-of-band parts.
+
+    Raises:
+        RequestRejected: The profile is not configured, or the first load
+            named none.
+
+    """
+    state = request.app.state
+    found = None if query.profile is None else state.worker.get_profile(query.profile)
+    if query.profile is not None and found is None:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    if query.retry:
+        ticked, chosen, follows = query.tags, query.correspondent, None
+    elif found is not None:
+        ticked = list(found.default_tags)
+        chosen = found.default_correspondent
+        follows = query.profile
+    else:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    tag_list = _tag_list_context(
+        state, q=query.q, selected=ticked, timeout=_REQUEST_FETCH_TIMEOUT
+    )
+    options = _correspondent_options_context(
+        state, chosen, timeout=_REQUEST_FETCH_TIMEOUT
+    )
+    live = _status_context(
+        state.worker,
+        state.job_store,
+        _status_facts(
+            request,
+            followed_job_id=_owned_active_job_id(
+                state.worker, state.job_store, _presented_owner(request)
+            ),
+        ),
+    )
+    return state.templates.TemplateResponse(
+        request,
+        "partials/metadata_response.html",
+        {
+            **tag_list,
+            **options,
+            "follows_profile": follows,
+            "show_tags": state.settings.web.show_tags,
+            "show_correspondent": state.settings.web.show_correspondent,
+            "job": live["job"],
+            "scan_blocked": live["scan_blocked"],
+            "retry_seconds": _metadata_retry_seconds(
+                state.settings.output.paperless_cache_ttl_seconds
+            ),
         },
     )
 
