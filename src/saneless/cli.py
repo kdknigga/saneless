@@ -125,6 +125,7 @@ from .vocabulary import (
     progress_label,
     rejection_message,
     removed_pages_note,
+    root_owned_config_note,
     state_label,
 )
 from .web.app import create_app
@@ -2233,6 +2234,29 @@ def _echo_write_result(
             )
 
 
+def _note_root_owned_config(path: Path) -> None:
+    """
+    Say on stderr when a config file this command created belongs to root.
+
+    A new file takes its directory's owner, so root writing into a root-owned
+    ``/etc/saneless`` -- the usual bare-metal layout -- leaves the file root's,
+    mode 0600.  saneless running as an ordinary user would then find it on the
+    next start and fail to read it, so the operator is told which file to give
+    to that user.  A file owned by anyone else needs nothing, and a status
+    that cannot be read is not worth failing a write that succeeded.
+
+    Args:
+        path: The file just created.
+
+    """
+    try:
+        owner = path.stat().st_uid
+    except OSError:
+        return
+    if owner == 0:
+        click.echo(root_owned_config_note(path.absolute()), err=True)
+
+
 def _new_config_target(settings: Settings) -> Path:
     """
     Choose where ``auto-profiles`` creates a config file when none was loaded.
@@ -2337,6 +2361,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     # a failure below can always name it, and the output names it absolutely
     # so the operator sees where it went.
     config_path = settings.config_path or _new_config_target(settings)
+    # Asked before the write, which is what creates it; a rewrite keeps the
+    # owner the file already had, so only a created file can need the note.
+    created = not config_path.exists()
     # A ConfigError here (a single-file bind mount, a non-UTF-8 file, or
     # merged text that would not parse) names the file and the fix; the group
     # guard prints it as-is and exits 2, with no traceback.  An OSError --
@@ -2357,6 +2384,8 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         click.echo(f"Cannot write {config_path}: {exc.strerror or exc}", err=True)
         ctx.exit(ExitCode.CONFIG)
     _echo_write_result(result, profiles)
+    if created:
+        _note_root_owned_config(result.path)
 
 
 def _state_marker(state: CheckState) -> str:

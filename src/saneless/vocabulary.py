@@ -28,11 +28,12 @@ from saneless.exceptions import (
 )
 
 if TYPE_CHECKING:
-    # Annotation-only, so the leaf rule is untouched either way -- both are
+    # Annotation-only, so the leaf rule is untouched either way -- all are
     # stdlib and importing them would not make this module depend on a
     # consumer.
     from collections.abc import Sequence
     from datetime import datetime
+    from pathlib import Path
 
 __all__ = [
     "ACTIVE_STATES",
@@ -138,6 +139,7 @@ __all__ = [
     "removed_pages_note",
     "restart_category",
     "restart_error",
+    "root_owned_config_note",
     "scan_page_description",
     "sixteen_bit_error",
     "source_not_offered_error",
@@ -2521,6 +2523,29 @@ def multi_page_manual_duplex_refusal(profile: str) -> str:
         f"Profile '{profile}' is manual duplex, and --multi-page is not "
         "available with manual duplex. Scan without --multi-page, or choose "
         "another profile."
+    )
+
+
+def root_owned_config_note(path: Path) -> str:
+    """
+    Return the note for a config file root created and could not give away.
+
+    A new config takes its directory's owner; when that owner is root too, the
+    file stays root's with mode 0600, and saneless running as any other user
+    finds it on the next start and cannot read it.  This is the one source of
+    that note's wording.
+
+    Args:
+        path: The created file, absolute.
+
+    Returns:
+        The note, naming the file and the ``chown`` that fixes it.
+
+    """
+    return (
+        f"Note: {path} is owned by root with mode 0600, so only root can read "
+        "it. If saneless runs as another user, give the file to that user "
+        f"before starting saneless: chown <user>: {path}"
     )
 
 

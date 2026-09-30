@@ -14,6 +14,7 @@ import re
 import signal
 import socket
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -4733,6 +4734,138 @@ class TestAutoProfilesTarget:
         assert result.exit_code == 0, result.output
         assert files.etc.exists()
         assert not files.cwd.exists()
+
+
+def _fake_file_owner(monkeypatch: pytest.MonkeyPatch, path: Path, uid: int) -> None:
+    """
+    Make ``os.stat`` report ``path`` as owned by ``uid`` once it exists.
+
+    A path that does not exist yet still raises, so a writer asking whether
+    the file is there is answered for real.  Nothing is chowned: a non-root
+    test cannot give a file to root.
+
+    Args:
+        monkeypatch: pytest's patcher.
+        path: The file whose owner is faked.
+        uid: The owner to report.
+
+    """
+    real_stat = os.stat
+    faked = os.fspath(path)
+
+    def fake_stat(
+        target: int | str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        """
+        Return the real status, with the file's owner replaced.
+
+        Returns:
+            The real status of ``target``, owned by ``uid`` when it is the file.
+
+        """
+        result = real_stat(target, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if isinstance(target, int) or os.fspath(target) != faked:
+            return result
+        fields = list(result)
+        fields[stat.ST_UID] = uid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+
+class TestAutoProfilesRootOwnedNewConfig:
+    """
+    A config root creates and cannot give away is named, with the fix.
+
+    A new file takes its directory's owner, which on a bare-metal host is
+    usually root for ``/etc/saneless``.  The file then stays root's, mode 0600,
+    and a service running as an ordinary user finds it and cannot read it, so
+    every later command exits 2.  The command therefore says so on stderr, with
+    the absolute path and the ``chown`` that fixes it.
+    """
+
+    @staticmethod
+    def _run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Result:
+        """
+        Run ``auto-profiles`` over the patched search with nothing loaded.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        Returns:
+            The runner's result.
+
+        """
+        return TestAutoProfilesTarget._run(monkeypatch, tmp_path)
+
+    def test_a_new_root_owned_file_is_named_with_the_chown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """The note names the absolute file and tells the operator to chown it."""
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        _fake_file_owner(monkeypatch, files.etc, 0)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        notes = [line for line in result.stderr.splitlines() if "chown" in line]
+        assert len(notes) == 1, result.stderr
+        assert f"chown <user>: {files.etc}" in notes[0]
+        assert f"{files.etc} is owned by root" in notes[0]
+        assert "chown" not in result.stdout
+
+    def test_a_new_file_owned_by_another_user_says_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        patched_search_paths: _SearchFiles,
+    ) -> None:
+        """A file that went to the directory's non-root owner needs no fix."""
+        files = patched_search_paths
+        files.etc.parent.mkdir(parents=True)
+        _fake_file_owner(monkeypatch, files.etc, 4242)
+
+        result = self._run(monkeypatch, tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert files.etc.exists()
+        assert "chown" not in result.output
+
+    def test_an_existing_root_owned_file_says_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A rewrite keeps the owner the file already had; that is not news.
+
+        The note is about a file this command created, so a loaded file owned
+        by root -- whoever put it there chose that -- is rewritten silently.
+        """
+        loaded = tmp_path / "etc" / CONFIG_FILENAME
+        loaded.parent.mkdir()
+        loaded.write_text("# loaded by the search\n")
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config((loaded,))
+        _fake_file_owner(monkeypatch, loaded, 0)
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+
+        result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert "flatbed" in tomllib.loads(loaded.read_text())["profiles"]
+        assert "chown" not in result.output
 
 
 class TestStaleConfigWarningReachesTheTerminal:

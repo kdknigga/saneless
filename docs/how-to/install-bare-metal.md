@@ -76,6 +76,12 @@ See [Configure Scan Profiles](configure-scan-profiles.md) for more profile optio
 
 If `auto-profiles` creates the config file from scratch -- you ran `saneless auto-profiles` before writing one -- it lands in `$XDG_CONFIG_HOME/saneless/saneless.toml` (by default `~/.config/saneless/saneless.toml`), or in `/etc/saneless/saneless.toml` when the `/etc/saneless` directory already exists and you can write to it. It never lands in `./saneless.toml` in the working directory, which would outrank both on the next start. Add the `[paperless]` table above to that file.
 
+If you run `sudo saneless auto-profiles` and `/etc/saneless` belongs to root, the new file is owned by root with mode `0600`. saneless running as your own user then finds that file on the next start and cannot read it, so every command stops with a configuration error. The command prints a note naming the file when this happens. Before you start saneless, give the file to the user saneless runs as; for your own user:
+
+```bash
+sudo chown "$USER": /etc/saneless/saneless.toml
+```
+
 Scans in progress are written under `tmp_dir`, by default `$TMPDIR/saneless-<uid>` (for example `/tmp/saneless-1000`), which saneless creates so that only your user can enter it; see [`[output]`](../reference/configuration.md#output) for what it refuses at startup. Upgrading from an earlier release? The old `/tmp/saneless` directory is no longer used and may be deleted, once any `saneless.db` a release older than `data_dir` left in it has been moved to `data_dir`.
 
 ### Upgrading from an earlier release
