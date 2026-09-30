@@ -53,6 +53,7 @@ from saneless.vocabulary import (
     TOKEN_UNSET_JOB_ERROR,
     ErrorCategory,
     FlipOutcome,
+    PassAnswer,
     RequestRejection,
     SubmitResult,
     WorkerHealth,
@@ -1696,6 +1697,26 @@ def _queued_job(client: TestClient, title: str) -> str:
     return job_store.create_job(profile="default", title=title).id
 
 
+def _polls(markup: str, job_id: str) -> bool:
+    """
+    Report whether the markup's status area polls ``job_id``'s status URL.
+
+    A prefix match: the URL may carry a query string after the path, so the
+    path must be followed by either that query or the attribute's closing
+    quote, which is what stops one id matching as the prefix of another.
+
+    Args:
+        markup: A rendered page or status response.
+        job_id: The job id in the path, or ``current`` for the current-job URL.
+
+    Returns:
+        True when an ``hx-get`` names that job's status URL.
+
+    """
+    pattern = rf'hx-get="/api/jobs/{re.escape(job_id)}/status[?"]'
+    return re.search(pattern, markup) is not None
+
+
 class TestFollowedJob:
     """
     The status area follows the job this browser submitted (D-25).
@@ -1784,6 +1805,111 @@ class TestFollowedJob:
         assert response.status_code == 200
         assert 'hx-get="/api/jobs/current/status"' in response.text
         assert "/api/jobs/current/status" in response.text
+
+    def test_continue_follows_the_posted_job(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+    ) -> None:
+        """
+        The Continue response keeps polling the job it answered.
+
+        Otherwise the answer hands the area to the current-job URL, and the next
+        poll reports whatever the worker runs, not the scan this person flipped.
+        """
+        job_id, _ = owned_flip
+
+        response = accepting_client.post("/api/flip/continue", data={"job_id": job_id})
+
+        assert response.status_code == 200
+        assert _polls(response.text, job_id)
+
+    def test_abort_follows_the_posted_job(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+    ) -> None:
+        """The Abort response keeps polling the job it answered."""
+        job_id, _ = owned_flip
+
+        response = accepting_client.post("/api/flip/abort", data={"job_id": job_id})
+
+        assert response.status_code == 200
+        assert _polls(response.text, job_id)
+
+    def test_multi_page_answer_follows_the_posted_job(self, client: TestClient) -> None:
+        """A multi-page answer's response keeps polling the job it answered."""
+        job_store: JobStore = _app(client).state.job_store
+        worker = _app(client).state.worker
+        job = job_store.create_job(
+            profile="default", title="Pages", owner_token=_as_owner(client)
+        )
+        job_store.update_state(job.id, JobState.AWAITING_NEXT_PASS)
+        worker._current_job_id = job.id
+        try:
+            response = client.post(
+                "/api/multi-page/answer",
+                data={"job_id": job.id, "prompt": "1", "answer": str(PassAnswer.NEXT)},
+            )
+        finally:
+            worker._current_job_id = None
+
+        assert response.status_code == 200
+        assert _polls(response.text, job.id)
+
+    def test_index_follows_the_owned_queued_job(self, client: TestClient) -> None:
+        """
+        A reload while someone else's scan runs follows this browser's queued job.
+
+        The page used to poll the current-job URL, so a queued submitter who
+        reloaded was shown the running job instead of their own.
+        """
+        owner = _as_owner(client)
+        _running_job(client, "Someone Elses Scan", owner_token="another-browser")
+        job_store: JobStore = _app(client).state.job_store
+        mine = job_store.create_job(profile="default", title="Mine", owner_token=owner)
+
+        page = client.get("/").text
+
+        assert _polls(page, mine.id)
+
+    def test_index_follows_the_newest_owned_active_job(
+        self, client: TestClient
+    ) -> None:
+        """Of two active jobs this browser owns, the page follows the newer one."""
+        owner = _as_owner(client)
+        _running_job(client, "Older And Running", owner_token=owner)
+        job_store: JobStore = _app(client).state.job_store
+        newer = job_store.create_job(
+            profile="default", title="Newer And Queued", owner_token=owner
+        )
+
+        page = client.get("/").text
+
+        assert _polls(page, newer.id)
+
+    def test_index_never_follows_an_unowned_job(self, client: TestClient) -> None:
+        """A queued job nobody owns, or someone else owns, is never followed."""
+        _as_owner(client)
+        job_store: JobStore = _app(client).state.job_store
+        nobodys = job_store.create_job(profile="default", title="Nobody's")
+        theirs = job_store.create_job(
+            profile="default", title="Theirs", owner_token="another-browser"
+        )
+
+        page = client.get("/").text
+
+        assert _polls(page, "current")
+        assert not _polls(page, nobodys.id)
+        assert not _polls(page, theirs.id)
+
+    def test_index_without_an_owned_job_polls_current(self, client: TestClient) -> None:
+        """With nothing of its own active, the page still follows the current job."""
+        _running_job(client, "Inferred")
+
+        page = client.get("/").text
+
+        assert _polls(page, "current")
 
 
 class TestQueueLine:
