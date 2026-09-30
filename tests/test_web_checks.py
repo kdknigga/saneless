@@ -1139,6 +1139,10 @@ class TestBoundedPoll:
         assert "/api/checks?attempt=1" in attrs
         assert "load," in attrs
 
+    # Offline, so the job the submit starts fails its upload at once instead
+    # of retrying a real localhost connection past the worker's stop join,
+    # which would leave the app's job store open at teardown.
+    @pytest.mark.usefixtures("offline_paperless")
     def test_the_out_of_band_strip_starts_the_poll_at_its_first_attempt(
         self, client: TestClient
     ) -> None:

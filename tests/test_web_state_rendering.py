@@ -823,6 +823,10 @@ def test_poll_scan_button_follows_the_state_table(
     assert match.group("text").strip() == expected
 
 
+# Offline, so the job the submit starts fails its upload at once instead of
+# retrying a real localhost connection past the worker's stop join, which
+# would leave the app's job store open at teardown.
+@pytest.mark.usefixtures("offline_paperless")
 def test_scan_success_carries_button_status_and_message_clear(
     client: TestClient,
 ) -> None:
