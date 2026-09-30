@@ -33,6 +33,7 @@ import io
 import json
 import re
 import socket
+import sqlite3
 import threading
 import time
 from contextlib import ExitStack, contextmanager
@@ -100,6 +101,7 @@ from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
     HIDDEN_PRESERVED_ERROR,
+    LOST_CONTACT_LINE,
     MULTI_PAGE_DISABLED_REASON,
     MULTI_PAGE_HELP,
     MULTI_PAGE_LABEL,
@@ -7302,3 +7304,93 @@ class TestMultiPagePromptInTheBrowser:
             assert page.evaluate("() => document.activeElement.id") == "mp-next"
         finally:
             _abort_the_document(server, job_id, wait_for_state)
+
+
+# Counts every write into the alert slot: a child added or removed, or text
+# changed, anywhere under ``#status-message``.  Attributes are left out on
+# purpose -- htmx toggles its own classes on any element it settles, and what
+# the operator would read is the slot's content.  Registered as an init script
+# and attached once the document is parsed, so the count covers the page's
+# whole life, from before the first poll.
+_RECORD_SLOT_MUTATIONS = """
+window.__slotMutations = 0;
+document.addEventListener("DOMContentLoaded", () => {
+    const slot = document.getElementById("status-message");
+    new MutationObserver((records) => {
+        window.__slotMutations += records.length;
+    }).observe(slot, {childList: true, subtree: true, characterData: true});
+});
+"""
+
+
+@pytest.mark.browser
+class TestStatusPollLostContact:
+    """
+    A job store that cannot be read never reaches the alert slot, in Chromium.
+
+    The alert slot is for the operator's own failed actions.  A status poll
+    that failed into it re-wrote the page's one alert on every tick and left
+    an error standing above "Done" once the store healed.  These tests break
+    the store's job reads under a live, held scan and watch both elements.
+    """
+
+    def test_lost_contact_never_touches_the_alert_slot(
+        self,
+        page: Page,
+        scan_harness: _ScanHarness,
+        wait_for_state: Callable[..., Job],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The status area shows the retrying line; the slot is never written.
+
+        ``get_job`` raises on every thread but the worker's, so the scan
+        itself carries on while every status poll fails.  Once the store is
+        healed and the gate opened, the same page reaches "Done" with the
+        slot still empty: nothing was left above it.  The waits are completed
+        responses and retrying assertions, never a sleep.
+        """
+        server = scan_harness.server
+        job_store = scan_harness.job_store
+        worker_thread = server.app.state.worker._thread
+        original = job_store.get_job
+        broken = threading.Event()
+
+        def get_job(job_id: str) -> Job | None:
+            if broken.is_set() and threading.current_thread() is not worker_thread:
+                msg = "disk I/O error"
+                raise sqlite3.OperationalError(msg)
+            return original(job_id)
+
+        monkeypatch.setattr(job_store, "get_job", get_job)
+        page.add_init_script(_RECORD_SLOT_MUTATIONS)
+        page.goto(server.url)
+        server.scanner.gate.clear()
+        try:
+            page.locator("#scan-btn").click()
+            expect(page.locator("#status-area p[aria-busy='true']")).to_be_visible()
+            created = scan_harness.created_job_ids()
+            assert len(created) == 1, created
+            wait_for_state(job_store, created[0], JobState.SCANNING)
+
+            broken.set()
+            # Two failing polls: by the time the second is answered, the
+            # first one's response has been swapped wherever it was going.
+            for _ in range(2):
+                with page.expect_response(
+                    lambda r: _POLL_URL.search(r.url) is not None, timeout=10_000
+                ):
+                    pass
+            assert page.evaluate("() => window.__slotMutations") == 0, (
+                "a failing status poll wrote into the alert slot"
+            )
+            expect(page.locator("#status-area .status-fallback")).to_contain_text(
+                LOST_CONTACT_LINE
+            )
+        finally:
+            broken.clear()
+            server.scanner.gate.set()
+
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=30_000)
+        expect(page.locator("#status-message")).to_be_empty()
+        assert page.evaluate("() => window.__slotMutations") == 0
