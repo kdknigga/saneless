@@ -104,6 +104,18 @@ RETRY_AFTER_SECONDS: Final = 30
 # button, an action whose failure belongs in the slot with every other click's.
 CHECKS_POLL_TARGET_ID: Final = "checks-body"
 
+# The press a refused submit hands focus back to, by method and path.
+_SCAN_SUBMIT: Final = ("POST", "/api/scan")
+
+# The refusals of a Scan press that do not hand focus back to the Scan button.
+# They refuse on an appliance that cannot upload, where the button is disabled
+# by design, and a disabled button cannot take focus: there is nothing to
+# return it to, and re-rendering the button enabled would offer a press the
+# route is certain to refuse.
+_BLOCKED_SCAN_REJECTIONS: Final = frozenset(
+    {RequestRejection.TOKEN_UNSET, RequestRejection.URL_UNSET}
+)
+
 _TOO_MANY_REQUESTS = 429
 _NOT_FOUND = 404
 _METHOD_NOT_ALLOWED = 405
@@ -281,6 +293,16 @@ def render_error(
     what makes an error body swap at all, so it is load-bearing here: without
     it the exempt response would be discarded and the poll would survive.
 
+    A refused Scan press -- an htmx ``POST /api/scan`` -- returns focus to the
+    Scan button.  The press disabled the button for the request, which
+    dropped focus to the page body, so the error carries the button
+    out-of-band, enabled and with ``autofocus``; the next status rendering
+    re-renders its true state.  Focus is never moved into ``#status-message``:
+    the slot is the page's alert region and speaks the error from where it
+    is.  The refusals in ``_BLOCKED_SCAN_REJECTIONS`` are the exception, as
+    the button on a blocked appliance is disabled by design.  No other
+    request's error carries the button.
+
     Args:
         request: The request being answered.
         rejection: The vocabulary member whose message is shown.
@@ -310,6 +332,10 @@ def render_error(
         if not _is_the_strip_fetching_itself(request):
             headers["HX-Retarget"] = "#status-message"
             headers["HX-Reswap"] = "innerHTML"
+        refocus_scan = (
+            request.method,
+            request.url.path,
+        ) == _SCAN_SUBMIT and rejection not in _BLOCKED_SCAN_REJECTIONS
         return request.app.state.templates.TemplateResponse(
             request,
             "partials/error.html",
@@ -319,6 +345,7 @@ def render_error(
                 "job_id": details.job_id,
                 "refresh_history": details.job_id is not None,
                 "host": details.echoed_host,
+                "refocus_scan": refocus_scan,
             },
             status_code=status_code,
             headers=headers,

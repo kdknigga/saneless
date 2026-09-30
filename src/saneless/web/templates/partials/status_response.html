@@ -10,8 +10,19 @@
    changes the job, not the appliance's health.
    Every one of these responses sets terminal_reload, so a job that has just
    ended reloads the history table and the strip; the full page does not set
-   it, because it has just rendered both. #}
-{% include "partials/status.html" %}
-{% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}
+   it, because it has just rendered both.
+
+   Focus.  An action's response sets focus_status_area, and the status area
+   takes focus; a plain poll never sets it.  focus_scan is the Scan button's
+   pending request for focus after a claimed Abort, and the button takes it
+   once it is enabled.  When both apply in one response -- an Abort that
+   lands after the scan has already ended -- the Scan button must win, but
+   htmx focuses the main swap's autofocus after the out-of-band ones, so the
+   status area is told not to ask.  Whether the button is enabled is the
+   button partial's own verdict, imported rather than restated here. #}
+{% import "partials/scan_button.html" as scan_button_state with context %}
+{% set scan_takes_focus = focus_scan and not scan_button_state.scan_disabled %}
+{% with focus_status_area = focus_status_area and not scan_takes_focus %}{% include "partials/status.html" %}{% endwith %}
+{% with oob = true, autofocus_scan = focus_scan %}{% include "partials/scan_button.html" %}{% endwith %}
 {% if clear_message %}<div id="status-message" hx-swap-oob="innerHTML"></div>{% endif %}
 {% if refresh_checks %}{% with oob = true %}{% include "partials/checks.html" %}{% endwith %}{% endif %}

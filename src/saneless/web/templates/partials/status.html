@@ -8,7 +8,9 @@
 
    The negative tabindex is on every rendering, in every state: the area is where
    focus goes after an action, and htmx restores focus by id only to an
-   element that can hold it.
+   element that can hold it.  autofocus is on it only in an action's response
+   (focus_status_area), never in a poll's or the page's: a poll that took focus
+   would pull it out of the Title box once a second while a scan runs.
 
    The area is always rendered inside index.html's #status-live, the page's
    polite region, and never carries that region itself.  So no line in here is
@@ -16,7 +18,7 @@
    region until it stops being busy, and "Scanning..." would then never be
    heard.  A line the machine is working on carries class="busy-line" instead,
    and app.css draws the spinner from that class. #}
-<div id="status-area" tabindex="-1"
+<div id="status-area" tabindex="-1"{% if focus_status_area %} autofocus{% endif %}
      {% if job and job.is_active %}
      hx-get="{{ poll_url }}"
      hx-trigger="every {{ poll_interval }}s"

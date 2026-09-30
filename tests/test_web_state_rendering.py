@@ -1121,15 +1121,27 @@ def test_flip_responses_never_clear_the_status_message(
     assert "status-message" not in response.text
 
 
-def test_scan_error_response_carries_no_button(client: TestClient) -> None:
-    """A rejected scan renders only the error, never the button (ROBU-04, S4)."""
+def test_scan_error_response_carries_the_button_only_to_return_focus(
+    client: TestClient,
+) -> None:
+    """
+    A rejected scan renders the error and hands focus back to Scan (ROBU-04, S4).
+
+    The button rides along once, out-of-band, enabled and with ``autofocus``,
+    so the keyboard user whose press was refused is back on it.  It is the only
+    thing besides the error: no status area, no second button.
+    """
     response = client.post(
         "/api/scan",
         data={"profile": "no-such-profile", "title": "Rejected"},
         headers={"HX-Request": "true"},
     )
     assert response.status_code == 422
-    assert "scan-btn" not in response.text
+    button = _only_scan_button(response.text).group("attrs")
+    assert button.startswith(_OOB_ATTR)
+    assert "disabled" not in button
+    assert re.search(r"\sautofocus\b", button) is not None
+    assert "status-area" not in response.text
 
 
 _SCAN_FORM = re.compile(r'<form hx-post="/api/scan"[^>]*>')

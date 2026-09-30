@@ -1218,8 +1218,28 @@ _POLL_INTERVAL_SECONDS: Final = 1
 _STATUS_TOKEN_BYTES: Final = 12
 """The token's digest size: 24 hex characters in the poll URL."""
 
+_FOCUS_SCAN: Final = "scan"
+"""
+The value of a status poll's ``focus`` parameter that asks for the Scan button.
 
-def _poll_url(followed_job_id: str | None, *, seen: str, attempt: int = 0) -> str:
+A claimed Abort sends focus to Scan, but the button its own response renders
+is still disabled while the scan winds down, and a disabled button cannot take
+focus.  So the response bakes this into its poll URL, and the first rendering
+whose Scan button is enabled carries ``autofocus`` on it.
+
+The parameter is compared against this constant and never echoed: any other
+value is ignored, and a poll URL only ever carries this constant, so nothing a
+client sends reaches the markup.
+"""
+
+
+def _poll_url(
+    followed_job_id: str | None,
+    *,
+    seen: str,
+    attempt: int = 0,
+    focus_scan: bool = False,
+) -> str:
     """
     Build the URL a status area polls, in the one place any URL for it is built.
 
@@ -1234,6 +1254,8 @@ def _poll_url(followed_job_id: str | None, *, seen: str, attempt: int = 0) -> st
         seen: The token of the rendering the poll's element shows; empty for
             a rendering that has not been hashed, which no poll matches.
         attempt: The poll's retry count, carried only when non-zero.
+        focus_scan: Whether the poll still asks for focus on the Scan button,
+            carried as ``_FOCUS_SCAN`` only when true.
 
     Returns:
         The path and its query string, not yet HTML-escaped.
@@ -1247,6 +1269,8 @@ def _poll_url(followed_job_id: str | None, *, seen: str, attempt: int = 0) -> st
     params = {"seen": seen}
     if attempt:
         params["attempt"] = str(attempt)
+    if focus_scan:
+        params["focus"] = _FOCUS_SCAN
     return f"{path}?{urlencode(params)}"
 
 
@@ -1284,6 +1308,10 @@ def _status_token(request: Request, context: Mapping[str, object]) -> str:
     after it, and every action would be followed by one needless swap -- one
     that replaces the focused button and speaks the area again.
 
+    The one focus fact the canonical rendering keeps is ``focus_scan``: unlike
+    the status area's action-only ``autofocus``, it is poll-visible, because
+    it rides in the poll URL and is what a poll carrying it renders.
+
     The hash is keyed with the process's ``status_token_key``.  The token
     travels in a URL, and so into access logs; keyed, it is unlinkable to the
     content and cannot be computed by anyone else.
@@ -1301,7 +1329,11 @@ def _status_token(request: Request, context: Mapping[str, object]) -> str:
         {
             **context,
             "request": request,
-            "poll_url": _poll_url(_followed_in(context), seen=""),
+            "poll_url": _poll_url(
+                _followed_in(context),
+                seen="",
+                focus_scan=context.get("focus_scan") is True,
+            ),
             "poll_interval": _POLL_INTERVAL_SECONDS,
             "focus_status_area": False,
             "clear_message": False,
@@ -1336,7 +1368,7 @@ def _keyed_digest(request: Request, text: str) -> str:
 
 
 def _with_poll(
-    request: Request, context: Mapping[str, object]
+    request: Request, context: Mapping[str, object], *, focus_scan: bool = False
 ) -> tuple[str, dict[str, object]]:
     """
     Add the poll URL and interval to a status context, with its token baked in.
@@ -1347,19 +1379,29 @@ def _with_poll(
     element a 204 left in place, so the URL a rendering bakes is the one every
     poll from it presents until something changes.
 
+    ``focus_scan`` is the Scan button's pending request for focus, set by a
+    claimed Abort and then by each poll that carries it on.  It rides in the
+    poll URL and in the token, and the rendering puts ``autofocus`` on the
+    Scan button once that button is enabled.  The status area polls only while
+    its job is active, and the button is disabled for exactly that long, so the
+    first rendering that can honour the request is also the last one that
+    polls: focus is moved once.
+
     Args:
         request: The incoming request.
         context: The status context ``_status_context`` built for this viewer.
+        focus_scan: Whether this rendering asks for focus on the Scan button.
 
     Returns:
-        The token, and the context extended with ``poll_url`` and
-        ``poll_interval``.
+        The token, and the context extended with ``focus_scan``, ``poll_url``
+        and ``poll_interval``.
 
     """
-    token = _status_token(request, context)
+    focused = {**context, "focus_scan": focus_scan}
+    token = _status_token(request, focused)
     return token, {
-        **context,
-        "poll_url": _poll_url(_followed_in(context), seen=token),
+        **focused,
+        "poll_url": _poll_url(_followed_in(context), seen=token, focus_scan=focus_scan),
         "poll_interval": _POLL_INTERVAL_SECONDS,
     }
 
@@ -1427,7 +1469,12 @@ def _confirmed_job_id(job_id: str | None) -> str | None:
 
 
 def _lost_contact_fallback(
-    request: Request, job_id: str | None, *, attempt: int, seen: str
+    request: Request,
+    job_id: str | None,
+    *,
+    attempt: int,
+    seen: str,
+    focus_scan: bool,
 ) -> Response:
     """
     Answer a status poll that could not read or render its job.
@@ -1442,13 +1489,17 @@ def _lost_contact_fallback(
     The next poll URL carries the next backoff step as ``attempt`` and the
     fallback's own token as ``seen``.  The token hashes the markup built with
     an empty ``seen``, the same shape ``_status_token`` hashes, so at the cap,
-    where the markup no longer changes, a poll presenting it gets a 204.
+    where the markup no longer changes, a poll presenting it gets a 204.  A
+    pending request for focus on the Scan button is carried on as well, so an
+    Abort whose wind-down the store could not report still focuses Scan once
+    the store heals.
 
     Args:
         request: The incoming request, for the token key.
         job_id: The id from the poll's path, or None for the current route.
         attempt: The failing poll's clamped attempt count.
         seen: The token the poll presented.
+        focus_scan: Whether the poll still asks for focus on the Scan button.
 
     Returns:
         The fallback at 200, or an empty 204 when the poll already shows it.
@@ -1460,7 +1511,9 @@ def _lost_contact_fallback(
     line = html.escape(LOST_CONTACT_LINE)
 
     def body(token: str) -> str:
-        poll_url = html.escape(_poll_url(followed, seen=token, attempt=step))
+        poll_url = html.escape(
+            _poll_url(followed, seen=token, attempt=step, focus_scan=focus_scan)
+        )
         return (
             f'<div id="status-area" tabindex="-1" hx-get="{poll_url}" '
             f'hx-trigger="every {interval}s" hx-swap="outerHTML">\n'
@@ -1475,7 +1528,12 @@ def _lost_contact_fallback(
 
 
 def _answer_status_poll(
-    request: Request, job_id: str | None, *, seen: str, attempt: int
+    request: Request,
+    job_id: str | None,
+    *,
+    seen: str,
+    attempt: int,
+    focus_scan: bool,
 ) -> Response:
     """
     Render a status poll for the followed job, falling back when that fails.
@@ -1489,6 +1547,7 @@ def _answer_status_poll(
         job_id: The followed job's id, or None for the current route.
         seen: The token the poll presented.
         attempt: The poll's attempt count, straight from the query string.
+        focus_scan: Whether the poll asks for focus on the Scan button.
 
     Returns:
         The status partial, the lost-contact fallback, or an empty 204.
@@ -1504,6 +1563,7 @@ def _answer_status_poll(
                 state.job_store,
                 _status_facts(request, followed_job_id=job_id),
             ),
+            focus_scan=focus_scan,
         )
         if _unchanged(seen, token):
             return Response(status_code=204)
@@ -1514,7 +1574,9 @@ def _answer_status_poll(
         )
     except Exception:
         logger.exception("Failed to render the job status")
-        return _lost_contact_fallback(request, job_id, attempt=counted, seen=seen)
+        return _lost_contact_fallback(
+            request, job_id, attempt=counted, seen=seen, focus_scan=focus_scan
+        )
 
 
 def _pass_wait_context(
@@ -2381,7 +2443,8 @@ def _queued_status_fallback(job_id: str) -> str:
     This is what a scan submit answers when rendering its normal response
     failed after the worker had already accepted the job.  It is fixed markup:
     the status area with the same poll attributes ``partials/status.html``
-    gives a followed active job, holding the existing starting prose, plus the
+    gives a followed active job, holding the existing starting prose and
+    taking focus as every accepted submit's status area does, plus the
     out-of-band clear of ``#status-message`` that every accepted submit sends.
     The first poll then renders the full status, the Scan button included.
     No exception text reaches it; that goes to the server log only.
@@ -2396,7 +2459,7 @@ def _queued_status_fallback(job_id: str) -> str:
     poll_url = html.escape(_poll_url(job_id, seen=""))
     line = html.escape(progress_label(JobState.PENDING))
     return (
-        f'<div id="status-area" tabindex="-1" hx-get="{poll_url}" '
+        f'<div id="status-area" tabindex="-1" autofocus hx-get="{poll_url}" '
         f'hx-trigger="every {_POLL_INTERVAL_SECONDS}s" hx-swap="outerHTML">\n'
         f'  <p class="busy-line">{line}</p>\n'
         "</div>\n"
@@ -2435,7 +2498,8 @@ def start_scan(
     the status partial once the job is queued.  That response re-renders the
     Scan button out-of-band from server state and clears the
     ``#status-message`` slot out-of-band, so an error left there by an earlier
-    rejected submit disappears.  A refused submit records a
+    rejected submit disappears.  It also moves focus to the status area,
+    where the scan just started is reported.  A refused submit records a
     REJECTED error row and raises: 429 with ``Retry-After`` when the queue is
     full, 503 when the worker is down or degraded, and
     503 with its own message when the paperless-ngx API token is a placeholder
@@ -2620,6 +2684,8 @@ def start_scan(
                         "clear_message": True,
                         "refresh_checks": True,
                         "terminal_reload": True,
+                        # Focus follows the press to the scan it started.
+                        "focus_status_area": True,
                         **checks,
                     },
                 )
@@ -2656,6 +2722,7 @@ def current_job_status(
     request: Request,
     seen: Annotated[str, Query()] = "",
     attempt: Annotated[int, Query()] = 0,
+    focus: Annotated[str, Query()] = "",
 ) -> Response:
     """
     Poll the current or most recent job status.
@@ -2693,13 +2760,17 @@ def current_job_status(
             named it.  Clamped into ``0..len(STATUS_BACKOFF_SECONDS)``, never
             refused, and reset by the first poll that succeeds, whose URL
             carries none.
+        focus: ``_FOCUS_SCAN`` when a claimed Abort asked for focus on the
+            Scan button; any other value is ignored and never echoed.
 
     Returns:
         The status partial, the lost-contact fallback, or an empty 204 when
         nothing has changed.
 
     """
-    return _answer_status_poll(request, None, seen=seen, attempt=attempt)
+    return _answer_status_poll(
+        request, None, seen=seen, attempt=attempt, focus_scan=focus == _FOCUS_SCAN
+    )
 
 
 @router.get("/api/jobs/{job_id}/status")
@@ -2708,6 +2779,7 @@ def followed_job_status(
     job_id: str,
     seen: Annotated[str, Query()] = "",
     attempt: Annotated[int, Query()] = 0,
+    focus: Annotated[str, Query()] = "",
 ) -> Response:
     """
     Poll the status of the job this browser submitted.
@@ -2737,13 +2809,17 @@ def followed_job_status(
         seen: The token of the rendering the polling element shows.
         attempt: How many polls in a row have failed, clamped as
             ``current_job_status`` clamps it.
+        focus: The pending request for focus on the Scan button, read as
+            ``current_job_status`` reads it.
 
     Returns:
         The status partial rendered for that job, the lost-contact fallback,
         or an empty 204 when nothing has changed.
 
     """
-    return _answer_status_poll(request, job_id, seen=seen, attempt=attempt)
+    return _answer_status_poll(
+        request, job_id, seen=seen, attempt=attempt, focus_scan=focus == _FOCUS_SCAN
+    )
 
 
 @router.get("/api/checks")
@@ -3251,7 +3327,9 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     ``owner_token`` is NULL is unowned and anyone may answer it.
 
     The response re-renders the Scan button out-of-band from server state
-    and leaves ``#status-message`` alone.
+    and leaves ``#status-message`` alone.  It moves focus to the status area:
+    the pressed button is gone from the rendering, and the area is where the
+    scan's progress is read from next.
     """
     state = request.app.state
     presented = _presented_owner(request)
@@ -3273,7 +3351,7 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {**context, "terminal_reload": True},
+        {**context, "terminal_reload": True, "focus_status_area": True},
     )
 
 
@@ -3298,6 +3376,12 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
 
     The response re-renders the Scan button out-of-band from server state
     and leaves ``#status-message`` alone.
+
+    Focus goes to the Scan button: the operator is done with this scan.  A
+    claimed Abort's own rendering usually still shows the button disabled,
+    so the response focuses the status area for the interim and bakes
+    ``focus=scan`` into its poll URL; the first rendering whose button is
+    enabled focuses it.  A dropped Abort asks for nothing.
     """
     state = request.app.state
     presented = _presented_owner(request)
@@ -3315,11 +3399,12 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
                 claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
             ),
         ),
+        focus_scan=claimed,
     )
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {**context, "terminal_reload": True},
+        {**context, "terminal_reload": True, "focus_status_area": True},
     )
 
 
@@ -3360,7 +3445,10 @@ def answer_multi_page(
     job whose ``owner_token`` is NULL is unowned and anyone may answer it.
 
     The response re-renders the Scan button out-of-band from server state
-    and leaves ``#status-message`` alone.
+    and leaves ``#status-message`` alone.  It moves focus to the status area,
+    where the next question's own primary button takes it when that question
+    appears.  A claimed Abort asks for the Scan button instead, as the flip
+    prompt's Abort does.
 
     Args:
         request: The incoming request.
@@ -3388,9 +3476,10 @@ def answer_multi_page(
                 claimed_pass=(job_id, answer) if claimed else None,
             ),
         ),
+        focus_scan=claimed and answer is PassAnswer.ABORT,
     )
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        {**context, "terminal_reload": True},
+        {**context, "terminal_reload": True, "focus_status_area": True},
     )

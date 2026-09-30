@@ -285,6 +285,40 @@ def _assert_json_error(
     }
 
 
+# The Scan button a refused htmx Scan press carries out-of-band, whitespace
+# collapsed: enabled and with ``autofocus``, so focus goes back to the button
+# the press came from.
+SCAN_REFOCUS = (
+    '<button type="submit" id="scan-btn" hx-swap-oob="true" autofocus> Scan </button>'
+)
+
+
+def _slot_of_scan_refusal(text: str) -> str:
+    """
+    Return a refused Scan press's slot body, after checking the button it ends with.
+
+    Args:
+        text: The response body.
+
+    Returns:
+        Everything before the out-of-band Scan button, stripped.
+
+    """
+    start = text.index('<button type="submit" id="scan-btn"')
+    assert " ".join(text[start:].split()) == SCAN_REFOCUS
+    return text[:start].strip()
+
+
+def _assert_scan_refusal(
+    response: httpx2.Response, rejection: RequestRejection, status: int
+) -> None:
+    """Assert a refused htmx Scan press is the slot body plus the Scan button."""
+    assert response.status_code == status
+    assert response.headers["HX-Retarget"] == "#status-message"
+    assert response.headers["HX-Reswap"] == "innerHTML"
+    assert _slot_of_scan_refusal(response.text) == _error_body(rejection, status)
+
+
 # --- T4 / T5: every rejection, both branches ---------------------------------
 
 
@@ -891,7 +925,7 @@ def test_scan_unknown_profile_is_422_without_a_row(
     )
     rejection = RequestRejection.UNKNOWN_PROFILE
     if htmx:
-        _assert_htmx_error(response, rejection, 422)
+        _assert_scan_refusal(response, rejection, 422)
     else:
         _assert_json_error(response, rejection, 422)
     assert INPUT_MARKER not in response.text
@@ -911,7 +945,7 @@ def test_scan_title_too_long_is_422_without_a_row(
     )
     rejection = RequestRejection.TITLE_TOO_LONG
     if htmx:
-        _assert_htmx_error(response, rejection, 422)
+        _assert_scan_refusal(response, rejection, 422)
     else:
         _assert_json_error(response, rejection, 422)
     assert INPUT_MARKER not in response.text
@@ -999,7 +1033,7 @@ def test_scan_title_control_character_is_422_without_a_row(
         )
     rejection = RequestRejection.TITLE_HAS_CONTROL
     if htmx:
-        _assert_htmx_error(response, rejection, 422)
+        _assert_scan_refusal(response, rejection, 422)
     else:
         _assert_json_error(response, rejection, 422)
     assert INPUT_MARKER not in response.text
@@ -1070,7 +1104,7 @@ def test_scan_tags_cap_refuses_one_over_without_a_row(
     )
     rejection = RequestRejection.INVALID_REQUEST
     if htmx:
-        _assert_htmx_error(response, rejection, 422)
+        _assert_scan_refusal(response, rejection, 422)
     else:
         _assert_json_error(response, rejection, 422)
     assert offered == []
@@ -1135,7 +1169,7 @@ def test_scan_malformed_id_is_422_without_a_row(
     )
     rejection = RequestRejection.INVALID_REQUEST
     if htmx:
-        _assert_htmx_error(response, rejection, 422)
+        _assert_scan_refusal(response, rejection, 422)
     else:
         _assert_json_error(response, rejection, 422)
     assert offered == []
@@ -1168,7 +1202,7 @@ def test_scan_malformed_tag_among_good_ones_is_422(
         data={"profile": "default", "title": "Mixed", "tags": ["3", "0", "7"]},
         headers=HTMX_HEADERS,
     )
-    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+    _assert_scan_refusal(response, RequestRejection.INVALID_REQUEST, 422)
     assert offered == []
 
 
@@ -1227,7 +1261,7 @@ def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
     assert response.headers["Retry-After"] == "30"
     assert response.headers["HX-Retarget"] == "#status-message"
     body = _error_body(rejection, 429, _newest_job_id(client))
-    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+    assert _slot_of_scan_refusal(response.text) == f"{body}\n{HISTORY_LOADER}"
     _assert_rejected_row(client, QUEUE_FULL_JOB_ERROR)
 
 
@@ -1273,7 +1307,7 @@ def test_scan_refused_submit_is_503_with_a_rejected_row(
     assert response.status_code == 503
     assert "Retry-After" not in response.headers
     body = _error_body(rejection, 503, _newest_job_id(client))
-    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+    assert _slot_of_scan_refusal(response.text) == f"{body}\n{HISTORY_LOADER}"
     _assert_rejected_row(client, error)
 
 
@@ -1306,7 +1340,7 @@ def test_scan_unhealthy_worker_is_503_before_submit(
     )
     assert response.status_code == 503
     body = _error_body(rejection, 503, _newest_job_id(client))
-    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+    assert _slot_of_scan_refusal(response.text) == f"{body}\n{HISTORY_LOADER}"
     assert offered == []
     _assert_rejected_row(client, error)
 
@@ -1353,7 +1387,7 @@ def test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails(
     assert offered == []
     assert [job for job in store.list_recent(limit=50) if job.is_active] == []
     _assert_rejected_row(client, error)
-    assert response.text.strip().endswith(HISTORY_LOADER)
+    assert _slot_of_scan_refusal(response.text).endswith(HISTORY_LOADER)
 
 
 def test_scan_degraded_store_failing_is_503_without_a_loader(
@@ -1383,7 +1417,7 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
             data={"profile": "default", "title": "Store Failing"},
             headers=HTMX_HEADERS,
         )
-    _assert_htmx_error(response, RequestRejection.WORKER_DEGRADED, 503)
+    _assert_scan_refusal(response, RequestRejection.WORKER_DEGRADED, 503)
     assert "/api/jobs/history" not in response.text
     assert offered == []
     assert store.list_recent(limit=50) == before
@@ -2271,7 +2305,7 @@ _RECOVERABLE_REFUSALS = {
         {"profile": "default", "title": "Queue Full"},
         RequestRejection.QUEUE_FULL,
     ),
-    "invalid_title": (
+    "title_too_long": (
         {"profile": "default", "title": "x" * (TITLE_MAX_LENGTH + 1)},
         RequestRejection.TITLE_TOO_LONG,
     ),
@@ -2301,7 +2335,7 @@ def test_rejected_scan_returns_focus_to_the_scan_button(
 
     response = client.post("/api/scan", data=data, headers=HTMX_HEADERS)
 
-    status = 422 if refusal == "invalid_title" else rejection_status_code(rejection)
+    status = rejection_status_code(rejection)
     assert response.status_code == status
     assert response.headers["HX-Retarget"] == "#status-message"
     assert _error_paragraph(rejection) in response.text

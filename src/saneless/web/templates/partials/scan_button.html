@@ -24,9 +24,21 @@
    A multi-page document waiting between passes reads "Waiting for you", not
    "Scanning": the scanner is idle and the next move is the person's.  Like the
    flip caption it carries no spinner, because aria-busy follows is_busy and a
-   waiting job is not busy. #}
+   waiting job is not busy.
+
+   The disabled sources are computed once, as scan_disabled, and read twice:
+   by the disabled attribute and by autofocus.  autofocus_scan asks for focus
+   on the button -- after a claimed Abort, through the poll's focus=scan, and
+   after a refused Scan press -- and the button takes it only when it is
+   enabled, because a disabled button cannot take focus.  That is why an
+   Abort, whose own response still shows the button disabled while the scan
+   winds down, defers the request to the first rendering that shows it
+   enabled.  scan_disabled is a top-level assignment so that
+   partials/status_response.html can import this partial and ask it, rather
+   than restate the rule. #}
+{% set scan_disabled = scan_blocked or (job and job.is_active) %}
 <button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
         {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% endif %}
-        {% if scan_blocked or (job and job.is_active) %}disabled{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
+        {% if scan_disabled %}disabled{% endif %}{% if autofocus_scan and not scan_disabled %} autofocus{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
     {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.state in pass_wait_states %}Waiting for you&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
 </button>

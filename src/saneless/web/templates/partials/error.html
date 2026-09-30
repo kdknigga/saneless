@@ -26,3 +26,10 @@
   {%- endif %}
 </details>
 {% if refresh_history %}<div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>{% endif %}
+{# A refused Scan press hands focus back to the Scan button.  The press
+   disabled it for the request, which dropped focus to the page body, so the
+   button is re-rendered out-of-band, enabled and with autofocus: the press
+   came from an enabled button, and the next status rendering re-renders its
+   true state.  Focus never moves into this slot; the slot speaks the error
+   from where it is.  render_error decides when this applies. #}
+{% if refocus_scan %}{% with oob = true, autofocus_scan = true, job = none, scan_blocked = false %}{% include "partials/scan_button.html" %}{% endwith %}{% endif %}
