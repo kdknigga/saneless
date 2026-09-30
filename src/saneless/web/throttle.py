@@ -50,7 +50,8 @@ MIN_MANUAL_REFRESH_SECONDS: Final = 2.0
 # unreachable host costs, so a bound of 35 s lets a follower share that answer
 # rather than time out a few milliseconds before it lands.  A leader slower
 # than this (a connect and a trickling read both near their budgets) leaves
-# the follower a TimeoutError, which the route answers as its usual 502.
+# the follower a TimeoutError, which the route answers as 503 with
+# Retry-After.
 PAPERLESS_TEST_WAIT_SECONDS: Final = 35.0
 
 

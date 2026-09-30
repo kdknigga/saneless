@@ -2127,7 +2127,7 @@ class PaperlessClient:
         except httpx2.TransportError:
             # The base class of ConnectError, ConnectTimeout and ReadTimeout.
             # Catching only ConnectError let the timeout siblings escape to
-            # routes.py's blanket handler, which answers HTTP 502
+            # routes.py's blanket handler, which answers HTTP 500
             # {"status": "error"} -- none of the outcomes.
             logger.warning("Paperless is unreachable")
             return ConnectionStatus.UNREACHABLE
