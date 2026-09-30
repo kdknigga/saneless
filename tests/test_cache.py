@@ -21,7 +21,13 @@ import pytest
 
 from saneless.exceptions import PaperlessError
 from saneless.paperless import PaperlessClient
-from saneless.web.cache import CachedList, CachedMetadataLookup, MetadataCache
+from saneless.web.cache import (
+    NEGATIVE_TTL_SECONDS,
+    CachedList,
+    CachedMetadataLookup,
+    MetadataCache,
+    MetadataUnavailableError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -177,23 +183,222 @@ def test_get_or_fetch_single_flight() -> None:
     assert all(result is results[0] for result in results)
 
 
-def test_get_or_fetch_failure_is_not_cached() -> None:
-    """With no previous value, a raising fetch propagates and caches nothing."""
-    cache = MetadataCache(ttl=60, clock=_FakeClock())
-    calls: list[int] = []
+def _counting_failure(calls: list[int]) -> Callable[[], _Rows]:
+    """Return a fetch that records each call in ``calls`` and then fails."""
 
     def failing_fetch() -> _Rows:
         calls.append(1)
         msg = "paperless unreachable"
         raise ConnectionError(msg)
 
-    with pytest.raises(ConnectionError):
-        cache.get_or_fetch("tags", failing_fetch)
-    assert cache.get("tags") is None
+    return failing_fetch
+
+
+def test_a_failure_is_remembered_for_the_negative_ttl() -> None:
+    """
+    With no previous value, a failure is remembered briefly instead of retried.
+
+    The first call gets the fetch's own error.  Until the negative TTL passes,
+    the next call is answered "unavailable" without asking paperless-ngx again;
+    after it, the next call fetches again.
+    """
+    clock = _FakeClock()
+    cache = MetadataCache(ttl=60, clock=clock)
+    calls: list[int] = []
+    failing_fetch = _counting_failure(calls)
 
     with pytest.raises(ConnectionError):
         cache.get_or_fetch("tags", failing_fetch)
-    assert len(calls) == 2
+    clock.advance(NEGATIVE_TTL_SECONDS - 1)
+    with pytest.raises(MetadataUnavailableError):
+        cache.get_or_fetch("tags", failing_fetch)
+    assert calls == [1]
+
+    clock.advance(2)
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", failing_fetch)
+    assert calls == [1, 1]
+
+
+def test_the_negative_window_never_outlasts_the_ttl() -> None:
+    """A TTL shorter than the negative TTL bounds how long a failure is kept."""
+    clock = _FakeClock()
+    ttl = 5
+    assert ttl < NEGATIVE_TTL_SECONDS
+    cache = MetadataCache(ttl=ttl, clock=clock)
+    calls: list[int] = []
+    failing_fetch = _counting_failure(calls)
+
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", failing_fetch)
+    clock.advance(ttl + 0.1)
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", failing_fetch)
+    assert calls == [1, 1]
+
+
+def test_invalidate_clears_the_negative_entry() -> None:
+    """Refresh retries at once: an invalidate forgets the remembered failure."""
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    calls: list[int] = []
+
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", _counting_failure(calls))
+    cache.invalidate("tags")
+    rows: _Rows = [{"id": 1, "name": "receipt"}]
+
+    assert cache.get_or_fetch_list("tags", lambda: rows) == CachedList(
+        rows, current=True
+    )
+    assert calls == [1]
+
+
+def test_zero_ttl_records_no_negative_entry() -> None:
+    """A disabled cache remembers nothing, failures included."""
+    cache = MetadataCache(ttl=0, clock=_FakeClock())
+    calls: list[int] = []
+    failing_fetch = _counting_failure(calls)
+
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", failing_fetch)
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", failing_fetch)
+    assert calls == [1, 1]
+
+
+def test_get_stays_none_during_the_negative_window() -> None:
+    """
+    A remembered failure is never read as an empty list.
+
+    The pre-scan id check reads the cache's plain lookup; an empty list there
+    would say "paperless-ngx has no tags", so during the negative window the
+    lookup misses and the id check asks the client itself.
+    """
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", _counting_failure([]))
+
+    assert cache.get("tags") is None
+    client = _LookupClient(tags=[[{"id": 3}]])
+    assert CachedMetadataLookup(cache, client).tag_ids(fresh=False) == frozenset({3})
+    assert client.fetches == [("tags", 5.0)]
+
+
+def test_waiters_behind_a_failing_fetch_return_at_once() -> None:
+    """
+    The threads queued behind a failing fetch do not each repeat it.
+
+    The fetch is held open until every thread has missed the cache at least
+    once, so each of them had the chance to start a fetch of its own; the
+    fetching thread misses twice, before and after taking the lock.
+    """
+    threads_count = 8
+    cache = _MissCountingCache(misses_wanted=threads_count + 1)
+    barrier = threading.Barrier(threads_count)
+    fetch_started = threading.Event()
+    gate = threading.Event()
+    calls: list[int] = []
+    calls_lock = threading.Lock()
+    outcomes: list[type[BaseException]] = []
+    outcomes_lock = threading.Lock()
+
+    def fetch() -> _Rows:
+        with calls_lock:
+            calls.append(1)
+        fetch_started.set()
+        gate.wait(_WAIT_SECONDS)
+        msg = "paperless unreachable"
+        raise ConnectionError(msg)
+
+    def request() -> None:
+        barrier.wait()
+        try:
+            cache.get_or_fetch("tags", fetch)
+        except (ConnectionError, MetadataUnavailableError) as exc:
+            with outcomes_lock:
+                outcomes.append(type(exc))
+
+    threads = [threading.Thread(target=request) for _ in range(threads_count)]
+    for thread in threads:
+        thread.start()
+    try:
+        assert fetch_started.wait(_WAIT_SECONDS)
+        assert cache.enough_missed.wait(_WAIT_SECONDS)
+    finally:
+        gate.set()
+        for thread in threads:
+            thread.join(_WAIT_SECONDS)
+
+    assert len(calls) == 1
+    assert sorted(outcomes, key=lambda kind: kind.__name__) == [ConnectionError] + [
+        MetadataUnavailableError
+    ] * (threads_count - 1)
+
+
+def test_a_waiter_gives_up_after_its_lock_timeout() -> None:
+    """
+    A request does not wait out another thread's hung fetch.
+
+    One thread's fetch is held open; a second request with a short lock
+    timeout is answered "unavailable" without fetching, while the first is
+    still in flight.
+    """
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    entered = threading.Event()
+    release = threading.Event()
+    rows: _Rows = [{"id": 1, "name": "receipt"}]
+    results: dict[str, CachedList] = {}
+    second_calls: list[int] = []
+
+    def hung_fetch() -> _Rows:
+        entered.set()
+        release.wait(_WAIT_SECONDS)
+        return rows
+
+    def second_fetch() -> _Rows:
+        second_calls.append(1)
+        return rows
+
+    def in_flight() -> None:
+        results["in_flight"] = cache.get_or_fetch_list("tags", hung_fetch)
+
+    thread = threading.Thread(target=in_flight)
+    thread.start()
+    try:
+        assert entered.wait(_WAIT_SECONDS)
+        with pytest.raises(MetadataUnavailableError):
+            cache.get_or_fetch_list("tags", second_fetch, lock_timeout=0.05)
+        assert not release.is_set()
+    finally:
+        release.set()
+        thread.join(_WAIT_SECONDS)
+
+    assert second_calls == []
+    assert results["in_flight"] == CachedList(rows, current=True)
+
+
+def test_an_invalidate_during_the_failing_fetch_wins() -> None:
+    """
+    A Refresh pressed while a failing fetch is in flight is not undone.
+
+    The failure lands after the invalidate, so it must not be remembered: the
+    next call fetches again at once.  An invalidate made from inside the fetch
+    runs while the fetch is in flight, without a second thread.
+    """
+    cache = MetadataCache(ttl=60, clock=_FakeClock())
+    calls: list[int] = []
+
+    def failing_fetch() -> _Rows:
+        calls.append(1)
+        cache.invalidate("tags")
+        msg = "paperless unreachable"
+        raise ConnectionError(msg)
+
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", failing_fetch)
+    with pytest.raises(ConnectionError):
+        cache.get_or_fetch("tags", failing_fetch)
+    assert calls == [1, 1]
 
 
 def test_invalidate_during_an_in_flight_fetch_is_not_undone() -> None:
@@ -486,10 +691,15 @@ def test_stale_warning_never_carries_marker_text(
     assert wording + cause in record.getMessage()
 
 
-def test_failure_without_a_last_good_value_propagates_and_stores_nothing(
+def test_failure_without_a_last_good_value_is_negative_cached_outside_the_store(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """With nothing to fall back on the error reaches the caller, unlogged here."""
+    """
+    With nothing to fall back on the error reaches the caller, unlogged here.
+
+    The failure is remembered, but not as a list: the plain lookup still
+    misses, and the next call's "unavailable" answer logs nothing either.
+    """
     cache = MetadataCache(ttl=60, clock=_FakeClock())
 
     with (
@@ -499,7 +709,14 @@ def test_failure_without_a_last_good_value_propagates_and_stores_nothing(
         cache.get_or_fetch("tags", lambda: _raise(PaperlessError("boom")))
 
     assert cache.get("tags") is None
-    assert _warnings(caplog) == []
+    with (
+        caplog.at_level(logging.DEBUG, logger=_CACHE_LOGGER),
+        pytest.raises(MetadataUnavailableError),
+    ):
+        cache.get_or_fetch("tags", lambda: _raise(PaperlessError("boom")))
+
+    assert cache.get("tags") is None
+    assert [r for r in caplog.records if r.name == _CACHE_LOGGER] == []
 
 
 def test_invalidate_racing_a_failed_refresh_is_not_overwritten(
