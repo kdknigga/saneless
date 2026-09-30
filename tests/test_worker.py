@@ -3622,7 +3622,7 @@ class TestOwedWriteStreak:
             )
             assert degraded
             probed = poll_until(lambda: len(probes.calls) >= 1, _STATE_BUDGET)
-            streak = worker._failed_flush_ticks
+            streak = worker._failed_owed_retries
             loop_failures = worker._consecutive_loop_failures
             row = _get(store, job.id)
             alive = worker.is_alive
@@ -3698,7 +3698,7 @@ class TestOwedWriteStreak:
                 owed_after = dict(worker._unrecorded_failures)
             owed_rejections_after = worker.owed_rejection_ids()
             probed = len(probes.calls)
-            streak_after = worker._failed_flush_ticks
+            streak_after = worker._failed_owed_retries
             loop_after = worker._consecutive_loop_failures
             second = _submit_jobs(worker, store, 1)[0]
             finished = wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
@@ -3748,12 +3748,12 @@ class TestOwedWriteStreak:
         )
         store = JobStore()
         worker = worker_for(store)
-        worker._failed_flush_ticks = worker_module._OWED_RETRY_DEGRADED_AFTER - 1
+        worker._failed_owed_retries = worker_module._OWED_RETRY_DEGRADED_AFTER - 1
         try:
             worker.start()
             job = _submit_jobs(worker, store, 1)[0]
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            reset = poll_until(lambda: worker._failed_flush_ticks == 0, _STATE_BUDGET)
+            reset = poll_until(lambda: worker._failed_owed_retries == 0, _STATE_BUDGET)
             health = worker.health
         finally:
             worker.stop()

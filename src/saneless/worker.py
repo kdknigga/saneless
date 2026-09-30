@@ -716,10 +716,10 @@ class ScanWorker:
         self._profile_storage: ProfileStorage = ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
-        # Idle ticks in a row whose owed-write retry raised, with no landed
-        # retry, recovery or cleanly recorded job in between.  Touched only by
-        # the worker thread.
-        self._failed_flush_ticks = 0
+        # Owed-write retries in a row that raised, whether an idle tick's or a
+        # clean job's, with no landed retry, recovery or cleanly recorded job
+        # in between.  Touched only by the worker thread.
+        self._failed_owed_retries = 0
         # Whether the current failure episode of the owed-write retry has
         # been logged at WARNING.  Unlike the streak above, a clean job does
         # not end an episode -- only a retry that lands, or recovery -- so a
@@ -1638,7 +1638,7 @@ class ScanWorker:
                 # "in a row" against a store that just accepted writes.  It
                 # does not clear degraded: only a successful idle probe does.
                 self._consecutive_loop_failures = 0
-                self._failed_flush_ticks = 0
+                self._failed_owed_retries = 0
                 # Owed writes are retried here as well as on an idle tick, so
                 # a queue that never empties cannot starve them.  Degraded,
                 # the retry is the recovery probe's alone; and prune stays on
@@ -1886,7 +1886,7 @@ class ScanWorker:
         try:
             written = self._flush_unrecorded_failures()
         except Exception:
-            self._failed_flush_ticks += 1
+            self._failed_owed_retries += 1
             # The first failure of an episode is worth an operator's eye; the
             # rest of the same episode would only repeat it.
             if not self._owed_failure_warned:
@@ -1902,16 +1902,16 @@ class ScanWorker:
                     "or idle tick",
                     exc_info=True,
                 )
-            if self._failed_flush_ticks >= _OWED_RETRY_DEGRADED_AFTER:
+            if self._failed_owed_retries >= _OWED_RETRY_DEGRADED_AFTER:
                 self._degraded.set()
                 logger.warning(
                     "Scan worker degraded after %d retries in a row failed "
                     "to write owed job records; rejecting scans until the "
                     "store recovers",
-                    self._failed_flush_ticks,
+                    self._failed_owed_retries,
                 )
         else:
-            self._failed_flush_ticks = 0
+            self._failed_owed_retries = 0
             self._owed_failure_warned = False
             if written:
                 self._consecutive_loop_failures = 0
@@ -2001,7 +2001,7 @@ class ScanWorker:
             )
             return
         self._consecutive_loop_failures = 0
-        self._failed_flush_ticks = 0
+        self._failed_owed_retries = 0
         self._owed_failure_warned = False
         self._degraded.clear()
         logger.info("Scan worker recovered: the job store accepted a write")
