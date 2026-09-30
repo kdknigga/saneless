@@ -342,6 +342,50 @@ def test_status_area_polls_only_while_active(
     assert ('hx-trigger="every 1s"' in text) is (state in ACTIVE_STATES)
 
 
+_STATUS_AREA_OPEN = re.compile(r'<div id="status-area"[^>]*>')
+
+
+@pytest.mark.parametrize("state", list(JobState))
+def test_status_area_is_always_focusable(client: TestClient, state: JobState) -> None:
+    """
+    Every rendering of the status area can take focus, in every state.
+
+    It is where focus goes after an action, and htmx restores focus by id
+    only to an element that can hold it, so the attribute cannot depend on
+    the state or on which route rendered the area.
+    """
+    job_id = _job_in_state(client, state)
+    renderings = [
+        client.get("/").text,
+        client.get("/api/jobs/current/status").text,
+        client.get(f"/api/jobs/{job_id}/status").text,
+        client.post("/api/flip/continue", data={"job_id": job_id}).text,
+    ]
+    for text in renderings:
+        opening = _STATUS_AREA_OPEN.findall(text)
+        assert len(opening) == 1, text
+        assert 'tabindex="-1"' in opening[0]
+
+
+def test_flip_buttons_have_stable_ids(client: TestClient) -> None:
+    """
+    Continue and Abort carry fixed ids, so focus on either survives a swap.
+
+    htmx moves focus back to the element with the focused element's id after
+    an outerHTML swap; a button without an id is lost to ``<body>``.
+    """
+    _job_in_state(client, JobState.AWAITING_FLIP)
+
+    text = client.get("/api/jobs/current/status").text
+
+    continue_button = re.search(r'<button[^>]*id="flip-continue"[^>]*>', text)
+    abort_button = re.search(r'<button[^>]*id="flip-abort"[^>]*>', text)
+    assert continue_button is not None
+    assert abort_button is not None
+    assert 'hx-post="/api/flip/continue"' in continue_button.group(0)
+    assert 'hx-post="/api/flip/abort"' in abort_button.group(0)
+
+
 @pytest.mark.parametrize("state", list(JobState))
 def test_status_area_prose(client: TestClient, state: JobState) -> None:
     """

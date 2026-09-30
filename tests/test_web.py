@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -1545,8 +1546,13 @@ class TestPostSubmitRender:
         assert job.error_category is None
 
         body = response.text
-        assert 'id="status-area"' in body
-        assert f'hx-get="/api/jobs/{job.id}/status"' in body
+        assert 'id="status-area" tabindex="-1"' in body
+        assert _polls(body, job.id)
+        # The first poll carries the empty token, so it is always answered
+        # with the full status, the Scan button included.
+        assert f'hx-get="/api/jobs/{job.id}/status?seen="' in body
+        line = html.escape(progress_label(JobState.PENDING))
+        assert f'<p class="busy-line">{line}</p>' in body
         assert 'hx-trigger="every 1s"' in body
         assert 'hx-swap="outerHTML"' in body
         assert html.escape(progress_label(JobState.PENDING)) in body
@@ -1628,7 +1634,7 @@ class TestPostSubmitRender:
         assert _owner_set_cookie(response) is not None
         job = _newest_job(accepting_client)
         body = response.text
-        assert f'hx-get="/api/jobs/{job.id}/status"' in body
+        assert _polls(body, job.id)
         assert '<div id="status-message" hx-swap-oob="innerHTML"></div>' in body
         # The out-of-band Scan button and status strip ride along only in the
         # full response, which is how it differs from the fallback.
@@ -1768,7 +1774,7 @@ class TestFollowedJob:
 
         response = client.get(f"/api/jobs/{job_id}/status")
 
-        assert f'hx-get="/api/jobs/{job_id}/status"' in response.text
+        assert _polls(response.text, job_id)
 
     def test_followed_job_unknown_id_polls_the_current_url(
         self, client: TestClient
@@ -1778,7 +1784,7 @@ class TestFollowedJob:
 
         response = client.get("/api/jobs/no-such-job-at-all/status")
 
-        assert 'hx-get="/api/jobs/current/status"' in response.text
+        assert _polls(response.text, "current")
 
     def test_followed_job_id_is_baked_into_the_scan_response(
         self, accepting_client: TestClient
@@ -1792,7 +1798,7 @@ class TestFollowedJob:
 
         newest = _newest_job(accepting_client).id
         assert newest != job_id
-        assert f'hx-get="/api/jobs/{newest}/status"' in response.text
+        assert _polls(response.text, newest)
 
     def test_followed_job_current_status_route_is_unchanged(
         self, client: TestClient
@@ -1803,7 +1809,7 @@ class TestFollowedJob:
         response = client.get("/api/jobs/current/status")
 
         assert response.status_code == 200
-        assert 'hx-get="/api/jobs/current/status"' in response.text
+        assert _polls(response.text, "current")
         assert "/api/jobs/current/status" in response.text
 
     def test_continue_follows_the_posted_job(
@@ -1910,6 +1916,174 @@ class TestFollowedJob:
         page = client.get("/").text
 
         assert _polls(page, "current")
+
+
+_STATUS_POLL_URL = re.compile(r'hx-get="(?P<url>/api/jobs/[^"/]+/status[^"]*)"')
+_TOKEN = re.compile(r"[0-9a-f]{24}")
+# A tiny JPEG's worth of base64: the thumbnail is rendered as a data URL, and
+# only whether it is present matters here.
+_THUMBNAIL = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP"
+
+
+def _poll_url_in(markup: str) -> str:
+    """
+    Return the URL the markup's status area polls, as the browser would request it.
+
+    Args:
+        markup: A rendered page or status response.
+
+    Returns:
+        The ``hx-get`` of the status area, with its HTML entities resolved.
+
+    """
+    match = _STATUS_POLL_URL.search(markup)
+    assert match is not None, markup
+    return html.unescape(match.group("url"))
+
+
+def _seen_in(markup: str) -> str:
+    """
+    Return the token the markup's status poll carries.
+
+    Args:
+        markup: A rendered page or status response.
+
+    Returns:
+        The ``seen`` query value of the status area's poll URL.
+
+    """
+    query = parse_qs(urlsplit(_poll_url_in(markup)).query)
+    assert "seen" in query, markup
+    return query["seen"][0]
+
+
+class TestStatusPollAnswersWhenChanged:
+    """
+    A status poll answers 204 when nothing its viewer would see has changed.
+
+    A poll that re-rendered every second would replace the focused button under
+    the operator's finger, and a live region over it would speak every second.
+    Every status rendering bakes a token of what it shows into its poll URL;
+    a poll presenting the current token is answered with no content, which
+    htmx leaves unswapped.
+    """
+
+    def test_unchanged_poll_answers_204(self, client: TestClient) -> None:
+        """The same state polled again with its own token is answered empty."""
+        job_id = _running_job(client, "Unchanged")
+
+        first = client.get(f"/api/jobs/{job_id}/status")
+        seen = _seen_in(first.text)
+        second = client.get(f"/api/jobs/{job_id}/status", params={"seen": seen})
+
+        assert first.status_code == 200
+        assert _TOKEN.fullmatch(seen)
+        assert second.status_code == 204
+        assert second.content == b""
+
+    def test_state_change_answers_200(self, client: TestClient) -> None:
+        """A state the viewer has not seen yet is rendered in full."""
+        job_id = _running_job(client, "Changing")
+        seen = _seen_in(client.get(f"/api/jobs/{job_id}/status").text)
+        job_store: JobStore = _app(client).state.job_store
+        job_store.update_state(job_id, JobState.UPLOADING)
+
+        response = client.get(f"/api/jobs/{job_id}/status", params={"seen": seen})
+
+        assert response.status_code == 200
+        assert _seen_in(response.text) != seen
+
+    def test_thumbnail_arrival_answers_200(self, client: TestClient) -> None:
+        """A preview stored mid-scan is news, though the busy line is unchanged."""
+        job_id = _running_job(client, "Previewed", owner_token=_as_owner(client))
+        seen = _seen_in(client.get(f"/api/jobs/{job_id}/status").text)
+        job_store: JobStore = _app(client).state.job_store
+        job_store.update_thumbnail(job_id, _THUMBNAIL)
+
+        response = client.get(f"/api/jobs/{job_id}/status", params={"seen": seen})
+
+        assert response.status_code == 200
+        assert _THUMBNAIL in response.text
+
+    def test_seen_from_another_viewer_answers_200(self, client: TestClient) -> None:
+        """
+        The owner's token proves nothing about what another browser was shown.
+
+        The owner sees the title; anyone else sees the generic one, so the
+        same job renders differently and the stranger's poll is answered.
+        """
+        job_id = _running_job(client, "Owners Title", owner_token=_as_owner(client))
+        seen = _seen_in(client.get(f"/api/jobs/{job_id}/status").text)
+
+        stranger = _other_browser(client).get(
+            f"/api/jobs/{job_id}/status", params={"seen": seen}
+        )
+
+        assert stranger.status_code == 200
+        assert "Owners Title" not in stranger.text
+
+    @pytest.mark.parametrize("seen", ["f" * 10_000, "not a token at all"])
+    def test_oversized_seen_answers_200(self, client: TestClient, seen: str) -> None:
+        """A token too long or malformed is ignored, never a 422."""
+        job_id = _running_job(client, "Odd Token")
+
+        response = client.get(f"/api/jobs/{job_id}/status", params={"seen": seen})
+
+        assert response.status_code == 200
+        assert seen not in response.text
+
+    def test_first_poll_after_the_page_is_unchanged(self, client: TestClient) -> None:
+        """The page's own token is the first poll's, so nothing is swapped."""
+        job_id = _running_job(client, "Reloaded", owner_token=_as_owner(client))
+
+        url = _poll_url_in(client.get("/").text)
+        response = client.get(url)
+
+        assert _polls(f'hx-get="{url}"', job_id)
+        assert response.status_code == 204
+
+    def test_first_poll_after_scan_is_unchanged(
+        self, accepting_client: TestClient
+    ) -> None:
+        """
+        The scan submit's token is the poll's, although the submit carries more.
+
+        The submit also clears the message slot and refreshes the strip; the
+        token is computed from the rendering a poll would produce, so those
+        extras cannot make the first poll swap.
+        """
+        submitted = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Submitted"}
+        )
+
+        response = accepting_client.get(_poll_url_in(submitted.text))
+
+        assert submitted.status_code == 200
+        assert response.status_code == 204
+
+    def test_first_poll_after_continue_is_unchanged(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+    ) -> None:
+        """While the worker still holds the answer, the first poll changes nothing."""
+        job_id, _ = owned_flip
+
+        answered = accepting_client.post("/api/flip/continue", data={"job_id": job_id})
+        response = accepting_client.get(_poll_url_in(answered.text))
+
+        assert answered.status_code == 200
+        assert response.status_code == 204
+
+    def test_current_route_answers_204_when_unchanged(self, client: TestClient) -> None:
+        """The current-job URL follows the same rule."""
+        _running_job(client, "Current")
+
+        url = _poll_url_in(client.get("/api/jobs/current/status").text)
+        response = client.get(url)
+
+        assert url.startswith("/api/jobs/current/status?")
+        assert response.status_code == 204
 
 
 class TestQueueLine:
