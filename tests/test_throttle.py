@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from saneless.web import checks_cache as checks_cache_module
 from saneless.web.app import create_app
+from saneless.web.errors import RETRY_AFTER_SECONDS
 from saneless.web.routes import MetadataResource
 from saneless.web.throttle import (
     MIN_MANUAL_REFRESH_SECONDS,
@@ -541,7 +542,7 @@ class TestPaperlessTestSingleFlight:
     def test_a_failing_probe_is_shared_the_same_way(
         self, app: FastAPI, client: TestClient, clock: _FakeClock
     ) -> None:
-        """A probe that raised is answered from the cache as the same 502."""
+        """A probe that raised is answered from the cache as the same 500."""
         probe = _ConnectionProbe(None)
         app.state.paperless.test_connection = probe
         app.state.paperless_test_result = _shared_result(clock)
@@ -549,7 +550,7 @@ class TestPaperlessTestSingleFlight:
         bodies = []
         for _ in range(_LOOP_CALLS):
             response = client.get("/api/paperless/test")
-            assert response.status_code == 502
+            assert response.status_code == 500
             bodies.append(response.json())
 
         assert probe.calls == 1
@@ -573,7 +574,7 @@ class TestPaperlessTestSingleFlight:
     def test_a_follower_that_gives_up_gets_the_error_shape(
         self, app: FastAPI, client: TestClient
     ) -> None:
-        """A bounded wait that expires is the existing 502, naming TimeoutError."""
+        """A bounded wait that expires is a 503 with Retry-After, naming TimeoutError."""
 
         class _TimesOut:
             """A shared result whose wait for the leader always expires."""
@@ -588,5 +589,6 @@ class TestPaperlessTestSingleFlight:
 
         response = client.get("/api/paperless/test")
 
-        assert response.status_code == 502
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == str(RETRY_AFTER_SECONDS)
         assert response.json() == {"status": "error", "detail": "TimeoutError"}

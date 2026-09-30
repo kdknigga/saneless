@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from starlette.datastructures import State
 
     from saneless.checks import CheckContext
+    from saneless.web.checks_cache import CachedChecks
     from saneless.web.refresher import CheckRefresher
 
 # The paused Scanner row, quoted from UI-SPEC S1 so the route test fails if the
@@ -672,6 +673,44 @@ def _a_probe_in_flight(client: TestClient) -> Generator[None]:
         yield
     finally:
         lock.release()
+
+
+class _AProbeLandsDuringTheRead:
+    """
+    A checks cache whose read lets the probe in flight land behind it.
+
+    It wraps the cache the app built, the way ``_RecordingRefresher`` wraps the
+    refresher: the read is the real one, and the store is the real one.  What
+    it adds is the order.  ``current()`` takes its snapshot of the pre-probe
+    entry, then the probe stores its results and releases the single-flight
+    lock, and only then does the snapshot come back to the caller.  That is a
+    probe finishing in the gap between a render's cache read and its flag read,
+    forced rather than waited for.
+    """
+
+    def __init__(
+        self,
+        real: CheckCache,
+        lock: threading.Lock,
+        landed: tuple[CheckResult, ...],
+    ) -> None:
+        """Wrap ``real``, releasing ``lock`` and storing ``landed`` on the read."""
+        self._real = real
+        self._lock = lock
+        self._landed = landed
+
+    def current(self) -> CachedChecks:
+        """
+        Read the real cache, then let the probe land before answering.
+
+        Returns:
+            The entry as it stood before the probe stored.
+
+        """
+        snapshot = self._real.current()
+        self._real.store(self._landed)
+        self._lock.release()
+        return snapshot
 
 
 # How far a poll chain is followed before it is called unbounded.  Comfortably
@@ -1724,6 +1763,39 @@ class TestCollapsedRefreshStillDelivers:
         assert _refresher(client).probe_in_flight is False
         assert "hx-" not in _body_attrs(client.get("/api/checks").text)
         assert "hx-" not in _body_attrs(client.get("/").text)
+
+    def test_a_probe_landing_between_the_reads_is_collected(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The forced interleaving: a probe that lands mid-render still gets fetched.
+
+        A render reads two things, the cached rows and whether a probe is in
+        flight.  If the rows come first, a probe can store and release its lock
+        between the two reads: the rows are the pre-probe ones, the flag then
+        says nothing is in flight, and the body carries no trigger -- so the
+        results that probe just stored never reach the page.  Reading the flag
+        first sees the probe as in flight, and the body asks once more, which
+        collects them.
+        """
+        app = _app(client)
+        real: CheckCache = app.state.checks
+        real.store(_results_with_a_skipped_scanner())
+        landed = _synthetic_results()
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        monkeypatch.setattr(
+            app.state, "checks", _AProbeLandsDuringTheRead(real, lock, landed)
+        )
+        try:
+            context = routes_module._checks_context(app.state, attempt=1)
+        finally:
+            if lock.locked():
+                lock.release()
+
+        assert context["checks"] == _results_with_a_skipped_scanner()
+        assert real.current().results == landed
+        assert context["poll_attempt"] == 2
 
 
 class TestTheWindowFollowsTheProbe:
