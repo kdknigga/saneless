@@ -877,6 +877,58 @@ def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | Non
     return job
 
 
+def _owned_active_job_id(
+    worker: ScanWorker, job_store: JobStore, presented: str | None
+) -> str | None:
+    """
+    Find the newest active job the presenting browser owns, for the page to follow.
+
+    A full page load has no poll URL to carry a followed id, so without this
+    a reload while someone else's scan runs would report that scan to a
+    person whose own job is still queued behind it.  The candidates are the
+    worker's current job, when it is still active, and every queued job;
+    the newest ``created_at`` among the ones this browser owns wins.
+
+    Ownership is ``owns_detail``'s rule, not the flip prompt's: a job that
+    recorded no owner is nobody's, so it is never followed, and a browser
+    presenting no token owns nothing.  A refused submit whose REJECTED write
+    is still owed to the worker is PENDING with the submitter's token, yet it
+    will never run, so it is left out as ``_current_or_recent_job`` leaves it
+    out.
+
+    The token is compared here, in Python, and never put into a SQL
+    ``WHERE``: ``owns_detail`` compares in constant time, which an index
+    lookup does not, and the set being filtered is bounded by the queue cap,
+    so reading it whole costs nothing.  ``JobStore.latest_run_job`` filters
+    its excluded ids in Python for the same kind of reason.
+
+    Args:
+        worker: The scan worker, for the job in flight and the owed refusals.
+        job_store: The job store to read the candidates from.
+        presented: The owner token this request carries, or None.
+
+    Returns:
+        The id of the newest active job this browser owns, or None.
+
+    """
+    if presented is None:
+        return None
+    candidates = list(job_store.list_pending())
+    if worker.current_job_id:
+        current = job_store.get_job(worker.current_job_id)
+        if current is not None and current.is_active:
+            candidates.append(current)
+    owed = worker.owed_rejection_ids()
+    owned = [
+        job
+        for job in candidates
+        if job.id not in owed and owns_detail(presented, job.owner_token)
+    ]
+    if not owned:
+        return None
+    return max(owned, key=lambda job: job.created_at).id
+
+
 def _busy_line(
     worker: ScanWorker,
     job_store: JobStore,
@@ -982,9 +1034,9 @@ class _StatusFacts:
 def _status_facts(
     request: Request,
     *,
+    followed_job_id: str | None,
     claimed: tuple[str, FlipOutcome] | None = None,
     claimed_pass: tuple[str, PassAnswer] | None = None,
-    followed_job_id: str | None = None,
 ) -> _StatusFacts:
     """
     Read every per-request status fact off the request, in one place.
@@ -995,6 +1047,13 @@ def _status_facts(
     appliance.  Only the two facts a route genuinely knows
     about itself -- the answer it just claimed, and the job the browser is
     following -- are passed in.
+
+    ``followed_job_id`` has no default, so every caller has to decide which
+    job its status area follows, and the type checkers refuse a call that did
+    not.  A default of None once let the flip and multi-page answers silently
+    hand the area to the current-job URL, so the next poll reported whatever
+    the worker ran instead of the job the operator had just answered.  A route
+    that genuinely follows nothing in particular passes None and says so.
 
     ``scan_blocked`` is derived from ``Settings``, which is loaded once at
     process start, so it cannot change while the process runs: there is no live
@@ -1011,7 +1070,8 @@ def _status_facts(
         claimed: The job id and flip answer this request itself claimed, if any.
         claimed_pass: The job id and multi-page answer this request itself
             claimed, if any.
-        followed_job_id: The job this browser submitted, if it submitted one.
+        followed_job_id: The job this browser follows -- the one it
+            submitted, answered or owns -- or None to report the current job.
 
     Returns:
         The bundle ``_status_context`` reads.
@@ -1532,7 +1592,19 @@ def index(request: Request) -> Response:
         }
     )
 
-    status = _status_context(state.worker, state.job_store, _status_facts(request))
+    # The page follows the newest active job this browser owns, so a reload
+    # while someone else's scan runs still reports the scan this person
+    # queued; with none of its own active, it reports the current job.
+    status = _status_context(
+        state.worker,
+        state.job_store,
+        _status_facts(
+            request,
+            followed_job_id=_owned_active_job_id(
+                state.worker, state.job_store, _presented_owner(request)
+            ),
+        ),
+    )
     block = _scan_block(state.settings)
 
     jobs = _history_views(request)
@@ -2268,7 +2340,11 @@ def current_job_status(request: Request) -> Response:
         request,
         "partials/status_response.html",
         {
-            **_status_context(state.worker, state.job_store, _status_facts(request)),
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(request, followed_job_id=None),
+            ),
             "terminal_reload": True,
         },
     )
@@ -2837,6 +2913,7 @@ def continue_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
                 state.job_store,
                 _status_facts(
                     request,
+                    followed_job_id=job_id,
                     claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
                 ),
             ),
@@ -2881,6 +2958,7 @@ def abort_flip(request: Request, job_id: Annotated[str, Form()]) -> Response:
                 state.job_store,
                 _status_facts(
                     request,
+                    followed_job_id=job_id,
                     claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
                 ),
             ),
@@ -2952,6 +3030,7 @@ def answer_multi_page(
                 state.job_store,
                 _status_facts(
                     request,
+                    followed_job_id=job_id,
                     claimed_pass=(job_id, answer) if claimed else None,
                 ),
             ),
