@@ -654,7 +654,7 @@ def waiting_flip(client: TestClient) -> Iterator[tuple[str, WorkerFlipCoordinato
 
 def _assert_acknowledged(text: str, label: str) -> None:
     """Assert the status area acknowledges ``label`` and shows no flip buttons."""
-    assert f'<p aria-busy="true">{label}</p>' in text
+    assert f'<p class="busy-line">{label}</p>' in text
     for button in _FLIP_BUTTONS:
         assert button not in text
     assert "flip the stack over the long edge" not in text.lower()

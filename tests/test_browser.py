@@ -2360,7 +2360,7 @@ class TestRequestErrorSlot:
         server.scanner.gate.clear()
         page.goto(server.url)
         page.locator("#scan-btn").click()
-        expect(page.locator('#status-area p[aria-busy="true"]')).to_be_visible()
+        expect(page.locator("#status-area p.busy-line")).to_be_visible()
 
         page.evaluate(_SUBMIT_UNKNOWN_PROFILE)
 
@@ -2784,7 +2784,7 @@ class TestOwnerCookieInABrowser:
         page.goto(server.url)
 
         page.locator("#scan-btn").click()
-        expect(page.locator('#status-area p[aria-busy="true"]')).to_be_visible()
+        expect(page.locator("#status-area p.busy-line")).to_be_visible()
 
         minted = [
             cookie
@@ -4169,8 +4169,9 @@ class TestStatusStripInChromium:
         "At a glance" is the phase goal and at a glance means first, so the
         ordinal is asserted rather than merely the presence. The second half is
         phase 26's invariant: ``#status-message`` is the immediate element
-        sibling above ``#status-area``, and inserting a card above the form must
-        not have moved either of them.
+        sibling above the status block -- ``#status-live``, the persistent
+        region whose one child is ``#status-area`` -- and inserting a card
+        above the form must not have moved either of them.
         """
         page.goto(browser_server_url)
 
@@ -4191,8 +4192,12 @@ class TestStatusStripInChromium:
             page.evaluate(
                 "() => document.getElementById('status-message').nextElementSibling.id"
             )
-            == "status-area"
+            == "status-live"
         )
+        live = page.locator("#status-message + #status-live")
+        expect(live).to_have_attribute("role", "status")
+        expect(live.locator("> *")).to_have_count(1)
+        expect(live.locator("> #status-area")).to_have_count(1)
 
     def test_a_cold_strip_polls_itself_until_results_land_and_then_stops(
         self, page: Page, cold_strip_server: _BrowserServer
@@ -5498,7 +5503,7 @@ class TestManualDuplexFrontCountInChromium:
             continue_button.click()
             wait_for_state(job_store, job_id, JobState.SCANNING_REVERSE, timeout=20.0)
 
-            busy = page.locator("#status-area p[aria-busy='true']")
+            busy = page.locator("#status-area p.busy-line")
             expect(busy).to_contain_text(_FRONT_COUNT_PREFIX.strip())
             assert busy.inner_text().startswith(_FRONT_COUNT_PREFIX), busy.inner_text()
         finally:
@@ -7368,7 +7373,7 @@ class TestStatusPollLostContact:
         server.scanner.gate.clear()
         try:
             page.locator("#scan-btn").click()
-            expect(page.locator("#status-area p[aria-busy='true']")).to_be_visible()
+            expect(page.locator("#status-area p.busy-line")).to_be_visible()
             created = scan_harness.created_job_ids()
             assert len(created) == 1, created
             wait_for_state(job_store, created[0], JobState.SCANNING)

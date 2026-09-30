@@ -49,10 +49,13 @@ from saneless.vocabulary import (
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
     ErrorCategory,
+    FlipOutcome,
     JobState,
+    PassAnswer,
     RequestRejection,
     error_message,
     error_next_step,
+    flip_answer_label,
     job_label,
     job_status_class,
     page_counts,
@@ -62,6 +65,7 @@ from saneless.vocabulary import (
 )
 from saneless.web import app as app_module
 from saneless.web.app import create_app
+from saneless.worker import WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, poll_until
 
 if TYPE_CHECKING:
@@ -394,7 +398,7 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     _job_in_state(client, state)
     text = client.get("/api/jobs/current/status").text
 
-    busy_line = f'<p aria-busy="true">{progress_label(state)}</p>'
+    busy_line = f'<p class="busy-line">{progress_label(state)}</p>'
     assert (busy_line in text) is (state in BUSY_STATES)
 
     # AWAITING_FLIP is active but NOT busy: it shows the flip prompt instead of
@@ -448,6 +452,203 @@ def test_multi_page_wait_names_what_it_waits_on(
 
     assert f"<p>{escape(progress_label(state))}</p>" in text
     assert 'aria-busy="true"' not in text
+
+
+# Every status-area rendering the browser swaps in, by the route that sends it.
+# Both polls, the scan submit, the three answer routes, and the fallback a poll
+# answers when it cannot read its job.  None of them may carry the persistent
+# region: it is on the page once and is never replaced, which is what lets a
+# screen reader hear each change inside it.
+_STATUS_ROUTES = (
+    "current poll",
+    "followed poll",
+    "scan submit",
+    "flip continue",
+    "flip abort",
+    "multi-page answer",
+    "lost-contact fallback",
+)
+_HX_REQUEST = {"HX-Request": "true"}
+_DIV_TAG = re.compile(r"<div\b|</div>")
+_STATUS_LIVE_OPEN = '<div id="status-live" role="status">'
+
+
+def _element(markup: str, element_id: str) -> str:
+    """
+    Return one ``<div>`` whole, from its open tag to its matching close.
+
+    The div tags after the open tag are counted, so nested divs -- an ERROR's
+    alert wrapper, a prompt's button group -- stay inside the result.
+
+    Args:
+        markup: The rendered page or response.
+        element_id: The id the div carries as its first attribute.
+
+    Returns:
+        The element's markup.
+
+    """
+    start = markup.index(f'<div id="{element_id}"')
+    depth = 0
+    for tag in _DIV_TAG.finditer(markup, start):
+        depth += 1 if tag.group() == "<div" else -1
+        if depth == 0:
+            return markup[start : tag.end()]
+    pytest.fail(f"#{element_id} is never closed")
+
+
+def _status_response(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+) -> str:
+    """
+    Send one status-rendering request and return its body.
+
+    Args:
+        client: The client to request through.
+        monkeypatch: Breaks the store's reads for the fallback case.
+        route: One of ``_STATUS_ROUTES``.
+
+    Returns:
+        The response body, after asserting it is a 200.
+
+    """
+    if route == "scan submit":
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Region Test"},
+            headers=_HX_REQUEST,
+        )
+        assert response.status_code == 200, response.text
+        return response.text
+    job_id = _job_in_state(client, JobState.AWAITING_FLIP)
+    if route == "lost-contact fallback":
+        store: JobStore = _app(client).state.job_store
+
+        def unreadable(*_args: object, **_kwargs: object) -> object:
+            msg = "disk I/O error"
+            raise sqlite3.OperationalError(msg)
+
+        for name in ("get_job", "latest_run_job"):
+            monkeypatch.setattr(store, name, unreadable)
+    match route:
+        case "current poll":
+            response = client.get("/api/jobs/current/status", headers=_HX_REQUEST)
+        case "followed poll" | "lost-contact fallback":
+            response = client.get(f"/api/jobs/{job_id}/status", headers=_HX_REQUEST)
+        case "flip continue" | "flip abort":
+            response = client.post(
+                f"/api/flip/{route.removeprefix('flip ')}",
+                data={"job_id": job_id},
+                headers=_HX_REQUEST,
+            )
+        case _:
+            response = client.post(
+                "/api/multi-page/answer",
+                data={"job_id": job_id, "prompt": "1", "answer": PassAnswer.NEXT},
+                headers=_HX_REQUEST,
+            )
+    assert response.status_code == 200, response.text
+    return response.text
+
+
+def test_the_status_area_sits_in_one_persistent_status_region(
+    client: TestClient,
+) -> None:
+    """
+    A fresh page has one polite region, and the status area is all it holds.
+
+    The region is the element a screen reader watches, so it must exist before
+    anything inside it changes and must never itself be replaced.  The error
+    slot stays the one assertive region, directly above it.
+    """
+    markup = client.get("/").text
+
+    assert markup.count('role="status"') == 1
+    assert markup.count('role="alert"') == 1
+    assert re.search(
+        r'<div id="status-message" role="alert"></div>\s*'
+        + re.escape(_STATUS_LIVE_OPEN),
+        markup,
+    )
+    area = _element(markup, "status-area")
+    assert re.fullmatch(
+        re.escape(_STATUS_LIVE_OPEN) + r"\s*" + re.escape(area) + r"\s*</div>",
+        _element(markup, "status-live"),
+    )
+
+
+@pytest.mark.usefixtures("offline_paperless")
+@pytest.mark.parametrize("route", _STATUS_ROUTES)
+def test_no_status_response_contains_the_live_region(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """
+    Every response swaps the status area inside the region, never the region.
+
+    A response that carried the region would nest a second one inside the
+    first, and a region that is itself swapped in is not heard at all.
+    """
+    text = _status_response(client, monkeypatch, route)
+
+    assert text.count('id="status-area"') == 1
+    assert "status-live" not in text
+    assert 'role="status"' not in text
+
+
+@pytest.mark.parametrize("owner", [True, False], ids=["owner", "other-viewer"])
+@pytest.mark.parametrize("state", list(JobState))
+def test_status_area_carries_no_aria_busy(
+    client: TestClient, state: JobState, *, owner: bool
+) -> None:
+    """
+    No status line is marked busy; a busy line is drawn from a class instead.
+
+    A busy subtree inside a live region may be held back by a screen reader
+    until it stops being busy, which for "Scanning..." is never, so the
+    spinner comes from ``.busy-line`` in app.css.  The Scan button, outside
+    the region, keeps its attribute while its job is busy.
+    """
+    _job_in_state(client, state)
+    text = _as_browser(client, _RENDERING_BROWSER if owner else None)
+    area = _element(text, "status-area")
+
+    assert "aria-busy" not in area
+    assert ('<p class="busy-line">' in area) is (state in BUSY_STATES)
+    button = _only_scan_button(text)
+    assert ('aria-busy="true"' in button.group("attrs")) is (state in BUSY_STATES)
+
+
+@pytest.mark.parametrize("owner", [True, False], ids=["owner", "other-viewer"])
+def test_a_flip_acknowledgement_is_a_busy_line(
+    client: TestClient, *, owner: bool
+) -> None:
+    """
+    An answered flip reads as work in progress, with no busy attribute.
+
+    The machine is about to scan the backs, so the line has a spinner; the
+    unanswered prompt a non-owner sees waits for a person and has none.
+    """
+    worker = _app(client).state.worker
+    job_id = _job_in_state(client, JobState.AWAITING_FLIP)
+    unanswered = _element(_as_browser(client, None), "status-area")
+    assert "aria-busy" not in unanswered
+    assert "busy-line" not in unanswered
+
+    coordinator = WorkerFlipCoordinator(job_id)
+    coordinator.arm()
+    worker._flip_coordinator = coordinator
+    try:
+        assert worker.continue_flip(job_id)
+        text = _as_browser(client, _RENDERING_BROWSER if owner else None)
+    finally:
+        worker._flip_coordinator = None
+
+    area = _element(text, "status-area")
+    label = escape(flip_answer_label(FlipOutcome.CONTINUE))
+    assert f'<p class="busy-line">{label}</p>' in area
+    assert "aria-busy" not in area
 
 
 # The alert region and the disclosure, captured whole. Neither nests a <div> or
@@ -1010,7 +1211,7 @@ def test_uploading_renders_its_literal_strings(client: TestClient) -> None:
     _job_in_state(client, JobState.UPLOADING)
     assert "Uploading" in client.get("/api/jobs/history").text
     status = client.get("/api/jobs/current/status").text
-    assert '<p aria-busy="true">Uploading to paperless-ngx...</p>' in status
+    assert '<p class="busy-line">Uploading to paperless-ngx...</p>' in status
 
 
 _HISTORY_RELOAD = (
@@ -1821,7 +2022,7 @@ class TestOwnerGatedFlipPrompt:
 
         markup = _as_browser(client, None)
 
-        assert f'<p aria-busy="true">{_NON_OWNER_LINE}</p>' in markup
+        assert f"<p>{_NON_OWNER_LINE}</p>" in markup
         assert markup.count('hx-post="/api/flip/') == 0
         assert "Continue" not in markup
         assert "Abort scan" not in markup
@@ -1834,7 +2035,7 @@ class TestOwnerGatedFlipPrompt:
 
         markup = _as_browser(client, "some-other-browsers-token")
 
-        assert f'<p aria-busy="true">{_NON_OWNER_LINE}</p>' in markup
+        assert f"<p>{_NON_OWNER_LINE}</p>" in markup
         assert markup.count('hx-post="/api/flip/') == 0
 
     def test_owner_and_non_owner_share_the_poll_and_button_but_not_the_preview(

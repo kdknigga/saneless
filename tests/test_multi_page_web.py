@@ -933,7 +933,8 @@ class TestTheAnswerRoute:
 
         assert waiting.asker.result() is answer
         area = _status_area(text)
-        assert f'<p aria-busy="true">{escape(pass_answer_label(answer))}</p>' in area
+        assert f'<p class="busy-line">{escape(pass_answer_label(answer))}</p>' in area
+        assert "aria-busy" not in area
         assert "<button" not in area
         assert 'id="status-message"' not in text
 
@@ -949,7 +950,8 @@ class TestTheAnswerRoute:
         assert waiting.asker.result() is PassAnswer.NEXT
         area = _status_area(text)
         label = escape(pass_answer_label(PassAnswer.NEXT))
-        assert f'<p aria-busy="true">{label}</p>' in area
+        assert f'<p class="busy-line">{label}</p>' in area
+        assert "aria-busy" not in area
         assert "<button" not in area
 
     @pytest.mark.parametrize(
@@ -1073,7 +1075,7 @@ class TestTheScanButtonAndBusyLine:
 
         line = f"4 pages so far · {progress_label(JobState.SCANNING)}"
         assert busy_line(JobState.SCANNING, pages_kept=4) == line
-        assert f'<p aria-busy="true">{line}</p>' in area
+        assert f'<p class="busy-line">{line}</p>' in area
 
 
 class TestTheFlipPromptIsUntouched:

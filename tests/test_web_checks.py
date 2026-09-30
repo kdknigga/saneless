@@ -2158,14 +2158,17 @@ class TestStripPlacement:
         self, client: TestClient
     ) -> None:
         """
-        Phase 26's invariant survives untouched.
+        Phase 26's invariant survives the persistent region around the area.
 
-        ``#status-message`` is the immediate sibling above ``#status-area``;
-        inserting a card at the top of the block must not have moved either.
+        ``#status-message`` is the immediate sibling above the status block,
+        which is now ``#status-live`` holding ``#status-area`` as its first
+        child; inserting a card at the top of the block must not have moved
+        either.
         """
         markup = client.get("/").text
         assert re.search(
-            r'<div id="status-message" role="alert"></div>\s*<div id="status-area"',
+            r'<div id="status-message" role="alert"></div>\s*'
+            r'<div id="status-live" role="status">\s*<div id="status-area"',
             markup,
         )
 
@@ -2189,11 +2192,16 @@ class TestStripPlacement:
 class TestStripAccessibility:
     """T-30-51: a health list must never interrupt a screen reader."""
 
-    def test_the_strip_is_a_polite_live_region(self, client: TestClient) -> None:
-        """The persistent container is what carries the announcement."""
+    def test_the_strip_is_not_a_live_region(self, client: TestClient) -> None:
+        """
+        The strip is silent; its rows stay reachable by navigation.
+
+        A health list that spoke on its own would compete with the status
+        area, which is the one thing on the page that announces a scan.
+        """
         match = _CHECKS_STRIP.search(client.get("/").text)
         assert match is not None
-        assert 'aria-live="polite"' in match.group("attrs")
+        assert "aria-live" not in match.group("attrs")
 
     def test_the_page_keeps_exactly_one_assertive_region(
         self, client: TestClient
