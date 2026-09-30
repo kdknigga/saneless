@@ -211,6 +211,31 @@
       <img src="data:image/jpeg;base64,{{ job.thumbnail }}" alt="First page preview" class="thumbnail">
     {% endif %}
   {% else %}
-    <p>Ready to scan.</p>
+    {# No job to report.  The idle line is the server's: the blocked reason on
+       an appliance that cannot upload, so this area never invites a scan the
+       button refuses, and plain text even then -- the red reason already sits
+       under the button, and a red line here with no alert would read as a
+       live failure.
+
+       On the full page, a job that has ended arrives as last_job, never as
+       job, and is reported as the past: muted, whatever the outcome, with no
+       alert, no preview, no counts and no reload, so a fresh page never
+       presents an old result as news.  The glyph and the outcome word are in
+       the vocabulary's line, and the title in it is the job view's, so the
+       owner gate still decides it.  A failure with a category keeps its
+       disclosure, the one place the page shows a past failure's detail. #}
+    <p>{{ idle_line }}</p>
+    {% if last_job %}
+    <p class="last-scan">{{ last_scan_line }}</p>
+    {% if last_scan_detail %}<p class="last-scan">{{ last_scan_detail }}</p>{% endif %}
+    {% if last_job.state == JobState.ERROR and last_job.error_category %}
+    <details class="tech-details">
+      <summary>Technical details</summary>
+      <p>{{ last_job.error }}</p>
+      <p>Category: {{ last_job.error_category }}</p>
+      <p>Job: {{ last_job.id }}</p>
+    </details>
+    {% endif %}
+    {% endif %}
   {% endif %}
 </div>

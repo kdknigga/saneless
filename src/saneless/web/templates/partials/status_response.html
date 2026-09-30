@@ -19,7 +19,15 @@
    lands after the scan has already ended -- the Scan button must win, but
    htmx focuses the main swap's autofocus after the out-of-band ones, so the
    status area is told not to ask.  Whether the button is enabled is the
-   button partial's own verdict, imported rather than restated here. #}
+   button partial's own verdict, imported rather than restated here.
+
+   The title element is top-level, first, and in every one of these
+   responses: htmx sets document.title from a title at the root of a swapped
+   response, and a 204 swaps nothing, so the tab follows each change the area
+   shows and keeps its title while nothing changes.  page_title names the
+   state and never the job's title, which the tab list and the browser
+   history would show to anybody. #}
+<title>{{ page_title }}</title>
 {% import "partials/scan_button.html" as scan_button_state with context %}
 {% set scan_takes_focus = focus_scan and not scan_button_state.scan_disabled %}
 {% with focus_status_area = focus_status_area and not scan_takes_focus %}{% include "partials/status.html" %}{% endwith %}

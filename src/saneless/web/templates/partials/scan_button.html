@@ -21,10 +21,14 @@
    because a disabled button is not focusable and cannot be reliably hovered,
    so the explanation has to be visible text rather than a tooltip.
 
-   A multi-page document waiting between passes reads "Waiting for you", not
-   "Scanning": the scanner is idle and the next move is the person's.  Like the
-   flip caption it carries no spinner, because aria-busy follows is_busy and a
-   waiting job is not busy.
+   The label is vocabulary.scan_button_label's, never a literal here, so the
+   button and the status area cannot disagree about a job.  A job still in the
+   queue reads "Queued", not "Scanning", and a multi-page document waiting
+   between passes reads "Waiting for you": the scanner is idle and the next
+   move is the person's.  Like the flip caption it carries no spinner, because
+   aria-busy follows is_busy and a waiting job is not busy.  A finished job is
+   handed to the filter as None, the same as no job: the button offers a scan
+   again.
 
    The disabled sources are computed once, as scan_disabled, and read twice:
    by the disabled attribute and by autofocus.  autofocus_scan asks for focus
@@ -40,5 +44,5 @@
 <button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
         {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% endif %}
         {% if scan_disabled %}disabled{% endif %}{% if autofocus_scan and not scan_disabled %} autofocus{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
-    {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.state in pass_wait_states %}Waiting for you&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
+    {{ (job.state if job and job.is_active else none) | scan_button_label }}
 </button>

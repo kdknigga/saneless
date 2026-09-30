@@ -44,6 +44,7 @@ from saneless.scanner.base import SourceKind, classify_source
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
+    IDLE_LINE,
     LOST_CONTACT_LINE,
     MULTI_PAGE_DISABLED_REASON,
     MULTI_PAGE_HELP,
@@ -65,7 +66,10 @@ from saneless.vocabulary import (
     SubmitResult,
     WorkerHealth,
     busy_line,
+    last_scan_detail,
+    last_scan_line,
     local_time,
+    page_title,
     pass_prompt_copy,
     progress_label,
     stale_default_correspondent_label,
@@ -79,7 +83,12 @@ from saneless.web.errors import (
     TITLE_CONTROL_TYPE,
     RequestRejected,
 )
-from saneless.web.job_view import build_job_view, owns_detail, scrub_for_owner
+from saneless.web.job_view import (
+    JobView,
+    build_job_view,
+    owns_detail,
+    scrub_for_owner,
+)
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
@@ -93,7 +102,6 @@ if TYPE_CHECKING:
     from saneless.vocabulary import PassPrompt, PassPromptCopy
     from saneless.web.cache import CachedList, MetadataCache
     from saneless.web.checks_cache import CachedChecks
-    from saneless.web.job_view import JobView
     from saneless.worker import ScanWorker
 
 __all__ = ["router"]
@@ -933,12 +941,37 @@ def _owned_active_job_id(
     return max(owned, key=lambda job: job.created_at).id
 
 
+def _is_queued(worker: ScanWorker, job: Job | None) -> bool:
+    """
+    Report whether a job waits in the queue behind the one the worker runs.
+
+    A PENDING job the worker is not running is queued only while the worker
+    runs another: with nothing running it is about to start.  The busy line
+    and the tab title both read this, from the one call ``_status_context``
+    makes, so a tab titled "Queued" never sits over a "Starting scan..." line.
+
+    Args:
+        worker: The scan worker, for the id of the job in flight.
+        job: The job being rendered, or None when nothing has ever run.
+
+    Returns:
+        True for a PENDING job while the worker runs a different one.
+
+    """
+    return (
+        job is not None
+        and job.state is JobState.PENDING
+        and worker.current_job_id not in (None, job.id)
+    )
+
+
 def _busy_line(
     worker: ScanWorker,
     job_store: JobStore,
     job: Job | None,
     *,
     presented: str | None,
+    queued: bool,
 ) -> str | None:
     """
     Compose the one line the status area shows while the rendered job works.
@@ -948,8 +981,10 @@ def _busy_line(
     for the copy to drift from what ``vocabulary.busy_line`` says.
 
     Four situations, in the precedence ``busy_line`` itself documents.  A
-    PENDING job while the worker runs a *different* one is waiting in the
-    queue, and is told what it is waiting for and how many jobs are ahead.
+    queued job -- PENDING while the worker runs a *different* one -- is told
+    what it is waiting for and how many jobs are ahead.  Whether it is queued
+    is decided once, by ``_is_queued`` in ``_status_context``, and passed in,
+    so the busy line and the tab title read one answer.
     The job the worker is actually running, on its second
     manual-duplex pass, leads with the pages counted on the first; on a later
     pass of a multi-page document, it leads with the pages already kept.
@@ -974,6 +1009,7 @@ def _busy_line(
         job_store: The job store, for the running job's title and the position.
         job: The job being rendered, or None when nothing has ever run.
         presented: The owner token this request carries, or None.
+        queued: Whether the job waits behind the one the worker is running.
 
     Returns:
         One line of plain text, or None when there is no job to describe.
@@ -982,7 +1018,7 @@ def _busy_line(
     if job is None:
         return None
     running_id = worker.current_job_id
-    if job.state is JobState.PENDING and running_id not in (None, job.id):
+    if queued:
         running = job_store.get_job(running_id) if running_id else None
         ahead = job_store.queue_position(job.id)
         if running is not None and ahead is not None:
@@ -1164,12 +1200,21 @@ def _status_context(
     ``_pass_wait_context``: its claimed answer, and, for a viewer who may
     answer, the open question and its wording.
 
+    ``idle_line`` is what the area says with no job to report: the blocked
+    reason on an appliance that cannot upload, so the area never invites a
+    scan the button under it refuses, and ``IDLE_LINE`` otherwise.
+    ``page_title`` is the tab's title for this rendering, from the job's state
+    and never its title, which the tab list and the browser history would
+    show to anyone at the tablet.  Every status response carries it, so the
+    tab follows each change the area shows and keeps its title across a 204.
+
     Returns:
         This viewer's view of the job, its flip answer, its multi-page answer,
         prompt and wording, the followed job's id, the one busy line, whether
-        this viewer may answer the job's prompt, whether the Scan button is
-        blocked and a false strip-refresh flag.  ``flip_answer`` is None unless
-        the rendered job is ``AWAITING_FLIP`` and has been answered.
+        the job is queued, the idle line, the tab title, whether this viewer
+        may answer the job's prompt, whether the Scan button is blocked and a
+        false strip-refresh flag.  ``flip_answer`` is None unless the rendered
+        job is ``AWAITING_FLIP`` and has been answered.
 
     """
     followed = (
@@ -1190,15 +1235,80 @@ def _status_context(
         else None
     )
     is_owner = job is not None and _is_owner(facts.owner_token, job.owner_token)
+    queued = _is_queued(worker, job)
+    block = _scan_block(facts.settings)
     return {
         "job": view,
         "flip_answer": answer,
         **_pass_wait_context(worker, job, facts, is_owner=is_owner),
         "refresh_checks": False,
         "followed_job_id": followed.id if followed is not None else None,
-        "busy_line": _busy_line(worker, job_store, job, presented=facts.owner_token),
+        "busy_line": _busy_line(
+            worker, job_store, job, presented=facts.owner_token, queued=queued
+        ),
+        "queued": queued,
+        "idle_line": block.reason if block is not None else IDLE_LINE,
+        "page_title": (
+            page_title(
+                view.state,
+                warning=view.warning,
+                category=view.error_category,
+                queued=queued,
+            )
+            if view is not None
+            else page_title(None)
+        ),
         "is_owner": is_owner,
         "scan_blocked": facts.scan_blocked,
+    }
+
+
+def _last_scan_context(view: JobView | None) -> dict[str, object]:
+    """
+    Turn a finished job on a fresh page into the "Last scan" lines.
+
+    A page loaded after a job ended would otherwise render that job's outcome
+    exactly as a live poll does -- red, in an alert, with the history reload --
+    and present an old result as news to whoever opens the page next, however
+    long ago it was.  So the full page, and only the full page, reports a job
+    that is not active as the past: the idle line, then one muted line naming
+    the outcome, the title and when it started, and the detail line a warning
+    or a failure carries.  Every status response keeps the live rendering, so
+    a poll that watches a job end still shows the outcome, alert included.
+
+    The lines are built from the job's view, so the owner gate still decides
+    the title and the warning and error text.  The time is ``created_at``,
+    worded "started", because a job records no finish time.
+
+    Args:
+        view: The job the status context chose, as this viewer may see it, or
+            None when no job has ever run.
+
+    Returns:
+        The keys that replace the live rendering, or an empty mapping when
+        there is no job or it is still active.  ``job`` becomes None, which
+        is what selects the idle branch and leaves the Scan button enabled.
+
+    """
+    if view is None or view.is_active:
+        return {}
+    return {
+        "job": None,
+        "last_job": view,
+        "last_scan_line": last_scan_line(
+            view.state,
+            warning=view.warning,
+            category=view.error_category,
+            title=view.title,
+            created_at=view.created_at,
+        ),
+        "last_scan_detail": last_scan_detail(
+            view.state,
+            warning=view.warning,
+            category=view.error_category,
+            error=view.error,
+        ),
+        "page_title": page_title(None),
     }
 
 
@@ -1978,19 +2088,22 @@ def index(request: Request) -> Response:
     # queued; with none of its own active, it reports the current job.  Its
     # poll URL carries the token of what the first poll would render, so that
     # poll is answered 204 and the page's own rendering stays in place.
-    _, status = _with_poll(
-        request,
-        _status_context(
-            state.worker,
-            state.job_store,
-            _status_facts(
-                request,
-                followed_job_id=_owned_active_job_id(
-                    state.worker, state.job_store, _presented_owner(request)
-                ),
+    live = _status_context(
+        state.worker,
+        state.job_store,
+        _status_facts(
+            request,
+            followed_job_id=_owned_active_job_id(
+                state.worker, state.job_store, _presented_owner(request)
             ),
         ),
     )
+    _, status = _with_poll(request, live)
+    # A job that is no longer active is reported as the last scan, not as
+    # news.  The poll token above is still the live rendering's, which no poll
+    # asks for: an area with no active job does not poll.
+    shown = live["job"]
+    last_scan = _last_scan_context(shown if isinstance(shown, JobView) else None)
     block = _scan_block(state.settings)
 
     jobs = _history_views(request)
@@ -2022,6 +2135,7 @@ def index(request: Request) -> Response:
             **tag_list,
             **correspondent_options,
             **status,
+            **last_scan,
             **_checks_context(state),
             "jobs": jobs,
             # The title input's maxlength; templates own no vocabulary.

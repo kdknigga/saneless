@@ -1,4 +1,7 @@
 {% extends "base.html" %}
+{# The tab's title follows the status area's state by the rule every status
+   response carries, so a reload and a poll never disagree about it. #}
+{% block title %}{{ page_title }}{% endblock %}
 {% block content %}
 
 {# --- Section 0: System status --- #}

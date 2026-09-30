@@ -40,6 +40,7 @@ from saneless.vocabulary import (
     pass_answer_label,
     progress_label,
     removed_pages,
+    scan_button_label,
 )
 from saneless.worker import PRESERVATION_JOIN_SECONDS, STOP_JOIN_SECONDS, ScanWorker
 from saneless.workspace import sweep_orphans
@@ -111,6 +112,11 @@ def _build_templates() -> Jinja2Templates:
     templates.env.filters["progress_label"] = progress_label
     templates.env.filters["flip_answer_label"] = flip_answer_label
     templates.env.filters["pass_answer_label"] = pass_answer_label
+    # The Scan button's label, one function picking by state, so the button
+    # cannot call a queued job "Scanning" while the status area says it waits.
+    # The template hands it None for a finished job, as for no job at all:
+    # the button offers a scan again once the job has an outcome.
+    templates.env.filters["scan_button_label"] = scan_button_label
     templates.env.filters["check_name"] = check_name
     # The strip draws its rows with these three and not with the state lookups
     # they delegate to: a row the registry skipped carries `CheckState.OK` so

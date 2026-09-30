@@ -3365,7 +3365,7 @@ class TestPromptAutofocus:
         assert poll.status_code == 204, poll.text
 
 
-# --- A fresh page reports a finished job as the past (D-12, D-13, T-19) -------
+# --- A fresh page reports a finished job as the past ---------------------------
 
 # One finished job per kind of outcome the "Last scan" line can name: the
 # state, the warning and the category it records, the start of the line it
@@ -3507,7 +3507,7 @@ def _page_as(client: TestClient, token: str | None) -> str:
 
 
 class TestLastScanLine:
-    """A page loaded with no job active reports the last one as the past (D-12)."""
+    """A page loaded with no job active reports the last one as the past."""
 
     @pytest.mark.parametrize("case", list(_LAST_SCAN_CASES))
     def test_last_scan_line_on_a_fresh_page(
