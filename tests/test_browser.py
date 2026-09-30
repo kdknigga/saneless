@@ -126,7 +126,10 @@ from saneless.vocabulary import (
     error_message,
     error_next_step,
     flip_answer_label,
+    flip_heading,
     job_label,
+    local_time,
+    non_owner_wait_line,
     pass_answer_label,
     progress_label,
 )
@@ -2934,7 +2937,11 @@ class TestOwnerCookieInABrowser:
             page.goto(browser_server.url)
 
             status = page.locator("#status-area")
-            expect(status).to_contain_text("Waiting for the stack to be flipped")
+            deadline = worker.flip_deadline(job.id)
+            assert deadline is not None
+            expect(status).to_contain_text(
+                non_owner_wait_line(JobState.AWAITING_FLIP, deadline=deadline)
+            )
             assert status.locator("button").count() == 0
             assert coordinator.answer is None
         finally:
@@ -5829,8 +5836,15 @@ class TestTimestampZonesInChromium:
 _FLIP_CONTROL_SELECTOR = "[hx-post^='/api/flip/']"
 """Every control that could answer a flip prompt, matched by where it posts."""
 
-_WAITING_LINE = "Waiting for the stack to be flipped"
-"""The non-owner's locked copy at AWAITING_FLIP (UI-SPEC S5). No ellipsis."""
+_WAITING_LINE = non_owner_wait_line(JobState.AWAITING_FLIP, deadline=None).removesuffix(
+    "."
+)
+"""
+What the non-owner's line at AWAITING_FLIP says with or without a deadline.
+
+The line's no-deadline form, less its full stop: a real scan's page may render
+before the worker records when the wait began, and either form carries this.
+"""
 
 _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
 """The question ``hx-confirm`` puts in the native dialog (D-27, UI-SPEC S5)."""
@@ -6068,6 +6082,100 @@ class TestTwoBrowsersOneStack:
                 "neither gate handled a request, so the no-egress assertion "
                 "below would have passed for two contexts that were never gated"
             )
+            assert blocked == [], f"a page tried to reach the network: {blocked}"
+            assert violations == [], (
+                f"a page violated its Content-Security-Policy: {violations}"
+            )
+
+    def test_flip_group_has_an_accessible_name(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The owner's buttons are named by the job line; the pictures are silent.
+
+        Read from the browser's own accessibility tree, not from the markup:
+        the group's name is computed through ``aria-labelledby``, and a hidden
+        picture is one the tree leaves out, which only a browser decides.  The
+        captions under the pictures stay in the tree, so nothing they said is
+        lost.
+        """
+        server = flip_server
+        job_id = _drive_to_flip_prompt(page, server, wait_for_state, _FLIP_JOB_TITLE)
+        try:
+            page.reload()
+            status = page.locator("#status-area")
+            # The prompt alone: the owner's page also carries the first-page
+            # preview, a real picture with its own name, below it.
+            prompt = status.locator(".flip-prompt")
+
+            expect(status.get_by_role("group")).to_have_accessible_name(
+                flip_heading(_FLIP_JOB_TITLE)
+            )
+            expect(prompt.locator("svg")).to_have_count(2)
+            expect(prompt.get_by_role("img")).to_have_count(0)
+            snapshot = prompt.aria_snapshot()
+            assert "img" not in snapshot, snapshot
+            assert "Long edge (correct)" in snapshot, snapshot
+            assert "Short edge (incorrect)" in snapshot, snapshot
+        finally:
+            _end_the_flip(server, job_id, wait_for_state)
+
+    def test_non_owner_sees_the_way_forward_and_deadline(
+        self,
+        page: Page,
+        browser: Browser,
+        flip_server: _BrowserServer,
+        egress_allowlist: list[str],
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A second browser is told where the flip can be answered, and until when.
+
+        The deadline is the worker's own, rendered in local time, and the
+        second browser is still given no button and no title.  Its context is
+        built by hand, installs the egress gate and the policy recorder itself,
+        and is checked after it closes.
+        """
+        server = flip_server
+        worker = server.app.state.worker
+        job_id = _drive_to_flip_prompt(page, server, wait_for_state, _FLIP_JOB_TITLE)
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        viewer_ctx = browser.new_context()
+        try:
+            assert poll_until(
+                lambda: worker.flip_deadline(job_id) is not None, _JOB_FINISH_TIMEOUT
+            ), "the worker never recorded when the flip wait began"
+            deadline = worker.flip_deadline(job_id)
+            assert deadline is not None
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(viewer_ctx, violations)
+            viewer = viewer_ctx.new_page()
+            viewer.goto(server.url)
+
+            viewer_status = viewer.locator("#status-area")
+            expect(viewer_status).to_contain_text(local_time(deadline))
+            expect(viewer_status).to_contain_text(
+                "from the device that started this scan"
+            )
+            expect(viewer_status).to_contain_text(
+                non_owner_wait_line(JobState.AWAITING_FLIP, deadline=deadline)
+            )
+            expect(viewer_status.get_by_role("button", name="Continue")).to_have_count(
+                0
+            )
+            expect(viewer.locator(_FLIP_CONTROL_SELECTOR)).to_have_count(0)
+            expect(viewer_status).not_to_contain_text(_FLIP_JOB_TITLE)
+            # The owner, at the same moment, still has the prompt.
+            expect(page.locator("#flip-continue")).to_be_visible()
+        finally:
+            viewer_ctx.close()
+            _end_the_flip(server, job_id, wait_for_state)
+            assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
                 f"a page violated its Content-Security-Policy: {violations}"
@@ -7342,9 +7450,12 @@ class TestMultiPagePromptInTheBrowser:
             viewer_page.goto(server.url)
 
             viewer_status = viewer_page.locator("#status-area")
+            deadline = server.app.state.worker.pass_deadline(job_id)
+            assert deadline is not None
             expect(viewer_status).to_contain_text(
-                progress_label(JobState.AWAITING_NEXT_PASS)
+                non_owner_wait_line(JobState.AWAITING_NEXT_PASS, deadline=deadline)
             )
+            expect(viewer_status).not_to_contain_text("Not Yours")
             expect(viewer_status.locator("button")).to_have_count(0)
             expect(viewer_status.locator(".pages-prompt")).to_have_count(0)
             expect(viewer_status.locator("[aria-busy]")).to_have_count(0)
@@ -7921,6 +8032,71 @@ def _reflow_lost_contact(stage: _Stage) -> Generator[None]:
             broken.clear()
 
 
+@contextmanager
+def _armed_flip(stage: _Stage, job_id: str) -> Generator[None]:
+    """
+    Give the worker an armed flip wait for ``job_id``, so its deadline is known.
+
+    Args:
+        stage: The page and server.
+        job_id: The job waiting at the flip.
+
+    """
+    worker = stage.server.app.state.worker
+    coordinator = WorkerFlipCoordinator(job_id)
+    coordinator.arm()
+    worker._flip_coordinator = coordinator
+    try:
+        assert worker.flip_deadline(job_id) is not None
+        yield
+    finally:
+        worker._flip_coordinator = None
+
+
+@contextmanager
+def _reflow_owner_flip_prompt(stage: _Stage) -> Generator[None]:
+    """
+    Open the owner's flip prompt for a max-length title with no spaces.
+
+    The job line, the instructions, the joined button group and the deadline
+    note are all on the page when it is measured.
+    """
+    title = "W" * TITLE_MAX_LENGTH
+    with (
+        _parked(stage, JobState.AWAITING_FLIP, title) as job_id,
+        _armed_flip(stage, job_id),
+    ):
+        _open_on(stage, flip_heading(title))
+        expect(stage.page.locator("#status-area .prompt-note")).to_be_visible()
+        expect(stage.page.locator("#flip-continue")).to_be_visible()
+        yield
+
+
+@contextmanager
+def _reflow_non_owner_flip_wait(stage: _Stage) -> Generator[None]:
+    """Show another browser's flip wait, with its deadline, to this page."""
+    job_store: JobStore = stage.server.app.state.job_store
+    worker = stage.server.app.state.worker
+    job = job_store.create_job(
+        profile="default",
+        title="W" * TITLE_MAX_LENGTH,
+        owner_token="a-browser-that-is-not-this-one",
+    )
+    job_store.update_state(job.id, JobState.AWAITING_FLIP)
+    worker._current_job_id = job.id
+    try:
+        with _armed_flip(stage, job.id):
+            deadline = worker.flip_deadline(job.id)
+            assert deadline is not None
+            _open_on(
+                stage, non_owner_wait_line(JobState.AWAITING_FLIP, deadline=deadline)
+            )
+            yield
+    finally:
+        worker._current_job_id = None
+        job_store.delete_job(job.id)
+
+
 _REFLOW_ROWS: dict[str, Callable[[_Stage], AbstractContextManager[None]]] = {
     "queued-with-max-length-title": _reflow_queued,
     "starting": _reflow_starting,
@@ -7931,6 +8107,8 @@ _REFLOW_ROWS: dict[str, Callable[[_Stage], AbstractContextManager[None]]] = {
     "settling-strip": _reflow_settling_strip,
     "lost-contact": _reflow_lost_contact,
     "last-scan-failed": _reflow_last_scan_failed,
+    "owner_flip_prompt": _reflow_owner_flip_prompt,
+    "non_owner_flip_wait": _reflow_non_owner_flip_wait,
 }
 
 
