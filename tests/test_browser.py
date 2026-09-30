@@ -2148,10 +2148,11 @@ _SUBMIT_UNKNOWN_PROFILE = """
 }
 """
 
-# The status poll names the job this browser submitted once it has one, and
+# The status poll names the job this browser follows once it has one, and
 # the current-job path only until then (D-25), so a poll is recognised by the
-# shape of its URL rather than by one literal path.
-_POLL_URL = re.compile(r"/api/jobs/[^/]+/status$")
+# shape of its URL rather than by one literal path.  The URL carries the token
+# of what the page shows as a query string, so the path may end there too.
+_POLL_URL = re.compile(r"/api/jobs/[^/?]+/status(\?|$)")
 
 
 def _fill_queue_until_rejected(url: str) -> None:
@@ -6029,6 +6030,180 @@ class TestTwoBrowsersOneStack:
         )
 
 
+_CONTINUE_URL = "/api/flip/continue"
+
+
+@pytest.mark.browser
+class TestFlipPromptSurvivesPolls:
+    """
+    The flip prompt stays put under the status poll, in Chromium.
+
+    The area is polled every second while the job waits for the flip.  Nothing
+    changes while nobody answers, so every poll is answered 204 and the
+    Continue button the operator reached -- by keyboard or by pointer -- is
+    never replaced under them.  Every wait is a completed poll or request,
+    never a sleep, and every POST is counted from a request listener.
+    """
+
+    @staticmethod
+    def _record_continues(page: Page) -> list[str]:
+        """
+        Record every Continue POST the page sends, from now on.
+
+        Args:
+            page: The page to listen on.
+
+        Returns:
+            The list the listener appends each Continue URL to.
+
+        """
+        posted: list[str] = []
+
+        def _on_request(request: Request) -> None:
+            if request.method == "POST" and request.url.endswith(_CONTINUE_URL):
+                posted.append(request.url)
+
+        page.on("request", _on_request)
+        return posted
+
+    @staticmethod
+    def _settled_prompt(
+        page: Page, server: _BrowserServer, wait_for_state: Callable[..., Job]
+    ) -> str:
+        """
+        Park a real scan at the flip prompt and wait until the page shows it.
+
+        Args:
+            page: The page that submits, and so owns the job.
+            server: The private flip server.
+            wait_for_state: The conftest waiter, polling the job store.
+
+        Returns:
+            The id of the job waiting at the flip prompt.
+
+        """
+        job_id = _drive_to_flip_prompt(page, server, wait_for_state, "Held Flip")
+        expect(page.locator("#flip-continue")).to_be_visible(timeout=10_000)
+        # One completed poll after the prompt appeared, so the area on the page
+        # is the one the unchanged polls will leave in place.
+        _await_status_poll(page)
+        return job_id
+
+    @staticmethod
+    def _finish(
+        server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
+    ) -> None:
+        """
+        Bring the job to an end before the server shuts down.
+
+        An Abort after Continue already won is dropped, so this ends a job the
+        test left at the prompt and leaves an answered one to finish.
+
+        Args:
+            server: The private flip server.
+            job_id: The job to end.
+            wait_for_state: The conftest waiter, polling the job store.
+
+        """
+        job_store: JobStore = server.app.state.job_store
+        server.app.state.worker.abort_flip(job_id)
+        wait_for_state(job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT)
+
+    def test_flip_buttons_have_stable_ids(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """Continue and Abort carry the ids focus is restored by."""
+        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        try:
+            expect(page.locator("#flip-continue")).to_have_text("Continue")
+            expect(page.locator("#flip-abort")).to_have_text("Abort scan")
+        finally:
+            self._finish(flip_server, job_id, wait_for_state)
+
+    def test_focused_continue_survives_two_polls_and_enter_sends_the_post(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A keyboard-focused Continue keeps focus through two polls, and Enter works.
+
+        The focused node is marked, so "still focused" means the very element
+        the keyboard reached, not a replacement that happens to share its id.
+        """
+        posted = self._record_continues(page)
+        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        try:
+            page.focus("#flip-continue")
+            page.locator("#flip-continue").evaluate(
+                "button => button.setAttribute('data-focused', '')"
+            )
+
+            assert [_await_status_poll(page) for _ in range(2)] == [204, 204]
+            expect(page.locator("#flip-continue[data-focused]")).to_be_focused()
+
+            with page.expect_response(
+                lambda r: r.url.endswith(_CONTINUE_URL)
+            ) as answered:
+                page.keyboard.press("Enter")
+
+            assert answered.value.status == 200
+            assert len(posted) == 1, posted
+        finally:
+            self._finish(flip_server, job_id, wait_for_state)
+
+    def test_space_held_across_a_poll_sends_one_continue(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A Space press that straddles a poll activates Continue exactly once.
+
+        A button activates on Space's keyup, so the press is only delivered if
+        the button that saw the keydown is still there when the key comes up.
+        """
+        posted = self._record_continues(page)
+        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        try:
+            page.focus("#flip-continue")
+            page.keyboard.down("Space")
+            assert _await_status_poll(page) == 204
+            with page.expect_response(lambda r: r.url.endswith(_CONTINUE_URL)):
+                page.keyboard.up("Space")
+
+            assert len(posted) == 1, posted
+        finally:
+            self._finish(flip_server, job_id, wait_for_state)
+
+    def test_pointer_held_across_a_poll_sends_one_continue(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A mouse press held across a poll clicks Continue exactly once."""
+        posted = self._record_continues(page)
+        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        try:
+            # hover() scrolls the button into view and puts the pointer on its
+            # centre; the press itself is the raw mouse, so it can be held.
+            page.locator("#flip-continue").hover()
+            page.mouse.down()
+            assert _await_status_poll(page) == 204
+            with page.expect_response(lambda r: r.url.endswith(_CONTINUE_URL)):
+                page.mouse.up()
+
+            assert len(posted) == 1, posted
+        finally:
+            self._finish(flip_server, job_id, wait_for_state)
+
+
 _OWNED_TITLE = "Owned By One Browser"
 """The title of the finished scan only its owner's page may show."""
 
@@ -6686,26 +6861,31 @@ def multi_page_scan_server(
         yield server
 
 
-def _await_status_swap(page: Page) -> None:
+def _await_status_poll(page: Page) -> int:
     """
-    Wait until a status poll has replaced the status area and htmx has settled it.
+    Wait for the next status poll to come back and for htmx to settle the area.
 
-    The area in the page now is marked first, and the wait is for the mark to
-    be gone, so the wait cannot be satisfied by the area that was already
-    there.  It then waits for htmx to process the new area, which happens a
-    moment after the swap: until then its buttons have no handler, and a click
-    would be lost.  Once both have happened, the next poll is most of a second
-    away, which is time enough for a click to land on the area just measured.
+    A poll that finds nothing changed is answered 204 and leaves the area in
+    place; one that finds a change swaps it.  Either way, once the response is
+    in and htmx has processed whatever area is now on the page, that area is
+    the one a click or a keypress lands on: an unchanged one stays for as long
+    as nothing changes, and a changed one is not replaced again until the next
+    change.  Content the test needs to see is asserted separately, with
+    Playwright's retrying ``expect``, never inferred from a swap having
+    happened -- under the 204 rule a swap may never come.
 
     Args:
         page: The browser page, showing an active job.
 
+    Returns:
+        The poll response's status code: 204 when nothing changed, 200 when
+        the area was re-rendered.
+
     """
-    page.locator("#status-area").evaluate("area => area.setAttribute('data-stale', '')")
-    with page.expect_response(lambda r: _POLL_URL.search(r.url) is not None):
+    with page.expect_response(lambda r: _POLL_URL.search(r.url) is not None) as polled:
         pass
-    expect(page.locator("#status-area[data-stale]")).to_have_count(0)
     expect(page.locator("#status-area.htmx-added")).to_have_count(0)
+    return polled.value.status
 
 
 def _start_multi_page_scan(
@@ -6879,14 +7059,14 @@ class TestMultiPagePromptInTheBrowser:
             expect(confirming).to_have_count(1)
             expect(confirming).to_have_id("mp-abort")
 
-            _await_status_swap(page)
+            _await_status_poll(page)
             with page.expect_response(lambda r: r.url.endswith(_ANSWER_URL)) as sent:
                 page.click("#mp-next")
             assert sent.value.status == 200
 
             expect(prompt).to_contain_text("2 pages kept so far.", timeout=15_000)
 
-            _await_status_swap(page)
+            _await_status_poll(page)
             with page.expect_response(lambda r: r.url.endswith(_ANSWER_URL)) as sent:
                 page.click("#mp-finish")
             assert sent.value.status == 200
@@ -6940,7 +7120,7 @@ class TestMultiPagePromptInTheBrowser:
         page.on("request", _on_request)
         job_id = _start_multi_page_scan(page, server, wait_for_state, "Abort Pages")
         try:
-            _await_status_swap(page)
+            _await_status_poll(page)
             page.click("#mp-abort")
             assert asked == [abort_question(1)], asked
 
@@ -6955,7 +7135,7 @@ class TestMultiPagePromptInTheBrowser:
             )
 
             answer[0] = "accept"
-            _await_status_swap(page)
+            _await_status_poll(page)
             with page.expect_response(lambda r: r.url.endswith(_ANSWER_URL)):
                 page.click("#mp-abort")
 
@@ -7067,7 +7247,7 @@ class TestMultiPagePromptInTheBrowser:
         page.set_viewport_size({"width": 320, "height": 640})
         job_id = _start_multi_page_scan(page, server, wait_for_state, "Phone Pages")
         try:
-            _await_status_swap(page)
+            _await_status_poll(page)
             layout = page.evaluate(_MEASURE_PROMPT)
 
             assert layout["scrollWidth"] <= layout["clientWidth"], (
@@ -7092,18 +7272,20 @@ class TestMultiPagePromptInTheBrowser:
         wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        A keyboard user keeps their place while the status area is replaced.
+        A keyboard user keeps their place while the status area is polled.
 
-        The area is replaced once a second while the job waits, and focus on a
-        replaced button is lost unless htmx finds a button with the same id in
-        the new area.  The swap is proven to have happened -- the marked button
-        is gone -- before focus is read, so the read cannot be of the button
-        the keyboard reached.  It is read once, not retried.
+        The area is polled once a second while the job waits.  Nothing changes
+        while the question stays open, so every poll is answered 204 and the
+        area -- the focused button with it -- is never replaced.  The button
+        the keyboard reached is marked, and after two polls that each came
+        back 204 the same marked node still holds focus: not merely a button
+        with the same id, the very element the keyboard landed on.  It is read
+        once, not retried.
         """
         server = multi_page_scan_server
         job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Pages")
         try:
-            _await_status_swap(page)
+            _await_status_poll(page)
             page.locator("#mp-finish").focus()
             page.keyboard.press("Shift+Tab")
             assert page.evaluate("() => document.activeElement.id") == "mp-next"
@@ -7111,9 +7293,12 @@ class TestMultiPagePromptInTheBrowser:
                 "button => button.setAttribute('data-focused', '')"
             )
 
-            _await_status_swap(page)
+            assert [_await_status_poll(page) for _ in range(2)] == [204, 204]
 
-            expect(page.locator("#mp-next[data-focused]")).to_have_count(0)
+            expect(page.locator("#mp-next[data-focused]")).to_have_count(1)
+            assert page.evaluate(
+                "() => document.activeElement.hasAttribute('data-focused')"
+            )
             assert page.evaluate("() => document.activeElement.id") == "mp-next"
         finally:
             _abort_the_document(server, job_id, wait_for_state)
