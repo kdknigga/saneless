@@ -1,4 +1,18 @@
+{# The first line names the scan, by the title the owner gate allows: the
+   owner's own, or the generic title for a job that recorded no owner, which
+   anyone may answer.  It also names the button group, through
+   aria-labelledby, so the group needs no name of its own; the id is unique
+   because only one prompt renders at a time.
+
+   The pictures are hidden from assistive technology: the caption under each
+   already says what it shows, and a name on the picture would be read
+   twice.
+
+   The note after the buttons says when the wait ends and what then happens,
+   and promises only what an unanswered flip does: the scan stops, nothing is
+   uploaded, and the front sides already scanned are kept. #}
 <div class="flip-prompt">
+  <p id="flip-heading"><strong>{{ flip_heading }}</strong></p>
   <p>
     Keep the pages in the same order, then flip the stack over the long edge
     (the left or right side, not the top or bottom).
@@ -8,7 +22,7 @@
   <div class="flip-illustration">
     {# Correct: long-edge flip (left/right) #}
     <div>
-      <svg viewBox="0 0 120 100" aria-label="Correct: flip over long edge">
+      <svg viewBox="0 0 120 100" aria-hidden="true" focusable="false">
         {# Paper stack #}
         <rect x="10" y="20" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
         <rect x="14" y="16" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 2"/>
@@ -23,7 +37,7 @@
 
     {# Incorrect: short-edge flip (top/bottom) #}
     <div>
-      <svg viewBox="0 0 120 100" aria-label="Incorrect: flip over short edge">
+      <svg viewBox="0 0 120 100" aria-hidden="true" focusable="false">
         {# Paper stack #}
         <rect x="10" y="20" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
         <rect x="14" y="16" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 2"/>
@@ -66,7 +80,7 @@
      page load moves no focus -- and the page's poll token is taken from the
      poll's rendering, so the first poll after it is still a 204.  Only the
      owner is ever sent this partial, so nobody else's focus moves. #}
-  <div role="group">
+  <div role="group" aria-labelledby="flip-heading">
     <button id="flip-continue"{% if not page_render %} autofocus{% endif %} hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
     <button id="flip-abort"
             hx-post="/api/flip/abort"
@@ -76,4 +90,5 @@
             hx-confirm="Abort this scan? It will stop and cannot be resumed."
             class="secondary">Abort scan</button>
   </div>
+  <small class="prompt-note">{{ flip_note }}</small>
 </div>

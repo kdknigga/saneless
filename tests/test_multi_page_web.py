@@ -425,15 +425,15 @@ _HX_CONFIRM = re.compile(r'hx-confirm="(?P<question>[^"]*)"')
 
 # The flip prompt's template is a sibling of the multi-page prompt and must not
 # change because the multi-page prompt exists.  Its digest is recorded here as
-# the file stood after its own last deliberate change -- Continue taking focus
-# when the prompt first appears through the poll, and never on a page load.
-# A later deliberate change to the flip prompt re-records it; a multi-page
-# change never should.
+# the file stood after its own last deliberate change -- the line naming the
+# scan, which also names the button group, the pictures hidden behind their
+# captions, and the note saying when the wait ends.  A later deliberate change
+# to the flip prompt re-records it; a multi-page change never should.
 _FLIP_TEMPLATE = (
     Path(app_module.__file__).parent / "templates" / "partials" / "flip.html"
 )
 _FLIP_TEMPLATE_SHA256 = (
-    "2ce4543672ec163db1ece743a28680ab7574d5bc8e8d8f8e21e7817755c3b5e8"
+    "80f5d15c8df0edd511d45dfa52462785dd2f0a40ab36de167c92d00b10daae73"
 )
 
 

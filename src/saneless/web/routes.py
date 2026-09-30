@@ -66,10 +66,14 @@ from saneless.vocabulary import (
     SubmitResult,
     WorkerHealth,
     busy_line,
+    flip_deadline_note,
+    flip_heading,
     last_scan_detail,
     last_scan_line,
     local_time,
+    non_owner_wait_line,
     page_title,
+    pass_heading,
     pass_prompt_copy,
     progress_label,
     stale_default_correspondent_label,
@@ -1198,7 +1202,19 @@ def _status_context(
 
     A job waiting on a multi-page question gets the same treatment through
     ``_pass_wait_context``: its claimed answer, and, for a viewer who may
-    answer, the open question and its wording.
+    answer, the open question and its wording.  ``pass_heading``, the
+    prompt's first line naming the document, is built beside it for an owner
+    from the view's title, so the owner gate decides that title here too.
+
+    A job waiting for a person -- the flip, or a multi-page question -- also
+    gets its deadline, read by ``_wait_deadline`` for every viewer, not only
+    the owner: a deadline is a time and carries no job detail, which is what
+    lets ``non_owner_line`` tell anyone else when the wait gives up.  The
+    title still reaches the prompt only through the view, so ``flip_heading``
+    names the owner's real title, and a job that recorded no owner -- which
+    anyone may answer -- by the generic title.  ``flip_note`` says when the
+    flip wait ends and what then happens to the pages, or how long it lasts
+    until the worker has recorded when it began.
 
     ``idle_line`` is what the area says with no job to report: the blocked
     reason on an appliance that cannot upload, so the area never invites a
@@ -1209,8 +1225,10 @@ def _status_context(
     tab follows each change the area shows and keeps its title across a 204.
 
     Returns:
-        This viewer's view of the job, its flip answer, its multi-page answer,
-        prompt and wording, the followed job's id, the one busy line, whether
+        This viewer's view of the job, its flip answer, the flip prompt's job
+        line and deadline note, the line a viewer who cannot answer a waiting
+        job sees, its multi-page answer, prompt, wording and job line, the
+        followed job's id, the one busy line, whether
         the job is queued, the idle line, the tab title, whether this viewer
         may answer the job's prompt, whether the Scan button is blocked and a
         false strip-refresh flag.  ``flip_answer`` is None unless the rendered
@@ -1237,10 +1255,35 @@ def _status_context(
     is_owner = job is not None and _is_owner(facts.owner_token, job.owner_token)
     queued = _is_queued(worker, job)
     block = _scan_block(facts.settings)
+    deadline = _wait_deadline(worker, job)
+    flipping = job is not None and job.state is JobState.AWAITING_FLIP
     return {
         "job": view,
         "flip_answer": answer,
-        **_pass_wait_context(worker, job, facts, is_owner=is_owner),
+        "flip_heading": (
+            flip_heading(view.title)
+            if flipping and is_owner and view is not None
+            else None
+        ),
+        "flip_note": (
+            flip_deadline_note(
+                deadline=deadline,
+                timeout_seconds=facts.settings.output.operator_wait_timeout_seconds,
+            )
+            if flipping
+            else None
+        ),
+        "non_owner_line": (
+            non_owner_wait_line(job.state, deadline=deadline)
+            if job is not None and (flipping or job.state in PASS_WAIT_STATES)
+            else None
+        ),
+        "pass_heading": (
+            pass_heading(view.title)
+            if is_owner and view is not None and view.state in PASS_WAIT_STATES
+            else None
+        ),
+        **_pass_wait_context(worker, job, facts, is_owner=is_owner, deadline=deadline),
         "refresh_checks": False,
         "followed_job_id": followed.id if followed is not None else None,
         "busy_line": _busy_line(
@@ -1689,12 +1732,42 @@ def _answer_status_poll(
         )
 
 
+def _wait_deadline(worker: ScanWorker, job: Job | None) -> datetime | None:
+    """
+    Read when the rendered job's wait for a person gives up, if it is known.
+
+    The flip wait's deadline comes from ``ScanWorker.flip_deadline`` and a
+    multi-page question's from ``ScanWorker.pass_deadline``; the job's stored
+    state says which wait it is in.  It is read once per rendering, for every
+    viewer and outside the owner gate: a deadline is a time and nothing else,
+    with no title or other job detail, so telling a viewer who cannot answer
+    when the wait ends discloses nothing the owner gate protects.
+
+    Args:
+        worker: The scan worker, which holds when each wait began.
+        job: The job being rendered, or None.
+
+    Returns:
+        The aware deadline, or None when the job is not waiting for a person
+        or the worker has not yet recorded when its wait began.
+
+    """
+    if job is None:
+        return None
+    if job.state is JobState.AWAITING_FLIP:
+        return worker.flip_deadline(job.id)
+    if job.state in PASS_WAIT_STATES:
+        return worker.pass_deadline(job.id)
+    return None
+
+
 def _pass_wait_context(
     worker: ScanWorker,
     job: Job | None,
     facts: _StatusFacts,
     *,
     is_owner: bool,
+    deadline: datetime | None,
 ) -> dict[str, object]:
     """
     Build the status context a job waiting on a multi-page question adds.
@@ -1721,11 +1794,17 @@ def _pass_wait_context(
     error.  It is scrubbed of host paths and addresses before it goes into the
     copy, so even the owner never sees one.
 
+    The copy's timeout note names ``deadline`` when there is one.  The
+    deadline is read by the caller for every viewer, outside the owner gate,
+    because it is a time and carries no job detail; the title that heads the
+    prompt stays gated through the view, in the caller.
+
     Args:
         worker: The scan worker, for the open question and its answer.
         job: The job being rendered, or None.
         facts: The per-request bundle, for the claimed answer and the settings.
         is_owner: Whether this viewer may answer the job's questions.
+        deadline: When the open question gives up, from ``_wait_deadline``.
 
     Returns:
         ``pass_answer``, ``pass_prompt`` and ``pass_copy``.
@@ -1749,7 +1828,7 @@ def _pass_wait_context(
         )
         # Replaced on the prompt itself rather than passed beside it: given no
         # error, the copy falls back to the prompt's own, unscrubbed text.
-        copy = pass_prompt_copy(replace(prompt, error=error))
+        copy = pass_prompt_copy(replace(prompt, error=error), deadline=deadline)
     return {"pass_answer": answer, "pass_prompt": prompt, "pass_copy": copy}
 
 

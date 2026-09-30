@@ -56,19 +56,23 @@
          absence IS the rendering, so it is asserted by test rather than left to a
          reviewer's memory.
 
-         The last arm's copy deliberately ends without the three periods that
-         in-progress copy normally carries.  It is locked copy, written that way
-         twice, and the style exception is recorded here so a later tidy-up does
-         not "fix" it.  It is a plain line with no spinner, like the multi-page
-         waiting line below: the job waits for a person, not the machine.  The
-         acknowledgement in the first arm is a busy line, because the machine
-         is about to act on the answer. #}
+         The last arm is the server's non_owner_line: what the scan waits
+         for, that it can be continued from the device that started it, and --
+         once the worker has recorded when the wait began -- when it stops.  It
+         names no title.  It deliberately ends in a full stop, without the
+         three periods that in-progress copy normally carries, and so do the
+         three multi-page waiting lines below: nothing is happening on this
+         viewer's behalf.  The style exception is locked and recorded here so a
+         later tidy-up does not "fix" any of the four.  It is a plain line with
+         no spinner, like the multi-page waiting line below: the job waits for
+         a person, not the machine.  The acknowledgement in the first arm is a
+         busy line, because the machine is about to act on the answer. #}
       {% if flip_answer %}
       <p class="busy-line">{{ flip_answer | flip_answer_label }}</p>
       {% elif is_owner %}
       {% include "partials/flip.html" %}
       {% else %}
-      <p>Waiting for the stack to be flipped</p>
+      <p>{{ non_owner_line }}</p>
       {% endif %}
     {% elif job.state in pass_wait_states %}
       {# A multi-page document waiting on its operator.  Three arms, in the
@@ -84,17 +88,25 @@
          scanner's error text are not emitted for them at all; hiding them
          with CSS would be an ASVS V4 failure and is forbidden.
 
-         Otherwise one plain line says what the job is waiting on.  That is
-         what anyone else sees, and what the owner sees for the moment before
-         the worker publishes the question.  It is the same server-built line
-         the busy branch renders, which for a waiting state is that state's
-         progress wording.  It deliberately carries no busy-line class: the job
-         waits for a person, not the machine, and a spinner here is exactly
-         what makes a waiting scan look hung. #}
+         Anyone else sees the server's non_owner_line: what the job waits on,
+         that it can be answered from the device that started it, and when it
+         stops waiting once that is known -- with no title, and ending in a
+         full stop under the locked style exception recorded above.
+
+         The owner, for the moment before the worker publishes the question,
+         sees the same server-built line the busy branch renders, which for a
+         waiting state is that state's progress wording: they are about to be
+         asked, so telling them to answer from another device would be wrong.
+
+         Neither line carries the busy-line class: the job waits for a person,
+         not the machine, and a spinner here is exactly what makes a waiting
+         scan look hung. #}
       {% if pass_answer %}
       <p class="busy-line">{{ pass_answer | pass_answer_label }}</p>
       {% elif is_owner and pass_copy %}
       {% include "partials/pages_prompt.html" %}
+      {% elif not is_owner %}
+      <p>{{ non_owner_line }}</p>
       {% else %}
       <p>{{ busy_line }}</p>
       {% endif %}
