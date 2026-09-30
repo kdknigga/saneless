@@ -61,7 +61,9 @@ The status area below the form updates as the scan progresses through these stag
 
 When a scan finishes, a line beneath the result sums up what happened to the paper -- "12 pages scanned, 2 blank removed, 10 uploaded". A scan that ended in an error or was cancelled has no counts to show, and shows none.
 
-If another scan is already running when you press Scan, the status area keeps following *your* job rather than switching to whichever one is current, and tells you where you are in the queue -- "Waiting for 'Tax return' to finish (1 ahead of you)". The running scan is named only if your browser started it too; otherwise it reads "Waiting for 'Scan (title hidden)' to finish".
+If another scan is already running when you press Scan, the status area keeps following *your* job rather than switching to whichever one is current, and tells you where you are in the queue -- "Waiting for 'Tax return' to finish (1 ahead of you)". The running scan is named only if your browser started it too; otherwise it reads "Waiting for 'Scan (title hidden)' to finish". Reloading the page keeps following the scan this browser started, and so does answering a flip prompt or a multi-page question.
+
+If saneless cannot read the scan's progress for a moment, the status area says so in amber -- "Cannot read the scan's progress right now — retrying..." -- and asks again, less often the longer it lasts, until it can. The line says the page cannot read the scan, not that the scan failed, and the real status replaces it by itself once saneless can read it again. If the saneless server itself stops, the page cannot tell: it keeps showing what it last showed until you reload it.
 
 A thumbnail of the first scanned page appears once the first page is acquired, in the browser that started the scan.
 

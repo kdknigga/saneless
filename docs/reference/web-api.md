@@ -148,6 +148,15 @@ Returns the current or most recent job status. Used by HTMX polling to update th
 
 What the partial shows depends on who asks. The browser that started the job sees its title, preview and error or warning text. Every other client sees the state, the outcome and the page counts under the title `Scan (title hidden)`, with no preview and a fixed sentence in place of the text. See [who can read what](#what-an-unauthenticated-client-can-read).
 
+**Query parameters:** both are written by saneless into the poll URL it hands the page. A client never needs to compose them.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `seen` | string, optional | A token for what the polling element is showing. When nothing the viewer would see has changed, the poll is answered `204` with no body, and htmx leaves the element and anything focused inside it in place. The token is a keyed hash, so it is meaningless outside the running server. A value that is missing, wrong or longer than any token is ignored and the full partial is returned; it is never refused. |
+| `attempt` | integer, optional | Which step of the lost-contact backoff this poll is on (see below). A value out of range is clamped rather than refused with a `422`. |
+
+**When the job cannot be read.** If saneless cannot read the job from its job store, or cannot render the partial, the poll is still answered `200`, never with an error. The response is a status indicator holding one amber line, `Cannot read the scan's progress right now — retrying...`, with no Scan button, no job text and no page title, and the page's message area is left alone. Its poll URL carries the next `attempt`, and its interval steps from 2 seconds to 5 and then to 15, where it stays. At 15 seconds the line no longer changes, so each poll from then on is answered `204`. Polling never stops: once the job can be read again, the next poll returns the real partial and the backoff starts over. The cause goes to the server log only.
+
 ---
 
 ### `GET /api/jobs/{job_id}/status`
@@ -165,6 +174,8 @@ Returns the status of one named job, rather than whichever job is current. The w
 Knowing a job's id does not show you more of it: the partial follows the same owner rule as [`GET /api/jobs/current/status`](#get-apijobscurrentstatus).
 
 An id that names no job is **not** a `404`. The partial falls back to the current-or-most-recent rendering, so a browser whose job has aged out of history keeps working, and a caller cannot use the status code to discover which job ids exist.
+
+It takes the same `seen` and `attempt` query parameters and answers a job it cannot read the same way. The retrying line keeps polling this job's URL only when `job_id` is a well-formed job id. Otherwise it polls `/api/jobs/current/status`, so nothing from the path is echoed back unchecked.
 
 ---
 
@@ -372,7 +383,7 @@ Tells a manual duplex job waiting in `AWAITING_FLIP` that the stack has been fli
 |-------|------|----------|-------------|
 | `job_id` | string | yes | The id of the job the answer is for. The web UI's Continue button sends it automatically. A request without it is rejected with `422`. |
 
-**Response:** HTML partial (the status indicator for HTMX swap), for the current job, else the most recent one. A call arriving just after the job ended reports that job, not the idle "Ready to scan." state. The endpoint does not wait for pass B to start, so the partial shows whatever state the job has recorded at that moment; the one-second status poll picks up pass B from there.
+**Response:** HTML partial (the status indicator for HTMX swap), for the job named by `job_id`. An id that names no job falls back to the current job, else the most recent one. A call arriving just after the job ended reports that job, not the idle "Ready to scan." state. The partial's poll keeps following the job it answered, through [`GET /api/jobs/{job_id}/status`](#get-apijobsjob_idstatus), so the next poll cannot report another browser's scan in its place. The endpoint does not wait for pass B to start, so the partial shows whatever state the job has recorded at that moment; the one-second status poll picks up pass B from there.
 
 While that job is still recorded `AWAITING_FLIP` and its flip wait has been answered -- by this call or by an earlier one -- the partial shows an acknowledgment instead of the Continue and Abort scan buttons: `Flip confirmed. Scanning reverse sides next...` after a Continue, `Aborting scan...` after an Abort.
 
@@ -388,7 +399,7 @@ Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt.
 |-------|------|----------|-------------|
 | `job_id` | string | yes | The id of the job the answer is for. The web UI's Abort scan button sends it automatically. A request without it is rejected with `422`. |
 
-**Response:** HTML partial (the status indicator for HTMX swap), for the current job, else the most recent one, with the same acknowledgment as `/api/flip/continue` while an answered job is still recorded `AWAITING_FLIP`.
+**Response:** HTML partial (the status indicator for HTMX swap), for the job named by `job_id` and polling that job, as `/api/flip/continue` does, with the same acknowledgment while an answered job is still recorded `AWAITING_FLIP`.
 
 ---
 
@@ -421,7 +432,7 @@ Answers the question a multi-page scan is waiting on. A multi-page job asks one 
 
 A missing field, a `prompt` below 1, or an `answer` that is not one of the answers above is rejected with `422` before anything reaches the worker.
 
-**Response:** HTML partial (the status indicator for HTMX swap), for the current job, else the most recent one. The endpoint does not wait for the next pass to start; the one-second status poll picks it up.
+**Response:** HTML partial (the status indicator for HTMX swap), for the job named by `job_id`, else the current job, else the most recent one. The partial's poll keeps following the job it answered. The endpoint does not wait for the next pass to start; the one-second status poll picks it up.
 
 While the job is still recorded in its waiting state and the question has been answered, the partial shows an acknowledgment instead of the buttons, for example `Scanning more pages...` after `NEXT` or `Finishing the document...` after `FINISH`.
 
