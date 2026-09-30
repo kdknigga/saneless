@@ -5246,10 +5246,15 @@ class TestPageCountsInChromium:
 
 # Every word in the history headers and in the Time, Profile and Status cells,
 # each measured as a Range: a word that fits on one line has exactly one client
-# rect, and a word split across lines has one per line.  The Title column is
-# left out on purpose, because a title is user text of any length and is the
-# one cell allowed to break inside a word.  A function expression, because the
-# Content-Security-Policy refuses the eval a bare expression would need.
+# rect, and a word split across lines has one per line.  A word is cut after
+# each hyphen it holds, so "2026-09-30" is measured as "2026-", "09-" and "30":
+# a line break straight after a printed hyphen is an ordinary one the browser
+# may take, and the reader sees the hyphen that says the word goes on.  What
+# is refused is a break with no hyphen to mark it, such as "Compl" and "ete".
+# The Title column is left out on purpose, because a title is user text of any
+# length and is the one cell allowed to break anywhere.  A function
+# expression, because the Content-Security-Policy refuses the eval a bare
+# expression would need.
 _SPLIT_HISTORY_WORDS = """
 () => {
   const table = document.querySelector(".history-table-wrap table");
@@ -5265,7 +5270,7 @@ _SPLIT_HISTORY_WORDS = """
   for (const cell of cells) {
     const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-      for (const match of node.data.matchAll(/\\S+/g)) {
+      for (const match of node.data.matchAll(/[^\\s-]*-|[^\\s-]+/g)) {
         const range = document.createRange();
         range.setStart(node, match.index);
         range.setEnd(node, match.index + match[0].length);
@@ -5303,6 +5308,12 @@ class TestHistoryTableOnAPhone:
         whatever it held, so a long label was broken mid-word.  The document
         width is checked as well, because keeping words whole by widening the
         page would trade one failure for another.
+
+        A break straight after a printed hyphen is allowed, as
+        ``_SPLIT_HISTORY_WORDS`` explains: at this width the date and
+        "paperless-ngx" cannot both stay whole and leave the Title column
+        room for more than a few letters, and a hyphen at the line end shows
+        the reader the word goes on.
         """
         server = empty_history_server
         job_store: JobStore = server.app.state.job_store

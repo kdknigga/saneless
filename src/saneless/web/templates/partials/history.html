@@ -13,8 +13,9 @@
      colspan below stay as they are, which designs a header/colspan mismatch
      out rather than guarding against it;
      it works on a phone, because the existing @media (max-width: 576px) rule
-     already gives #history-body td white-space: normal and word-break, so a
-     two-line cell wraps with no new breakpoint; and a fifth column would
+     already gives #history-body td white-space: normal and lets this cell
+     break long words, so a two-line cell wraps with no new breakpoint; and a
+     fifth column would
      compete with the Time column, which the zone name already widens.
      The guard is the filter returning None, never truthiness.  The pages
      removed as blank are a further line of the same kind, not a warning. #}
