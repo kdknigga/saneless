@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, override
 
 import pytest
@@ -904,3 +905,138 @@ class TestScanWorkerMultiPage:
         _finished(store, job.id)
 
         assert kept is None
+
+
+# A second question's timeout, longer than the first's by far more than the
+# time between the two asks, so its deadline is later whatever the clock does.
+_LONGER_PROMPT_TIMEOUT = _OPEN_PROMPT_TIMEOUT * 4
+
+
+class TestPassDeadline:
+    """
+    An open multi-page question reports when it times out.
+
+    The deadline is the moment the question was asked plus the prompt's own
+    timeout, and it is reported for the running multi-page job only.
+    """
+
+    def test_no_deadline_before_a_question(
+        self,
+        running: tuple[ScanWorker, JobStore],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A job that has announced its wait but not asked yet has no deadline."""
+        worker, store = running
+        assert worker.pass_deadline("no-such-job") is None
+        go = threading.Event()
+        prompt = _prompt(timeout=_OPEN_PROMPT_TIMEOUT)
+        fake = _FakePipeline(prompt, event=PipelineEvent.AWAITING_NEXT_PASS, go=go)
+        monkeypatch.setattr("saneless.worker.run_pipeline", fake)
+        try:
+            job = store.create_job("default", "Not Asked Yet")
+            worker.submit(job, ScanOptions(multi_page=True))
+            assert poll_until(
+                lambda: (
+                    (row := store.get_job(job.id)) is not None
+                    and row.state is JobState.AWAITING_NEXT_PASS
+                ),
+                _BUDGET,
+            ), "the wait was never announced"
+            before_asking = worker.pass_deadline(job.id)
+
+            go.set()
+            assert poll_until(lambda: worker.pass_prompt(job.id) is not None, _BUDGET)
+            once_asked = worker.pass_deadline(job.id)
+            assert worker.answer_pass(job.id, 1, PassAnswer.NEXT) is True
+        finally:
+            go.set()
+        _finished(store, job.id)
+
+        assert before_asking is None
+        assert once_asked is not None
+
+    def test_deadline_is_asked_at_plus_the_prompt_timeout(
+        self,
+        running: tuple[ScanWorker, JobStore],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The deadline is the ask's UTC time plus the prompt's timeout."""
+        worker, store = running
+        prompt = _prompt(timeout=_OPEN_PROMPT_TIMEOUT)
+        hold = threading.Event()
+        fake = _FakePipeline(prompt, event=PipelineEvent.AWAITING_NEXT_PASS, hold=hold)
+        monkeypatch.setattr("saneless.worker.run_pipeline", fake)
+        try:
+            job = store.create_job("default", "Asked")
+            before = datetime.now(tz=UTC)
+            worker.submit(job, ScanOptions(multi_page=True))
+            assert poll_until(lambda: worker.pass_prompt(job.id) is not None, _BUDGET)
+            after = datetime.now(tz=UTC)
+            deadline = worker.pass_deadline(job.id)
+
+            assert worker.answer_pass(job.id, 1, PassAnswer.NEXT) is True
+            assert poll_until(lambda: len(fake.answers) == 1, _BUDGET)
+            answered = worker.pass_deadline(job.id)
+        finally:
+            hold.set()
+        _finished(store, job.id)
+
+        assert deadline is not None
+        asked_at = deadline - timedelta(seconds=_OPEN_PROMPT_TIMEOUT)
+        assert asked_at.tzinfo is UTC
+        assert before <= asked_at <= after
+        assert answered is None
+
+    def test_a_new_question_moves_the_deadline(self) -> None:
+        """Each question is timed from its own ask, with its own timeout."""
+        coordinator = WorkerPassCoordinator("job-1", stopping=threading.Event())
+        assert coordinator.open_deadline is None
+
+        asker = _Asker(coordinator, _prompt(1, timeout=_OPEN_PROMPT_TIMEOUT))
+        _wait_until_open(coordinator, 1)
+        first = coordinator.open_deadline
+        assert coordinator.answer(1, PassAnswer.NEXT) is True
+        assert asker.result() is PassAnswer.NEXT
+        between = coordinator.open_deadline
+
+        before = datetime.now(tz=UTC)
+        asker = _Asker(coordinator, _prompt(2, timeout=_LONGER_PROMPT_TIMEOUT))
+        _wait_until_open(coordinator, 2)
+        after = datetime.now(tz=UTC)
+        second = coordinator.open_deadline
+        assert coordinator.answer(2, PassAnswer.FINISH) is True
+        assert asker.result() is PassAnswer.FINISH
+
+        assert first is not None
+        assert between is None
+        assert second is not None
+        asked_at = second - timedelta(seconds=_LONGER_PROMPT_TIMEOUT)
+        assert before <= asked_at <= after
+        assert second - first >= timedelta(
+            seconds=_LONGER_PROMPT_TIMEOUT - _OPEN_PROMPT_TIMEOUT
+        )
+
+    def test_no_deadline_for_another_job(
+        self,
+        running: tuple[ScanWorker, JobStore],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only the running multi-page job's open question has a deadline."""
+        worker, store = running
+        prompt = _prompt(timeout=_OPEN_PROMPT_TIMEOUT)
+        hold = threading.Event()
+        fake = _FakePipeline(prompt, event=PipelineEvent.AWAITING_NEXT_PASS, hold=hold)
+        monkeypatch.setattr("saneless.worker.run_pipeline", fake)
+        try:
+            job = store.create_job("default", "Someone Else's")
+            worker.submit(job, ScanOptions(multi_page=True))
+            assert poll_until(lambda: worker.pass_prompt(job.id) is not None, _BUDGET)
+            own = worker.pass_deadline(job.id)
+            other = worker.pass_deadline("other-id")
+            assert worker.answer_pass(job.id, 1, PassAnswer.NEXT) is True
+        finally:
+            hold.set()
+        _finished(store, job.id)
+
+        assert own is not None
+        assert other is None
