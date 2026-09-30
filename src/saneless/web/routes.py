@@ -2042,6 +2042,12 @@ def index(request: Request) -> Response:
             # on the page.
             "show_tags": state.settings.web.show_tags,
             "show_correspondent": state.settings.web.show_correspondent,
+            # A page load moves no focus, even while a prompt is open: the
+            # prompts leave their autofocus off when this is set.  No status
+            # response sets it and the poll token never sees it, so the page's
+            # token still names the poll's rendering, autofocus included, and
+            # the first poll after the page is a 204.
+            "page_render": True,
         },
     )
 

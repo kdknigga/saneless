@@ -56,9 +56,18 @@
      the focused element's id after it swaps the status area, so a stable id
      is what lets a keyboard-focused Continue survive a re-render; without one
      focus falls to the page body.  The multi-page prompt's buttons carry ids
-     for the same reason. #}
+     for the same reason.
+
+     Continue takes focus when the prompt appears.  The attribute is on every
+     poll rendering of the prompt, and it still moves focus only once: a poll
+     that would render what the browser already shows is answered 204 and
+     swaps nothing, so only the rendering where the prompt first appears ever
+     reaches the page.  The full page leaves it off (page_render), because a
+     page load moves no focus -- and the page's poll token is taken from the
+     poll's rendering, so the first poll after it is still a 204.  Only the
+     owner is ever sent this partial, so nobody else's focus moves. #}
   <div role="group">
-    <button id="flip-continue" hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
+    <button id="flip-continue"{% if not page_render %} autofocus{% endif %} hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
     <button id="flip-abort"
             hx-post="/api/flip/abort"
             hx-vals='{{ {"job_id": job.id} | tojson }}'

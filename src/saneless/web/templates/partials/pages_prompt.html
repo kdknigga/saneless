@@ -34,7 +34,15 @@
 
    Nothing here is a disclosure widget: the once-a-second swap would close it
    again on every poll.  Nothing here is marked busy either: the job is waiting
-   for a person. #}
+   for a person.
+
+   The question's primary button takes focus when the question appears: Scan
+   next (Retry, on the failed-pass question) or Skip, whichever it offers --
+   every question offers exactly one of the two.  It moves focus only once for
+   the same reason the flip prompt's Continue does: an unchanged poll is
+   answered 204 and swaps nothing, so only the rendering of a new question
+   reaches the page.  The full page leaves it off (page_render), because a
+   page load moves no focus. #}
 {% set button_ids = {
   "NEXT": "mp-retry" if pass_prompt.wait == "RETRY" else "mp-next",
   "FINISH": "mp-finish",
@@ -60,7 +68,7 @@
   {% endif %}
   <div class="prompt-actions">
     {% for answer, label in pass_copy.buttons %}
-    <button id="{{ button_ids[answer] }}"
+    <button id="{{ button_ids[answer] }}"{% if answer in ("NEXT", "SKIP_BLANKS") and answer in pass_prompt.offered and not page_render %} autofocus{% endif %}
             {% if button_classes.get(answer) %}class="{{ button_classes[answer] }}"{% endif %}
             hx-post="/api/multi-page/answer"
             hx-vals='{{ {"job_id": job.id, "prompt": pass_prompt.number, "answer": answer} | tojson }}'
