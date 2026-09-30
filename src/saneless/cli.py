@@ -50,6 +50,7 @@ from .checks import (
 from .config import (
     CONFIG_FILENAME,
     Settings,
+    absolute_or_as_spelled,
     config_file_state,
     config_search_paths,
     is_placeholder_token,
@@ -2580,7 +2581,7 @@ def _resolution_line(label: str, path: Path, note: str = "") -> str:
         The line, with the path at the same column whatever the label.
 
     """
-    return f"  {label:<{_RESOLUTION_LABEL_WIDTH}}  {path.absolute()}{note}"
+    return f"  {label:<{_RESOLUTION_LABEL_WIDTH}}  {absolute_or_as_spelled(path)}{note}"
 
 
 def _config_resolution_lines(settings: Settings) -> list[str]:
@@ -2636,6 +2637,16 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
         elif candidate in discovery.found:
             lines.append(
                 _resolution_line("not used", candidate, " (an earlier file won)")
+            )
+        elif not candidate.is_absolute():
+            # Recorded as spelled only when the directory it is relative to
+            # had been removed, which is why nothing could be there.
+            lines.append(
+                _resolution_line(
+                    "not found",
+                    candidate,
+                    " (the working directory no longer exists)",
+                )
             )
         else:
             lines.append(_resolution_line("not found", candidate))

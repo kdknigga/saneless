@@ -236,23 +236,78 @@ class TestLoadedConfigPath:
         settings = load_settings()
         assert settings.config_path is None
 
-    def test_a_deleted_working_directory_is_a_config_error(
-        self, empty_cwd_and_home: Path
+    def test_a_deleted_working_directory_still_loads_the_per_user_config(
+        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A shell left in a removed directory gets a sentence, not a crash.
+        A shell left in a removed directory still loads the file further down.
 
-        The search spells its first candidate relative to the working
-        directory, and making it absolute asks the kernel for a directory that
-        is gone.  The raw FileNotFoundError named no file and reached the
-        "saneless bug" exit.
+        A removed directory is empty and nothing can be created in it, so
+        ``./saneless.toml`` cannot be there: the candidate is simply not
+        found, and the search goes on to the per-user file.
+        """
+        xdg = empty_cwd_and_home / "xdg"
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+        expected = xdg / "saneless" / config_mod.CONFIG_FILENAME
+        expected.parent.mkdir(parents=True)
+        expected.write_text("[profiles.default]\n")
+        gone = empty_cwd_and_home / "gone"
+        gone.mkdir()
+        os.chdir(gone)
+        gone.rmdir()
+
+        settings = load_settings()
+
+        assert settings.config_path == expected
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.found == (expected,)
+        assert len(discovery.searched) == len(config_mod.config_search_paths())
+        assert discovery.documented_spelling(discovery.searched[0]) == (
+            f"./{config_mod.CONFIG_FILENAME}"
+        )
+
+    def test_a_deleted_working_directory_with_no_file_loads_the_defaults(
+        self, empty_cwd_and_home: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        Every default path is absolute, so nothing needs the missing directory.
+
+        The start-up line that lists the search names the candidate it could
+        not anchor as it is spelled, rather than asking for the directory.
         """
         gone = empty_cwd_and_home / "gone"
         gone.mkdir()
         os.chdir(gone)
         gone.rmdir()
 
-        with pytest.raises(ConfigError, match="working directory no longer exists"):
+        settings = load_settings()
+        with caplog.at_level(logging.INFO, logger="saneless.config"):
+            config_mod.log_config_sources(settings)
+
+        assert settings.config_path is None
+        assert settings.output.data_dir.is_absolute()
+        assert f"searched {config_mod.CONFIG_FILENAME}, " in caplog.text
+
+    def test_a_relative_path_from_a_deleted_working_directory_is_a_config_error(
+        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A relative value with no file to anchor it gets a sentence, not a crash.
+
+        With no file loaded, a relative path setting is pinned against the
+        working directory, and that directory is gone.  The raw
+        FileNotFoundError named no file and reached the "saneless bug" exit.
+        """
+        monkeypatch.setenv("SANELESS_OUTPUT__DATA_DIR", "state")
+        gone = empty_cwd_and_home / "gone"
+        gone.mkdir()
+        os.chdir(gone)
+        gone.rmdir()
+
+        with pytest.raises(
+            ConfigError, match=r"output\.data_dir .*working directory no longer exists"
+        ):
             load_settings()
 
     def test_an_explicit_config_loads_from_a_deleted_working_directory(

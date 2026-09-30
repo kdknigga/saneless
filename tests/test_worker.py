@@ -5653,6 +5653,35 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
             assert str(candidate.absolute()) in message
         assert LEGACY_CONFIG_FILENAME not in message
 
+    def test_a_search_from_a_deleted_working_directory_lists_it_as_spelled(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A candidate with no directory to anchor it is named, not made absolute."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        later = tmp_path / "etc" / CONFIG_FILENAME
+        later.parent.mkdir()
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.chdir(gone)
+            gone.rmdir()
+            default_settings._config_discovery = discover_config(
+                (Path(CONFIG_FILENAME), later)
+            )
+
+            persisted = self._persist(default_settings, mock_scanner, mock_paperless)
+
+        assert persisted is None
+
+        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        assert len(records) == 1
+        assert f"create one of {CONFIG_FILENAME}, {later}" in records[0].getMessage()
+
     def test_neither_message_writes_a_file(
         self,
         mock_scanner: MagicMock,

@@ -23,6 +23,7 @@ from .auto_profiles import (
 )
 from .config import (
     CONFIG_FILENAME,
+    absolute_or_as_spelled,
     config_file_state,
     config_search_paths,
     profile_storage_for_loaded,
@@ -1512,7 +1513,7 @@ class ScanWorker:
         # process actually looked at rather than what a fresh call would
         # return; settings built directly carry no recording and fall back.
         searched = (
-            tuple(path.absolute() for path in discovery.searched)
+            tuple(absolute_or_as_spelled(path) for path in discovery.searched)
             if discovery is not None
             else config_search_paths()
         )

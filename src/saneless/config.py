@@ -223,7 +223,10 @@ class ConfigDiscovery:
     Every path is recorded absolute, made so against the working directory at
     load and never resolved through symlinks: a relative path means nothing to
     a reader who does not know that directory, and the path the operator wrote
-    is the one they will recognise.
+    is the one they will recognise.  The exception is a relative candidate
+    searched from a working directory that has since been removed: there is
+    no directory to join it onto, so ``searched`` keeps it as spelled and it
+    is never found.  ``absolute_or_as_spelled`` shows either kind.
 
     One file is one file.  Running from inside the XDG directory makes the
     relative first candidate name the same file as the second, and a
@@ -337,30 +340,47 @@ def _first_of_each_file(
     return tuple(first), tuple(again)
 
 
-def _working_directory() -> Path:
+def _working_directory() -> Path | None:
     """
-    Return the working directory, as a configuration error when it is gone.
+    Return the working directory, or None when it has been removed.
 
     A shell can sit in a directory another process has since removed, and
-    then ``os.getcwd`` raises a FileNotFoundError that names no file.  The
-    search's first candidate and an unanchored relative path both need this
-    directory, so its absence is said once, with the way out.
+    then ``os.getcwd`` raises a FileNotFoundError that names no file.  Such a
+    directory is empty and can gain no entry, so the search's relative first
+    candidate names nothing there; only a relative path setting with no
+    loaded file to anchor it truly needs the directory, and that is refused
+    where it is pinned.
 
     Returns:
-        The absolute working directory.
-
-    Raises:
-        ConfigError: The working directory no longer exists.
+        The absolute working directory, or None when it no longer exists.
 
     """
     try:
         return Path.cwd()
     except FileNotFoundError:
-        msg = (
-            "The working directory no longer exists; cd to an existing "
-            "directory or pass --config"
-        )
-        raise ConfigError(msg) from None
+        return None
+
+
+def absolute_or_as_spelled(path: Path) -> Path:
+    """
+    Make a path absolute for a reader, or keep its spelling when that cannot be.
+
+    A search from a removed working directory records its relative candidate
+    as it is spelled, because there is no directory to join it onto; asking
+    for its absolute form would ask for that directory again.
+
+    Args:
+        path: A path to show in a log line or on a terminal.
+
+    Returns:
+        ``path`` made absolute, or ``path`` itself when it is relative to a
+        working directory that no longer exists.
+
+    """
+    if path.is_absolute():
+        return path
+    cwd = _working_directory()
+    return path if cwd is None else cwd / path
 
 
 def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
@@ -375,17 +395,17 @@ def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
     reach the settings.  A path that cannot be stat-ed counts as not found.
 
     The candidates are made absolute first, so the recording carries no path
-    whose meaning depends on the working directory.
+    whose meaning depends on the working directory.  The one exception is a
+    relative candidate when the working directory has been removed: it is
+    recorded as spelled and counts as not found, because a removed directory
+    is empty and nothing can be created in it.  The later candidates are
+    searched as usual, so a per-user or system file still loads.
 
     Args:
         candidates: The paths to search, in priority order.
 
     Returns:
         The recording, with the first existing candidate as ``loaded``.
-
-    Raises:
-        ConfigError: A candidate is relative and the working directory it is
-            relative to no longer exists.
 
     """
     cwd = (
@@ -397,9 +417,10 @@ def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
         candidate if cwd is None or candidate.is_absolute() else cwd / candidate
         for candidate in candidates
     )
-    found, duplicates = _first_of_each_file(searched)
+    anchored = tuple(candidate for candidate in searched if candidate.is_absolute())
+    found, duplicates = _first_of_each_file(anchored)
     stale, _ = _first_of_each_file(
-        tuple(candidate.with_name(LEGACY_CONFIG_FILENAME) for candidate in searched)
+        tuple(candidate.with_name(LEGACY_CONFIG_FILENAME) for candidate in anchored)
     )
     return ConfigDiscovery(
         explicit=None,
@@ -2342,15 +2363,16 @@ def config_search_paths() -> tuple[Path, ...]:
     )
 
 
-def _pin_relative_paths(settings: Settings, base: Path) -> None:
+def _pin_relative_paths(settings: Settings, base: Path | None) -> None:
     """
     Make every relative path setting absolute, joined onto ``base``.
 
     ``base`` is the directory of the loaded config file, or the working
-    directory when no file was loaded. A relative path used to be taken
-    against whichever directory a command happened to run in, so two commands
-    could open two different job databases. Pinned once at load, every
-    command agrees, and the log and ``doctor`` show the path that is used.
+    directory when no file was loaded, or None when neither exists. A
+    relative path used to be taken against whichever directory a command
+    happened to run in, so two commands could open two different job
+    databases. Pinned once at load, every command agrees, and the log and
+    ``doctor`` show the path that is used.
 
     Where a value came from does not matter: a relative value from a
     ``SANELESS_*`` variable is joined onto the same base as one from the file.
@@ -2365,27 +2387,45 @@ def _pin_relative_paths(settings: Settings, base: Path) -> None:
     The field validators have already expanded ``~``, so any value still
     relative here is joined; an absolute value is kept as it is.
 
+    With no base, only a relative value needs one: every default is absolute,
+    so a run from a removed working directory is refused only when a value
+    actually has nothing to be joined onto.
+
     Args:
         settings: The freshly built settings, rebound in place.
-        base: An absolute directory to resolve relative values against.
+        base: An absolute directory to resolve relative values against, or
+            None when no file was loaded and the working directory has been
+            removed.
+
+    Raises:
+        ConfigError: A value is relative and ``base`` is None.
 
     """
 
-    def pin(value: Path) -> Path:
-        return value if value.is_absolute() else base / value
+    def pin(key: str, value: Path) -> Path:
+        if value.is_absolute():
+            return value
+        if base is None:
+            msg = (
+                f"{key} is relative, and the working directory no longer exists "
+                "to resolve it against; cd to an existing directory, pass "
+                "--config, or make the path absolute"
+            )
+            raise ConfigError(msg)
+        return base / value
 
     output = settings.output
     settings.output = output.model_copy(
         update={
-            "tmp_dir": pin(output.tmp_dir),
-            "data_dir": pin(output.data_dir),
-            "log_file": pin(output.log_file),
+            "tmp_dir": pin("output.tmp_dir", output.tmp_dir),
+            "data_dir": pin("output.data_dir", output.data_dir),
+            "log_file": pin("output.log_file", output.log_file),
         }
     )
     consume_dir = settings.paperless.consume_dir
     if consume_dir is not None:
         settings.paperless = settings.paperless.model_copy(
-            update={"consume_dir": pin(consume_dir)}
+            update={"consume_dir": pin("paperless.consume_dir", consume_dir)}
         )
 
 
@@ -2412,9 +2452,9 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     Raises:
         ConfigError: If an explicit path is empty, cannot have its ``~``
-            expanded, is missing or is not a regular file, if no explicit
-            path was given and the working directory no longer exists, if
-            the file cannot be read, is not UTF-8 or is not valid TOML
+            expanded, is missing or is not a regular file, if no file was
+            loaded, the working directory no longer exists and a path setting
+            is relative, if the file cannot be read, is not UTF-8 or is not valid TOML
             (chained to the OSError, UnicodeDecodeError or TOMLDecodeError),
             or if the configuration fails validation.
 
@@ -2546,7 +2586,7 @@ def log_config_sources(settings: Settings) -> None:
         source = str(settings.config_path.absolute())
     else:
         searched = ", ".join(
-            str(candidate.absolute())
+            str(absolute_or_as_spelled(candidate))
             for candidate in (discovery.searched if discovery is not None else ())
         )
         source = "no config file; defaults + environment"

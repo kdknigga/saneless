@@ -836,6 +836,30 @@ class TestDoctorConfigResolutionTable:
             str(candidate.absolute()) for candidate in candidates
         ]
 
+    def test_a_candidate_in_a_deleted_working_directory_says_why_it_was_not_found(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A removed working directory leaves the first candidate unanchored.
+
+        It is listed as spelled, with the reason, and the table goes on to the
+        file that did load instead of failing to name the missing directory.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[1].write_text("# the per-user file\n")
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        monkeypatch.chdir(gone)
+        gone.rmdir()
+        discovery = discover_config((Path(CONFIG_FILENAME), *candidates[1:]))
+
+        lines = self._run(monkeypatch, tmp_path, discovery)
+
+        assert lines[0] == (
+            f"not found {CONFIG_FILENAME} (the working directory no longer exists)"
+        )
+        assert lines[1] == f"used {candidates[1]}"
+
     def test_a_candidate_that_does_not_exist_says_not_found(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
