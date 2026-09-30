@@ -18,6 +18,7 @@ functions themselves.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -52,6 +53,8 @@ from saneless.vocabulary import (
     RequestRejection,
     error_message,
     error_next_step,
+    job_label,
+    job_status_class,
     page_counts,
     progress_label,
     rejection_message,
@@ -2552,3 +2555,86 @@ class TestFormHelpTextAndTagPicker:
             'hx-include="#tag-filter, #tags-list"',
         ):
             assert attribute in refresh.group(0), attribute
+
+
+# The htmx configuration, captured whole: the attribute is single-quoted so the
+# JSON inside it can use double quotes, which is how base.html writes it.
+_HTMX_CONFIG = re.compile(r"<meta name=\"htmx-config\"\s+content='(?P<json>[^']*)'>")
+
+# The Check again button, captured whole so an attribute found elsewhere on the
+# page cannot satisfy an assertion about this one.
+_CHECK_AGAIN = re.compile(r'<button type="button"[^>]*class="check-refresh[^"]*"[^>]*>')
+
+
+def test_htmx_config_sets_a_request_timeout(client: TestClient) -> None:
+    """
+    Every htmx request is abandoned after 20 s, and nothing else changed.
+
+    A stalled or half-open request would otherwise hold its element forever:
+    a poll that never answers never asks again.  htmx merges the meta
+    shallowly, so the timeout is added beside every existing key rather than
+    replacing any of them; the response handling and the three eval and style
+    switches are pinned here so that adding a key cannot quietly drop one.
+    """
+    match = _HTMX_CONFIG.search(client.get("/").text)
+    assert match is not None, "htmx-config meta not rendered"
+    config = json.loads(match.group("json"))
+
+    assert config["timeout"] == 20000
+    assert config["allowEval"] is False
+    assert config["allowScriptTags"] is False
+    assert config["includeIndicatorStyles"] is False
+    assert config["responseHandling"] == [
+        {"code": "204", "swap": False},
+        {"code": "[23]..", "swap": True},
+        {"code": "[45]..", "swap": True, "error": True},
+    ]
+
+
+def test_check_again_has_a_stable_id_and_a_long_timeout(client: TestClient) -> None:
+    """
+    Check again keeps focus across its own swap and waits out a slow probe.
+
+    htmx restores focus by id after an outerHTML swap, so the id is what keeps
+    a keyboard user on the button once ``#checks-body`` is replaced.  The
+    probe behind it runs synchronously and can take minutes, far past the
+    global timeout, so the button carries its own, on the element itself.
+    """
+    page = client.get("/").text
+    assert page.count('id="checks-refresh"') == 1
+
+    match = _CHECK_AGAIN.search(page)
+    assert match is not None, "Check again button not rendered"
+    button = match.group(0)
+    assert 'id="checks-refresh"' in button
+
+    request = re.search(r"hx-request='(?P<json>[^']*)'", button)
+    assert request is not None, button
+    assert json.loads(request.group("json"))["timeout"] >= 180000
+
+
+@pytest.mark.parametrize("state", list(JobState))
+def test_history_never_emits_an_empty_class(
+    client: TestClient, state: JobState
+) -> None:
+    """
+    A row with no status colour has no class attribute at all.
+
+    ``job_status_class`` returns an empty string for a job still in flight,
+    and an attribute holding nothing is noise in the markup.  The four
+    terminal classes still render; ``test_history_cell_css_class`` pins them.
+    """
+    _job_in_state(client, state)
+    history = client.get("/api/jobs/history").text
+    page = client.get("/").text
+
+    assert 'class=""' not in history
+    assert 'class=""' not in page
+    if not job_status_class(state, None, _DEFAULT_ERROR_CATEGORY):
+        label = job_label(state, None, _DEFAULT_ERROR_CATEGORY)
+        assert f"<td>\n    {label}\n  </td>" in history
+
+
+def test_page_title_defaults_to_saneless(client: TestClient) -> None:
+    """The tab reads ``saneless`` unless a page sets its own title."""
+    assert "<title>saneless</title>" in client.get("/").text

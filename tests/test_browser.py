@@ -4370,6 +4370,49 @@ class TestStatusStripInChromium:
         # refreshed twice; a swap that dropped it would look fine once.
         expect(page.locator(".check-refresh")).to_have_count(1)
 
+    def test_htmx_request_timeout_is_configured(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        The loaded htmx really reads the 20 s timeout from the meta.
+
+        The template test proves the JSON says so; only the running library
+        proves the meta was merged, and that a stalled request will be let go
+        instead of holding its element for as long as the socket stays open.
+        """
+        page.goto(browser_server_url)
+        expect(page.locator("#checks-body")).to_have_count(1)
+
+        assert page.evaluate("() => htmx.config.timeout") == 20000
+
+    def test_focus_map_check_again_keeps_focus(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        A keyboard press on Check again leaves focus on the new Check again.
+
+        The button sits inside the body it replaces, so the element that had
+        focus is detached by its own swap.  htmx puts focus back on the element
+        with the same id, which is the only thing standing between a keyboard
+        user and a focus that has fallen to the top of the page.  The witness
+        proves the body really was replaced, so the focus assertion is about
+        the new button and not the old one surviving an in-place update.
+        """
+        server = cold_strip_server
+        _probe_now(server)
+        page.goto(server.url)
+        expect(page.locator("#checks-body:not([hx-trigger])")).to_have_count(1)
+        page.locator("#checks-body").evaluate(
+            "(el) => el.setAttribute('data-witness', 'before-refresh')"
+        )
+
+        page.focus("#checks-refresh")
+        with page.expect_response(lambda r: r.url.endswith("/api/checks/refresh")):
+            page.keyboard.press("Enter")
+
+        expect(page.locator("#checks-body:not([data-witness])")).to_have_count(1)
+        expect(page.locator("#checks-refresh")).to_be_focused()
+
     def test_the_strip_fits_a_320px_phone_without_a_sideways_scrollbar(
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
