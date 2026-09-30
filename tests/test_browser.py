@@ -38,11 +38,14 @@ import threading
 import time
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
+from http import HTTPStatus
+from itertools import pairwise
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
+    from contextlib import AbstractContextManager
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -107,6 +110,7 @@ from saneless.vocabulary import (
     MULTI_PAGE_LABEL,
     NOTHING_TO_FINISH,
     TERMINAL_STATES,
+    TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
     ErrorCategory,
     FlipOutcome,
@@ -117,9 +121,12 @@ from saneless.vocabulary import (
     ScanOutcome,
     WorkerHealth,
     abort_question,
+    busy_line,
     error_message,
     error_next_step,
+    flip_answer_label,
     job_label,
+    pass_answer_label,
     progress_label,
 )
 from saneless.web.app import TEMPLATE_DIR, create_app
@@ -7399,3 +7406,447 @@ class TestStatusPollLostContact:
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=30_000)
         expect(page.locator("#status-message")).to_be_empty()
         assert page.evaluate("() => window.__slotMutations") == 0
+
+
+# Records one signature per swap of the status area inside its persistent
+# region: the region's text with runs of whitespace collapsed, then the alt
+# text of every image in it.  The alt is part of the signature because the
+# preview arriving is a visible change whose text is otherwise the same, so a
+# text-only signature would read that one swap as a repeat.  Registered as an
+# init script, which the page's Content-Security-Policy does not govern, and
+# attached once the document is parsed: the area the page loads with is not a
+# swap, and a region that is missing records nothing.
+_STATUS_SWAP_RECORDER = """
+window.__statusSwaps = [];
+document.addEventListener("DOMContentLoaded", () => {
+    const region = document.getElementById("status-live");
+    if (region === null) {
+        return;
+    }
+    new MutationObserver((records) => {
+        const swapped = records.some((record) => Array.from(record.addedNodes)
+            .some((node) => node.id === "status-area"));
+        if (swapped) {
+            const text = region.textContent.replace(/\\s+/g, " ").trim();
+            const alts = Array.from(region.querySelectorAll("img"))
+                .map((img) => img.alt);
+            window.__statusSwaps.push([text, ...alts].join(" | "));
+        }
+    }).observe(region, {childList: true, subtree: true});
+});
+"""
+
+_HELD_POLLS = 2
+"""How many unchanged polls a held state must survive without a new swap."""
+
+_SETTLE_POLLS = 5
+"""How many polls a page may take to catch up with a state before it is held."""
+
+
+def _status_swaps(page: Page) -> list[str]:
+    """
+    Return every status-area swap ``_STATUS_SWAP_RECORDER`` has seen, in order.
+
+    Args:
+        page: A page whose context installed the recorder before it loaded.
+
+    Returns:
+        One signature per swap.
+
+    """
+    # A function, not a bare expression: the page's policy refuses eval.
+    swaps: list[str] = page.evaluate("() => window.__statusSwaps")
+    return swaps
+
+
+def _await_an_unchanged_poll(page: Page) -> None:
+    """
+    Wait until a status poll is answered 204: the page shows what the server has.
+
+    Args:
+        page: A page showing an active job.
+
+    """
+    statuses = [_await_status_poll(page) for _ in range(_SETTLE_POLLS)]
+    assert HTTPStatus.NO_CONTENT in statuses, (
+        f"no poll found the page up to date in {_SETTLE_POLLS} tries: {statuses}"
+    )
+
+
+@pytest.mark.browser
+class TestStatusAnnouncements:
+    """
+    The status region changes once per visible change, and never while held.
+
+    A screen reader announces a polite region each time its content is
+    replaced, so the number of swaps inside ``#status-live`` is the number of
+    announcements.  The recorder counts them; a held state must add none, and
+    a whole scan must never swap the same thing in twice running.
+    """
+
+    def test_a_held_state_is_announced_once(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        A scan held in SCANNING is swapped in once, then polled in silence.
+
+        The page is first allowed to catch up -- a poll answered 204 is the
+        server saying the page already shows the state -- and from there two
+        further polls are both 204 and the recorder gains nothing.
+        """
+        server = scan_harness.server
+        page.context.add_init_script(_STATUS_SWAP_RECORDER)
+        page.goto(server.url)
+        expect(page.locator("#status-message + #status-live")).to_have_count(1)
+        server.scanner.gate.clear()
+        try:
+            page.locator("#scan-btn").click()
+            area = page.locator("#status-live > #status-area")
+            expect(area).to_contain_text(progress_label(JobState.SCANNING))
+            _await_an_unchanged_poll(page)
+
+            held = _status_swaps(page)
+            assert held, "the scan's status was never swapped into the region"
+            assert progress_label(JobState.SCANNING) in held[-1], held
+
+            polls = [_await_status_poll(page) for _ in range(_HELD_POLLS)]
+            assert polls == [HTTPStatus.NO_CONTENT] * _HELD_POLLS, polls
+            assert _status_swaps(page) == held
+        finally:
+            server.scanner.gate.set()
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+
+    def test_a_scan_is_announced_once_per_state(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        From Scan to Done, no two swaps running are the same announcement.
+
+        The scan is held long enough to be seen scanning and then let go, so
+        the record covers the submit, the progress states and the outcome.
+        """
+        server = scan_harness.server
+        page.context.add_init_script(_STATUS_SWAP_RECORDER)
+        page.goto(server.url)
+        server.scanner.gate.clear()
+        try:
+            page.locator("#scan-btn").click()
+            expect(page.locator("#status-area")).to_contain_text(
+                progress_label(JobState.SCANNING)
+            )
+        finally:
+            server.scanner.gate.set()
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+
+        swaps = _status_swaps(page)
+        assert len(swaps) >= 2, swaps
+        assert any(progress_label(JobState.SCANNING) in swap for swap in swaps), swaps
+        assert "Done" in swaps[-1], swaps
+        repeats = [
+            (before, after) for before, after in pairwise(swaps) if before == after
+        ]
+        assert repeats == [], f"a state was announced twice running: {swaps}"
+
+
+# One read of the page's width, taken in a single call so no swap can land
+# between the measurements.  The overflowing text is there to name the culprit
+# when the assertion fails: a line that will not wrap runs out of its own box,
+# so it is the text, not the element, that reaches past the edge.  A function:
+# the page's policy refuses eval.
+_MEASURE_REFLOW = """
+() => {
+    const edge = document.documentElement.clientWidth;
+    const overflowing = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        if (range.getBoundingClientRect().right > edge) {
+            overflowing.push(`${node.parentElement.tagName}.`
+                + `${node.parentElement.className}: `
+                + node.textContent.trim().slice(0, 60));
+        }
+    }
+    return {
+        overflow: document.documentElement.scrollWidth - edge,
+        overflowing: overflowing,
+        stripBusy: document.querySelector('#checks-body[aria-busy="true"]') !== null,
+    };
+}
+"""
+
+_QUEUE_AHEAD = 2
+"""How many queued jobs the reflow test's own queued job waits behind."""
+
+_FRONT_PAGE_COUNT = 3
+"""The first-pass page count the manual-duplex busy line leads with."""
+
+_KEPT_PAGE_COUNT = 3
+"""The pages a multi-page document holds while its later pass scans."""
+
+
+class _Stage(NamedTuple):
+    """What a reflow staging needs: the page, its private server, a patcher."""
+
+    page: Page
+    server: _BrowserServer
+    monkeypatch: pytest.MonkeyPatch
+
+
+@contextmanager
+def _parked(
+    stage: _Stage, state: JobState, title: str = "Reflow Doc"
+) -> Generator[str]:
+    """
+    Park one job owned by the page as the worker's current job, in ``state``.
+
+    Args:
+        stage: The page and server to stage on.
+        state: The state to write on the row.
+        title: The row's title.
+
+    Yields:
+        The job's id.
+
+    """
+    job_store: JobStore = stage.server.app.state.job_store
+    worker = stage.server.app.state.worker
+    owner = _as_owner(stage.page, stage.server.url)
+    job = job_store.create_job(profile="default", title=title, owner_token=owner)
+    if state is not JobState.PENDING:
+        job_store.update_state(job.id, state)
+    worker._current_job_id = job.id
+    try:
+        yield job.id
+    finally:
+        worker._current_job_id = None
+        job_store.delete_job(job.id)
+
+
+def _open_on(stage: _Stage, line: str) -> None:
+    """
+    Load the page and wait for the status area to say ``line``.
+
+    Args:
+        stage: The page and server.
+        line: Text the area must contain before anything is measured.
+
+    """
+    stage.page.goto(stage.server.url)
+    expect(stage.page.locator("#status-area")).to_contain_text(line)
+
+
+@contextmanager
+def _reflow_queued(stage: _Stage) -> Generator[None]:
+    """Queue the page's job behind two others and a running max-length title."""
+    job_store: JobStore = stage.server.app.state.job_store
+    title = "W" * TITLE_MAX_LENGTH
+    owner = _as_owner(stage.page, stage.server.url)
+    with _parked(stage, JobState.SCANNING, title):
+        queued = [
+            job_store.create_job(
+                profile="default", title=f"Queued {index}", owner_token=owner
+            ).id
+            for index in range(_QUEUE_AHEAD + 1)
+        ]
+        try:
+            # The page follows this browser's own newest job, the last queued.
+            _open_on(
+                stage,
+                busy_line(
+                    JobState.PENDING, queue_title=title, queue_ahead=_QUEUE_AHEAD
+                ),
+            )
+            yield
+        finally:
+            for job_id in queued:
+                job_store.delete_job(job_id)
+
+
+@contextmanager
+def _reflow_starting(stage: _Stage) -> Generator[None]:
+    """Park the page's job as the one the worker is starting."""
+    with _parked(stage, JobState.PENDING):
+        _open_on(stage, busy_line(JobState.PENDING))
+        yield
+
+
+@contextmanager
+def _reflow_later_pass(stage: _Stage) -> Generator[None]:
+    """Answer a between-pass prompt with Scan next, so a later pass is scanning."""
+    prompt = PassPrompt(
+        number=1,
+        wait=PassWait.NEXT_PASS,
+        pages_kept=_KEPT_PAGE_COUNT,
+        offered=frozenset(
+            {PassAnswer.NEXT, PassAnswer.FINISH, PassAnswer.RESCAN, PassAnswer.ABORT}
+        ),
+        timeout_seconds=600,
+        last_pass_pages=1,
+        last_pass_kept=1,
+    )
+    owner = _as_owner(stage.page, stage.server.url)
+    with _staged_prompt(stage.server, owner, prompt) as staged:
+        assert staged.coordinator.answer(prompt.number, PassAnswer.NEXT)
+        staged.asker.join(_JOB_FINISH_TIMEOUT)
+        stage.server.app.state.job_store.update_state(staged.job_id, JobState.SCANNING)
+        _open_on(stage, busy_line(JobState.SCANNING, pages_kept=_KEPT_PAGE_COUNT))
+        yield
+
+
+@contextmanager
+def _reflow_front_count(stage: _Stage) -> Generator[None]:
+    """Park a manual-duplex job scanning its backs, after a counted front pass."""
+    worker = stage.server.app.state.worker
+    with _parked(stage, JobState.SCANNING_REVERSE):
+        worker._front_pages = _FRONT_PAGE_COUNT
+        try:
+            _open_on(
+                stage,
+                busy_line(JobState.SCANNING_REVERSE, front_pages=_FRONT_PAGE_COUNT),
+            )
+            yield
+        finally:
+            worker._front_pages = None
+
+
+@contextmanager
+def _reflow_flip_acknowledgement(stage: _Stage) -> Generator[None]:
+    """Answer a waiting flip with Continue, so the acknowledgement shows."""
+    worker = stage.server.app.state.worker
+    with _parked(stage, JobState.AWAITING_FLIP) as job_id:
+        coordinator = WorkerFlipCoordinator(job_id)
+        coordinator.arm()
+        worker._flip_coordinator = coordinator
+        try:
+            assert worker.continue_flip(job_id)
+            _open_on(stage, flip_answer_label(FlipOutcome.CONTINUED))
+            yield
+        finally:
+            worker._flip_coordinator = None
+
+
+@contextmanager
+def _reflow_pass_acknowledgement(stage: _Stage) -> Generator[None]:
+    """Interrupt an open between-pass prompt: the longest acknowledgement."""
+    prompt = PassPrompt(
+        number=1,
+        wait=PassWait.NEXT_PASS,
+        pages_kept=1,
+        offered=frozenset(
+            {PassAnswer.NEXT, PassAnswer.FINISH, PassAnswer.RESCAN, PassAnswer.ABORT}
+        ),
+        timeout_seconds=600,
+        last_pass_pages=1,
+        last_pass_kept=1,
+    )
+    owner = _as_owner(stage.page, stage.server.url)
+    with _staged_prompt(stage.server, owner, prompt) as staged:
+        assert staged.coordinator.interrupt_for_shutdown()
+        _open_on(stage, pass_answer_label(PassAnswer.INTERRUPTED))
+        yield
+
+
+@contextmanager
+def _reflow_settling_strip(stage: _Stage) -> Generator[None]:
+    """Hold a scan while the cold strip is still asking for its results."""
+    with _parked(stage, JobState.SCANNING):
+        _open_on(stage, busy_line(JobState.SCANNING))
+        expect(stage.page.locator('#checks-body[aria-busy="true"]')).to_have_count(1)
+        yield
+
+
+@contextmanager
+def _reflow_lost_contact(stage: _Stage) -> Generator[None]:
+    """Break the store's job reads under a scan, so the poll shows its fallback."""
+    job_store: JobStore = stage.server.app.state.job_store
+    broken = threading.Event()
+
+    def _guarded(original: Callable[..., object]) -> Callable[..., object]:
+        def guarded(*args: object, **kwargs: object) -> object:
+            if broken.is_set():
+                msg = "disk I/O error"
+                raise sqlite3.OperationalError(msg)
+            return original(*args, **kwargs)
+
+        return guarded
+
+    for name in ("get_job", "latest_run_job"):
+        stage.monkeypatch.setattr(job_store, name, _guarded(getattr(job_store, name)))
+    with _parked(stage, JobState.SCANNING):
+        _open_on(stage, busy_line(JobState.SCANNING))
+        broken.set()
+        try:
+            expect(stage.page.locator("#status-area")).to_contain_text(
+                LOST_CONTACT_LINE, timeout=10_000
+            )
+            yield
+        finally:
+            broken.clear()
+
+
+_REFLOW_ROWS: dict[str, Callable[[_Stage], AbstractContextManager[None]]] = {
+    "queued-with-max-length-title": _reflow_queued,
+    "starting": _reflow_starting,
+    "later-multi-page-pass": _reflow_later_pass,
+    "manual-duplex-front-count": _reflow_front_count,
+    "flip-acknowledgement": _reflow_flip_acknowledgement,
+    "pass-acknowledgement": _reflow_pass_acknowledgement,
+    "settling-strip": _reflow_settling_strip,
+    "lost-contact": _reflow_lost_contact,
+}
+
+
+@pytest.mark.browser
+class TestStatusReflow:
+    """
+    Every busy status line wraps at 320 px, and its spinner obeys reduced motion.
+
+    A busy line used to carry ``aria-busy``, and Pico keeps any busy element on
+    one line, so a queued line naming a long title pushed the whole page wider
+    than a phone.  Each row here stages one busy state on a private server and
+    measures the document at 320 x 640.
+    """
+
+    @pytest.mark.parametrize("row", list(_REFLOW_ROWS))
+    def test_status_reflows_at_320px(
+        self,
+        page: Page,
+        cold_strip_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+        row: str,
+    ) -> None:
+        """The page never scrolls sideways at 320 px in this busy state."""
+        page.set_viewport_size({"width": 320, "height": 640})
+        stage = _Stage(page, cold_strip_server, monkeypatch)
+        with _REFLOW_ROWS[row](stage):
+            layout = page.evaluate(_MEASURE_REFLOW)
+
+        assert layout["overflow"] <= 0, (
+            f"the page scrolls sideways by {layout['overflow']}px at 320px: "
+            f"{layout['overflowing']}"
+        )
+        if row == "settling-strip":
+            assert layout["stripBusy"], "the strip had settled before it was measured"
+
+    def test_busy_spinner_is_still_under_reduced_motion(
+        self,
+        page: Page,
+        cold_strip_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        With reduced motion the spinner's animated image is replaced by a ring.
+
+        The loading image animates inside its own SVG, which no page rule can
+        pause, so the only way to stop it is not to draw it.  Read both ways,
+        so the reduced-motion reading cannot pass for want of any image at all.
+        """
+        stage = _Stage(page, cold_strip_server, monkeypatch)
+        with _reflow_starting(stage):
+            spinner = page.locator("#status-area .busy-line")
+            read = "(line) => getComputedStyle(line, '::before').backgroundImage"
+            assert spinner.evaluate(read).startswith("url("), spinner.evaluate(read)
+
+            page.emulate_media(reduced_motion="reduce")
+            assert spinner.evaluate(read) == "none"
