@@ -245,8 +245,9 @@ def _keep_label(fd: int, target: Path, name: str, value: bytes) -> None:
 
     A label the new file already carries is left alone. A differing one --
     an SELinux type an admin set with ``chcon``, a Smack label -- is copied,
-    because falling back to the directory's default can change who may read
-    the file. When the kernel refuses the copy the rewrite still goes ahead,
+    because falling back to the label a new file gets (the directory's default
+    under SELinux; under Smack the writer's own label, unless the directory
+    transmutes its own) can change who may read the file. When the kernel refuses the copy the rewrite still goes ahead,
     with a WARNING naming the file and the attribute but never the label: a
     container rewriting a config its host user created is refused that
     user's label although the two differ only in the SELinux user, which
@@ -276,7 +277,7 @@ def _keep_label(fd: int, target: Path, name: str, value: bytes) -> None:
             raise _xattr_refusal(target, name, exc) from exc
         logger.warning(
             "Not keeping the security label %r of %s (%s); the rewritten file "
-            "carries the label its directory gives a new file, which may "
+            "carries the label the system gives a new file here, which may "
             "change who can read it",
             name,
             target,
