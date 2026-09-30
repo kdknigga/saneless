@@ -23,8 +23,11 @@
      comparison here.  A warned upload wears the fallback amber: it was
      uploaded, but it is not the clean success the green would claim.  A
      failure that may already be in paperless-ngx wears it too, labelled by
-     its category, because the red "Failed" reads as "scan it again". #}
-  <td class="{{ job.state | job_status_class(job.warning, job.error_category) }}">
+     its category, because the red "Failed" reads as "scan it again".  A job
+     still in flight has no colour, and then the cell carries no class
+     attribute at all rather than an empty one. #}
+  {% set status_class = job.state | job_status_class(job.warning, job.error_category) %}
+  <td{% if status_class %} class="{{ status_class }}"{% endif %}>
     {{ job.state | job_label(job.warning, job.error_category) }}
   </td>
 </tr>
