@@ -116,20 +116,20 @@ _IDLE_TICK_SECONDS: Final = 5.0
 _QUEUE_DEPTH: Final = 10
 
 # How many loop-level failures in a row -- the loop's own job store writes, or
-# the idle prune, raising -- make the worker degraded.  A pipeline
-# failure is a job failure and never counts.  Three rides out one transient
-# error without calling the store broken.  Not configurable.
+# the idle prune, raising -- make the worker degraded.  A pipeline failure is
+# a job failure and never counts.  Three rides out one transient error
+# without calling the store broken.  Not configurable.
 _DEGRADED_AFTER: Final = 3
 
 # How many retries in a row the owed-write retry may fail before the worker
 # is degraded.  A clean job ends a streak before its own retry, so every
-# retry after the first of a streak is an idle tick's.  Kept apart from _DEGRADED_AFTER's loop count: the guard
-# already counted the failure behind a guard debt, and a request-side
-# owe_rejection debt was never counted, so a streak of failed retries is its
-# own evidence that the store is not healing.  Three rides out a fault that
-# heals within a tick or two, and at the 5 s idle tick bounds a stuck row's
-# silent window to about 15 s.  Not configurable.  Read at call time, so tests
-# can change it.
+# retry after the first of a streak is an idle tick's.  Kept apart from
+# _DEGRADED_AFTER's loop count: the guard already counted the failure behind
+# a guard debt, and a request-side owe_rejection debt was never counted, so a
+# streak of failed retries is its own evidence that the store is not
+# healing.  Three rides out a fault that heals within a tick or two, and at
+# the 5 s idle tick bounds a stuck row's silent window to about 15 s.  Not
+# configurable.  Read at call time, so tests can change it.
 _OWED_RETRY_DEGRADED_AFTER: Final = 3
 
 # How often an idle worker prunes job history.  Prune left the per-job
@@ -735,8 +735,8 @@ class ScanWorker:
         # and rejected submits whose REJECTED write failed in the request.
         # Every idle tick and every clean job retries them, and a streak of
         # failed retries degrades the worker.  Shared by the worker thread
-        # (the guard and the flush) and request threads (owe_rejection), so every read and
-        # write goes through _unrecorded_lock.
+        # (the guard and the flush) and request threads (owe_rejection), so
+        # every read and write goes through _unrecorded_lock.
         self._unrecorded_lock = threading.Lock()
         self._unrecorded_failures: dict[str, _OwedWrite] = {}
         # Set and cleared by the worker thread (and by mark_recovery_pending,
@@ -801,10 +801,10 @@ class ScanWorker:
         under it.
 
         The worker writes it after its next clean job or on its next idle
-        tick, or through the recovery path while degraded, sharing the flush of the loop guard's owed
-        failures.  If the worker thread is not running (DOWN) no tick comes:
-        ``/health`` reports 503 meanwhile, and the next startup's
-        ``fail_active_jobs()`` ends the row.
+        tick, or through the recovery path while degraded, sharing the flush
+        of the loop guard's owed failures.  If the worker thread is not
+        running (DOWN) no tick comes: ``/health`` reports 503 meanwhile, and
+        the next startup's ``fail_active_jobs()`` ends the row.
 
         Args:
             job_id: The refused submit's job row.
@@ -873,8 +873,9 @@ class ScanWorker:
         wait is answered with ``INTERRUPTED``, and one not yet reached is
         pre-answered, so a manual-duplex job lets the thread go as soon as it
         is at the prompt.  A multi-page prompt is answered the same way,
-        whether it is open now or asked later.  That is nobody's decision to discard the scan, so
-        the job keeps pass A's fronts in ``failed/`` and records the restart.
+        whether it is open now or asked later.  That is nobody's decision to
+        discard the scan, so the job keeps pass A's fronts in ``failed/`` and
+        records the restart.
 
         The join is bounded by ``STOP_JOIN_SECONDS``.  If the thread is still
         running then because the job is keeping its pages -- under Docker a
@@ -1721,9 +1722,8 @@ class ScanWorker:
 
         The store just raised, so this may raise too; that is only logged.
         The write is remembered instead, and the next clean job or idle tick
-        retries it --
-        through the recovery path while degraded -- until the store accepts
-        it, so the row does not sit active until a restart.
+        retries it -- through the recovery path while degraded -- until the
+        store accepts it, so the row does not sit active until a restart.
 
         Args:
             job: The job the loop was handling.
@@ -1878,10 +1878,10 @@ class ScanWorker:
         landed.  The first failure of an episode is logged at WARNING and the
         rest at DEBUG; the episode, unlike the streak, outlasts a clean job and
         ends only when a retry lands or the worker recovers, so a busy queue
-        does not log the same traceback after every scan.  A retry that writes at least one row also ends the run of
-        loop-level failures: the store just accepted a write.  One that had
-        nothing to write touched no store, so it proves nothing and leaves the
-        run alone.
+        does not log the same traceback after every scan.  A retry that writes
+        at least one row also ends the run of loop-level failures: the store
+        just accepted a write.  One that had nothing to write touched no store,
+        so it proves nothing and leaves the run alone.
         """
         try:
             written = self._flush_unrecorded_failures()
