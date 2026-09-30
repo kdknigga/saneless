@@ -34,7 +34,8 @@ services:
       # beside saneless.toml and renaming it over the original, and a
       # single-file bind mount makes that rename fail with EBUSY.
       # If saneless.toml is missing, saneless starts with defaults plus
-      # environment variables and does not create the file.
+      # environment variables and the server does not create it;
+      # `saneless auto-profiles` creates it here (mode 0600).
       # See: https://github.com/kdknigga/saneless#configuration
       - ./config:/etc/saneless
       # Durable state: job database and preserved scans. /tmp/saneless-1000
