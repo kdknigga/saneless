@@ -666,10 +666,13 @@ def _profile_description(
 
 # The human text of the ``default`` generated for a device with no ``source``
 # option. There is no source to describe, so neither phrase names an input; the
-# description says why the operator sees no other profile to choose from.
+# description says why the operator sees no other profile to choose from. It
+# also says "one page": with no source to classify, the scan routes as the
+# model default's flatbed, a single page per scan, even on a sheet-fed device.
 _NO_SOURCE_LABEL: Final = "Standard scan"
 _NO_SOURCE_DESCRIPTION: Final = (
-    "Scans from the scanner, which offers no choice of where the page comes from."
+    "Scans one page from the scanner, which offers no choice of where the page "
+    "comes from."
 )
 
 

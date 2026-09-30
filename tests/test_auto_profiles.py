@@ -1875,12 +1875,18 @@ auto_generated = true
         assert "source" not in default.model_fields_set
 
     def test_no_source_default_text(self) -> None:
-        """The human text says the scanner offers no choice of input."""
+        """
+        The human text says the scanner offers no choice, and scans one page.
+
+        With no source to classify, the scan is routed as the model default's
+        flatbed, one page per scan, even on a sheet-fed device; the
+        description says so rather than promising a stack.
+        """
         default = generate_profiles(self._CAPS)["default"]
         assert default.label == "Standard scan"
         assert default.description == (
-            "Scans from the scanner, which offers no choice of where the page "
-            "comes from."
+            "Scans one page from the scanner, which offers no choice of where "
+            "the page comes from."
         )
 
     def test_no_source_default_is_written_without_a_source_key(

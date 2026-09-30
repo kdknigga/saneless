@@ -196,7 +196,7 @@ The labels shown in the web UI are saneless's own wording, chosen from the kind 
 - A feeder reads `Feeder, single-sided`, or `Feeder, double-sided` when it scans both sides. A feeder source that names one side -- such as `ADF Front` or `ADF Back` -- reads `Feeder, front side only` or `Feeder, back side only`.
 - The glass reads `Glass (flatbed)`, an `Auto` source `Automatic`, and a source saneless cannot place `Scanner source`.
 - When two sources would get the same label, the second gets a number: `Feeder, single-sided`, then `Feeder, single-sided 2`. The description beneath the dropdown stays the same for both.
-- A scanner with no choice of source at all gets a single `default` profile labelled `Standard scan`, with no `source` key.
+- A scanner with no choice of source at all gets a single `default` profile labelled `Standard scan`, with no `source` key. Each scan with it takes one page, even on a sheet-fed scanner, because saneless has no source to tell a feeder from the glass. Tick **Multiple pages** in the web UI, or pass `--multi-page` to `saneless scan`, to put several pages in one document.
 
 If `auto-profiles` creates the config file from scratch, it creates it with mode `0600`, readable only by you, because the file may hold your paperless-ngx token. Rewriting an existing file keeps its permission bits, owner and group, each when saneless is permitted to set it: a non-root user cannot give the file back to another owner, but keeps the group if it belongs to it, and a filesystem without Unix permissions keeps none of them.
 
