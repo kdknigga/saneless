@@ -146,7 +146,15 @@ def require_sane() -> None:
             "sane-backends-devel on Fedora/RHEL) and reinstall saneless; see "
             "Install on Bare Metal in the documentation"
         )
-        raise ConfigError(msg) from exc
+        # The configuration category's own advice cannot know that the fix is
+        # an install, and nothing in the config file brings the library back.
+        raise ConfigError(
+            msg,
+            next_step=(
+                "Install the SANE development package and reinstall saneless, "
+                "as the error says, then run the command again."
+            ),
+        ) from exc
 
 
 def _launch_listing(

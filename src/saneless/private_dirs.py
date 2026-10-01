@@ -65,7 +65,8 @@ def _refusal(path: Path, key: str, problem: str) -> ConfigError:
         problem: What is wrong with it, as a phrase following the path.
 
     Returns:
-        The error, naming the setting, the path, the problem and the fix.
+        The error, naming the setting, the path, the problem and the fix, with
+        a next step that names only the setting.
 
     """
     msg = (
@@ -74,7 +75,13 @@ def _refusal(path: Path, key: str, problem: str) -> ConfigError:
         f"write to: run `chmod 700 {path}` if it is yours, remove it so saneless "
         f"creates it privately, or set {key} to another directory."
     )
-    return ConfigError(msg)
+    return ConfigError(
+        msg,
+        next_step=(
+            f"Make {key} a directory you own that nobody else can write to, "
+            f"or set {key} to another directory, then try again."
+        ),
+    )
 
 
 def check_private_dir(path: Path, *, key: str) -> None:
@@ -102,7 +109,13 @@ def check_private_dir(path: Path, *, key: str) -> None:
         info = os.lstat(path)
     except OSError as exc:
         msg = f"{key} {path} could not be checked: {describe(exc)}"
-        raise ConfigError(msg) from exc
+        raise ConfigError(
+            msg,
+            next_step=(
+                f"Make sure saneless can reach {key}, or set {key} to another "
+                f"directory, then try again."
+            ),
+        ) from exc
     if stat.S_ISLNK(info.st_mode):
         raise _refusal(path, key, "is a symbolic link")
     if not stat.S_ISDIR(info.st_mode):
@@ -148,5 +161,11 @@ def ensure_private_dir(path: Path, *, key: str) -> None:
             f"yourself with `mkdir -m 700 {path}`, or set {key} to another "
             f"directory."
         )
-        raise ConfigError(msg) from exc
+        raise ConfigError(
+            msg,
+            next_step=(
+                f"Create {key} yourself with mode 700, or set {key} to another "
+                f"directory, then try again."
+            ),
+        ) from exc
     check_private_dir(path, key=key)
