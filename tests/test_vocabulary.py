@@ -890,8 +890,111 @@ class TestFinishWarnings:
         )
 
 
+# A category's next step is the fallback for every error filed under it that
+# does not carry a next step of its own, and the CLI's ``Try:`` line and the
+# web job view both show it.  So it must be true for every one of them: a
+# generic pointer is fine, a specific fix that some member contradicts is not.
+# Each entry pairs an error that reaches the category with phrases its real fix
+# contradicts; a fallback containing any of them would send that operator the
+# wrong way.  Errors whose raise site supplies its own next step (a broken
+# terminal prompt, an unreadable trust store) are left out on purpose.
+_CONFIG_IS_NOT_THE_FIX = ("configuration file", "config file", "restart saneless")
+_SCAN_IS_NOT_THE_RETRY = ("start the scan again", "scan again")
+_CATEGORY_AUDIT: dict[ErrorCategory, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    ErrorCategory.CONFIG: (
+        ("port already in use", _CONFIG_IS_NOT_THE_FIX),
+        ("python-sane or libsane missing", _CONFIG_IS_NOT_THE_FIX),
+        ("--config path not found", _CONFIG_IS_NOT_THE_FIX),
+        ("HOME unset", _CONFIG_IS_NOT_THE_FIX),
+        ("environment variable typo", _CONFIG_IS_NOT_THE_FIX),
+        ("workspace folder not writable", _CONFIG_IS_NOT_THE_FIX),
+        ("a single file mounted where a folder belongs", _CONFIG_IS_NOT_THE_FIX),
+        ("unknown profile", _CONFIG_IS_NOT_THE_FIX),
+        ("any one-shot command", _CONFIG_IS_NOT_THE_FIX),
+    ),
+    ErrorCategory.SCANNER: (
+        ("saneless devices found no scanner", _SCAN_IS_NOT_THE_RETRY),
+        ("listing timed out", _SCAN_IS_NOT_THE_RETRY),
+        ("listing crashed or never answered", _SCAN_IS_NOT_THE_RETRY),
+        ("SANE could not start in devices or auto-profiles", _SCAN_IS_NOT_THE_RETRY),
+    ),
+    ErrorCategory.UPLOAD: (
+        (
+            "serve could not build the client",
+            ("start the scan again", "scan again", "api token is correct"),
+        ),
+        ("upload refused", ("start the scan again", "api token is correct")),
+        ("paperless.url redirects", ("api token is correct",)),
+        ("URL carries a user name or password", ("api token is correct",)),
+    ),
+}
+
+# The category message states a cause, so it is held to the same rule over
+# the members whose cause is something else.
+_CATEGORY_MESSAGE_AUDIT: dict[
+    ErrorCategory, tuple[tuple[str, tuple[str, ...]], ...]
+] = {
+    ErrorCategory.CONFIG: (
+        ("port already in use", ("configuration is invalid",)),
+        ("python-sane or libsane missing", ("configuration is invalid",)),
+        ("HOME unset", ("configuration is invalid",)),
+        ("workspace folder not writable", ("configuration is invalid",)),
+    ),
+}
+
+
+def _audit_cases(
+    audit: dict[ErrorCategory, tuple[tuple[str, tuple[str, ...]], ...]],
+) -> list[object]:
+    """
+    Flatten an audit table into one test case per category, member and phrase.
+
+    Args:
+        audit: Each category's members, paired with the phrases they contradict.
+
+    Returns:
+        ``pytest.param(category, member, phrase)`` cases with readable ids.
+
+    """
+    return [
+        pytest.param(category, member, phrase, id=f"{category}-{member}-{phrase}")
+        for category, members in audit.items()
+        for member, phrases in members
+        for phrase in phrases
+    ]
+
+
 class TestErrorAdvice:
     """error_advice category-to-advice lookup tests (APPL-04, D-10, D-11)."""
+
+    @pytest.mark.parametrize(
+        ("category", "member", "phrase"), _audit_cases(_CATEGORY_AUDIT)
+    )
+    def test_no_fallback_names_a_fix_a_member_contradicts(
+        self, category: ErrorCategory, member: str, phrase: str
+    ) -> None:
+        """
+        A category's next step holds for every error that reaches it.
+
+        The next step is shown for each of them on the CLI and on the web, so
+        a fix that is wrong for one member leads that operator astray.
+        """
+        next_step = error_next_step(category).lower()
+        assert phrase not in next_step, (
+            f"{category} advice {next_step!r} is wrong for {member!r}"
+        )
+
+    @pytest.mark.parametrize(
+        ("category", "member", "phrase"), _audit_cases(_CATEGORY_MESSAGE_AUDIT)
+    )
+    def test_no_category_message_names_a_cause_a_member_contradicts(
+        self, category: ErrorCategory, member: str, phrase: str
+    ) -> None:
+        """A category's message names no cause that one of its errors disproves."""
+        message = error_message(category).lower()
+        assert phrase not in message, (
+            f"{category} message {message!r} is wrong for {member!r}"
+        )
 
     def test_error_advice_fields(self) -> None:
         """ErrorAdvice carries exactly a message and a next step (APPL-04)."""
@@ -954,20 +1057,6 @@ class TestErrorAdvice:
                 ErrorCategory.FEEDER,
                 "Load the pages squarely in the feeder, clear any jam, then "
                 "start the scan again.",
-            ),
-            (
-                ErrorCategory.CONFIG,
-                "Correct the saneless configuration file, then restart saneless.",
-            ),
-            (
-                ErrorCategory.SCANNER,
-                "Check the scanner is switched on and connected, then start the "
-                "scan again.",
-            ),
-            (
-                ErrorCategory.UPLOAD,
-                "Check paperless-ngx is running and the API token is correct, "
-                "then start the scan again.",
             ),
             (
                 ErrorCategory.ASSEMBLY,
