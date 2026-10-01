@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import hashlib
 import importlib.metadata
 import io
 import json
@@ -35,6 +36,7 @@ from PIL import Image, ImageDraw
 
 import saneless.cli as cli_module
 import saneless.config as config_module
+import saneless.job as job_module
 import saneless.vocabulary as vocabulary_module
 from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
@@ -3151,12 +3153,10 @@ class TestJobsCommand:
             assert key in row
             assert row[key] is None, key
 
-    def test_jobs_data_dir_is_created_private(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """A missing data_dir is created 0700 even under the common umask 022."""
-        data_dir = tmp_path / "data"
-        settings = _make_settings(
+    @staticmethod
+    def _settings_in(tmp_path: Path, data_dir: Path) -> Settings:
+        """Build Settings whose data_dir is ``data_dir``, everything else in tmp_path."""
+        return _make_settings(
             tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
@@ -3164,16 +3164,115 @@ class TestJobsCommand:
                 log_file=str(tmp_path / "saneless.log"),
             ),
         )
+
+    @pytest.mark.parametrize("limit", ["-1", "0"])
+    def test_jobs_rejects_a_non_positive_limit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, limit: str
+    ) -> None:
+        """
+        ``--limit`` below 1 is a usage error, exit 2.
+
+        SQLite reads a negative LIMIT as no limit at all, so ``-1`` used to
+        print the whole history, and ``0`` asked for nothing.
+        """
+        settings = self._settings_for(tmp_path)
+        self._populate_store(settings.output.db_path, count=3)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
-        previous = os.umask(0o022)
+        result = runner.invoke(cli, ["jobs", "--limit", limit])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "Invalid value for '--limit'" in result.stderr
+        assert "Test Document" not in result.stdout
+
+    def test_jobs_refuses_an_older_database_and_leaves_it_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A history at an older schema is refused, and not upgraded behind a server.
+
+        Listing the history is a read.  Upgrading the database is the job of
+        the ``saneless serve`` that owns it, so ``jobs`` names that and exits
+        2, and the file's bytes and its stamped version are as they were.
+        """
+        settings = self._settings_for(tmp_path)
+        db_path = settings.output.db_path
+        conn = sqlite3.connect(db_path)
         try:
-            result = runner.invoke(cli, ["jobs"])
+            # The first two steps of the real ladder, as a version 2 release
+            # left the database.
+            for step in job_module._MIGRATIONS[:2]:
+                step(conn, str(db_path))
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
         finally:
-            os.umask(previous)
+            conn.close()
+        before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "schema version 2" in result.stderr
+        assert "saneless serve" in result.stderr
+        assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute("PRAGMA user_version").fetchone() == (2,)
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["table", "json"])
+    @pytest.mark.parametrize("data_dir_exists", [True, False], ids=["dir", "no-dir"])
+    def test_jobs_without_a_database_creates_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        as_json: bool,
+        data_dir_exists: bool,
+    ) -> None:
+        """
+        No history yet is an empty listing, and leaves no file behind.
+
+        Neither the database nor its ``-wal`` and ``-shm`` files are created,
+        and a ``data_dir`` that does not exist yet still does not: it is the
+        server's and the scan's to create.
+        """
+        data_dir = tmp_path / "data"
+        if data_dir_exists:
+            data_dir.mkdir()
+        settings = self._settings_in(tmp_path, data_dir)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", *(["--json"] if as_json else [])])
 
         assert result.exit_code == 0, result.output
-        assert (data_dir.stat().st_mode & 0o777) == 0o700
+        if as_json:
+            assert json.loads(result.stdout) == []
+        else:
+            assert result.stdout.splitlines()[0].startswith("Timestamp")
+            assert len(result.stdout.splitlines()) == 2
+        assert data_dir.exists() is data_dir_exists
+        db_path = settings.output.db_path
+        for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+            assert not path.exists(), path
+
+    def test_jobs_with_a_file_for_data_dir_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A data_dir that is a regular file is a configuration error, exit 2."""
+        data_dir = tmp_path / "data"
+        data_dir.write_text("not a directory\n")
+        runner, _ = _patch_cli(
+            monkeypatch, settings=self._settings_in(tmp_path, data_dir)
+        )
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert "data_dir is not a directory" in result.stderr
+        assert data_dir.read_text() == "not a directory\n"
 
 
 _UVICORN_LOGGERS = ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")
@@ -6349,7 +6448,12 @@ class TestExitCodes:
     def test_job_database_unsupported_schema_exits_2_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A jobs table saneless cannot migrate is exit 2, naming the database."""
+        """
+        A jobs table from before the versioned schema is exit 2, naming the database.
+
+        ``jobs`` only reads, so it refuses the old table rather than migrating
+        it, and points at ``saneless serve``, which upgrades it.
+        """
         settings = _tmp_settings(tmp_path)
         conn = sqlite3.connect(settings.output.db_path)
         try:
@@ -6365,7 +6469,7 @@ class TestExitCodes:
         lines = _failure_lines(result)
         assert len(lines) == 1
         assert str(settings.output.db_path) in lines[0]
-        assert "unsupported schema" in lines[0]
+        assert "older than this saneless reads" in lines[0]
         assert "Unexpected error" not in result.output
         assert "Traceback" not in result.output
 
@@ -6378,12 +6482,12 @@ class TestExitCodes:
         """A StorageError is one line and exit 2, logged without a bug-report hint."""
         exc = StorageError(f"Could not open the job database at {tmp_path}: boom")
 
-        def failing_store(*_args: object, **_kwargs: object) -> JobStore:
+        def failing_read(*_args: object, **_kwargs: object) -> list[Job]:
             raise exc
 
         runner, _ = _patch_cli(monkeypatch, settings=_tmp_settings(tmp_path))
         monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: True)
-        monkeypatch.setattr("saneless.cli.JobStore", failing_store)
+        monkeypatch.setattr("saneless.cli.read_recent_jobs", failing_read)
         caplog.set_level(logging.ERROR, logger="saneless.cli")
 
         result = runner.invoke(cli, ["jobs"])
@@ -6908,11 +7012,11 @@ class TestFailureAdvice:
         """
         runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
 
-        def unusable_store(*_args: object, **_kwargs: object) -> NoReturn:
+        def unusable_history(*_args: object, **_kwargs: object) -> NoReturn:
             msg = "db is unreadable"
             raise StorageError(msg)
 
-        monkeypatch.setattr("saneless.cli.JobStore", unusable_store)
+        monkeypatch.setattr("saneless.cli.read_recent_jobs", unusable_history)
 
         result = runner.invoke(cli, ["jobs"])
 
