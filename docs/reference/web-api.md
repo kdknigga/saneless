@@ -379,7 +379,7 @@ are done, and the Scan button is held until they are. Both lists are fetched wit
 | `retry` | boolean | no | `1` for a retry, which keeps the form's current ticks and choice instead of the profile's defaults |
 | `q` | string | no | The tag filter, bounded as for `GET /api/tags` |
 | `tags` | int[] | no | The tag ids currently ticked, bounded as for `GET /api/tags`. Read on a retry |
-| `correspondent` | int | no | The correspondent currently chosen, from 1 to 2147483647. Read on a retry |
+| `correspondent` | int | no | The correspondent currently chosen, from 1 to 2147483647. Read on a retry. An empty value, which the dropdown sends for `No correspondent`, means none |
 
 **Modes:**
 
