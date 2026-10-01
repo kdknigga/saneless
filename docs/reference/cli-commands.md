@@ -214,7 +214,7 @@ saneless [--config PATH] [-v] doctor
 | Paperless | Whether the API token and the paperless-ngx address have been set, and whether paperless-ngx accepts the token. A placeholder token or an empty `paperless.url` is reported without sending a request |
 | Profiles | Whether any scan profiles are configured, whether they were saved to a config file, and whether the generated ones have names yet |
 | Fallback | Whether a fallback folder is configured for when paperless-ngx is down, and whether saneless can write to it |
-| Data folder | Whether the folder holding the job database will take a write |
+| Data folder | Whether `output.data_dir`, which holds the job database, and `output.tmp_dir`, where scans in progress are built, will take a write. A folder that does not exist yet is fine when saneless can create it where it would go; an existing `output.tmp_dir` must also be private (not a symbolic link, owned by saneless's user, and writable by nobody else). A red row names the setting that is wrong, never its path |
 
 **Example output:**
 

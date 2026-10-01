@@ -147,6 +147,22 @@ def _refuse_temp_files_in(monkeypatch: pytest.MonkeyPatch, folder: Path) -> None
     monkeypatch.setattr("saneless.checks.tempfile.NamedTemporaryFile", refusing)
 
 
+def _a_file_in(folder: Path) -> Path:
+    """
+    Put a regular file in ``folder``, for a setting that must not name one.
+
+    Args:
+        folder: The directory to create the file in.
+
+    Returns:
+        The file's path.
+
+    """
+    file = folder / "a-file"
+    file.write_text("not a folder", encoding="utf-8")
+    return file
+
+
 # The real saned probe, kept before any test replaces it, so the probe's own
 # tests can still reach it by name.
 _REAL_PROBE_SANED: Final = checks._probe_saned
@@ -2428,6 +2444,9 @@ def _settings(
     """
     Build a Settings object whose every path is inside the test's tmp_path.
 
+    The working folder exists and is private, created 0700 the way saneless
+    creates it, so the Data folder row is green unless a test says otherwise.
+
     A healthy discovery is attached: a file loaded from the first searched
     place, and no superseded-name file anywhere.  Without it every test in
     this file would carry an amber Configuration row it never asked for,
@@ -2449,13 +2468,15 @@ def _settings(
         resolved = tmp_path / "data"
         resolved.mkdir(exist_ok=True)
         data_dir = str(resolved)
+    scratch = tmp_path / "tmp"
+    scratch.mkdir(mode=0o700, exist_ok=True)
     settings = Settings(
         scanner=ScannerConfig(host=host, device=_DEVICE_ID),
         paperless=PaperlessConfig(
             url="http://paperless:8000", token=token, consume_dir=consume_dir
         ),
         output=OutputConfig(
-            tmp_dir=str(tmp_path / "tmp"),
+            tmp_dir=str(scratch),
             data_dir=data_dir,
             log_file=str(tmp_path / "saneless.log"),
         ),
@@ -2501,6 +2522,22 @@ def _with_profiles(settings: Settings, profiles: dict[str, ProfileConfig]) -> Se
 
     """
     return settings.model_copy(update={"profiles": profiles})
+
+
+def _with_tmp_dir(settings: Settings, tmp_dir: Path) -> Settings:
+    """
+    Return the same settings with a different ``output.tmp_dir``.
+
+    Args:
+        settings: The base settings.
+        tmp_dir: The working folder to substitute.
+
+    Returns:
+        A copy whose working folder is exactly what was passed.
+
+    """
+    output = settings.output.model_copy(update={"tmp_dir": tmp_dir})
+    return settings.model_copy(update={"output": output})
 
 
 def _context(
@@ -6208,11 +6245,336 @@ class TestDataDirCheck:
         settings = _settings(tmp_path, data_dir=str(folder))
         row = _row(run_checks(_context(settings)), CheckKey.DATA_DIR)
         assert row.state is CheckState.FAIL
-        assert row.message == "The data folder cannot be written to."
-        assert row.next_step == (
-            "Check the folder exists and saneless can write to it, "
-            "then restart saneless."
+        assert row.message == "output.data_dir cannot be written to."
+        assert row.next_step == _WRITABLE_NEXT_STEP.format(key="output.data_dir")
+
+
+# The next step of a Data folder row that names a folder saneless cannot use,
+# and of one that names a working folder another local user could reach.
+# ``{key}`` is the setting the row names.
+_WRITABLE_NEXT_STEP: Final = (
+    "Fix that folder, or set {key} in the saneless config to a folder saneless "
+    "can write to, then restart saneless."
+)
+_PRIVATE_NEXT_STEP: Final = (
+    "Remove that folder or link so saneless creates it privately, or set {key} "
+    "in the saneless config to a folder only saneless's user can write to, "
+    "then restart saneless."
+)
+
+
+def _data_folder_row(settings: Settings) -> CheckResult:
+    """
+    Run every check and keep the Data folder row.
+
+    Args:
+        settings: The configuration under test.
+
+    Returns:
+        The ``CheckKey.DATA_DIR`` row.
+
+    """
+    return _row(run_checks(_context(settings)), CheckKey.DATA_DIR)
+
+
+def _skip_as_root() -> None:
+    """Skip a test whose refusal comes from a file mode, which root ignores."""
+    if os.geteuid() == 0:
+        pytest.skip("root is not stopped by a file mode")
+
+
+class TestDataFolderRow:
+    """
+    The Data folder row asks the question start-up asks, for both folders.
+
+    ``output.data_dir`` and ``output.tmp_dir`` are judged together, each the way
+    saneless will use it: an existing folder must take a write, a missing one
+    must be creatable where it would go, and an existing working folder must
+    also be private.  The row names the setting that is wrong, never a path.
+    """
+
+    def test_a_missing_data_folder_that_can_be_created_is_ok(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The data folder is created when needed, so its absence is no fault.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _settings(tmp_path, data_dir=str(tmp_path / "new" / "data"))
+        row = _data_folder_row(settings)
+        assert row.state is CheckState.OK
+        assert row.message == "The data folder will be created when first needed."
+        assert row.next_step == ""
+
+    def test_a_missing_working_folder_that_can_be_created_is_ok(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The working folder is created 0700 when it is first needed.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_tmp_dir(_settings(tmp_path), tmp_path / "new" / "scratch")
+        row = _data_folder_row(settings)
+        assert row.state is CheckState.OK
+        assert row.message == (
+            "The data folder is writable, and the working folder will be "
+            "created when first needed."
         )
+
+    def test_both_missing_but_creatable_is_ok(self, tmp_path: Path) -> None:
+        """
+        Neither folder exists yet, and both can be made where they would go.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_tmp_dir(
+            _settings(tmp_path, data_dir=str(tmp_path / "new" / "data")),
+            tmp_path / "new" / "scratch",
+        )
+        row = _data_folder_row(settings)
+        assert row.state is CheckState.OK
+        assert row.message == (
+            "The data and working folders will be created when first needed."
+        )
+
+    def test_both_existing_and_usable_is_ok(self, tmp_path: Path) -> None:
+        """
+        The healthy case keeps its existing wording.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        row = _data_folder_row(_settings(tmp_path))
+        assert row.state is CheckState.OK
+        assert row.message == "The data folder is writable."
+
+    def test_a_missing_data_folder_under_a_read_only_folder_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The nearest existing folder is where creating it would fail.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        _skip_as_root()
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        settings = _settings(tmp_path, data_dir=str(locked / "a" / "data"))
+        locked.chmod(0o555)
+        try:
+            row = _data_folder_row(settings)
+        finally:
+            locked.chmod(0o700)
+        assert row.state is CheckState.FAIL
+        assert row.message == (
+            "output.data_dir does not exist and cannot be created, because the "
+            "folder it would go in cannot be written to."
+        )
+        assert row.next_step == _WRITABLE_NEXT_STEP.format(key="output.data_dir")
+
+    def test_a_missing_data_folder_is_probed_by_writing_to_its_ancestor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The ancestor is probed with a real write, so the refusal holds as root.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: The test's monkeypatch fixture.
+
+        """
+        ancestor = tmp_path / "refusing"
+        ancestor.mkdir()
+        _refuse_temp_files_in(monkeypatch, ancestor)
+        settings = _settings(tmp_path, data_dir=str(ancestor / "a" / "data"))
+        row = _data_folder_row(settings)
+        assert row.state is CheckState.FAIL
+        assert row.message.startswith("output.data_dir ")
+
+    def test_a_missing_working_folder_under_a_refusing_folder_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The working folder gets the same nearest-ancestor rule.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: The test's monkeypatch fixture.
+
+        """
+        ancestor = tmp_path / "refusing"
+        ancestor.mkdir()
+        _refuse_temp_files_in(monkeypatch, ancestor)
+        settings = _with_tmp_dir(_settings(tmp_path), ancestor / "scratch")
+        row = _data_folder_row(settings)
+        assert row.state is CheckState.FAIL
+        assert row.message.startswith("output.tmp_dir ")
+        assert row.next_step == _WRITABLE_NEXT_STEP.format(key="output.tmp_dir")
+
+    def test_a_working_folder_others_can_write_to_fails(self, tmp_path: Path) -> None:
+        """
+        A shared working folder is refused at start-up, so the row is red.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        scratch = tmp_path / "shared"
+        scratch.mkdir()
+        scratch.chmod(0o777)
+        row = _data_folder_row(_with_tmp_dir(_settings(tmp_path), scratch))
+        assert row.state is CheckState.FAIL
+        assert row.message == (
+            "output.tmp_dir can be written by other users, who could read or "
+            "replace the scans kept there."
+        )
+        assert row.next_step == _PRIVATE_NEXT_STEP.format(key="output.tmp_dir")
+
+    def test_a_working_folder_that_is_a_symlink_fails(self, tmp_path: Path) -> None:
+        """
+        A symlink is refused rather than followed, even to a private folder.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        target = tmp_path / "real"
+        target.mkdir(mode=0o700)
+        link = tmp_path / "link"
+        link.symlink_to(target)
+        row = _data_folder_row(_with_tmp_dir(_settings(tmp_path), link))
+        assert row.state is CheckState.FAIL
+        assert row.message == (
+            "output.tmp_dir is a symbolic link, so another local user could "
+            "redirect the scans kept there."
+        )
+        assert row.next_step == _PRIVATE_NEXT_STEP.format(key="output.tmp_dir")
+
+    def test_a_working_folder_that_is_a_file_fails(self, tmp_path: Path) -> None:
+        """
+        A file where the working folder should be is not a folder.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        row = _data_folder_row(_with_tmp_dir(_settings(tmp_path), _a_file_in(tmp_path)))
+        assert row.state is CheckState.FAIL
+        assert row.message == "output.tmp_dir is not a folder."
+
+    def test_a_data_folder_that_is_a_file_fails(self, tmp_path: Path) -> None:
+        """
+        A file passes a write probe's parent but is no place for a database.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        row = _data_folder_row(_settings(tmp_path, data_dir=str(_a_file_in(tmp_path))))
+        assert row.state is CheckState.FAIL
+        assert row.message == "output.data_dir is not a folder."
+        assert row.next_step == _WRITABLE_NEXT_STEP.format(key="output.data_dir")
+
+    def test_a_data_folder_under_a_file_fails(self, tmp_path: Path) -> None:
+        """
+        Nothing can be created under a file, however deep the missing path.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        data_dir = _a_file_in(tmp_path) / "a" / "data"
+        row = _data_folder_row(_settings(tmp_path, data_dir=str(data_dir)))
+        assert row.state is CheckState.FAIL
+        assert row.message == "output.data_dir is under a file, not a folder."
+
+    def test_the_data_folder_is_named_first_when_both_are_wrong(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The first setting that fails decides the row.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        file = _a_file_in(tmp_path)
+        settings = _with_tmp_dir(_settings(tmp_path, data_dir=str(file)), file)
+        row = _data_folder_row(settings)
+        assert row.state is CheckState.FAIL
+        assert row.message.startswith("output.data_dir ")
+        assert "output.tmp_dir" not in row.message
+
+    @pytest.mark.parametrize(
+        "case", ["data-file", "data-under-file", "tmp-shared", "tmp-link", "fine"]
+    )
+    def test_no_row_names_a_path(self, tmp_path: Path, case: str) -> None:
+        """
+        The strip is visible to the LAN, so the row names a setting, never a path.
+
+        Args:
+            tmp_path: The test's own directory.
+            case: Which folder state to render.
+
+        """
+        if case == "data-file":
+            settings = _settings(tmp_path, data_dir=str(_a_file_in(tmp_path)))
+        elif case == "data-under-file":
+            data_dir = _a_file_in(tmp_path) / "data"
+            settings = _settings(tmp_path, data_dir=str(data_dir))
+        elif case == "tmp-shared":
+            shared = tmp_path / "shared"
+            shared.mkdir()
+            shared.chmod(0o777)
+            settings = _with_tmp_dir(_settings(tmp_path), shared)
+        elif case == "tmp-link":
+            target = tmp_path / "real"
+            target.mkdir(mode=0o700)
+            (tmp_path / "link").symlink_to(target)
+            settings = _with_tmp_dir(_settings(tmp_path), tmp_path / "link")
+        else:
+            settings = _settings(tmp_path, data_dir=str(tmp_path / "new" / "data"))
+        row = _data_folder_row(settings)
+        for text in (row.message, row.next_step):
+            assert str(tmp_path) not in text
+            assert "/" not in text
+
+    def test_a_missing_consume_folder_is_still_red(self, tmp_path: Path) -> None:
+        """
+        The consume folder is never created, so it must already exist.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _settings(tmp_path, consume_dir=str(tmp_path / "new" / "consume"))
+        results = run_checks(_context(settings))
+        assert _row(results, CheckKey.FALLBACK).state is CheckState.FAIL
+        assert _row(results, CheckKey.DATA_DIR).state is CheckState.OK
+
+    def test_there_are_still_six_rows(self, tmp_path: Path) -> None:
+        """
+        The working folder joins the Data folder row rather than adding one.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_tmp_dir(_settings(tmp_path), _a_file_in(tmp_path))
+        results = run_checks(_context(settings))
+        assert len(results) == 6
+        assert [result.key for result in results] == list(CheckKey)
 
 
 def _broken_context(tmp_path: Path) -> CheckContext:
@@ -6237,7 +6599,7 @@ def _broken_context(tmp_path: Path) -> CheckContext:
             host=f"127.0.0.1:{_closed_port()}",
             token="changeme",
             consume_dir=str(tmp_path / "missing-consume"),
-            data_dir=str(tmp_path / "missing-data"),
+            data_dir=str(_a_file_in(tmp_path) / "data"),
         ),
         {},
     )

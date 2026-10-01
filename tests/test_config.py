@@ -4525,8 +4525,8 @@ class TestValidateSettingsDirs:
 
     def test_nearest_existing_ancestor_walks_up(self, tmp_path: Path) -> None:
         """The nearest ancestor of a missing path is its deepest existing one."""
-        assert config_mod._nearest_existing_ancestor(tmp_path / "a" / "b") == tmp_path
-        assert config_mod._nearest_existing_ancestor(tmp_path) == tmp_path
+        assert config_mod.nearest_existing_ancestor(tmp_path / "a" / "b") == tmp_path
+        assert config_mod.nearest_existing_ancestor(tmp_path) == tmp_path
 
 
 class TestDirectorySettingsMustBeDirectories:
