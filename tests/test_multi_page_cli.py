@@ -13,6 +13,11 @@ contradictory and are not.  ``CliRunner`` genuinely is not a terminal, so the
 non-terminal refusal runs with ``_stdin_is_interactive`` unpatched: it is
 telling the truth about its environment.  Every test that needs the prompt
 patches that one seam to ``True``.
+
+The question waits for stdin to become readable before it reads a line, and
+``CliRunner``'s stdin has no descriptor to wait on, so every test here starts
+with that wait reporting stdin readable at once (``tests.prompt_support``).
+A test about the clock, a broken read or Ctrl-C replaces it again.
 """
 
 from __future__ import annotations
@@ -27,7 +32,6 @@ import threading
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-import click
 import pytest
 from click.testing import CliRunner
 
@@ -38,7 +42,6 @@ from saneless.cli import (
     _Interruption,
     cli,
 )
-from saneless.pipeline import AnswerSlot
 from saneless.vocabulary import (
     MULTI_PAGE_NEEDS_TERMINAL,
     NOTHING_TO_FINISH,
@@ -65,7 +68,13 @@ from tests.multi_page_support import (
     ScriptedPassCoordinator,
     multi_page_settings,
 )
-from tests.prompt_support import FakeClock, broken_read, readable, typed_after
+from tests.prompt_support import (
+    FakeClock,
+    broken_read,
+    never_readable,
+    readable,
+    typed_after,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -80,9 +89,6 @@ _TITLE = "Stapled letter"
 
 # The operator-wait bound multi_page_settings gives every prompt, in seconds.
 _TIMEOUT = 600
-
-# The name the prompt thread runs under, so a test can wait for it to end.
-_PROMPT_THREAD = "saneless-multi-page-prompt"
 
 # The four answers the between-pass prompt offers once a page is kept.
 _EVERY_NEXT_PASS_ANSWER = frozenset(
@@ -324,11 +330,10 @@ def _ask(prompt: PassPrompt, text: str) -> tuple[PassAnswer, str, ClickPassCoord
     return answer, output.getvalue().decode(), coordinator
 
 
-def _join_prompt_threads() -> None:
-    """Wait for every multi-page prompt thread still running to end."""
-    for thread in threading.enumerate():
-        if thread.name == _PROMPT_THREAD:
-            thread.join(timeout=5)
+@pytest.fixture(autouse=True)
+def _lines_are_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every question's wait report stdin readable at once."""
+    readable(monkeypatch)
 
 
 def _interactive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -702,22 +707,10 @@ class TestClickPassCoordinatorEndings:
     """The ways a wait ends that are not a letter: the clock, Ctrl-C, EOF, a fault."""
 
     def test_nobody_answering_times_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A zero timeout with a prompt that never returns resolves ``TIMED_OUT``."""
-        release = threading.Event()
+        """A zero timeout with nothing typed resolves ``TIMED_OUT``."""
+        never_readable(monkeypatch, FakeClock())
 
-        def never_answered(*_args: object, **_kwargs: object) -> PassAnswer:
-            """Block until the test lets go."""
-            release.wait()
-            return PassAnswer.NEXT
-
-        monkeypatch.setattr("saneless.cli.click.prompt", never_answered)
-        coordinator = ClickPassCoordinator()
-
-        try:
-            answer = coordinator.ask(_next_pass_prompt(timeout=0))
-        finally:
-            release.set()
-        _join_prompt_threads()
+        answer, _, coordinator = _ask(_next_pass_prompt(timeout=0), "")
 
         assert answer is PassAnswer.TIMED_OUT
         assert coordinator.abort_cause is None
@@ -728,119 +721,17 @@ class TestClickPassCoordinatorEndings:
         """
         Ctrl-C is a cancel with no confirmation, however many pages are kept.
 
-        SIGINT lands in the calling thread's wait, not in the prompt, so the
-        slot's wait is made to raise as a real Ctrl-C would.
+        SIGINT raises ``KeyboardInterrupt`` out of the wait on the main
+        thread, so the wait is made to raise it; the real signal is sent on a
+        real terminal in ``test_cli_prompt_terminal``.
         """
-        release = threading.Event()
-        confirmations: list[str] = []
+        broken_read(monkeypatch, KeyboardInterrupt())
 
-        def interrupted_wait(_slot: object, timeout: float) -> None:
-            """Raise as SIGINT would on the main thread."""
-            raise KeyboardInterrupt
-
-        def never_answered(*_args: object, **_kwargs: object) -> PassAnswer:
-            """Block until the test lets go."""
-            release.wait()
-            return PassAnswer.NEXT
-
-        def confirm(text: str, *_args: object, **_kwargs: object) -> bool:
-            """Record a confirmation that must never be asked."""
-            confirmations.append(text)
-            return True
-
-        monkeypatch.setattr(AnswerSlot, "wait", interrupted_wait)
-        monkeypatch.setattr("saneless.cli.click.prompt", never_answered)
-        monkeypatch.setattr("saneless.cli.click.confirm", confirm)
-        coordinator = ClickPassCoordinator()
-
-        try:
-            answer = coordinator.ask(_next_pass_prompt(pages_kept=40))
-        finally:
-            release.set()
-        _join_prompt_threads()
+        answer, shown, coordinator = _ask(_next_pass_prompt(pages_kept=40), "a\ny\n")
 
         assert answer is PassAnswer.ABORT
         assert coordinator.abort_cause is None
-        assert confirmations == []
-
-    @pytest.mark.parametrize(
-        ("reply", "timeout", "expected"),
-        [
-            ("yes", _TIMEOUT, PassAnswer.ABORT),
-            ("no", _TIMEOUT, PassAnswer.TIMED_OUT),
-            ("never", 0, PassAnswer.TIMED_OUT),
-        ],
-        ids=["yes-aborts", "no-finishes", "unanswered-is-bounded"],
-    )
-    def test_an_abort_being_confirmed_holds_the_clock(
-        self,
-        reply: str,
-        timeout: float,
-        expected: PassAnswer,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """
-        The wait running out mid-confirmation does not finish the document under it.
-
-        The operator typed ``a`` and the clock ran out while "abort?" was on
-        screen.  A yes then aborts, as the operator chose, rather than being
-        overtaken by a finish that uploads the pages.  A no is not an abort,
-        so the expired wait finishes.  A confirmation nobody answers is held
-        for at most one more wait, then read as its default, No.
-
-        The slot's wait is made to expire only once the confirmation is on
-        screen, and the confirmation is answered only once it has, so the
-        straddle is certain rather than a matter of timing.
-        """
-        on_screen = threading.Event()
-        clock_ran_out = threading.Event()
-        operator = threading.Event()
-        release = threading.Event()
-        answers: list[PassAnswer] = []
-        typed: list[PassAnswer] = [PassAnswer.ABORT]
-
-        def expired_wait(_slot: object, timeout: float) -> None:
-            """Run out once the confirmation is showing."""
-            del timeout
-            assert on_screen.wait(5)
-            clock_ran_out.set()
-
-        def question(*_args: object, **_kwargs: object) -> PassAnswer:
-            """Type ``a`` once; then leave the question unanswered."""
-            if typed:
-                return typed.pop()
-            release.wait()
-            return PassAnswer.NEXT
-
-        def confirm(*_args: object, **_kwargs: object) -> bool:
-            """Show the confirmation, and answer it when the test says."""
-            on_screen.set()
-            if reply == "never":
-                release.wait()
-                return False
-            assert operator.wait(5)
-            return reply == "yes"
-
-        monkeypatch.setattr(AnswerSlot, "wait", expired_wait)
-        monkeypatch.setattr("saneless.cli.click.prompt", question)
-        monkeypatch.setattr("saneless.cli.click.confirm", confirm)
-        coordinator = ClickPassCoordinator()
-        prompt = _next_pass_prompt(pages_kept=3, timeout=timeout)
-        asker = threading.Thread(target=lambda: answers.append(coordinator.ask(prompt)))
-
-        asker.start()
-        try:
-            assert clock_ran_out.wait(5)
-            operator.set()
-            asker.join(5)
-        finally:
-            operator.set()
-            release.set()
-        _join_prompt_threads()
-
-        assert not asker.is_alive()
-        assert answers == [expected]
-        assert coordinator.abort_cause is None
+        assert abort_question(40) not in shown
 
     def test_end_of_input_with_no_signal_is_an_abort(self) -> None:
         """Ctrl-D at the prompt is the operator's cancel, once the grace has passed."""
@@ -849,50 +740,32 @@ class TestClickPassCoordinatorEndings:
         assert answer is PassAnswer.ABORT
         assert coordinator.abort_cause is None
 
+    def test_end_of_input_at_the_confirmation_is_an_abort(self) -> None:
+        """Ctrl-D while "abort?" is asked is a cancel too, not a No."""
+        answer, shown, coordinator = _ask(_next_pass_prompt(pages_kept=2), "a\n")
+
+        assert answer is PassAnswer.ABORT
+        assert coordinator.abort_cause is None
+        assert abort_question(2) in shown
+
     def test_end_of_input_after_a_signal_leaves_the_answer_alone(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        A hangup's end of input claims nothing: the signal decides the run.
+        A hangup's end of input claims no cancel: the signal decides the run.
 
-        The prompt thread's every claim is recorded, and it must make none.
+        A signal recorded without raising leaves the question unanswered, so
+        it ends as an unanswered wait does, never as a cancel that would throw
+        the kept pages away.
         """
         interruption = _Interruption()
         interruption.record(signal.SIGHUP.value)
         monkeypatch.setattr("saneless.cli._INTERRUPTION", interruption)
-        claims: list[tuple[str, str]] = []
-        real_offer = AnswerSlot.offer
-        real_settle = AnswerSlot.settle
-
-        def offer(slot: AnswerSlot[PassAnswer], outcome: PassAnswer) -> bool:
-            """Record which thread offered, then offer."""
-            claims.append((threading.current_thread().name, outcome))
-            return real_offer(slot, outcome)
-
-        def settle(slot: AnswerSlot[PassAnswer], outcome: PassAnswer) -> PassAnswer:
-            """Record which thread settled, then settle."""
-            claims.append((threading.current_thread().name, outcome))
-            return real_settle(slot, outcome)
-
-        def end_of_input(*_args: object, **_kwargs: object) -> PassAnswer:
-            """
-            Be a closed terminal's end of input.
-
-            Raises:
-                click.Abort: Always.
-
-            """
-            raise click.Abort
-
-        monkeypatch.setattr(AnswerSlot, "offer", offer)
-        monkeypatch.setattr(AnswerSlot, "settle", settle)
-        monkeypatch.setattr("saneless.cli.click.prompt", end_of_input)
         caplog.set_level(logging.INFO, logger="saneless.cli")
 
-        ClickPassCoordinator().ask(_next_pass_prompt(timeout=0))
-        _join_prompt_threads()
+        answer, _, _ = _ask(_next_pass_prompt(), "")
 
-        assert [name for name, _ in claims if name == _PROMPT_THREAD] == []
+        assert answer is PassAnswer.TIMED_OUT
         assert (
             "Multi-page prompt reached end of input after a signal "
             f"({signal.SIGHUP.value}); leaving the answer to the interruption"
@@ -902,21 +775,32 @@ class TestClickPassCoordinatorEndings:
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A prompt that fails is not the operator's choice: ABORT, cause kept."""
-        failure = RuntimeError("tty")
-
-        def broken(*_args: object, **_kwargs: object) -> PassAnswer:
-            """Fail the way a broken terminal does."""
-            raise failure
-
-        monkeypatch.setattr("saneless.cli.click.prompt", broken)
+        failure = OSError(errno.EIO, "Input/output error")
+        broken_read(monkeypatch, failure)
         caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        answer, _, coordinator = _ask(_next_pass_prompt(), "n\n")
+
+        assert answer is PassAnswer.ABORT
+        assert coordinator.abort_cause is failure
+        assert any(record.exc_info is not None for record in caplog.records)
+
+    def test_a_closed_stdin_at_the_question_is_a_broken_prompt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        No stdin at all when the question is asked: a failure, never a crash.
+
+        The scan refuses a closed stdin before any paper moves, so this is the
+        coordinator's own guard: it answers as a broken read does.
+        """
+        monkeypatch.setattr(sys, "stdin", None)
         coordinator = ClickPassCoordinator()
 
         answer = coordinator.ask(_next_pass_prompt())
 
         assert answer is PassAnswer.ABORT
-        assert coordinator.abort_cause is failure
-        assert any(record.exc_info is not None for record in caplog.records)
+        assert isinstance(coordinator.abort_cause, OSError)
 
     def test_the_flip_prompt_logs_its_end_of_input_as_before(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -1043,20 +927,27 @@ class TestTypeAheadFlush:
             """Record the flush."""
             log.append("flush")
 
-        def prompt(*_args: object, **_kwargs: object) -> PassAnswer:
-            """Record the read and answer next."""
-            log.append("prompt")
-            return PassAnswer.NEXT
+        def wait(_stream: object, _timeout: float) -> bool:
+            """
+            Record the wait, and report the next line ready.
+
+            Returns:
+                Always ``True``.
+
+            """
+            log.append("wait")
+            return True
 
         monkeypatch.setattr("saneless.cli._flush_typed_ahead", flush)
-        monkeypatch.setattr("saneless.cli.click.prompt", prompt)
+        monkeypatch.setattr("saneless.cli._wait_readable", wait)
         coordinator = ClickPassCoordinator()
 
-        first = coordinator.ask(_next_pass_prompt())
-        second = coordinator.ask(_next_pass_prompt(pages_kept=2))
+        with CliRunner().isolation(input="n\nn\n"):
+            first = coordinator.ask(_next_pass_prompt())
+            second = coordinator.ask(_next_pass_prompt(pages_kept=2))
 
         assert (first, second) == (PassAnswer.NEXT, PassAnswer.NEXT)
-        assert log == ["flush", "prompt", "flush", "prompt"]
+        assert log == ["flush", "wait", "flush", "wait"]
 
 
 # The thread the multi-page question was once read on.  Nothing may start it.
@@ -1314,7 +1205,6 @@ class TestTheQuestionOnTheMainThread:
             real_start(thread)
 
         _interactive(monkeypatch)
-        readable(monkeypatch)
         monkeypatch.setattr(threading.Thread, "start", recording_start)
 
         run = _scan(

@@ -9,8 +9,8 @@ cancel that keeps nothing (exit 130).
 
 Every signal here is real, sent with ``os.kill`` to this very process, and each
 is sent from inside the run at the moment it matters: from the in-memory
-paperless-ngx while it receives the upload, and from the flip prompt's or a
-multi-page question's own thread, where a dropped SSH session delivers its
+paperless-ngx while it receives the upload, and from inside the wait of the
+flip prompt or a multi-page question, where a dropped SSH session delivers its
 hangup.  That is the only way
 to prove the handler is live at that moment, rather than merely installed at
 some point.
@@ -68,7 +68,6 @@ from saneless.config import (
 )
 from saneless.exceptions import ScanError, ScanInterrupted
 from saneless.vocabulary import ExitCode
-from tests.conftest import poll_until
 from tests.golden_support import (
     DOCUMENTS_PATH,
     DistinctPageScanner,
@@ -100,11 +99,6 @@ _INTERRUPTING = (signal.SIGTERM, signal.SIGHUP)
 # Short next to pytest-timeout's ceiling, so a flip wait the signal failed to
 # end still finishes inside the test instead of hanging it.
 _FLIP_TIMEOUT_SECONDS = 10
-
-# The longest a prompt's own thread waits for the main thread's handler to
-# run for a signal it has just sent: a bound on a failure, not a pause, since
-# the handler runs at the main thread's next bytecode.
-_SIGNAL_HANDLED_SECONDS = 10
 
 type _Disposition = Callable[[int, FrameType | None], object] | int | None
 
@@ -341,6 +335,10 @@ def _patch_environment(
     monkeypatch.setattr("saneless.cli.SaneBackend", sane_backend)
 
 
+# What a multi-page run's operator types: "next" at the first question.
+_FIRST_ANSWER = "n\n"
+
+
 def _run_cli(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -383,6 +381,9 @@ def _run_scan(
     """
     Run the real ``saneless scan`` with any options, as ``_run_cli`` does.
 
+    A ``--multi-page`` run's operator has typed ``n`` for its first
+    question, and nothing more.
+
     Args:
         tmp_path: pytest's per-test directory.
         monkeypatch: Replaces the environment ``saneless.cli`` reaches for.
@@ -400,7 +401,8 @@ def _run_scan(
     monkeypatch.setattr("saneless.cli.PaperlessClient", cli_client_builder(recorder))
     # The flip and multi-page prompts need a terminal, which CliRunner is not.
     monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
-    result = CliRunner().invoke(cli, ["scan", "--title", _TITLE, *options])
+    typed = _FIRST_ANSWER if "--multi-page" in options else None
+    result = CliRunner().invoke(cli, ["scan", "--title", _TITLE, *options], input=typed)
     failed_dir = settings.output.failed_dir
     failed = sorted(failed_dir.iterdir()) if failed_dir.is_dir() else []
     return _CliRun(result=result, failed=failed, recorder=recorder, scanner=scanner)
@@ -408,17 +410,15 @@ def _run_scan(
 
 class _SignalAtSecondQuestion:
     """
-    Stand in for ``click.prompt`` under ``--multi-page``: "next", then a signal.
+    Stand in for the multi-page question's wait: "next" typed, then a signal.
 
-    The first question is answered "next".  The signal is sent from inside
-    the second, as a dropped session or a supervisor's stop would deliver
-    it.  A hangup also ends the question's input, as a closed terminal does;
-    a stop leaves the question waiting until ``release`` is set, and its late
-    answer then reaches a question the interruption already settled.
+    The first question finds its answer, ``n``, already typed.  The signal is
+    sent from inside the second question's wait, as a dropped session or a
+    supervisor's stop would deliver it, and the handler raises out of that
+    wait on the main thread.
 
     Attributes:
-        questions: Every question asked, in order.
-        release: Set by the test once the run has returned.
+        waits: How many waits the questions made.
 
     """
 
@@ -433,30 +433,22 @@ class _SignalAtSecondQuestion:
         """
         self._signaller = signaller
         self._signum = signum
-        self.questions: list[str] = []
-        self.release = threading.Event()
+        self.waits = 0
 
-    def __call__(
-        self, text: str, *, value_proc: Callable[[str], object], **_kwargs: object
-    ) -> object:
+    def __call__(self, _stream: object, _timeout: float) -> bool:
         """
-        Answer "next" once, then deliver the signal at the second question.
+        Report the first answer ready, then deliver the signal at the second.
 
         Returns:
-            The first question's parsed answer, or the stop's late one.
-
-        Raises:
-            click.Abort: For a hangup, the end of input it gives the prompt.
+            That stdin is readable.  At the second question that is only
+            reached if the handler did not raise, and stdin is then at end of
+            input, which ends the run as a cancel the test refuses.
 
         """
-        self.questions.append(text)
-        if len(self.questions) == 1:
-            return value_proc("n")
-        self._signaller.send(self._signum)
-        if self._signum is signal.SIGHUP:
-            raise click.Abort
-        self.release.wait()
-        return value_proc("f")
+        self.waits += 1
+        if self.waits > 1:
+            self._signaller.send(self._signum)
+        return True
 
 
 def _run_multi_page(
@@ -466,28 +458,25 @@ def _run_multi_page(
     scanner: DistinctPageScanner,
 ) -> _CliRun:
     """
-    Run ``saneless scan --multi-page`` with ``prompt`` answering its questions.
+    Run ``saneless scan --multi-page``, ``prompt`` standing in for its waits.
 
     Args:
         tmp_path: pytest's per-test directory.
         monkeypatch: Replaces the environment ``saneless.cli`` reaches for.
-        prompt: The stand-in for ``click.prompt``.
+        prompt: The stand-in for ``saneless.cli._wait_readable``.
         scanner: The scanner the command opens.
 
     Returns:
         What the run left behind.
 
     """
-    monkeypatch.setattr("saneless.cli.click.prompt", prompt)
-    try:
-        return _run_scan(
-            tmp_path,
-            monkeypatch,
-            ["--profile", _SIMPLEX, "--multi-page"],
-            scanner=scanner,
-        )
-    finally:
-        prompt.release.set()
+    monkeypatch.setattr("saneless.cli._wait_readable", prompt)
+    return _run_scan(
+        tmp_path,
+        monkeypatch,
+        ["--profile", _SIMPLEX, "--multi-page"],
+        scanner=scanner,
+    )
 
 
 def _kept_pages(kept: Path) -> list[bytes]:
@@ -673,7 +662,7 @@ def test_a_signal_at_the_multi_page_prompt_keeps_the_pages_scanned(
 
     assert signaller.refusals == []
     assert signaller.sent == [signum]
-    assert len(prompt.questions) == 2
+    assert prompt.waits == 2
     assert run.result.exit_code == expected, run.result.output
     (kept,) = run.failed
     assert run.interrupted_lines == [run.interrupted_lines[0]]
@@ -701,8 +690,8 @@ def test_sighup_at_the_blank_page_question_keeps_the_document_and_the_pass(
 
     assert signaller.refusals == []
     assert signaller.sent == [signal.SIGHUP]
-    assert len(prompt.questions) == 2
-    assert "looks blank" in prompt.questions[1]
+    assert prompt.waits == 2
+    assert "looks blank" in run.result.output
     assert run.result.exit_code == ExitCode.HANGUP, run.result.output
     (document,) = [kept for kept in run.failed if "partial" not in kept.name]
     (partial,) = [kept for kept in run.failed if "partial" in kept.name]
@@ -734,8 +723,8 @@ def test_sigterm_at_the_failed_pass_question_keeps_only_the_accepted_pages(
 
     assert signaller.refusals == []
     assert signaller.sent == [signal.SIGTERM]
-    assert len(prompt.questions) == 2
-    assert "jam" in prompt.questions[1]
+    assert prompt.waits == 2
+    assert "jam" in run.result.output
     assert run.result.exit_code == ExitCode.TERMINATED, run.result.output
     (kept,) = run.failed
     assert "partial" not in kept.name
@@ -752,55 +741,34 @@ def test_a_hangup_whose_end_of_input_lands_first_at_a_multi_page_question(
     """
     End of input first, SIGHUP a moment later, at a multi-page question: kept.
 
-    The multi-page question's version of the flip prompt's race.  The
-    signal is sent from inside the prompt thread's pause for it, so it lands
-    after end of input by construction, with no timed pause.  The pause then
-    lasts until the handler, on the main thread, has recorded the signal, as
-    the real pause outlasts a signal that arrives within it.  Settling the
-    question as an abort without that pause would end the run as a cancel
-    that keeps nothing.
+    The multi-page question's version of the flip prompt's race.  The second
+    question reads end of input (the run's stdin holds only the first
+    answer) before SIGHUP arrives; the signal is sent from inside the pause
+    end of input makes for it, so it lands after end of input by
+    construction, with no timed pause.  Settling the question as an abort
+    without that pause would end the run as a cancel that keeps nothing.
     """
     signaller = _Signaller()
     paused: list[float] = []
-    questions: list[str] = []
+    waits: list[float] = []
 
-    def prompt(
-        text: str, *, value_proc: Callable[[str], object], **_kwargs: object
-    ) -> object:
+    def wait(_stream: object, timeout: float) -> bool:
         """
-        Answer "next" once, then be the closed terminal's end of input.
+        Note the wait, and report stdin readable at once.
 
         Returns:
-            The first question's parsed answer.
-
-        Raises:
-            click.Abort: At the second question.
+            Always ``True``.
 
         """
-        questions.append(text)
-        if len(questions) == 1:
-            return value_proc("n")
-        raise click.Abort
-
-    def handled() -> bool:
-        """
-        Say whether the handler has run: its first act replaces itself.
-
-        Returns:
-            Whether SIGHUP's disposition is no longer the handler.
-
-        """
-        return signal.getsignal(signal.SIGHUP) is not _interrupt_handler
+        waits.append(timeout)
+        return True
 
     def signal_arrives(seconds: float) -> None:
         """Be the grace pause, with the hangup's SIGHUP arriving in it."""
         paused.append(seconds)
         signaller.send(signal.SIGHUP)
-        # No assertion here: this runs on the prompt's thread, and the test
-        # reads the outcome the main thread reports.
-        poll_until(handled, _SIGNAL_HANDLED_SECONDS)
 
-    monkeypatch.setattr("saneless.cli.click.prompt", prompt)
+    monkeypatch.setattr("saneless.cli._wait_readable", wait)
     monkeypatch.setattr("saneless.cli.time.sleep", signal_arrives)
     scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
 
@@ -814,7 +782,7 @@ def test_a_hangup_whose_end_of_input_lands_first_at_a_multi_page_question(
     assert signaller.refusals == []
     assert signaller.sent == [signal.SIGHUP]
     assert paused == [_HANGUP_GRACE_SECONDS]
-    assert len(questions) == 2
+    assert len(waits) == 2
     assert run.result.exit_code == ExitCode.HANGUP, run.result.output
     (kept,) = run.failed
     assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1))

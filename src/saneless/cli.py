@@ -81,7 +81,6 @@ from .job import CLI_JOBS_DEFAULT_LIMIT, JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import (
-    AnswerSlot,
     FlipCoordinator,
     PassCoordinator,
     PipelineEvent,
@@ -449,12 +448,12 @@ def _end_of_input(settle_abort: Callable[[], object], what: str) -> None:
     signal first, and settles the cancel only if none came.  Every terminal
     prompt shares this, so a hangup means the same thing at each of them.
 
-    The pause is a plain sleep, never a wait on a lock.  On the main thread,
-    where the flip prompt reads, the signal's handler raises
+    The pause is a plain sleep, never a wait on a lock, on the main thread
+    where every terminal prompt reads.  The signal's handler raises
     ``ScanInterrupted`` out of the sleep, and that propagates to the caller.
-    On a prompt's own thread the sleep runs to its end, the handler raises on
-    the main thread instead, and the signal it recorded says to claim
-    nothing and leave the answer to that interruption.
+    A signal recorded without raising -- the command's outcome was already
+    settled -- lets the sleep run to its end, and says to claim nothing and
+    leave the answer to that interruption.
 
     Args:
         settle_abort: Claims the prompt's cancel answer.
@@ -664,182 +663,135 @@ def _flush_typed_ahead() -> None:
     would answer the next prompt the moment it appeared, starting a pass on a
     platen nobody has changed.  Only a terminal has such a queue; anything else
     -- a test's fake stdin, a stream with no descriptor, a terminal that went
-    away -- is left alone, and the prompt reads it as it is.
+    away, no stdin at all -- is left alone, and the prompt reads it as it is.
     """
+    stdin = sys.stdin
+    if stdin is None:
+        return
     try:
-        if sys.stdin.isatty():
-            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        if stdin.isatty():
+            termios.tcflush(stdin.fileno(), termios.TCIFLUSH)
     except OSError, ValueError, termios.error:
         return
 
 
-class _AbortConfirmation:
+# The abort confirmation as click.confirm(question, default=False) put it. An
+# empty line takes the default, which is no; anything else is refused with
+# _INVALID_YES_NO and the confirmation asked again.
+_ABORT_SUFFIX: Final = " [y/N]: "
+_ABORT_YES: Final = frozenset({"y", "yes"})
+_ABORT_NO: Final = frozenset({"", "n", "no"})
+
+
+def _pass_question(prompt: PassPrompt) -> str:
     """
-    Whether the operator is confirming an abort, which the clock must wait out.
+    Return the multi-page question as the terminal shows it, suffix included.
 
-    The operator who typed ``a`` is at the terminal, answering "abort?".  If
-    the wait ran out under them and the clock claimed its answer, the document
-    would be finished and uploaded while they were confirming they wanted it
-    thrown away.  So the prompt thread opens this before it asks, and the
-    calling thread, its wait over, waits for it to close before it claims the
-    timeout.  A Yes is left open until the abort has been claimed, so the
-    calling thread can never find the confirmation over and the answer still
-    unclaimed.
-    """
-
-    def __init__(self) -> None:
-        """Start closed: no abort is being confirmed."""
-        self._changed = threading.Condition()
-        self._open = False
-
-    def begin(self) -> None:
-        """Mark an abort as being confirmed."""
-        with self._changed:
-            self._open = True
-
-    def end(self) -> None:
-        """Mark the confirmation over, and wake a waiter.  Idempotent."""
-        with self._changed:
-            self._open = False
-            self._changed.notify_all()
-
-    def wait_out(self, timeout: float) -> None:
-        """
-        Wait until no abort is being confirmed, for at most ``timeout`` seconds.
-
-        Args:
-            timeout: The longest to wait, in seconds.
-
-        """
-        with self._changed:
-            self._changed.wait_for(lambda: not self._open, timeout)
-
-
-def _read_pass_answer(
-    prompt: PassPrompt, confirmation: _AbortConfirmation
-) -> PassAnswer:
-    """
-    Ask one multi-page question at the terminal until it has an answer.
-
-    Only the first character of a line counts, in either case, and only a
-    letter the prompt lists is accepted.  Anything else is refused with the
-    letters on offer, and ``f`` while nothing is kept says why there is
-    nothing to finish; either way the question is asked again.  An abort is
-    confirmed first, No by default, and a No asks the question again.
+    A failed pass's error text comes from outside saneless -- a SANE status
+    string, a wrapped OS error -- so its control characters are shown as
+    escapes here, at the terminal, as on every other failure line.
 
     Args:
         prompt: The open question.
-        confirmation: Opened while an abort is being confirmed.  Closed again
-            on a No; left open on a Yes, for the caller to close once the
-            abort is claimed.
 
     Returns:
-        The operator's answer, one of those ``prompt`` offers.
+        The question, ending ``": "`` as click.prompt ended it.
 
     """
-    letters = {choice.letter: choice.answer for choice in cli_pass_choices(prompt)}
-
-    def parse(text: str) -> PassAnswer:
-        """
-        Turn a typed line into the answer its first letter picks.
-
-        Args:
-            text: What the operator typed.
-
-        Returns:
-            The answer.
-
-        Raises:
-            click.BadParameter: The letter picks nothing this question offers;
-                click prints the reason and asks again.
-
-        """
-        letter = text.strip().lower()[:1]
-        answer = letters.get(letter)
-        if answer is not None:
-            return answer
-        if letter == "f" and prompt.wait is not PassWait.BLANK_DECISION:
-            raise click.BadParameter(NOTHING_TO_FINISH)
-        raise click.BadParameter(cli_choice_hint(prompt))
-
-    # A failed pass's error text comes from outside saneless -- a SANE status
-    # string, a wrapped OS error -- so its control characters are shown as
-    # escapes here, at the terminal, as on every other failure line.
     shown = prompt
     if prompt.error is not None:
         shown = replace(prompt, error=neutralise_controls(prompt.error))
-    question = cli_pass_question(shown)
-    _flush_typed_ahead()
-    while True:
-        answer = click.prompt(question, value_proc=parse, show_default=False)
-        if answer is not PassAnswer.ABORT:
-            return answer
-        confirmation.begin()
-        if click.confirm(abort_question(prompt.pages_kept), default=False):
-            return answer
-        confirmation.end()
+    return f"{cli_pass_question(shown)}: "
+
+
+def _parse_pass_answer(prompt: PassPrompt, line: str) -> PassAnswer | None:
+    """
+    Turn one typed line into the answer its first letter picks, if any.
+
+    Only the first character counts, in either case, and only a letter the
+    prompt lists is accepted.  Anything else is refused with the letters on
+    offer, and ``f`` while nothing is kept says why there is nothing to
+    finish.  A line with nothing on it at all is no answer and no mistake,
+    so it is passed over without a word.
+
+    Args:
+        prompt: The open question.
+        line: The line typed, newline included.
+
+    Returns:
+        The answer, or ``None`` when the question must be asked again.
+
+    """
+    text = line.rstrip("\r\n")
+    if not text:
+        return None
+    letter = text.strip().lower()[:1]
+    letters = {choice.letter: choice.answer for choice in cli_pass_choices(prompt)}
+    answer = letters.get(letter)
+    if answer is not None:
+        return answer
+    if letter == "f" and prompt.wait is not PassWait.BLANK_DECISION:
+        click.echo(f"Error: {NOTHING_TO_FINISH}")
+    else:
+        click.echo(f"Error: {cli_choice_hint(prompt)}")
+    return None
 
 
 class ClickPassCoordinator(PassCoordinator):
     """
-    The CLI multi-page coordinator: a one-letter prompt with a bounded wait.
+    The CLI multi-page coordinator: a one-letter question with a bounded wait.
 
-    ``click.prompt`` has no timeout of its own, so it runs on a daemon thread
-    while the calling thread waits for at most the prompt's
-    ``timeout_seconds``, and the operator's answer and the clock race for one
-    ``AnswerSlot``.  Every
-    question gets a fresh slot, so an answer to one question can never be
-    read as the answer to the next.
+    Each question is asked and its answer read on the calling thread -- the
+    main thread, where Python delivers signals -- so every way of leaving it
+    ends the wait at once and nothing is left reading stdin afterwards.  A
+    line is read only once stdin is readable, and the wait for it ends at the
+    question's deadline, ``timeout_seconds`` after it was asked, which
+    answers ``TIMED_OUT``.  A refused answer does not restart the clock.
 
     The question lists only the letters it accepts, and keys typed during the
-    pass are thrown away before it is shown (``_read_pass_answer``).  Ctrl-C
-    is a cancel, with no confirmation however many pages are kept: SIGINT
-    raises in the calling thread's wait, which answers ``ABORT``, and a page
-    is only ever kept by choosing to finish.  End of input is a cancel too,
-    unless a hangup caused it (``_end_of_input``).  A prompt that fails with a
-    read error answers ``ABORT`` at once, logged with its traceback, and
-    records the exception as ``abort_cause``: nobody chose to stop, so the
-    scan is reported as failed, not cancelled, and its pages are kept.
+    pass are thrown away once, before it is shown (``_flush_typed_ahead``).
+    Ctrl-C is a cancel, with no confirmation however many pages are kept: it
+    raises out of the wait, which answers ``ABORT``, and a page is only ever
+    kept by choosing to finish.  End of input is a cancel too, unless a
+    hangup caused it (``_end_of_input``); a SIGHUP or SIGTERM that arrives
+    while the question waits raises the handler's ``ScanInterrupted``, which
+    propagates out of this call untouched.
 
-    An abort being confirmed when the wait runs out holds the clock
-    (``_AbortConfirmation``), for at most one more ``timeout_seconds``: a Yes
-    then aborts, as the operator chose, rather than being overtaken by a
-    finish that uploads the pages.  A No, or no answer within that bound --
-    the confirmation's default -- is not an abort, and the expired wait
-    resolves ``TIMED_OUT``.
+    An ``a`` is confirmed first, No by default.  The confirmation holds the
+    clock for at most one more ``timeout_seconds``: the operator answering
+    "abort?" when the question's deadline passes must not have the document
+    finished and uploaded under them.  So the confirmation is due by the
+    question's deadline plus one more timeout.  A Yes aborts.  A No before
+    the question's deadline asks the question again for the time left; a No
+    after it, or no answer by the confirmation's own deadline, is not an
+    abort, and the expired wait answers ``TIMED_OUT``.
 
-    Accepted cost, deliberate and not a leak: after a
-    timeout the prompt thread is abandoned.  It keeps its read on stdin until
-    the process exits, and its question may be left sitting on the terminal.
-    A timeout always ends the document, so at most one thread is ever
-    abandoned, and a daemon thread parked on stdin does not delay interpreter
-    shutdown.  It must stay a daemon thread: a non-daemon one would hold the
-    interpreter open at exit waiting for an answer nobody is going to give.
+    A read that fails instead -- an I/O error from the terminal, undecodable
+    input, stdin closed -- answers ``ABORT`` at once, logged with its
+    traceback, and records the exception as ``abort_cause``: nobody chose to
+    stop, so the scan is reported as failed, not cancelled, and its pages
+    are kept.
     """
 
     def __init__(self) -> None:
         """Start with no abort cause."""
-        # Held across a broken prompt's claim and its cause, so the calling
-        # thread, woken by that claim, cannot read the cause before it is set.
-        self._cause_lock = threading.Lock()
         self._abort_cause: Exception | None = None
 
     @property
     def abort_cause(self) -> Exception | None:
         """
-        The exception a broken prompt raised, if that failure claimed the answer.
+        The exception a broken read raised, if one ended the question.
 
         Returns:
-            The prompt's exception, or ``None`` when the answer came from the
+            The read's exception, or ``None`` when the answer came from the
             operator (a letter, end of input, Ctrl-C) or from the clock.
 
         """
-        with self._cause_lock:
-            return self._abort_cause
+        return self._abort_cause
 
     def ask(self, prompt: PassPrompt) -> PassAnswer:
         """
-        Put ``prompt`` to the operator; claim ``TIMED_OUT`` if its wait expires.
+        Put ``prompt`` to the operator; answer ``TIMED_OUT`` if its wait expires.
 
         Args:
             prompt: The question, and the only answers it accepts.
@@ -848,86 +800,99 @@ class ClickPassCoordinator(PassCoordinator):
             The one answer this question resolved to.
 
         """
-        slot = AnswerSlot[PassAnswer]()
-        confirmation = _AbortConfirmation()
-        reader = threading.Thread(
-            target=self._prompt,
-            args=(prompt, slot, confirmation),
-            name="saneless-multi-page-prompt",
-            daemon=True,
-        )
-        reader.start()
+        _flush_typed_ahead()
+        deadline = _monotonic() + prompt.timeout_seconds
         try:
-            slot.wait(prompt.timeout_seconds)
-            # The operator may be confirming an abort as the wait runs out;
-            # the clock must not finish the document under them.  Returns at
-            # once when nothing is being confirmed.
-            confirmation.wait_out(prompt.timeout_seconds)
+            return self._ask(prompt, deadline)
         except KeyboardInterrupt:
-            # Ctrl-C lands here, not in click.prompt: Python handles SIGINT on
-            # the main thread, which is this one, parked in the wait.  It is
-            # the operator's cancel, unconfirmed, whatever has been kept.
-            return slot.settle(PassAnswer.ABORT)
-        # One path for both endings: an answer already claimed is handed
-        # back, and an expired wait claims TIMED_OUT.
-        return slot.settle(PassAnswer.TIMED_OUT)
-
-    def _prompt(
-        self,
-        prompt: PassPrompt,
-        slot: AnswerSlot[PassAnswer],
-        confirmation: _AbortConfirmation,
-    ) -> None:
-        """
-        Ask the operator on the prompt thread, claim their answer, then let go.
-
-        The abort confirmation is closed only once the answer is claimed,
-        whatever the ending, so the calling thread never finds it over with
-        nothing claimed.
-
-        Args:
-            prompt: The open question.
-            slot: This question's slot.
-            confirmation: Open while the operator confirms an abort.
-
-        """
-        try:
-            self._claim(prompt, slot, confirmation)
-        finally:
-            confirmation.end()
-
-    def _claim(
-        self,
-        prompt: PassPrompt,
-        slot: AnswerSlot[PassAnswer],
-        confirmation: _AbortConfirmation,
-    ) -> None:
-        """
-        Ask the operator and claim their answer, or the prompt's failure.
-
-        Args:
-            prompt: The open question.
-            slot: This question's slot.
-            confirmation: Passed to ``_read_pass_answer``.
-
-        """
-        try:
-            answer = _read_pass_answer(prompt, confirmation)
-        except click.Abort:
-            _end_of_input(partial(slot.settle, PassAnswer.ABORT), "Multi-page prompt")
-            return
-        except Exception as exc:
-            # As at the flip prompt: a prompt that broke ends the wait now as
-            # ABORT, with the exception kept as abort_cause so the run reports
-            # a failure that keeps its pages rather than a cancel.  The cause
-            # is set only if this claim won, and the failure is logged before
-            # the claim, so the record exists once the wait wakes.
+            # Ctrl-C, raised out of the wait or the end-of-input pause: the
+            # operator's cancel, unconfirmed, whatever has been kept.
+            return PassAnswer.ABORT
+        except _PromptTimedOut:
+            return PassAnswer.TIMED_OUT
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            # The read broke, so the scan stops now: ABORT, with the
+            # exception kept as abort_cause so the run reports a failure that
+            # keeps its pages rather than a cancel.
             logger.exception("Multi-page prompt failed; treating it as an abort")
-            with self._cause_lock:
-                if slot.offer(PassAnswer.ABORT):
-                    self._abort_cause = exc
-            return
-        slot.settle(answer)
+            self._abort_cause = exc
+            return PassAnswer.ABORT
+
+    def _ask(self, prompt: PassPrompt, deadline: float) -> PassAnswer:
+        """
+        Ask until an answer is accepted, input ends, or ``deadline`` passes.
+
+        Args:
+            prompt: The open question.
+            deadline: The ``_monotonic`` reading the answer is due by.
+
+        Returns:
+            The operator's answer, the cancel end of input stands for, or
+            ``TIMED_OUT`` when an abort was declined after ``deadline``.
+
+        """
+        question = _pass_question(prompt)
+        while True:
+            line = _read_line(question, deadline)
+            if line is None:
+                return self._end_of_input()
+            answer = _parse_pass_answer(prompt, line)
+            if answer is None:
+                continue
+            if answer is not PassAnswer.ABORT:
+                return answer
+            confirmed = self._confirm_abort(prompt, deadline)
+            if confirmed is not None:
+                return confirmed
+            if _monotonic() >= deadline:
+                return PassAnswer.TIMED_OUT
+
+    def _confirm_abort(self, prompt: PassPrompt, deadline: float) -> PassAnswer | None:
+        """
+        Ask whether to abort, holding the clock for at most one more timeout.
+
+        Args:
+            prompt: The open question.
+            deadline: The question's own deadline.
+
+        Returns:
+            ``ABORT`` for a Yes, ``None`` for a No, or the cancel end of input
+            stands for.
+
+        Raises:
+            _PromptTimedOut: Nobody answered by the confirmation's deadline,
+                ``deadline`` plus ``prompt.timeout_seconds``.
+
+        """
+        question = f"{abort_question(prompt.pages_kept)}{_ABORT_SUFFIX}"
+        confirm_deadline = deadline + prompt.timeout_seconds
+        while True:
+            line = _read_line(question, confirm_deadline)
+            if line is None:
+                return self._end_of_input()
+            answer = line.strip().lower()
+            if answer in _ABORT_YES:
+                return PassAnswer.ABORT
+            if answer in _ABORT_NO:
+                return None
+            click.echo(_INVALID_YES_NO)
+
+    @staticmethod
+    def _end_of_input() -> PassAnswer:
+        """
+        Answer end of input: a cancel, unless a signal claims the question.
+
+        A raising signal propagates out of ``_end_of_input``'s pause.  One
+        recorded without raising leaves the question unanswered, which ends it
+        as an unanswered wait does: ``TIMED_OUT``.
+
+        Returns:
+            ``ABORT`` for the cancel, else ``TIMED_OUT``.
+
+        """
+        settled: list[PassAnswer] = []
+        _end_of_input(partial(settled.append, PassAnswer.ABORT), "Multi-page prompt")
+        return settled[0] if settled else PassAnswer.TIMED_OUT
 
 
 def _truncate(value: str, width: int) -> str:
@@ -1686,12 +1651,10 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
             ),
             hooks=RequestHooks(
                 status_callback=status_callback,
-                # run_pipeline is synchronous, so the flip wait holds this
-                # thread; only the click.confirm read itself moves to the
-                # prompt thread.
+                # run_pipeline is synchronous, so the flip question is asked
+                # and read on this thread, where a signal ends its wait.
                 flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
-                # The same holds for every multi-page question: the run waits
-                # on this thread, and only each click.prompt read moves off it.
+                # So is every multi-page question.
                 multi_page=multi_page,
                 pass_coordinator=ClickPassCoordinator() if multi_page else None,
                 # The run sets it once its outcome is fixed, and from then on
