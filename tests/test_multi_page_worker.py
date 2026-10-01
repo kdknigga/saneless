@@ -376,14 +376,16 @@ class _FakePipeline:
     """
     A ``run_pipeline`` stand-in that announces one wait and asks one prompt.
 
-    Every run records its request.  When the request carries a pass
-    coordinator and a prompt was given, the run announces ``event``, waits for
-    ``go`` if one was given, asks the prompt, and then holds at ``hold`` if one
-    was given, so a test can look at the worker while the job is still live.
+    Every run records its request and announces SCANNING, as the real
+    pipeline does once it holds the scanner.  When the request carries a pass
+    coordinator and a prompt was given, the run then announces ``event``, waits
+    for ``go`` if one was given, asks the prompt, and then holds at ``hold`` if
+    one was given, so a test can look at the worker while the job is still
+    live.
 
     Args:
         prompt: The prompt to ask, or ``None`` to ask nothing.
-        event: The event to announce first, or ``None``.
+        event: The event to announce after SCANNING, or ``None``.
         go: A gate the run waits at before asking, or ``None``.
         hold: A gate the run waits at after asking, or ``None``.
 
@@ -415,6 +417,10 @@ class _FakePipeline:
     ) -> ScanResult:
         """Record the request, announce, ask, and hold."""
         self.requests.append(request)
+        if request.status_callback is not None:
+            # The real pipeline's first event: the worker records SCANNING
+            # from it, so the row leaves PENDING here and not before.
+            request.status_callback(PipelineEvent.SCANNING)
         if self._event is not None and request.status_callback is not None:
             request.status_callback(self._event)
         if self._go is not None:

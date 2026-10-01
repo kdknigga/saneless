@@ -1896,8 +1896,14 @@ class _BreakableWrite:
     it delegates to the real method, so the row the worker writes is the row
     the status poll reads back.
 
+    It also stands in for the worker's handling of a job.  SCANNING is a
+    progress write recorded under the scanner gate, and its failure is only
+    logged, so no store write is left ahead of the pipeline whose failure is
+    the loop's own: a store error escaping the job's handling is staged by
+    breaking that handling instead.
+
     Args:
-        original: The bound store method being replaced.
+        original: The bound store method, or job handling, being replaced.
         broken: Set while the store should refuse writes.
 
     """
@@ -1952,8 +1958,10 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
 
     with TestClient(app) as tc:
         job_store: JobStore = app.state.job_store
+        handling = _BreakableWrite(app.state.worker._scan_job, broken)
         updates = _BreakableWrite(job_store.update_state, broken)
         finishes = _BreakableWrite(job_store.finish_job, broken)
+        monkeypatch.setattr(app.state.worker, "_scan_job", handling)
         monkeypatch.setattr(job_store, "update_state", updates)
         monkeypatch.setattr(job_store, "finish_job", finishes)
 
@@ -1986,9 +1994,8 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
     """
     A job store that keeps refusing an owed write shows on ``/health``.
 
-    ROBU-01 success criterion 1, WR-10, D-10, D-12: the job's SCANNING write
-    and the guard's ERROR write fail, and every idle retry of the owed write
-    fails too.  After a short streak of failed retries the worker degrades, so
+    A store error escapes the job's handling and the guard's ERROR write
+    fails, and every idle retry of the owed write fails too.  After a short streak of failed retries the worker degrades, so
     ``/health`` answers 503 "job store failing" and a new scan is refused with
     503.  Once the store heals, the recovery probe and the owed write land:
     ``/health`` is 200 again and the status poll renders ``#scan-btn`` enabled.
@@ -2002,8 +2009,10 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
 
     with TestClient(app) as tc:
         job_store: JobStore = app.state.job_store
+        handling = _BreakableWrite(app.state.worker._scan_job, broken)
         updates = _BreakableWrite(job_store.update_state, broken)
         finishes = _BreakableWrite(job_store.finish_job, broken)
+        monkeypatch.setattr(app.state.worker, "_scan_job", handling)
         monkeypatch.setattr(job_store, "update_state", updates)
         monkeypatch.setattr(job_store, "finish_job", finishes)
 

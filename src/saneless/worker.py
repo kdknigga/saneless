@@ -2133,7 +2133,7 @@ class ScanWorker:
             self._scan_job(job, options)
         finally:
             # Cleared on every ending, a loop-level failure included, so a
-            # raise from the SCANNING write cannot leave a stale current job
+            # raise from the terminal write cannot leave a stale current job
             # or flip coordinator behind.  No prune here any more: it runs on
             # the idle tick, where its failure cannot fail a job.
             self._flip_coordinator = None
@@ -2216,18 +2216,25 @@ class ScanWorker:
         CANCELLED, and a server stop -- ``ScanInterrupted``, which is not an
         ``Exception`` and would otherwise end the worker thread -- as ERROR
         with the restart text for the last state the run announced, followed
-        by whatever the pipeline kept; neither is a failure.  The loop's own store
-        writes -- SCANNING before the pipeline, and the terminal write of
-        either outcome -- are never swallowed, so their failure escapes to
-        ``_run`` as a loop-level failure.  A failed terminal write is owed
-        first, with the outcome it meant to record.
+        by whatever the pipeline kept; neither is a failure.  The loop's own
+        store write -- the terminal write of either outcome -- is never
+        swallowed, so its failure escapes to ``_run`` as a loop-level failure.
+        A failed terminal write is owed first, with the outcome it meant to
+        record.
+
+        SCANNING is recorded when the pipeline reports it, which it does under
+        the scanner gate.  A job waiting behind a health check that holds the
+        gate has not started to scan, so its row stays PENDING and the status
+        area keeps its "Starting scan..." text until the scan really begins.
+        That makes SCANNING a progress write like any other active state:
+        logged and swallowed if the store refuses it.  A store that is really
+        broken is still caught, by the terminal write that follows.
 
         Args:
             job: The Job to process.
             options: The per-scan choices it was submitted with.
 
         """
-        self._job_store.update_state(job.id, JobState.SCANNING)
         # A previous job's preservation always clears it on the way out; this
         # is the belt to that brace, so a stop never waits on a stale flag.
         self._preserving.clear()
@@ -2270,16 +2277,17 @@ class ScanWorker:
                     exc_info=True,
                 )
 
-        # The worker persisted SCANNING just above, before starting the
-        # pipeline.  run_pipeline re-announces it as its first event; rewriting
-        # the state we just wrote would blank error/error_category a second
-        # time for no change of state.
-        persisted_state = JobState.SCANNING
+        # The row is still PENDING: SCANNING is the pipeline's first event,
+        # announced once this job holds the scanner gate, and it is persisted
+        # by the progress write below like every later state.
+        persisted_state = JobState.PENDING
         # The last active state the run announced, whether or not its write
         # landed.  A server stop words the row by it: an upload that had begun
         # may already be in paperless-ngx, even when the UPLOADING write failed
-        # and the row still reads an earlier state.
-        announced_state = JobState.SCANNING
+        # and the row still reads an earlier state.  PENDING until the first
+        # event, so a stop before the scan starts gets the restart text for a
+        # job that never reached the scanner.
+        announced_state = JobState.PENDING
 
         def _status_cb(event: PipelineEvent, _jid: str = job.id) -> None:
             nonlocal persisted_state, announced_state
