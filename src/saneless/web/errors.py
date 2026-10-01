@@ -89,11 +89,12 @@ RETRY_AFTER_SECONDS: Final = 30
 # ``partials/checks.html`` gives its swap target, and a test asserts the two
 # agree.
 #
-# Two elements in this application poll: the status strip, which this
-# exemption covers, and the status area, whose poll routes catch their own
-# failures and render a backing-off fallback rather than raising into this
-# handler.  An armed htmx poll is ended by exactly two things: the element
-# leaving the DOM
+# Four elements in this application poll: the status strip, which this
+# exemption covers, and three whose routes never raise into this handler --
+# the status area, whose poll routes catch their own failures and render a
+# backing-off fallback; the lazy list load; and a list's retry (see
+# ``get_metadata`` and ``probe_metadata``).  An armed htmx poll is ended by
+# exactly two things: the element leaving the DOM
 # (``ct()`` re-arms only while ``se(e)``, i.e. while the element is still
 # attached) or an HTTP 286.  Removing an attribute does not end it -- the loop
 # never re-reads ``hx-trigger``.  Retargeting the strip's own failure into
