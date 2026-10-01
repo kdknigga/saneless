@@ -103,13 +103,12 @@
   <p class="check-meta">{{ freshness_line }}</p>
   {# The id is what keeps a keyboard user on this button: it sits inside the
      body its own press replaces, and htmx puts focus back on the element with
-     the same id after the #checks-body swap.  The timeout is the button's own
-     because the probe behind it runs synchronously on the request thread, and
-     its worst case (checks.POLL_PROBE_ATTEMPT_CAP polls of 2 s, about 180 s)
-     is far past the page-wide 20 s in base.html; a request the browser gave up
-     on would drop a slow but valid answer.  It is on the button alone, so
-     nothing else inherits it. #}
+     the same id after the #checks-body swap.  The button carries no timeout
+     of its own: the probe behind it runs on the refresher thread, and the
+     route waits at most 2.5 s for it (routes.CHECK_AGAIN_WAIT_SECONDS) before
+     answering with the settling strip, so the page-wide 20 s in base.html
+     already outlasts every answer it can give. #}
   <button type="button" class="check-refresh secondary" id="checks-refresh"
-          hx-post="/api/checks/refresh" hx-target="#checks-body" hx-swap="outerHTML"
-          hx-request='{"timeout":180000}'>Check again</button>
+          hx-post="/api/checks/refresh" hx-target="#checks-body"
+          hx-swap="outerHTML">Check again</button>
 </div>

@@ -386,7 +386,7 @@ class TestReleaseManualClaim:
         """
         The floor exists to bound probe traffic, and a collapse made none.
 
-        ``probe_now`` returning False means another checker already owned the
+        ``request_probe`` reporting a collapse means another checker owned the
         probe, so this call issued no Paperless request, no saned dial and no
         filesystem write.  Charging it the interval would refuse the very next
         click for no traffic saved -- which is the second consequence WR-03

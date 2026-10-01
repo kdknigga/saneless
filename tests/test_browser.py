@@ -5160,30 +5160,58 @@ def _check_row(page: Page, name: str) -> Locator:
     return page.locator(f'.check-row:has(.check-name:text-is("{name}"))')
 
 
+# Seconds ``_probe_now`` waits for the probe it asked for to finish.  The test
+# scanner answers at once, so this bounds only what a broken probe would hang.
+_REQUESTED_PROBE_BUDGET = 30.0
+
+
+def _no_tick() -> None:
+    """Stand in for the refresher's background tick, and probe nothing."""
+
+
+def _pause_background_ticks(
+    server: _BrowserServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Keep the refresher thread running, but stop it probing on its own.
+
+    Left ticking, the refresher fills the cache on its first tick after a page
+    says someone is looking, so the cold window would be "however long a tick
+    takes" and a cold-start assertion would be racing a stopwatch. The thread
+    itself has to stay up: Check again hands its probe to that thread and runs
+    none of its own, so with the thread stopped no click would ever be
+    answered. Only the tick is replaced, and a requested probe never goes
+    through it.
+
+    Args:
+        server: The private server whose refresher is paused.
+        monkeypatch: Restores the real tick at teardown.
+
+    """
+    monkeypatch.setattr(server.app.state.refresher, "_tick", _no_tick)
+
+
 @pytest.fixture
 def cold_strip_server(
-    tmp_path: Path, egress_allowlist: list[str]
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[_BrowserServer]:
     """
     Serve a private app whose check cache is cold and stays cold until asked.
 
-    The background refresher is stopped rather than raced. Left running it
-    fills the cache on its first tick, so the cold window would be "however
-    long a tick takes" and the cold-start assertions would be racing a
-    stopwatch -- the flake T-30-84 exists to design out. Stopped, the strip
-    stays cold until the test itself asks for a probe through
+    The background refresher's ticks are paused rather than raced, so the
+    strip stays cold until the test itself asks for a probe through
     ``POST /api/checks/refresh``, which is the app's own probe-and-store path
     and not a reimplementation of it.
     """
     with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
-        assert server.app.state.refresher.stop(), "the refresher thread did not stop"
+        _pause_background_ticks(server, monkeypatch)
         egress_allowlist.append(server.url)
         yield server
 
 
 @pytest.fixture
 def stale_config_strip_server(
-    tmp_path: Path, egress_allowlist: list[str]
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[_BrowserServer]:
     """
     Serve a private app that found only a file under the superseded config name.
@@ -5194,8 +5222,9 @@ def stale_config_strip_server(
     three directories inside ``tmp_path``, so the search that the page reports
     is a search that really ran and the host's own ``/etc`` is never touched.
 
-    The refresher is stopped for the reason ``cold_strip_server`` stops it: the
-    test asks for the probe itself, so nothing here is racing a tick.
+    The refresher's ticks are paused for the reason ``cold_strip_server``
+    pauses them: the test asks for the probe itself, so nothing here is racing
+    a tick.
     """
     candidates = tuple(
         tmp_path / name / CONFIG_FILENAME for name in ("cfg-cwd", "cfg-xdg", "cfg-etc")
@@ -5206,14 +5235,14 @@ def stale_config_strip_server(
     settings = _browser_test_settings(tmp_path)
     settings._config_discovery = discover_config(candidates)
     with _serve(settings, _BrowserTestScanner()) as server:
-        assert server.app.state.refresher.stop(), "the refresher thread did not stop"
+        _pause_background_ticks(server, monkeypatch)
         egress_allowlist.append(server.url)
         yield server
 
 
 @pytest.fixture
 def refused_scanner_strip_server(
-    tmp_path: Path, egress_allowlist: list[str]
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[_BrowserServer]:
     """
     Serve a private app whose scanner host refuses the connection.
@@ -5225,7 +5254,8 @@ def refused_scanner_strip_server(
     Nothing leaves the machine: the dial is the server's, to 127.0.0.1, and
     the browser never makes it.
 
-    The refresher is stopped for the reason ``cold_strip_server`` stops it.
+    The refresher's ticks are paused for the reason ``cold_strip_server``
+    pauses them.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -5234,7 +5264,7 @@ def refused_scanner_strip_server(
     scanner = base.scanner.model_copy(update={"host": f"127.0.0.1:{closed_port}"})
     settings = base.model_copy(update={"scanner": scanner})
     with _serve(settings, _BrowserTestScanner()) as server:
-        assert server.app.state.refresher.stop(), "the refresher thread did not stop"
+        _pause_background_ticks(server, monkeypatch)
         egress_allowlist.append(server.url)
         yield server
 
@@ -5243,13 +5273,16 @@ def _probe_now(server: _BrowserServer) -> None:
     """
     Make the appliance probe and store its checks, from outside the browser.
 
-    ``POST /api/checks/refresh`` is the "Check again" route: it takes the
-    scanner gate without blocking, sets ``skip_scanner`` from the outcome, runs
-    the probes and stores them. Calling it over HTTP rather than clicking the
-    button leaves the *page* untouched, so what discovers the new results is
-    the strip's own poll -- which is the half of the cold-start contract under
-    test. Neither ``Origin`` nor ``Sec-Fetch-Site`` is sent, which is the
-    non-browser branch ``CrossOriginGuard`` allows by design.
+    ``POST /api/checks/refresh`` is the "Check again" route: it hands a probe
+    to the refresher thread, which sets ``skip_scanner`` from the worker's job
+    record, runs the probes and stores them, and it waits a bounded time for
+    the answer. This waits on until the probe has finished, so a caller that
+    opens the page next finds the results already stored. Calling it over HTTP
+    rather than clicking the button leaves the *page* untouched, so what
+    discovers the new results is the strip's own poll -- which is the half of
+    the cold-start contract under test. Neither ``Origin`` nor
+    ``Sec-Fetch-Site`` is sent, which is the non-browser branch
+    ``CrossOriginGuard`` allows by design.
 
     Args:
         server: The private server to probe.
@@ -5257,6 +5290,10 @@ def _probe_now(server: _BrowserServer) -> None:
     """
     response = httpx2.post(f"{server.url}/api/checks/refresh", timeout=30.0)
     assert response.status_code == 200, response.status_code
+    refresher = server.app.state.refresher
+    assert poll_until(lambda: not refresher.probe_in_flight, _REQUESTED_PROBE_BUDGET), (
+        "the requested probe never finished"
+    )
 
 
 @pytest.mark.browser
@@ -5789,9 +5826,10 @@ class TestColdStartPollIsBounded:
         """
         A cache that is never filled runs the poll out of attempts (IN-07).
 
-        ``cold_strip_server`` stops the refresher, which is the appliance whose
-        background thread has died -- the case IN-07 is about, and the one where
-        the poll's original terminating condition can never fire. The count is
+        ``cold_strip_server`` pauses the refresher's ticks, which to the page is
+        the appliance whose background thread has died -- the case this class
+        is about, and the one where the poll's original terminating condition
+        can never fire. The count is
         asserted against the cap now rather than merely recorded, and the
         stillness afterwards is asserted separately: a poll that had paused
         rather than stopped would have fired at least three times inside the

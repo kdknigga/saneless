@@ -84,7 +84,7 @@ from saneless.vocabulary import (
 )
 from saneless.web import app as app_module
 from saneless.web.app import create_app
-from saneless.web.routes import TAG_FILTER_MAX_LENGTH
+from saneless.web.routes import CHECK_AGAIN_WAIT_SECONDS, TAG_FILTER_MAX_LENGTH
 from saneless.worker import WorkerFlipCoordinator
 from tests.conftest import (
     StubScannerBackend,
@@ -3404,14 +3404,19 @@ def test_htmx_config_sets_a_request_timeout(client: TestClient) -> None:
     ]
 
 
-def test_check_again_has_a_stable_id_and_a_long_timeout(client: TestClient) -> None:
+def test_check_again_has_a_stable_id_and_a_timeout_above_its_wait(
+    client: TestClient,
+) -> None:
     """
-    Check again keeps focus across its own swap and waits out a slow probe.
+    Check again keeps focus across its own swap and outlasts the route's wait.
 
     htmx restores focus by id after an outerHTML swap, so the id is what keeps
     a keyboard user on the button once ``#checks-body`` is replaced.  The
-    probe behind it runs synchronously and can take minutes, far past the
-    global timeout, so the button carries its own, on the element itself.
+    route waits a bounded time for the refresher's probe and then answers
+    either way, so the request the browser makes must not give up first.
+    The effective timeout is the button's own when it carries one and the
+    page-wide one otherwise, and the minutes-long override that a probe on
+    the request thread once needed is gone.
     """
     page = client.get("/").text
     assert page.count('id="checks-refresh"') == 1
@@ -3420,10 +3425,15 @@ def test_check_again_has_a_stable_id_and_a_long_timeout(client: TestClient) -> N
     assert match is not None, "Check again button not rendered"
     button = match.group(0)
     assert 'id="checks-refresh"' in button
+    assert "180000" not in button
 
+    config = _HTMX_CONFIG.search(page)
+    assert config is not None, "htmx-config meta not rendered"
+    timeout_ms = json.loads(config.group("json"))["timeout"]
     request = re.search(r"hx-request='(?P<json>[^']*)'", button)
-    assert request is not None, button
-    assert json.loads(request.group("json"))["timeout"] >= 180000
+    if request is not None:
+        timeout_ms = json.loads(request.group("json"))["timeout"]
+    assert timeout_ms > CHECK_AGAIN_WAIT_SECONDS * 1000
 
 
 @pytest.mark.parametrize("state", list(JobState))

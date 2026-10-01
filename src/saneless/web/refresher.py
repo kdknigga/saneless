@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
 from saneless.checks import run_checks
@@ -18,7 +19,7 @@ if TYPE_CHECKING:
 
     from .checks_cache import CheckCache
 
-__all__ = ["TICK_SECONDS", "WATCH_WINDOW_SECONDS", "CheckRefresher"]
+__all__ = ["TICK_SECONDS", "WATCH_WINDOW_SECONDS", "CheckRefresher", "ManualProbe"]
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,25 @@ WATCH_WINDOW_SECONDS: Final = 90.0
 TICK_SECONDS: Final = 1.0
 
 
+class ManualProbe(StrEnum):
+    """
+    What a requested probe came to within the caller's wait.
+
+    The route reads it for one decision: whether the clicker's manual-refresh
+    claim was spent.  A collapsed request spent nothing and gets it back; a
+    done or pending one keeps it, because a probe ran or is running for it.
+    """
+
+    # A probe already held the lock when the request arrived, so nothing was
+    # asked for: that probe's store is imminent and is the answer.
+    COLLAPSED = "collapsed"
+    # A probe that started after the request finished inside the wait.
+    DONE = "done"
+    # The wait ended first, or the refresher is stopping.  The request stays
+    # outstanding until a probe serves it, and the strip asks again meanwhile.
+    PENDING = "pending"
+
+
 class CheckRefresher:
     """
     A daemon thread that refills the check cache, but only while someone looks.
@@ -49,8 +69,8 @@ class CheckRefresher:
     It follows :class:`~saneless.worker.ScanWorker` in every structural respect
     -- a daemon thread built in ``__init__`` and started separately,
     a ``_stopping`` :class:`threading.Event` set once by :meth:`stop`, an
-    ``Event.wait`` idle sleep rather than a blocking one so stopping wakes it
-    at once, a per-tick ``try``/``except Exception`` so nothing but stopping
+    idle sleep that stopping wakes at once rather than a blocking one, a
+    per-tick ``try``/``except Exception`` so nothing but stopping
     ends the loop, and a join bounded by the same
     ``STOP_JOIN_SECONDS`` imported from that module rather than redefined --
     or, when the lifespan brings both threads down against one deadline, by
@@ -98,6 +118,17 @@ class CheckRefresher:
         self._probe_lock = threading.Lock()
         # Set once by stop(); read by the idle wait, which it wakes at once.
         self._stopping = threading.Event()
+        # Guards _requested and _completed, and is what a waiting request and
+        # the idle loop both sleep on.  It is held only to read or move a
+        # counter, never across a probe, so a request thread never waits
+        # behind run_checks for it.
+        self._changed = threading.Condition()
+        # Generations of requested probes: how many have been asked for, and
+        # the highest one a finished probe served.  A probe serves every
+        # request made before it started, so the gap between the two is the
+        # work still owed.
+        self._requested = 0
+        self._completed = 0
         # Guards every read and every write of self._last_watched, and nothing
         # else.  Request threads write it and the refresher thread reads it.
         self._watch_lock = threading.Lock()
@@ -132,16 +163,11 @@ class CheckRefresher:
         """
         Assemble the dependencies for one probe, exactly as a tick would.
 
-        Public because the Refresh button probes from a request handler and
-        has to bypass the TTL to do it: routing that click through
-        :meth:`_tick` would do nothing at all while the cache is still fresh,
-        which is exactly when somebody who has just plugged the scanner back in
-        presses the button.  Handing the one factory back out is what keeps the
-        button's probe and the thread's probe building the *same* context,
-        instead of the route assembling a second one that could drift.
+        Every probe builds its context here, whether a tick or a request asked
+        for it, so the two cannot drift into different contexts.
 
         It builds a context and nothing else: no probe, no cache write and no
-        lock, so calling it from a request thread costs nothing.
+        lock, so calling it from any thread costs nothing.
 
         Returns:
             A context with ``skip_scanner`` unset.  :meth:`_probe_and_store`
@@ -166,9 +192,10 @@ class CheckRefresher:
         instead of one per thread is the single deadline the lifespan takes
         before either join and passes to :meth:`stop`.
 
-        Setting the event is the whole of it, so this never blocks, and calling
-        it on a refresher that was never started -- a lifespan that failed
-        during startup -- is safe.
+        Setting the event and waking whoever sleeps on the condition is the
+        whole of it, and the condition is never held across a probe, so this
+        never waits on one.  Calling it on a refresher that was never started
+        -- a lifespan that failed during startup -- is safe.
 
         The same event is the abort every probe runs under, so it also stops
         a probe in flight: a scanner listing ends within a fraction of a
@@ -177,8 +204,14 @@ class CheckRefresher:
         wait out a listing for up to its whole deadline, far past the few
         seconds an idle server is given to shut down.  This thread never
         signals the child itself; it only sets the event.
+
+        A request waiting in :meth:`request_probe` is woken as well and told
+        its probe is still pending, so no request thread waits out its whole
+        wait on a refresher that is going away.
         """
-        self._stopping.set()
+        with self._changed:
+            self._stopping.set()
+            self._changed.notify_all()
 
     def stop(self, timeout: float | None = None) -> bool:
         """
@@ -220,15 +253,31 @@ class CheckRefresher:
         """
         Tick until stopped, and let nothing but stopping end the loop.
 
-        ``Event.wait`` is the idle sleep here, and a blocking sleep is never
-        used: setting the event returns from the wait immediately, so
-        ``stop()`` wakes the thread at once instead of after a full tick.  That
-        is the same property ``queue.shutdown(immediate=True)`` gives the
-        worker's blocked ``get()``.
+        A ``Condition.wait_for`` is the idle sleep here, and a blocking sleep
+        is never used: a stop or a request notifies the condition and returns
+        from the wait immediately, so ``stop()`` wakes the thread at once
+        instead of after a full tick, and Check again's probe starts at once
+        instead of on the next one.  That is the same property
+        ``queue.shutdown(immediate=True)`` gives the worker's blocked ``get()``.
+
+        A requested probe bypasses :meth:`_tick`'s two guards: the TTL would
+        turn the click away while the cache is fresh, which is exactly when
+        somebody who has just plugged the scanner back in presses the button,
+        and somebody pressing a button is by definition somebody watching.
+        Only this thread calls :meth:`_probe_and_store`, so the request cannot
+        collapse here.
         """
-        while not self._stopping.wait(TICK_SECONDS):
+        while True:
+            with self._changed:
+                self._changed.wait_for(self._woken, TICK_SECONDS)
+                requested = self._requested > self._completed
+            if self._stopping.is_set():
+                return
             try:
-                self._tick()
+                if requested:
+                    _ = self._probe_and_store()
+                else:
+                    self._tick()
             except Exception:
                 # The backstop ``ScanWorker._run`` puts round each job, for
                 # the rule it names there: nothing ends the loop but stopping.
@@ -240,6 +289,18 @@ class CheckRefresher:
                 # stays outside the guard, so stopping is still the one thing
                 # that ends the loop.
                 logger.exception("Check refresher tick failed; continuing")
+
+    def _woken(self) -> bool:
+        """
+        Say whether the idle loop has something to do before its next tick.
+
+        Called by ``wait_for`` with the condition held.
+
+        Returns:
+            Whether a stop was asked for or a requested probe is still owed.
+
+        """
+        return self._stopping.is_set() or self._requested > self._completed
 
     @property
     def probe_in_flight(self) -> bool:
@@ -262,41 +323,66 @@ class CheckRefresher:
         the other way round, a probe landing between the two reads leaves a
         body with the old rows and no reason to ask again.
 
-        Returns:
-            True while a probe holds the single-flight lock.
-
-        """
-        return self._probe_lock.locked()
-
-    def probe_now(self) -> bool:
-        """
-        Probe at once, whatever the TTL and the watch window say.
-
-        This is the Refresh button's path.  It bypasses both guards
-        deliberately: ``_tick`` returns early on a fresh cache, which is
-        precisely the first thirty seconds after a page load -- exactly when
-        somebody who has just plugged the scanner back in presses the button --
-        and somebody pressing a button is, by definition, somebody watching.
-
-        It exists so the route and the refresher thread cannot drift into two
-        probe implementations.  They had drifted, and three separate bugs came
-        from the same block existing twice.  Both callers
-        now go through :meth:`_probe_and_store`; neither this nor ``_tick``
-        calls the other, which is the discipline ``job.py``'s
-        ``TestLockDiscipline`` enforces for public-to-public self-calls.
+        A requested probe that has not finished counts as in flight too, from
+        the moment it is asked for, so a request answered as pending leaves a
+        page that keeps asking.  The counters are read without the condition:
+        each read is atomic, and a stale answer is harmless for the same
+        reason as above, because ``_completed`` moves only after the store.
 
         Returns:
-            True when this call took the probe and ran it, and False when it
-            collapsed into one already in flight.  ``False`` tells the one
-            caller that reads it -- ``routes.refresh_checks`` -- three things:
-            another checker owns the probe, that checker's ``store`` is
-            imminent, and this call did nothing at all.  The handler owes the
-            page a way to collect the imminent answer, and owes the clicker
-            their manual-refresh claim back, because a collapse cost no
-            Paperless request, no saned dial and no filesystem write.
+            True while a probe holds the single-flight lock, or a requested
+            probe has not yet completed.
 
         """
-        return self._probe_and_store()
+        return self._probe_lock.locked() or self._requested > self._completed
+
+    def request_probe(self, *, wait: float) -> ManualProbe:
+        """
+        Ask the refresher thread for a probe now, and wait a bounded time for it.
+
+        This is Check again's path.  The probe runs on the refresher thread and
+        never on the caller's: libsane is not reentrant, a probe can sit in a
+        ``getaddrinfo`` for minutes, and a request thread still inside one
+        would keep the server alive past its shutdown budget.  So the caller
+        only signals, and waits at most ``wait`` seconds for the answer.
+
+        It also keeps the route and the refresher thread from drifting into
+        two probe implementations.  They once had, and three separate bugs came
+        from the same block existing twice.  The only probe is
+        :meth:`_probe_and_store`, and only the refresher thread calls it.
+
+        A probe that *starts* after the request serves it, so a due tick that
+        wins the race answers the request too, and two requests made before a
+        probe starts share it.  The condition is held only to move the
+        counters and is released while waiting, and never while a probe runs.
+
+        Args:
+            wait: The most seconds to wait for the probe to finish.  A probe
+                still running when it ends goes on running, and stores what
+                it finds for the strip to collect.
+
+        Returns:
+            ``COLLAPSED`` at once when a probe already holds the lock: its
+            store is imminent and nothing was asked for.  ``DONE`` when a
+            probe that started after the request finished inside the wait,
+            whether or not it stored.  ``PENDING`` when the wait ended first,
+            or the refresher is stopping and will serve nothing more.
+
+        """
+        with self._changed:
+            if self._stopping.is_set():
+                return ManualProbe.PENDING
+            if self._probe_lock.locked():
+                return ManualProbe.COLLAPSED
+            self._requested += 1
+            ticket = self._requested
+            self._changed.notify_all()
+            self._changed.wait_for(
+                lambda: self._completed >= ticket or self._stopping.is_set(),
+                max(0.0, wait),
+            )
+            done = self._completed >= ticket
+        return ManualProbe.DONE if done else ManualProbe.PENDING
 
     def _probe_and_store(self) -> bool:
         """
@@ -341,6 +427,12 @@ class CheckRefresher:
         and a run that ended that way, or that finished after the stop was
         asked for, stores nothing, for the same last-known-good reason.
 
+        The probe serves every request made before it took the lock, and says
+        so once it has finished, whatever it came to -- stored, failed or
+        aborted -- so no waiting request is left waiting for a probe that has
+        already run.  The lock is released first, so a request answered here
+        renders with no probe in flight.
+
         Returns:
             "Did this call probe", which is deliberately *not* "did this call
             store".  The ``except`` arm probed and stored nothing, and it
@@ -353,6 +445,10 @@ class CheckRefresher:
         """
         if not self._probe_lock.acquire(blocking=False):
             return False
+        # Read after the lock is taken: a request that found the lock free has
+        # already counted itself by the time the condition is ours.
+        with self._changed:
+            serving = self._requested
         try:
             context = replace(
                 self.build_context(),
@@ -370,6 +466,9 @@ class CheckRefresher:
             logger.exception("Check refresh failed; keeping the previous results")
         finally:
             self._probe_lock.release()
+            with self._changed:
+                self._completed = max(self._completed, serving)
+                self._changed.notify_all()
         return True
 
     def _tick(self) -> None:
@@ -378,8 +477,9 @@ class CheckRefresher:
 
         The refresh *policy* lives here and only here, and it is a plain
         synchronous method so the tests can call it with no thread running.
-        The probe itself lives in :meth:`_probe_and_store`, which the Refresh
-        button reaches through :meth:`probe_now`.
+        The probe itself lives in :meth:`_probe_and_store`, which a Check again
+        request reaches through :meth:`request_probe` and the refresher
+        thread's own loop.
 
         Two guards come first, in this order: nobody is watching, and the
         cache is still fresh.  Either one means no probe, which is
@@ -392,7 +492,7 @@ class CheckRefresher:
             return
         if self._cache.is_fresh():
             return
-        # The boolean is dropped deliberately.  It exists for the request
-        # handler, which owes an answer to a page; the thread has nobody
-        # waiting on this tick and will come round again on the next one.
+        # The boolean is dropped deliberately.  A tick has nobody waiting on
+        # it and will come round again on the next one, and a request it
+        # happens to serve hears so through the generation counters.
         _ = self._probe_and_store()

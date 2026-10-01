@@ -1479,7 +1479,7 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     app = create_app(settings, scanner)
     app.state.paperless.get_tags = lambda *, timeout=None: []
     app.state.paperless.get_correspondents = lambda *, timeout=None: []
-    app.state.paperless.test_connection = lambda: "connected"
+    app.state.paperless.test_connection = lambda timeout=None: "connected"
     app.state.paperless.upload_document = lambda *_a, **_k: ApiDelivery(
         task_id="d-19-proof"
     )

@@ -500,8 +500,9 @@ class _ConnectionProbe:
         self.answer = answer
         self.calls = 0
 
-    def __call__(self) -> str:
-        """Count the call, then answer or raise."""
+    def __call__(self, *, timeout: object = None) -> str:
+        """Count the call, then answer or raise, whatever the timeout."""
+        _ = timeout
         self.calls += 1
         if self.answer is None:
             msg = "boom"

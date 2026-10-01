@@ -30,6 +30,8 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+import threading
+import time
 from contextlib import contextmanager
 from html import unescape
 from pathlib import Path
@@ -73,14 +75,13 @@ from saneless.web.checks_cache import MIN_MANUAL_REFRESH_SECONDS, CheckCache
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable, Generator, Iterator
 
     from starlette.datastructures import State
 
     from saneless.checks import CheckContext
     from saneless.web.checks_cache import CachedChecks
-    from saneless.web.refresher import CheckRefresher
+    from saneless.web.refresher import CheckRefresher, ManualProbe
 
 # The paused Scanner row, quoted from UI-SPEC S1 so the route test fails if the
 # registry's sentence and the page's sentence ever drift apart (D-02).
@@ -94,6 +95,11 @@ _CHECKS_BODY = re.compile(r'<div id="checks-body"(?P<attrs>[^>]*)>', re.DOTALL)
 _HX_GET = re.compile(r'hx-get="(?P<url>[^"]+)"')
 _CHECK_ROW = re.compile(r'<li class="check-row">(?P<row>.*?)</li>', re.DOTALL)
 _CHECK_META = re.compile(r'<p class="check-meta">(?P<text>.*?)</p>', re.DOTALL)
+
+# The longest a held probe waits for its test to release it.  It bounds what a
+# failing test leaks into the refresher thread, and nothing waits it out on a
+# passing run.
+_HELD_PROBE_SECONDS = 10.0
 
 
 class _StubScanner(StubScannerBackend):
@@ -134,9 +140,8 @@ class _RecordingRefresher:
     tick -- no background probe can land mid-assertion and fill the cache a
     cold-start test just emptied.
 
-    :meth:`build_context` is delegated rather than faked, because the refresh
-    route probes through it and the context it hands over is the real one the
-    application assembled.
+    :meth:`build_context` is delegated rather than faked, so the context any
+    caller sees is the real one the application assembled.
     """
 
     def __init__(self, real: CheckRefresher) -> None:
@@ -158,19 +163,33 @@ class _RecordingRefresher:
         """
         return self._real.build_context()
 
-    def probe_now(self) -> bool:
+    def request_probe(self, *, wait: float) -> ManualProbe:
         """
-        Probe through the real refresher, which owns the one probe path.
+        Ask the real refresher's thread for a probe, which owns the one probe path.
 
-        The boolean is forwarded rather than invented.  A stub returning
-        ``None`` would make the handler read every call as a collapse, and the
+        The answer is forwarded rather than invented.  A stub returning a
+        constant would make the handler read every call the same way, and the
         collapse tests below would pass for entirely the wrong reason.
 
+        Args:
+            wait: The most seconds the handler waits for the probe.
+
         Returns:
-            Whether this call took the probe or collapsed into one in flight.
+            Whether the request collapsed, was served in time, or is pending.
 
         """
-        return self._real.probe_now()
+        return self._real.request_probe(wait=wait)
+
+    @property
+    def thread_name(self) -> str:
+        """
+        The name of the real refresher's thread, the one every probe runs on.
+
+        Returns:
+            The thread name a probe spy should have recorded.
+
+        """
+        return self._real._thread.name
 
     @property
     def probe_in_flight(self) -> bool:
@@ -209,6 +228,7 @@ class _ProbeSpy:
         self.calls = 0
         self.contexts: list[CheckContext] = []
         self.gates: list[threading.Lock | None] = []
+        self.threads: list[str] = []
 
     def __call__(
         self, context: CheckContext, *, scanner_gate: threading.Lock | None = None
@@ -227,7 +247,39 @@ class _ProbeSpy:
         self.calls += 1
         self.contexts.append(context)
         self.gates.append(scanner_gate)
+        self.threads.append(threading.current_thread().name)
         return _synthetic_results()
+
+
+class _HeldProbeSpy(_ProbeSpy):
+    """A ``_ProbeSpy`` whose probe waits until the test lets it finish."""
+
+    def __init__(self) -> None:
+        """Start held, with nothing entered yet."""
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(
+        self, context: CheckContext, *, scanner_gate: threading.Lock | None = None
+    ) -> tuple[CheckResult, ...]:
+        """
+        Announce the probe, wait for the release, then record it as usual.
+
+        The wait is bounded, so a test that never releases fails on its own
+        assertions instead of wedging the refresher thread.
+
+        Args:
+            context: The context the refresher built for this probe.
+            scanner_gate: The gate the probe handed in rather than held.
+
+        Returns:
+            One ``OK`` result per ``CheckKey`` member, in member order.
+
+        """
+        self.entered.set()
+        self.release.wait(_HELD_PROBE_SECONDS)
+        return super().__call__(context, scanner_gate=scanner_gate)
 
 
 def _synthetic_results() -> tuple[CheckResult, ...]:
@@ -487,9 +539,9 @@ def _spy(monkeypatch: pytest.MonkeyPatch) -> _ProbeSpy:
     Replace the refresher module's ``run_checks`` with a counting stand-in.
 
     The refresher module's reference is the one patched, because the refresh
-    handler no longer runs the registry itself: it goes through
-    ``CheckRefresher.probe_now``, which is the single probe implementation both
-    the button and the background thread share.
+    handler runs no registry itself: it hands its probe to the refresher
+    thread through ``CheckRefresher.request_probe``, and that thread's probe is
+    the single implementation both the button and the background ticks share.
 
     Returns:
         The spy, whose ``calls`` is the number of probes the request made.
@@ -1262,7 +1314,7 @@ class TestTheStripSurvivesItsOwnFailure:
         def boom(*_args: object, **_kwargs: object) -> bool:
             raise RuntimeError(_CHECKS_BOOM_MARKER)
 
-        monkeypatch.setattr(_app(client).state.refresher, "probe_now", boom)
+        monkeypatch.setattr(_app(client).state.refresher, "request_probe", boom)
         with pytest.raises(RuntimeError, match=_CHECKS_BOOM_MARKER):
             client.post("/api/checks/refresh")
 
@@ -1435,6 +1487,136 @@ class TestRefreshButton:
         finally:
             lock.release()
         assert spy.calls == 0
+
+
+class TestCheckAgainOnTheRefresherThread:
+    """
+    Check again hands its probe to the refresher thread and waits a bounded time.
+
+    The request thread never enters the registry.  The scanner check reaches
+    a C library that is not reentrant, and a probe can take far longer than a
+    server is given to shut down, so a request thread still inside one would
+    hold the process open.  The route signals, waits, and answers either way.
+    """
+
+    def test_check_again_probes_on_the_refresher_thread(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one probe a click asks for ran on the refresher thread."""
+        spy = _spy(monkeypatch)
+        assert client.post("/api/checks/refresh").status_code == 200
+        assert spy.threads == [_refresher(client).thread_name]
+
+    def test_a_fast_probe_renders_in_the_same_response(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A probe that finishes inside the wait is the response, settled."""
+        _spy(monkeypatch)
+        response = client.post("/api/checks/refresh")
+        assert response.status_code == 200
+        assert "hx-trigger" not in _body_attrs(response.text)
+        assert len(_CHECK_ROW.findall(response.text)) == len(CheckKey)
+        assert f"{CheckKey.SCANNER.value} row." in response.text
+
+    def test_a_slow_probe_returns_the_settling_strip(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        A probe still running at the end of the wait leaves the strip asking.
+
+        The response arrives while the probe is still held, carrying the
+        trigger that collects its answer, and the answer is there once the
+        probe finishes.
+        """
+        spy = _HeldProbeSpy()
+        monkeypatch.setattr(refresher_module, "run_checks", spy)
+        try:
+            began = time.monotonic()
+            response = client.post("/api/checks/refresh")
+            elapsed = time.monotonic() - began
+
+            assert response.status_code == 200
+            assert elapsed < 4.0
+            assert elapsed >= routes_module.CHECK_AGAIN_WAIT_SECONDS - 0.5
+            assert spy.entered.is_set()
+            assert spy.calls == 0
+            assert "hx-trigger" in _body_attrs(response.text)
+        finally:
+            spy.release.set()
+
+        assert poll_until(
+            lambda: not _refresher(client).probe_in_flight, _HELD_PROBE_SECONDS
+        )
+        settled = client.get("/api/checks")
+        assert "hx-trigger" not in _body_attrs(settled.text)
+        assert f"{CheckKey.SCANNER.value} row." in settled.text
+
+    def test_a_refused_click_returns_at_once(
+        self,
+        clocked: _Clocked,
+        monkeypatch: pytest.MonkeyPatch,
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """A click the floor refuses waits for nothing, and asks for nothing."""
+        client, _clock = clocked
+        monkeypatch.setattr(routes_module, "CHECK_AGAIN_WAIT_SECONDS", 0.2)
+        spy = _HeldProbeSpy()
+        monkeypatch.setattr(refresher_module, "run_checks", spy)
+        try:
+            assert client.post("/api/checks/refresh").status_code == 200
+            began = time.monotonic()
+            refused = client.post("/api/checks/refresh")
+            elapsed = time.monotonic() - began
+        finally:
+            spy.release.set()
+
+        assert refused.status_code == 200
+        assert elapsed < 1.0
+        assert poll_until(
+            lambda: not _refresher(client).probe_in_flight, _HELD_PROBE_SECONDS
+        )
+        assert spy.calls == 1
+
+    def test_a_collapsed_click_releases_its_claim(
+        self,
+        clocked: _Clocked,
+        monkeypatch: pytest.MonkeyPatch,
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        A click that lands on a running probe returns at once and costs no claim.
+
+        The third click is inside the floor of the second, so it is honoured
+        only if the collapsed second click gave its claim back.
+        """
+        client, clock = clocked
+        monkeypatch.setattr(routes_module, "CHECK_AGAIN_WAIT_SECONDS", 0.2)
+        spy = _HeldProbeSpy()
+        monkeypatch.setattr(refresher_module, "run_checks", spy)
+        try:
+            first = client.post("/api/checks/refresh")
+            assert "hx-trigger" in _body_attrs(first.text)
+            assert spy.entered.wait(_HELD_PROBE_SECONDS) is True
+            clock.advance(MIN_MANUAL_REFRESH_SECONDS + 1.0)
+
+            began = time.monotonic()
+            collapsed = client.post("/api/checks/refresh")
+            elapsed = time.monotonic() - began
+        finally:
+            spy.release.set()
+
+        assert collapsed.status_code == 200
+        assert elapsed < 1.0
+        assert "hx-trigger" in _body_attrs(collapsed.text)
+        assert poll_until(
+            lambda: not _refresher(client).probe_in_flight, _HELD_PROBE_SECONDS
+        )
+        assert spy.calls == 1
+        assert client.post("/api/checks/refresh").status_code == 200
+        assert spy.calls == 2
 
 
 class TestRefreshMinimumInterval:
@@ -2070,7 +2252,7 @@ class TestRouteShape:
         only thing that can see it.
         """
         source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        assert source.count("probe_now()") == 1
+        assert source.count("request_probe(") == 1
 
     def test_routes_py_runs_no_registry_of_its_own(self) -> None:
         """

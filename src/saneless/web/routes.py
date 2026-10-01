@@ -103,6 +103,7 @@ from saneless.web.job_view import (
     owns_detail,
     scrub_for_owner,
 )
+from saneless.web.refresher import ManualProbe
 from saneless.worker import ScanOptions
 
 if TYPE_CHECKING:
@@ -219,6 +220,20 @@ refusing one of them: unauthenticated, unbounded upstream traffic, each request
 holding a worker thread for up to the connect budget.  Five seconds still lets
 a page left open recover soon after paperless-ngx is back.  Read at call time,
 not bound where it is used.
+"""
+
+CHECK_AGAIN_WAIT_SECONDS: Final = 2.5
+"""
+The most seconds Check again waits for the probe it handed to the refresher.
+
+A probe that finishes inside it is rendered in the same response, which is
+the usual case on a healthy appliance.  A slower one returns the strip with
+its settling poll, which collects the answer when the probe stores it.  The
+wait is far inside the ten seconds an idle server is given to stop, so a
+request waiting here never holds a shutdown open.  Only a click the
+manual-refresh floor admits waits at all, so a loop of clicks holds at most
+one waiting worker thread per floor interval.  Read at call time, not bound
+where it is used.
 """
 
 # The only metadata resources the cache holds.  A runtime alias, not a
@@ -528,8 +543,11 @@ def _checks_context(
     background probe issues a small, capped number of extra cache reads before
     it settles.  Each is a cache read and never a probe, and the count is
     bounded by ``POLL_PROBE_ATTEMPT_CAP``.
-    ``probe_in_flight`` is a ``locked()`` read and never an acquire, so no
-    request thread can be parked behind the probe it is asking about.
+    ``probe_in_flight`` is a ``locked()`` read and two counter reads, never an
+    acquire, so no request thread can be parked behind the probe it is asking
+    about.  It is also true for a Check again probe the refresher has been
+    asked for and not yet finished, which is what keeps a click answered as
+    pending asking for its result.
 
     ``gave_up`` means "this cold chain has stopped", and it is measured against
     the *applicable* cap rather than always against ``POLL_ATTEMPT_CAP``.  It
@@ -2463,19 +2481,25 @@ def paperless_test(request: Request) -> JSONResponse:
     token-bearing request to paperless-ngx per window rather than one per
     call.  Concurrent callers do not each probe either, and while a probe is
     in flight a caller with a previous answer gets that answer at once rather
-    than holding a worker thread behind it -- against an unreachable
-    paperless-ngx the probe takes the client's full timeout.  Only the very
-    first callers, before any answer exists, wait for the probe, two at most
-    at a time; a wait that outlasts its bound, and a caller refused a place
-    to wait, answers 503 naming ``TimeoutError``, with a ``Retry-After``
-    header saying when to ask again.  That answer is not shared: the caller
-    never got a turn, so there is no result to reuse.
+    than holding a worker thread behind it.
+
+    The probe runs on the status strip's budget, ``_REQUEST_FETCH_TIMEOUT``
+    (2 s to connect, 5 s to read), not the client's own 30 s default, so
+    against an unreachable paperless-ngx it ends within seconds.  Only the
+    very first callers, before any answer exists, wait for the probe, two at
+    most at a time, and for at most ``PAPERLESS_TEST_WAIT_SECONDS``: longer
+    than the probe budget, so a follower shares the answer, and shorter than
+    the time an idle server is given to stop, so no request waiting here
+    holds a shutdown open.  A wait that outlasts its bound, and a caller
+    refused a place to wait, answers 503 naming ``TimeoutError``, with a
+    ``Retry-After`` header saying when to ask again.  That answer is not
+    shared: the caller never got a turn, so there is no result to reuse.
     """
     state = request.app.state
 
     def probe() -> _PaperlessTestAnswer:
         try:
-            status = state.paperless.test_connection()
+            status = state.paperless.test_connection(timeout=_REQUEST_FETCH_TIMEOUT)
         except Exception as exc:
             return _paperless_test_error(exc)
         return _PaperlessTestAnswer(status_code=200, body={"status": str(status)})
@@ -3308,21 +3332,26 @@ def refresh_checks(request: Request) -> Response:
     """
     Re-probe every check now, bypassing the TTL, and render the result.
 
-    This is the one handler in this module allowed to probe, and the bypass is
-    the whole point of the button.  Routing the click through the refresher's
-    *policy* would do nothing for the first thirty seconds after a page load --
-    ``_tick`` returns early on a fresh cache -- which is precisely when
-    somebody who has just plugged the scanner back in presses it.  So it goes
-    through the refresher's *probe* instead: ``probe_now`` is the same
-    implementation the background thread runs, reached without the two guards,
-    which is what keeps the button and the thread from drifting into two
-    probes that disagree.
+    The bypass is the whole point of the button.  Routing the click through the
+    refresher's *policy* would do nothing for the first thirty seconds after a
+    page load -- ``_tick`` returns early on a fresh cache -- which is precisely
+    when somebody who has just plugged the scanner back in presses it.  So the
+    click asks the refresher for a probe with ``request_probe``, and the
+    refresher's own thread runs it without the two guards.
 
-    Concurrent clicks collapse.  ``probe_now`` admits one checker at a time and
+    This thread never probes.  It signals and then waits at most
+    ``CHECK_AGAIN_WAIT_SECONDS`` for the answer: a probe that finishes inside
+    that is rendered here, and a slower one leaves ``probe_in_flight`` true, so
+    the strip rendered below carries the settling poll that collects it.  A
+    request thread still inside a probe would hold the server open past its
+    shutdown budget, and would be a second caller into a scanner library that
+    is not reentrant.
+
+    Concurrent clicks collapse.  The refresher admits one probe at a time and
     a click landing while a probe is in flight re-renders the current strip
-    rather than probing again: the answer is seconds away, and a second probe
-    would cost a Paperless request and two filesystem writes to produce it
-    twice.
+    rather than asking for another, at once and without waiting: the answer is
+    seconds away, and a second probe would cost a Paperless request and two
+    filesystem writes to produce it twice.
 
     The collapse used to cost the clicker three things.
     The strip rendered was the cache *as it stood* -- the pre-probe entry,
@@ -3331,8 +3360,8 @@ def refresh_checks(request: Request) -> Response:
     to pick up the result that probe landed a second later; the button could
     visibly do nothing.  And the claim was stamped before the collapse was
     discovered, so the next click inside two seconds was refused too: nothing,
-    twice in a row.  All three close here.  ``probe_now`` now reports whether
-    it probed, so a collapse is a fact rather than a guess; on a collapse the
+    twice in a row.  All three close here.  ``request_probe`` reports a
+    collapse, so a collapse is a fact rather than a guess; on a collapse the
     claim goes back, because a collapse issued no Paperless request, no saned
     dial and no filesystem write and so bought none of the traffic the floor
     exists to bound; and ``_checks_context`` sees the same lock still held and
@@ -3349,9 +3378,12 @@ def refresh_checks(request: Request) -> Response:
 
     There is one render path and it is the last statement.  The context decides
     the trigger from ``probe_in_flight``, which is still ``True`` on the
-    collapse branch -- the other checker has not released yet -- so the one
-    render covers both outcomes, and there is no second response and no
-    "poll once" flag for a later reader to keep in step with the template.
+    collapse branch -- the other checker has not released yet -- and on a
+    probe still pending at the end of the wait, so the one render covers every
+    outcome, and there is no second response and no "poll once" flag for a
+    later reader to keep in step with the template.  A click the probe
+    answered in time and a pending one both keep their claim: a probe ran, or
+    is running, for each.
 
     That render is guarded the way ``get_checks``'s is, and only the render.
     ``_checks_context`` raising here used to be a 500, and because the button
@@ -3361,9 +3393,10 @@ def refresh_checks(request: Request) -> Response:
     the only button that could bring them back.  Now a failure inside the
     strip's rendering ends as ``_checks_fallback_context`` at 200 on this route
     too, so the strip and the button stay on the page.  Everything before the
-    render -- the watcher stamp, the claim, the probe -- is the click's action
-    rather than the strip's drawing, and stays outside the guard on purpose: a
-    probe that raises is a failed click, and a failed click is reported like
+    render -- the watcher stamp, the claim, the probe request -- is the click's
+    action rather than the strip's drawing, and stays outside the guard on
+    purpose: a request that raises is a failed click, and a failed click is
+    reported like
     every other one, as an error in the message slot with the strip left as it
     was.
 
@@ -3385,8 +3418,8 @@ def refresh_checks(request: Request) -> Response:
     the previous entry in place -- and a strip that blanked would be worse than
     one still showing what was true a moment ago.
 
-    The bypass has a floor under it.  This is the one handler permitted to
-    probe and it is unauthenticated by design on a LAN -- ``CrossOriginGuard``
+    The bypass has a floor under it.  This is the one handler that can ask for
+    a probe and it is unauthenticated by design on a LAN -- ``CrossOriginGuard``
     allows a request carrying neither ``Sec-Fetch-Site`` nor ``Origin``, which
     is what a non-browser client sends -- so without a minimum interval a loop
     turns one click into unbounded Paperless requests, saned dials and
@@ -3402,7 +3435,11 @@ def refresh_checks(request: Request) -> Response:
     state = request.app.state
     state.refresher.note_watcher()
     claim = state.checks.claim_manual_refresh()
-    if claim is not None and not state.refresher.probe_now():
+    if (
+        claim is not None
+        and state.refresher.request_probe(wait=CHECK_AGAIN_WAIT_SECONDS)
+        is ManualProbe.COLLAPSED
+    ):
         state.checks.release_manual_claim(claim)
     try:
         context = _checks_context(state)
