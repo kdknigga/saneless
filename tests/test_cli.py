@@ -6865,15 +6865,74 @@ class TestFailureAdvice:
         assert result.exit_code == 5
         assert "Try: " not in result.stderr
 
-    def test_a_storage_error_gets_no_advice_line(
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_a_raise_site_next_step_replaces_the_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """
+        A raise site that knows the fix is advised by it, not by its category.
+
+        Line 1 is unchanged; only line 2 moves from the category's fallback to
+        the error's own next step.
+        """
+        exc = exc_type("boom", next_step="Do y.")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines == [_failure_line(exc, category), "Try: Do y."]
+        assert result.exit_code == int(exit_code_for(category))
+
+    def test_a_next_step_has_its_control_characters_shown_as_escapes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """StorageError has its own arm and its own line; it gains no advice."""
-        result = _scan_raising(monkeypatch, StorageError("db is unreadable"))
+        """A next step is neutralised like the failure line, so it stays one line."""
+        exc = ConfigError("boom", next_step="Do \x1b[31m y.\nThen z.")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines == ["boom", "Try: Do \\x1b[31m y.\\nThen z."]
+
+    def test_a_storage_error_gets_advice(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A job database saneless cannot use ends with a ``Try:`` line too.
+
+        ``StorageError`` has its own arm, ahead of the classified one, so it
+        has to print the advice itself: its first line is unchanged and the
+        second is the configuration fallback.
+        """
+        runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+
+        def unusable_store(*_args: object, **_kwargs: object) -> NoReturn:
+            msg = "db is unreadable"
+            raise StorageError(msg)
+
+        monkeypatch.setattr("saneless.cli.JobStore", unusable_store)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 2, result.output
+        assert result.stderr.splitlines() == [
+            "Job database error: db is unreadable",
+            f"Try: {error_next_step(ErrorCategory.CONFIG)}",
+        ]
+
+    def test_a_storage_error_with_its_own_next_step_prints_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``StorageError`` that knows its fix is advised by it."""
+        exc = StorageError("db is unreadable", next_step="Do y.")
+        result = _scan_raising(monkeypatch, exc)
 
         assert result.exit_code == 2
-        assert result.stderr.startswith("Job database error: db is unreadable")
-        assert "Try: " not in result.stderr
+        assert result.stderr.splitlines() == [
+            "Job database error: db is unreadable",
+            "Try: Do y.",
+        ]
 
     def test_a_cancelled_scan_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7594,6 +7653,46 @@ class TestServeLogging:
         assert cli_module._VERBOSE_HINT not in result.stderr
         assert "Full details in" not in result.stderr
         assert "Traceback" in result.stderr
+
+    def test_serve_logs_an_expected_failure_without_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A port that is taken is a setup problem, reported with no traceback.
+
+        The real ``configure_logging`` runs, so the stream handler that would
+        render a traceback is really attached: a stub that attaches nothing
+        would pass this test whatever the guard logged.  The port is held by a
+        real listening socket, so the bind failure is the real one.  The
+        record still names the failure, and the failure line is printed once.
+        """
+        settings = self._serve_settings(tmp_path)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder,
+            _restored_root_logging(),
+        ):
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            port = holder.getsockname()[1]
+            result = runner.invoke(
+                cli, ["serve", "--host", "127.0.0.1", "--port", str(port)]
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.stderr
+        lines = result.stderr.splitlines()
+        failure = [
+            line
+            for line in lines
+            if line.startswith(f"Cannot bind to 127.0.0.1:{port}")
+        ]
+        assert len(failure) == 1, result.stderr
+        assert lines[-1].startswith("Try: ")
+        assert lines[-2] == failure[0]
+        assert "saneless serve failed" in result.stderr
 
     def test_one_shot_command_still_attaches_the_file_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
