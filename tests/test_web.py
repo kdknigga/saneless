@@ -34,6 +34,8 @@ from fastapi.testclient import TestClient
 
 from saneless.auto_profiles import generate_profiles, source_to_slug
 from saneless.checks import (
+    PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
     check_name,
     check_row_class,
     check_row_glyph,
@@ -61,6 +63,7 @@ from saneless.vocabulary import (
     TAGS_LOADING,
     TAGS_UNAVAILABLE,
     TOKEN_UNSET_JOB_ERROR,
+    ConnectionStatus,
     ErrorCategory,
     FlipOutcome,
     PassAnswer,
@@ -83,6 +86,7 @@ from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
 from saneless.web.routes import _profile_options, _ProfileOption
 from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
+from saneless.web.throttle import PAPERLESS_TEST_WAIT_SECONDS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, leaf_routes, load_the_lists
 
@@ -845,7 +849,7 @@ def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
 
 def test_paperless_test_connected(client: TestClient) -> None:
     """GET /api/paperless/test returns connected status (PLSS-03)."""
-    _app(client).state.paperless.test_connection = lambda: "connected"
+    _app(client).state.paperless.test_connection = lambda timeout=None: "connected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "connected"}
@@ -853,7 +857,7 @@ def test_paperless_test_connected(client: TestClient) -> None:
 
 def test_paperless_test_token_rejected(client: TestClient) -> None:
     """GET /api/paperless/test returns token_rejected status (PLSS-03)."""
-    _app(client).state.paperless.test_connection = lambda: "token_rejected"
+    _app(client).state.paperless.test_connection = lambda timeout=None: "token_rejected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "token_rejected"}
@@ -861,7 +865,7 @@ def test_paperless_test_token_rejected(client: TestClient) -> None:
 
 def test_paperless_test_unreachable(client: TestClient) -> None:
     """GET /api/paperless/test returns unreachable status (PLSS-03)."""
-    _app(client).state.paperless.test_connection = lambda: "unreachable"
+    _app(client).state.paperless.test_connection = lambda timeout=None: "unreachable"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "unreachable"}
@@ -870,7 +874,8 @@ def test_paperless_test_unreachable(client: TestClient) -> None:
 def test_paperless_test_error(client: TestClient) -> None:
     """GET /api/paperless/test returns error on exception (PLSS-03)."""
 
-    def raise_exc() -> None:
+    def raise_exc(*, timeout: httpx2.Timeout | None = None) -> None:
+        _ = timeout
         msg = "boom"
         raise RuntimeError(msg)
 
@@ -987,6 +992,66 @@ def test_paperless_test_500_sanitizes_exception(client: TestClient) -> None:
     assert data["detail"] == "ConnectionError"
     assert "192.168.1.100" not in response.text
     assert "abc123" not in response.text
+
+
+# The seconds an idle server is given to stop.  No request may wait longer.
+_IDLE_STOP_BUDGET_SECONDS = 10.0
+
+
+class _RecordingConnectionTest:
+    """A ``test_connection`` stand-in that records the timeout it was handed."""
+
+    def __init__(self) -> None:
+        """Record no calls yet."""
+        self.timeouts: list[httpx2.Timeout | None] = []
+
+    def __call__(self, *, timeout: httpx2.Timeout | None = None) -> ConnectionStatus:
+        """
+        Record the timeout and answer connected.
+
+        Args:
+            timeout: The budget the route handed the probe.
+
+        Returns:
+            Always ``CONNECTED``.
+
+        """
+        self.timeouts.append(timeout)
+        return ConnectionStatus.CONNECTED
+
+
+def test_the_connection_test_uses_the_probe_budget(client: TestClient) -> None:
+    """
+    The route's probe runs on the status probe's budget, not the client's own.
+
+    The client's default would let one probe of an unreachable paperless-ngx
+    hold a worker thread, and the requests waiting on it, for half a minute,
+    far past what a stopping server waits for.
+    """
+    recording = _RecordingConnectionTest()
+    _app(client).state.paperless.test_connection = recording
+
+    assert client.get("/api/paperless/test").status_code == 200
+
+    assert len(recording.timeouts) == 1
+    timeout = recording.timeouts[0]
+    assert timeout is not None
+    assert timeout.connect == PROBE_CONNECT_SECONDS
+    assert timeout.read == PROBE_READ_SECONDS
+
+
+def test_the_first_caller_wait_fits_the_stop_budget() -> None:
+    """
+    A follower outlasts the probe it waits on, and a stop outlasts the follower.
+
+    The wait must be longer than the probe budget, or a follower would give
+    up just before the answer it was waiting for landed.  It must be shorter
+    than the ten seconds an idle server is given to stop, or a waiting
+    request could hold a shutdown open.
+    """
+    assert PAPERLESS_TEST_WAIT_SECONDS == 8.0
+    assert PAPERLESS_TEST_WAIT_SECONDS > PROBE_CONNECT_SECONDS + PROBE_READ_SECONDS
+    assert PAPERLESS_TEST_WAIT_SECONDS < _IDLE_STOP_BUDGET_SECONDS
 
 
 def _raise_factory(exc_type: type[Exception], msg: str) -> Callable[..., NoReturn]:
@@ -5208,7 +5273,8 @@ class TestRouteLogsNameExceptionsOnly:
     ) -> None:
         """The userinfo and the host both stay out of the record (ASVS V7)."""
 
-        def _raise_with_the_url() -> str:
+        def _raise_with_the_url(*, timeout: httpx2.Timeout | None = None) -> str:
+            _ = timeout
             raise httpx2.ConnectError(_CREDENTIALLED_URL)
 
         app = _simple_form_app(tmp_path)
