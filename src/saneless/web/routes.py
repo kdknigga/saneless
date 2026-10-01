@@ -206,6 +206,20 @@ list that does not answer within them is reported as not loaded, and is asked
 again when the cache's short memory of the failure runs out.
 """
 
+METADATA_RETRY_FLOOR_SECONDS: Final = 5
+"""
+The shortest interval at which a list that could not be loaded asks again.
+
+The retry follows the cache's memory of a failure, which is never longer than
+``paperless_cache_ttl_seconds`` and is nothing at all with the cache disabled.
+Without a floor, a short or zero TTL would have every open page ask
+paperless-ngx for both lists about once a second for as long as it is down or
+refusing one of them: unauthenticated, unbounded upstream traffic, each request
+holding a worker thread for up to the connect budget.  Five seconds still lets
+a page left open recover soon after paperless-ngx is back.  Read at call time,
+not bound where it is used.
+"""
+
 # The only metadata resources the cache holds.  A runtime alias, not a
 # TYPE_CHECKING import, because FastAPI reads it to validate the ``resource``
 # query parameter: anything else is a 422 instead of reaching the cache.
@@ -3685,8 +3699,11 @@ def _metadata_retry_seconds(ttl: float) -> int:
     As often as the cache forgets the failure, so every retry is a real
     fetch and none is answered from the cache's memory of it: the negative
     TTL, or the cache's own TTL when that is shorter.  Rounded up to whole
-    seconds for htmx's trigger, and never under one.  The constant is read
-    here, at call time, not bound when the module loads.
+    seconds for htmx's trigger, and never under
+    ``METADATA_RETRY_FLOOR_SECONDS``, so a short or disabled cache cannot
+    make every open page ask paperless-ngx once a second.  A floor longer
+    than the memory still leaves every retry a real fetch.  Both constants
+    are read here, at call time, not bound when the module loads.
 
     Args:
         ttl: The configured ``paperless_cache_ttl_seconds``.
@@ -3695,7 +3712,10 @@ def _metadata_retry_seconds(ttl: float) -> int:
         The retry element's interval.
 
     """
-    return max(1, math.ceil(min(ttl, web_cache.NEGATIVE_TTL_SECONDS)))
+    return max(
+        METADATA_RETRY_FLOOR_SECONDS,
+        math.ceil(min(ttl, web_cache.NEGATIVE_TTL_SECONDS)),
+    )
 
 
 def _metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:

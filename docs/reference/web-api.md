@@ -406,8 +406,9 @@ asked. When every shown list loaded, the main part is empty and the loader is re
 While a shown list could not be loaded, it is a hidden retry element that asks again with
 `retry=1`, carrying the tag filter, the ticked tags and the chosen correspondent, every
 15 seconds, or every `paperless_cache_ttl_seconds` if that is shorter, but never more
-often than once a second: as often as the failure is forgotten, so each retry really asks
-paperless-ngx.
+often than once every 5 seconds: as often as the failure is forgotten, so each retry
+really asks paperless-ngx, with a floor so a short or disabled cache (`0`) cannot make
+every open page ask paperless-ngx once a second while it is down.
 The rest is out of band:
 
 | Element | When |

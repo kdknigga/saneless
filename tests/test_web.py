@@ -3881,7 +3881,11 @@ _CORRESPONDENT_SELECT_TAG = re.compile(
 
 
 def _pre_ticked_app(
-    tmp_path: Path, *, show_tags: bool = True, show_correspondent: bool = True
+    tmp_path: Path,
+    *,
+    show_tags: bool = True,
+    show_correspondent: bool = True,
+    cache_ttl: int = 60,
 ) -> FastAPI:
     """
     Build an app whose opening profile carries default tags and a correspondent.
@@ -3890,6 +3894,7 @@ def _pre_ticked_app(
         tmp_path: Where the app writes its database and files.
         show_tags: Whether the Tags fieldset is rendered at all.
         show_correspondent: Whether the Correspondent control is rendered.
+        cache_ttl: The configured ``paperless_cache_ttl_seconds``.
 
     Returns:
         The app, whose lifespan starts with its TestClient.
@@ -3900,7 +3905,11 @@ def _pre_ticked_app(
         paperless=PaperlessConfig(
             url="http://localhost:8000", token="a-real-looking-token"
         ),
-        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+        output=OutputConfig(
+            tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
+            paperless_cache_ttl_seconds=cache_ttl,
+        ),
         web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
         profiles={
             "plain": ProfileConfig(),
@@ -5418,7 +5427,7 @@ class TestMetadataRoute:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The interval is the cache's memory of a failure, rounded up, read now."""
-        monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 2.5)
+        monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 7.5)
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             app.state.paperless.get_correspondents = _FailingList()
@@ -5426,7 +5435,25 @@ class TestMetadataRoute:
             response = client.get("/api/metadata", params={"profile": "default"})
 
         assert _HELP_OOB_UNAVAILABLE in response.text
-        assert _retry_element(3) in response.text
+        assert _retry_element(8) in response.text
+
+    @pytest.mark.parametrize("ttl", [0, 1, 4])
+    def test_metadata_retry_interval_has_a_floor(
+        self, tmp_path: Path, ttl: int
+    ) -> None:
+        """
+        A short or disabled cache never makes the retry ask every second.
+
+        With the cache disabled no failure is remembered at all, so each retry
+        is a fetch from paperless-ngx; the floor bounds what one open page asks.
+        """
+        app = _pre_ticked_app(tmp_path, cache_ttl=ttl)
+        with TestClient(app) as client:
+            app.state.paperless.get_tags = _FailingList()
+            _cold(app)
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert _retry_element(5) in response.text, response.text
 
     def test_metadata_retry_carries_ticks_and_choice(self, tmp_path: Path) -> None:
         """A retry keeps what the form shows and leaves the markers alone."""

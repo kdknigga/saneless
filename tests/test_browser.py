@@ -4166,13 +4166,15 @@ class TestLazyListsInTheBrowser:
         """
         Once paperless-ngx answers, the tag rows appear and the retry stops.
 
-        The failure is remembered for one second here, not fifteen, so the
-        retry asks paperless-ngx again within the test.  What the operator
+        The failure is remembered for one second here, not fifteen, and the
+        retry's floor is lowered to match, so the retry asks paperless-ngx
+        again within the test.  What the operator
         changed while the list was unavailable is carried through the
         recovery: the default tag they unticked stays unticked, and the
         correspondent they chose stays chosen.
         """
         monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
+        monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 1)
         answering = threading.Event()
         paperless = defaults_server.app.state.paperless
         monkeypatch.setattr(
@@ -4219,6 +4221,7 @@ class TestLazyListsInTheBrowser:
         paperless-ngx answers, with the choice left as it was.
         """
         monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
+        monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 1)
         answering = threading.Event()
         paperless = defaults_server.app.state.paperless
         monkeypatch.setattr(
