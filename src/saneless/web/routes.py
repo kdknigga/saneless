@@ -3856,8 +3856,10 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
     retry, so it can never put back a tick or a choice changed while it was
     in flight, nor a profile's defaults changed away from.  The list it
     brings back is asked for only after it lands, and that request is
-    synced with the list's own profile-change request: whichever comes
-    second is abandoned (see ``index.html``).  The fresh copy is sent on
+    synced with the list's own profile-change request, which always wins: a
+    recovery asked while the profile change is in flight is dropped, and
+    one in flight when the profile change starts is abandoned (see
+    ``index.html``).  The fresh copy is sent on
     recovery too, so a recovery request that is dropped or fails is asked
     again; the recovered list replaces it.
 
