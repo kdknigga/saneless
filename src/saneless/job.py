@@ -51,6 +51,7 @@ __all__ = [
     "JobResult",
     "JobState",
     "JobStore",
+    "read_recent_jobs",
 ]
 
 logger = logging.getLogger(__name__)
@@ -540,6 +541,64 @@ newer step has touched is refused by any release that lacks that step.
 """
 
 
+def _schema_version(conn: sqlite3.Connection, stamped: int) -> int:
+    """
+    Return the schema version a job database is really at.
+
+    Args:
+        conn: Open connection to the job database.
+        stamped: The ``PRAGMA user_version`` the database reports.
+
+    Returns:
+        ``stamped``, except that an unstamped database already holding a jobs
+        table is at version 1: nothing ever stamped user_version, so an
+        existing jobs table is at version 1 rather than at nothing.
+
+    """
+    if stamped != 0:
+        return stamped
+    legacy = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()
+    return 0 if legacy is None else 1
+
+
+def _refuse_unsupported_version(db_path: str, version: int) -> None:
+    """
+    Refuse a schema version no step of this release's ladder can reach.
+
+    The read-write open and the read-only history read both call this, so
+    the two refuse the same versions in the same words.
+
+    Args:
+        db_path: Path the connection was opened on, named in the message.
+        version: The ``PRAGMA user_version`` the database reports.
+
+    Raises:
+        StorageError: If ``version`` is newer than this release supports, or
+            negative.
+
+    """
+    supported = len(_MIGRATIONS)
+    if version > supported:
+        msg = (
+            f"job database at {db_path} is at schema version {version}, "
+            f"newer than this release supports ({supported}); "
+            "restore a backup or run a newer saneless"
+        )
+        raise StorageError(msg)
+    # user_version is a signed 32-bit field, so a foreign tool can stamp a
+    # negative value. The ladder would index its migrations from the end
+    # for one, so it is refused here with the too-new case.
+    if version < 0:
+        msg = (
+            f"job database at {db_path} is at schema version {version}, "
+            f"which no saneless release writes (0 to {supported}); "
+            "restore a backup"
+        )
+        raise StorageError(msg)
+
+
 def _migrate(conn: sqlite3.Connection, db_path: str) -> None:
     """
     Run every outstanding migration step against a job database.
@@ -549,15 +608,8 @@ def _migrate(conn: sqlite3.Connection, db_path: str) -> None:
         db_path: Path the connection was opened on.
 
     """
-    version: int = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version == 0:
-        legacy = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
-        ).fetchone()
-        if legacy is not None:
-            # Nothing ever stamped user_version, so an existing jobs table is
-            # at version 1 rather than at nothing.
-            version = 1
+    stamped: int = conn.execute("PRAGMA user_version").fetchone()[0]
+    version = _schema_version(conn, stamped)
     for index in range(version, len(_MIGRATIONS)):
         _MIGRATIONS[index](conn, db_path)
         # A PRAGMA argument cannot be bound -- "PRAGMA user_version = ?" is a
@@ -681,24 +733,7 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
         # after it would no longer leave the file exactly as it was found.
         # The except BaseException arm below closes the connection.
         version: int = conn.execute("PRAGMA user_version").fetchone()[0]
-        supported = len(_MIGRATIONS)
-        # user_version is a signed 32-bit field, so a foreign tool can stamp a
-        # negative value. The ladder would index its migrations from the end
-        # for one, so it is refused here with the too-new case.
-        if version > supported:
-            msg = (
-                f"job database at {db_path} is at schema version {version}, "
-                f"newer than this release supports ({supported}); "
-                "restore a backup or run a newer saneless"
-            )
-            raise StorageError(msg)
-        if version < 0:
-            msg = (
-                f"job database at {db_path} is at schema version {version}, "
-                f"which no saneless release writes (0 to {supported}); "
-                "restore a backup"
-            )
-            raise StorageError(msg)
+        _refuse_unsupported_version(db_path, version)
         if created:
             # auto_vacuum can only be switched on for free while the file
             # holds no table yet, so it runs before the WAL header rewrite and
@@ -910,6 +945,178 @@ def _locked[**P, R](
     return wrapper
 
 
+def _job_from_row(row: sqlite3.Row) -> Job:
+    """
+    Convert one jobs row into a Job.
+
+    The only row-to-``Job`` conversion in this module.  It is a plain
+    function rather than a store method so the read-only history read, which
+    has no store, maps rows exactly as :meth:`JobStore.list_recent` does.  It
+    holds no lock and opens no transaction, which is what lets a store method
+    call it from inside its own ``with conn:``.
+
+    Every access is by name.  A database migrated from the pre-``thumbnail``
+    shape by the old bare ``ALTER`` carries ``error_category`` last while a
+    freshly created one carries it sixth, so physical column order is not a
+    contract and no ordinal may be used here.  (``sqlite3.Row`` keys are
+    case-insensitive; nothing here relies on that, and nothing should.)
+
+    Args:
+        row: A jobs row, fetched with ``sqlite3.Row`` as the row factory.
+
+    Returns:
+        The job the row records.
+
+    """
+    return Job(
+        id=row["id"],
+        profile=row["profile"],
+        title=row["title"],
+        state=JobState(row["state"]),
+        error=row["error"],
+        error_category=(
+            ErrorCategory(row["error_category"]) if row["error_category"] else None
+        ),
+        tags=json.loads(row["tags"]),
+        correspondent=row["correspondent"],
+        thumbnail=row["thumbnail"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        outcome=ScanOutcome(row["outcome"]) if row["outcome"] else None,
+        pages_scanned=row["pages_scanned"],
+        pages_removed=row["pages_removed"],
+        pages_uploaded=row["pages_uploaded"],
+        removed_positions=_parse_positions(row["pages_removed_at"], row["id"]),
+        warning=row["warning"],
+        owner_token=row["owner_token"],
+    )
+
+
+def _open_uri(uri: str) -> tuple[sqlite3.Connection, int]:
+    """
+    Connect to a ``file:`` URI and read the database's schema version.
+
+    The version read is the first statement, and so the point where a
+    read-only open that cannot work fails.
+
+    Args:
+        uri: The ``file:`` URI to connect to.
+
+    Returns:
+        The open connection, with ``sqlite3.Row`` rows, and the database's
+        ``PRAGMA user_version``.
+
+    """
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+    except BaseException:
+        conn.close()
+        raise
+    return conn, version
+
+
+def _immutable_read_is_safe(db_path: Path) -> bool:
+    """
+    Report whether a job database can be read with ``immutable=1``.
+
+    Args:
+        db_path: Path of the job database file.
+
+    Returns:
+        True only when the database's directory is not writable and neither
+        its ``-wal`` nor its ``-shm`` file exists.
+
+    """
+    sidecars = (db_path.with_name(db_path.name + suffix) for suffix in ("-wal", "-shm"))
+    return not os.access(db_path.parent, os.W_OK) and not any(
+        sidecar.exists() for sidecar in sidecars
+    )
+
+
+def _connect_read_only(db_path: Path) -> tuple[sqlite3.Connection, int]:
+    """
+    Open a job database read-only and read its schema version.
+
+    Args:
+        db_path: Path of an existing job database file.
+
+    Returns:
+        The open connection and the database's ``PRAGMA user_version``.
+
+    """
+    # as_uri() percent-encodes the path, so a '?', '#' or space in it stays
+    # part of the file name rather than starting the URI's query or fragment.
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    try:
+        return _open_uri(uri)
+    except sqlite3.OperationalError:
+        if not _immutable_read_is_safe(db_path):
+            raise
+    # A read-only connection to a WAL database still creates the -shm file
+    # beside it, so in a directory nobody can write to it fails.  There, and
+    # with no -wal or -shm present, immutable=1 is safe: no writer can be
+    # active in a directory where none could create its -wal, and no -wal
+    # means no committed page lives outside the database file, so nothing can
+    # change under the read and nothing is missed by skipping the WAL.
+    return _open_uri(uri + "&immutable=1")
+
+
+def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
+    """
+    Read the most recent jobs, newest first, without ever writing.
+
+    The listing can run beside a server that has the same database open, so
+    it must never change the file under it: it opens the database read-only,
+    and never creates the file, switches its journal mode, sets
+    ``auto_vacuum`` or runs a migration step.  Upgrading a database belongs
+    to the server that writes it, so one at an older schema is refused rather
+    than migrated.  A missing file, or one with no jobs table yet, is an
+    empty history.
+
+    Args:
+        db_path: Path of the job database file.
+        limit: Maximum number of jobs to return.
+
+    Returns:
+        The jobs, newest first, mapped exactly as
+        :meth:`JobStore.list_recent` maps them.
+
+    Raises:
+        StorageError: If the database cannot be opened or read, or its schema
+            version is older than this release reads, newer than it
+            supports, or negative.  Every message names ``db_path``.  The
+            file is left exactly as it was found.
+
+    """
+    if not db_path.exists():
+        return []
+    name = str(db_path)
+    try:
+        conn, stamped = _connect_read_only(db_path)
+    except sqlite3.Error as exc:
+        raise _open_failure(name, exc) from exc
+    try:
+        _refuse_unsupported_version(name, stamped)
+        version = _schema_version(conn, stamped)
+        if version == 0:
+            return []
+        supported = len(_MIGRATIONS)
+        if version < supported:
+            msg = (
+                f"job database at {name} is at schema version {version}, "
+                f"older than this saneless reads ({supported}); "
+                "start saneless serve once to upgrade it"
+            )
+            raise StorageError(msg)
+        rows = conn.execute(_SELECT_RECENT, (limit,)).fetchall()
+        return [_job_from_row(row) for row in rows]
+    except sqlite3.Error as exc:
+        raise _open_failure(name, exc) from exc
+    finally:
+        conn.close()
+
+
 class JobStore:
     """
     SQLite-backed persistence for scan jobs.
@@ -953,19 +1160,12 @@ class JobStore:
 
     def _row_to_job(self, row: sqlite3.Row) -> Job:
         """
-        Convert one jobs row into a Job.
+        Convert one jobs row into a Job through the module's one row mapper.
 
-        The only row-to-``Job`` conversion in this module.  It is private and
-        undecorated deliberately: ``sqlite3`` connection context managers do
-        not nest, so an inner ``with conn:`` commits the outer transaction.
-        Shared logic therefore has to live in a helper a public method can
-        call without going through another public method.
-
-        Every access is by name.  A database migrated from the pre-``thumbnail``
-        shape by the old bare ``ALTER`` carries ``error_category`` last while a
-        freshly created one carries it sixth, so physical column order is not a
-        contract and no ordinal may be used here.  (``sqlite3.Row`` keys are
-        case-insensitive; nothing here relies on that, and nothing should.)
+        Private and undecorated deliberately: ``sqlite3`` connection context
+        managers do not nest, so an inner ``with conn:`` commits the outer
+        transaction.  Shared logic therefore has to live in a helper a public
+        method can call without going through another public method.
 
         Args:
             row: A jobs row fetched over this store's own connection.
@@ -974,27 +1174,7 @@ class JobStore:
             The job the row records.
 
         """
-        return Job(
-            id=row["id"],
-            profile=row["profile"],
-            title=row["title"],
-            state=JobState(row["state"]),
-            error=row["error"],
-            error_category=(
-                ErrorCategory(row["error_category"]) if row["error_category"] else None
-            ),
-            tags=json.loads(row["tags"]),
-            correspondent=row["correspondent"],
-            thumbnail=row["thumbnail"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            outcome=ScanOutcome(row["outcome"]) if row["outcome"] else None,
-            pages_scanned=row["pages_scanned"],
-            pages_removed=row["pages_removed"],
-            pages_uploaded=row["pages_uploaded"],
-            removed_positions=_parse_positions(row["pages_removed_at"], row["id"]),
-            warning=row["warning"],
-            owner_token=row["owner_token"],
-        )
+        return _job_from_row(row)
 
     @_locked
     def create_job(
