@@ -3815,7 +3815,12 @@ class SaneBackend(ScannerBackend):
                 sources=[str(s) for s in sources],
                 resolutions=[int(r) for r in resolution.values or []],
                 modes=[str(m) for m in modes],
-                option_names=tuple(str(opt[1]) for opt in raw_options if len(opt) >= 2),
+                # Option 0, the option count, is named '' and a group heading
+                # None: neither is an option anyone can read or set, and
+                # listed they would print as a blank line and "None".
+                option_names=tuple(
+                    str(opt[1]) for opt in raw_options if len(opt) >= 2 and opt[1]
+                ),
                 resolution_range=resolution.span,
             )
 

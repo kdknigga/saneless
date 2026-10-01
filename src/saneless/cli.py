@@ -216,6 +216,18 @@ _STATUS_COL_WIDTH = max(
 _PROFILE_COL_WIDTH: Final = 14
 _TITLE_COL_FLOOR: Final = 15
 
+# Widths of the fixed columns in `saneless devices`, and the floor the Name
+# column never shrinks below.  The Name column takes whatever the terminal has
+# left after them and the three separators, which at 80 columns is 30 -- room
+# for a typical network device name, the value a profile is set up with.  The
+# Type column is cut like the others: SANE's "multi-function peripheral" is 25
+# characters, and printed whole it pushed every row past 80.  ``--json`` gives
+# every value whole.
+_DEVICE_VENDOR_COL_WIDTH: Final = 15
+_DEVICE_MODEL_COL_WIDTH: Final = 20
+_DEVICE_TYPE_COL_WIDTH: Final = 12
+_DEVICE_NAME_COL_FLOOR: Final = 20
+
 # The widest zone token ``%Z`` produces at a realistic offset: five characters,
 # the ``+0545`` shape the tz database falls back to where there is no
 # abbreviation. The only literal in the width below, and the one this host
@@ -1914,14 +1926,20 @@ def _echo_device_table(device_list: list[DeviceInfo]) -> None:
     """
     Print the device list as a table sized to the terminal.
 
+    Each value is escaped before it is cut, so the width is measured on what
+    prints, and every row fits a terminal of 70 columns or more.
+
     Args:
         device_list: The devices SANE reported.
 
     """
     cols = shutil.get_terminal_size((80, 24)).columns
-    name_w = max(20, cols - 45)
-    vendor_w = 15
-    model_w = 20
+    vendor_w = _DEVICE_VENDOR_COL_WIDTH
+    model_w = _DEVICE_MODEL_COL_WIDTH
+    type_w = _DEVICE_TYPE_COL_WIDTH
+    # Three single spaces separate the four columns, so a row is never wider
+    # than the terminal once it has room for the Name column's floor.
+    name_w = max(_DEVICE_NAME_COL_FLOOR, cols - (vendor_w + model_w + type_w + 3))
     header = f"{'Name':<{name_w}} {'Vendor':<{vendor_w}} {'Model':<{model_w}} {'Type'}"
     click.echo(header)
     click.echo("-" * min(len(header), cols))
@@ -1930,7 +1948,7 @@ def _echo_device_table(device_list: list[DeviceInfo]) -> None:
             f"{_truncate(neutralise_controls(d.name), name_w):<{name_w}} "
             f"{_truncate(neutralise_controls(d.vendor), vendor_w):<{vendor_w}} "
             f"{_truncate(neutralise_controls(d.model), model_w):<{model_w}} "
-            f"{neutralise_controls(d.device_type)}"
+            f"{_truncate(neutralise_controls(d.device_type), type_w)}"
         )
 
 

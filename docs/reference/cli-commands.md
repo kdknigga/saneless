@@ -93,7 +93,7 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--json` | flag | off | Output device list as JSON |
-| `--capabilities` | flag | off | Show each device's sources, modes and resolution support — either a list of values or a minimum/maximum/step range, whichever the device reports — plus its raw SANE option names. With `--json`, each device object gains a `capabilities` object |
+| `--capabilities` | flag | off | Show each device's sources, modes and resolution support — either a list of values or a minimum/maximum/step range, whichever the device reports — plus its raw SANE option names (the entries SANE reports without a name, the option count and the group headings, are left out). With `--json`, each device object gains a `capabilities` object |
 
 **Exit codes:**
 
@@ -119,7 +119,7 @@ Name                 Vendor          Model                Type
 net:192.168.1.50:pi  Canon           MF740C Series        scanner
 ```
 
-The first line is on stderr; the table is on stdout.
+The first line is on stderr; the table is on stdout. The table fits the terminal: the Name column takes the width the other three leave, and a value too long for its column is cut short with `…`. `--json` prints every value whole.
 
 **Example output (JSON):**
 
