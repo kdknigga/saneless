@@ -273,6 +273,7 @@ shipped template now does.
 services:
   saneless:
     image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    stop_grace_period: 90s
     ports:
       - "8080:8080"
     volumes:
@@ -310,6 +311,7 @@ the container's own host, or another one:
 services:
   saneless:
     image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    stop_grace_period: 90s
     ports:
       - "8080:8080"
     volumes:
@@ -340,6 +342,7 @@ Mount the file read-only over the image's own copy:
 services:
   saneless:
     image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    stop_grace_period: 90s
     ports:
       - "8080:8080"
     volumes:
@@ -369,6 +372,7 @@ avahi-daemon to ask. Prefer the explicit `device` line.
 services:
   saneless:
     image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    stop_grace_period: 90s
     ports:
       - "8080:8080"
     volumes:

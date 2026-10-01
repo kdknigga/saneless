@@ -43,6 +43,7 @@ on that box, and `SANELESS_SCANNER__HOST` pointing at it -- either
     services:
       saneless:
         image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+        stop_grace_period: 90s
         ports:
           - "8080:8080"
         volumes:
@@ -81,6 +82,7 @@ machine that has the scanner.
     services:
       saneless:
         image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+        stop_grace_period: 90s
         ports:
           - "8080:8080"
         volumes:
