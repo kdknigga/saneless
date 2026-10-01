@@ -1178,7 +1178,7 @@ def _busy_line(
     running_id = worker.current_job_id
     if queued:
         running = job_store.get_job(running_id) if running_id else None
-        ahead = job_store.queue_position(job.id)
+        ahead = job_store.queue_position(job.id, running=running_id)
         if running is not None and ahead is not None:
             title = (
                 running.title

@@ -2229,6 +2229,30 @@ class TestQueueLine:
             response.text
         )
 
+    def test_queue_line_does_not_count_the_job_waiting_for_the_scanner(
+        self, client: TestClient
+    ) -> None:
+        """
+        The worker's job is not ahead in the queue while it waits for the scanner.
+
+        It keeps its PENDING row until it holds the scanner gate, which a
+        running check can delay for up to the listing deadline.  It is already
+        named as the job being waited for, so counting it as well would tell
+        the job behind it that one more is ahead.
+        """
+        job_store: JobStore = _app(client).state.job_store
+        running = job_store.create_job(
+            profile="default", title="Tax return", owner_token=_as_owner(client)
+        )
+        _app(client).state.worker._current_job_id = running.id
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "Waiting for 'Tax return' to finish (next in line)" in _displayed(
+            response.text
+        )
+
     def test_queue_line_never_says_zero_ahead_of_you(self, client: TestClient) -> None:
         """
         ``(0 ahead of you)`` is never rendered.

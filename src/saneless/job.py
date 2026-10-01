@@ -1603,7 +1603,7 @@ class JobStore:
         return self._pending_jobs()
 
     @_locked
-    def queue_position(self, job_id: str) -> int | None:
+    def queue_position(self, job_id: str, *, running: str | None = None) -> int | None:
         """
         Count the queued jobs ahead of one job.
 
@@ -1624,20 +1624,25 @@ class JobStore:
         agree today drift tomorrow.  The queue is bounded by the submission
         cap, so reading it is cheaper than keeping the two in step by hand.
 
+        The job the worker has taken is not in the queue, although its row
+        can still read ``PENDING``: the worker persists ``SCANNING`` only once
+        it holds the scanner gate, and a running check can hold that gate for
+        up to the listing deadline.  The caller names that job in
+        ``running``, and it is never counted ahead of anyone; asked about
+        itself, it answers ``None``.
+
         Args:
             job_id: The job to locate in the queue.
+            running: The job the worker is running, or None when it is idle.
 
         Returns:
             The zero-based number of pending jobs ahead of job_id, or None when
-            that job is not pending.
+            that job is not waiting.
 
         """
+        queue = (job for job in self._pending_jobs() if job.id != running)
         return next(
-            (
-                position
-                for position, job in enumerate(self._pending_jobs())
-                if job.id == job_id
-            ),
+            (position for position, job in enumerate(queue) if job.id == job_id),
             None,
         )
 

@@ -2425,6 +2425,23 @@ class TestQueuePosition:
         finally:
             store.close()
 
+    def test_queue_position_skips_the_running_job_still_reading_pending(
+        self,
+    ) -> None:
+        """The worker's job waiting for the scanner is not counted ahead."""
+        store = JobStore()
+        try:
+            running, second, third = _create_in_order(store, 3)
+
+            positions = [
+                store.queue_position(job_id, running=running)
+                for job_id in (running, second, third)
+            ]
+
+            assert positions == [None, 0, 1]
+        finally:
+            store.close()
+
     def test_queue_position_of_an_unknown_job_id_is_none(self) -> None:
         """An id no row carries is not in the queue, so it has no position."""
         store = JobStore()
