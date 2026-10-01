@@ -5612,6 +5612,7 @@ _PROBE_OUTCOMES = [
     pytest.param(
         406, CheckState.FAIL, ConnectionStatus.INCOMPATIBLE, id="incompatible"
     ),
+    pytest.param(302, CheckState.FAIL, ConnectionStatus.REDIRECTED, id="redirected"),
 ]
 
 
@@ -5788,6 +5789,118 @@ class TestPaperlessCheck:
             "saneless needs paperless-ngx 2.16 or later (API version 9 or 10); "
             "upgrade paperless-ngx, then press Check again."
         )
+
+    @staticmethod
+    def _row_for(
+        tmp_path: Path, responder: Callable[[httpx2.Request], httpx2.Response]
+    ) -> CheckResult:
+        """
+        Run the checks against a stub paperless-ngx and return its row.
+
+        Args:
+            tmp_path: The test's own directory.
+            responder: What the stub server answers with, or raises.
+
+        Returns:
+            The Paperless row.
+
+        """
+        client = _paperless(_RequestCounter(responder))
+        try:
+            results = run_checks(_context(_settings(tmp_path), paperless=client))
+        finally:
+            client.close()
+        return _row(results, CheckKey.PAPERLESS)
+
+    def test_a_redirect_row_names_no_address(self, tmp_path: Path) -> None:
+        """
+        A redirect says to check paperless.url, never where it pointed.
+
+        The strip is visible to anyone on the LAN, so the target is kept for
+        the log and ``doctor`` only.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+
+        def responder(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
+                302, headers={"location": "https://elsewhere.example:9443/login/"}
+            )
+
+        row = self._row_for(tmp_path, responder)
+        assert row.state is CheckState.FAIL
+        assert row.message == connection_status_message(ConnectionStatus.REDIRECTED)
+        assert "paperless.url" in row.next_step
+        assert "https://" not in row.next_step
+        for text in (row.message, row.next_step):
+            assert "elsewhere.example" not in text
+            assert "9443" not in text
+
+    def test_a_redirect_to_https_says_use_https(self, tmp_path: Path) -> None:
+        """
+        Only the scheme changed, so the next step says to use https://.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+
+        def responder(request: httpx2.Request) -> httpx2.Response:
+            target = request.url.copy_with(scheme="https")
+            return httpx2.Response(301, headers={"location": str(target)})
+
+        row = self._row_for(tmp_path, responder)
+        assert row.state is CheckState.FAIL
+        assert row.message == connection_status_message(ConnectionStatus.REDIRECTED)
+        assert "paperless.url" in row.next_step
+        assert "https://" in row.next_step
+        for text in (row.message, row.next_step):
+            assert "paperless:8000" not in text
+
+    @pytest.mark.parametrize(
+        "exc_type",
+        [
+            pytest.param(httpx2.UnsupportedProtocol, id="unsupported-protocol"),
+            pytest.param(httpx2.LocalProtocolError, id="local-protocol-error"),
+        ],
+    )
+    def test_a_misconfigured_row_is_configuration_copy(
+        self, tmp_path: Path, exc_type: type[httpx2.TransportError]
+    ) -> None:
+        """
+        A URL the library will not use is a setting to correct, not a network fault.
+
+        The client is built with an empty token, which is outside the load
+        rules, so a local refusal is blamed on the configuration as well.
+
+        Args:
+            tmp_path: The test's own directory.
+            exc_type: How the library refused the request.
+
+        """
+
+        def responder(_request: httpx2.Request) -> httpx2.Response:
+            msg = "refused before sending"
+            raise exc_type(msg)
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token="",
+            transport=httpx2.MockTransport(_RequestCounter(responder)),
+        )
+        try:
+            results = run_checks(_context(_settings(tmp_path), paperless=client))
+        finally:
+            client.close()
+        row = _row(results, CheckKey.PAPERLESS)
+        assert row.state is CheckState.FAIL
+        assert row.message == connection_status_message(ConnectionStatus.MISCONFIGURED)
+        assert "paperless.url" in row.next_step
+        assert "paperless.token" in row.next_step
+        for text in (row.message, row.next_step):
+            assert "reach" not in text.lower()
 
     def test_the_probe_is_bounded(self, tmp_path: Path) -> None:
         """

@@ -30,6 +30,7 @@ from saneless.exceptions import (
 )
 from saneless.paperless import (
     ApiDelivery,
+    ConnectionProbe,
     FolderDelivery,
     PaperlessClient,
     PaperlessTiming,
@@ -211,8 +212,15 @@ _CONNECTION_STATUS_CASES = [
     pytest.param(406, ConnectionStatus.INCOMPATIBLE, id="406"),
     pytest.param(500, ConnectionStatus.SERVER_ERROR, id="500"),
     pytest.param(503, ConnectionStatus.SERVER_ERROR, id="503"),
-    pytest.param(302, ConnectionStatus.SERVER_ERROR, id="302"),
     pytest.param(429, ConnectionStatus.SERVER_ERROR, id="429"),
+    # A redirect is paperless.url pointing at the wrong address, never a
+    # server error.  These carry no Location; TestProbeConnection covers the
+    # ones that do.
+    pytest.param(301, ConnectionStatus.REDIRECTED, id="301"),
+    pytest.param(302, ConnectionStatus.REDIRECTED, id="302"),
+    pytest.param(303, ConnectionStatus.REDIRECTED, id="303"),
+    pytest.param(307, ConnectionStatus.REDIRECTED, id="307"),
+    pytest.param(308, ConnectionStatus.REDIRECTED, id="308"),
 ]
 
 _CONNECTION_EXCEPTION_CASES = [
@@ -4392,9 +4400,11 @@ class TestConnectionTest:
         be added without someone deciding what produces it.
         """
         produced = {
-            _connection_result_for_status(code) for code in (200, 401, 404, 406, 500)
+            _connection_result_for_status(code)
+            for code in (200, 302, 401, 404, 406, 500)
         }
         produced.add(_connection_result_for_exception(httpx2.ConnectError))
+        produced.add(_connection_result_for_exception(httpx2.UnsupportedProtocol))
         assert member in produced, f"{member.name} is not produced by any input"
 
     def test_legacy_wire_strings_are_byte_identical(self) -> None:
@@ -4437,6 +4447,248 @@ class TestConnectionTest:
         with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
             assert _connection_result_for_status(429) is ConnectionStatus.SERVER_ERROR
         assert any("429" in message for message in caplog.messages)
+
+
+_PROBE_BASE_URL = "http://p.example:8000"
+_PROBE_TOKEN = "tok-PROBE-9c4e1f"
+
+
+def _probe(
+    handler: Callable[[httpx2.Request], httpx2.Response],
+    *,
+    url: str = _PROBE_BASE_URL,
+    token: str = _PROBE_TOKEN,
+) -> ConnectionProbe:
+    """
+    Run ``probe_connection`` against a mock transport.
+
+    Args:
+        handler: What the stub server answers with, or raises.
+        url: The configured paperless.url.
+        token: The configured paperless.token.
+
+    Returns:
+        The probe's result.
+
+    """
+    client = PaperlessClient(url=url, token=token, transport=_make_transport(handler))
+    try:
+        return client.probe_connection()
+    finally:
+        client.close()
+
+
+def _redirecting(
+    location: str, status_code: int = 301
+) -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Answer every request with a redirect to ``location``.
+
+    Args:
+        location: The Location header to send.
+        status_code: The 3xx status to answer with.
+
+    Returns:
+        A mock transport handler.
+
+    """
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status_code, headers={"location": location})
+
+    return handler
+
+
+def _raising(
+    exc_type: type[httpx2.TransportError],
+) -> Callable[[httpx2.Request], httpx2.Response]:
+    """
+    Raise ``exc_type`` from every request, quoting the token as h11 would.
+
+    Args:
+        exc_type: The transport error to raise.
+
+    Returns:
+        A mock transport handler.
+
+    """
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        msg = f"Illegal header value b'Token {_PROBE_TOKEN}'"
+        raise exc_type(msg)
+
+    return handler
+
+
+class TestProbeConnection:
+    """
+    The connection probe tells a wrong address and a bad setting apart.
+
+    A redirect is paperless.url pointing somewhere paperless-ngx does not
+    answer, and a URL or token the HTTP library will not send is a setting
+    to correct; neither is a server error or a network fault.  The probe
+    keeps where a redirect pointed, sanitised, for the log and ``doctor``.
+    """
+
+    @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+    def test_a_redirect_is_redirected_with_its_target(self, status_code: int) -> None:
+        """Every redirect status is REDIRECTED and keeps the target."""
+        probe = _probe(_redirecting("https://other.example/api/", status_code))
+        assert probe.status is ConnectionStatus.REDIRECTED
+        assert probe.redirect_target == "https://other.example/api/"
+
+    def test_a_redirect_with_no_location_has_no_target(self) -> None:
+        """A 3xx naming nowhere is still a wrong address, with nothing to show."""
+
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(302)
+
+        probe = _probe(handler)
+        assert probe == ConnectionProbe(ConnectionStatus.REDIRECTED)
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            pytest.param("https://p.example:8000/", id="to-the-root"),
+            pytest.param(
+                "https://p.example:8000/api/tags/?page_size=1", id="same-path"
+            ),
+        ],
+    )
+    def test_the_same_address_on_https_is_an_upgrade(self, location: str) -> None:
+        """Only the scheme changed, so the fix is to use https://."""
+        probe = _probe(_redirecting(location))
+        assert probe.status is ConnectionStatus.REDIRECTED
+        assert probe.https_upgrade is True
+        assert probe.redirect_target == location
+
+    def test_the_default_ports_count_as_the_same_port(self) -> None:
+        """Plain HTTP on port 80 to HTTPS on 443 is the usual proxy upgrade."""
+        probe = _probe(
+            _redirecting("https://p.example/api/tags/?page_size=1"),
+            url="http://p.example",
+        )
+        assert probe.https_upgrade is True
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            pytest.param("https://other.example/", id="other-host"),
+            pytest.param("https://p.example:9443/", id="other-port"),
+            pytest.param("https://p.example:8000/accounts/login/", id="other-path"),
+            pytest.param("http://p.example:8000/paperless/", id="same-scheme"),
+        ],
+    )
+    def test_anything_more_than_the_scheme_is_not_an_upgrade(
+        self, location: str
+    ) -> None:
+        """Another host, port or path is a different address, not just https."""
+        probe = _probe(_redirecting(location))
+        assert probe.status is ConnectionStatus.REDIRECTED
+        assert probe.https_upgrade is False
+
+    def test_a_relative_target_is_resolved_against_the_request(self) -> None:
+        """A path-only Location is shown as the address it names."""
+        probe = _probe(_redirecting("/accounts/login/"))
+        assert probe.redirect_target == "http://p.example:8000/accounts/login/"
+        assert probe.https_upgrade is False
+
+    def test_the_target_is_sanitised_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        No credential, no token and no control character survives into the log.
+
+        The Location is upstream text: a proxy can echo what it was sent,
+        so the token is struck out, any userinfo is cut, and a CR, LF or ESC
+        cannot forge a log line or reach a terminal.
+        """
+        location = (
+            f"https://scanner:{_URL_SECRET}@other.example/login"
+            f"?next=/api/&token={_PROBE_TOKEN}\r\nX-Forged: \x1b[31mred"
+        )
+        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
+            probe = _probe(_redirecting(location))
+        target = probe.redirect_target
+        assert target is not None
+        assert target.startswith("https://other.example/login")
+        for text in (target, *caplog.messages):
+            assert _URL_SECRET not in text
+            assert "scanner:" not in text
+            assert _PROBE_TOKEN not in text
+            assert not has_control_characters(text)
+        assert any(
+            target in message and "check paperless.url" in message
+            for message in caplog.messages
+        )
+
+    def test_a_huge_target_is_bounded(self) -> None:
+        """A megabyte of Location cannot flood the log or the terminal."""
+        probe = _probe(_redirecting("https://other.example/" + "a" * 100_000))
+        assert probe.redirect_target is not None
+        assert len(probe.redirect_target) < 1_000
+
+    def test_an_unsupported_scheme_is_misconfigured(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A URL with no usable scheme is a setting to correct, not unreachable."""
+        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
+            probe = _probe(_raising(httpx2.UnsupportedProtocol))
+        assert probe == ConnectionProbe(ConnectionStatus.MISCONFIGURED)
+        assert all(_PROBE_TOKEN not in message for message in caplog.messages)
+
+    def test_a_scheme_less_url_is_misconfigured_on_the_real_transport(self) -> None:
+        """No mock: httpx2 itself refuses the URL before anything is sent."""
+        client = PaperlessClient(url="paperless:8000", token=_PROBE_TOKEN)
+        try:
+            probe = client.probe_connection()
+        finally:
+            client.close()
+        assert probe.status is ConnectionStatus.MISCONFIGURED
+
+    def test_an_unsendable_token_refused_locally_is_misconfigured(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A token outside the load rules is what the library refused to send."""
+        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
+            probe = _probe(_raising(httpx2.LocalProtocolError), token="")
+        assert probe.status is ConnectionStatus.MISCONFIGURED
+        assert all(_PROBE_TOKEN not in message for message in caplog.messages)
+
+    def test_a_local_refusal_of_a_sendable_configuration_is_unreachable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        Settings that pass the load rules are not blamed for a local refusal.
+
+        The same rule the upload path applies: only a configuration that
+        could be at fault is reported as one.
+        """
+        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
+            probe = _probe(_raising(httpx2.LocalProtocolError))
+        assert probe.status is ConnectionStatus.UNREACHABLE
+        assert caplog.messages
+        assert all(_PROBE_TOKEN not in message for message in caplog.messages)
+
+    @pytest.mark.parametrize(
+        "handler",
+        [
+            pytest.param(_redirecting("https://p.example:8000/"), id="redirect"),
+            pytest.param(_raising(httpx2.UnsupportedProtocol), id="unsupported"),
+            pytest.param(_raising(httpx2.ConnectError), id="connect-error"),
+        ],
+    )
+    def test_test_connection_returns_the_probe_status(
+        self, handler: Callable[[httpx2.Request], httpx2.Response]
+    ) -> None:
+        """The wire contract is the probe's status and nothing else."""
+        client = PaperlessClient(
+            url=_PROBE_BASE_URL, token=_PROBE_TOKEN, transport=_make_transport(handler)
+        )
+        try:
+            assert client.test_connection() is client.probe_connection().status
+        finally:
+            client.close()
 
 
 class TestConnectionTimeout:
