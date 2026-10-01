@@ -38,6 +38,7 @@ import saneless.cli as cli_module
 import saneless.config as config_module
 import saneless.job as job_module
 import saneless.vocabulary as vocabulary_module
+from saneless.checks import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
 from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
     CONFIG_FILENAME,
@@ -3725,10 +3726,13 @@ class TestServeCommand:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A stop waits at most 3 s for requests to finish, per uvicorn's config.
+        A stop waits 8 s for requests to finish, per uvicorn's config.
 
-        An int, because uvicorn types the setting ``int | None``.  Three
-        seconds of request drain plus the background threads' shared stop fit
+        An int, because uvicorn types the setting ``int | None``.  The drain
+        is long enough for one request-path call to paperless-ngx, whose
+        connect and read budgets come to 7 s, to end inside it, so the
+        lifespan does not close the Paperless client under that request.  An
+        idle server has no request to wait for, so its stop still fits
         inside Docker's default 10 s grace period.
         """
         runs = _fake_server_run(monkeypatch)
@@ -3740,7 +3744,8 @@ class TestServeCommand:
         [run] = runs
         bound = run.config.timeout_graceful_shutdown
         assert isinstance(bound, int)
-        assert bound <= 3
+        assert bound > PROBE_CONNECT_SECONDS + PROBE_READ_SECONDS
+        assert bound == 8
 
     def test_serve_port_0_binds_an_os_chosen_port_and_reports_it(
         self, monkeypatch: pytest.MonkeyPatch

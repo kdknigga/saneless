@@ -179,19 +179,25 @@ _LISTEN_BACKLOG: Final = 2048
 
 # How long, in whole seconds, a stopping web server waits for requests still
 # being answered before it cancels them.  uvicorn types the setting
-# ``int | None``, so it is an int.  An idle stop is uvicorn's 0.1 s poll, at
-# most this drain, and the lifespan's one shared 5 s deadline for the scan
-# worker and the check refresher: about 8 s, inside Docker's default 10 s
-# grace period.  A stop while a stopped scan's pages are being preserved runs
-# longer, which is what the documented 90 s stop grace period covers.
+# ``int | None``, so it is an int.
 #
-# The drain can be bounded only because every route is bounded: no request
-# thread runs a status probe (Check again hands it to the refresher thread and
-# waits a few seconds at most), every paperless-ngx call a request makes has
-# a short timeout, and a stop aborts the refresher's scanner listing.  A route
-# that outlived the drain would keep its worker thread, and so the process,
-# alive after the lifespan had already closed what that thread was using.
-_GRACEFUL_SHUTDOWN_SECONDS: Final = 3
+# It is sized to the longest single call a request makes to paperless-ngx:
+# the connection test and each page of a tag or correspondent list are bounded
+# by a 2 s connect and a 5 s read, 7 s in all, so one such call that was under
+# way when the stop came ends inside the drain, and the lifespan does not
+# close the Paperless client under it.  Not every request fits.  A list
+# fetch of more than one page is one such call per page, and a name lookup
+# takes no timeout at all, so either can outlast the drain.  uvicorn then
+# cancels the request, but its worker thread keeps running, and so keeps the
+# process alive, after the lifespan has closed what that thread was using.
+#
+# An idle server has no request to wait for, so its stop is uvicorn's 0.1 s
+# poll and pause and the lifespan's one shared 5 s deadline for the scan worker
+# and the check refresher, inside Docker's default 10 s grace period.  A stop
+# that has to wait out a request to paperless-ngx can take this drain on top,
+# as can a stop while a stopped scan's pages are being preserved; the
+# documented 90 s stop grace period covers both.
+_GRACEFUL_SHUTDOWN_SECONDS: Final = 8
 
 # Width of the Status column in `saneless jobs`, derived rather than written
 # down: the humanised labels are longer than the raw enum values they replaced,
