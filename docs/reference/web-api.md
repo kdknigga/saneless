@@ -422,7 +422,7 @@ The rest is out of band:
 | The correspondent dropdown (`#correspondent-select`), whole, and its help line (`#correspondent-help`) | When `show_correspondent` is on. A list that could not be loaded says so in the help line |
 | The profile markers | For each shown list, when the request names a configured profile |
 | The Scan button (`#scan-btn`) | Always. It is disabled only while a scan is active or the appliance is blocked, exactly as on the page: a list that could not be loaded releases it just as a loaded one does. If the job store cannot be read, the failure is logged and the button is rendered as though no scan were active, still disabled on a blocked appliance; the status poll corrects it once it can read the job again. While the job store keeps failing, the poll shows that it cannot read the scan's progress and leaves the button as it is, and a scan started then is refused or queued as described under [`POST /api/scan`](#post-apiscan) |
-| The Scan hold reason (`#scan-hold-reason`) | Always, emptied |
+| The Scan hold reason (`#scan-hold-reason`) | Emptied, except on a blocked appliance, whose page renders the blocked reason instead and has no hold reason to empty |
 
 A hidden list is neither fetched nor rendered.
 
