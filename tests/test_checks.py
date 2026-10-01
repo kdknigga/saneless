@@ -86,9 +86,11 @@ from saneless.scanner.base import DeviceInfo, DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
+    CheckSurface,
     ConnectionStatus,
     ProfileStorage,
     connection_status_message,
+    render_check_step,
 )
 from tests.conftest import StubScannerBackend
 from tests.fake_sane import FakeSaneDev, FakeSaneHandle, FakeSaneModule
@@ -8622,3 +8624,131 @@ class TestAbortedRun:
 
         """
         assert _context(_settings(tmp_path)).abort is None
+
+
+# Every check next step that ends in a retry, paired with exactly what the
+# strip said before the retry ending became per-surface.  Each literal is
+# written out, so the strip's wording cannot drift while the source moves.
+_STRIP_WORDING: Final = (
+    pytest.param(
+        lambda: checks._CHECK_FAILED_NEXT_STEP,
+        "Restart saneless, then press Check again.",
+        id="check-failed",
+    ),
+    pytest.param(
+        lambda: checks._host_problem_next_step(checks._SanedOutcome.TIMED_OUT),
+        "Check the scanner host is switched on and on the network, "
+        "then press Check again.",
+        id="saned-timed-out",
+    ),
+    pytest.param(
+        lambda: checks._host_problem_next_step(checks._SanedOutcome.REFUSED),
+        "Start saned on the scanner host, or check it is listening on the "
+        "network, then press Check again.",
+        id="saned-refused",
+    ),
+    pytest.param(
+        lambda: checks._host_problem_next_step(checks._SanedOutcome.UNRESOLVED),
+        "Check the host name in [scanner] host or [scanner] device, or in "
+        "SANE_NET_HOSTS if that is set. If you fixed the name in DNS or the "
+        "hosts file, press Check again; if you changed a setting, restart "
+        "saneless.",
+        id="saned-unresolved",
+    ),
+    pytest.param(
+        lambda: checks._host_problem_next_step(checks._SanedOutcome.REJECTED),
+        "Add this machine to saned.conf on the scanner host, then press Check again.",
+        id="saned-rejected",
+    ),
+    pytest.param(
+        lambda: checks._scanner_configured_missing_row().next_step,
+        "Check it is switched on and connected, then press Check again. If "
+        "saneless devices does not list it, set [scanner] device to one it "
+        "lists, then restart saneless.",
+        id="configured-missing",
+    ),
+    pytest.param(
+        lambda: checks._scanner_listing_crashed_row().next_step,
+        "Press Check again.",
+        id="listing-crashed",
+    ),
+    pytest.param(
+        lambda: checks._scanner_listing_timed_out_row().next_step,
+        "Check the scanner, and its scanner host if it has one, are switched "
+        "on and reachable, then press Check again.",
+        id="listing-timed-out",
+    ),
+    pytest.param(
+        lambda: checks._scanner_listing_no_answer_row().next_step,
+        "Press Check again.",
+        id="listing-no-answer",
+    ),
+    pytest.param(
+        lambda: checks._scanner_nothing_found_row(0).next_step,
+        "Check the scanner is switched on and connected, then press Check again.",
+        id="nothing-found",
+    ),
+    pytest.param(
+        lambda: checks._scanner_nothing_found_row(1).next_step,
+        "Check the scanner is switched on and connected to the scanner host, "
+        "then press Check again.",
+        id="host-answers-nothing-found",
+    ),
+    pytest.param(
+        lambda: checks._paperless_next_step(ConnectionStatus.SERVER_ERROR),
+        "Check paperless-ngx is healthy, then press Check again.",
+        id="paperless-server-error",
+    ),
+    pytest.param(
+        lambda: checks._paperless_next_step(ConnectionStatus.UNREACHABLE),
+        "Check paperless-ngx is running and on the network, then press Check again.",
+        id="paperless-unreachable",
+    ),
+    pytest.param(
+        lambda: checks._paperless_next_step(ConnectionStatus.INCOMPATIBLE),
+        "saneless needs paperless-ngx 2.16 or later (API version 9 or 10); "
+        "upgrade paperless-ngx, then press Check again.",
+        id="paperless-incompatible",
+    ),
+)
+
+
+class TestStripWording:
+    """
+    One row, two endings: the strip still reads exactly as it did.
+
+    A retrying next step is stored with a placeholder and rendered for the
+    surface that shows it.  The strip's rendering must be byte-identical to
+    the sentence it carried before, and the stored step must not name the
+    web button, because ``saneless doctor`` prints the same row.
+    """
+
+    @pytest.mark.parametrize(("step", "today"), _STRIP_WORDING)
+    def test_strip_wording_is_unchanged(
+        self, step: Callable[[], str], today: str
+    ) -> None:
+        """
+        The strip rendering is today's sentence, and the stored step is not.
+
+        Args:
+            step: Reads the stored next step from the module.
+            today: What the strip said before.
+
+        """
+        stored = step()
+        assert render_check_step(stored, CheckSurface.STRIP) == today
+        assert "Check again" not in stored
+        doctor = render_check_step(stored, CheckSurface.DOCTOR)
+        assert "Check again" not in doctor
+        assert "saneless doctor again" in doctor
+
+    def test_the_give_up_line_stays_strip_only(self) -> None:
+        """
+        The give-up line is shown only by the strip, and keeps its wording.
+
+        It names the button beside it and is never printed by doctor, so it
+        carries no placeholder and renders unchanged.
+        """
+        line = "The checks have not run yet. Press Check again to try now."
+        assert line == checks.POLL_GAVE_UP_LINE
+        assert render_check_step(checks.POLL_GAVE_UP_LINE, CheckSurface.STRIP) == line

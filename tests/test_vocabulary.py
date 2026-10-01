@@ -13,7 +13,7 @@ import signal
 import time
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import pytest
 
@@ -61,6 +61,8 @@ from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     RESTART_UPLOADING_REASON,
+    RETRY_PLACEHOLDER,
+    RETRY_SENTENCE_PLACEHOLDER,
     TAG_FILTER_LABEL,
     TAGS_LOADING,
     TAGS_UNAVAILABLE,
@@ -75,6 +77,7 @@ from saneless.vocabulary import (
     WARNED_UPLOAD_LABEL,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
+    CheckSurface,
     ConnectionStatus,
     ErrorAdvice,
     ErrorCategory,
@@ -133,6 +136,7 @@ from saneless.vocabulary import (
     rejection_status_code,
     removed_pages,
     removed_pages_note,
+    render_check_step,
     restart_category,
     restart_error,
     scan_button_label,
@@ -3469,3 +3473,101 @@ class TestNoScriptCopy:
     def test_refusal_title_is_its_heading(self) -> None:
         """The tab and the heading say the same thing."""
         assert f"{NO_SCRIPT_HEADING} — saneless" == NO_SCRIPT_PAGE_TITLE
+
+
+# What each surface says in place of the two retry placeholders.  Written out
+# rather than read from the module, so a change to either ending fails here.
+_SURFACE_ENDINGS: Final = (
+    (CheckSurface.STRIP, "press Check again", "Press Check again"),
+    (CheckSurface.DOCTOR, "run saneless doctor again", "Run saneless doctor again"),
+)
+
+
+class TestRenderCheckStep:
+    """
+    One check row, two endings: each surface names its own way to retry.
+
+    The strip has a Check again button; ``saneless doctor`` is run again from a
+    terminal, where no button exists.
+    """
+
+    @pytest.mark.parametrize(("surface", "mid", "start"), _SURFACE_ENDINGS)
+    def test_the_mid_sentence_placeholder(
+        self, surface: CheckSurface, mid: str, start: str
+    ) -> None:
+        """A retry after a comma is spelled in lower case."""
+        step = f"Check the scanner is on, then {RETRY_PLACEHOLDER}."
+        assert (
+            render_check_step(step, surface) == f"Check the scanner is on, then {mid}."
+        )
+        assert start not in render_check_step(step, surface)
+
+    @pytest.mark.parametrize(("surface", "mid", "start"), _SURFACE_ENDINGS)
+    def test_the_sentence_start_placeholder(
+        self, surface: CheckSurface, mid: str, start: str
+    ) -> None:
+        """A retry that opens a sentence is capitalised."""
+        step = f"{RETRY_SENTENCE_PLACEHOLDER}."
+        assert render_check_step(step, surface) == f"{start}."
+        assert mid not in render_check_step(step, surface)
+
+    @pytest.mark.parametrize(("surface", "mid", "start"), _SURFACE_ENDINGS)
+    def test_both_placeholders_in_one_step(
+        self, surface: CheckSurface, mid: str, start: str
+    ) -> None:
+        """Every placeholder in a step is replaced, not only the first."""
+        step = (
+            f"{RETRY_SENTENCE_PLACEHOLDER}. If that fails, restart, then "
+            f"{RETRY_PLACEHOLDER}."
+        )
+        assert render_check_step(step, surface) == (
+            f"{start}. If that fails, restart, then {mid}."
+        )
+
+    @pytest.mark.parametrize("surface", list(CheckSurface))
+    def test_a_step_with_no_placeholder_is_unchanged(
+        self, surface: CheckSurface
+    ) -> None:
+        """A step that does not retry reads the same on both surfaces."""
+        step = (
+            "Correct paperless.url in the saneless config file, then restart saneless."
+        )
+        assert render_check_step(step, surface) == step
+        assert render_check_step("", surface) == ""
+
+    @pytest.mark.parametrize("surface", list(CheckSurface))
+    def test_other_braces_are_inert(self, surface: CheckSurface) -> None:
+        """
+        Only the two placeholders are replaced; no other brace is interpreted.
+
+        A format call would raise on ``{0}`` or substitute ``{name}``, so the
+        row text is never handed to one.
+        """
+        step = f"Set [scanner] device to {{0}} or {{name}}, then {RETRY_PLACEHOLDER}."
+        rendered = render_check_step(step, surface)
+        assert rendered.startswith("Set [scanner] device to {0} or {name}, then ")
+        assert RETRY_PLACEHOLDER not in rendered
+
+    def test_the_placeholders_differ(self) -> None:
+        """The two placeholders are distinct, so each keeps its own case."""
+        assert RETRY_PLACEHOLDER != RETRY_SENTENCE_PLACEHOLDER
+        assert RETRY_PLACEHOLDER.lower() == RETRY_SENTENCE_PLACEHOLDER.lower()
+
+    def test_the_strip_ending_names_the_button(self) -> None:
+        """The strip's ending names the button on the page beside it."""
+        assert "Check again" in render_check_step(
+            RETRY_SENTENCE_PLACEHOLDER, CheckSurface.STRIP
+        )
+
+    def test_the_doctor_ending_names_no_button(self) -> None:
+        """Doctor's ending names the command, never a web button."""
+        for placeholder in (RETRY_PLACEHOLDER, RETRY_SENTENCE_PLACEHOLDER):
+            rendered = render_check_step(placeholder, CheckSurface.DOCTOR)
+            assert "Check again" not in rendered
+            assert "saneless doctor again" in rendered
+
+    def test_an_unknown_surface_raises(self) -> None:
+        """A value outside CheckSurface is a programming error."""
+        bad = cast("CheckSurface", "KIOSK")
+        with pytest.raises(AssertionError):
+            render_check_step("Nothing to retry.", bad)

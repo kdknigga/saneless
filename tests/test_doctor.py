@@ -52,6 +52,7 @@ from saneless.checks import (
 )
 from saneless.cli import (
     _MARKER_WIDTH,
+    _NEXT_STEP_INDENT,
     _SKIPPED_MARKER,
     _row_marker,
     _state_marker,
@@ -69,7 +70,13 @@ from saneless.config import (
     discover_config,
     profile_storage_for_loaded,
 )
-from saneless.exceptions import ConfigError, PaperlessError, ScanError
+from saneless.exceptions import (
+    ConfigError,
+    ListingCrashedError,
+    ListingTimedOutError,
+    PaperlessError,
+    ScanError,
+)
 from saneless.job import JobStore
 from saneless.paperless import ConnectionProbe
 from saneless.scanner.base import DeviceInfo
@@ -78,9 +85,11 @@ from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
+    import threading
+
     import httpx2
 
-    from saneless.scanner.base import DeviceCapabilities
+    from saneless.scanner.base import DeviceCapabilities, DeviceSurvey
 
 # Every ExitCode member, written out rather than derived, so that adding a
 # member to the enum fails here as well as in the two doc-truth tests.  D-01
@@ -202,6 +211,115 @@ class _ConnectedPaperless:
 
     def close(self) -> None:
         """Nothing to close."""
+
+
+class _UnreachablePaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test finds nothing listening."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Report a paperless-ngx that could not be reached.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            A ``ConnectionStatus.UNREACHABLE`` probe.
+
+        """
+        return ConnectionProbe(ConnectionStatus.UNREACHABLE)
+
+
+class _FailingPaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test is answered with a 500."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Report a paperless-ngx that answered with a server error.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            A ``ConnectionStatus.SERVER_ERROR`` probe.
+
+        """
+        return ConnectionProbe(ConnectionStatus.SERVER_ERROR)
+
+
+class _RaisingPaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test raises, so the check cannot finish."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Fail the way an unexpected bug in the probe would.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            RuntimeError: Always.
+
+        """
+        msg = "unexpected"
+        raise RuntimeError(msg)
+
+
+class _ListingTimesOut(_ReadyScanner):
+    """A backend whose isolated listing is stopped at its deadline."""
+
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
+        """
+        Fail the way a listing stopped at its deadline fails.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ListingTimedOutError: Always.
+
+        """
+        msg = "The scanner library did not finish listing scanners in time"
+        raise ListingTimedOutError(msg)
+
+
+class _ListingCrashes(_ReadyScanner):
+    """A backend whose isolated listing crashes in the scanner library."""
+
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
+        """
+        Fail the way a listing child that died on a signal fails.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ListingCrashedError: Always.
+
+        """
+        msg = "The scanner library failed while listing scanners"
+        raise ListingCrashedError(msg)
 
 
 def _make_settings(
@@ -1575,3 +1693,92 @@ class TestProfilesRowAgreement:
 
         assert seen == [settings]
         assert storage is ProfileStorage.PERSISTED
+
+
+class TestDoctorNamesItsOwnRetry:
+    """
+    One check row, two endings: doctor never tells a terminal to press a button.
+
+    The strip's next steps end in "press Check again", the button beside them.
+    ``saneless doctor`` prints the same rows, and in a terminal that advice
+    points at nothing, so its rows end in "run saneless doctor again" instead.
+    Each case drives the real registry through a failing or warning row.
+    """
+
+    @pytest.mark.parametrize(
+        ("scanner_cls", "paperless_cls", "expected"),
+        [
+            pytest.param(
+                _WrongScanner,
+                _ConnectedPaperless,
+                "Check it is switched on and connected, then run saneless doctor "
+                "again. If saneless devices does not list it, set [scanner] "
+                "device to one it lists, then restart saneless.",
+                id="scanner-not-found",
+            ),
+            pytest.param(
+                _ListingTimesOut,
+                _ConnectedPaperless,
+                "Check the scanner, and its scanner host if it has one, are "
+                "switched on and reachable, then run saneless doctor again.",
+                id="listing-timed-out",
+            ),
+            pytest.param(
+                _ListingCrashes,
+                _ConnectedPaperless,
+                "Run saneless doctor again.",
+                id="listing-crashed",
+            ),
+            pytest.param(
+                _ReadyScanner,
+                _UnreachablePaperless,
+                "Check paperless-ngx is running and on the network, then run "
+                "saneless doctor again.",
+                id="paperless-unreachable",
+            ),
+            pytest.param(
+                _ReadyScanner,
+                _FailingPaperless,
+                "Check paperless-ngx is healthy, then run saneless doctor again.",
+                id="paperless-500",
+            ),
+            pytest.param(
+                _ReadyScanner,
+                _RaisingPaperless,
+                "Restart saneless, then run saneless doctor again.",
+                id="check-raised",
+            ),
+        ],
+    )
+    def test_doctor_never_names_the_web_button(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        scanner_cls: type,
+        paperless_cls: type,
+        expected: str,
+    ) -> None:
+        """
+        The row's next step ends in re-running doctor, and no line says Check again.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            scanner_cls: Stands in for ``SaneBackend``.
+            paperless_cls: Stands in for ``PaperlessClient``.
+            expected: The next step doctor prints for the row that is not green.
+
+        """
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        runner = _patch_doctor(
+            monkeypatch,
+            settings,
+            scanner_cls=scanner_cls,
+            paperless_cls=paperless_cls,
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert "Check again" not in result.output
+        assert "saneless doctor again" in result.output
+        assert f"{_NEXT_STEP_INDENT}{expected}\n" in result.output, result.output

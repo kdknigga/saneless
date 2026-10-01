@@ -66,7 +66,14 @@ from saneless.config import (
 )
 from saneless.paperless import ConnectionProbe, PaperlessClient
 from saneless.scanner.base import DeviceInfo
-from saneless.vocabulary import ConnectionStatus, JobState, local_time
+from saneless.vocabulary import (
+    CheckSurface,
+    ConnectionStatus,
+    JobState,
+    connection_status_message,
+    local_time,
+    render_check_step,
+)
 from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web import routes as routes_module
@@ -2943,3 +2950,129 @@ class TestWhichResponsesCarryWhat:
         # second one is the shape of a poll, never a response anybody is sent,
         # so it cannot re-render the strip.
         assert source.count('"refresh_checks": False') == 2
+
+
+def _paperless_row(status: ConnectionStatus) -> CheckResult:
+    """
+    Build the red Paperless row the registry draws for one probe outcome.
+
+    Args:
+        status: What the connection test found.
+
+    Returns:
+        The row, with the message and next step the registry gives it.
+
+    """
+    return CheckResult(
+        key=CheckKey.PAPERLESS,
+        state=CheckState.FAIL,
+        message=connection_status_message(status),
+        next_step=checks_module._paperless_next_step(status),
+    )
+
+
+def _check_failed_row() -> CheckResult:
+    """
+    Build the row the registry draws for a check that raised.
+
+    Returns:
+        The red Paperless row a raising probe becomes.
+
+    """
+    return CheckResult(
+        key=CheckKey.PAPERLESS,
+        state=CheckState.FAIL,
+        message=checks_module._CHECK_FAILED_MESSAGE,
+        next_step=checks_module._CHECK_FAILED_NEXT_STEP,
+    )
+
+
+class TestTheStripNamesItsOwnRetry:
+    """
+    One row, two endings: the strip keeps saying press Check again.
+
+    The registry stores a retrying next step with a placeholder, and
+    ``saneless doctor`` renders it as "run saneless doctor again".  The strip
+    renders the same row with the button that is beside it, word for word as
+    it always has, and never shows the placeholder itself.
+    """
+
+    @pytest.mark.parametrize(
+        ("row", "expected"),
+        [
+            pytest.param(
+                checks_module._scanner_configured_missing_row,
+                "Check it is switched on and connected, then press Check again. "
+                "If saneless devices does not list it, set [scanner] device to "
+                "one it lists, then restart saneless.",
+                id="scanner-not-found",
+            ),
+            pytest.param(
+                checks_module._scanner_listing_timed_out_row,
+                "Check the scanner, and its scanner host if it has one, are "
+                "switched on and reachable, then press Check again.",
+                id="listing-timed-out",
+            ),
+            pytest.param(
+                checks_module._scanner_listing_crashed_row,
+                "Press Check again.",
+                id="listing-crashed",
+            ),
+            pytest.param(
+                lambda: _paperless_row(ConnectionStatus.UNREACHABLE),
+                "Check paperless-ngx is running and on the network, then press "
+                "Check again.",
+                id="paperless-unreachable",
+            ),
+            pytest.param(
+                lambda: _paperless_row(ConnectionStatus.SERVER_ERROR),
+                "Check paperless-ngx is healthy, then press Check again.",
+                id="paperless-500",
+            ),
+            pytest.param(
+                _check_failed_row,
+                "Restart saneless, then press Check again.",
+                id="check-raised",
+            ),
+        ],
+    )
+    def test_the_strip_still_says_check_again(
+        self,
+        client: TestClient,
+        row: Callable[[], CheckResult],
+        expected: str,
+    ) -> None:
+        """
+        The row's next step names the button, and no placeholder reaches the page.
+
+        Args:
+            client: A client over the real app.
+            row: Builds the row the registry would draw.
+            expected: The sentence the strip shows under it.
+
+        """
+        failing = row()
+        _app(client).state.checks.store(
+            tuple(
+                failing
+                if key is failing.key
+                else CheckResult(key=key, state=CheckState.OK, message="Fine.")
+                for key in CheckKey
+            )
+        )
+        rendered = _row_named(client.get("/").text, check_name(failing.key))
+        assert f'<span class="check-next">{expected}</span>' in rendered
+        assert "{" not in rendered
+        assert "saneless doctor again" not in rendered
+
+    def test_the_strip_renders_next_steps_through_the_shared_function(self) -> None:
+        """
+        The template reaches the one renderer doctor uses, not a copy of it.
+
+        The filter is the vocabulary function itself, so the strip's ending and
+        doctor's cannot be chosen by two implementations.
+        """
+        templates = app_module._build_templates()
+        assert templates.env.filters["check_step"] is render_check_step
+        assert "check_step" in _template()
+        assert templates.env.globals["CheckSurface"] is CheckSurface
