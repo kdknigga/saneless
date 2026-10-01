@@ -21,7 +21,7 @@
 # `requires = ["uv_build>=0.12.17,<0.13.0"]`, so a Dependabot bump across that
 # ceiling needs the constraint widened in the same pull request -- which is
 # the coupling surfacing where it can be reviewed, rather than breaking later.
-FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv
+FROM ghcr.io/astral-sh/uv:0.12.21@sha256:a7aed3216253ee804de3e2d8afa5073baa1a177335345d43845cd4165e43b711 AS uv
 
 # Stage 1: Build
 FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS builder
