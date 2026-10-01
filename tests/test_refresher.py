@@ -34,7 +34,7 @@ from saneless.scanner.listing import ListingRequest, run_listing_child
 from saneless.vocabulary import ProfileStorage
 from saneless.web import refresher as refresher_module
 from saneless.web.checks_cache import CheckCache
-from saneless.web.refresher import WATCH_WINDOW_SECONDS, CheckRefresher
+from saneless.web.refresher import WATCH_WINDOW_SECONDS, CheckRefresher, ManualProbe
 from saneless.worker import STOP_JOIN_SECONDS
 from tests.conftest import StubScannerBackend
 
@@ -131,12 +131,19 @@ class _FakeClock:
 
 
 class _RunChecksSpy:
-    """A stand-in for ``run_checks`` that records every context handed to it."""
+    """
+    A stand-in for ``run_checks`` that records every context handed to it.
+
+    It also records the name of the thread each call ran on, which is how a
+    test proves a requested probe ran on the refresher thread and not on the
+    thread that asked for it.
+    """
 
     def __init__(self, error: Exception | None = None) -> None:
         """Record nothing yet; raise ``error`` on every call when given one."""
         self.calls: list[CheckContext] = []
         self.gates: list[threading.Lock | None] = []
+        self.threads: list[str] = []
         self.results = _results()
         self._error = error
 
@@ -156,9 +163,78 @@ class _RunChecksSpy:
         """
         self.calls.append(context)
         self.gates.append(scanner_gate)
+        self.threads.append(threading.current_thread().name)
         if self._error is not None:
             raise self._error
         return self.results
+
+
+class _BlockingRunChecksSpy(_RunChecksSpy):
+    """A ``run_checks`` stand-in that holds its probe until the test lets go."""
+
+    def __init__(self) -> None:
+        """Start blocked, with nothing entered yet."""
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(
+        self, context: CheckContext, *, scanner_gate: threading.Lock | None = None
+    ) -> tuple[CheckResult, ...]:
+        """
+        Announce the probe, wait for the release, then record it as usual.
+
+        The wait is bounded, so a test that never releases fails on its own
+        assertions instead of wedging the refresher thread.
+
+        Args:
+            context: The context the refresher assembled.
+            scanner_gate: The gate the refresher handed in rather than held.
+
+        Returns:
+            The canned results.
+
+        """
+        self.entered.set()
+        self.release.wait(_JOIN_TIMEOUT_SECONDS)
+        return super().__call__(context, scanner_gate=scanner_gate)
+
+
+class _Requester:
+    """Asks a refresher for a probe from a helper thread and keeps the answer."""
+
+    def __init__(self, refresher: CheckRefresher, wait: float) -> None:
+        """
+        Build the helper thread without starting it.
+
+        Args:
+            refresher: The refresher to ask.
+            wait: How long the request may wait for its probe.
+
+        """
+        self.answer: ManualProbe | None = None
+        self._refresher = refresher
+        self._wait = wait
+        self._thread = threading.Thread(target=self._ask, daemon=True)
+
+    def _ask(self) -> None:
+        """Make the request and keep what it returned."""
+        self.answer = self._refresher.request_probe(wait=self._wait)
+
+    def start(self) -> None:
+        """Start asking."""
+        self._thread.start()
+
+    def join(self) -> bool:
+        """
+        Wait a bounded time for the request to return.
+
+        Returns:
+            Whether the request returned within the bound.
+
+        """
+        self._thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
+        return not self._thread.is_alive()
 
 
 class _ReentrantRunChecksSpy:
@@ -166,7 +242,7 @@ class _ReentrantRunChecksSpy:
 
     def __init__(self, refresher_box: list[CheckRefresher]) -> None:
         """
-        Re-enter the probe path of whatever refresher ``refresher_box`` holds.
+        Ask for a probe from inside whatever refresher ``refresher_box`` holds.
 
         A box rather than the refresher itself, because the spy has to exist
         before the refresher that calls it does.
@@ -176,6 +252,7 @@ class _ReentrantRunChecksSpy:
 
         """
         self.calls: list[CheckContext] = []
+        self.answers: list[ManualProbe] = []
         self.results = _results()
         self._box = refresher_box
 
@@ -183,10 +260,12 @@ class _ReentrantRunChecksSpy:
         self, context: CheckContext, *, scanner_gate: threading.Lock | None = None
     ) -> tuple[CheckResult, ...]:
         """
-        Record the call, probe again from inside it, and return results.
+        Record the call, ask for a probe from inside it, and return results.
 
-        The nested probe is the whole point: it is a second checker arriving
+        The nested request is the whole point: it is a second checker arriving
         while the first is mid-flight, with no thread scheduling luck involved.
+        The wait it asks for is long, so a request that waited instead of
+        collapsing would show up as a slow test rather than pass.
 
         Args:
             context: The context the refresher assembled.
@@ -198,7 +277,7 @@ class _ReentrantRunChecksSpy:
         """
         self.calls.append(context)
         for refresher in self._box:
-            refresher.probe_now()
+            self.answers.append(refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS))
         return self.results
 
 
@@ -613,7 +692,7 @@ def test_a_failing_probe_releases_the_probe_lock(
     refresher.note_watcher()
     refresher._tick()
     good = _spy(monkeypatch)
-    refresher.probe_now()
+    refresher._probe_and_store()
     assert len(good.calls) == 1
 
 
@@ -635,6 +714,7 @@ def test_two_overlapping_probes_run_the_checks_once(
     refresher.note_watcher()
     refresher._tick()
     assert len(spy.calls) == 1
+    assert spy.answers == [ManualProbe.COLLAPSED]
 
 
 def test_the_second_of_two_overlapping_probes_stores_nothing(
@@ -653,60 +733,72 @@ def test_the_second_of_two_overlapping_probes_stores_nothing(
     assert counter.count == 1
 
 
-def test_probe_now_ignores_a_fresh_cache(
-    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+def test_a_requested_probe_ignores_a_fresh_cache(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    started_refreshers: list[CheckRefresher],
 ) -> None:
-    """D-09: an explicit click does not wait out the TTL."""
+    """An explicit click does not wait out the TTL."""
     spy = _spy(monkeypatch)
     refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
     refresher.note_watcher()
     refresher._tick()
-    refresher.probe_now()
+    started_refreshers.append(refresher)
+    refresher.start()
+    assert refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS) is ManualProbe.DONE
     assert len(spy.calls) == 2
 
 
-def test_probe_now_ignores_a_closed_watch_window(
-    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+def test_a_requested_probe_ignores_a_closed_watch_window(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    started_refreshers: list[CheckRefresher],
 ) -> None:
     """Somebody pressing the button is, by definition, somebody watching."""
     spy = _spy(monkeypatch)
     clock = _FakeClock()
     refresher, _cache = _build(default_settings, clock, threading.Lock())
     clock.advance(WATCH_WINDOW_SECONDS + 1.0)
-    refresher.probe_now()
+    started_refreshers.append(refresher)
+    refresher.start()
+    assert refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS) is ManualProbe.DONE
     assert len(spy.calls) == 1
 
 
-def test_probe_now_stores_what_the_checks_returned(
+def test_a_probe_stores_what_the_checks_returned(
     default_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The button's probe fills the same cache the thread's probe fills."""
+    """A probe fills the cache with exactly what the checks returned."""
     spy = _spy(monkeypatch)
     refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
-    refresher.probe_now()
+    refresher._probe_and_store()
     assert cache.current().results == spy.results
 
 
-def test_a_failing_probe_now_leaves_the_previous_entry_in_place(
+def test_a_failing_probe_leaves_the_previous_entry_in_place(
     default_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Last-known-good is still last-known-good on the button's path."""
+    """Last-known-good holds whichever path asked for the probe."""
     good = _spy(monkeypatch)
     refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
-    refresher.probe_now()
+    refresher._probe_and_store()
     _spy(monkeypatch, error=RuntimeError("probe exploded"))
-    refresher.probe_now()
+    refresher._probe_and_store()
     assert cache.current().results == good.results
 
 
-def test_probe_now_skips_the_scanner_while_a_job_is_in_flight(
-    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+def test_a_requested_probe_skips_the_scanner_while_a_job_is_in_flight(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    started_refreshers: list[CheckRefresher],
 ) -> None:
     """An explicit click does not get to defeat the exclusive-scanner rule."""
     spy = _spy(monkeypatch)
     scan = _ScanState(active=True)
     refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock(), scan)
-    refresher.probe_now()
+    started_refreshers.append(refresher)
+    refresher.start()
+    assert refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS) is ManualProbe.DONE
     assert spy.calls[0].skip_scanner is True
 
 
@@ -717,9 +809,9 @@ def test_the_scan_fact_is_read_at_probe_time(
     spy = _spy(monkeypatch)
     scan = _ScanState(active=True)
     refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock(), scan)
-    refresher.probe_now()
+    refresher._probe_and_store()
     scan.active = False
-    refresher.probe_now()
+    refresher._probe_and_store()
     assert [call.skip_scanner for call in spy.calls] == [True, False]
 
 
@@ -790,31 +882,37 @@ def test_a_raising_store_leaves_the_previous_entry_in_place(
     """Last-known-good covers a failed *write* too, not only a failed probe."""
     good = _spy(monkeypatch)
     refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
-    refresher.probe_now()
+    refresher._probe_and_store()
     previous = cache.current().results
     monkeypatch.setattr(cache, "store", _RaisingStore(RuntimeError("store exploded")))
 
-    assert refresher.probe_now() is True
+    assert refresher._probe_and_store() is True
 
     assert cache.current().results == previous
     assert previous == good.results
 
 
-def test_probe_now_with_a_raising_store_reports_that_it_probed(
-    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+def test_a_requested_probe_with_a_raising_store_still_answers_its_waiter(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    started_refreshers: list[CheckRefresher],
 ) -> None:
     """
-    The button's path must render, not 500 with the manual claim spent.
+    A probe that ran and could not store still ends the request's wait.
 
-    ``POST /api/checks/refresh`` calls this from a request thread, so a raise
-    here is a raise in a request thread: the clicker gets an error page and
-    their one claim is gone, for a probe that actually ran.
+    The request is a page waiting for an answer.  Reporting this as still
+    pending would leave that page asking again for a result that is never
+    coming; the cache keeps its previous entry and the page renders that.
     """
     _spy(monkeypatch)
     refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
-    monkeypatch.setattr(cache, "store", _RaisingStore(RuntimeError("store exploded")))
+    store = _RaisingStore(RuntimeError("store exploded"))
+    monkeypatch.setattr(cache, "store", store)
+    started_refreshers.append(refresher)
+    refresher.start()
 
-    assert refresher.probe_now() is True
+    assert refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS) is ManualProbe.DONE
+    assert store.calls == 1
     assert refresher.probe_in_flight is False
 
 
@@ -1074,30 +1172,29 @@ def test_stop_with_a_timeout_does_not_join_a_finished_thread(
     assert thread.join_timeouts == []
 
 
-def test_probe_now_reports_that_it_probed(
+def test_a_probe_reports_that_it_probed(
     default_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The route has to tell a probe from a collapse, so the probe says which."""
+    """A probe that took the lock says so."""
     _spy(monkeypatch)
     refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
-    assert refresher.probe_now() is True
+    assert refresher._probe_and_store() is True
 
 
-def test_probe_now_reports_a_collapse_while_another_checker_holds_the_lock(
+def test_a_probe_reports_a_collapse_while_another_checker_holds_the_lock(
     default_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    WR-03: a collapsed click must be visible to the handler that made it.
+    A second checker leaves without probing, and says it did nothing.
 
-    The lock is taken by the test rather than by a thread, which is the same
-    idiom ``tests/test_web_checks.py::_RecordingRefresher.probe_lock`` exists
-    for: the overlap is a fact of the call, with no scheduling luck in it.
+    The lock is taken by the test rather than by a thread, so the overlap is
+    a fact of the call, with no scheduling luck in it.
     """
     spy = _spy(monkeypatch)
     refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
     assert refresher._probe_lock.acquire(blocking=False) is True
     try:
-        assert refresher.probe_now() is False
+        assert refresher._probe_and_store() is False
     finally:
         refresher._probe_lock.release()
     assert spy.calls == []
@@ -1115,7 +1212,7 @@ def test_a_probe_that_raised_still_reports_that_it_probed(
     """
     spy = _spy(monkeypatch, error=RuntimeError("probe exploded"))
     refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
-    assert refresher.probe_now() is True
+    assert refresher._probe_and_store() is True
     assert len(spy.calls) == 1
     assert cache.current().results is None
 
@@ -1184,7 +1281,7 @@ def test_probe_in_flight_is_true_inside_the_probe_and_false_after_it(
     monkeypatch.setattr("saneless.web.refresher.run_checks", _record)
     refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
     box.append(refresher)
-    assert refresher.probe_now() is True
+    assert refresher._probe_and_store() is True
     assert seen == [True]
     assert refresher.probe_in_flight is False
 
@@ -1246,7 +1343,8 @@ def test_an_aborted_probe_stores_nothing(
 
     monkeypatch.setattr("saneless.web.refresher.run_checks", stopping_run_checks)
 
-    assert refresher.probe_now() is True
+    assert refresher._probe_and_store() is True
+
     assert cache.current().results == before
 
 
@@ -1298,3 +1396,185 @@ def test_stop_aborts_an_in_flight_listing(
     assert not Path(f"/proc/{pid}").exists()
     assert backend.aborts == [refresher._stopping]
     assert cache.current().results == before
+
+
+class TestRequestProbe:
+    """
+    Check again's probe runs on the refresher thread, never on the caller's.
+
+    The caller signals and then waits a bounded time for the answer.  Every
+    wait here has a bound, so a refresher that never answers fails the test
+    instead of hanging it.
+    """
+
+    def test_a_requested_probe_runs_on_the_refresher_thread(
+        self,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        started_refreshers: list[CheckRefresher],
+    ) -> None:
+        """A fast probe is done inside the wait, and ran on the refresher."""
+        spy = _spy(monkeypatch)
+        refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+        started_refreshers.append(refresher)
+        refresher.start()
+
+        answer = refresher.request_probe(wait=2.5)
+
+        assert answer is ManualProbe.DONE
+        assert spy.threads == [refresher._thread.name]
+        assert threading.current_thread().name not in spy.threads
+        assert cache.current().results == spy.results
+
+    def test_a_slow_probe_answers_pending_and_stays_in_flight(
+        self,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        poll_until: Callable[..., bool],
+        started_refreshers: list[CheckRefresher],
+    ) -> None:
+        """The caller gets its answer at the wait, and the probe carries on."""
+        spy = _BlockingRunChecksSpy()
+        monkeypatch.setattr("saneless.web.refresher.run_checks", spy)
+        refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+        started_refreshers.append(refresher)
+        refresher.start()
+        try:
+            began = time.monotonic()
+            answer = refresher.request_probe(wait=0.2)
+            elapsed = time.monotonic() - began
+
+            assert answer is ManualProbe.PENDING
+            assert elapsed < 1.0
+            assert spy.entered.wait(_JOIN_TIMEOUT_SECONDS) is True
+            assert refresher.probe_in_flight is True
+            assert cache.current().results is None
+        finally:
+            spy.release.set()
+
+        assert poll_until(lambda: not refresher.probe_in_flight, _JOIN_TIMEOUT_SECONDS)
+        assert cache.current().results == spy.results
+
+    def test_a_request_collapses_at_once_while_a_probe_holds_the_lock(
+        self, default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A request that finds a probe running neither waits nor asks again."""
+        spy = _spy(monkeypatch)
+        refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+        assert refresher._probe_lock.acquire(blocking=False) is True
+        try:
+            began = time.monotonic()
+            answer = refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS)
+            elapsed = time.monotonic() - began
+        finally:
+            refresher._probe_lock.release()
+
+        assert answer is ManualProbe.COLLAPSED
+        assert elapsed < 0.5
+        assert refresher.probe_in_flight is False
+        assert spy.calls == []
+
+    def test_a_tick_that_starts_after_a_request_satisfies_it(
+        self,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """A due tick that wins the race serves the waiting request too."""
+        spy = _spy(monkeypatch)
+        refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+        refresher.note_watcher()
+        requester = _Requester(refresher, wait=_JOIN_TIMEOUT_SECONDS)
+        requester.start()
+        assert poll_until(lambda: refresher.probe_in_flight, _JOIN_TIMEOUT_SECONDS)
+
+        refresher._tick()
+
+        assert requester.join() is True
+        assert requester.answer is ManualProbe.DONE
+        assert len(spy.calls) == 1
+
+    def test_two_near_simultaneous_requests_share_one_probe(
+        self,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        poll_until: Callable[..., bool],
+        started_refreshers: list[CheckRefresher],
+    ) -> None:
+        """Both requests are waiting before the thread runs, so one probe serves both."""
+        spy = _spy(monkeypatch)
+        refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+        started_refreshers.append(refresher)
+        first = _Requester(refresher, wait=_JOIN_TIMEOUT_SECONDS)
+        second = _Requester(refresher, wait=_JOIN_TIMEOUT_SECONDS)
+        first.start()
+        second.start()
+        assert poll_until(lambda: refresher._requested == 2, _JOIN_TIMEOUT_SECONDS)
+
+        refresher.start()
+
+        assert first.join() is True
+        assert second.join() is True
+        assert first.answer is ManualProbe.DONE
+        assert second.answer is ManualProbe.DONE
+        assert len(spy.calls) == 1
+
+    def test_request_stop_wakes_a_waiting_request(
+        self,
+        default_settings: Settings,
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        A stop answers a waiting request at once, as still pending.
+
+        The refresher is never started, so nothing would ever serve the
+        request: without the stop waking it, the request would wait out the
+        whole of its long wait and the join below would fail.
+        """
+        refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+        requester = _Requester(refresher, wait=10 * _JOIN_TIMEOUT_SECONDS)
+        requester.start()
+        assert poll_until(lambda: refresher.probe_in_flight, _JOIN_TIMEOUT_SECONDS)
+
+        began = time.monotonic()
+        refresher.request_stop()
+        returned = requester.join()
+        elapsed = time.monotonic() - began
+
+        assert returned is True
+        assert requester.answer is ManualProbe.PENDING
+        assert elapsed < 0.5
+
+    def test_a_request_after_the_stop_does_not_wait(
+        self, default_settings: Settings
+    ) -> None:
+        """A stopping refresher serves nothing, so a late request is told at once."""
+        refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+        refresher.request_stop()
+
+        began = time.monotonic()
+        answer = refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS)
+        elapsed = time.monotonic() - began
+
+        assert answer is ManualProbe.PENDING
+        assert elapsed < 0.5
+
+    def test_a_failed_requested_probe_still_answers_its_waiter(
+        self,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        started_refreshers: list[CheckRefresher],
+    ) -> None:
+        """A probe that raised is finished, and last-known-good stays put."""
+        spy = _spy(monkeypatch, error=RuntimeError("probe exploded"))
+        refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+        started_refreshers.append(refresher)
+        refresher.start()
+
+        assert refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS) is ManualProbe.DONE
+        assert len(spy.calls) == 1
+        assert cache.current().results is None
+
+    def test_the_request_thread_probe_is_gone(self) -> None:
+        """No caller can run a probe on its own thread any more."""
+        assert not hasattr(CheckRefresher, "probe_now")
