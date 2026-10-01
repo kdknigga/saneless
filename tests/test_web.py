@@ -3314,7 +3314,9 @@ def _render_correspondent_options(client: TestClient, selected: int | None) -> s
 
     """
     app = _app(client)
-    context = routes_module._correspondent_options_context(app.state, selected)
+    context = routes_module._correspondent_options_context(
+        app.state, selected, timeout=routes_module._REQUEST_FETCH_TIMEOUT
+    )
     template = app.state.templates.get_template("partials/correspondents.html")
     return template.render(context)
 

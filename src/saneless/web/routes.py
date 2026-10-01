@@ -638,24 +638,22 @@ def _checks_fallback_context() -> dict[str, object]:
     }
 
 
-def _lock_wait(timeout: httpx2.Timeout | None) -> float | None:
+def _lock_wait(timeout: httpx2.Timeout) -> float:
     """
     Say how long a request waits its turn to fetch, given its fetch budget.
 
     A request queued behind another request's fetch of the same list waits at
     most as long as that fetch may take to connect and read, then answers the
-    list unavailable.  Without a budget it waits as long as it takes, which is
-    the full page's behaviour today.
+    list unavailable.  Every list fetch made to answer a request has a budget,
+    so no request waits as long as it takes.
 
     Args:
-        timeout: The request's fetch budget, or None for the client default.
+        timeout: The request's fetch budget.
 
     Returns:
-        The seconds to wait for the cache's per-key lock, or None for no bound.
+        The seconds to wait for the cache's per-key lock.
 
     """
-    if timeout is None:
-        return None
     return (timeout.connect or 0.0) + (timeout.read or 0.0)
 
 
@@ -672,7 +670,7 @@ def _cached_list_or_none(
     paperless: PaperlessClient,
     resource: MetadataResource,
     *,
-    timeout: httpx2.Timeout | None = None,
+    timeout: httpx2.Timeout,
 ) -> CachedList | None:
     """
     Retrieve metadata from cache or paperless-ngx, or None when it is unknown.
@@ -699,8 +697,7 @@ def _cached_list_or_none(
         paperless: Paperless-ngx API client.
         resource: Resource name ('tags' or 'correspondents').
         timeout: The fetch budget on a miss, which also bounds the wait for
-            another request's fetch, or None for the client's own default and
-            no bound.
+            another request's fetch.
 
     Returns:
         The list, fresh or the last good one, with whether it is current, or
@@ -708,7 +705,7 @@ def _cached_list_or_none(
 
     """
     getter = paperless.get_tags if resource == "tags" else paperless.get_correspondents
-    fetch = getter if timeout is None else partial(getter, timeout=timeout)
+    fetch = partial(getter, timeout=timeout)
     try:
         return cache.get_or_fetch_list(
             resource, fetch, lock_timeout=_lock_wait(timeout)
@@ -825,7 +822,7 @@ def _tag_list_context(
     *,
     q: str,
     selected: list[int],
-    timeout: httpx2.Timeout | None = None,
+    timeout: httpx2.Timeout,
 ) -> dict[str, object]:
     """
     Build the tag checkbox list's context: the filtered list and pinned ticks.
@@ -856,8 +853,7 @@ def _tag_list_context(
         state: Application state, for the metadata cache and Paperless client.
         q: The filter text, matched case-insensitively against tag names.
         selected: The tag ids the request reports as currently ticked.
-        timeout: The fetch budget on a cache miss, or None for the client's
-            own default.
+        timeout: The fetch budget on a cache miss.
 
     Returns:
         The context ``partials/tags.html`` renders: the stale and unlisted
@@ -920,7 +916,7 @@ def _tag_list_context(
 
 
 def _correspondent_options_context(
-    state: State, selected: int | None, *, timeout: httpx2.Timeout | None = None
+    state: State, selected: int | None, *, timeout: httpx2.Timeout
 ) -> dict[str, object]:
     """
     Build the correspondent options' context, with one of them chosen.
@@ -934,8 +930,7 @@ def _correspondent_options_context(
     Args:
         state: Application state, for the metadata cache and Paperless client.
         selected: The correspondent id to show chosen, or None for none.
-        timeout: The fetch budget on a cache miss, or None for the client's
-            own default.
+        timeout: The fetch budget on a cache miss.
 
     Returns:
         The context ``partials/correspondents.html`` renders: the list, the
