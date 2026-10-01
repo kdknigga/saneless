@@ -76,6 +76,7 @@ from tests.golden_support import (
     png_idat,
     web_client_builder,
 )
+from tests.prompt_support import readable
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -781,8 +782,10 @@ def _run_cli(
         args.append("--multi-page")
         typed = "".join(f"{_CLI_LETTERS[answer]}\n" for answer in scenario.answers)
     if typed is not None:
-        # CliRunner is not a terminal, and both prompts need one.
+        # CliRunner is not a terminal, and both prompts need one; its stdin
+        # has no descriptor to wait on either, so the wait reports it readable.
         monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+        readable(monkeypatch)
 
     result = CliRunner().invoke(cli, args, input=typed)
     consumed = sorted(consume_dir.glob("*.pdf")) if consume_dir is not None else []

@@ -11,15 +11,18 @@ that turns a failure into a single stderr line and a documented exit code.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import os
+import select
 import shutil
 import signal
 import socket
 import sys
 import termios
 import threading
+import time
 import traceback
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -79,7 +82,6 @@ from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import (
     AnswerSlot,
-    FlipAnswerSlot,
     FlipCoordinator,
     PassCoordinator,
     PipelineEvent,
@@ -226,8 +228,52 @@ _UNSET_ADDRESS_PROBLEM = "the paperless-ngx address in paperless.url has not bee
 # refusal test runs unpatched and the prompt test patches this one name.
 # Written as a bare sys.stdin.isatty() in scan, one of the two could not exist.
 def _stdin_is_interactive() -> bool:
-    """Whether stdin is a terminal a human can answer a prompt on."""
-    return sys.stdin.isatty()
+    """
+    Whether stdin is a terminal a human can answer a prompt on.
+
+    A process started with stdin closed (``<&-``) has no ``sys.stdin`` at all,
+    which is no more a terminal than a pipe is.
+    """
+    stdin = sys.stdin
+    return stdin is not None and not stdin.closed and stdin.isatty()
+
+
+# The clock a prompt's deadline is read from, behind a function of its own for
+# the same reason as _stdin_is_interactive: a test patches this one name to
+# move time on without waiting for it.
+def _monotonic() -> float:
+    """
+    Read the clock a prompt's deadline is measured on.
+
+    Returns:
+        ``time.monotonic()``.
+
+    """
+    return time.monotonic()
+
+
+# The one wait a terminal prompt makes, behind a function of its own so a test
+# patches this one name: CliRunner's stdin has no descriptor to wait on, and
+# everything after the wait -- the read, the parsing, end of input -- then runs
+# for real. Clamped at zero because select refuses a negative timeout.
+def _wait_readable(stream: TextIO, timeout: float) -> bool:
+    """
+    Wait up to ``timeout`` seconds for a line, or end of input, on ``stream``.
+
+    Runs on the main thread, where a signal interrupts it: Ctrl-C raises
+    ``KeyboardInterrupt`` out of the wait, and SIGTERM or SIGHUP raises the
+    handler's ``ScanInterrupted``.
+
+    Args:
+        stream: The stream to wait on; it must have a file descriptor.
+        timeout: The longest to wait, in seconds.
+
+    Returns:
+        Whether ``stream`` can be read without blocking.
+
+    """
+    ready, _, _ = select.select([stream.fileno()], [], [], max(0.0, timeout))
+    return bool(ready)
 
 
 # The signals a one-shot command turns into an interruption: a supervisor
@@ -237,12 +283,12 @@ def _stdin_is_interactive() -> bool:
 # KeyboardInterrupt, and it keeps nothing.
 _INTERRUPT_SIGNALS: Final = (signal.SIGTERM, signal.SIGHUP)
 
-# A dropped SSH session delivers SIGHUP to the main thread and end of input to
-# a terminal prompt's thread at nearly the same moment, in no promised order.
-# End of input on its own is a cancel, which keeps nothing, so the prompt thread
-# waits this long for the signal before it treats end of input as one: the
-# signal wins, and the hangup keeps the pages scanned -- the fronts at the flip
-# prompt, the accepted pages at a multi-page one.
+# A dropped SSH session delivers SIGHUP and end of input to a terminal prompt
+# at nearly the same moment, in no promised order. End of input on its own is a
+# cancel, which keeps nothing, so the prompt waits this long for the signal
+# before it treats end of input as one: the signal wins, and the hangup keeps
+# the pages scanned -- the fronts at the flip prompt, the accepted pages at a
+# multi-page one.
 _HANGUP_GRACE_SECONDS: Final = 0.25
 
 
@@ -250,11 +296,14 @@ class _Interruption:
     """
     Whether a SIGTERM or SIGHUP has reached the running command, and which.
 
-    Set by the signal handler on the main thread and read by a terminal
-    prompt's thread, which is why the signal itself is an ``Event`` and not a bare
-    flag.  On the main thread that Event's lock is taken only inside the
-    handler, and in ``clear``, which runs only while the handler is not
-    installed.
+    Set by the signal handler, which runs on the main thread, and read after
+    end of input at a terminal prompt.  The received flag is a plain
+    attribute, taking no lock, and nothing waits on it.  The handler records
+    the signal and then raises, interrupting whatever the main thread was
+    doing; a lock taken there -- by the handler, or by the very call it
+    interrupted -- could be left held, and the next record or clear would
+    block forever.  The prompt waits for a signal by sleeping instead, which
+    the raising handler interrupts.
 
     ``settled`` is the scan's ``PipelineRequest.settled``: the run sets it once
     its outcome is fixed, and the guard sets it as it starts reporting a
@@ -269,7 +318,7 @@ class _Interruption:
 
     def __init__(self) -> None:
         """Start with no signal received and nothing settled."""
-        self._received = threading.Event()
+        self._received = False
         self.signum: int | None = None
         self.deferred: int | None = None
         self.settled = Settled()
@@ -283,26 +332,23 @@ class _Interruption:
 
         """
         self.signum = signum
-        self._received.set()
+        self._received = True
 
-    def wait(self, timeout: float) -> bool:
+    def received(self) -> bool:
         """
-        Wait up to ``timeout`` seconds for a signal to arrive.
-
-        Args:
-            timeout: The longest to wait, in seconds.
+        Say whether a signal has arrived since the command started.
 
         Returns:
-            Whether a signal has arrived.
+            Whether ``record`` has been called since the last ``clear``.
 
         """
-        return self._received.wait(timeout)
+        return self._received
 
     def clear(self) -> None:
         """Forget any signal, once the command that received it is over."""
         self.signum = None
         self.deferred = None
-        self._received.clear()
+        self._received = False
         self.settled.clear()
 
 
@@ -396,21 +442,27 @@ def _end_of_input(settle_abort: Callable[[], object], what: str) -> None:
     """
     Treat end of input at a prompt as a cancel, unless a hangup caused it.
 
-    A terminal that closes sends SIGHUP to the main thread and end of input to
-    the prompt's thread at nearly the same moment, in no promised order.  The
-    signal is an interruption, which keeps the pages scanned; end of input on
-    its own is the operator's cancel, which keeps nothing.  So the prompt
-    thread waits ``_HANGUP_GRACE_SECONDS`` for a signal first.  If one came,
-    it claims nothing and leaves the calling thread to the ``ScanInterrupted``
-    the signal raised there; otherwise it settles the cancel.  Every terminal
+    A terminal that closes sends SIGHUP and end of input at nearly the same
+    moment, in no promised order.  The signal is an interruption, which keeps
+    the pages scanned; end of input on its own is the operator's cancel, which
+    keeps nothing.  So the prompt pauses ``_HANGUP_GRACE_SECONDS`` for a
+    signal first, and settles the cancel only if none came.  Every terminal
     prompt shares this, so a hangup means the same thing at each of them.
+
+    The pause is a plain sleep, never a wait on a lock.  On the main thread,
+    where the flip prompt reads, the signal's handler raises
+    ``ScanInterrupted`` out of the sleep, and that propagates to the caller.
+    On a prompt's own thread the sleep runs to its end, the handler raises on
+    the main thread instead, and the signal it recorded says to claim
+    nothing and leave the answer to that interruption.
 
     Args:
         settle_abort: Claims the prompt's cancel answer.
         what: The prompt, as its log line names it.
 
     """
-    if _INTERRUPTION.wait(_HANGUP_GRACE_SECONDS):
+    time.sleep(_HANGUP_GRACE_SECONDS)
+    if _INTERRUPTION.received():
         logger.info(
             "%s reached end of input after a signal (%s); "
             "leaving the answer to the interruption",
@@ -421,120 +473,187 @@ def _end_of_input(settle_abort: Callable[[], object], what: str) -> None:
     settle_abort()
 
 
+class _PromptTimedOut(Exception):
+    """A terminal prompt's deadline passed with no line typed."""
+
+
+def _end_the_question_line() -> None:
+    """
+    End the line a question was left on, when no answer ended it.
+
+    An answer ends the line itself: the terminal echoes the operator's
+    Return.  A timeout, end of input or a signal does not, and the line that
+    reports it would land after the question on the same row.  A terminal
+    that has gone away cannot take the newline either, and that must not
+    replace the ending being reported.
+    """
+    with contextlib.suppress(OSError):
+        click.echo()
+
+
+def _read_line(question: str, deadline: float) -> str | None:
+    """
+    Ask ``question`` and read one line of answer, on the calling thread.
+
+    The question is printed, then the prompt waits for stdin to become
+    readable until ``deadline``, then reads one line.  A terminal in its
+    usual line mode hands over at most one line per read, so nothing typed is
+    left buffered where the next wait could not see it.
+
+    Args:
+        question: The whole question, suffix included.
+        deadline: The ``_monotonic`` reading the answer is due by.
+
+    Returns:
+        The line typed, newline included, or ``None`` at end of input.
+
+    Raises:
+        OSError: stdin is closed, or the terminal failed.
+        _PromptTimedOut: ``deadline`` passed first.
+
+    """
+    stdin = sys.stdin
+    if stdin is None or stdin.closed:
+        raise OSError(errno.EBADF, "stdin is closed")
+    click.echo(question, nl=False)
+    try:
+        while not _wait_readable(stdin, deadline - _monotonic()):
+            if _monotonic() >= deadline:
+                raise _PromptTimedOut
+        line = stdin.readline()
+    except _PromptTimedOut, KeyboardInterrupt, ScanInterrupted:
+        _end_the_question_line()
+        raise
+    if not line:
+        _end_the_question_line()
+        return None
+    return line
+
+
+# The flip question as click.confirm(_FLIP_PROMPT, default=True) put it, and
+# click's own refusal of an answer that is neither yes nor no, so an operator
+# used to that prompt sees nothing new now that the CLI reads the line itself.
+_FLIP_QUESTION: Final = f"{_FLIP_PROMPT} [Y/n]: "
+_INVALID_YES_NO: Final = "Error: invalid input"
+
+# The answers click.confirm accepted, after stripping and lower-casing. An
+# empty line takes the default, which is yes.
+_FLIP_YES: Final = frozenset({"", "y", "yes"})
+_FLIP_NO: Final = frozenset({"n", "no"})
+
+
 class ClickFlipCoordinator(FlipCoordinator):
     """
-    The CLI flip coordinator: a terminal prompt with a bounded wait.
+    The CLI flip coordinator: a terminal question with a bounded wait.
 
-    ``click.confirm`` has no timeout of its own, so it runs on a daemon thread
-    while the calling thread waits for at most ``timeout`` seconds.  Whichever
-    of the operator's answer or the clock claims the single answer first is the
-    answer -- claimed through ``FlipAnswerSlot``, the same slot the web worker's
-    coordinator uses, so an answer that lands as the wait expires is honoured
-    rather than overwritten.
+    The question is asked and its answer read on the calling thread -- the
+    main thread, where Python delivers signals -- so every way of leaving it
+    ends the wait at once and nothing is left reading stdin afterwards.  A
+    line is read only once stdin is readable, and the wait for it ends at the
+    deadline, which answers ``TIMED_OUT``.
 
-    A yes is ``CONTINUED``; a no is ``ABORTED``; and so are EOF at the prompt
-    (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
-    the calling thread, where Python delivers SIGINT).  Those three are an
-    operator's abort -- a cancel -- so giving up at the terminal and clicking
-    Abort in the web UI end the job the same way.  The exception is end of
-    input caused by a hangup: a terminal that closes also sends SIGHUP, which
-    is an interruption, not a cancel, and keeps the fronts.  The two arrive at
-    nearly the same moment on different threads, so on end of input the prompt
-    thread waits ``_HANGUP_GRACE_SECONDS`` for a signal and, if one came,
-    claims nothing and leaves the calling thread to the ``ScanInterrupted``
-    the signal raised there.  A prompt that fails with a
-    read error instead -- an I/O error from the terminal, undecodable input --
-    also answers ``ABORTED`` at once, logged with its traceback, but it records
-    the exception as ``abort_cause``: nobody chose to stop, so the scan is
-    reported as failed (exit 1), not cancelled.
+    A yes, or just Return, is ``CONTINUED``; a no is ``ABORTED``; anything
+    else is refused with click's own wording and the question asked again
+    for the time left.  End of input (Ctrl-D) and Ctrl-C are ``ABORTED`` too.
+    Those are an operator's abort -- a cancel -- so giving up at the terminal
+    and clicking Abort in the web UI end the job the same way.
 
-    Accepted cost, deliberate and not a leak: after a timeout the prompt thread
-    is abandoned.  It keeps its read on stdin until the process exits, and its
-    prompt may be left sitting on the terminal.  That is bounded -- the job has
-    already failed and the CLI is on its way out -- and a daemon thread parked
-    on stdin was measured not to delay interpreter shutdown.  It must stay a
-    daemon thread: a non-daemon one would hold the interpreter open at exit
-    waiting for an answer nobody is going to give.
+    The exception is end of input caused by a hangup: a terminal that closes
+    also sends SIGHUP, which is an interruption, not a cancel, and keeps the
+    fronts.  So end of input pauses for the signal first
+    (``_end_of_input``); if it comes, the handler's ``ScanInterrupted``
+    propagates out of the pause, and out of this call, untouched.  A SIGHUP
+    or SIGTERM that arrives while the question waits does the same.
+
+    A read that fails instead -- an I/O error from the terminal, undecodable
+    input, stdin closed -- also answers ``ABORTED`` at once, logged with its
+    traceback, but it records the exception as ``abort_cause``: nobody chose
+    to stop, so the scan is reported as failed (exit 1), not cancelled.
     """
 
     def __init__(self) -> None:
-        """Start unanswered, with no abort cause."""
-        self._slot = FlipAnswerSlot()
-        # Held across a broken prompt's claim and its cause, so the calling
-        # thread, woken by that claim, cannot read the cause before it is set.
-        self._cause_lock = threading.Lock()
+        """Start with no abort cause."""
         self._abort_cause: Exception | None = None
 
     @property
     def abort_cause(self) -> Exception | None:
         """
-        The exception a broken prompt raised, if that failure claimed the answer.
+        The exception a broken read raised, if one ended the question.
 
         Returns:
-            The prompt's exception, or ``None`` when the answer came from the
-            operator (yes, no, EOF, Ctrl-C) or from the clock.
+            The read's exception, or ``None`` when the answer came from the
+            operator (yes, no, end of input, Ctrl-C) or from the clock.
 
         """
-        with self._cause_lock:
-            return self._abort_cause
+        return self._abort_cause
 
     def wait_for_flip(self, timeout: float) -> FlipOutcome:
         """
-        Prompt the operator, and claim ``TIMED_OUT`` if ``timeout`` elapses first.
+        Ask the operator, answering ``TIMED_OUT`` if ``timeout`` elapses first.
 
         Args:
             timeout: The longest to wait for an answer, in seconds.
 
         Returns:
-            The one answer this coordinator resolved to.
+            The one answer the question resolved to.
 
         """
-        prompt = threading.Thread(
-            target=self._prompt, name="saneless-flip-prompt", daemon=True
-        )
-        prompt.start()
+        deadline = _monotonic() + timeout
         try:
-            self._slot.wait(timeout)
+            return self._ask(deadline)
         except KeyboardInterrupt:
-            # Ctrl-C lands here, not in click.confirm: Python handles SIGINT on
-            # the main thread, which is this one, parked in the wait.  Offered
-            # as ABORTED so it ends the job the way a web Abort does.
-            return self._slot.settle(FlipOutcome.ABORTED)
-        # One path for both endings.  If the prompt answered, settle finds that
-        # answer already claimed and hands it back; if the wait expired,
-        # TIMED_OUT is offered and wins unless the answer beat it after all.
-        return self._slot.settle(FlipOutcome.TIMED_OUT)
-
-    def _prompt(self) -> None:
-        """Ask the operator on the prompt thread and claim their answer."""
-        try:
-            flipped = click.confirm(_FLIP_PROMPT, default=True)
-        except click.Abort:
-            # End of input.  If the terminal hung up, SIGHUP is on its way to
-            # (or already at) the calling thread as ScanInterrupted, and
-            # settling ABORTED here first would turn that interruption into a
-            # cancel that keeps nothing.  So the signal gets a moment to win.
-            _end_of_input(
-                partial(self._slot.settle, FlipOutcome.ABORTED), "Flip prompt"
-            )
-            return
-        except Exception as exc:
-            # Anything else used to kill this thread silently, leaving the
-            # calling thread waiting out the whole timeout and then reporting
-            # that nobody confirmed the flip, which was false.  The prompt
-            # broke, so the scan stops now: ABORTED rather than a fourth
-            # outcome, with the exception kept as abort_cause so the pipeline
-            # reports a failure, not a cancel.  The cause is set only if this
-            # claim won: a Ctrl-C or a timeout that answered first keeps its own
-            # meaning.  Logged before the claim, so the record exists once the
-            # wait wakes.
+            # Ctrl-C, raised out of the wait or the end-of-input pause: the
+            # operator's cancel, so it ends the job the way a web Abort does.
+            return FlipOutcome.ABORTED
+        except _PromptTimedOut:
+            return FlipOutcome.TIMED_OUT
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            # The read broke, so the scan stops now: ABORTED rather than a
+            # fourth outcome, with the exception kept as abort_cause so the
+            # pipeline reports a failure, not a cancel.
             logger.exception("Flip prompt failed; treating it as an abort")
-            with self._cause_lock:
-                claimed = self._slot.offer(FlipOutcome.ABORTED)
-                if claimed:
-                    self._abort_cause = exc
-            return
-        self._slot.settle(FlipOutcome.CONTINUED if flipped else FlipOutcome.ABORTED)
+            self._abort_cause = exc
+            return FlipOutcome.ABORTED
+
+    def _ask(self, deadline: float) -> FlipOutcome:
+        """
+        Ask until an answer is accepted, input ends, or ``deadline`` passes.
+
+        Args:
+            deadline: The ``_monotonic`` reading the answer is due by.
+
+        Returns:
+            The operator's answer, or the cancel end of input stands for.
+
+        """
+        while True:
+            line = _read_line(_FLIP_QUESTION, deadline)
+            if line is None:
+                return self._end_of_input()
+            answer = line.strip().lower()
+            if answer in _FLIP_YES:
+                return FlipOutcome.CONTINUED
+            if answer in _FLIP_NO:
+                return FlipOutcome.ABORTED
+            click.echo(_INVALID_YES_NO)
+
+    @staticmethod
+    def _end_of_input() -> FlipOutcome:
+        """
+        Answer end of input: a cancel, unless a signal claims the question.
+
+        A raising signal propagates out of ``_end_of_input``'s pause.  One
+        recorded without raising leaves the question unanswered, which ends it
+        as an unanswered wait does: ``TIMED_OUT``, which keeps the fronts,
+        rather than a cancel that would throw them away.
+
+        Returns:
+            ``ABORTED`` for the cancel, else ``TIMED_OUT``.
+
+        """
+        settled: list[FlipOutcome] = []
+        _end_of_input(partial(settled.append, FlipOutcome.ABORTED), "Flip prompt")
+        return settled[0] if settled else FlipOutcome.TIMED_OUT
 
 
 def _flush_typed_ahead() -> None:
@@ -665,10 +784,10 @@ class ClickPassCoordinator(PassCoordinator):
     """
     The CLI multi-page coordinator: a one-letter prompt with a bounded wait.
 
-    Built as ``ClickFlipCoordinator`` is, for the same reasons.  ``click.prompt``
-    has no timeout of its own, so it runs on a daemon thread while the calling
-    thread waits for at most the prompt's ``timeout_seconds``, and the
-    operator's answer and the clock race for one ``AnswerSlot``.  Every
+    ``click.prompt`` has no timeout of its own, so it runs on a daemon thread
+    while the calling thread waits for at most the prompt's
+    ``timeout_seconds``, and the operator's answer and the clock race for one
+    ``AnswerSlot``.  Every
     question gets a fresh slot, so an answer to one question can never be
     read as the answer to the next.
 
@@ -689,7 +808,7 @@ class ClickPassCoordinator(PassCoordinator):
     the confirmation's default -- is not an abort, and the expired wait
     resolves ``TIMED_OUT``.
 
-    Accepted cost, as at the flip prompt, deliberate and not a leak: after a
+    Accepted cost, deliberate and not a leak: after a
     timeout the prompt thread is abandoned.  It keeps its read on stdin until
     the process exits, and its question may be left sitting on the terminal.
     A timeout always ends the document, so at most one thread is ever
@@ -749,8 +868,8 @@ class ClickPassCoordinator(PassCoordinator):
             # the main thread, which is this one, parked in the wait.  It is
             # the operator's cancel, unconfirmed, whatever has been kept.
             return slot.settle(PassAnswer.ABORT)
-        # One path for both endings, as at the flip prompt: an answer already
-        # claimed is handed back, and an expired wait claims TIMED_OUT.
+        # One path for both endings: an answer already claimed is handed
+        # back, and an expired wait claims TIMED_OUT.
         return slot.settle(PassAnswer.TIMED_OUT)
 
     def _prompt(

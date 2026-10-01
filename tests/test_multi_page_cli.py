@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import logging
 import signal
+import sys
 import termios
 import threading
 from dataclasses import dataclass, replace
@@ -63,6 +64,7 @@ from tests.multi_page_support import (
     ScriptedPassCoordinator,
     multi_page_settings,
 )
+from tests.prompt_support import readable
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -918,28 +920,21 @@ class TestClickPassCoordinatorEndings:
     def test_the_flip_prompt_logs_its_end_of_input_as_before(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The manual-duplex prompt's hangup line reads exactly as it always has."""
+        """
+        The manual-duplex prompt's hangup line reads exactly as it always has.
+
+        A signal recorded without raising leaves the question unanswered, so
+        it ends as an unanswered wait does, keeping the fronts.
+        """
         interruption = _Interruption()
         interruption.record(signal.SIGHUP.value)
         monkeypatch.setattr("saneless.cli._INTERRUPTION", interruption)
-
-        def end_of_input(*_args: object, **_kwargs: object) -> bool:
-            """
-            Be a closed terminal's end of input.
-
-            Raises:
-                click.Abort: Always.
-
-            """
-            raise click.Abort
-
-        monkeypatch.setattr("saneless.cli.click.confirm", end_of_input)
+        # A closed terminal's end of input, readable at once.
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        readable(monkeypatch)
         caplog.set_level(logging.INFO, logger="saneless.cli")
 
         outcome = ClickFlipCoordinator().wait_for_flip(0)
-        for thread in threading.enumerate():
-            if thread.name == "saneless-flip-prompt":
-                thread.join(timeout=5)
 
         assert outcome is FlipOutcome.TIMED_OUT
         assert (
