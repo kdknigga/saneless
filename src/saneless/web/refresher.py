@@ -198,12 +198,22 @@ class CheckRefresher:
         -- a lifespan that failed during startup -- is safe.
 
         The same event is the abort every probe runs under, so it also stops
-        a probe in flight: a scanner listing ends within a fraction of a
-        second, its child killed and reaped by the refresher thread that
-        started it, and no check after it runs.  Without that, a stop would
-        wait out a listing for up to its whole deadline, far past the few
-        seconds an idle server is given to shut down.  This thread never
+        a probe in flight, and no check after it runs.  A scanner listing ends
+        within a fraction of a second, its child killed and reaped by the
+        refresher thread that started it.  A saned pre-probe stops waiting
+        for saned's reply within a fraction of a second too, and a connect in
+        progress within what is left of ``PROBE_CONNECT_SECONDS``.  Without
+        that, a stop would wait out a listing for up to its whole deadline,
+        or a silent saned host for its whole handshake budget, far past the
+        few seconds an idle server is given to shut down.  This thread never
         signals the child itself; it only sets the event.
+
+        Two waits cannot be cut short, and a stop that lands in one waits
+        for it.  A name lookup takes no timeout at all.  The Paperless check
+        is one HTTP request of up to ``PROBE_CONNECT_SECONDS`` plus
+        ``PROBE_READ_SECONDS``, longer than the lifespan's shared join, so a
+        stop early in it can find the thread still running, and the lifespan
+        then closes nothing.
 
         A request waiting in :meth:`request_probe` is woken as well and told
         its probe is still pending, so no request thread waits out its whole
@@ -220,7 +230,10 @@ class CheckRefresher:
         The event is set first, so a loop already awake finishes its tick and
         then exits rather than starting another, and a probe in flight is
         aborted as :meth:`request_stop` describes, so the thread is normally
-        gone within about a second even mid-listing.  The join is bounded by the
+        gone within about a second even mid-listing or waiting on a silent
+        saned host.  It is not when the stop lands in the Paperless check's
+        request or in a name lookup, which :meth:`request_stop` cannot cut
+        short.  The join is bounded by the
         worker's ``STOP_JOIN_SECONDS``, or by the caller's remaining share of
         it: the lifespan takes one deadline for both threads, so what the
         worker's join already spent is not spent again here.  When this

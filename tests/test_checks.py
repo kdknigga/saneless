@@ -194,11 +194,15 @@ def _the_configured_device_host_answers(monkeypatch: pytest.MonkeyPatch) -> None
     """
 
     def _probe(
-        host: str, port: int, connect_timeout: float, handshake_timeout: float
+        host: str,
+        port: int,
+        connect_timeout: float,
+        handshake_timeout: float,
+        abort: threading.Event | None = None,
     ) -> checks._SanedOutcome:
         if host == _DEVICE_HOST:
             return checks._SanedOutcome.HEALTHY
-        return _REAL_PROBE_SANED(host, port, connect_timeout, handshake_timeout)
+        return _REAL_PROBE_SANED(host, port, connect_timeout, handshake_timeout, abort)
 
     monkeypatch.setattr(checks, "_probe_saned", _probe)
 
@@ -1676,6 +1680,66 @@ class TestSanedHandshake:
         )
         assert _probe() is checks._SanedOutcome.TIMED_OUT
 
+    def test_a_stop_ends_the_wait_for_a_silent_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With an abort Event, the reply is awaited in short slices, and a stop ends it.
+
+        The peer never answers, so every ``recv`` runs out.  The Event is set
+        before the probe starts waiting, so the first slice that runs out
+        must end the probe as aborted rather than wait out the handshake
+        budget, and no slice may be longer than the abort poll.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        answering = _THREE_ADDRESSES[0][4]
+        recorder = _install_probe_recorder(
+            monkeypatch,
+            connectable=[answering],
+            peer=_PeerScript(recv_error=TimeoutError()),
+        )
+        abort = threading.Event()
+        real_handshake = checks._handshake
+
+        def _stop_then_handshake(
+            sock: socket.socket,
+            deadline: float,
+            handshake_abort: threading.Event | None,
+        ) -> checks._SanedOutcome:
+            abort.set()
+            return real_handshake(sock, deadline, handshake_abort)
+
+        monkeypatch.setattr(checks, "_handshake", _stop_then_handshake)
+
+        with pytest.raises(checks._PreProbeAbortedError):
+            _REAL_PROBE_SANED("scanbox.lan", SANED_PORT, 60.0, 60.0, abort)
+
+        assert recorder.events.count("recv") == 1
+        assert recorder.timeouts[-1] <= checks._ABORT_POLL_SECONDS
+        assert "exit" in recorder.events
+
+    def test_a_probe_stopped_before_it_starts_dials_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A set abort Event ends the probe before it resolves or dials.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        abort = threading.Event()
+        abort.set()
+
+        with pytest.raises(checks._PreProbeAbortedError):
+            _REAL_PROBE_SANED("scanbox.lan", SANED_PORT, 60.0, 60.0, abort)
+
+        assert recorder.constructions == []
+
     def test_a_rejection_is_not_retried_on_the_next_address(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2659,7 +2723,11 @@ def _recording_dialler(
     per_address = dict(port_outcomes or {})
 
     def _probe_stub(
-        host: str, port: int, _connect_timeout: float, _handshake_timeout: float
+        host: str,
+        port: int,
+        _connect_timeout: float,
+        _handshake_timeout: float,
+        _abort: threading.Event | None = None,
     ) -> checks._SanedOutcome:
         dialled.append((host, port))
         return per_address.get((host, port), per_host.get(host, outcome))
@@ -6969,7 +7037,11 @@ def _gate_sampling_dialler(
     dialled: list[tuple[str, int]] = []
 
     def _probe_stub(
-        host: str, port: int, _connect_timeout: float, _handshake_timeout: float
+        host: str,
+        port: int,
+        _connect_timeout: float,
+        _handshake_timeout: float,
+        _abort: threading.Event | None = None,
     ) -> checks._SanedOutcome:
         dialled.append((host, port))
         probe.sample("pre-probe")

@@ -157,6 +157,14 @@ PROBE_CONNECT_SECONDS: Final = 2.0
 # enumeration.  Read at call time, so tests can shorten it.
 PROBE_HANDSHAKE_SECONDS: Final = 5.0
 
+# The longest a pre-probe that may have to stop waits on saned's reply before
+# it looks at the caller's abort Event again.  So a stopping server ends a
+# pre-probe stuck on a host that accepted the connection and says nothing
+# within about this long, rather than waiting out ``PROBE_HANDSHAKE_SECONDS``.
+# The connect is not sliced: it is bounded by ``PROBE_CONNECT_SECONDS`` over
+# the host's addresses, and the abort is looked at before each address.
+_ABORT_POLL_SECONDS: Final = 0.1
+
 # How long the Paperless probe waits for a response body once connected.  The
 # client's own default is a flat 30 s, which is the right budget for an upload
 # and the wrong one for a health row.  Read at call time.
@@ -1286,7 +1294,39 @@ def _init_request() -> bytes:
     return struct.pack(">iii", _SANE_NET_INIT, _SANE_VERSION_CODE, len(user)) + user
 
 
-def _recv_exactly(sock: socket.socket, count: int, deadline: float) -> bytes | None:
+class _PreProbeAbortedError(Exception):
+    """
+    A saned pre-probe stopped part way because its caller is stopping.
+
+    Not a finding about the host: what the probe would have learnt is
+    unknown.  ``run_checks`` ends the run on it, as it does on an aborted
+    listing, and a stopping caller stores nothing.
+    """
+
+
+def _raise_if_aborted(abort: threading.Event | None) -> None:
+    """
+    Stop a pre-probe whose caller has asked it to.
+
+    Args:
+        abort: The caller's abort Event, or ``None`` for a caller that never
+            stops part way.
+
+    Raises:
+        _PreProbeAbortedError: ``abort`` is set.
+
+    """
+    if abort is not None and abort.is_set():
+        logger.debug("saned pre-probe stopped because saneless is stopping")
+        raise _PreProbeAbortedError
+
+
+def _recv_exactly(
+    sock: socket.socket,
+    count: int,
+    deadline: float,
+    abort: threading.Event | None = None,
+) -> bytes | None:
     """
     Read exactly ``count`` bytes before ``deadline``, and never one more.
 
@@ -1295,16 +1335,22 @@ def _recv_exactly(sock: socket.socket, count: int, deadline: float) -> bytes | N
     peer that trickles bytes cannot stretch the read past the deadline and a
     peer that floods cannot make the probe take more than it asked for.
 
+    With an ``abort`` Event, no ``recv`` waits longer than
+    ``_ABORT_POLL_SECONDS``, and the Event is looked at each time one runs
+    out, so a stop ends the read within about that long.
+
     Args:
         sock: The connected socket.
         count: How many bytes to read.
         deadline: The ``monotonic`` reading the read must finish by.
+        abort: The caller's abort Event, or ``None``.
 
     Returns:
         The bytes, or ``None`` when the peer closed the connection first.
 
     Raises:
         TimeoutError: When the deadline passes before ``count`` bytes arrive.
+        _PreProbeAbortedError: ``abort`` was set while the read waited.
 
     """
     buffer = bytearray()
@@ -1312,15 +1358,27 @@ def _recv_exactly(sock: socket.socket, count: int, deadline: float) -> bytes | N
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError
-        sock.settimeout(remaining)
-        chunk = sock.recv(count - len(buffer))
+        sock.settimeout(
+            remaining if abort is None else min(remaining, _ABORT_POLL_SECONDS)
+        )
+        try:
+            chunk = sock.recv(count - len(buffer))
+        except TimeoutError:
+            if abort is None:
+                raise
+            # One slice ran out, not the deadline: the loop's own check says
+            # whether the deadline has passed.
+            _raise_if_aborted(abort)
+            continue
         if not chunk:
             return None
         buffer += chunk
     return bytes(buffer)
 
 
-def _handshake(sock: socket.socket, deadline: float) -> _SanedOutcome:
+def _handshake(
+    sock: socket.socket, deadline: float, abort: threading.Event | None = None
+) -> _SanedOutcome:
     """
     Say hello to a connected saned and classify what comes back.
 
@@ -1339,9 +1397,14 @@ def _handshake(sock: socket.socket, deadline: float) -> _SanedOutcome:
     Args:
         sock: A socket whose ``connect`` has just succeeded.
         deadline: The ``monotonic`` reading the reply must arrive by.
+        abort: The caller's abort Event, or ``None``; the wait for the reply
+            ends within ``_ABORT_POLL_SECONDS`` of it being set.
 
     Returns:
         ``HEALTHY``, ``REJECTED`` or ``TIMED_OUT``.
+
+    Raises:
+        _PreProbeAbortedError: ``abort`` was set while the reply was awaited.
 
     """
     remaining = deadline - monotonic()
@@ -1350,7 +1413,7 @@ def _handshake(sock: socket.socket, deadline: float) -> _SanedOutcome:
     try:
         sock.settimeout(remaining)
         sock.sendall(_init_request())
-        reply = _recv_exactly(sock, _INIT_REPLY_LENGTH, deadline)
+        reply = _recv_exactly(sock, _INIT_REPLY_LENGTH, deadline, abort)
     except TimeoutError:
         logger.debug("saned pre-probe handshake: %s", _SanedOutcome.TIMED_OUT.value)
         return _SanedOutcome.TIMED_OUT
@@ -1382,7 +1445,11 @@ def _handshake(sock: socket.socket, deadline: float) -> _SanedOutcome:
 
 
 def _probe_saned(
-    host: str, port: int, connect_timeout: float, handshake_timeout: float
+    host: str,
+    port: int,
+    connect_timeout: float,
+    handshake_timeout: float,
+    abort: threading.Event | None = None,
 ) -> _SanedOutcome:
     """
     Classify one configured saned host by the opening of the SANE handshake.
@@ -1444,7 +1511,14 @@ def _probe_saned(
     therefore costs whatever ``resolv.conf`` says, and that is stated rather
     than claimed away.
 
-    **Failure policy.**  This raises nothing.  Every ``OSError`` becomes an
+    **Stopping.**  A caller that may have to stop part way passes ``abort``.
+    It is looked at before resolution and before each address is dialled, and
+    the wait for saned's reply looks at it every ``_ABORT_POLL_SECONDS``, so
+    a stop costs at most what is left of the connect budget.  Resolution
+    itself still cannot be interrupted.
+
+    **Failure policy.**  This raises nothing but the abort.  Every
+    ``OSError`` becomes an
     outcome, and an empty resolver answer needs no guard of its own: the walk
     holds no subscript, so nothing to dial is a loop body that never runs and
     the answer is ``UNRESOLVED``.  Subscripting the resolver's first answer
@@ -1458,11 +1532,17 @@ def _probe_saned(
         port: The TCP port to dial.
         connect_timeout: The deadline for connecting, over every address.
         handshake_timeout: The deadline for saned's reply, once connected.
+        abort: The caller's abort Event, or ``None`` for a caller that never
+            stops part way.
 
     Returns:
         What the probe learnt about the host.
 
+    Raises:
+        _PreProbeAbortedError: ``abort`` was set before the probe finished.
+
     """
+    _raise_if_aborted(abort)
     try:
         candidates = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -1480,6 +1560,7 @@ def _probe_saned(
     unanswered = False
     refused = False
     for family, socket_type, protocol, _canonical_name, address in candidates:
+        _raise_if_aborted(abort)
         remaining = deadline - monotonic()
         if remaining <= 0:
             # The budget is spent, so the addresses left over do not get one.
@@ -1489,7 +1570,7 @@ def _probe_saned(
             with socket.socket(family, socket_type, protocol) as probe:
                 probe.settimeout(remaining)
                 probe.connect(address)
-                outcome = _handshake(probe, monotonic() + handshake_timeout)
+                outcome = _handshake(probe, monotonic() + handshake_timeout, abort)
         except ConnectionRefusedError:
             # One address refusing says nothing about the next one: this is
             # exactly the dual-stack case where the IPv6 address the resolver
@@ -1875,7 +1956,9 @@ def _net_device_entry(device_id: str) -> str | None:
 
 
 def _configured_device_probes(
-    device_id: str, probes: tuple[_HostProbe, ...]
+    device_id: str,
+    probes: tuple[_HostProbe, ...],
+    abort: threading.Event | None = None,
 ) -> tuple[tuple[_HostProbe, ...], bool]:
     """
     Probe a configured ``net:`` device's own host, when nothing else did.
@@ -1905,10 +1988,14 @@ def _configured_device_probes(
     Args:
         device_id: The configured ``scanner.device``, possibly empty.
         probes: What the setting's own hosts' probes found.
+        abort: The caller's abort Event, handed to the probe, or ``None``.
 
     Returns:
         The probes, with the device's host appended when it was probed here,
         and whether enumeration may open the device if it is not listed.
+
+    Raises:
+        _PreProbeAbortedError: ``abort`` was set during the probe.
 
     """
     if not device_id.startswith(_NET_DEVICE_PREFIX):
@@ -1925,7 +2012,7 @@ def _configured_device_probes(
     # out of it; the port is named here so the dial plainly is libsane's.
     host = dialable[0][0]
     outcome = _probe_saned(
-        host, SANED_PORT, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS
+        host, SANED_PORT, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS, abort
     )
     return (*probes, _HostProbe(host, outcome, SANED_PORT)), True
 
@@ -2931,6 +3018,11 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     may not be enumerated.  Refused, rejected, unresolved and healthy hosts,
     and a setting with no host to probe, go on to enumeration.
 
+    A stop ends the probing: each probe looks at ``context.abort`` before
+    it dials and while it waits for saned's reply, and an aborted probe
+    raises rather than becoming a row, because a host nobody finished asking
+    about has no outcome.
+
     Args:
         context: The injected dependencies and configuration.
 
@@ -2938,6 +3030,9 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
         The row, when it can be decided here; otherwise what enumeration
         needs, which is the backend, what each host's probe found, and
         whether an unlisted configured device may be opened.
+
+    Raises:
+        _PreProbeAbortedError: ``context.abort`` was set during a probe.
 
     """
     scanner = context.scanner
@@ -2948,13 +3043,19 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     probes = tuple(
         _HostProbe(
             host,
-            _probe_saned(host, port, PROBE_CONNECT_SECONDS, PROBE_HANDSHAKE_SECONDS),
+            _probe_saned(
+                host,
+                port,
+                PROBE_CONNECT_SECONDS,
+                PROBE_HANDSHAKE_SECONDS,
+                context.abort,
+            ),
             port,
         )
         for host, port in _saned_hosts(_saned_host_setting(context.settings))
     )
     probes, may_open = _configured_device_probes(
-        context.settings.scanner.device, probes
+        context.settings.scanner.device, probes, context.abort
     )
     if any(_blocks_enumeration(probe.outcome) for probe in probes):
         return _scanner_host_unanswered(probes)
@@ -3808,9 +3909,12 @@ def run_checks(
     on the way out of it.
 
     A caller that is stopping sets ``context.abort``.  The run then ends
-    before the next check, and a scanner listing in flight ends as aborted,
-    which also ends the run there, so a stop never waits out the Paperless
-    check's budget after the listing was stopped.  What is returned then is
+    before the next check, and a saned pre-probe or a scanner listing in
+    flight ends as aborted, which also ends the run there, so a stop never
+    waits out the Paperless check's budget after the scanner check was
+    stopped.  The Paperless probe itself is one HTTP request that cannot be
+    interrupted: a stop that lands during it waits for it, up to
+    ``PROBE_CONNECT_SECONDS`` plus ``PROBE_READ_SECONDS``.  What is returned then is
     only the rows of the checks that finished, which is the one case where
     there is not one row per member: it exists only for a stopping caller,
     and that caller stores none of it.
@@ -3838,7 +3942,7 @@ def run_checks(
                 results.append(_scanner_result(context, scanner_gate))
             else:
                 results.append(_dispatch(key, context))
-        except ListingAbortedError:
+        except ListingAbortedError, _PreProbeAbortedError:
             # The caller is stopping: no row, and not a check that failed.
             break
         except Exception as exc:

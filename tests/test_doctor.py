@@ -2085,7 +2085,11 @@ class TestAnUnansweredScannerHostIsAWarning:
         probed: list[str] = []
 
         def _silent(
-            host: str, port: int, connect_timeout: float, handshake_timeout: float
+            host: str,
+            port: int,
+            connect_timeout: float,
+            handshake_timeout: float,
+            abort: threading.Event | None = None,
         ) -> _SanedOutcome:
             """
             Report every host as one that never answered.
@@ -2095,6 +2099,7 @@ class TestAnUnansweredScannerHostIsAWarning:
                 port: Its port.
                 connect_timeout: Unused.
                 handshake_timeout: Unused.
+                abort: Unused; ``doctor`` passes none.
 
             Returns:
                 ``TIMED_OUT``.

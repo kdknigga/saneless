@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import socket
 import sqlite3
 import stat
 import threading
@@ -30,6 +31,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
 
 import saneless.scanner.sane_backend as sane_backend_mod
+from saneless import checks
 from saneless import worker as worker_module
 from saneless.config import (
     OutputConfig,
@@ -76,6 +78,9 @@ _APP_LOGGER = "saneless.web.app"
 # test waits: a degraded worker retries startup recovery on every tick.
 _FAST_TICK = 0.02
 _HEAL_BUDGET = 5.0
+
+# The longest a test waits for a thread it started, or for a peer to connect.
+_JOIN_TIMEOUT = 5.0
 
 # ``PRAGMA auto_vacuum`` reads 2 for INCREMENTAL.
 _INCREMENTAL = 2
@@ -1023,6 +1028,69 @@ def test_shutdown_leaves_resources_open_when_the_refresher_does_not_stop(
         assert real_refresher_stop() is True
         real_paperless_close()
         real_store_close()
+
+
+def test_a_stop_during_a_silent_saned_pre_probe_still_closes_everything(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A refresher waiting on a saned that never replies stops, and the closes run.
+
+    The scanner check's pre-probe is inside its handshake wait with a peer
+    that accepted the connection and says nothing, the amber host's case.  A
+    stop must end that wait, not sit it out: a refresher that outlived its
+    join would leave the job store, the Paperless client and the scanner all
+    open.  The handshake budget is raised far past the join so only the stop
+    can end the wait, and the join is shortened so a broken stop fails fast.
+    """
+    monkeypatch.setattr(checks, "PROBE_HANDSHAKE_SECONDS", 60.0)
+    monkeypatch.setattr(app_module, "STOP_JOIN_SECONDS", 1.0)
+    calls: list[str] = []
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as silent:
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(1)
+        silent.settimeout(_JOIN_TIMEOUT)
+        settings.scanner = ScannerConfig(
+            device="", host=f"127.0.0.1:{silent.getsockname()[1]}"
+        )
+        scanner = _ClosingScanner()
+        app = create_app(settings, scanner)
+        app.state.paperless.get_tags = lambda *, timeout=None: []
+        app.state.paperless.get_correspondents = lambda *, timeout=None: []
+        store: JobStore = app.state.job_store
+        paperless = app.state.paperless
+        refresher = app.state.refresher
+        real_store_close = store.close
+        real_paperless_close = paperless.close
+
+        def recording_store_close() -> None:
+            calls.append("job_store.close")
+            real_store_close()
+
+        def recording_paperless_close() -> None:
+            calls.append("paperless.close")
+            real_paperless_close()
+
+        def recording_scanner_close() -> None:
+            calls.append("scanner.close")
+
+        monkeypatch.setattr(store, "close", recording_store_close)
+        monkeypatch.setattr(paperless, "close", recording_paperless_close)
+        monkeypatch.setattr(scanner, "close", recording_scanner_close)
+        with TestClient(app):
+            refresher.note_watcher()
+            # The probe has connected, so it is waiting for saned's reply.
+            conn, _peer = silent.accept()
+        try:
+            assert calls == ["paperless.close", "job_store.close", "scanner.close"]
+        finally:
+            # Hanging up ends a wait the stop failed to end, so the thread
+            # this test started is gone before the next test runs.
+            conn.close()
+            assert refresher.stop(timeout=_JOIN_TIMEOUT) is True
+            if not calls:
+                real_paperless_close()
+                real_store_close()
 
 
 def test_shutdown_leaves_resources_open_when_the_worker_does_not_stop(
