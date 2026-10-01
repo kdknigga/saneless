@@ -67,6 +67,8 @@ from saneless.vocabulary import (
     SubmitResult,
     WorkerHealth,
     classify_error,
+    restart_category,
+    restart_error,
 )
 from saneless.web.cache import CachedMetadataLookup, MetadataCache
 from saneless.web.job_view import build_job_view
@@ -2695,7 +2697,10 @@ _UNREACHABLE_STREAK = 1_000_000
 
 class _StoreFault:
     """
-    A job store method that raises ``sqlite3.OperationalError`` on chosen calls.
+    A callable that raises the job store's ``sqlite3.OperationalError`` on cue.
+
+    It wraps a job store method, or the worker's handling of a job (see
+    :func:`_fail_the_job_path`).
 
     Every call is recorded.  A call whose 1-based number is in ``fail_calls``
     raises -- or every call does, when ``fail_calls`` is ``None`` -- until
@@ -2739,6 +2744,35 @@ class _StoreFault:
         if failing and not self._healed.is_set():
             raise sqlite3.OperationalError(_DISK_ERROR)
         return self._original(*args, **kwargs)
+
+
+def _fail_the_job_path(
+    worker: ScanWorker,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_calls: frozenset[int] | None = None,
+) -> _StoreFault:
+    """
+    Make an unstarted worker's handling of chosen jobs raise the store's error.
+
+    This stages a loop-level failure that is not the terminal write, so the
+    guard has no outcome owed for the job and records the failure's own text.
+    No store write is left ahead of the pipeline to stage it with: SCANNING
+    is recorded from the pipeline's first event, under the scanner gate, as a
+    progress write whose failure is only logged.  So the job's whole handling
+    raises instead, as a store error escaping it would.
+
+    Args:
+        worker: The worker whose job handling to break.
+        monkeypatch: Undoes the patch after the test.
+        fail_calls: Which jobs, numbered from 1, raise; ``None`` for all.
+
+    Returns:
+        The fault, to count the jobs it saw or to heal it.
+
+    """
+    fault = _StoreFault(worker._scan_job, fail_calls)
+    monkeypatch.setattr(worker, "_scan_job", fault)
+    return fault
 
 
 # Idle ticks a test that asserts nothing happened waits for before asserting.
@@ -2822,23 +2856,22 @@ class TestWorkerGuard:
     finishing a later job, not by reading ``is_alive`` alone.
     """
 
-    def test_a_failed_scanning_write_does_not_end_the_worker(
+    def test_a_store_error_escaping_a_job_does_not_end_the_worker(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """ROBU-01, C-09: a raise from ``update_state`` is logged and survived."""
+        """A store error escaping the job's handling is logged and survived."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        fault = _StoreFault(store.update_state, frozenset({1}))
-        monkeypatch.setattr(store, "update_state", fault)
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset({1}))
         try:
             worker.start()
             first = store.create_job("default", "Store Fails")
@@ -3121,7 +3154,7 @@ class TestWorkerGuard:
         wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        ROBU-01, research Pitfall 6: a job whose SCANNING write failed still ends.
+        A job whose handling raised a store error still ends.
 
         The guard makes one best-effort ``finish_job`` with the failure's own
         text and category, so the row does not sit active until restart.
@@ -3131,10 +3164,10 @@ class TestWorkerGuard:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        monkeypatch.setattr(store, "update_state", _StoreFault(store.update_state))
         spy = _StoreFault(store.finish_job, frozenset())
         monkeypatch.setattr(store, "finish_job", spy)
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch)
         try:
             worker.start()
             job = store.create_job("default", "Never Scanning")
@@ -3245,11 +3278,11 @@ class TestWorkerGuard:
         """
         ROBU-01, CR-01, D-12: a row the guard could not end still ends on its own.
 
-        The job's SCANNING write and the guard's ERROR write both fail once.
-        That is one loop-level failure, well below degraded, so no probe ever
-        runs; the owed write must still land on a later idle tick, with no
-        restart and no scan.  Only once that row is terminal is a second job
-        submitted, so a newer row cannot hide a stranded one.
+        The job's handling and the guard's ERROR write both fail once with a
+        store error.  That is one loop-level failure, well below degraded, so
+        no probe ever runs; the owed write must still land on a later idle
+        tick, with no restart and no scan.  Only once that row is terminal is
+        a second job submitted, so a newer row cannot hide a stranded one.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
@@ -3258,11 +3291,10 @@ class TestWorkerGuard:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        updates = _StoreFault(store.update_state, frozenset({1}))
         finishes = _StoreFault(store.finish_job, frozenset({1}))
-        monkeypatch.setattr(store, "update_state", updates)
         monkeypatch.setattr(store, "finish_job", finishes)
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset({1}))
         try:
             worker.start()
             first = store.create_job("default", "Twice Unrecordable")
@@ -3317,13 +3349,12 @@ class TestWorkerGuard:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        updates = _StoreFault(store.update_state, frozenset(range(1, stranded + 1)))
         finishes = _StoreFault(store.finish_job, None)
         probes = _StoreFault(store.probe, frozenset())
-        monkeypatch.setattr(store, "update_state", updates)
         monkeypatch.setattr(store, "finish_job", finishes)
         monkeypatch.setattr(store, "probe", probes)
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset(range(1, stranded + 1)))
         try:
             worker.start()
             jobs = _submit_jobs(worker, store, stranded)
@@ -3618,11 +3649,10 @@ class TestOwedRejections:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        updates = _StoreFault(store.update_state, frozenset({1}))
         finishes = _StoreFault(store.finish_job, None)
-        monkeypatch.setattr(store, "update_state", updates)
         monkeypatch.setattr(store, "finish_job", finishes)
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset({1}))
         try:
             worker.start()
             guard = _submit_jobs(worker, store, 1)[0]
@@ -3732,8 +3762,8 @@ class TestOwedWriteStreak:
         """
         WR-10, D-10: an owed write the store never accepts reaches DEGRADED.
 
-        The debt is either the guard's (a failed SCANNING write whose ERROR
-        write failed too, one loop-level failure) or a request-side rejection
+        The debt is either the guard's (a store error escaping a job, whose
+        ERROR write failed too, one loop-level failure) or a request-side rejection
         (no loop-level failure at all).  Either way ``finish_job`` never heals,
         so every idle retry fails, and the worker must degrade within
         ``_OWED_RETRY_DEGRADED_AFTER`` ticks rather than hours later.
@@ -3750,10 +3780,9 @@ class TestOwedWriteStreak:
         probes = _StoreFault(store.probe, frozenset())
         monkeypatch.setattr(store, "finish_job", finishes)
         monkeypatch.setattr(store, "probe", probes)
-        if debt == "guard":
-            update_state = _StoreFault(store.update_state, frozenset({1}))
-            monkeypatch.setattr(store, "update_state", update_state)
         worker = worker_for(store)
+        if debt == "guard":
+            _fail_the_job_path(worker, monkeypatch, frozenset({1}))
         try:
             worker.start()
             if debt == "guard":
@@ -3819,10 +3848,9 @@ class TestOwedWriteStreak:
         probes = _StoreFault(store.probe, frozenset())
         monkeypatch.setattr(store, "finish_job", finishes)
         monkeypatch.setattr(store, "probe", probes)
-        if debt == "guard":
-            updates = _StoreFault(store.update_state, frozenset({1}))
-            monkeypatch.setattr(store, "update_state", updates)
         worker = worker_for(store)
+        if debt == "guard":
+            _fail_the_job_path(worker, monkeypatch, frozenset({1}))
         try:
             worker.start()
             first = _owe_one_write(worker, store, debt)
@@ -4047,7 +4075,6 @@ class TestOwedWriteStreak:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        update_state = _StoreFault(store.update_state, frozenset({1, 2}))
         # One finish call per tick while one entry is owed: the guard's write
         # and threshold - 1 retries fail, then the next retry lands -- per job.
         finish_job = _StoreFault(
@@ -4056,10 +4083,10 @@ class TestOwedWriteStreak:
             | frozenset(range(threshold + 2, 2 * threshold + 2)),
         )
         probes = _StoreFault(store.probe, frozenset())
-        monkeypatch.setattr(store, "update_state", update_state)
         monkeypatch.setattr(store, "finish_job", finish_job)
         monkeypatch.setattr(store, "probe", probes)
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset({1, 2}))
         try:
             worker.start()
             first = _submit_jobs(worker, store, 1)[0]
@@ -4091,7 +4118,7 @@ class TestOwedWriteStreak:
         """
         An owed write that lands ends the run of loop-level failures.
 
-        The job's SCANNING write fails, one loop-level failure, and the
+        A store error escapes the job, one loop-level failure, and the
         guard's ERROR write fails too, so the ERROR is owed.  The next idle
         tick writes it: the store just accepted a write, so the failure
         before it is no longer part of a run.
@@ -4099,12 +4126,10 @@ class TestOwedWriteStreak:
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
         monkeypatch.setattr(
-            store, "update_state", _StoreFault(store.update_state, frozenset({1}))
-        )
-        monkeypatch.setattr(
             store, "finish_job", _StoreFault(store.finish_job, frozenset({1}))
         )
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset({1}))
         try:
             worker.start()
             job = _submit_jobs(worker, store, 1)[0]
@@ -4128,16 +4153,14 @@ class TestOwedWriteStreak:
         """
         A flush that writes nothing proves nothing about the store.
 
-        The job's SCANNING write fails and the guard's ERROR write lands, so
+        A store error escapes the job and the guard's ERROR write lands, so
         nothing is owed.  Idle ticks then flush an empty set, which touches no
         store, and the loop-level failure still counts.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
-        monkeypatch.setattr(
-            store, "update_state", _StoreFault(store.update_state, frozenset({1}))
-        )
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset({1}))
         ticks = _count_idle_ticks(worker, monkeypatch)
         try:
             worker.start()
@@ -4220,9 +4243,9 @@ class TestOwedWritesAfterAJob:
 
         Recovery owns the retry while degraded: it probes first, and clearing
         degraded is its call.  Startup generation is held so every job is
-        queued before the worker takes one; the first jobs' SCANNING writes
-        fail until the worker degrades, and the two queued after them then run
-        cleanly on a degraded worker.
+        queued before the worker takes one; a store error escapes each of the
+        first jobs until the worker degrades, and the two queued after them
+        then run cleanly on a degraded worker.
         """
         entered = threading.Event()
         released = threading.Event()
@@ -4242,10 +4265,8 @@ class TestOwedWritesAfterAJob:
         mock_scanner.get_devices.side_effect = held_devices
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
         monkeypatch.setattr("saneless.worker.run_pipeline", snapshotting_pipeline)
-        monkeypatch.setattr(
-            store,
-            "update_state",
-            _StoreFault(store.update_state, frozenset(range(1, _DEGRADING_JOBS + 1))),
+        _fail_the_job_path(
+            worker, monkeypatch, frozenset(range(1, _DEGRADING_JOBS + 1))
         )
         try:
             worker.start()
@@ -4292,8 +4313,8 @@ def _owe_one_write(worker: ScanWorker, store: JobStore, debt: str) -> Job:
     """
     Leave a started worker owing one job-row write of the given kind.
 
-    ``"guard"`` submits a job whose SCANNING write the caller has made fail,
-    so the guard owes its ERROR write when that fails too; ``"rejection"``
+    ``"guard"`` submits a job the caller has made raise a store error, so
+    the guard owes its ERROR write when that fails too; ``"rejection"``
     owes a refused submit's REJECTED write, as the scan route does.
 
     Returns:
@@ -4309,7 +4330,7 @@ def _owe_one_write(worker: ScanWorker, store: JobStore, debt: str) -> Job:
 
 def _degrade(worker: ScanWorker, store: JobStore) -> list[Job]:
     """
-    Drive a started worker whose SCANNING write always raises into DEGRADED.
+    Drive a started worker whose every job raises a store error into DEGRADED.
 
     ``_DEGRADING_JOBS`` jobs make that many loop-level failures in a row
     (D-10).  Degraded is set before the guard's write for the last job, so a
@@ -4373,9 +4394,9 @@ class TestWorkerDegradedHealth:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        monkeypatch.setattr(store, "update_state", _StoreFault(store.update_state))
         monkeypatch.setattr(store, "probe", _StoreFault(store.probe))
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch)
         try:
             worker.start()
             _degrade(worker, store)
@@ -4404,11 +4425,10 @@ class TestWorkerDegradedHealth:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        updates = _StoreFault(store.update_state, frozenset({1, 2, 4, 5}))
-        monkeypatch.setattr(store, "update_state", updates)
         # A wrongly degraded worker must stay degraded for the assertion to see.
         monkeypatch.setattr(store, "probe", _StoreFault(store.probe))
         worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch, frozenset({1, 2, 4, 5}))
         try:
             worker.start()
             jobs = _submit_jobs(worker, store, 5)
@@ -4445,17 +4465,16 @@ class TestWorkerDegradedHealth:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        updates = _StoreFault(store.update_state)
         probes = _StoreFault(store.probe)
-        monkeypatch.setattr(store, "update_state", updates)
         monkeypatch.setattr(store, "probe", probes)
         worker = worker_for(store)
+        jobs_fault = _fail_the_job_path(worker, monkeypatch)
         try:
             worker.start()
             _degrade(worker, store)
             probed = poll_until(lambda: len(probes.calls) >= 3, _STATE_BUDGET)
             still_degraded = worker.health
-            updates.heal()
+            jobs_fault.heal()
             probes.heal()
             recovered = poll_until(
                 lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
@@ -4482,7 +4501,7 @@ class TestWorkerDegradedHealth:
         """
         Research Pitfall 6: a row the guard could not end is ended on recovery.
 
-        Both the SCANNING write and the guard's ERROR write raise, so the rows
+        Both the job's handling and the guard's ERROR write raise, so the rows
         stay PENDING through degraded.  The first successful probe writes the
         error the guard tried to write, and nothing is left active.
         """
@@ -4492,16 +4511,11 @@ class TestWorkerDegradedHealth:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        faults = [
-            _StoreFault(store.update_state),
-            _StoreFault(store.finish_job),
-            _StoreFault(store.probe),
-        ]
-        for name, fault in zip(
-            ("update_state", "finish_job", "probe"), faults, strict=True
-        ):
+        faults = [_StoreFault(store.finish_job), _StoreFault(store.probe)]
+        for name, fault in zip(("finish_job", "probe"), faults, strict=True):
             monkeypatch.setattr(store, name, fault)
         worker = worker_for(store)
+        faults.append(_fail_the_job_path(worker, monkeypatch))
         try:
             worker.start()
             jobs = _degrade(worker, store)
@@ -5915,8 +5929,8 @@ class TestWorkerEnumDispatch:
                 request: PipelineRequest,
             ) -> ScanResult:
                 # Snapshot only what the callback itself writes, so the
-                # worker's own pre-pipeline SCANNING and post-pipeline DONE
-                # writes cannot be mistaken for callback output.
+                # worker's own post-pipeline DONE write cannot be mistaken
+                # for callback output.
                 start = len(states_seen)
                 if request.status_callback:
                     for event in PipelineEvent:
@@ -5942,13 +5956,13 @@ class TestWorkerEnumDispatch:
             # The states applied are exactly the in-flight ones, in the order
             # the events were emitted.  SCANNING_REVERSE is persisted as its own
             # busy state, so pass B takes the job out of AWAITING_FLIP (DPLX-06).
-            # DONE (terminal) contributes nothing -- and neither does SCANNING,
-            # which the worker persisted before starting the pipeline and which
-            # run_pipeline merely re-announces as its first event.  Rewriting it
-            # would blank error/error_category a second time and signal a
-            # transition that did not occur.  The three multi-page waits are
-            # active states like the flip wait, so each is persisted as well.
+            # DONE (terminal) contributes nothing.  SCANNING comes first, and
+            # from here: the worker writes nothing before the pipeline, whose
+            # first event is announced only once the scanner gate is held.
+            # The three multi-page waits are active states like the flip
+            # wait, so each is persisted as well.
             assert from_callback == [
+                JobState.SCANNING,
                 JobState.AWAITING_FLIP,
                 JobState.SCANNING_REVERSE,
                 JobState.AWAITING_NEXT_PASS,
@@ -5957,7 +5971,7 @@ class TestWorkerEnumDispatch:
                 JobState.ASSEMBLING,
                 JobState.UPLOADING,
             ]
-            assert JobState.SCANNING not in from_callback
+            assert states_seen.count(JobState.SCANNING) == 1
 
             # DONE is still written by the worker, after run_pipeline returned
             # -- but through finish_job now, not update_state.  update_state's
@@ -7668,6 +7682,237 @@ class TestPerJobReinitialise:
         ]
 
 
+# How long a test leaves a job waiting on a held gate before it looks at the
+# row.  A SCANNING written ahead of the gate lands within microseconds of the
+# job being taken, so this is generous for the failure it is there to catch.
+_GATE_WAIT_WINDOW = 0.3
+
+
+class _GateStateRecorder:
+    """
+    ``JobStore.update_state`` that notes whether the test had let the gate go.
+
+    Every call records the state it was asked to write beside whether
+    ``released`` was set at that moment, then delegates, so the row the worker
+    writes is the row the test reads back.
+
+    Args:
+        original: The bound ``update_state`` being replaced.
+        released: Set by the test just before it releases the scanner gate.
+
+    """
+
+    def __init__(
+        self, original: Callable[..., None], released: threading.Event
+    ) -> None:
+        """Wrap ``original``, watching ``released``."""
+        self._original = original
+        self._released = released
+        self._lock = threading.Lock()
+        self._writes: list[tuple[JobState, bool]] = []
+
+    @property
+    def writes(self) -> list[tuple[JobState, bool]]:
+        """Each state written so far, with whether the gate had been let go."""
+        with self._lock:
+            return list(self._writes)
+
+    def __call__(
+        self,
+        job_id: str,
+        state: JobState,
+        error: str | None = None,
+        error_category: ErrorCategory | None = None,
+    ) -> None:
+        """Record the state and the gate's release, then delegate."""
+        with self._lock:
+            self._writes.append((state, self._released.is_set()))
+        self._original(job_id, state, error=error, error_category=error_category)
+
+
+def _a_scanner_free_of_startup_generation(
+    settings: Settings,
+) -> _ReinitRecordingScanner:
+    """
+    Give a worker test a recording scanner the worker reaches only for a job.
+
+    A second profile makes the set something other than the bare default, so
+    the worker thread skips startup generation and never takes the gate for
+    it: the first time the worker wants the gate is the job.
+
+    Args:
+        settings: The test's settings, given the second profile in place.
+
+    Returns:
+        A scanner recording every SANE call the worker makes.
+
+    """
+    settings.scanner.device = ""
+    settings.profiles["duplex"] = ProfileConfig(source="ADF Duplex")
+    return _ReinitRecordingScanner()
+
+
+class TestScanningWaitsForTheGate:
+    """
+    SCANNING is recorded only once the worker holds the scanner gate.
+
+    A health check can hold the gate for up to its listing deadline.  A job
+    submitted meanwhile has not started scanning, so its row stays PENDING --
+    the status area keeps "Starting scan..." -- until the worker has the
+    gate and the pipeline reports that the scan has begun.
+    """
+
+    def test_a_job_waiting_for_the_gate_stays_pending(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """With the gate held elsewhere, the taken job's row still reads PENDING."""
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        gate = worker.scanner_gate
+        try:
+            worker.start()
+            assert gate.acquire(timeout=_PASS_B_GATE_CEILING)
+            try:
+                job = store.create_job("default", "Waiting For The Gate")
+                worker.submit(job)
+                taken = poll_until(
+                    lambda: worker.current_job_id == job.id, _STATE_BUDGET
+                )
+                quiet_window(_GATE_WAIT_WINDOW)
+                during = store.get_job(job.id)
+                calls_during = list(scanner.calls)
+            finally:
+                gate.release()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert taken, "the worker never took the job"
+        assert during is not None
+        assert during.state is JobState.PENDING
+        assert calls_during == []
+        assert finished.state is JobState.DONE
+
+    def test_scanning_is_recorded_once_the_gate_is_held(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """SCANNING is written once, after PENDING, and only after the gate is free."""
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
+        store = JobStore()
+        released = threading.Event()
+        recorder = _GateStateRecorder(store.update_state, released)
+        monkeypatch.setattr(store, "update_state", recorder)
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        gate = worker.scanner_gate
+        try:
+            worker.start()
+            assert gate.acquire(timeout=_PASS_B_GATE_CEILING)
+            try:
+                job = store.create_job("default", "Scanning Under The Gate")
+                created = store.get_job(job.id)
+                worker.submit(job)
+                taken = poll_until(
+                    lambda: worker.current_job_id == job.id, _STATE_BUDGET
+                )
+                quiet_window(_GATE_WAIT_WINDOW)
+            finally:
+                released.set()
+                gate.release()
+            scanning = poll_until(
+                lambda: any(s is JobState.SCANNING for s, _ in recorder.writes),
+                _STATE_BUDGET,
+            )
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert taken, "the worker never took the job"
+        assert scanning, "SCANNING was never recorded"
+        assert created is not None
+        sequence = [created.state, *(state for state, _ in recorder.writes)]
+        assert sequence.count(JobState.SCANNING) == 1
+        assert sequence.index(JobState.PENDING) < sequence.index(JobState.SCANNING)
+        assert [
+            after for state, after in recorder.writes if state is JobState.SCANNING
+        ] == [True]
+        assert finished.state is JobState.DONE
+
+    def test_a_stop_while_waiting_for_the_gate_ends_the_job_untouched(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A job that gets the gate only once the server is stopping never scans.
+
+        A stop can end the check that held the gate, so the waiting job is
+        handed the gate in the middle of shutdown.  Starting the scan then
+        would feed paper the stop's bounded join walks away from; the job
+        ends instead, with the restart text for a job that never started.
+        """
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
+        pipelines: list[str] = []
+
+        def spy_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            pipelines.append(request.job_id)
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", spy_pipeline)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        gate = worker.scanner_gate
+        stopped: list[bool] = []
+
+        def stop_the_worker() -> None:
+            stopped.append(worker.stop())
+
+        stopper = threading.Thread(target=stop_the_worker, name="test-stopper")
+        try:
+            worker.start()
+            assert gate.acquire(timeout=_PASS_B_GATE_CEILING)
+            try:
+                job = store.create_job("default", "Stopped At The Gate")
+                worker.submit(job)
+                taken = poll_until(
+                    lambda: worker.current_job_id == job.id, _STATE_BUDGET
+                )
+                stopper.start()
+                stopping = poll_until(worker._stopping.is_set, _STATE_BUDGET)
+            finally:
+                gate.release()
+            stopper.join(worker_module.STOP_JOIN_SECONDS + _STATE_BUDGET)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert taken, "the worker never took the job"
+        assert stopping, "the stop never began"
+        assert stopped == [True]
+        assert finished.state is JobState.ERROR
+        assert finished.error == restart_error(JobState.PENDING, None)
+        assert finished.error_category is restart_category(JobState.PENDING)
+        assert scanner.calls == []
+        assert pipelines == []
+
+
 class TestProfileStorage:
     """
     ``ScanWorker.profile_storage`` records what the startup persist did (A-2).
@@ -8188,7 +8433,12 @@ class TestProgressWriteFailures:
 
     @pytest.mark.parametrize(
         "state",
-        [JobState.ASSEMBLING, JobState.UPLOADING, JobState.SCANNING_REVERSE],
+        [
+            JobState.SCANNING,
+            JobState.ASSEMBLING,
+            JobState.UPLOADING,
+            JobState.SCANNING_REVERSE,
+        ],
         ids=lambda state: state.value.lower(),
     )
     def test_a_progress_write_failing_once_leaves_the_scan_to_finish(

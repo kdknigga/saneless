@@ -86,7 +86,12 @@ from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.routes import TAG_FILTER_MAX_LENGTH
 from saneless.worker import WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, load_the_lists, poll_until
+from tests.conftest import (
+    StubScannerBackend,
+    load_the_lists,
+    poll_until,
+    quiet_window,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1891,8 +1896,14 @@ class _BreakableWrite:
     it delegates to the real method, so the row the worker writes is the row
     the status poll reads back.
 
+    It also stands in for the worker's handling of a job.  SCANNING is a
+    progress write recorded under the scanner gate, and its failure is only
+    logged, so no store write is left ahead of the pipeline whose failure is
+    the loop's own: a store error escaping the job's handling is staged by
+    breaking that handling instead.
+
     Args:
-        original: The bound store method being replaced.
+        original: The bound store method, or job handling, being replaced.
         broken: Set while the store should refuse writes.
 
     """
@@ -1947,8 +1958,10 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
 
     with TestClient(app) as tc:
         job_store: JobStore = app.state.job_store
+        handling = _BreakableWrite(app.state.worker._scan_job, broken)
         updates = _BreakableWrite(job_store.update_state, broken)
         finishes = _BreakableWrite(job_store.finish_job, broken)
+        monkeypatch.setattr(app.state.worker, "_scan_job", handling)
         monkeypatch.setattr(job_store, "update_state", updates)
         monkeypatch.setattr(job_store, "finish_job", finishes)
 
@@ -1981,9 +1994,8 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
     """
     A job store that keeps refusing an owed write shows on ``/health``.
 
-    ROBU-01 success criterion 1, WR-10, D-10, D-12: the job's SCANNING write
-    and the guard's ERROR write fail, and every idle retry of the owed write
-    fails too.  After a short streak of failed retries the worker degrades, so
+    A store error escapes the job's handling and the guard's ERROR write
+    fails, and every idle retry of the owed write fails too.  After a short streak of failed retries the worker degrades, so
     ``/health`` answers 503 "job store failing" and a new scan is refused with
     503.  Once the store heals, the recovery probe and the owed write land:
     ``/health`` is 200 again and the status poll renders ``#scan-btn`` enabled.
@@ -1997,8 +2009,10 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
 
     with TestClient(app) as tc:
         job_store: JobStore = app.state.job_store
+        handling = _BreakableWrite(app.state.worker._scan_job, broken)
         updates = _BreakableWrite(job_store.update_state, broken)
         finishes = _BreakableWrite(job_store.finish_job, broken)
+        monkeypatch.setattr(app.state.worker, "_scan_job", handling)
         monkeypatch.setattr(job_store, "update_state", updates)
         monkeypatch.setattr(job_store, "finish_job", finishes)
 
@@ -2030,6 +2044,50 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
         finished = job_store.get_job(job_id)
         assert finished is not None
         assert finished.state is JobState.ERROR
+
+
+# How long the worker gets to reach the held gate, and then to finish the job
+# once the gate is let go: a stub scan and an offline upload.
+_GATE_WAIT_BUDGET = 5.0
+
+# How long the job is left waiting on the held gate before the status area is
+# read.  A SCANNING written ahead of the gate lands within microseconds of the
+# worker taking the job.
+_GATE_WAIT_WINDOW = 0.3
+
+
+@pytest.mark.usefixtures("offline_paperless")
+def test_a_job_waiting_for_the_gate_reads_starting_scan(client: TestClient) -> None:
+    """
+    A scan queued behind a running check still says "Starting scan...".
+
+    A health check may hold the scanner gate for as long as its listing
+    deadline.  The job has not begun to scan until the worker holds the gate,
+    so the status area keeps its first line and claims no scan in progress.
+    """
+    app = _app(client)
+    worker = app.state.worker
+    job_store: JobStore = app.state.job_store
+    gate = worker.scanner_gate
+    assert gate.acquire(timeout=_GATE_WAIT_BUDGET)
+    try:
+        response = client.post("/api/scan", data={"profile": "default"})
+        assert response.status_code == 200
+        job_id = job_store.list_recent(limit=1)[0].id
+        assert poll_until(lambda: worker.current_job_id == job_id, _GATE_WAIT_BUDGET)
+        quiet_window(_GATE_WAIT_WINDOW)
+        area = _element(client.get("/api/jobs/current/status").text, "status-area")
+    finally:
+        gate.release()
+
+    def finished() -> bool:
+        job = job_store.get_job(job_id)
+        return job is not None and job.state in TERMINAL_STATES
+
+    assert poll_until(finished, _GATE_WAIT_BUDGET)
+    starting = progress_label(JobState.PENDING)
+    assert f'<p class="busy-line">{escape(starting)}</p>' in area
+    assert progress_label(JobState.SCANNING) not in area
 
 
 # --- The owner-gated flip prompt (APPL-09, D-24, D-26, D-27) ----------------
