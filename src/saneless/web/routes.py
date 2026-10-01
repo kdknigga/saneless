@@ -1721,6 +1721,12 @@ poll that gave up would leave the area frozen on the fallback line after the
 store healed.  At the cap the fallback is the same every time, so its poll is
 answered 204 and the area is not re-swapped or re-announced.
 
+Before the cap, each step's fallback carries a different poll URL, so it is
+swapped in, and a screen reader may read the same line again: at most once
+per step, three times in all.  That bounded repeat is accepted.  Skipping it
+would mean keeping the step out of the swapped markup, which only starting at
+the cap does, and that would turn a moment's lock contention into a 15 s wait.
+
 Read at call time rather than bound into a default, so a test can shorten it.
 """
 
