@@ -55,6 +55,7 @@ from saneless.exceptions import (
     FeederEmptyError,
     NoScannerFoundError,
     PaperlessError,
+    PaperlessTrustStoreError,
     PdfError,
     SanelessError,
     ScanCancelledError,
@@ -95,6 +96,7 @@ from tests.conftest import (
     leave_killed_workspace,
     scan_batch,
 )
+from tests.fake_sane import FakeSaneModule
 from tests.prompt_support import (
     FakeClock,
     broken_read,
@@ -6624,6 +6626,76 @@ class TestEntryPointsCloseTheBackend:
 
         assert result.exit_code == 0, result.output
         assert [scanner.close_calls for scanner in built] == [0]
+
+    def test_serve_closes_the_backend_when_the_app_cannot_be_built(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An app that is never built never takes the backend, so ``serve`` closes it.
+
+        An unreadable trust store is the real case: the Paperless client is
+        built after SANE was initialised, and the command exits 3.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        def unreadable_trust_store(*_args: object) -> NoReturn:
+            msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
+            raise PaperlessTrustStoreError(msg)
+
+        monkeypatch.setattr("saneless.cli.create_app", unreadable_trust_store)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 3, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    @pytest.mark.usefixtures("uvicorn_loggers_restored")
+    def test_serve_closes_the_backend_when_the_server_never_starts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A server that never started never ran the lifespan that would close SANE.
+
+        The command exits 2, and the backend is closed on the way out.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+        _fake_server_run(monkeypatch, started=False)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 2, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    def test_serve_leaves_sane_uninitialised_after_a_failed_start(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A real backend's failed start leaves the process with SANE shut down.
+
+        The app factory checks that SANE really was initialised when it ran,
+        so the final assertion is about a shutdown and not about a backend
+        that never started SANE at all.
+        """
+        fake_sane = FakeSaneModule()
+        monkeypatch.setattr(sane_backend, "sane", fake_sane)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        initialised_when_built: list[bool] = []
+
+        def unreadable_trust_store(*_args: object) -> NoReturn:
+            initialised_when_built.append(sane_backend._INIT.done)
+            msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
+            raise PaperlessTrustStoreError(msg)
+
+        monkeypatch.setattr("saneless.cli.create_app", unreadable_trust_store)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 3, result.output
+        assert initialised_when_built == [True]
+        assert sane_backend._INIT.done is False
+        assert fake_sane.exit_call_count == 1
 
 
 # The five categories a SanelessError can carry through the guard to an exit
