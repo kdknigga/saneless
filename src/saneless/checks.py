@@ -32,6 +32,10 @@ a row that would not name it could not be acted on; and because the spelling
 comes from the search *position* rather than from the path, what reaches the
 page is a constant this module could have hard-coded.  Every other row, every
 message, and every other state stays under the rule above.
+
+``CheckResult.terminal_detail`` is outside the rule because it is never
+rendered on the page: only ``saneless doctor`` prints it, on the machine.  It
+carries where paperless-ngx redirected to, sanitised by ``paperless.py``.
 """
 
 from __future__ import annotations
@@ -480,6 +484,12 @@ class CheckResult:
         next_step: What to do about it, for ``WARN`` and ``FAIL`` rows, with
             any retry still a placeholder.
         skipped: True when the probe was deliberately not run.
+        terminal_detail: A line for ``saneless doctor`` only, or empty.  It
+            may name an address -- today it is where paperless-ngx redirected
+            to, already sanitised by ``paperless.py`` -- which is why the
+            status strip never renders it: the strip is visible to anyone on
+            the LAN, and the terminal is on the machine.  ``doctor`` passes it
+            through ``neutralise_controls`` before printing it.
 
     """
 
@@ -488,6 +498,7 @@ class CheckResult:
     message: str
     next_step: str = ""
     skipped: bool = False
+    terminal_detail: str = ""
 
 
 class PaperlessRefusal(StrEnum):
@@ -3206,9 +3217,9 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     was never set gets its own, plainer row here.
 
     A redirect's row names no address, because the strip is visible to
-    anyone on the LAN: ``probe_connection`` keeps the target for the log,
-    and only whether it was a plain switch to ``https://`` reaches the next
-    step.
+    anyone on the LAN: only whether it was a plain switch to ``https://``
+    reaches the next step.  The sanitised target goes in ``terminal_detail``
+    instead, which ``saneless doctor`` prints and the strip never renders.
 
     A ``None`` client means one could not be constructed, and
     ``context.paperless_refusal`` says why.  ``PaperlessClient.__init__``
@@ -3249,6 +3260,7 @@ def _check_paperless(context: CheckContext) -> CheckResult:
         )
     client = context.paperless
     https_upgrade = False
+    terminal_detail = ""
     if client is None and context.paperless_refusal is PaperlessRefusal.TRUST_STORE:
         return CheckResult(
             key=CheckKey.PAPERLESS,
@@ -3272,12 +3284,15 @@ def _check_paperless(context: CheckContext) -> CheckResult:
         )
         status = probe.status
         https_upgrade = probe.https_upgrade
+        if probe.redirect_target is not None:
+            terminal_detail = f"Redirected to {probe.redirect_target}"
     state = CheckState.OK if status is ConnectionStatus.CONNECTED else CheckState.FAIL
     return CheckResult(
         key=CheckKey.PAPERLESS,
         state=state,
         message=connection_status_message(status),
         next_step=_paperless_next_step(status, https_upgrade=https_upgrade),
+        terminal_detail=terminal_detail,
     )
 
 

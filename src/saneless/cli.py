@@ -1377,7 +1377,11 @@ def _warn_stale_config(settings: Settings) -> None:
 
 
 def _load_cli_settings(
-    ctx: click.Context, *, stream_logs: bool = False, warn_stale: bool = True
+    ctx: click.Context,
+    *,
+    stream_logs: bool = False,
+    warn_stale: bool = True,
+    validate_dirs: bool = True,
 ) -> Settings:
     """
     Load and validate settings and configure logging, once per process.
@@ -1410,6 +1414,12 @@ def _load_cli_settings(
             Only ``auto-profiles`` passes it: that command refuses outright in
             one of the two states, and the refusal and the warning are the
             same sentence, so it decides for itself which one is printed.
+        validate_dirs: If False, skip ``validate_settings_dirs``.  Only
+            ``doctor`` passes it: a folder start-up would refuse is one of the
+            things it reports, and its Fallback and Data folder rows ask the
+            same questions that validation asks, so refusing first would
+            replace six rows with one line.  Every other command keeps the
+            refusal, because it is about to use those folders.
 
     Returns:
         The loaded settings, the same object on every call.
@@ -1420,7 +1430,8 @@ def _load_cli_settings(
         return cached
 
     settings = load_settings(ctx.obj.get("config_path"))
-    validate_settings_dirs(settings)
+    if validate_dirs:
+        validate_settings_dirs(settings)
     if not stream_logs:
         _make_log_home_private(settings)
     # A service is handed no log file at all: configure_logging then attaches
@@ -2957,7 +2968,9 @@ def _doctor_paperless(
 @click.pass_context
 def doctor(ctx: click.Context) -> None:
     """Check that saneless is ready to scan."""
-    settings = _load_cli_settings(ctx)
+    # No directory gate: an unusable folder is a red Fallback or Data folder
+    # row here, not a refusal that prints no rows at all.
+    settings = _load_cli_settings(ctx, validate_dirs=False)
     scanner, scanner_refusal = _doctor_scanner(settings)
     if scanner is not None:
         # Registered before the first SANE call, so a check that fails still
@@ -2989,6 +3002,12 @@ def doctor(ctx: click.Context) -> None:
             f"{_row_marker(result):<{_MARKER_WIDTH}} "
             f"{check_name(result.key):<{_NAME_COL_WIDTH}} {result.message}"
         )
+        if result.terminal_detail:
+            # Terminal-only detail, such as where paperless-ngx redirected to.
+            # The strip never shows it; the text is upstream-derived, so its
+            # control characters are made harmless before they reach a tty.
+            detail = neutralise_controls(result.terminal_detail)
+            click.echo(f"{_NEXT_STEP_INDENT}{detail}")
         if result.next_step:
             # The row's retry is spelled for a terminal: there is no Check
             # again button here, so it says to run this command again.
