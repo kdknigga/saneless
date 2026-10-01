@@ -50,6 +50,7 @@ from saneless.vocabulary import (
     CORRESPONDENTS_LOADING,
     HIDDEN_JOB_TITLE,
     HIDDEN_WARNING_LINE,
+    NO_SCRIPT_LINE,
     PASS_WAIT_STATES,
     SCAN_BLOCKED_REASON,
     SCAN_BLOCKED_URL_REASON,
@@ -2537,10 +2538,16 @@ _REASON_LINE = re.compile(
 # prose, and a looser pattern matches that instead of the element.
 _SCAN_FORM_TAG = re.compile(r'<form hx-post="/api/scan"\s+(?P<attrs>[^>]*)>')
 
-# The four attributes the scan form carries, in order. Phase 30 adds none:
+# The four htmx attributes the scan form carries, in order. Phase 30 adds none:
 # `hx-disinherit` is the C-10 fix and `hx-disabled-elt` is what it protects, so
 # the list is asserted whole rather than by membership.
+#
+# Two more lead them now.  `method` and `action` are not htmx attributes and
+# nothing inherits them: they make a submit with JavaScript off a POST, so the
+# title never lands in a URL, and the server refuses that POST with a page.
 _SCAN_FORM_ATTRS = [
+    'method="post"',
+    'action="/api/scan"',
     'hx-target="#status-area"',
     'hx-swap="outerHTML"',
     'hx-disabled-elt="#scan-btn"',
@@ -3184,6 +3191,24 @@ class TestFormHelpTextAndTagPicker:
         assert match is not None
         assert match.group("attrs").split() == _SCAN_FORM_ATTRS
         assert "hx-confirm" not in index
+
+    def test_noscript_line_follows_the_scan_heading(self, client: TestClient) -> None:
+        """
+        With JavaScript off the page says why Scan will not work, first.
+
+        The line sits directly under the Scan heading, ahead of every control,
+        so it is read before anything that would not work.  It is the amber
+        fallback line with its warning glyph, and its words come from the
+        vocabulary.
+        """
+        page = client.get("/").text
+
+        noscript = (
+            '<noscript><p class="status-fallback">&#9888; '
+            f"{html.escape(NO_SCRIPT_LINE)}</p></noscript>"
+        )
+        assert page.count("<noscript>") == 1
+        assert re.search(rf"<h2>Scan</h2>\s*{re.escape(noscript)}", page), page
 
     def test_no_template_keeps_the_tag_multi_select(self) -> None:
         """D-30: one control, one partial -- the multi-select is deleted."""

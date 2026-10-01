@@ -52,6 +52,10 @@ from saneless.scanner.base import DeviceCapabilities
 from saneless.vocabulary import (
     CORRESPONDENTS_LOADING,
     CORRESPONDENTS_UNAVAILABLE,
+    NO_SCRIPT_BACK_LINK,
+    NO_SCRIPT_BODY,
+    NO_SCRIPT_HEADING,
+    NO_SCRIPT_PAGE_TITLE,
     QUEUE_FULL_JOB_ERROR,
     TAGS_LOADING,
     TAGS_UNAVAILABLE,
@@ -77,6 +81,7 @@ from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
 from saneless.web.routes import _profile_options, _ProfileOption
+from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, leaf_routes, load_the_lists
 
@@ -5553,3 +5558,124 @@ class TestLazyPageLoad:
         assert 'id="metadata-loader"' not in page
         assert html.escape(TAGS_LOADING) not in page
         assert html.escape(CORRESPONDENTS_LOADING) not in page
+
+
+# What a browser sends as ``Accept`` when it submits a form as a navigation:
+# the page it will show next, so ``text/html`` first.  htmx sends the Fetch
+# default, ``*/*``, and so do curl and most scripts.
+_NAVIGATION_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+# A title nothing else on the refusal page could contain, so its absence
+# proves no submitted field is echoed.
+_ECHO_PROBE = "Secret-7f3e2a"
+
+
+def _refusal_page_parts() -> list[str]:
+    """
+    Return the fixed copy the refusal page must carry, as rendered.
+
+    Returns:
+        The title element, the heading, the body sentence and the link back.
+
+    """
+    return [
+        f"<title>{html.escape(NO_SCRIPT_PAGE_TITLE)}</title>",
+        f"<h2>{html.escape(NO_SCRIPT_HEADING)}</h2>",
+        html.escape(NO_SCRIPT_BODY),
+        f'<a href="/">{html.escape(NO_SCRIPT_BACK_LINK)}</a>',
+    ]
+
+
+class TestBrowserNavigationRefused:
+    """
+    A scan form submitted with JavaScript off is refused with a page.
+
+    With no script the browser posts the form itself and shows whatever comes
+    back, so the answer is a full page saying why nothing happened.  Only a
+    browser navigation is refused -- no ``HX-Request`` header, and an
+    ``Accept`` naming ``text/html`` -- because the documented API takes direct
+    posts from curl and scripts.  The refusal runs before anything else the
+    route does: it starts no scan, writes no row, and echoes no field.
+    """
+
+    def test_javascript_off_navigation_is_refused_with_a_page(
+        self, client: TestClient
+    ) -> None:
+        """A 400 page with the fixed copy, the usual headers, and no row."""
+        before = _job_count(client)
+
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": _ECHO_PROBE},
+            headers={"Accept": _NAVIGATION_ACCEPT},
+        )
+
+        assert response.status_code == 400
+        assert response.headers["content-type"].startswith("text/html")
+        for part in _refusal_page_parts():
+            assert part in response.text, part
+        assert _ECHO_PROBE not in response.text
+        for name, value in (*SECURITY_HEADERS, NO_STORE):
+            assert response.headers[name] == value, name
+        assert _job_count(client) == before
+
+    def test_htmx_post_is_unaffected(self, client: TestClient) -> None:
+        """The page's own submit names text/html too, and still starts a scan."""
+        before = _job_count(client)
+
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "From the page"},
+            headers={"HX-Request": "true", "Accept": _NAVIGATION_ACCEPT},
+        )
+
+        assert response.status_code == 200
+        assert 'id="status-area"' in response.text
+        assert _job_count(client) == before + 1
+
+    @pytest.mark.parametrize(
+        "accept",
+        [pytest.param("*/*", id="curl"), pytest.param(None, id="no-accept")],
+    )
+    def test_api_callers_are_unaffected(
+        self, client: TestClient, accept: str | None
+    ) -> None:
+        """A script's post is accepted exactly as the reference documents."""
+        before = _job_count(client)
+        headers = {} if accept is None else {"Accept": accept}
+
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "From a script"},
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        assert _job_count(client) == before + 1
+
+    def test_refusal_wins_over_validation(self, client: TestClient) -> None:
+        """A navigation with an invalid field still gets the page, not a 422."""
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "x" * 10_000},
+            headers={"Accept": _NAVIGATION_ACCEPT},
+        )
+
+        assert response.status_code == 400
+        assert response.headers["content-type"].startswith("text/html")
+        assert f"<title>{html.escape(NO_SCRIPT_PAGE_TITLE)}</title>" in response.text
+
+    def test_refusal_writes_no_row_on_a_blocked_appliance(self, tmp_path: Path) -> None:
+        """The refusal comes before the blocked-appliance row is written."""
+        with TestClient(_simple_form_app(tmp_path, credential="changeme")) as client:
+            before = _job_count(client)
+
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": _ECHO_PROBE},
+                headers={"Accept": _NAVIGATION_ACCEPT},
+            )
+
+            assert response.status_code == 400
+            assert f"<h2>{html.escape(NO_SCRIPT_HEADING)}</h2>" in response.text
+            assert _job_count(client) == before
