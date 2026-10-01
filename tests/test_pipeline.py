@@ -1884,6 +1884,73 @@ class TestManualDuplex:
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
 
+    def test_a_flip_timeout_next_step_names_the_wait_setting(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The error run_pipeline raises says to answer in time, or allow longer.
+
+        The scanner did nothing wrong, so the scanner category's advice does
+        not fit; the raise site knows the wait setting, and its next step
+        survives the run guard, which re-raises the same object.
+        """
+        _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Timeout Next Step",
+                    job_id="job-flip-timeout-next-step",
+                    flip_coordinator=_FixedFlipCoordinator(FlipOutcome.TIMED_OUT),
+                ),
+            )
+
+        next_step = excinfo.value.next_step
+        assert next_step is not None
+        assert "operator_wait_timeout_seconds" in next_step
+        assert "flip prompt" in next_step
+        assert "scanner" not in next_step
+
+    def test_a_broken_flip_prompt_next_step_is_about_the_terminal(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A prompt that could not be read points at the terminal, not the scanner."""
+        _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
+        cause = OSError(5, "Input/output error")
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Broken Prompt Next Step",
+                    job_id="job-broken-prompt-next-step",
+                    flip_coordinator=_BrokenPromptFlipCoordinator(cause),
+                ),
+            )
+
+        next_step = excinfo.value.next_step
+        assert next_step is not None
+        assert "terminal" in next_step
+        assert "scanner" not in next_step
+        assert str(cause) not in next_step
+
     def test_a_server_stop_at_the_flip_keeps_the_fronts(
         self,
         mock_paperless: MagicMock,
@@ -3008,6 +3075,57 @@ class TestDiskSpaceCheck:
             )
         assert isinstance(exc_info.value.__cause__, OSError)
         scanner.scan_pages.assert_not_called()
+
+    @pytest.mark.parametrize("failing_call", ["mkdir", "disk_usage", "JobWorkspace"])
+    def test_a_workspace_failure_next_step_names_tmp_dir(
+        self,
+        failing_call: str,
+        tmp_path: Path,
+        default_settings: Settings,
+        mock_paperless: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Each way the workspace cannot be prepared points at ``output.tmp_dir``.
+
+        The message names the directory and why it failed; the next step names
+        the setting, and never the path or the OS error.
+        """
+        tmp_dir = tmp_path / "work"
+        default_settings.output.tmp_dir = tmp_dir
+        failure = OSError(errno.EACCES, "Permission denied")
+        if failing_call == "mkdir":
+            (tmp_path / "blocker").write_text("")
+            tmp_dir = tmp_path / "blocker" / "work"
+            default_settings.output.tmp_dir = tmp_dir
+        elif failing_call == "disk_usage":
+
+            def failing_disk_usage(*_args: object) -> object:
+                raise failure
+
+            monkeypatch.setattr(
+                "saneless.pipeline.shutil.disk_usage", failing_disk_usage
+            )
+        else:
+
+            def failing_mkdtemp(*_args: object, **_kwargs: object) -> str:
+                raise failure
+
+            monkeypatch.setattr("saneless.workspace.tempfile.mkdtemp", failing_mkdtemp)
+
+        with pytest.raises(ConfigError) as exc_info:
+            run_pipeline(
+                scanner=MagicMock(spec=ScannerBackend),
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="No dir"),
+            )
+
+        next_step = exc_info.value.next_step
+        assert next_step is not None
+        assert "output.tmp_dir" in next_step
+        assert str(tmp_dir) not in next_step
+        assert "Permission denied" not in next_step
 
     @pytest.mark.parametrize(
         "code", [errno.ENOSPC, errno.EDQUOT], ids=["ENOSPC", "EDQUOT"]

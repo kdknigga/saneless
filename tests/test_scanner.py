@@ -7521,6 +7521,33 @@ class TestSaneBoundary:
 
         assert exc_info.value.__cause__ is original
 
+    def test_require_sane_next_step_says_install_not_reconfigure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The next step is the install the message names, not a config fix.
+
+        A missing python-sane or libsane is filed under the configuration
+        category, whose general advice cannot know the fix.  This raise site
+        does, so it carries it: nothing in the config file or a restart
+        brings the library back.
+        """
+
+        def _fail() -> None:
+            raise ImportError(_LIBSANE_MISSING)
+
+        monkeypatch.setattr(sane_backend_mod, "_ensure_sane", _fail)
+
+        with pytest.raises(ConfigError) as exc_info:
+            sane_backend_mod.require_sane()
+
+        next_step = exc_info.value.next_step
+        assert next_step is not None
+        assert "install" in next_step.lower()
+        assert "configuration file" not in next_step
+        assert "config file" not in next_step
+        assert "restart" not in next_step.lower()
+
     def test_require_sane_keeps_an_already_loaded_module(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
