@@ -852,7 +852,14 @@ def test_handlers_are_restored_after_help(
 def test_serve_installs_no_handler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``serve`` keeps uvicorn's own signal handling: saneless installs nothing."""
+    """
+    ``serve`` installs no handler of its own before the server runs.
+
+    The one-shot commands' SIGTERM and SIGHUP handlers are not ``serve``'s:
+    it reaches ``_run_server`` with the handlers it started with, and those
+    are in place again once it returns.  ``_run_server`` itself installs a
+    SIGTERM handler around uvicorn's run and restores the previous one.
+    """
     before = {signum: signal.getsignal(signum) for signum in _INTERRUPTING}
     seen: dict[signal.Signals, _Disposition] = {}
     _patch_environment(monkeypatch, _settings(tmp_path), scanner=DistinctPageScanner())

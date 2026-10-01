@@ -156,6 +156,22 @@ logger = logging.getLogger(__name__)
 # is the backlog uvicorn itself listens with.
 _LISTEN_BACKLOG: Final = 2048
 
+# How long, in whole seconds, a stopping web server waits for requests still
+# being answered before it cancels them.  uvicorn types the setting
+# ``int | None``, so it is an int.  An idle stop is uvicorn's 0.1 s poll, at
+# most this drain, and the lifespan's one shared 5 s deadline for the scan
+# worker and the check refresher: about 8 s, inside Docker's default 10 s
+# grace period.  A stop while a stopped scan's pages are being preserved runs
+# longer, which is what the documented 90 s stop grace period covers.
+#
+# The drain can be bounded only because every route is bounded: no request
+# thread runs a status probe (Check again hands it to the refresher thread and
+# waits a few seconds at most), every paperless-ngx call a request makes has
+# a short timeout, and a stop aborts the refresher's scanner listing.  A route
+# that outlived the drain would keep its worker thread, and so the process,
+# alive after the lifespan had already closed what that thread was using.
+_GRACEFUL_SHUTDOWN_SECONDS: Final = 3
+
 # Width of the Status column in `saneless jobs`, derived rather than written
 # down: the humanised labels are longer than the raw enum values they replaced,
 # and a new JobState member must not be able to overflow an 80-column
@@ -2261,14 +2277,42 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
             log_config=None,
             log_level=log_level.lower(),
             access_log=True,
+            timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_SECONDS,
         )
     )
-    # On Ctrl-C uvicorn shuts down gracefully and then re-raises the signal it
-    # caught, which arrives here as KeyboardInterrupt. A running server being
-    # stopped is a normal stop, exit 0, so it is swallowed here; a Ctrl-C
-    # before this point -- while settings load or the app is built -- is not
-    # uvicorn's to handle and reaches the group guard, exit 130.
+
+    def _stop_requested(_signum: int, _frame: FrameType | None) -> None:
+        """Ask the server to stop, as uvicorn's own SIGTERM handler does."""
+        server.should_exit = True
+
+    # A running server stopped with SIGTERM is a normal stop, exit 0, whether
+    # or not it is PID 1. uvicorn installs its own handler while it runs, and
+    # on the way out restores the handler it found and raises the caught
+    # signal again into it. With the default handler that re-raise ends the
+    # process by the signal (exit 143 in a shell) everywhere except as PID 1,
+    # where the kernel ignores it. With this handler in place the re-raise is
+    # one more stop request to a server that has already stopped, and the
+    # command returns normally. It also covers a SIGTERM that lands before
+    # uvicorn has installed its own: the server stops instead of the signal
+    # being lost or ending the process mid-start-up. The previous handler is
+    # put back however the run ends. As in _install_interrupt_handlers, a
+    # handler installed from outside Python (getsignal returns None) is left
+    # alone, since it could not be put back, and only the main thread may
+    # install one at all.
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    owns_sigterm = (
+        previous_sigterm is not None
+        and threading.current_thread() is threading.main_thread()
+    )
+    if owns_sigterm:
+        signal.signal(signal.SIGTERM, _stop_requested)
     try:
+        # On Ctrl-C uvicorn shuts down gracefully and then re-raises the
+        # signal it caught, which arrives here as KeyboardInterrupt. A running
+        # server being stopped is a normal stop, exit 0, so it is swallowed
+        # here; a Ctrl-C before this point -- while settings load or the app
+        # is built -- is not uvicorn's to handle and reaches the group guard,
+        # exit 130.
         with contextlib.suppress(KeyboardInterrupt):
             server.run(sockets=sockets)
     except SystemExit:
@@ -2278,6 +2322,9 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
         # started server exiting is uvicorn's own decision and is left alone.
         if server.started:
             raise
+    finally:
+        if owns_sigterm and previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
     # Server.run returns quietly when start-up fails, such as the app's
     # lifespan raising; uvicorn has already logged why. Every command shares
     # one exit table, so that is a failure to start: one line, exit 2.
