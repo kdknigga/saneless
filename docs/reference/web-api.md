@@ -48,8 +48,8 @@ that could not be loaded keeps asking whether it can be loaded now, through
 the form. Once it can, the page asks for the list again with what the form shows at that
 moment, and drops or abandons that request if Profile is changing at the same time. So the
 lists never come back for a profile no longer chosen, and a tick or a choice made in the
-meantime is kept. Until that answer lands, the Scan button
-is disabled with a line beneath it saying it waits for the lists; the answer releases it
+meantime is kept. Until the `GET /api/metadata` answer lands, the Scan button
+is disabled with a line beneath it saying it waits for the lists; that answer releases it
 whether the lists arrived or could not be loaded. A form that shows neither list waits for
 nothing.
 
