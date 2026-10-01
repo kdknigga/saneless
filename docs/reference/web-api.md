@@ -134,12 +134,13 @@ failed. A script that posts its own `tags` and `correspondent` can leave them ou
 | Status Code | Meaning |
 |-------------|---------|
 | 200 | The job is queued. HTML partial: the status indicator for HTMX swap, plus an out-of-band Scan button and an out-of-band clear of any earlier error message. |
+| 400 | A browser posted the scan form by itself, which happens only with JavaScript off. The answer is an HTML page saying no scan was started; see [A browser with JavaScript off](#a-browser-with-javascript-off). |
 | 403 | The request was blocked as cross-site. See [Cross-site requests](#cross-site-requests). |
 | 422 | The request is not valid: the profile does not exist, Multiple pages was asked for on a manual-duplex profile, the title is longer than 118 characters, the title contains a tab or another control character, more than 100 `tags` were sent, a tag or correspondent ID is outside 1 to 2147483647 (the range of a paperless-ngx ID), or a required field is missing. No job is created. |
 | 429 | The scan queue is full: 10 jobs are already waiting to start. The response carries `Retry-After: 30`. |
 | 503 | The worker is not running, or it is degraded (see [`GET /health`](#get-health)). |
 
-A `429` or `503` is a refused attempt, not a missing one: it is recorded in job history as a failed job ("Not started: ..."), provided the job store accepts the write. A `422` records nothing. Error bodies follow [Errors](#errors).
+A `429` or `503` is a refused attempt, not a missing one: it is recorded in job history as a failed job ("Not started: ..."), provided the job store accepts the write. A `400` or `422` records nothing. Error bodies follow [Errors](#errors).
 
 A title holding a control character -- a tab, an escape character, any other C0 or C1 control, or DEL -- is refused rather than cleaned up, so the title stored is always the one that was typed. The web page's title box cannot produce a newline, so in practice this is a pasted tab or a request that did not come from the page. Accented letters and other ordinary characters, a no-break space included, are accepted.
 
@@ -534,6 +535,17 @@ Every error response saneless renders -- a refused scan, a validation failure, a
 | Anything else | `{"status": "error", "detail": "<message>"}` | none |
 
 A `429` carries `Retry-After: 30` in both forms.
+
+### A browser with JavaScript off
+
+The web page submits the scan form through htmx. A browser with JavaScript off, or one whose htmx failed to load, submits the form by itself and shows the answer as a whole page. The form is a `POST`, so the title never appears in a URL, and saneless answers that submit with a page of its own rather than either form above:
+
+- It applies to `POST /api/scan` when the request has no `HX-Request: true` header and its `Accept` header names `text/html`, which is what a browser sends when it submits a form.
+- The answer is `400` with an HTML page titled `Scan not started — saneless`. It says scanning from the page needs JavaScript, and that `saneless scan` on the server works without it, and links back to `/`.
+- No scan is started and nothing is recorded in job history. The check comes before every other one, so this is the answer even when a field is invalid or the appliance cannot scan.
+- The page echoes nothing that was submitted. It carries the same [security headers](#security-headers) and `Cache-Control: no-store` as every other error.
+
+A script or `curl` is unaffected: they send `Accept: */*`, or no `Accept` at all, and get the responses documented under [`POST /api/scan`](#post-apiscan).
 
 A refused `POST /api/scan` from the web UI also carries the Scan button out-of-band, enabled and marked `autofocus`, so keyboard focus returns to the button that was pressed rather than being left on the page body. Focus is never moved into the message area. A refusal because the paperless-ngx token or address is unset carries no button: the button is disabled on such an appliance, so there is nothing to return focus to.
 

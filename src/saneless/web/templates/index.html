@@ -29,13 +29,26 @@
 {# --- Section 1: Scan Form --- #}
 <article>
     <h2>Scan</h2>
-    {# hx-disabled-elt replaces the deleted app script's beforeRequest handler:
+    <noscript><p class="status-fallback">&#9888; {{ no_script_line }}</p></noscript>
+    {# The line above is what a browser with JavaScript off reads first, ahead of
+       every control: Scan cannot work there, and saneless scan on the server
+       can.  It is the amber fallback line, because nothing has failed yet.
+
+       hx-disabled-elt replaces the deleted app script's beforeRequest handler:
        the button is disabled for the round-trip, so there is no double submit.
        hx-disinherit is mandatory: hx-disabled-elt is an inherited attribute, so
        without it the tags/correspondent selects and refresh buttons inside this
        form would each inherit it and disable the Scan button for the length of
-       their own round-trip -- greying it out every time a list refreshes. #}
+       their own round-trip -- greying it out every time a list refreshes.
+
+       method and action are for a browser with JavaScript off, which submits
+       the form by itself.  Without them it would GET the page with every field,
+       the title included, in the URL, where history and access logs keep it.
+       As a POST the fields stay in the body, and the server refuses that post
+       with a page saying why nothing started.  They are not htmx attributes and
+       nothing inherits them, so the inheritance fix is unchanged. #}
     <form hx-post="/api/scan"
+          method="post" action="/api/scan"
           hx-target="#status-area"
           hx-swap="outerHTML"
           hx-disabled-elt="#scan-btn"

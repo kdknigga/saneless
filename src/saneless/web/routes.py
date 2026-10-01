@@ -53,6 +53,7 @@ from saneless.vocabulary import (
     MULTI_PAGE_DISABLED_REASON,
     MULTI_PAGE_HELP,
     MULTI_PAGE_LABEL,
+    NO_SCRIPT_LINE,
     PASS_WAIT_STATES,
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
@@ -92,6 +93,7 @@ from saneless.web.cache import MetadataUnavailableError
 from saneless.web.errors import (
     RETRY_AFTER_SECONDS,
     TITLE_CONTROL_TYPE,
+    BrowserNavigationRefused,
     RequestRejected,
 )
 from saneless.web.job_view import (
@@ -2304,6 +2306,9 @@ def index(request: Request) -> Response:
             "jobs": jobs,
             # The title input's maxlength; templates own no vocabulary.
             "title_max_length": TITLE_MAX_LENGTH,
+            # What a browser with JavaScript off reads under the Scan heading:
+            # Scan cannot work there, and the server refuses its post.
+            "no_script_line": NO_SCRIPT_LINE,
             # The reason line's copy, which only the full page renders: it is
             # never an out-of-band swap target, so no status response needs it
             # and it never has to exist as an empty placeholder.
@@ -2751,7 +2756,41 @@ def _queued_status_fallback(job_id: str) -> str:
     )
 
 
-@router.post("/api/scan")
+def _refuse_browser_navigation(request: Request) -> None:
+    """
+    Refuse a scan form a browser posted by itself, with JavaScript off.
+
+    The page submits the form through htmx, which sends ``HX-Request: true``.
+    A browser with JavaScript off, or one whose htmx failed to load, posts the
+    form itself as a navigation and shows the answer as the page, so it is
+    answered with a page saying why nothing happened, and nothing is started.
+
+    A navigation is told apart by two headers together: no ``HX-Request``, and
+    an ``Accept`` naming ``text/html``, which a browser sends for the page it
+    will show next.  Refusing every post without ``HX-Request`` would break
+    the documented API: curl and scripts post here directly, and they send
+    ``*/*`` or no ``Accept`` at all.  ``Sec-Fetch-Mode`` would name a
+    navigation outright, but a browser sends it only to a secure origin, and
+    this appliance is usually reached over plain http on the LAN.
+
+    This runs as a route dependency, ahead of every parameter, so it answers
+    before body validation does and before ``_scan_block`` writes a refused
+    attempt's row: a refused navigation started nothing and records nothing.
+
+    Args:
+        request: The incoming request.
+
+    Raises:
+        BrowserNavigationRefused: The request is a browser navigation.
+
+    """
+    if request.headers.get("HX-Request") != "true" and "text/html" in (
+        request.headers.get("accept", "")
+    ):
+        raise BrowserNavigationRefused
+
+
+@router.post("/api/scan", dependencies=[Depends(_refuse_browser_navigation)])
 def start_scan(
     request: Request,
     choice: Annotated[_ScanChoice, Depends(_scan_choice)],
@@ -2765,6 +2804,10 @@ def start_scan(
 ) -> Response:
     """
     Start a new scan job from form submission.
+
+    A browser that posted the form by itself, with JavaScript off, is refused
+    before anything else, with a page that says why and starts nothing
+    (``_refuse_browser_navigation``).
 
     Input is validated before any job row exists: a title over
     ``TITLE_MAX_LENGTH``, a title holding a tab or any other control

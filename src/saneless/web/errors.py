@@ -14,6 +14,11 @@ whose failure goes to the slot like any other click's.  Any other request gets
 ``{"status": "error", "detail": <message>}`` with the same status code, and a
 429 carries ``Retry-After`` on both branches.
 
+One refusal is answered outside ``render_error``: a scan form a browser posted
+by itself, with JavaScript off, gets a whole page (``BrowserNavigationRefused``),
+because a browser shows a navigation's answer as the page and JSON would be
+shown as text.
+
 Every message is a ``RequestRejection`` vocabulary constant.  No exception
 text reaches a response body from here, and only one piece of request input
 does: the refused ``Host`` of a 421, which ``host_guard`` neutralises and cuts
@@ -43,6 +48,10 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from saneless.vocabulary import (
+    NO_SCRIPT_BACK_LINK,
+    NO_SCRIPT_BODY,
+    NO_SCRIPT_HEADING,
+    NO_SCRIPT_PAGE_TITLE,
     RequestRejection,
     rejection_message,
     rejection_status_code,
@@ -60,6 +69,7 @@ __all__ = [
     "CHECKS_POLL_TARGET_ID",
     "RETRY_AFTER_SECONDS",
     "TITLE_CONTROL_TYPE",
+    "BrowserNavigationRefused",
     "RequestRejected",
     "TechnicalDetails",
     "install_error_handlers",
@@ -116,6 +126,7 @@ _BLOCKED_SCAN_REJECTIONS: Final = frozenset(
     {RequestRejection.TOKEN_UNSET, RequestRejection.URL_UNSET}
 )
 
+_BAD_REQUEST = 400
 _TOO_MANY_REQUESTS = 429
 _NOT_FOUND = 404
 _METHOD_NOT_ALLOWED = 405
@@ -191,6 +202,20 @@ class RequestRejected(HTTPException):
         )
         self.rejection = rejection
         self.job_id = job_id
+
+
+class BrowserNavigationRefused(Exception):
+    """
+    A browser posted the scan form as a navigation, so no scan is started.
+
+    That happens only when JavaScript is off, or htmx failed to load: the page
+    submits the form itself through htmx, which says so in its headers.  A
+    browser posting on its own shows whatever comes back as a whole page, so
+    this is answered with a page of its own (``no_script.html``) and never
+    through ``render_error``, whose answer to a request that is not htmx's is
+    JSON.  It carries nothing, because the page echoes nothing the request
+    sent.
+    """
 
 
 def rejection_for_status(status_code: int) -> RequestRejection:
@@ -430,9 +455,42 @@ async def _unhandled_exception(request: Request, exc: Exception) -> Response:
     )
 
 
+async def _browser_navigation_refused(request: Request, exc: Exception) -> Response:
+    """
+    Answer a scan form a browser posted by itself with the refusal page.
+
+    The page is built here rather than by ``render_error``: that function
+    answers anything but an htmx request with JSON, and a browser showing a
+    navigation's answer would show the JSON as text.  Everything else
+    ``render_error`` guarantees still holds.  Every word comes from the
+    vocabulary and none from the request (ASVS V7), and the response carries
+    ``SECURITY_HEADERS`` and ``NO_STORE`` itself.  It is a 400, because the
+    request is one this route does not serve, and nothing was started or
+    recorded.
+    """
+    if not isinstance(exc, BrowserNavigationRefused):
+        return await _unhandled_exception(request, exc)
+    return request.app.state.templates.TemplateResponse(
+        request,
+        "no_script.html",
+        {
+            "page_title": NO_SCRIPT_PAGE_TITLE,
+            "heading": NO_SCRIPT_HEADING,
+            "body": NO_SCRIPT_BODY,
+            "back_link": NO_SCRIPT_BACK_LINK,
+        },
+        status_code=_BAD_REQUEST,
+        headers=dict((*SECURITY_HEADERS, NO_STORE)),
+    )
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """
-    Register the three handlers that send every error through ``render_error``.
+    Register the handlers that answer every error the web layer produces.
+
+    Three send their error through ``render_error``.  The fourth answers a
+    scan form posted by a browser with JavaScript off with a page of its own,
+    which is the one error a person sees as a whole page.
 
     Args:
         app: The application to register the handlers on.
@@ -440,4 +498,5 @@ def install_error_handlers(app: FastAPI) -> None:
     """
     app.add_exception_handler(StarletteHTTPException, _http_exception)
     app.add_exception_handler(RequestValidationError, _validation_error)
+    app.add_exception_handler(BrowserNavigationRefused, _browser_navigation_refused)
     app.add_exception_handler(Exception, _unhandled_exception)

@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{# The page a browser with JavaScript off is shown after pressing Scan.
+
+   With no script the browser posts the scan form by itself and shows whatever
+   comes back as the whole page.  The route refuses that post before it does
+   anything else, so no scan starts and no row is written, and this page says
+   why and leads back.
+
+   It is rendered by its own handler and not through render_error, whose answer
+   to a request that is not htmx's is JSON: a browser would show that as text.
+   The rule render_error keeps still holds here.  ASVS V7 forbids request input
+   from reaching an error surface, so every word on this page comes from the
+   vocabulary through the handler and nothing the request sent is echoed, the
+   title least of all.  The handler also sets the security headers and
+   no-store itself.
+
+   The amber fallback line, not the red error one: nothing failed, and turning
+   JavaScript on is the next step. #}
+{% block title %}{{ page_title }}{% endblock %}
+{% block content %}
+<article>
+    <h2>{{ heading }}</h2>
+    <p class="status-fallback">&#9888; {{ body }}</p>
+    <p><a href="/">{{ back_link }}</a></p>
+</article>
+{% endblock %}

@@ -2760,8 +2760,11 @@ class TestPageOpensOnDefault:
 # profile select lives inside it and must add nothing to it: the form already
 # carries hx-disinherit="hx-disabled-elt", because an inherited hx-disabled-elt
 # would put the form's own child requests in charge of the Scan button's
-# disabled attribute (C-10).
+# disabled attribute (C-10).  The one line added since is ``method`` and
+# ``action``, which are not htmx attributes and which nothing inherits: they
+# keep a JavaScript-off submit's fields out of the URL.
 _SCAN_FORM_ELEMENT = """    <form hx-post="/api/scan"
+          method="post" action="/api/scan"
           hx-target="#status-area"
           hx-swap="outerHTML"
           hx-disabled-elt="#scan-btn"
