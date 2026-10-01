@@ -26,6 +26,7 @@ In a shell, `echo $?` right after the command prints its exit code.
 | 10 | The server ran out of disk space | [Out of disk space](#out-of-disk-space-exit-10) |
 | 129 | A SIGHUP interrupted the command, for example a dropped SSH session | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
 | 130 | You cancelled the scan | [Cancelled scans](#cancelled-scans-exit-130) |
+| 141 | The program reading the output closed it early: a broken pipe, not a failure | [The output was cut off](#the-output-was-cut-off-exit-141) |
 | 143 | A SIGTERM interrupted the command | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
 
 [Use the CLI for Scripting](cli-scripting.md#exit-codes) shows how to branch on these codes in a
@@ -568,6 +569,18 @@ whatever had not reached `failed/` yet is lost, so let a failed scan finish repo
 connection interrupting it, start it under `tmux` or `screen`, or with `nohup`: a signal the
 command was started with ignored stays ignored, so under `nohup` a hangup does not interrupt it. Once `saneless serve`
 is running, SIGTERM is a graceful stop that exits 0.
+
+## The output was cut off (exit 141)
+
+Exit 141 is 128 plus SIGPIPE, the shell's code for a broken pipe. The program reading the output
+of `saneless devices`, `jobs`, `auto-profiles` or `doctor` stopped before the command finished
+writing, as `head` does in `saneless jobs | head` once it has its lines. Nothing went wrong, so
+saneless prints nothing about it and keeps no traceback. A shell reports a pipeline's last
+command's status, so you see 141 only with `set -o pipefail`. If you wanted the whole output, run
+the command without the reader that stops early.
+
+`saneless scan` never exits 141. Its progress and closing lines are not what the scan is for, so a
+reader that went away does not change its exit code: a delivered scan still exits 0.
 
 ## A scan stopped by a crash or a power cut
 

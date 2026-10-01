@@ -179,6 +179,7 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 | 10 | Out of disk space | The server ran out of disk space while scanning or assembling the PDF; the error line names the folder, and how much space is needed when saneless found the shortfall before writing. Free space, then scan again |
 | 129 | Interrupted by SIGHUP | The terminal or SSH session running the command went away. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 | 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; a confirmed abort, Ctrl-D or Ctrl-C at a multi-page question; Ctrl-C during a one-shot command |
+| 141 | Broken pipe | The program reading the output of `devices`, `jobs`, `auto-profiles` or `doctor` closed it early, as `head` does once it has its lines. Nothing failed and nothing is printed. `scan` never exits 141: its outcome's code stands |
 | 143 | Interrupted by SIGTERM | `kill`, a service manager or a container runtime stopped the command. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 
 130 means someone chose to stop, so nothing was kept. 129 and 143 (128 plus the signal number)
@@ -192,11 +193,15 @@ pages already being kept -- does not change it: the command exits with that outc
 `saneless serve` is the exception: once the web server is running, SIGTERM is a graceful stop and
 it exits 0, as on Ctrl-C.
 
+141 is 128 plus SIGPIPE, the shell's own code for a broken pipe. A pipeline reports the last
+command's status unless `set -o pipefail` is set, so `saneless jobs --json | head` gives `head`'s
+status, and the 141 shows only under `pipefail`.
+
 A failure prints a line to stderr saying what failed, then a `Try:` line with the next step (a
 configuration error prints a header naming the file and one line per problem, then the `Try:`
 line). A script that parses the failure should read the first line: the `Try:` line is advice for
 a person, and its wording may change. A cancel (130), an interruption (129, 143) and an
-unexpected error (5) print one line and no `Try:` line.
+unexpected error (5) print one line and no `Try:` line, and a broken pipe (141) prints nothing.
 [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) explains what each code means and
 what to check.
 

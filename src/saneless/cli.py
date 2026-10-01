@@ -1255,26 +1255,32 @@ class _GuardedGroup(click.Group):
     1. click's ``Exit``, ``Abort`` and ``ClickException`` are re-raised first.
        ``Exit`` and ``Abort`` subclass ``RuntimeError``, so a later
        ``except Exception`` would turn ``--help`` into exit 5.
-    2. ``ScanInterrupted`` -- a SIGHUP or SIGTERM to the command -- is an
+    2. ``BrokenPipeError`` -- the reader of stdout went away, as under
+       ``saneless jobs | head`` -- is no failure and no bug: nothing is
+       printed, no traceback is kept, and the command exits 141 (128 plus
+       SIGPIPE), the shell's code for it.  It has to come before the last
+       clause, which would call it a saneless bug.  A scan never gets here:
+       its report survives a dead stdout so that its outcome's code stands.
+    3. ``ScanInterrupted`` -- a SIGHUP or SIGTERM to the command -- is an
        interruption, not a cancel: nobody chose to stop, so the pages already
        scanned were kept. One ``Interrupted:`` line and 128 plus the signal
        number, 129 or 143. It is a ``BaseException``, so no later clause
        would catch it. A signal that arrives once the outcome is settled --
        delivered, or failed and being kept, or being reported here -- is
        deferred instead, and the command exits with its own outcome's code.
-    3. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
+    4. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
        failure: one line and exit 130.
-    4. ``StorageError`` -- a job database saneless cannot use -- is a setup
+    5. ``StorageError`` -- a job database saneless cannot use -- is a setup
        problem and exits 2. It is mapped here by type and sits before the
        ``SanelessError`` clause because ``ErrorCategory`` is persisted on job
        records, and ``classify_error`` deliberately keeps ``StorageError``
        ``UNKNOWN`` rather than growing a category for it. Its message already
        names the database path and the reason; its ``Try:`` line is the
        configuration fallback unless the error carries its own next step.
-    5. Any other ``SanelessError`` is classified once, by the same
+    6. Any other ``SanelessError`` is classified once, by the same
        ``classify_error`` the web worker uses, so the CLI's exit code and the
        job's category cannot disagree.
-    6. Anything else is not a saneless type: ``Unexpected error (<Type>)``,
+    7. Anything else is not a saneless type: ``Unexpected error (<Type>)``,
        exit 5, the traceback in the log.
     """
 
@@ -1300,6 +1306,14 @@ class _GuardedGroup(click.Group):
                 raise
         except _CLICK_CONTROL_FLOW:
             raise
+        except BrokenPipeError:
+            # The reader of stdout went away -- `saneless jobs | head` once
+            # head has its lines.  Nothing failed, so nothing is printed and
+            # no traceback is kept; what the reader refused is discarded, so
+            # the interpreter's last flush raises nothing either.
+            logger.info("The reader of saneless's output went away; stopping")
+            _drain_dead_stream(sys.stdout)
+            ctx.exit(ExitCode.BROKEN_PIPE)
         except ScanInterrupted as exc:
             logger.info("Command interrupted by a signal: %r", failure_text(exc))
             _echo_err(neutralise_controls(f"Interrupted: {failure_text(exc)}"))

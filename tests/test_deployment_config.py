@@ -1027,7 +1027,8 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     builds the Paperless client; a malformed Paperless URL never gets that
     far, because the config load refuses it with a 2.
 
-    ``doctor`` has the same four codes as ``jobs``, for three separate reasons.
+    ``doctor`` has the same codes as ``jobs``, and lacks 1, 3 and 4 for three
+    separate reasons.
     No 1: it never fails on SANE at all -- Amendment A-1 turns a missing
     python-sane, or a scanner library that will not start, into a ``FAIL``
     row rather than a refusal, and the scanner check reports an unreachable
@@ -1047,6 +1048,13 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     the pages already scanned, unlike the cancel's 130.  A running ``serve``
     turns SIGTERM into uvicorn's graceful stop, exit 0, whether or not it is
     PID 1, so it has no 143.
+
+    141 (128 + SIGPIPE) is a command whose stdout reader went away, as under
+    ``saneless jobs | head``, so ``devices``, ``jobs``, ``auto-profiles`` and
+    ``doctor``, which print their results to stdout, have it.  ``serve``
+    prints nothing to stdout, so it has none.  ``scan`` has none either: its
+    progress and closing lines survive a dead stdout on purpose, so that the
+    scan's own outcome code stands.
     """
     text, name = _read(CLI_REFERENCE)
     tables = _command_exit_tables(text, name)
@@ -1073,11 +1081,20 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
         130,
         143,
     }
-    assert _documented_codes(tables["devices"]) == {0, 1, 2, 5, 129, 130, 143}
-    assert _documented_codes(tables["jobs"]) == {0, 2, 5, 129, 130, 143}
+    assert _documented_codes(tables["devices"]) == {0, 1, 2, 5, 129, 130, 141, 143}
+    assert _documented_codes(tables["jobs"]) == {0, 2, 5, 129, 130, 141, 143}
     assert _documented_codes(tables["serve"]) == {0, 2, 3, 5, 130}
-    assert _documented_codes(tables["auto-profiles"]) == {0, 1, 2, 5, 129, 130, 143}
-    assert _documented_codes(tables["doctor"]) == {0, 2, 5, 129, 130, 143}
+    assert _documented_codes(tables["auto-profiles"]) == {
+        0,
+        1,
+        2,
+        5,
+        129,
+        130,
+        141,
+        143,
+    }
+    assert _documented_codes(tables["doctor"]) == {0, 2, 5, 129, 130, 141, 143}
     assert "abort" not in _table_row(tables["scan"], "1").lower(), (
         f"{name}: scan's exit-1 row still describes a flip-prompt abort"
     )

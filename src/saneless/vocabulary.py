@@ -482,6 +482,14 @@ class ExitCode(IntEnum):
     with that outcome's own code.
     ``exit_code_for_signal`` chooses them.
 
+    ``BROKEN_PIPE`` (141) is the shell's 128 plus SIGPIPE, for a command
+    whose output's reader went away before it finished writing, as under
+    ``saneless jobs | head``.  It is neither a scan failure (1) nor a
+    saneless bug (5): nothing went wrong that anyone has to fix, so nothing
+    is printed about it.  A shell reports a pipeline's last command's status,
+    so a script sees 141 only when it sets ``pipefail``.  A scan never ends
+    this way: its outcome's own code stands, whatever became of its output.
+
     Members are declared in value order, the order every table pinned to
     this enum lists them in.
     """
@@ -499,6 +507,7 @@ class ExitCode(IntEnum):
     DISK_SPACE = 10
     HANGUP = 129
     CANCELLED = 130
+    BROKEN_PIPE = 141
     TERMINATED = 143
 
 

@@ -2596,7 +2596,8 @@ class TestExitCode:
         Rewritten when the all-blank failure (8) and the two signal
         interruptions (129 for SIGHUP, 143 for SIGTERM) joined the enum, and
         again for the upload that may already be in paperless-ngx (9) and the
-        full disk (10), so the pinned set lists all fourteen members.
+        full disk (10), and once more for the broken pipe (141, 128 + SIGPIPE),
+        so the pinned set lists all fifteen members.
         """
         assert {(member.name, int(member)) for member in ExitCode} == {
             ("SUCCESS", 0),
@@ -2612,6 +2613,7 @@ class TestExitCode:
             ("DISK_SPACE", 10),
             ("HANGUP", 129),
             ("CANCELLED", 130),
+            ("BROKEN_PIPE", 141),
             ("TERMINATED", 143),
         }
 
@@ -2622,10 +2624,14 @@ class TestExitCode:
         This replaces a test that pinned 130 as the last member.  That held
         while 130 was the only shell-convention code; SIGTERM's 143 (128 + 15)
         now follows it, so the lasting rule is value order: saneless's own
-        small codes first, then 129, 130 and 143.
+        small codes first, then 129, 130, 141 and 143.
         """
         values = [int(member) for member in ExitCode]
         assert values == sorted(values)
+
+    def test_broken_pipe_is_the_shells_sigpipe_code(self) -> None:
+        """A reader that went away exits 141, 128 plus SIGPIPE, as a shell's would."""
+        assert int(ExitCode.BROKEN_PIPE) == 128 + signal.SIGPIPE == 141
 
 
 class TestExitCodeForSignal:

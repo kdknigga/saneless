@@ -15,7 +15,7 @@ These options apply to all commands and must appear **before** the subcommand na
 
 ## Exit codes
 
-Every command uses the same exit codes. A failure prints a line to stderr saying what failed, then a `Try:` line with the next step, and no traceback unless `-v` asked for one. The `Try:` line is the fix the failing step knows about when it knows one, and otherwise advice for that kind of failure. `saneless serve` logs these failures to its stream without a traceback too. Three kinds of ending print one line and no `Try:` line: a cancel (130), an interruption (129, 143) and an unexpected error (5). A script that parses the failure should read the first line; the `Try:` line is advice for a person, and its wording may change.
+Every command uses the same exit codes. A failure prints a line to stderr saying what failed, then a `Try:` line with the next step, and no traceback unless `-v` asked for one. The `Try:` line is the fix the failing step knows about when it knows one, and otherwise advice for that kind of failure. `saneless serve` logs these failures to its stream without a traceback too. Three kinds of ending print one line and no `Try:` line: a cancel (130), an interruption (129, 143) and an unexpected error (5). A broken pipe (141) prints nothing at all. A script that parses the failure should read the first line; the `Try:` line is advice for a person, and its wording may change.
 
 | Code | Meaning |
 |------|---------|
@@ -32,9 +32,10 @@ Every command uses the same exit codes. A failure prints a line to stderr saying
 | 10 | The server ran out of disk space; the error line names the folder, and how much space is needed when saneless found the shortfall before writing |
 | 129 | Interrupted by SIGHUP, for example a dropped SSH session. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 | 130 | Cancelled by the operator |
+| 141 | Broken pipe: whatever was reading the command's output stopped before it finished, as `head` does once it has the lines it wanted. Nothing failed, and nothing is printed about it |
 | 143 | Interrupted by SIGTERM. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 
-Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had when it can, and the `Interrupted:` line says what was kept, or where the pages were left. A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's pages already being kept -- does not change it: the command finishes and exits with that outcome's own code. No path on that line means nothing was kept: the command was not a scan, or it was stopped before its first page. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. A running `serve` stops gracefully on SIGTERM and exits 0, as on Ctrl-C, whether or not it is the container's first process (PID 1). Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
+Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had when it can, and the `Interrupted:` line says what was kept, or where the pages were left. A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's pages already being kept -- does not change it: the command finishes and exits with that outcome's own code. No path on that line means nothing was kept: the command was not a scan, or it was stopped before its first page. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. A running `serve` stops gracefully on SIGTERM and exits 0, as on Ctrl-C, whether or not it is the container's first process (PID 1). `devices`, `jobs`, `auto-profiles` and `doctor` exit 141 (128 plus SIGPIPE) when the program reading their output closes it early; a shell reports a pipeline's last command's status, so a script sees the 141 only with `set -o pipefail`. `scan` does not: its outcome's code stands even when its output can no longer be written. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
 
 ---
 
@@ -104,6 +105,7 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
 | 143 | Interrupted by SIGTERM |
 
 Only data goes to stdout. The `Discovering scanners...` and `No scanners found.` status lines, which the table mode prints, and any per-device capability error go to stderr, so `saneless devices | grep` and `saneless devices --json | jq` see the device list and nothing else. With no scanners, the table mode writes nothing to stdout and `--json` writes `[]`; both exit 0.
@@ -187,6 +189,7 @@ saneless [--config PATH] [-v] jobs [--json] [--limit N]
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
 | 143 | Interrupted by SIGTERM |
 
 The table's `Timestamp` column renders each job's start time in the server's local timezone with the zone named, for example `2026-03-22 09:30 CDT`, and drops seconds. `--json` is a machine contract and is unaffected: its `created_at` stays a UTC ISO-8601 string carrying the `+00:00` offset. See [Use the CLI for Scripting](../how-to/cli-scripting.md#job-history-json).
@@ -259,6 +262,7 @@ When the table would have no lines at all -- settings built with no search behin
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
 | 143 | Interrupted by SIGTERM |
 
 **A warning does not fail the command.** An appliance that scans and files correctly is not broken because it could be tidier, and a health gate that goes red for tidiness is one people learn to ignore. Only a failure exits non-zero.
@@ -326,6 +330,7 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
+| 141 | Broken pipe: the program reading the output closed it early |
 | 143 | Interrupted by SIGTERM |
 
 Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, `auto-profiles` creates `/etc/saneless/saneless.toml` if the `/etc/saneless` directory already exists and the command may write to it, and otherwise `$XDG_CONFIG_HOME/saneless/saneless.toml` (by default `~/.config/saneless/saneless.toml`), creating a missing `saneless` directory with mode `0700` and, when the process is permitted to set it, the owner of the directory it is created in. saneless never creates `/etc/saneless` itself, even as root. It never writes `./saneless.toml` either: that file comes first in the search, so a new one would outrank every other config file on the next start, and in the Docker image, whose working directory is the data volume, it would go on shadowing the mounted `./config` directory after every container recreation. In the container that mounted directory is `/etc/saneless`, so the file lands there (see [Deploy with Docker Compose](../how-to/deploy-docker-compose.md)). If the target cannot be written, the command exits 2 naming it. A config file created from scratch gets mode `0600` and, when the process is permitted to set it, its directory's owner; rewriting an existing file keeps its permission bits, owner and group, each when the process is permitted to set it and the filesystem supports it. A config file that is a symlink is rewritten at the file it points to; the command refuses a symlink to a file that does not exist and, run as root, a symlink that someone other than root made to a file they do not own.
