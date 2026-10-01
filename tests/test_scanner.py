@@ -65,6 +65,7 @@ from tests.conftest import (
 )
 from tests.fake_sane import (
     TYPE_INT,
+    UNNAMED_OPTION_ENTRIES,
     FakeSaneDev,
     FakeSaneError,
     FakeSaneModule,
@@ -1761,6 +1762,34 @@ class TestSaneBackendGetCapabilities:
         expected = tuple(str(opt[1]) for opt in build_option_table())
         assert caps.option_names == expected
         assert all(type(name) is str for name in caps.option_names)
+
+    def test_option_names_skip_blank_entries(
+        self,
+        fake_sane_module: FakeSaneModule,
+        sane_backend: SaneBackend,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        An entry with no name is not an option name; the rest keep their order.
+
+        A real device reports the option count with the name '' and each
+        group heading with None.  Neither can be read or set, and listed they
+        print as a blank line and the word None.
+        """
+        device = fake_sane_module.device
+        named = device.get_options()
+        count, group = UNNAMED_OPTION_ENTRIES
+
+        def with_unnamed() -> list[tuple]:
+            return [count, *named[:2], group, *named[2:]]
+
+        # The device stores a name that is not one of its options on itself,
+        # as python-sane does, so this shadows get_options for this device.
+        monkeypatch.setattr(device, "get_options", with_unnamed)
+
+        caps = sane_backend.get_capabilities("test:device:001")
+
+        assert caps.option_names == tuple(str(opt[1]) for opt in named)
 
 
 # ---------------------------------------------------------------------------

@@ -93,6 +93,7 @@ if TYPE_CHECKING:
 __all__ = [
     "TYPE_FIXED",
     "TYPE_INT",
+    "UNNAMED_OPTION_ENTRIES",
     "FakeSaneDev",
     "FakeSaneError",
     "FakeSaneHandle",
@@ -114,6 +115,25 @@ _TYPE_GROUP = 5
 # one for the geometry or page-size options without restating SANE's codes.
 TYPE_INT = _TYPE_INT
 TYPE_FIXED = _TYPE_FIXED
+
+# The two entries ``get_options()`` hands over with no usable name, as python-sane
+# reports them from a real device: option 0, the option count, named '', and a
+# group heading, named None.  Neither is an option anyone can read or set.  Not
+# part of any built table, so a test that wants them splices them in.
+UNNAMED_OPTION_ENTRIES: tuple[tuple, ...] = (
+    (
+        0,
+        "",
+        "Number of options",
+        "Read-only option that specifies how many options a specific device supports.",
+        _TYPE_INT,
+        0,
+        4,
+        4,
+        None,
+    ),
+    (1, None, "Geometry", "", _TYPE_GROUP, 0, 0, 0, None),
+)
 
 # SANE units.  There is no UNIT_CM and no UNIT_INCH.
 _UNIT_NONE = 0

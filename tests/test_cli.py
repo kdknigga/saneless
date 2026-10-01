@@ -99,7 +99,7 @@ from tests.conftest import (
     leave_killed_workspace,
     scan_batch,
 )
-from tests.fake_sane import FakeSaneModule
+from tests.fake_sane import UNNAMED_OPTION_ENTRIES, FakeSaneDev, FakeSaneModule
 from tests.prompt_support import (
     FakeClock,
     broken_read,
@@ -2051,6 +2051,85 @@ class TestDevicesCommand:
         assert result.exit_code == 0, result.output
         assert result.stdout == stdout
         assert result.stderr.splitlines() == stderr
+
+    def test_the_device_table_fits_80_columns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        On an 80-column terminal no line of the table is wider than 80.
+
+        A device type as long as SANE's own "multi-function peripheral" used
+        to be printed whole after three fixed columns, so every row wrapped.
+        """
+
+        class _LongFields(StubScannerBackend):
+            def __init__(self, host: str = "") -> None:
+                """Accept the host the CLI passes."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Report one device whose every field is long."""
+                return [
+                    DeviceInfo(
+                        "net:scanner-host.example.lan:hpaio:/net/OfficeJet_Pro?ip=1",
+                        "Hewlett-Packard Development Company",
+                        "OfficeJet Pro 9010 series all-in-one",
+                        "multi-function peripheral",
+                    )
+                ]
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_LongFields)
+
+        result = runner.invoke(cli, ["devices"], env={"COLUMNS": "80"})
+
+        assert result.exit_code == 0, result.output
+        lines = result.stdout.splitlines()
+        assert len(lines) == 3, result.stdout
+        assert all(len(line) <= 80 for line in lines), [len(x) for x in lines]
+
+    @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])
+    def test_capabilities_omit_blank_option_names(
+        self, monkeypatch: pytest.MonkeyPatch, *, as_json: bool
+    ) -> None:
+        """
+        The raw option list names options, and nothing without a name.
+
+        The real backend over a device that reports the option count ('') and
+        a group heading (None) among its options: the text has no blank line
+        and no "None" under "Raw options", and the JSON list holds strings
+        only.
+        """
+        device = FakeSaneDev()
+        named = device.get_options()
+        count, group = UNNAMED_OPTION_ENTRIES
+
+        def with_unnamed() -> list[tuple]:
+            return [count, *named[:2], group, *named[2:]]
+
+        # The device stores a name that is not one of its options on itself,
+        # as python-sane does, so this shadows get_options for this device.
+        monkeypatch.setattr(device, "get_options", with_unnamed)
+        monkeypatch.setattr(sane_backend, "sane", FakeSaneModule(device=device))
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        expected = [str(opt[1]) for opt in named]
+
+        result = runner.invoke(
+            cli, ["devices", "--capabilities", *(["--json"] if as_json else [])]
+        )
+
+        assert result.exit_code == 0, result.output
+        if as_json:
+            entries = json.loads(result.stdout)
+            assert entries
+            for entry in entries:
+                assert entry["capabilities"]["raw_options"] == expected
+        else:
+            blocks = result.stdout.split("  Raw options:\n")[1:]
+            assert blocks, result.stdout
+            for block in blocks:
+                listed = [
+                    line for line in block.splitlines() if line.startswith("    ")
+                ]
+                assert listed == [f"    {name}" for name in expected]
 
     def test_devices_capabilities(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """
