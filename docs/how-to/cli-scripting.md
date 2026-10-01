@@ -16,7 +16,7 @@ saneless devices --json
 saneless jobs --json --limit 10
 ```
 
-`saneless doctor` has no `--json` mode; it prints a table for a person to read, and scripts gate on its exit code instead (see [Checking readiness before a scan](#checking-readiness-before-a-scan)).
+`saneless doctor` has no `--json` mode; it prints a table for a person to read, and its exit code says whether any check failed (see [`saneless doctor`'s exit code](#saneless-doctors-exit-code)). To check for a scanner before a scan, ask `saneless devices` instead (see [Checking readiness before a scan](#checking-readiness-before-a-scan)).
 
 ### Device list JSON
 
@@ -198,19 +198,26 @@ what each code means and what to check.
 
 ### `saneless doctor`'s exit code
 
-`saneless doctor` reports five health checks and collapses them to one code:
+`saneless doctor` reports six health checks and collapses them to one code:
 
-- **0** — every check came out OK, **or** came out as a warning. A warning is a true statement
-  about a deployment that still scans and files: no fallback folder is configured, or the
-  generated profiles live only in memory. It is deliberately **not** a failure, because a gate
-  that goes red for tidiness is a gate people learn to ignore.
-- **2** — at least one check failed: scanner support is not installed, no scanner is reachable,
-  the paperless-ngx API token is unset or rejected, no scan profiles are configured, or a folder
-  saneless needs is not writable.
+- **0** — every check came out OK, **or** came out as a warning. Most warnings are true
+  statements about a deployment that still scans and files: no fallback folder is configured,
+  or the generated profiles live only in memory. They are deliberately **not** failures, because
+  a gate that goes red for tidiness is a gate people learn to ignore. One warning is different:
+  a scanner host that does not answer, even when it is the only one configured. The check stops
+  there without asking SANE for scanners, so it cannot say that none would be found.
+- **2** — at least one check failed: scanner support is not installed or will not start, no
+  usable scanner was found, the paperless-ngx API token is unset or rejected, paperless-ngx
+  could not be used, no scan profiles are configured, or a folder saneless needs is not
+  writable. A folder problem is a row like any other: `doctor` still prints all six rows, where
+  the other commands refuse to start. A configuration file that cannot be loaded at all is
+  also 2.
 - **5**, **129**, **130** and **143** behave as they do for every other command.
 
-`doctor` prints a human-readable table and has no `--json` mode, so a script should gate on the
-exit code rather than parse the output. Do not wire it to a container `HEALTHCHECK`: it probes
+So exit 0 means that nothing `doctor` could check is broken. It does not prove that a scan
+will work, because the scanner may simply be switched off. `doctor` prints a human-readable
+table and has no `--json` mode, so a script that runs it should read the exit code rather than
+parse the output. Do not wire it to a container `HEALTHCHECK`: it probes
 the scanner and talks to paperless-ngx, so it would mark the container unhealthy during a routine
 paperless-ngx restart. Use the web server's `/health` endpoint for that.
 
@@ -274,22 +281,27 @@ exit code and stderr are the only report a script gets.
 
 ### Checking readiness before a scan
 
-`saneless doctor` exits 0 while every check is OK or a warning, so it reads as a plain condition:
+`saneless doctor`'s exit code is not a readiness check: a scanner that is switched off is a
+warning, and `doctor` exits 0. Gate a scan on the scanner itself instead, by asking which
+devices SANE can see:
 
 ```bash
 #!/bin/bash
-if ! saneless doctor; then
-  echo "saneless is not ready to scan -- see the failed rows above"
-  exit 2
+if ! saneless devices --json | jq -e 'length > 0' >/dev/null; then
+  echo "No scanner found -- run saneless doctor to see why"
+  exit 1
 fi
 saneless scan --profile adf --title "Batch $(date +%Y-%m-%d)"
 ```
+
+`jq -e` exits non-zero when the list is empty, and also when `saneless devices` failed and
+printed nothing. When it does, run `saneless doctor` by hand: its rows say what is wrong.
 
 ### Scan only if scanner is available
 
 ```bash
 #!/bin/bash
-if saneless devices --json | grep -q '"name"'; then
+if saneless devices --json | jq -e 'length > 0' >/dev/null; then
   saneless scan --profile adf --title "Batch $(date +%Y-%m-%d)"
 else
   echo "No scanner found, skipping"

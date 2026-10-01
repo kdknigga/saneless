@@ -47,6 +47,7 @@ from saneless.checks import (
     CheckKey,
     CheckResult,
     CheckState,
+    _SanedOutcome,
     check_name,
     configuration_check,
     run_checks,
@@ -2057,3 +2058,58 @@ class TestDoctorReportsWhatItFinds:
 
         assert "consume_dir is not writable" in result.output
         assert result.exit_code == ExitCode.CONFIG
+
+
+class TestAnUnansweredScannerHostIsAWarning:
+    """
+    A scanner host that does not answer is amber, and doctor exits 0 for it.
+
+    The check stops before it asks SANE for scanners, so it cannot say none
+    would be found; that is a warning even when the host is the only one
+    configured.  A script that needs a scanner asks ``saneless devices``.
+    """
+
+    def test_a_sole_unanswered_scanner_host_warns_and_exits_0(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The only configured host timing out is a WARN row and exit 0.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        settings.scanner = ScannerConfig(device="epson:001", host="scanner.lan")
+        probed: list[str] = []
+
+        def _silent(
+            host: str, port: int, connect_timeout: float, handshake_timeout: float
+        ) -> _SanedOutcome:
+            """
+            Report every host as one that never answered.
+
+            Args:
+                host: The host probed.
+                port: Its port.
+                connect_timeout: Unused.
+                handshake_timeout: Unused.
+
+            Returns:
+                ``TIMED_OUT``.
+
+            """
+            probed.append(f"{host}:{port}")
+            return _SanedOutcome.TIMED_OUT
+
+        monkeypatch.setattr("saneless.checks._probe_saned", _silent)
+        runner = _patch_doctor(monkeypatch, settings)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert probed, "the scanner host was never probed"
+        row, step = _row_and_step(result.output, CheckKey.SCANNER)
+        assert row.startswith(_state_marker(CheckState.WARN)), row
+        assert step.startswith(_NEXT_STEP_INDENT)
+        assert result.exit_code == 0, result.output

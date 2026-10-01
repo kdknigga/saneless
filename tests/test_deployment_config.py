@@ -1029,12 +1029,13 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
 
     ``doctor`` has the same four codes as ``jobs``, for three separate reasons.
     No 1: it never fails on SANE at all -- Amendment A-1 turns a missing
-    python-sane into a ``FAIL`` row rather than a refusal, and the scanner
-    check reports an unreachable device instead of raising. No 3: it does
-    construct a Paperless client, but ``test_connection`` returns a status
-    rather than raising, and a URL the client cannot be built from becomes the
-    "not found at that URL" row instead of a ``PaperlessError``. No 4: it
-    assembles nothing.
+    python-sane, or a scanner library that will not start, into a ``FAIL``
+    row rather than a refusal, and the scanner check reports an unreachable
+    device instead of raising. No 3: it does construct a Paperless client,
+    but ``probe_connection`` returns a status
+    rather than raising, and a client the constructor refuses -- for its URL,
+    its token or an unreadable TLS trust store -- becomes a ``FAIL`` row
+    instead of a ``PaperlessError``. No 4: it assembles nothing.
 
     Only ``scan`` judges pages blank, so only ``scan`` has 8.  Only ``scan``
     uploads a document and writes pages to disk, so only ``scan`` has 9 (the
@@ -1145,6 +1146,48 @@ def test_scripting_does_not_claim_every_read_command_has_json() -> None:
         f"{name} still claims every read command supports --json"
     )
     assert "doctor" in text, f"{name} does not mention doctor's exit semantics"
+
+
+def test_the_scripting_readiness_gate_uses_devices() -> None:
+    """
+    The readiness example checks for a scanner, not for ``doctor``'s exit code.
+
+    ``doctor`` exits 0 when a scanner host does not answer, because that row
+    is a warning, so a scan gated on ``doctor`` still runs with no scanner
+    there.  Asking ``saneless devices`` is the check that can fail when it
+    should.
+    """
+    text, name = _read(CLI_SCRIPTING)
+    assert "saneless devices --json | jq -e 'length > 0'" in text, (
+        f"{name} does not gate a scan on saneless devices --json"
+    )
+    assert not re.search(r"if !? *saneless doctor", text), (
+        f"{name} still gates a scan on saneless doctor's exit code"
+    )
+    assert "no scanner is reachable" not in text, (
+        f"{name} still says doctor exits 2 when no scanner is reachable"
+    )
+
+
+def test_the_doctor_reference_says_an_unanswered_host_is_a_warning() -> None:
+    """
+    The doctor section stops promising exit 2 for a scanner that is not there.
+
+    A scanner host that does not answer is a warning even when it is the only
+    one configured, so the exit table may not list it as a failure, and the
+    section says so in words a script author will read.
+    """
+    text, name = _read(CLI_REFERENCE)
+    section = _section(text, "## `saneless doctor`", name)
+    assert "no scanner reachable" not in section, (
+        f"{name} still lists 'no scanner reachable' under doctor's exit 2"
+    )
+    assert "cannot disagree" not in section, (
+        f"{name} still says doctor and the page cannot disagree"
+    )
+    assert "saneless devices --json" in section, (
+        f"{name} does not point a readiness check at saneless devices --json"
+    )
 
 
 def test_scripting_documents_jobs_json_created_at_as_utc() -> None:
