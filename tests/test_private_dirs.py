@@ -99,6 +99,20 @@ def _assert_refusal(error: ConfigError, path: Path) -> None:
     assert "chmod 700" in message
 
 
+def _assert_refusal_next_step(error: ConfigError) -> None:
+    """
+    Check that a refusal's next step is the fix its message names.
+
+    It names the setting, and no path: the message already carries the path,
+    and the next step is a constant sentence about the setting.
+    """
+    next_step = error.next_step
+    assert next_step is not None
+    assert _KEY in next_step
+    assert "nobody else can write to" in next_step
+    assert "/" not in next_step
+
+
 class TestMakePrivateDir:
     """``make_private_dir`` creates the leaf owner-only and leaves others alone."""
 
@@ -223,6 +237,33 @@ class TestEnsurePrivateDir:
         assert str(target) in message
         assert isinstance(exc_info.value.__cause__, OSError)
 
+    def test_a_creation_failure_next_step_names_the_setting(
+        self, tmp_path: Path
+    ) -> None:
+        """A directory that cannot be created: create it yourself, or move it."""
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        target = blocker / "scratch"
+        with pytest.raises(ConfigError) as exc_info:
+            ensure_private_dir(target, key=_KEY)
+        next_step = exc_info.value.next_step
+        assert next_step is not None
+        assert _KEY in next_step
+        assert "700" in next_step
+        assert str(target) not in next_step
+
+    def test_another_users_directory_has_the_refusal_next_step(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A directory owned by another UID gets the same next step."""
+        target = tmp_path / "scratch"
+        target.mkdir(mode=_PRIVATE)
+        owner = target.stat().st_uid
+        monkeypatch.setattr(private_dirs_module.os, "geteuid", lambda: owner + 1)
+        with pytest.raises(ConfigError, match="owned by") as exc_info:
+            ensure_private_dir(target, key=_KEY)
+        _assert_refusal_next_step(exc_info.value)
+
 
 class TestCheckPrivateDir:
     """``check_private_dir`` only inspects; it never creates."""
@@ -247,3 +288,26 @@ class TestCheckPrivateDir:
         with pytest.raises(ConfigError) as exc_info:
             check_private_dir(target, key=_KEY)
         _assert_refusal(exc_info.value, target)
+
+    @pytest.mark.parametrize("shape", sorted(_REFUSED_SHAPES))
+    def test_a_refusal_next_step_names_the_setting(
+        self, tmp_path: Path, shape: str
+    ) -> None:
+        """Every unsafe shape's next step is the fix its message names."""
+        target = tmp_path / "scratch"
+        _REFUSED_SHAPES[shape](target)
+        with pytest.raises(ConfigError) as exc_info:
+            check_private_dir(target, key=_KEY)
+        _assert_refusal_next_step(exc_info.value)
+
+    def test_a_directory_that_cannot_be_checked_has_a_next_step(
+        self, tmp_path: Path
+    ) -> None:
+        """When ``lstat`` itself fails, the next step still names the setting."""
+        target = tmp_path / "scratch"
+        with pytest.raises(ConfigError, match="could not be checked") as exc_info:
+            check_private_dir(target, key=_KEY)
+        next_step = exc_info.value.next_step
+        assert next_step is not None
+        assert _KEY in next_step
+        assert str(target) not in next_step

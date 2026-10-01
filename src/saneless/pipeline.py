@@ -238,6 +238,14 @@ MAX_DOCUMENT_PAGES: Final = MAX_PAGES_PER_PASS
 SCAN_LABEL_FRONT: Final = "front"
 SCAN_LABEL_BACK: Final = "back"
 
+# The next step for a prompt that broke: a flip or multi-page prompt whose
+# coordinator answered abort with an ``abort_cause``.  Only the CLI's terminal
+# prompts set one, and the fault is the terminal's, so the scanner category's
+# advice would send the operator to a scanner that did nothing wrong.  What was
+# kept is not claimed here: the run guard's note says that, and it is true even
+# when keeping the pages failed.
+_BROKEN_PROMPT_NEXT_STEP: Final = "Run the scan again from a working terminal."
+
 
 class FlipCoordinator(ABC):
     """
@@ -938,7 +946,13 @@ def _open_workspace(
             if is_out_of_space(exc):
                 raise _workspace_out_of_space(tmp_dir, exc) from exc
             msg = f"Could not prepare the working directory {tmp_dir}: {describe(exc)}"
-            raise ConfigError(msg) from exc
+            raise ConfigError(
+                msg,
+                next_step=(
+                    "Check saneless can create and write to output.tmp_dir, "
+                    "then try again."
+                ),
+            ) from exc
         yield workspace
 
 
@@ -2376,7 +2390,7 @@ class _PipelineRun:
                 cause = flip.coordinator.abort_cause
                 if cause is not None:
                     msg = f"Flip prompt failed: {describe(cause)}"
-                    raise ScanError(msg) from cause
+                    raise ScanError(msg, next_step=_BROKEN_PROMPT_NEXT_STEP) from cause
                 # The one ending here that keeps NOTHING, and the asymmetry is
                 # policy rather than oversight: pass A's fronts are preserved
                 # after a flip timeout or a broken prompt precisely because nobody
@@ -2393,7 +2407,17 @@ class _PipelineRun:
                     f"Manual duplex flip wait timed out after {flip.timeout:g} "
                     "seconds: nobody confirmed the stack was flipped"
                 )
-                raise ScanError(msg)
+                # Not the scanner's fault, and the fronts are not claimed as
+                # kept: the run guard's note says what was, even when keeping
+                # them failed.
+                raise ScanError(
+                    msg,
+                    next_step=(
+                        "Start the scan again and answer the flip prompt within "
+                        "output.operator_wait_timeout_seconds, or raise that "
+                        "setting."
+                    ),
+                )
             case FlipOutcome.INTERRUPTED:
                 # The server is stopping.  That is nobody's decision to throw
                 # the scan away, so it is an interruption rather than a
@@ -3053,7 +3077,7 @@ class _PipelineRun:
             cause = context.coordinator.abort_cause
             if cause is not None:
                 msg = f"Multi-page prompt failed: {describe(cause)}"
-                raise ScanError(msg) from cause
+                raise ScanError(msg, next_step=_BROKEN_PROMPT_NEXT_STEP) from cause
             # The one ending that keeps NOTHING, and the asymmetry is policy
             # rather than oversight: the pages are kept after a timeout, a
             # broken prompt or a stop precisely because nobody chose to stop,

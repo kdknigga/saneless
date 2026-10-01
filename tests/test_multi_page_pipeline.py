@@ -106,6 +106,20 @@ _RESERVE_MB = 1
 _SETTINGS = ScanSettings(source="Flatbed", resolution=100, mode="Gray")
 
 
+def _assert_terminal_next_step(error: ScanError) -> None:
+    """
+    Check that a broken prompt's next step points at the terminal.
+
+    The scanner category's advice would send the operator to a scanner that
+    did nothing wrong, so the raise site carries its own.
+    """
+    next_step = error.next_step
+    assert next_step is not None
+    assert "terminal" in next_step
+    assert "scanner" not in next_step
+    assert "tty gone" not in next_step
+
+
 def _prompt(offered: frozenset[PassAnswer], number: int = 1) -> PassPrompt:
     """
     Build a next-pass prompt offering ``offered``.
@@ -941,6 +955,16 @@ class TestMultiPageLoop:
         (kept,) = rig.kept_pdfs()
         assert embedded_streams(kept) == _pages(scanner, [0])
 
+    def test_a_broken_prompt_next_step_is_about_the_terminal(self, rig: _Rig) -> None:
+        """The prompt broke, not the scanner: the next step says so."""
+        scanner = DistinctPageScanner(passes=((0,),))
+        coordinator = ScriptedPassCoordinator([_ABORT], cause=RuntimeError("tty gone"))
+
+        with pytest.raises(ScanError) as raised:
+            rig.run(scanner, coordinator)
+
+        _assert_terminal_next_step(raised.value)
+
     def test_a_timeout_finishes_with_a_warning(self, rig: _Rig) -> None:
         """Nobody answered prompt 3: the three kept pages upload, warned."""
         scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
@@ -1485,6 +1509,19 @@ class TestMultiPageScannerFault:
         assert str(raised.value).startswith("Multi-page prompt failed")
         assert raised.value.__cause__ is cause
         assert len(coordinator.prompts) == 2
+
+    def test_a_broken_retry_prompt_next_step_is_about_the_terminal(
+        self, rig: _Rig
+    ) -> None:
+        """After a jam, a broken retry prompt still points at the terminal."""
+        coordinator = ScriptedPassCoordinator(
+            [_NEXT, _ABORT], cause=RuntimeError("tty gone")
+        )
+
+        with pytest.raises(ScanError) as raised:
+            rig.run(_jams_on_pass_2(), coordinator)
+
+        _assert_terminal_next_step(raised.value)
 
     def test_the_failure_is_logged_once(
         self, rig: _Rig, caplog: pytest.LogCaptureFixture
