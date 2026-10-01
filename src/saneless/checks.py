@@ -3037,7 +3037,9 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     return _scanner_verdict(pre.probes, enumeration, configured_device)
 
 
-def _paperless_next_step(status: ConnectionStatus) -> str:
+def _paperless_next_step(
+    status: ConnectionStatus, *, https_upgrade: bool = False
+) -> str:
     """
     Return what to do about one connection outcome.
 
@@ -3046,8 +3048,14 @@ def _paperless_next_step(status: ConnectionStatus) -> str:
     remedy, never the diagnosis, so the two surfaces cannot disagree about
     what happened even if they disagreed about what to do.
 
+    A redirect's next step never names where it pointed: that is upstream
+    text, and this row is shown on the LAN-visible status strip.  It says to
+    use ``https://`` only when the redirect changed nothing but the scheme.
+
     Args:
         status: The connection-test outcome.
+        https_upgrade: Whether a redirect went from ``http`` to ``https`` on
+            the same address.  Read only for REDIRECTED.
 
     Returns:
         A next step, or the empty string when there is nothing to do.
@@ -3078,6 +3086,21 @@ def _paperless_next_step(status: ConnectionStatus) -> str:
                 "saneless needs paperless-ngx 2.16 or later (API version 9 or 10); "
                 "upgrade paperless-ngx, then press Check again."
             )
+        case ConnectionStatus.REDIRECTED if https_upgrade:
+            next_step = (
+                "Change paperless.url in the saneless config file to start with "
+                "https://, then restart saneless."
+            )
+        case ConnectionStatus.REDIRECTED:
+            next_step = (
+                "Set paperless.url in the saneless config file to the address "
+                "paperless-ngx answers on, then restart saneless."
+            )
+        case ConnectionStatus.MISCONFIGURED:
+            next_step = (
+                "Correct paperless.url and paperless.token in the saneless config "
+                "file, then restart saneless."
+            )
         case _:
             assert_never(status)
     return next_step
@@ -3095,10 +3118,14 @@ def _check_paperless(context: CheckContext) -> CheckResult:
 
     An empty ``paperless.url`` is examined next and skips the probe too.  It
     loads, so ``serve`` can start and show this row, but a request to it
-    fails inside httpx2 before anything is sent, and ``test_connection``
-    would report that as UNREACHABLE -- a network fault, when the fix is a
-    setting.  ``ConnectionStatus`` is a public JSON contract, so the unset URL
-    gets its own row here rather than a new status.
+    fails inside httpx2 before anything is sent.  The probe would call that
+    MISCONFIGURED, which is true but names both settings; an address that
+    was never set gets its own, plainer row here.
+
+    A redirect's row names no address, because the strip is visible to
+    anyone on the LAN: ``probe_connection`` keeps the target for the log,
+    and only whether it was a plain switch to ``https://`` reaches the next
+    step.
 
     A ``None`` client means one could not be constructed.
     ``PaperlessClient.__init__`` refuses a URL httpx2 will not parse or that
@@ -3136,18 +3163,21 @@ def _check_paperless(context: CheckContext) -> CheckResult:
             ),
         )
     client = context.paperless
+    https_upgrade = False
     if client is None:
         status = ConnectionStatus.NOT_FOUND
     else:
-        status = client.test_connection(
+        probe = client.probe_connection(
             timeout=httpx2.Timeout(PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS)
         )
+        status = probe.status
+        https_upgrade = probe.https_upgrade
     state = CheckState.OK if status is ConnectionStatus.CONNECTED else CheckState.FAIL
     return CheckResult(
         key=CheckKey.PAPERLESS,
         state=state,
         message=connection_status_message(status),
-        next_step=_paperless_next_step(status),
+        next_step=_paperless_next_step(status, https_upgrade=https_upgrade),
     )
 
 

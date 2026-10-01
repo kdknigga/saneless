@@ -88,15 +88,23 @@ Tests the connection to the configured paperless-ngx instance.
 | 200 | `{"status": "connected"}` | paperless-ngx answered with a 2xx |
 | 200 | `{"status": "token_rejected"}` | Server reachable, token rejected (401 or 403) |
 | 200 | `{"status": "not_found"}` | Server reachable, but the paperless-ngx API is not at the configured URL (404) |
-| 200 | `{"status": "server_error"}` | Server reachable, but answered 5xx or any other unclassified non-2xx |
+| 200 | `{"status": "server_error"}` | Server reachable, but answered 5xx or another status not listed here |
 | 200 | `{"status": "unreachable"}` | Server is not reachable (connection refused, DNS failure, connect or read timeout) |
 | 200 | `{"status": "incompatible_version"}` | Server reachable, but refused the API version (406): saneless needs paperless-ngx 2.16 or later, which allows API version 9 or 10 |
+| 200 | `{"status": "redirected"}` | Server reachable, but answered a redirect (3xx): paperless.url is not the address paperless-ngx answers on. The redirect is not followed, and where it points is written to the saneless log, never into this body |
+| 200 | `{"status": "misconfigured"}` | Nothing was sent: paperless.url has no `http` or `https` scheme, or paperless.url or paperless.token holds a character an HTTP request cannot carry |
 | 500 | `{"status": "error", "detail": "..."}` | Unexpected failure inside saneless while running the test |
 | 503 | `{"status": "error", "detail": "TimeoutError"}` | The caller could not get a turn to wait for a running test; carries a `Retry-After` header |
 
-The six 200 values are the complete set, and each is a stable wire contract: `connected`
+The eight 200 values are the complete set, and each is a stable wire contract: `connected`
 is returned for a 2xx and nothing else, so a 404 or a 500 is now reported as its own
-outcome rather than as a working connection.
+outcome rather than as a working connection, and a redirect or an unusable setting is
+reported as its own outcome rather than as a server error or a network fault.
+
+Both `redirected` and `misconfigured` mean a setting in the saneless config file needs
+correcting. Neither body names an address, because this endpoint needs no login. The
+saneless log names where a redirect pointed, with any user name, password or API token in
+it removed.
 
 saneless asks for API version 9 on its first request, which every paperless-ngx from 2.16
 on allows, and for version 10 once an answer has said the server allows it (paperless-ngx

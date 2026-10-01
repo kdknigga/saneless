@@ -659,6 +659,18 @@ class ConnectionStatus(StrEnum):
     INCOMPATIBLE is a paperless-ngx that answered 406 Not Acceptable: it does
     not allow API version 9 or 10, so it is older than 2.16 or newer than
     this saneless knows.  Its wire value is ``incompatible_version``.
+
+    REDIRECTED is a 3xx answer.  paperless-ngx, or a proxy in front of it,
+    answers from a different address than ``paperless.url`` names -- most
+    often a plain ``http://`` URL behind a proxy that redirects to
+    ``https://``.  The redirect is not followed, so it is never a server
+    error and never a success.  Its message names no address: the target is
+    upstream text, and it is logged rather than shown on the status strip.
+
+    MISCONFIGURED is a request the HTTP library would not send: the URL has
+    no scheme it can use, or the URL or token is one an HTTP request cannot
+    carry.  Nothing reached the network, so it is a setting to correct, not
+    a server that could not be reached.
     """
 
     CONNECTED = "connected"
@@ -667,6 +679,8 @@ class ConnectionStatus(StrEnum):
     SERVER_ERROR = "server_error"
     UNREACHABLE = "unreachable"
     INCOMPATIBLE = "incompatible_version"
+    REDIRECTED = "redirected"
+    MISCONFIGURED = "misconfigured"
 
 
 class WorkerHealth(StrEnum):
@@ -3833,6 +3847,13 @@ def connection_status_message(status: ConnectionStatus) -> str:
         case ConnectionStatus.INCOMPATIBLE:
             message = (
                 "This paperless-ngx does not speak an API version saneless supports."
+            )
+        case ConnectionStatus.REDIRECTED:
+            message = "Paperless-ngx answered from a different address."
+        case ConnectionStatus.MISCONFIGURED:
+            message = (
+                "The paperless-ngx address or API token in the saneless config "
+                "cannot be used."
             )
         case _:
             assert_never(status)

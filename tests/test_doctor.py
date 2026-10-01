@@ -71,6 +71,7 @@ from saneless.config import (
 )
 from saneless.exceptions import ConfigError, PaperlessError, ScanError
 from saneless.job import JobStore
+from saneless.paperless import ConnectionProbe
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import ConnectionStatus, ExitCode, ProfileStorage
 from saneless.worker import ScanWorker
@@ -184,9 +185,9 @@ class _ConnectedPaperless:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         """Accept and ignore every constructor argument."""
 
-    def test_connection(
+    def probe_connection(
         self, *, timeout: httpx2.Timeout | None = None
-    ) -> ConnectionStatus:
+    ) -> ConnectionProbe:
         """
         Report a healthy paperless-ngx.
 
@@ -194,10 +195,10 @@ class _ConnectedPaperless:
             timeout: Accepted because the registry passes its own bound.
 
         Returns:
-            ``ConnectionStatus.CONNECTED``.
+            A ``ConnectionStatus.CONNECTED`` probe.
 
         """
-        return ConnectionStatus.CONNECTED
+        return ConnectionProbe(ConnectionStatus.CONNECTED)
 
     def close(self) -> None:
         """Nothing to close."""

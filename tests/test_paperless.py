@@ -40,6 +40,7 @@ from saneless.paperless import (
     UploadResult,
     _not_accepted_message,
     _one_line_reason,
+    _redirect_target,
     _render_error_body,
     _retry_decision,
     _RetryDecision,
@@ -4499,7 +4500,7 @@ def _redirecting(
     return handler
 
 
-def _raising(
+def _refused_by(
     exc_type: type[httpx2.TransportError],
 ) -> Callable[[httpx2.Request], httpx2.Response]:
     """
@@ -4597,43 +4598,75 @@ class TestProbeConnection:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        No credential, no token and no control character survives into the log.
+        No credential and no token survives into the target or the log.
 
         The Location is upstream text: a proxy can echo what it was sent,
-        so the token is struck out, any userinfo is cut, and a CR, LF or ESC
-        cannot forge a log line or reach a terminal.
+        so the token is struck out and any userinfo is cut.
         """
         location = (
             f"https://scanner:{_URL_SECRET}@other.example/login"
-            f"?next=/api/&token={_PROBE_TOKEN}\r\nX-Forged: \x1b[31mred"
+            f"?next=/api/&token={_PROBE_TOKEN}"
         )
         with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
             probe = _probe(_redirecting(location))
         target = probe.redirect_target
-        assert target is not None
-        assert target.startswith("https://other.example/login")
-        for text in (target, *caplog.messages):
+        assert target == "https://other.example/login?next=/api/&token=***"
+        for text in caplog.messages:
             assert _URL_SECRET not in text
             assert "scanner:" not in text
             assert _PROBE_TOKEN not in text
-            assert not has_control_characters(text)
         assert any(
             target in message and "check paperless.url" in message
             for message in caplog.messages
         )
 
-    def test_a_huge_target_is_bounded(self) -> None:
-        """A megabyte of Location cannot flood the log or the terminal."""
-        probe = _probe(_redirecting("https://other.example/" + "a" * 100_000))
+    def test_a_long_target_is_bounded(self) -> None:
+        """A Location as long as httpx2 accepts cannot flood the log or terminal."""
+        probe = _probe(_redirecting("https://other.example/" + "a" * 60_000))
         assert probe.redirect_target is not None
         assert len(probe.redirect_target) < 1_000
+
+    def test_a_target_with_control_characters_is_one_line(self) -> None:
+        """
+        A CR, LF or ESC in a Location can neither forge a line nor colour one.
+
+        httpx2's client refuses such a Location before the probe sees it, so
+        the response is built by hand: the sanitising must not rely on that.
+        """
+        response = httpx2.Response(
+            301,
+            headers={
+                "location": (
+                    f"https://scanner:{_URL_SECRET}@other.example/?t={_PROBE_TOKEN}"
+                    "\r\nX-Forged: \x1b[31mred"
+                )
+            },
+            request=httpx2.Request("GET", f"{_PROBE_BASE_URL}/api/tags/"),
+        )
+        shown, target = _redirect_target(response, _PROBE_TOKEN)
+        assert target is None
+        assert shown.startswith("https://other.example/?t=***")
+        assert "X-Forged" in shown
+        assert not has_control_characters(shown)
+        assert _URL_SECRET not in shown
+        assert _PROBE_TOKEN not in shown
+
+    def test_a_location_httpx2_refuses_is_a_broken_answer(self) -> None:
+        """
+        A Location the URL parser rejects never arrives as a redirect.
+
+        httpx2 raises ``RemoteProtocolError`` for it while reading the
+        answer, so the probe reports what it reports for any broken answer.
+        """
+        probe = _probe(_redirecting("https://other.example/\x1b[31m"))
+        assert probe == ConnectionProbe(ConnectionStatus.UNREACHABLE)
 
     def test_an_unsupported_scheme_is_misconfigured(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A URL with no usable scheme is a setting to correct, not unreachable."""
         with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
-            probe = _probe(_raising(httpx2.UnsupportedProtocol))
+            probe = _probe(_refused_by(httpx2.UnsupportedProtocol))
         assert probe == ConnectionProbe(ConnectionStatus.MISCONFIGURED)
         assert all(_PROBE_TOKEN not in message for message in caplog.messages)
 
@@ -4651,7 +4684,7 @@ class TestProbeConnection:
     ) -> None:
         """A token outside the load rules is what the library refused to send."""
         with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
-            probe = _probe(_raising(httpx2.LocalProtocolError), token="")
+            probe = _probe(_refused_by(httpx2.LocalProtocolError), token="")
         assert probe.status is ConnectionStatus.MISCONFIGURED
         assert all(_PROBE_TOKEN not in message for message in caplog.messages)
 
@@ -4665,7 +4698,7 @@ class TestProbeConnection:
         could be at fault is reported as one.
         """
         with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
-            probe = _probe(_raising(httpx2.LocalProtocolError))
+            probe = _probe(_refused_by(httpx2.LocalProtocolError))
         assert probe.status is ConnectionStatus.UNREACHABLE
         assert caplog.messages
         assert all(_PROBE_TOKEN not in message for message in caplog.messages)
@@ -4674,8 +4707,8 @@ class TestProbeConnection:
         "handler",
         [
             pytest.param(_redirecting("https://p.example:8000/"), id="redirect"),
-            pytest.param(_raising(httpx2.UnsupportedProtocol), id="unsupported"),
-            pytest.param(_raising(httpx2.ConnectError), id="connect-error"),
+            pytest.param(_refused_by(httpx2.UnsupportedProtocol), id="unsupported"),
+            pytest.param(_refused_by(httpx2.ConnectError), id="connect-error"),
         ],
     )
     def test_test_connection_returns_the_probe_status(

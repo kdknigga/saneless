@@ -64,7 +64,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.paperless import PaperlessClient
+from saneless.paperless import ConnectionProbe, PaperlessClient
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import ConnectionStatus, JobState, local_time
 from saneless.web import app as app_module
@@ -363,8 +363,8 @@ def _make_app(
             real one.  True for every test but the wiring test, because a real
             refresher that has been stamped will probe on its next tick and
             fill a cache a cold-start assertion just emptied.
-        stub_connection: Whether to replace ``test_connection`` with a constant
-            ``CONNECTED``.  False only for the test that counts Paperless
+        stub_connection: Whether to replace ``probe_connection`` with a
+            constant ``CONNECTED``.  False only for the test that counts Paperless
             requests at the transport, which needs the real method to reach the
             mock transport it would otherwise step over.
 
@@ -389,7 +389,7 @@ def _make_app(
     if stub_connection:
         # Offline, and CONNECTED so the Paperless row is not the one that
         # varies.
-        app.state.paperless.test_connection = lambda timeout=None: (
+        app.state.paperless.probe_connection = lambda timeout=None: ConnectionProbe(
             ConnectionStatus.CONNECTED
         )
     if stub_refresher:

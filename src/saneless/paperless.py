@@ -4,7 +4,7 @@ Paperless-ngx REST API client with retry, polling, and connection test.
 Uploads PDFs with metadata (title, tags, correspondent) but no document
 date, which paperless-ngx chooses itself; polls the task endpoint with
 exponential backoff until a terminal state and raises when that state is
-not success; and probes connections, reporting one of the six
+not success; and probes connections, reporting one of the eight
 ConnectionStatus outcomes.  Every request names API version 9 or 10, the
 highest the server has announced (see ``PaperlessClient.api_version``).
 """
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ApiDelivery",
+    "ConnectionProbe",
     "FolderDelivery",
     "PaperlessClient",
     "PaperlessTiming",
@@ -947,6 +948,72 @@ def _not_accepted_message(response: httpx2.Response, token: str) -> str:
         f"Paperless did not accept the upload ({status}): "
         f"{_render_error_body(response, token)}"
     )
+
+
+def _redirect_target(
+    response: httpx2.Response, token: str
+) -> tuple[str, httpx2.URL | None]:
+    """
+    Resolve and sanitise where a redirect answer points.
+
+    The Location header is upstream text, and a proxy can echo what it was
+    sent.  It is resolved against the request, so a path-only target names a
+    whole address, then cut of any userinfo, the token struck out, and taken
+    to one bounded line with its controls shown as escapes.  The token is
+    struck before the join as well, because the join percent-encodes some
+    characters and would hide a token holding them from the second strike.
+
+    httpx2's client already refuses a Location its URL parser rejects, as a
+    ``RemoteProtocolError``, so such a response never reaches the
+    connection test; one built by hand is shown as its own text, through the
+    same steps, rather than raising.
+
+    Args:
+        response: A 3xx response.
+        token: The configured token, struck out by ``_strike``.
+
+    Returns:
+        The target as it may be logged or shown to the operator, empty when
+        the answer named none, and the resolved URL for comparison, or None
+        when there is none or it could not be parsed.
+
+    """
+    raw = response.headers.get("location", "").strip()
+    if not raw:
+        return "", None
+    try:
+        target = response.url.join(_strike(raw, token))
+    except httpx2.InvalidURL:
+        return _bounded_line(_strike(_without_userinfo(raw), token)), None
+    return _bounded_line(_strike(_without_userinfo(str(target)), token)), target
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionProbe:
+    """
+    What a connection test found, with what only the operator should see.
+
+    ``status`` is the public outcome: the web API serialises it, and the
+    status strip shows its fixed message.  The other two fields describe a
+    redirect, for the log and ``saneless doctor``.
+
+    Attributes:
+        status: The connection-test outcome.
+        redirect_target: Where a redirect pointed, resolved against the
+            request and sanitised: no userinfo, the token struck out, one
+            line with no control characters, bounded in length.  None unless
+            the status is REDIRECTED and the answer named a target.  It is
+            upstream text, so it is never shown on the LAN-visible strip.
+        https_upgrade: True only when the redirect went from ``http`` to
+            ``https`` on the same host and port, to the same path or to the
+            configured base path -- the case where the fix is to use
+            ``https://`` in paperless.url.
+
+    """
+
+    status: ConnectionStatus
+    redirect_target: str | None = None
+    https_upgrade: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2074,11 +2141,11 @@ class PaperlessClient:
             raise PaperlessUnconfirmedError(msg)
         return None
 
-    def test_connection(
+    def probe_connection(
         self, *, timeout: httpx2.Timeout | None = None
-    ) -> ConnectionStatus:
+    ) -> ConnectionProbe:
         """
-        Probe paperless-ngx and report which of six outcomes occurred.
+        Probe paperless-ngx and report which of eight outcomes occurred.
 
         CONNECTED means a 2xx and nothing else.  A 404 says the API is not
         where the configured URL points -- a different thing to fix than a
@@ -2086,6 +2153,16 @@ class PaperlessClient:
         reported as CONNECTED.  A 406 is INCOMPATIBLE: paperless-ngx refused
         the API version, so it is older than 2.16 or newer than this client
         knows.  It is not tried again with another version.
+
+        A 3xx is REDIRECTED, as the upload path treats it: paperless.url
+        points at an address paperless-ngx does not answer on, and following
+        the redirect would only hide that.  Where it pointed is logged and
+        kept on the result for ``doctor``, sanitised, and ``https_upgrade``
+        says whether only the scheme changed.  A request the HTTP library
+        would not send is MISCONFIGURED when the configuration can be at
+        fault, by the rule ``_unsendable_error`` applies to an upload:
+        nothing reached the network, so "could not reach" would send the
+        operator to look for a fault that is not there.
 
         The classification is an ordered chain of integer comparisons rather
         than a ``match`` with ``assert_never``, for the same reason
@@ -2097,22 +2174,164 @@ class PaperlessClient:
         closed set.
 
         The bound is a per-request override rather than a constructor
-        argument, because the two kinds of caller want different budgets.
-        ``SaneBackend.get_devices()`` still has no timeout inside python-sane
-        or ``sane_get_devices(3)``, and none is settable from Python.  saneless
-        runs it in a child process that is stopped at a deadline, and the SANE
-        side of the status strip keeps its socket pre-probe as well, so a
-        silent host is named in seconds and never holds the scanner gate for
-        the whole deadline; httpx2, by contrast, takes a bound per request.
-        The status strip and ``saneless doctor`` pass a short budget so an
-        unplugged host is discovered in about two seconds instead of thirty,
-        while ``GET /api/paperless/test`` deliberately keeps today's client
-        default and therefore calls this with no argument at all.
-
-        Bounding the probe needs no new exception handling.  The
-        ``except httpx2.TransportError`` arm below is the base class of
+        argument, because callers want a shorter budget than an upload's.
+        The status strip, ``saneless doctor`` and ``GET /api/paperless/test``
+        all pass the short probe budget, so an unplugged host is discovered
+        in about two seconds instead of thirty.  The ``except
+        httpx2.TransportError`` arm below is the base class of
         ``ConnectTimeout`` and ``ReadTimeout`` as well as ``ConnectError``, so
-        a budget that expires already lands on UNREACHABLE.
+        a budget that expires lands on UNREACHABLE.
+
+        Args:
+            timeout: The per-request budget to send, or None to use the
+                client's own 30 s default.
+
+        Returns:
+            The outcome, with the redirect's target and kind when there was
+            one.
+
+        """
+        try:
+            response = self._client.get(
+                "/api/tags/",
+                params={"page_size": 1},
+                timeout=timeout if timeout is not None else httpx2.USE_CLIENT_DEFAULT,
+            )
+        # Both refusals are TransportError subclasses, so they must be caught
+        # before it.  Neither reached the network, and neither exception's
+        # text is logged: h11's text for a refused header value quotes it,
+        # and for the Authorization header that is the token.
+        except httpx2.UnsupportedProtocol:
+            logger.warning("Paperless connection test: %s", _URL_UNUSABLE)
+            return ConnectionProbe(ConnectionStatus.MISCONFIGURED)
+        except httpx2.LocalProtocolError:
+            return self._refused_probe()
+        except httpx2.TransportError:
+            # The base class of ConnectError, ConnectTimeout and ReadTimeout.
+            # Catching only ConnectError let the timeout siblings escape to
+            # routes.py's blanket handler, which answers HTTP 500
+            # {"status": "error"} -- none of the outcomes.
+            logger.warning("Paperless is unreachable")
+            return ConnectionProbe(ConnectionStatus.UNREACHABLE)
+        return self._answer_probe(response)
+
+    def _refused_probe(self) -> ConnectionProbe:
+        """
+        Classify a connection test h11 refused to send, and log it.
+
+        The configuration is blamed only when it can be at fault, by the rule
+        ``_unsendable_error`` applies to an upload: settings that pass the
+        load rules are ones h11 sends, so a refusal of them has another cause
+        and is reported as UNREACHABLE.  The exception's text is never
+        logged, because h11's text for a refused header value quotes it.
+
+        Returns:
+            MISCONFIGURED when the configuration cannot be sent, otherwise
+            UNREACHABLE.
+
+        """
+        if not self._configuration_sendable:
+            logger.warning("Paperless connection test: %s", _REQUEST_UNSENDABLE)
+            return ConnectionProbe(ConnectionStatus.MISCONFIGURED)
+        logger.warning(
+            "Paperless connection test: the HTTP library refused the "
+            "request (LocalProtocolError)"
+        )
+        return ConnectionProbe(ConnectionStatus.UNREACHABLE)
+
+    def _answer_probe(self, response: httpx2.Response) -> ConnectionProbe:
+        """
+        Classify the answer paperless-ngx, or something in front of it, gave.
+
+        Args:
+            response: The answer to the connection test.
+
+        Returns:
+            The outcome that answer means.
+
+        """
+        if response.is_redirect:
+            return self._redirect_probe(response)
+        if response.is_success:
+            status = ConnectionStatus.CONNECTED
+        elif response.status_code in (401, 403):
+            status = ConnectionStatus.TOKEN_REJECTED
+        elif response.status_code == 404:
+            status = ConnectionStatus.NOT_FOUND
+        elif response.status_code == 406:
+            status = ConnectionStatus.INCOMPATIBLE
+        else:
+            logger.warning("Unexpected paperless status %s", response.status_code)
+            status = ConnectionStatus.SERVER_ERROR
+        return ConnectionProbe(status)
+
+    def _redirect_probe(self, response: httpx2.Response) -> ConnectionProbe:
+        """
+        Describe a redirect answer to the connection test, and log it.
+
+        Args:
+            response: The 3xx answer to the connection test.
+
+        Returns:
+            A REDIRECTED probe with the sanitised target, if the answer named
+            one, and whether only the scheme changed.
+
+        """
+        status = _status_text(response, self._token)
+        shown, target = _redirect_target(response, self._token)
+        if not shown:
+            logger.warning(
+                "Paperless answered %s with no redirect target; check paperless.url",
+                status,
+            )
+            return ConnectionProbe(ConnectionStatus.REDIRECTED)
+        logger.warning(
+            "Paperless answered %s from a different address: %s; check paperless.url",
+            status,
+            shown,
+        )
+        return ConnectionProbe(
+            ConnectionStatus.REDIRECTED,
+            redirect_target=shown,
+            https_upgrade=(
+                target is not None and self._is_https_upgrade(response.url, target)
+            ),
+        )
+
+    def _is_https_upgrade(self, sent: httpx2.URL, target: httpx2.URL) -> bool:
+        """
+        Report whether a redirect changed only ``http`` to ``https``.
+
+        The target may keep the request's path, or go to the root of the
+        configured address, which is where many proxies send every plain
+        HTTP request.  httpx2 drops a scheme's default port, so ``http`` on
+        80 and ``https`` on 443 compare as the same port.
+
+        Args:
+            sent: The URL the probe requested.
+            target: The resolved redirect target.
+
+        Returns:
+            True when the scheme went from http to https and the host, port
+            and path are otherwise the same.
+
+        """
+        return (
+            sent.scheme == "http"
+            and target.scheme == "https"
+            and sent.host == target.host
+            and sent.port == target.port
+            and target.path in {sent.path, self._client.base_url.path}
+        )
+
+    def test_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionStatus:
+        """
+        Probe paperless-ngx and report only the outcome.
+
+        ``probe_connection`` with the redirect details dropped, for the web
+        API, which serialises the outcome and nothing else.
 
         Args:
             timeout: The per-request budget to send, or None to use the
@@ -2126,30 +2345,7 @@ class PaperlessClient:
             not be renamed without breaking existing clients.
 
         """
-        try:
-            response = self._client.get(
-                "/api/tags/",
-                params={"page_size": 1},
-                timeout=timeout if timeout is not None else httpx2.USE_CLIENT_DEFAULT,
-            )
-        except httpx2.TransportError:
-            # The base class of ConnectError, ConnectTimeout and ReadTimeout.
-            # Catching only ConnectError let the timeout siblings escape to
-            # routes.py's blanket handler, which answers HTTP 500
-            # {"status": "error"} -- none of the outcomes.
-            logger.warning("Paperless is unreachable")
-            return ConnectionStatus.UNREACHABLE
-
-        if response.is_success:
-            return ConnectionStatus.CONNECTED
-        if response.status_code in (401, 403):
-            return ConnectionStatus.TOKEN_REJECTED
-        if response.status_code == 404:
-            return ConnectionStatus.NOT_FOUND
-        if response.status_code == 406:
-            return ConnectionStatus.INCOMPATIBLE
-        logger.warning("Unexpected paperless status %s", response.status_code)
-        return ConnectionStatus.SERVER_ERROR
+        return self.probe_connection(timeout=timeout).status
 
     def get_tags(
         self, *, timeout: float | httpx2.Timeout | None = None

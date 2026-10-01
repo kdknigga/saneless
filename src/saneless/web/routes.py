@@ -2472,8 +2472,10 @@ def paperless_test(request: Request) -> JSONResponse:
     Test paperless-ngx connection status.
 
     Returns 200 with one ``ConnectionStatus`` value as its status:
-    connected, token_rejected, not_found, server_error, unreachable or
-    incompatible_version.  An unexpected failure inside saneless is a 500
+    connected, token_rejected, not_found, server_error, unreachable,
+    incompatible_version, redirected or misconfigured.  A redirect's target
+    is never in the body: it is upstream text, and this endpoint needs no
+    login.  An unexpected failure inside saneless is a 500
     whose status is error, with the exception's class name as its detail.
 
     The answer is shared and reused for ``MIN_MANUAL_REFRESH_SECONDS``, error
