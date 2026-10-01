@@ -1,0 +1,22 @@
+{# The hidden retry a list carries while it could not be loaded, rendered
+   inside that list's own rendering: in the tag list's wrapper, and in the
+   help line under the Correspondent select, because a select cannot hold
+   it.  It asks again for exactly as long as that rendering is on the page.
+   Whatever replaces the rendering -- a profile change, a filter, a refresh,
+   the lazy list load -- replaces the retry with it, and htmx stops polling
+   an element that has left the page.
+
+   It asks every retry_seconds, the cache's memory of the failure, so each
+   ask is a real fetch.  It carries nothing of the form and its answer
+   swaps nothing (hx-swap none), so a tick or a choice made while it is in
+   flight is never put back, and an answer landing after a profile change
+   cannot bring back the profile chosen before.  When the list can be loaded
+   the answer fires the list's recovery event, and the page's recovery
+   element for that list asks for it with what the form shows then (see
+   index.html).
+
+   The target and the include are its own, because it sits inside the tag
+   list's wrapper and the scan form, whose hx-target and hx-include it would
+   otherwise inherit: an inherited include would send the Profile select.
+   retry_resource names the list, tags or correspondents, and retry_seconds
+   is that list's own interval from its context. #}<span class="htmx-hidden" hx-get="/api/metadata/probe?resource={{ retry_resource }}" hx-trigger="every {{ retry_seconds }}s" hx-target="this" hx-include="this" hx-swap="none"></span>

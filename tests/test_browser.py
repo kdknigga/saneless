@@ -4072,6 +4072,181 @@ def _flagged_list(
     return _fetch
 
 
+# Counts the page's requests from send until htmx has handled the answer, and
+# lists the ones finished.  The loadend listener is added after htmx's own load
+# handler, which swaps at once, and loadend comes after load, so a request
+# counted finished has been swapped, and whatever its answer triggered has
+# already been sent and counted.
+_COUNT_REQUESTS = """
+(() => {
+    window.__requestsInFlight = 0;
+    window.__requestsFinished = [];
+    const open = XMLHttpRequest.prototype.open;
+    const send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        this.__requestUrl = String(url);
+        return open.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function (...args) {
+        window.__requestsInFlight += 1;
+        this.addEventListener("loadend", () => {
+            window.__requestsInFlight -= 1;
+            window.__requestsFinished.push(this.__requestUrl);
+        });
+        return send.apply(this, args);
+    };
+})();
+"""
+
+# True once a list retry has been answered and handled, and htmx has settled.
+_RETRY_HANDLED = """
+() => window.__requestsFinished.some(
+        (url) => url.startsWith("/api/metadata") && !/[?&]profile=/.test(url)
+    )
+    && document.querySelector(".htmx-added, .htmx-settling") === null
+"""
+
+# True once nothing the page sent is still unanswered, and htmx has settled.
+_REQUESTS_SETTLED = """
+() => window.__requestsInFlight === 0
+    && document.querySelector(".htmx-added, .htmx-settling") === null
+"""
+
+# The two requests a profile change sends for the lists.
+_PROFILE_CHANGE_PATHS = frozenset({"/api/profiles/tags", "/api/profiles/correspondent"})
+
+
+def _is_list_retry(url: str) -> bool:
+    """
+    Say whether a request is a list asking again rather than the page's load.
+
+    The page's first list load names the profile it shows; a list asking
+    again after it could not be loaded names none.
+
+    Args:
+        url: The request's URL.
+
+    Returns:
+        Whether the request is a list retry.
+
+    """
+    parts = urlsplit(url)
+    return parts.path.startswith("/api/metadata") and "profile" not in parse_qs(
+        parts.query
+    )
+
+
+def _await_held(page: Page, held: list[Route], count: int) -> None:
+    """
+    Wait until ``count`` requests have been held.
+
+    Args:
+        page: The browser page.
+        held: The held requests, filled as they are sent.
+        count: How many to wait for.
+
+    """
+
+    def _arrived() -> bool:
+        # A synchronous Playwright client delivers a route to its handler
+        # only while it talks to the browser, so each check is a round trip.
+        page.evaluate("() => true")
+        return len(held) >= count
+
+    assert poll_until(_arrived, _HELD_LOAD_BUDGET), ("never held", count, held)
+
+
+def _fail_a_list(
+    server: _BrowserServer,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: Literal["tags", "correspondents"],
+) -> threading.Event:
+    """
+    Make one list unloadable until the returned event is set.
+
+    The failure is remembered for one second rather than fifteen, and the
+    retry's floor is lowered to match, so the page asks again within a test.
+
+    Args:
+        server: The server whose paperless-ngx client to patch.
+        monkeypatch: The test's monkeypatch.
+        resource: The list to fail.
+
+    Returns:
+        Set it to have paperless-ngx answer the list.
+
+    """
+    monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
+    monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 1)
+    answering = threading.Event()
+    if resource == "tags":
+        fetch = _flagged_list(answering, _DEFAULTS_TAGS)
+        monkeypatch.setattr(server.app.state.paperless, "get_tags", fetch)
+    else:
+        fetch = _flagged_list(answering, _DEFAULTS_CORRESPONDENTS)
+        monkeypatch.setattr(server.app.state.paperless, "get_correspondents", fetch)
+    server.app.state.cache.invalidate(resource)
+    return answering
+
+
+def _hold_the_first_retry(
+    page: Page, *, hold_profile_changes: bool
+) -> tuple[list[Route], list[Route]]:
+    """
+    Hold the page's first list retry, and its profile-change requests if asked.
+
+    Every other request goes through.  Requests are counted, so a test can
+    wait until the page has handled them (see ``_COUNT_REQUESTS``).
+
+    Args:
+        page: The browser page, before it loads.
+        hold_profile_changes: Whether to hold the lists' profile-change
+            requests too.
+
+    Returns:
+        The held retry and the held profile-change requests, each filled as
+        they are sent.
+
+    """
+    page.add_init_script(_COUNT_REQUESTS)
+    retries: list[Route] = []
+    changes: list[Route] = []
+
+    def _route(route: Route) -> None:
+        url = route.request.url
+        if _is_list_retry(url) and not retries:
+            retries.append(route)
+        elif hold_profile_changes and urlsplit(url).path in _PROFILE_CHANGE_PATHS:
+            changes.append(route)
+        else:
+            route.continue_()
+
+    page.route(lambda url: urlsplit(url).path.startswith("/api/"), _route)
+    return retries, changes
+
+
+def _scan_and_read_the_job(page: Page, server: _BrowserServer, title: str) -> Job:
+    """
+    Scan under ``title`` from the page, wait until it is done, and read its job.
+
+    Args:
+        page: The browser page, on the scan form.
+        server: The server the page talks to.
+        title: A title no other job in the test has.
+
+    Returns:
+        The finished job.
+
+    """
+    page.fill("#title-input", title)
+    with page.expect_request("**/api/scan"):
+        page.click("#scan-btn")
+    status = page.locator("#status-area")
+    expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
+    job_store: JobStore = server.app.state.job_store
+    return next(job for job in job_store.list_recent(100) if job.title == title)
+
+
 @pytest.mark.browser
 class TestLazyListsInTheBrowser:
     """
@@ -4152,10 +4327,16 @@ class TestLazyListsInTheBrowser:
             expect(hold).to_be_hidden()
             expect(scan).to_be_enabled()
             expect(scan).not_to_have_attribute("aria-describedby", re.compile(".*"))
-            # The loader stays, as the slow retry, while a list is unavailable.
-            expect(page.locator("#metadata-loader")).to_have_attribute(
-                "hx-trigger", re.compile(r"^every \d+s$")
-            )
+            # The loader is gone, and each unavailable list carries its retry.
+            expect(page.locator("#metadata-loader")).to_have_count(0)
+            for retry in (
+                '#tags-list [hx-get="/api/metadata/probe?resource=tags"]',
+                '#correspondent-help [hx-get="/api/metadata/probe'
+                '?resource=correspondents"]',
+            ):
+                expect(page.locator(retry)).to_have_attribute(
+                    "hx-trigger", re.compile(r"^every \d+s$")
+                )
 
     def test_unavailable_lists_recover_without_a_click(
         self,
@@ -4164,7 +4345,7 @@ class TestLazyListsInTheBrowser:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        Once paperless-ngx answers, the tag rows appear and the retry stops.
+        Once paperless-ngx answers, the tag rows appear and the retry goes.
 
         The failure is remembered for one second here, not fifteen, and the
         retry's floor is lowered to match, so the retry asks paperless-ngx
@@ -4186,9 +4367,8 @@ class TestLazyListsInTheBrowser:
         tags_list = page.locator("#tags-list")
         expect(tags_list).to_contain_text(TAGS_UNAVAILABLE)
         _await_the_lists(page)
-        expect(page.locator("#metadata-loader")).to_have_attribute(
-            "hx-trigger", "every 1s"
-        )
+        retry = tags_list.locator('[hx-get="/api/metadata/probe?resource=tags"]')
+        expect(retry).to_have_attribute("hx-trigger", "every 1s")
         expect(page.locator("#scan-btn")).to_be_enabled()
         default_tag = page.locator('#tags-list input[value="31"]')
         expect(default_tag).to_be_checked()
@@ -4201,7 +4381,7 @@ class TestLazyListsInTheBrowser:
             len(_DEFAULTS_TAGS), timeout=15_000
         )
         expect(tags_list).not_to_contain_text(TAGS_UNAVAILABLE)
-        expect(page.locator("#metadata-loader")).to_have_count(0)
+        expect(retry).to_have_count(0)
         expect(page.locator('#tags-list input[value="31"]')).not_to_be_checked()
         expect(page.locator("#correspondent-select")).to_have_value("42")
         assert _ticked_tags(page) == []
@@ -4213,23 +4393,14 @@ class TestLazyListsInTheBrowser:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        The retry recovers the correspondents when "No correspondent" is chosen.
+        The correspondents fill in with "No correspondent" still chosen.
 
-        The select sends "No correspondent" as an empty value, and the retry
-        carries it while the correspondents are unavailable.  Each retry is
-        answered, the alert slot stays empty, and the options appear once
-        paperless-ngx answers, with the choice left as it was.
+        The select sends "No correspondent" as an empty value, and the
+        request that fills the list in once paperless-ngx answers carries it.
+        Each retry before then is answered quietly, the alert slot stays
+        empty, and the options appear with the choice left as it was.
         """
-        monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
-        monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 1)
-        answering = threading.Event()
-        paperless = defaults_server.app.state.paperless
-        monkeypatch.setattr(
-            paperless,
-            "get_correspondents",
-            _flagged_list(answering, _DEFAULTS_CORRESPONDENTS),
-        )
-        defaults_server.app.state.cache.invalidate("correspondents")
+        answering = _fail_a_list(defaults_server, monkeypatch, "correspondents")
 
         page.goto(defaults_server.url)
         select = page.locator("#correspondent-select")
@@ -4241,21 +4412,28 @@ class TestLazyListsInTheBrowser:
         expect(select).to_have_value("")
 
         with page.expect_response(
-            lambda r: (
-                "/api/metadata?retry=1" in r.url
-                and re.search(r"[?&]correspondent=(&|$)", r.url) is not None
-            )
+            lambda r: "/api/metadata/probe?resource=correspondents" in r.url
         ) as retried:
             pass
-        assert retried.value.status == 200
+        assert retried.value.status == 204
         expect(page.locator("#status-message")).to_be_empty()
 
-        answering.set()
+        with page.expect_response(
+            lambda r: (
+                urlsplit(r.url).path == "/api/correspondents"
+                and re.search(r"[?&]correspondent=(&|$)", r.url) is not None
+            ),
+            timeout=15_000,
+        ) as filled:
+            answering.set()
+        assert filled.value.status == 200
 
         expect(select.locator("option")).to_have_count(
-            1 + len(_DEFAULTS_CORRESPONDENTS), timeout=15_000
+            1 + len(_DEFAULTS_CORRESPONDENTS)
         )
-        expect(page.locator("#metadata-loader")).to_have_count(0)
+        expect(page.locator("#correspondent-help")).not_to_contain_text(
+            CORRESPONDENTS_UNAVAILABLE
+        )
         expect(select).to_have_value("")
         expect(page.locator("#status-message")).to_be_empty()
 
@@ -4388,6 +4566,116 @@ class TestLazyListsInTheBrowser:
         assert job.profile == _RECEIPTS
         assert job.tags == [32, 33]
         assert job.correspondent == 42
+
+    @pytest.mark.parametrize("lands", ["after the change", "during the change"])
+    @pytest.mark.parametrize("failing", ["tags", "correspondents"])
+    def test_a_retry_never_brings_back_the_profile_chosen_before(
+        self,
+        page: Page,
+        defaults_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+        failing: Literal["tags", "correspondents"],
+        lands: str,
+    ) -> None:
+        """
+        A list retry in flight across a profile change changes nothing.
+
+        One list cannot be loaded, so the page asks for it again, and that
+        request is held while Profile changes to ``receipts`` and
+        paperless-ngx comes back.  It is let through after the change has
+        landed, or while the change's own requests are still held and land
+        after it, so the list it brings back is asked for during the change.
+        Either way the form ends on ``receipts``' defaults with both markers
+        naming ``receipts``, and the scan files those defaults.
+        """
+        answering = _fail_a_list(defaults_server, monkeypatch, failing)
+        hold_the_change = lands == "during the change"
+        retries, changes = _hold_the_first_retry(
+            page, hold_profile_changes=hold_the_change
+        )
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+        if failing == "tags":
+            expect(page.locator("#tags-list")).to_contain_text(TAGS_UNAVAILABLE)
+        else:
+            expect(page.locator("#correspondent-help")).to_contain_text(
+                CORRESPONDENTS_UNAVAILABLE
+            )
+        _await_held(page, retries, 1)
+        answering.set()
+        defaults_server.app.state.cache.invalidate(failing)
+
+        page.select_option("#profile-select", _RECEIPTS)
+        if hold_the_change:
+            _await_held(page, changes, 2)
+            retries[0].continue_()
+            page.wait_for_function(_RETRY_HANDLED)
+            for change in changes:
+                change.continue_()
+        else:
+            expect(page.locator("#tags-profile")).to_have_value(_RECEIPTS)
+            expect(page.locator("#correspondent-profile")).to_have_value(_RECEIPTS)
+            expect(page.locator("#correspondent-select")).to_have_value("42")
+            retries[0].continue_()
+            page.wait_for_function(_RETRY_HANDLED)
+        page.wait_for_function(_REQUESTS_SETTLED)
+
+        expect(page.locator("#profile-select")).to_have_value(_RECEIPTS)
+        expect(page.locator("#tags-profile")).to_have_value(_RECEIPTS)
+        expect(page.locator("#correspondent-profile")).to_have_value(_RECEIPTS)
+        expect(page.locator("#correspondent-select")).to_have_value("42")
+        assert _ticked_tags(page) == ["32", "33"]
+        expect(page.locator("#tags-list")).not_to_contain_text(TAGS_UNAVAILABLE)
+        expect(page.locator("#correspondent-help")).not_to_contain_text(
+            CORRESPONDENTS_UNAVAILABLE
+        )
+
+        job = _scan_and_read_the_job(
+            page, defaults_server, f"Retry for {failing} {lands}"
+        )
+        assert job.profile == _RECEIPTS
+        assert job.tags == [32, 33]
+        assert job.correspondent == 42
+
+    def test_edits_made_while_a_retry_is_in_flight_survive_it(
+        self,
+        page: Page,
+        defaults_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A tick and a choice made while a list retry is in flight are kept.
+
+        Only the correspondents cannot be loaded.  While the page's request
+        for them again is held, the default tag is unticked, another is
+        ticked and "No correspondent" is chosen.  Then paperless-ngx answers
+        and the request is let through: the correspondents fill in, and
+        nothing the operator changed is put back.
+        """
+        answering = _fail_a_list(defaults_server, monkeypatch, "correspondents")
+        retries, _ = _hold_the_first_retry(page, hold_profile_changes=False)
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+        help_line = page.locator("#correspondent-help")
+        expect(help_line).to_contain_text(CORRESPONDENTS_UNAVAILABLE)
+        _await_held(page, retries, 1)
+
+        page.locator('#tags-list input[value="31"]').uncheck()
+        page.locator('#tags-list input[value="32"]').check()
+        page.select_option("#correspondent-select", "")
+        answering.set()
+        defaults_server.app.state.cache.invalidate("correspondents")
+        retries[0].continue_()
+        page.wait_for_function(_RETRY_HANDLED)
+        page.wait_for_function(_REQUESTS_SETTLED)
+
+        select = page.locator("#correspondent-select")
+        expect(select.locator("option")).to_have_count(
+            1 + len(_DEFAULTS_CORRESPONDENTS)
+        )
+        expect(help_line).not_to_contain_text(CORRESPONDENTS_UNAVAILABLE)
+        expect(select).to_have_value("")
+        assert _ticked_tags(page) == ["32"]
 
     def test_a_released_scan_hides_the_hold_line(
         self, page: Page, defaults_server: _BrowserServer

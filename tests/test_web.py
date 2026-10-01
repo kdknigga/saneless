@@ -217,10 +217,10 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
         route for route in leaf_routes(_app(client)) if isinstance(route, APIRoute)
     ]
     # The exact count, not just a non-empty one: a filter that found a single
-    # route would satisfy `assert routes` while leaving the other nineteen
+    # route would satisfy `assert routes` while leaving the other twenty
     # handlers unchecked.
-    assert len(routes) == 20, (
-        f"the app serves {len(routes)} API routes, not the 20 this test pins; "
+    assert len(routes) == 21, (
+        f"the app serves {len(routes)} API routes, not the 21 this test pins; "
         f"a route was added or removed, so update this literal"
     )
     for route in routes:
@@ -3969,11 +3969,48 @@ class _TimedList:
 # read seconds, never the client's 30 s.
 _REQUEST_BUDGET = httpx2.Timeout(5.0, connect=2.0)
 
+
+def _list_retry(resource: str, seconds: int = 15) -> str:
+    """
+    Return the hidden retry a list carries while it could not be loaded.
+
+    Args:
+        resource: The list, ``tags`` or ``correspondents``.
+        seconds: The retry interval it carries; 15 is the negative TTL, which
+            the test apps' 60 s cache does not shorten.
+
+    Returns:
+        The element's exact markup.
+
+    """
+    return (
+        '<span class="htmx-hidden"'
+        f' hx-get="/api/metadata/probe?resource={resource}"'
+        f' hx-trigger="every {seconds}s" hx-target="this" hx-include="this"'
+        ' hx-swap="none"></span>'
+    )
+
+
+def _help_oob_unavailable(seconds: int = 15) -> str:
+    """
+    Return the unavailable correspondent help line as a list response sends it.
+
+    Args:
+        seconds: The interval of the retry it holds.
+
+    Returns:
+        The help line, out of band, with its retry inside.
+
+    """
+    return (
+        '<small id="correspondent-help" hx-swap-oob="true" class="status-fallback">'
+        f"&#9888; {html.escape(CORRESPONDENTS_UNAVAILABLE)}"
+        f"{_list_retry('correspondents', seconds)}</small>"
+    )
+
+
 # The correspondent help line as each list response carries it out of band.
-_HELP_OOB_UNAVAILABLE = (
-    '<small id="correspondent-help" hx-swap-oob="true" class="status-fallback">'
-    f"&#9888; {html.escape(CORRESPONDENTS_UNAVAILABLE)}</small>"
-)
+_HELP_OOB_UNAVAILABLE = _help_oob_unavailable()
 _HELP_OOB_NORMAL = (
     '<small id="correspondent-help" hx-swap-oob="true">'
     "Who sent this document? Optional.</small>"
@@ -5313,25 +5350,6 @@ _METADATA_SCAN_BUTTON = re.compile(
 _EMPTIED_HOLD_REASON = '<small id="scan-hold-reason" hx-swap-oob="true"></small>'
 
 
-def _retry_element(seconds: int) -> str:
-    """
-    Return the element the lazy list load leaves while a list is unavailable.
-
-    Args:
-        seconds: The retry interval it carries.
-
-    Returns:
-        The element's exact markup.
-
-    """
-    return (
-        '<div id="metadata-loader" class="htmx-hidden"'
-        ' hx-get="/api/metadata?retry=1"'
-        ' hx-include="#tag-filter, #tags-list, #correspondent-select"'
-        f' hx-trigger="every {seconds}s" hx-swap="outerHTML"></div>'
-    )
-
-
 def _metadata_scan_button(markup: str) -> str:
     """
     Return the one out-of-band Scan button opening tag in ``markup``.
@@ -5348,28 +5366,14 @@ def _metadata_scan_button(markup: str) -> str:
     return found[0]
 
 
-def _has_retry_element(markup: str) -> bool:
-    """
-    Say whether ``markup`` carries the lazy list load's retry element.
-
-    Args:
-        markup: A response body.
-
-    Returns:
-        True when the loader element is in it.
-
-    """
-    return 'id="metadata-loader"' in markup
-
-
 class TestMetadataRoute:
     """
     One lazy request renders both lists, their markers, and releases Scan.
 
     Only the server knows when both lists are done, so one request fetches
     both and answers with everything that depends on them out of band.  The
-    primary swap target is the loader itself, which the response removes, or
-    replaces with a slow retry while a list could not be loaded.
+    primary swap target is the loader itself, which the response removes; a
+    list that could not be loaded carries its own retry.
     """
 
     def test_metadata_initial_mode_renders_both_lists_and_markers(
@@ -5405,7 +5409,7 @@ class TestMetadataRoute:
         assert tags.timeouts == [_REQUEST_BUDGET]
         assert correspondents.timeouts == [_REQUEST_BUDGET]
 
-    def test_metadata_unavailable_list_leaves_a_retry_element(
+    def test_metadata_unavailable_list_carries_its_own_retry(
         self, tmp_path: Path
     ) -> None:
         """A list that failed says so, releases Scan, and asks again later."""
@@ -5417,13 +5421,15 @@ class TestMetadataRoute:
 
         assert response.status_code == 200
         text = response.text
-        assert _TAGS_UNAVAILABLE_LINE in text
+        assert _TAGS_UNAVAILABLE_LINE + _list_retry("tags") in text
         assert "checked" in _checkbox(text, 3)
         assert "checked" in _checkbox(text, 7)
         assert "disabled" not in _metadata_scan_button(text)
         assert _EMPTIED_HOLD_REASON in text
-        assert text.count('id="metadata-loader"') == 1
-        assert _retry_element(15) in text
+        assert 'id="metadata-loader"' not in text
+        # The list that loaded asks nothing again.
+        assert _HELP_OOB_NORMAL in text
+        assert 'resource=correspondents"' not in text
 
     def test_metadata_retry_interval_follows_the_negative_ttl(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5436,8 +5442,8 @@ class TestMetadataRoute:
             _cold(app)
             response = client.get("/api/metadata", params={"profile": "default"})
 
-        assert _HELP_OOB_UNAVAILABLE in response.text
-        assert _retry_element(8) in response.text
+        assert _help_oob_unavailable(8) in response.text
+        assert 'resource=tags"' not in response.text
 
     @pytest.mark.parametrize("ttl", [0, 1, 4])
     def test_metadata_retry_interval_has_a_floor(
@@ -5455,56 +5461,7 @@ class TestMetadataRoute:
             _cold(app)
             response = client.get("/api/metadata", params={"profile": "default"})
 
-        assert _retry_element(5) in response.text, response.text
-
-    def test_metadata_retry_carries_ticks_and_choice(self, tmp_path: Path) -> None:
-        """A retry keeps what the form shows and leaves the markers alone."""
-        app = _pre_ticked_app(tmp_path)
-        with TestClient(app) as client:
-            _cold(app)
-            response = client.get(
-                "/api/metadata",
-                params={"retry": "1", "tags": ["3", "5"], "correspondent": "41"},
-            )
-
-        assert response.status_code == 200
-        text = response.text
-        assert "checked" in _checkbox(text, 3)
-        assert "checked" in _checkbox(text, 5)
-        assert "checked" not in _checkbox(text, 7)
-        assert "selected" in _option(text, 41)
-        assert "selected" not in _option(text, _OPENING_CORRESPONDENT)
-        assert 'name="tags_profile"' not in text
-        assert 'name="correspondent_profile"' not in text
-        assert 'id="metadata-loader"' not in text
-
-    def test_metadata_retry_reads_no_correspondent_as_none(
-        self, tmp_path: Path
-    ) -> None:
-        """
-        A retry with "No correspondent" chosen is answered, not refused.
-
-        The select sends its empty option as ``correspondent=``, which is what
-        the retry element carries whenever the correspondents are unavailable,
-        so refusing it would leave the list unrecovered for good.
-        """
-        app = _pre_ticked_app(tmp_path)
-        with TestClient(app) as client:
-            _cold(app)
-            response = client.get(
-                "/api/metadata",
-                params={"retry": "1", "q": "", "tags": ["3"], "correspondent": ""},
-                headers={"HX-Request": "true"},
-            )
-
-        assert response.status_code == 200, response.text
-        text = response.text
-        assert "HX-Retarget" not in response.headers
-        assert "checked" in _checkbox(text, 3)
-        # No option is marked, so the select stays on "No correspondent".
-        assert "<option value=" in text
-        assert not re.search(r"<option [^>]*\bselected\b", text), text
-        assert 'id="metadata-loader"' not in text
+        assert _list_retry("tags", 5) in response.text, response.text
 
     def test_metadata_scan_button_respects_an_active_job(self, tmp_path: Path) -> None:
         """A scan in flight keeps the button disabled after the lists land."""
@@ -5567,8 +5524,10 @@ class TestMetadataRoute:
         assert absent not in response.text
         if hidden == "show_correspondent":
             assert 'id="correspondent-help"' not in response.text
-        # The list that is shown failed, so the retry element stays.
-        assert _has_retry_element(response.text)
+        # The list that is shown failed, so it carries its retry.
+        shown = "correspondents" if hidden == "show_tags" else "tags"
+        assert _list_retry(shown) in response.text
+        assert 'id="metadata-loader"' not in response.text
 
     def test_metadata_answers_the_lists_when_the_job_store_fails(
         self,
@@ -5659,27 +5618,6 @@ class TestMetadataRoute:
         assert _EMPTIED_HOLD_REASON in text
         assert 'id="metadata-loader"' not in text
 
-    @pytest.mark.parametrize(
-        "params",
-        [
-            pytest.param({"profile": "default", "q": "a" * 500}, id="long-filter"),
-            pytest.param({"profile": "default", "tags": ["x"]}, id="bad-tag"),
-            pytest.param({"retry": "1", "correspondent": "x"}, id="bad-correspondent"),
-        ],
-    )
-    def test_metadata_rejects_input_out_of_bounds(
-        self, tmp_path: Path, params: dict[str, str | list[str]]
-    ) -> None:
-        """An input out of bounds is a 422, before any fetch."""
-        app = _pre_ticked_app(tmp_path)
-        with TestClient(app) as client:
-            _cold(app)
-            response = client.get("/api/metadata", params=params)
-
-        assert response.status_code == 422
-        tags: _TimedList = app.state.paperless.get_tags
-        assert tags.timeouts == []
-
 
 def _break_the_job_store(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     """
@@ -5698,6 +5636,155 @@ def _break_the_job_store(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
 
     for name in ("get_job", "latest_run_job", "list_pending"):
         monkeypatch.setattr(store, name, _fail)
+
+
+class TestListRetry:
+    """
+    A list that could not be loaded asks whether it can be now, and nothing more.
+
+    The retry carries nothing of the form and its answer swaps nothing: a 200
+    fires the list's recovery event, which the page's recovery element for
+    that list hears, and a 204 means not yet.  The recovery element asks for
+    the list with what the form shows then, so the list routes it uses keep
+    the ticks and the choice they are sent.
+    """
+
+    @pytest.mark.parametrize(
+        ("resource", "getter"),
+        [("tags", "get_tags"), ("correspondents", "get_correspondents")],
+    )
+    def test_a_list_that_loads_fires_its_recovery_event(
+        self, tmp_path: Path, resource: str, getter: str
+    ) -> None:
+        """A list that can be loaded is fetched once and fires its event."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            fetch: _TimedList = getattr(app.state.paperless, getter)
+            response = client.get(
+                "/api/metadata/probe",
+                params={"resource": resource},
+                headers={"HX-Request": "true"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["HX-Trigger"] == f"{resource}-recovered"
+        assert response.text == ""
+        assert fetch.timeouts == [_REQUEST_BUDGET]
+
+    @pytest.mark.parametrize(
+        ("resource", "getter"),
+        [("tags", "get_tags"), ("correspondents", "get_correspondents")],
+    )
+    def test_a_list_still_unavailable_is_a_quiet_no_content(
+        self, tmp_path: Path, resource: str, getter: str
+    ) -> None:
+        """A list that still cannot be loaded fires nothing and refuses nothing."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            setattr(app.state.paperless, getter, _FailingList())
+            _cold(app)
+            response = client.get(
+                "/api/metadata/probe",
+                params={"resource": resource},
+                headers={"HX-Request": "true"},
+            )
+
+        assert response.status_code == 204, response.text
+        assert "HX-Trigger" not in response.headers
+        assert "HX-Retarget" not in response.headers
+
+    @pytest.mark.parametrize(
+        ("hidden", "resource", "getter"),
+        [
+            ("show_tags", "tags", "get_tags"),
+            ("show_correspondent", "correspondents", "get_correspondents"),
+        ],
+    )
+    def test_a_hidden_list_is_never_fetched(
+        self, tmp_path: Path, hidden: str, resource: str, getter: str
+    ) -> None:
+        """A list the page does not show is not asked for, and fires nothing."""
+        app = _pre_ticked_app(tmp_path, **{hidden: False})
+        with TestClient(app) as client:
+            _cold(app)
+            fetch: _TimedList = getattr(app.state.paperless, getter)
+            response = client.get("/api/metadata/probe", params={"resource": resource})
+
+        assert response.status_code == 204
+        assert "HX-Trigger" not in response.headers
+        assert fetch.timeouts == []
+
+    def test_an_unknown_list_is_refused(self, tmp_path: Path) -> None:
+        """Only the two lists can be asked about, before any fetch."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = client.get("/api/metadata/probe", params={"resource": "x"})
+
+        assert response.status_code == 422
+        tags: _TimedList = app.state.paperless.get_tags
+        assert tags.timeouts == []
+
+    @pytest.mark.parametrize(
+        ("sent", "chosen"),
+        [pytest.param("", None, id="none"), pytest.param("14", 14, id="chosen")],
+    )
+    def test_the_correspondents_keep_the_choice_they_are_sent(
+        self, tmp_path: Path, sent: str, chosen: int | None
+    ) -> None:
+        """
+        The correspondent options come back with the choice they were sent.
+
+        The select sends "No correspondent" as ``correspondent=``, which is
+        read as none rather than refused: the recovery element sends whatever
+        the select holds.
+        """
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = client.get(
+                "/api/correspondents",
+                params={"correspondent": sent},
+                headers={"HX-Request": "true"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert "HX-Retarget" not in response.headers
+        selected = re.findall(r'<option value="(\d*)"[^>]*\bselected\b', response.text)
+        assert selected == ([] if chosen is None else [str(chosen)])
+        assert _HELP_OOB_NORMAL in response.text
+
+    def test_the_correspondents_refuse_a_choice_that_is_no_id(
+        self, tmp_path: Path
+    ) -> None:
+        """A choice that is not a paperless-ngx id is a 422, before any fetch."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = client.get("/api/correspondents", params={"correspondent": "x"})
+
+        assert response.status_code == 422
+        correspondents: _TimedList = app.state.paperless.get_correspondents
+        assert correspondents.timeouts == []
+
+
+# The page's elements that fill in a list once its retry says it can be loaded,
+# each asking with what the form shows then, and each synced with its list's
+# own profile-change refresh.
+_TAGS_RECOVER = (
+    '<div id="tags-recover" class="htmx-hidden" hx-get="/api/tags"'
+    ' hx-include="#tag-filter, #tags-list"'
+    ' hx-trigger="tags-recovered from:body" hx-target="#tags-list"'
+    ' hx-swap="outerHTML" hx-sync="#tags-list:abort"></div>'
+)
+_CORRESPONDENTS_RECOVER = (
+    '<div id="correspondents-recover" class="htmx-hidden"'
+    ' hx-get="/api/correspondents" hx-include="#correspondent-select"'
+    ' hx-trigger="correspondents-recovered from:body"'
+    ' hx-target="#correspondent-select" hx-swap="innerHTML"'
+    ' hx-sync="#correspondent-select:abort"></div>'
+)
 
 
 # The page's hidden loader: it asks for both lists once the page has rendered,
@@ -5814,6 +5901,9 @@ class TestLazyPageLoad:
         assert page.count('id="correspondent-help"') == 1
         assert page.count(_LOADER) == 1
         assert page.index(_LOADER) > _scan_form_end(page)
+        for recover in (_TAGS_RECOVER, _CORRESPONDENTS_RECOVER):
+            assert page.count(recover) == 1
+            assert page.index(recover) > _scan_form_end(page)
         assert _marker_values(page) == dict.fromkeys(
             _MARKER_NAMES, routes_module.LISTS_LOADING_MARKER
         )
@@ -5849,6 +5939,8 @@ class TestLazyPageLoad:
         assert page.count(_LOADER) == 1
         assert (html.escape(TAGS_LOADING) in page) is show_tags
         assert (_LOADING_HELP in page) is show_correspondent
+        assert (_TAGS_RECOVER in page) is show_tags
+        assert (_CORRESPONDENTS_RECOVER in page) is show_correspondent
 
     def test_blocked_appliance_shows_no_hold(self, tmp_path: Path) -> None:
         """The blocked reason explains the button, and no hold line competes."""

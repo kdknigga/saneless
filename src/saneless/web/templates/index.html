@@ -269,9 +269,9 @@
 
     {# The lazy list load's trigger: once the page has rendered, it asks
        /api/metadata for both lists, naming the profile the select shows, and
-       the answer replaces it -- with nothing, or with the slow retry while a
-       list could not be loaded -- and brings the lists, the profile markers,
-       a released Scan button and the emptied hold line out of band.  It
+       the answer removes it and brings the lists, the profile markers, a
+       released Scan button and the emptied hold line out of band.  A list
+       that could not be loaded brings its own retry inside it.  The loader
        renders only while a shown list is loading, which is every page with a
        list on it.
 
@@ -290,6 +290,31 @@
        the person then adjusted. #}
     {% if lists_loading %}
     <div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata" hx-include="#profile-select" hx-trigger="load, change from:#profile-select, every 20s" hx-sync="this:replace" hx-swap="outerHTML"></div>
+    {% endif %}
+
+    {# How a list that could not be loaded fills in once it can.  Its hidden
+       retry (partials/list_retry.html) only asks whether the list can be
+       loaded now, and on yes fires the list's recovery event, heard here.
+       Each element then asks for its list again, carrying what the form
+       shows at that moment: the filter and the ticks, or the choice.  So
+       the answer keeps every tick and choice made while the retry was in
+       flight, and never names a profile.
+
+       Each is synced with its list (hx-sync abort on the list's id), whose
+       only request of its own is the profile-change refresh.  A recovery
+       request asked while that refresh is in flight is dropped, and one in
+       flight when Profile changes is abandoned.  Otherwise the answer could
+       land first, take the refresh's swap target from under it, and leave
+       the list showing the profile chosen before under the new profile's
+       marker.  The refresh renders the list afresh, with a retry of its own
+       if it still could not be loaded, so a dropped recovery loses nothing.
+
+       Outside the scan form, like the loader, so they inherit nothing. #}
+    {% if show_tags %}
+    <div id="tags-recover" class="htmx-hidden" hx-get="/api/tags" hx-include="#tag-filter, #tags-list" hx-trigger="tags-recovered from:body" hx-target="#tags-list" hx-swap="outerHTML" hx-sync="#tags-list:abort"></div>
+    {% endif %}
+    {% if show_correspondent %}
+    <div id="correspondents-recover" class="htmx-hidden" hx-get="/api/correspondents" hx-include="#correspondent-select" hx-trigger="correspondents-recovered from:body" hx-target="#correspondent-select" hx-swap="innerHTML" hx-sync="#correspondent-select:abort"></div>
     {% endif %}
 
     {# The filter box belongs to this form, not to the scan form.  An input with

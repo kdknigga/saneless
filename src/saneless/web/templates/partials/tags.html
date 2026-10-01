@@ -24,7 +24,9 @@
    never when the list could not be loaded: then the amber unavailable line
    comes first instead, and the ticked ids still follow as unlisted rows,
    because "paperless-ngx has no tags" and "paperless-ngx could not be asked"
-   are different facts.
+   are different facts.  The unavailable line brings the list's hidden retry
+   with it (see partials/list_retry.html), so the list asks again for as long
+   as it is rendered unavailable.
 
    Every box turns autocomplete off: a browser that restores form state on
    reload would otherwise re-tick or untick boxes over what the server
@@ -73,6 +75,7 @@
     {%- else %}
     {%- if tags_unavailable %}
     <small class="status-fallback">&#9888; {{ TAGS_UNAVAILABLE }}</small>
+    {%- with retry_resource = "tags", retry_seconds = tags_retry_seconds %}{% include "partials/list_retry.html" %}{% endwith %}
     {%- endif %}
     {%- for row in stale %}
     <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>

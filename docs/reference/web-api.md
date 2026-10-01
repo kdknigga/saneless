@@ -23,6 +23,7 @@ Direct calls, such as from `curl` or a script, work too, but only those two JSON
 | GET | `/api/profiles/tags` | The tag list ticked with one profile's default tags |
 | GET | `/api/profiles/correspondent` | The correspondent dropdown set to one profile's default |
 | GET | `/api/metadata` | Both metadata lists, their help, and the Scan button, in one answer |
+| GET | `/api/metadata/probe` | Whether a list that could not be loaded can be loaded now |
 | POST | `/api/cache/invalidate` | Refresh cached metadata |
 | GET | `/api/jobs/history` | Job history table |
 | POST | `/api/flip/continue` | Continue manual duplex scan |
@@ -41,8 +42,13 @@ The page asks paperless-ngx for nothing, so it renders at once even when paperle
 slow or down. Where the tag list and the correspondent dropdown go, it says each is
 loading, and once the page has rendered it asks [`GET /api/metadata`](#get-apimetadata)
 for both, naming the profile the dropdown shows. If Profile changes before the answer
-lands, the page asks again for the new profile and abandons the earlier request, so the
-lists never come back for a profile no longer chosen. Until that answer lands, the Scan button
+lands, the page asks again for the new profile and abandons the earlier request. A list
+that could not be loaded keeps asking whether it can be loaded now, through
+[`GET /api/metadata/probe`](#get-apimetadataprobe), and that asking changes nothing on
+the form. Once it can, the page asks for the list again with what the form shows at that
+moment, and drops or abandons that request if Profile is changing at the same time. So the
+lists never come back for a profile no longer chosen, and a tick or a choice made in the
+meantime is kept. Until that answer lands, the Scan button
 is disabled with a line beneath it saying it waits for the lists; the answer releases it
 whether the lists arrived or could not be loaded. A form that shows neither list waits for
 nothing.
@@ -276,7 +282,13 @@ page is showing the last list fetched successfully, which cannot show that a tag
 
 Fetches paperless-ngx correspondents for the dropdown selector. Uses cached data when available, with the same 2-second connect and 5-second read budget as `GET /api/tags`. If a refresh cannot reach paperless-ngx, the dropdown offers the last list fetched successfully, rather than an error. If there has never been one, it offers only `No correspondent`, and the help line under the dropdown says the correspondents could not be loaded from paperless-ngx. That failure is remembered and retried as described under `GET /api/tags`.
 
-With `show_correspondent = false` in `[web]`, no route fetches correspondents: this one, the refresh, the profile change and `GET /api/metadata` all answer without asking paperless-ngx.
+With `show_correspondent = false` in `[web]`, no route fetches correspondents: this one, the refresh, the profile change, `GET /api/metadata` and `GET /api/metadata/probe` all answer without asking paperless-ngx.
+
+**Query parameter:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `correspondent` | int | no | The correspondent currently chosen, from 1 to 2147483647, which comes back selected; anything else is rejected with `422` before any work. An empty value, which the dropdown sends for `No correspondent`, means none. The page sends it when it fills in a list that could not be loaded, so the choice is kept |
 
 **Response:** HTML partial (`<option>` elements for HTMX swap), followed by the help line under the dropdown (`#correspondent-help`) out of band, so the line always describes the list the dropdown holds.
 
@@ -373,49 +385,42 @@ afterwards: one request, not one per list, because only the server knows when bo
 are done, and the Scan button is held until they are. Both lists are fetched with the
 2-second connect and 5-second read budget described under `GET /api/tags`.
 
-**Query parameters:**
+**Query parameter:**
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `profile` | string | no | The profile whose defaults the first load shows. Not read on a retry |
-| `retry` | boolean | no | `1` for a retry, which keeps the form's current ticks and choice instead of the profile's defaults |
-| `q` | string | no | The tag filter, bounded as for `GET /api/tags` |
-| `tags` | int[] | no | The tag ids currently ticked, bounded as for `GET /api/tags`. Read on a retry |
-| `correspondent` | int | no | The correspondent currently chosen, from 1 to 2147483647. Read on a retry. An empty value, which the dropdown sends for `No correspondent`, means none |
+| `profile` | string | no | The profile whose defaults to show |
 
-**Modes:**
+The tag list comes back with the profile's `default_tags` ticked and the dropdown with its
+`default_correspondent` selected, and both profile markers (`tags_profile`,
+`correspondent_profile`) come back naming the profile. The page asks again whenever
+Profile changes before it is answered, abandoning the request in flight. The markers are
+always sent all the same, so whichever answer lands last leaves each list agreeing with its
+marker (see [`POST /api/scan`](#post-apiscan)).
 
-- **First load** (no `retry`): the tag list comes back with the profile's `default_tags`
-  ticked and the dropdown with its `default_correspondent` selected, and both profile
-  markers (`tags_profile`, `correspondent_profile`) come back naming the profile. The page
-  sends the first load again whenever Profile changes before it is answered, abandoning
-  the request in flight. The markers are always sent all the same, so whichever answer
-  lands last leaves each list agreeing with its marker (see
-  [`POST /api/scan`](#post-apiscan)).
-- **First load naming no configured profile** (none, or a profile removed from the
-  configuration since the page rendered): the lists come back with nothing ticked or
-  chosen and no marker is sent, so the page's markers still say the lists have not
-  answered, and a scan submitted from it gets the submitted profile's defaults. It is not
-  refused: the loader polls, so an error would land in the page's alert slot on every
-  tick and hold the Scan button for good.
-- **Retry** (`retry=1`): the lists keep the ticks, filter and choice the request carries,
-  and no marker is sent, as a refresh does.
+A request naming no configured profile (none, or a profile removed from the configuration
+since the page rendered) gets the lists with nothing ticked or chosen and no marker, so
+the page's markers still say the lists have not answered, and a scan submitted from it gets
+the submitted profile's defaults. It is not refused: the loader polls, so an error would
+land in the page's alert slot on every tick and hold the Scan button for good.
 
-**Response:** `200` with an HTML body whose main part replaces the loader element that
-asked. When every shown list loaded, the main part is empty and the loader is removed.
-While a shown list could not be loaded, it is a hidden retry element that asks again with
-`retry=1`, carrying the tag filter, the ticked tags and the chosen correspondent, every
-15 seconds, or every `paperless_cache_ttl_seconds` if that is shorter, but never more
-often than once every 5 seconds: as often as the failure is forgotten, so each retry
-really asks paperless-ngx, with a floor so a short or disabled cache (`0`) cannot make
-every open page ask paperless-ngx once a second while it is down.
+**Response:** `200` with an HTML body whose main part, empty, replaces the loader element
+that asked, which removes it. A list that could not be loaded carries its own hidden retry,
+inside the tag list or inside the help line under the dropdown, which asks
+[`GET /api/metadata/probe`](#get-apimetadataprobe) every 15 seconds, or every
+`paperless_cache_ttl_seconds` if that is shorter, but never more often than once every 5
+seconds: as often as the failure is forgotten, so each retry really asks paperless-ngx,
+with a floor so a short or disabled cache (`0`) cannot make every open page ask
+paperless-ngx once a second while it is down. Whatever later replaces that list, such as a
+profile change, a filter or a refresh, brings a retry of its own if the list still could
+not be loaded, and none once it could.
 The rest is out of band:
 
 | Element | When |
 |---------|------|
 | The tag list (`#tags-list`), whole | When `show_tags` is on. A list that could not be loaded says so, and the ticked ids still come back ticked |
 | The correspondent dropdown (`#correspondent-select`), whole, and its help line (`#correspondent-help`) | When `show_correspondent` is on. A list that could not be loaded says so in the help line |
-| The profile markers | On the first load, for each shown list |
+| The profile markers | For each shown list, when the request names a configured profile |
 | The Scan button (`#scan-btn`) | Always. It is disabled only while a scan is active or the appliance is blocked, exactly as on the page: a list that could not be loaded releases it just as a loaded one does. If the job store cannot be read, the failure is logged and the button is rendered as though no scan were active, still disabled on a blocked appliance; the status poll corrects it within a second |
 | The Scan hold reason (`#scan-hold-reason`) | Always, emptied |
 
@@ -424,7 +429,29 @@ A hidden list is neither fetched nor rendered.
 | Status Code | Meaning |
 |-------------|---------|
 | 200 | The HTML described above |
-| 422 | A parameter is out of bounds |
+
+---
+
+### `GET /api/metadata/probe`
+
+Says whether a list that could not be loaded can be loaded now. The hidden retry that such
+a list carries asks this (see [`GET /api/metadata`](#get-apimetadata)). It carries
+nothing of the form, and its answer changes nothing on the page by itself, so a retry in
+flight can never put back a tick or a choice, nor a profile's defaults after Profile has
+changed. The list is fetched through the cache with the budget described under
+`GET /api/tags`.
+
+**Query parameter:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `resource` | string | yes | The list to ask about: `tags` or `correspondents` |
+
+| Status Code | Meaning |
+|-------------|---------|
+| 200 | The list can be loaded. The body is empty, and an `HX-Trigger` header fires `tags-recovered` or `correspondents-recovered`. The page then asks [`GET /api/tags`](#get-apitags) or [`GET /api/correspondents`](#get-apicorrespondents) for that list, carrying the filter and the ticked tags, or the chosen correspondent, as they are at that moment. It drops that request if the list's own profile change is in flight, and abandons it if Profile changes while it is in flight, because the profile change renders the list afresh |
+| 204 | The list still cannot be loaded, or it is hidden, in which case nothing is fetched. The retry asks again later |
+| 422 | Any other `resource` value, or none, before any work |
 
 ---
 

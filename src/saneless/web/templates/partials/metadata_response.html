@@ -1,21 +1,20 @@
 {# The lazy list load's response: GET /api/metadata, asked by the hidden
-   loader on the page once it has rendered, and by the retry element below.
-   Only the server knows when both lists are done, so one request fetches
-   both and sends everything that depends on them here.
+   loader on the page once it has rendered.  Only the server knows when both
+   lists are done, so one request fetches both and sends everything that
+   depends on them here.
 
-   The primary swap target is the loader itself, swapped outerHTML.  When
-   every shown list loaded, the primary content is nothing and the loader is
-   removed.  While a shown list could not be loaded it is replaced by the
-   retry element, hidden, asking again every retry_seconds -- the cache's
-   memory of the failure, so each retry is a real fetch -- and carrying the
-   form's current ticks, filter and choice, so a retry never changes them.
-   It sits outside the scan form, as the loader does, so it inherits nothing.
+   The primary swap target is the loader itself, swapped outerHTML, and the
+   primary content is always nothing: the loader is removed.  A list that
+   could not be loaded carries its own hidden retry inside its rendering
+   (see partials/list_retry.html), so it asks again for exactly as long as
+   that rendering is on the page, whatever replaced the loader.
 
    Everything else is out-of-band:
    - the tag list, wrapper and all, and the correspondent select with the help
      line under it, each only when the control is shown.  list_oob marks the
      element that carries the id; the profile markers ride along inside the
-     same partials when follows_profile is set, which is the first load only.
+     same partials when follows_profile is set: whenever the load named a
+     profile that is still configured.
    - the Scan button, from the one partial that renders it, fed from the
      status context, so an active job or a blocked appliance still disables
      it.  A failed list releases it exactly as a loaded one does.
@@ -25,7 +24,6 @@
      target is an htmx error.
 
    No title element: the lists change nothing the tab names. #}
-{% if (show_tags and tags_unavailable) or (show_correspondent and correspondents_unavailable) %}<div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata?retry=1" hx-include="#tag-filter, #tags-list, #correspondent-select" hx-trigger="every {{ retry_seconds }}s" hx-swap="outerHTML"></div>{% endif %}
 {% if show_tags %}{% with list_oob = true %}{% include "partials/tags.html" %}{% endwith %}{% endif %}
 {% if show_correspondent %}{% with list_oob = true %}{% include "partials/correspondent_select.html" %}{% endwith %}{% endif %}
 {% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}
