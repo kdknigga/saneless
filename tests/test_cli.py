@@ -3339,6 +3339,35 @@ class TestJobsCommand:
         for path in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
             assert not path.exists(), path
 
+    @pytest.mark.parametrize("as_json", [False, True], ids=["table", "json"])
+    def test_jobs_with_a_database_it_cannot_reach_exits_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        as_json: bool,
+    ) -> None:
+        """
+        A database path that cannot be looked up is a storage error, exit 2.
+
+        Only a database that is not there is an empty history.  A path the
+        lookup fails on for any other reason -- here a symlink that loops --
+        is not, and an empty table, or ``[]`` on the JSON contract, would tell
+        a script there are no jobs.
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        settings = self._settings_in(tmp_path, data_dir)
+        db_path = settings.output.db_path
+        db_path.symlink_to(db_path.name)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", *(["--json"] if as_json else [])])
+
+        assert result.exit_code == ExitCode.CONFIG, result.output
+        assert result.stdout == ""
+        assert str(db_path) in result.stderr
+
     def test_jobs_with_a_file_for_data_dir_is_refused(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

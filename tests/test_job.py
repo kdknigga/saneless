@@ -3135,6 +3135,35 @@ class TestReadRecentJobs:
         assert job_module.read_recent_jobs(data / "jobs.db", 10) == []
         assert _names(data) == []
 
+    def test_a_database_behind_an_unreadable_folder_is_a_storage_error(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A history the caller cannot reach is an error, never an empty one.
+
+        ``Path.exists()`` answers False for a permission error as well as for
+        a missing file, so a read that asked it would list nothing and exit
+        0, and a script reading ``jobs --json`` would see ``[]``.
+        """
+        _skip_if_root()
+        data = tmp_path / "data"
+        data.mkdir()
+        store = JobStore(db_path=data / "jobs.db")
+        try:
+            store.create_job("default", "Out Of Reach")
+        finally:
+            store.close()
+
+        data.chmod(0o000)
+        try:
+            with pytest.raises(StorageError) as excinfo:
+                job_module.read_recent_jobs(data / "jobs.db", 10)
+        finally:
+            data.chmod(0o755)
+
+        assert str(data / "jobs.db") in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+
     def test_rows_match_the_store(self, tmp_path: Path) -> None:
         """The read returns what the open store's own listing returns."""
         db = tmp_path / "jobs.db"

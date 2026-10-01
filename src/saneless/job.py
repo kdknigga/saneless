@@ -633,7 +633,8 @@ def _open_failure(db_path: str, exc: sqlite3.Error | OSError) -> StorageError:
     Args:
         db_path: Path the connection was opened on, named in the message.
         exc: The sqlite3 error that stopped the open, or the OS error that
-            stopped the private pre-create of a new database file.
+            stopped the private pre-create of a new database file or the
+            read-only listing's lookup of an existing one.
 
     Returns:
         A one-line StorageError naming the path and sqlite's reason.
@@ -1072,7 +1073,8 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
     ``auto_vacuum`` or runs a migration step.  Upgrading a database belongs
     to the server that writes it, so one at an older schema is refused rather
     than migrated.  A missing file, or one with no jobs table yet, is an
-    empty history.
+    empty history; a file that cannot be looked up for any other reason is
+    an error, never an empty history.
 
     Args:
         db_path: Path of the job database file.
@@ -1083,15 +1085,23 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
         :meth:`JobStore.list_recent` maps them.
 
     Raises:
-        StorageError: If the database cannot be opened or read, or its schema
-            version is older than this release reads, newer than it
-            supports, or negative.  Every message names ``db_path``.  The
+        StorageError: If the database cannot be looked up, opened or read, or
+            its schema version is older than this release reads, newer than
+            it supports, or negative.  Every message names ``db_path``.  The
             file is left exactly as it was found.
 
     """
-    if not db_path.exists():
-        return []
     name = str(db_path)
+    # Only a file that is not there is an empty history.  Path.exists() also
+    # answers False for a lookup that failed -- a folder this user may not
+    # enter, a symlink loop -- and a listing that took that for "no jobs"
+    # would print an empty table, and [] on the JSON contract.
+    try:
+        db_path.stat()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise _open_failure(name, exc) from exc
     try:
         conn, stamped = _connect_read_only(db_path)
     except sqlite3.Error as exc:
