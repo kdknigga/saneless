@@ -203,8 +203,8 @@ numbers, so they are the codebase's one measure of "answering", and every list
 route fetches with them: the tag list and its filter, the correspondent
 options, both refreshes, both profile-change swaps, the lazy list load and
 the retry of a list that could not be loaded.  A list that does not answer
-within them is reported as not loaded, and is asked again when the cache's
-short memory of the failure runs out.
+within them is reported as not loaded, and is asked again once the cache's
+short memory of the failure has run out.
 """
 
 METADATA_RETRY_FLOOR_SECONDS: Final = 5
@@ -3765,7 +3765,7 @@ def get_metadata(request: Request, profile: str | None = None) -> Response:
     part that depends on them out of band (see
     ``partials/metadata_response.html``).  The loader itself is removed: a
     list that could not be loaded carries its own retry, which asks
-    ``probe_metadata`` and changes nothing on the page itself.
+    ``probe_metadata`` and changes nothing on the page but the retry.
 
     The request names the profile the page's select shows now, and the
     answer shows that profile's default ticks and correspondent with both
