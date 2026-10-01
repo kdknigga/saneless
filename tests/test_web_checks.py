@@ -49,6 +49,7 @@ from saneless.checks import (
     CHECKING_STATE_CLASS,
     CHECKING_STATE_LABEL,
     SKIPPED_STATE_LABEL,
+    CheckContext,
     CheckKey,
     CheckResult,
     CheckState,
@@ -70,6 +71,7 @@ from saneless.vocabulary import (
     CheckSurface,
     ConnectionStatus,
     JobState,
+    ProfileStorage,
     connection_status_message,
     local_time,
     render_check_step,
@@ -86,7 +88,6 @@ if TYPE_CHECKING:
 
     from starlette.datastructures import State
 
-    from saneless.checks import CheckContext
     from saneless.web.checks_cache import CachedChecks
     from saneless.web.refresher import CheckRefresher, ManualProbe
 
@@ -3076,3 +3077,56 @@ class TestTheStripNamesItsOwnRetry:
         assert templates.env.filters["check_step"] is render_check_step
         assert "check_step" in _template()
         assert templates.env.globals["CheckSurface"] is CheckSurface
+
+
+class TestTheStripNeverShowsTheRedirectTarget:
+    """
+    Where paperless-ngx redirected to is terminal-only.
+
+    The registry keeps the sanitised target on the row for ``saneless doctor``
+    to print, and the strip is a page anyone on the LAN can load, so the
+    template never renders it.
+    """
+
+    def test_the_strip_never_shows_the_redirect_target(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The row the registry draws carries the target, and the page does not.
+
+        Args:
+            client: A client over the real app.
+            monkeypatch: pytest's patcher.
+
+        """
+        app = _app(client)
+        target = "https://paperless.example/"
+        monkeypatch.setattr(
+            app.state.paperless,
+            "probe_connection",
+            lambda *, timeout=None: ConnectionProbe(
+                ConnectionStatus.REDIRECTED, redirect_target=target
+            ),
+        )
+        row = checks_module._check_paperless(
+            CheckContext(
+                settings=app.state.settings,
+                scanner=None,
+                paperless=app.state.paperless,
+                profile_storage=ProfileStorage.PERSISTED,
+            )
+        )
+        assert target in row.terminal_detail
+        app.state.checks.store(
+            tuple(
+                row
+                if key is row.key
+                else CheckResult(key=key, state=CheckState.OK, message="Fine.")
+                for key in CheckKey
+            )
+        )
+        page = client.get("/").text
+        rendered = _row_named(page, check_name(CheckKey.PAPERLESS))
+        assert connection_status_message(ConnectionStatus.REDIRECTED) in rendered
+        assert "paperless.example" not in page
+        assert "paperless.example" not in client.get("/api/checks").text

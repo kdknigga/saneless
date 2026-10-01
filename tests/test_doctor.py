@@ -34,6 +34,7 @@ which already has 91 tests of its own.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
@@ -1810,7 +1811,12 @@ def _row_and_step(output: str, key: CheckKey) -> tuple[str, str]:
 
     """
     lines = _rows(output)
-    index = next(i for i, line in enumerate(lines) if check_name(key) in line)
+    index = next(
+        i
+        for i, line in enumerate(lines)
+        if line.startswith("[")
+        and line[_MARKER_WIDTH + 1 :].startswith(check_name(key))
+    )
     following = lines[index + 1] if index + 1 < len(lines) else ""
     return lines[index], following
 
@@ -1899,3 +1905,155 @@ class TestDoctorNamesEachConfigurationFault:
             if record.levelname == "WARNING"
         ]
         assert any(reason in message for message in warnings), warnings
+
+
+_REDIRECT_TARGET = "https://paperless.example/"
+
+
+class _RedirectedPaperless(_ConnectedPaperless):
+    """A Paperless client whose connection test is answered with a redirect."""
+
+    def probe_connection(
+        self, *, timeout: httpx2.Timeout | None = None
+    ) -> ConnectionProbe:
+        """
+        Report a paperless-ngx that answered from another address.
+
+        Args:
+            timeout: Accepted because the registry passes its own bound.
+
+        Returns:
+            A ``ConnectionStatus.REDIRECTED`` probe naming where it pointed.
+
+        """
+        return ConnectionProbe(
+            ConnectionStatus.REDIRECTED, redirect_target=_REDIRECT_TARGET
+        )
+
+
+def _unwritable(folder: Path) -> Path:
+    """
+    Create ``folder`` and take its write bit away.
+
+    Skips the test as root, which can write to any folder whatever its mode.
+
+    Args:
+        folder: The folder to create.
+
+    Returns:
+        The folder.
+
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can write to a folder whatever its mode")
+    folder.mkdir(parents=True, exist_ok=True)
+    folder.chmod(0o555)
+    return folder
+
+
+class TestDoctorReportsWhatItFinds:
+    """
+    doctor always prints its six rows, and the terminal gets the detail.
+
+    A folder start-up would refuse is one of the things doctor checks, so it
+    is a row rather than a refusal with no rows.  Where paperless-ngx
+    redirected to is printed under its row, because this is a terminal on the
+    machine; the status strip, which anyone on the LAN can load, never shows
+    it.
+    """
+
+    def test_doctor_prints_the_redirect_target(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The sanitised redirect target is on an indented line under the row.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        runner = _patch_doctor(
+            monkeypatch,
+            _make_settings(tmp_path),
+            paperless_cls=_RedirectedPaperless,
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        row, detail = _row_and_step(result.output, CheckKey.PAPERLESS)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert _REDIRECT_TARGET not in row
+        assert detail.startswith(_NEXT_STEP_INDENT), result.output
+        assert _REDIRECT_TARGET in detail, result.output
+        assert result.exit_code == ExitCode.CONFIG
+
+    def test_an_unwritable_consume_folder_is_a_row_not_a_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Start-up's directory refusal does not stop doctor printing its rows.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        consume = _unwritable(tmp_path / "consume")
+        runner = _patch_doctor(
+            monkeypatch, _make_settings(tmp_path, consume_dir=str(consume))
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        assert len(rows) == len(CheckKey), result.output
+        row, _step = _row_and_step(result.output, CheckKey.FALLBACK)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert "consume_dir is not writable" not in result.output
+        assert result.exit_code == ExitCode.CONFIG
+
+    def test_a_shared_tmp_dir_is_a_data_folder_row(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A working folder others can write to is the Data folder row.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        settings = _make_settings(tmp_path)
+        settings.output.tmp_dir.chmod(0o777)
+        runner = _patch_doctor(monkeypatch, settings)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        assert len(rows) == len(CheckKey), result.output
+        row, _step = _row_and_step(result.output, CheckKey.DATA_DIR)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert "output.tmp_dir" in row
+        assert result.exit_code == ExitCode.CONFIG
+
+    def test_other_commands_still_refuse_an_unwritable_folder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Only doctor reports the folder as a row; ``jobs`` still refuses to start.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        consume = _unwritable(tmp_path / "consume")
+        runner = _patch_doctor(
+            monkeypatch, _make_settings(tmp_path, consume_dir=str(consume))
+        )
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert "consume_dir is not writable" in result.output
+        assert result.exit_code == ExitCode.CONFIG
