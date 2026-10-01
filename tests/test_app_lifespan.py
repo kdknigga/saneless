@@ -38,6 +38,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.exceptions import ConfigError, PaperlessTrustStoreError
 from saneless.job import JobStore
 from saneless.paperless import ApiDelivery, TaskFiled
 from saneless.pipeline import PipelineRequest, ScanResult
@@ -1143,6 +1144,142 @@ def test_shutdown_closes_the_scanner_after_the_store(
     assert calls == ["paperless.close", "job_store.close", "scanner.close"]
 
 
+def test_one_failing_close_does_not_skip_the_others(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A Paperless client that raises on close still lets the store and SANE close.
+
+    Each close is guarded on its own and runs in the usual order.  The failure
+    is logged with its traceback, and the shutdown itself does not raise: the
+    process is on its way out, and every other resource has still been
+    released.
+    """
+    scanner = _ClosingScanner()
+    app = create_app(settings, scanner)
+    app.state.paperless.get_tags = lambda *, timeout=None: []
+    app.state.paperless.get_correspondents = lambda *, timeout=None: []
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    calls: list[str] = []
+    original_paperless_close = paperless.close
+    original_store_close = store.close
+
+    def failing_paperless_close() -> None:
+        calls.append("paperless.close")
+        original_paperless_close()
+        msg = "the connection pool would not close"
+        raise RuntimeError(msg)
+
+    def recording_store_close() -> None:
+        calls.append("job_store.close")
+        original_store_close()
+
+    def recording_scanner_close() -> None:
+        calls.append("scanner.close")
+
+    monkeypatch.setattr(paperless, "close", failing_paperless_close)
+    monkeypatch.setattr(store, "close", recording_store_close)
+    monkeypatch.setattr(scanner, "close", recording_scanner_close)
+    caplog.set_level(logging.INFO, logger=_APP_LOGGER)
+    with TestClient(app):
+        pass
+
+    assert calls == ["paperless.close", "job_store.close", "scanner.close"]
+    failures = [
+        record
+        for record in caplog.records
+        if record.name == _APP_LOGGER
+        and record.levelno == logging.ERROR
+        and record.exc_info is not None
+        and "Paperless client" in record.getMessage()
+    ]
+    assert len(failures) == 1
+    exc_info = failures[0].exc_info
+    assert exc_info is not None
+    assert isinstance(exc_info[1], RuntimeError)
+
+
+def _new_live_threads(before: set[threading.Thread]) -> list[str]:
+    """
+    Name every thread still running that was not running at ``before``.
+
+    Args:
+        before: The threads that were alive when the test started.
+
+    Returns:
+        The names of the threads started since, that are still alive.
+
+    """
+    return [
+        thread.name
+        for thread in threading.enumerate()
+        if thread not in before and thread.is_alive()
+    ]
+
+
+@pytest.mark.parametrize("failing_step", ["recovery", "refresher start"])
+def test_a_failed_start_releases_the_store_and_client(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, failing_step: str
+) -> None:
+    """
+    A start-up that raises stops what it started and closes what it holds.
+
+    The error still propagates, so the server refuses to start.  When the
+    refresher fails to start, the worker thread is already running, and it is
+    stopped before the store and the client are closed under it.
+    """
+    app = _build_app(settings)
+    worker = app.state.worker
+    refresher = app.state.refresher
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    calls: list[str] = []
+    original_paperless_close = paperless.close
+    original_store_close = store.close
+
+    def recording_paperless_close() -> None:
+        calls.append("paperless.close")
+        original_paperless_close()
+
+    def recording_store_close() -> None:
+        calls.append("job_store.close")
+        original_store_close()
+
+    def failing(*_args: object, **_kwargs: object) -> None:
+        msg = f"the {failing_step} failed"
+        raise RuntimeError(msg)
+
+    if failing_step == "recovery":
+        monkeypatch.setattr(app_module, "_recover_interrupted_jobs", failing)
+    else:
+        monkeypatch.setattr(refresher, "start", failing)
+    monkeypatch.setattr(paperless, "close", recording_paperless_close)
+    monkeypatch.setattr(store, "close", recording_store_close)
+    before = set(threading.enumerate())
+    try:
+        with (
+            pytest.raises(RuntimeError, match=f"the {failing_step} failed"),
+            TestClient(app),
+        ):
+            pass
+        assert poll_until(lambda: not _new_live_threads(before), budget=5.0), (
+            f"left running after a failed start: {_new_live_threads(before)}"
+        )
+        assert worker.health is WorkerHealth.DOWN
+        assert calls == ["paperless.close", "job_store.close"]
+        assert app.state.lifespan_started is False
+    finally:
+        # Whatever the start left behind is released, so a failing run of
+        # this test leaks neither a thread nor a database handle.
+        worker.stop()
+        refresher.stop()
+        original_paperless_close()
+        original_store_close()
+
+
 def test_shutdown_leaves_the_scanner_open_when_the_worker_does_not_stop(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1654,6 +1791,72 @@ def test_create_app_makes_tmp_dir_and_data_dir_private(tmp_path: Path) -> None:
         pass
     assert stat.S_IMODE(settings.output.tmp_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(settings.output.data_dir.stat().st_mode) == 0o700
+
+
+def test_create_app_validates_before_it_creates_anything(tmp_path: Path) -> None:
+    """
+    A refused directory leaves no scratch directory and no job database behind.
+
+    The directories are checked before anything is created or opened, so a
+    configuration the server will not start with costs nothing on disk.
+    """
+    not_a_directory = tmp_path / "consume"
+    not_a_directory.write_text("a file, not a folder", encoding="utf-8")
+    settings = Settings(
+        scanner=ScannerConfig(device="test:device:001"),
+        paperless=PaperlessConfig(
+            url="http://localhost:8000",
+            token="test-token",
+            consume_dir=not_a_directory,
+        ),
+        output=OutputConfig(
+            tmp_dir=str(tmp_path / "scratch"), data_dir=str(tmp_path / "state")
+        ),
+        profiles={"default": ProfileConfig()},
+    )
+
+    with pytest.raises(ConfigError, match="consume_dir"):
+        create_app(settings, StubScannerBackend())
+
+    assert not settings.output.tmp_dir.exists()
+    assert not settings.output.db_path.exists()
+
+
+def test_create_app_releases_what_it_opened_when_it_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A client that cannot be built closes the job store opened before it.
+
+    An unreadable trust store is the real case: it is found while the
+    Paperless client is built, after the job store is already open.
+    """
+    settings = _private_settings(tmp_path)
+    closes: list[str] = []
+    real_open_job_store = app_module._open_job_store
+
+    def recording_open_job_store(opened_for: Settings) -> JobStore:
+        store = real_open_job_store(opened_for)
+        original_close = store.close
+
+        def recording_close() -> None:
+            closes.append("job_store.close")
+            original_close()
+
+        monkeypatch.setattr(store, "close", recording_close)
+        return store
+
+    def unreadable_trust_store(**_kwargs: object) -> None:
+        msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
+        raise PaperlessTrustStoreError(msg)
+
+    monkeypatch.setattr(app_module, "_open_job_store", recording_open_job_store)
+    monkeypatch.setattr(app_module, "PaperlessClient", unreadable_trust_store)
+
+    with pytest.raises(PaperlessTrustStoreError):
+        create_app(settings, StubScannerBackend())
+
+    assert closes == ["job_store.close"]
 
 
 def test_create_app_keeps_an_existing_data_dir_mode(tmp_path: Path) -> None:
