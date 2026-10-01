@@ -2475,7 +2475,8 @@ class TestFirstRunFileModes:
         assert result.exit_code == 0, result.output
         assert self._mode(data_dir) == 0o700
         assert self._mode(data_dir / "saneless.log") == 0o600
-        assert self._mode(data_dir / "saneless.db") == 0o600
+        # Listing the history only reads it: none yet is no database.
+        assert not (data_dir / "saneless.db").exists()
 
     def test_a_log_nested_inside_data_dir_still_leaves_data_dir_private(
         self, tmp_path: Path
@@ -2672,7 +2673,8 @@ class TestRequireSane:
         ``jobs`` runs without python-sane and shows an empty history (D-05).
 
         On a fresh install the data directory does not exist yet: the command
-        creates it and prints the header with no rows, exit 0.
+        prints the header with no rows, exit 0, and creates nothing, because
+        listing the history only reads it.
         """
         data_dir = tmp_path / "new"
         settings = _make_settings(
@@ -2694,7 +2696,7 @@ class TestRequireSane:
         assert len(lines) == 2, result.output
         assert lines[0].startswith("Timestamp")
         assert set(lines[1]) == {"-"}
-        assert data_dir.is_dir()
+        assert not data_dir.exists()
 
     @pytest.mark.parametrize("command", _SANE_COMMANDS)
     def test_help_runs_without_python_sane(

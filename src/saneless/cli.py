@@ -85,7 +85,7 @@ from .exceptions import (
     failure_text,
     note_text,
 )
-from .job import CLI_JOBS_DEFAULT_LIMIT, JobStore
+from .job import CLI_JOBS_DEFAULT_LIMIT, read_recent_jobs
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import (
@@ -2059,97 +2059,94 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
 @click.option(
-    "--limit", default=CLI_JOBS_DEFAULT_LIMIT, type=int, help="Maximum jobs to show."
+    "--limit",
+    default=CLI_JOBS_DEFAULT_LIMIT,
+    type=click.IntRange(min=1),
+    help="Maximum jobs to show (at least 1).",
 )
 @click.pass_context
 def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     """List recent scan job history."""
     settings = _load_cli_settings(ctx)
-    # sqlite3.connect does not create parent directories, so data_dir must
-    # exist before JobStore opens the database. Deliberately not hidden inside
-    # the db_path property: a property with a filesystem side effect surprises.
-    # Created owner-only: it holds the job history and any preserved scans.
-    make_private_dir(settings.output.data_dir)
-    store = JobStore(db_path=settings.output.db_path)
-    try:
-        recent = store.list_recent(limit=limit)
-        if as_json:
+    # A read and nothing more: the history may belong to a running server, so
+    # this neither creates the database or its folder nor upgrades an older
+    # schema under it.  No database yet is an empty history.
+    recent = read_recent_jobs(settings.output.db_path, limit)
+    if as_json:
+        click.echo(
+            json.dumps(
+                [
+                    {
+                        "id": j.id,
+                        "profile": j.profile,
+                        "title": j.title,
+                        # Raw enum value, deliberately not humanised: this
+                        # is the machine contract and scripts compare
+                        # against "DONE" / "FALLBACK".
+                        "state": j.state.value,
+                        # UTC ISO-8601, deliberately not localised: this is
+                        # a machine contract documented in
+                        # docs/how-to/cli-scripting.md, and local time is
+                        # for *user-facing* surfaces. The human table below
+                        # goes local; this does not.
+                        "created_at": j.created_at.isoformat(),
+                        "outcome": j.outcome.value if j.outcome else None,
+                        "warning": j.warning,
+                        # The full stored text, host paths and the
+                        # paperless URL included: the web page shows only
+                        # a path-free sentence that points here. Added
+                        # after the other keys, so existing scripts are
+                        # unaffected.
+                        "error": j.error,
+                        # Added after the other keys, so existing scripts
+                        # are unaffected. NULL when never recorded, never
+                        # a zero. The positions are 1-based scanned page
+                        # numbers in document order, and are information
+                        # rather than a warning: a DONE that removed blank
+                        # backs keeps "warning": null.
+                        "pages_scanned": j.pages_scanned,
+                        "pages_removed": j.pages_removed,
+                        "pages_uploaded": j.pages_uploaded,
+                        "pages_removed_positions": (
+                            None
+                            if j.removed_positions is None
+                            else list(j.removed_positions)
+                        ),
+                    }
+                    for j in recent
+                ],
+                indent=2,
+            )
+        )
+    else:
+        cols = shutil.get_terminal_size((80, 24)).columns
+        ts_w = _TIME_COL_WIDTH
+        profile_w = _PROFILE_COL_WIDTH
+        # Three single spaces separate the four columns.
+        title_w = max(
+            _TITLE_COL_FLOOR, cols - (ts_w + profile_w + _STATUS_COL_WIDTH + 3)
+        )
+        header = (
+            f"{'Timestamp':<{ts_w}} {'Profile':<{profile_w}} "
+            f"{'Title':<{title_w}} {'Status'}"
+        )
+        click.echo(header)
+        click.echo("-" * min(len(header), cols))
+        for j in recent:
+            # A stored title or profile can hold a control character, and
+            # this table goes to a terminal. It is escaped before
+            # truncating, so the width is measured on what prints.
+            profile = _truncate(neutralise_controls(j.profile), profile_w)
+            title = _truncate(neutralise_controls(j.title), title_w)
             click.echo(
-                json.dumps(
-                    [
-                        {
-                            "id": j.id,
-                            "profile": j.profile,
-                            "title": j.title,
-                            # Raw enum value, deliberately not humanised: this
-                            # is the machine contract and scripts compare
-                            # against "DONE" / "FALLBACK".
-                            "state": j.state.value,
-                            # UTC ISO-8601, deliberately not localised: this is
-                            # a machine contract documented in
-                            # docs/how-to/cli-scripting.md, and local time is
-                            # for *user-facing* surfaces. The human table below
-                            # goes local; this does not.
-                            "created_at": j.created_at.isoformat(),
-                            "outcome": j.outcome.value if j.outcome else None,
-                            "warning": j.warning,
-                            # The full stored text, host paths and the
-                            # paperless URL included: the web page shows only
-                            # a path-free sentence that points here. Added
-                            # after the other keys, so existing scripts are
-                            # unaffected.
-                            "error": j.error,
-                            # Added after the other keys, so existing scripts
-                            # are unaffected. NULL when never recorded, never
-                            # a zero. The positions are 1-based scanned page
-                            # numbers in document order, and are information
-                            # rather than a warning: a DONE that removed blank
-                            # backs keeps "warning": null.
-                            "pages_scanned": j.pages_scanned,
-                            "pages_removed": j.pages_removed,
-                            "pages_uploaded": j.pages_uploaded,
-                            "pages_removed_positions": (
-                                None
-                                if j.removed_positions is None
-                                else list(j.removed_positions)
-                            ),
-                        }
-                        for j in recent
-                    ],
-                    indent=2,
-                )
+                # The one shared formatter the web history table reads, so
+                # the two surfaces cannot drift. Seconds are gone and
+                # the zone is named.
+                f"{local_time(j.created_at):<{ts_w}} "
+                f"{profile:<{profile_w}} "
+                f"{title:<{title_w}} "
+                f"{job_label(j.state, j.warning, j.error_category)}"
             )
-        else:
-            cols = shutil.get_terminal_size((80, 24)).columns
-            ts_w = _TIME_COL_WIDTH
-            profile_w = _PROFILE_COL_WIDTH
-            # Three single spaces separate the four columns.
-            title_w = max(
-                _TITLE_COL_FLOOR, cols - (ts_w + profile_w + _STATUS_COL_WIDTH + 3)
-            )
-            header = (
-                f"{'Timestamp':<{ts_w}} {'Profile':<{profile_w}} "
-                f"{'Title':<{title_w}} {'Status'}"
-            )
-            click.echo(header)
-            click.echo("-" * min(len(header), cols))
-            for j in recent:
-                # A stored title or profile can hold a control character, and
-                # this table goes to a terminal. It is escaped before
-                # truncating, so the width is measured on what prints.
-                profile = _truncate(neutralise_controls(j.profile), profile_w)
-                title = _truncate(neutralise_controls(j.title), title_w)
-                click.echo(
-                    # The one shared formatter the web history table reads, so
-                    # the two surfaces cannot drift. Seconds are gone and
-                    # the zone is named.
-                    f"{local_time(j.created_at):<{ts_w}} "
-                    f"{profile:<{profile_w}} "
-                    f"{title:<{title_w}} "
-                    f"{job_label(j.state, j.warning, j.error_category)}"
-                )
-    finally:
-        store.close()
 
 
 def _bind_next_step(exc: OSError) -> str:

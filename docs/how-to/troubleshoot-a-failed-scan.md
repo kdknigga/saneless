@@ -199,6 +199,9 @@ Other causes of exit 2, each a line naming the problem and then a `Try:` line wi
   that saneless can read and write it and its directory, and that the file really is saneless's
   job database. If it is damaged, move it aside: saneless then starts with an empty job history,
   and the moved file is kept for inspection or restoring.
+  `saneless jobs` only reads the history, so it also refuses a database an earlier release left
+  at an older schema, and says so; start `saneless serve` once, which upgrades it, then run
+  `saneless jobs` again.
 - **`paperless.url` or `paperless.token` refused.** Spaces and line breaks around either value
   are ignored. What is left of `paperless.url` must be empty, or an `http://` or `https://`
   address that names a host and holds no user name or password. What is left of

@@ -178,14 +178,14 @@ saneless [--config PATH] [-v] jobs [--json] [--limit N]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--json` | flag | off | Output job history as JSON |
-| `--limit` | int | `20` | Maximum number of jobs to show |
+| `--limit` | int | `20` | Maximum number of jobs to show; at least 1, and a smaller value is a usage error (exit 2) |
 
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 2 | Configuration error (invalid config, or the job database is unreadable or has an unsupported schema) |
+| 2 | Configuration or usage error (invalid config, `--limit` below 1, or the job database is unreadable, at an older schema `saneless serve` has not upgraded yet, or at an unsupported one) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 129 | Interrupted by SIGHUP |
 | 130 | Cancelled (Ctrl-C) |
@@ -196,7 +196,7 @@ The table's `Timestamp` column renders each job's start time in the server's loc
 
 Each `--json` entry also carries an `error` field: the full stored text of what stopped the job, file paths on the server and the paperless-ngx URL included, or `null`. The web page shows a failure only as a sentence without paths, and points here for the rest.
 
-`jobs` does not need python-sane, and on a fresh install it creates the data directory, readable only by the user running saneless, and prints an empty history.
+`jobs` does not need python-sane. It only reads the history, so it is safe to run while `saneless serve` is using the same database: it never creates the database and never upgrades it. On a fresh install, with no database yet, it prints an empty history. A database left at an older schema by an earlier release is refused with exit 2, and the message says to start `saneless serve` once, which upgrades it.
 
 ---
 
