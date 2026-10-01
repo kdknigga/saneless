@@ -32,6 +32,12 @@
    reload would otherwise re-tick or untick boxes over what the server
    rendered, and the page's ticks are a profile's defaults.
 
+   Every box carries an id made from its tag id, unique because every id
+   lands in exactly one row.  htmx gives focus back after a swap only to an
+   element with the same id, and a list that fills in by itself once
+   paperless-ngx answers is swapped with no action of the person's: without
+   the id, someone on a row then would lose focus to the page.
+
    The filter text itself appears nowhere in this file.  It is a filter, not a
    label, and nothing the client typed is rendered back (ASVS V5).  The tag
    names are upstream text and the notes come from the context; both stay
@@ -78,16 +84,16 @@
     {%- with retry_resource = "tags", retry_seconds = tags_retry_seconds %}{% include "partials/list_retry.html" %}{% endwith %}
     {%- endif %}
     {%- for row in stale %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" id="tag-option-{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
     {%- endfor %}
     {%- for row in unlisted %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ row.id }}" id="tag-option-{{ row.id }}" autocomplete="off" checked> {{ row.label }}</label>
     {%- endfor %}
     {%- for tag in pinned %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" autocomplete="off" checked> {{ tag.name }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" id="tag-option-{{ tag.id }}" autocomplete="off" checked> {{ tag.name }}</label>
     {%- endfor %}
     {%- for tag in tags %}
-    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" autocomplete="off"{% if tag.id in selected_tags %} checked{% endif %}> {{ tag.name }}</label>
+    <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" id="tag-option-{{ tag.id }}" autocomplete="off"{% if tag.id in selected_tags %} checked{% endif %}> {{ tag.name }}</label>
     {%- endfor %}
     {%- if not tags_unavailable and not stale and not unlisted and not pinned and not tags %}
     {% if any_tags %}<small>No tags match that filter.</small>{% else %}<small>No tags in paperless-ngx yet.</small>{% endif %}

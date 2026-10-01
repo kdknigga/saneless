@@ -4396,6 +4396,37 @@ class TestLazyListsInTheBrowser:
         expect(page.locator("#correspondent-select")).to_have_value("42")
         assert _ticked_tags(page) == []
 
+    def test_a_focused_tag_keeps_focus_when_the_list_fills_in(
+        self,
+        page: Page,
+        defaults_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Focus on a tag row survives the list filling in by itself.
+
+        While the tags cannot be loaded, the profile's default tag is a
+        focusable row of its own.  Focus is put there, then paperless-ngx
+        answers and the list is swapped in with no action of the person's.
+        Focus is on the same tag's box in the new list, not left on the page.
+        """
+        answering = _fail_a_list(defaults_server, monkeypatch, "tags")
+        page.goto(defaults_server.url)
+        tags_list = page.locator("#tags-list")
+        expect(tags_list).to_contain_text(TAGS_UNAVAILABLE)
+        _await_the_lists(page)
+        page.locator('#tags-list input[value="31"]').focus()
+        expect(page.locator('#tags-list input[value="31"]')).to_be_focused()
+
+        answering.set()
+
+        expect(tags_list.locator("label.tag-option")).to_have_count(
+            len(_DEFAULTS_TAGS), timeout=15_000
+        )
+        expect(tags_list).not_to_contain_text(TAGS_UNAVAILABLE)
+        expect(page.locator('#tags-list input[value="31"]')).to_be_focused()
+        expect(page.locator('#tags-list input[value="31"]')).to_be_checked()
+
     def test_unavailable_correspondents_recover_with_no_correspondent_chosen(
         self,
         page: Page,
