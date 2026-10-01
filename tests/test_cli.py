@@ -74,6 +74,7 @@ from saneless.scanner.base import (
     ScannerBackend,
 )
 from saneless.vocabulary import (
+    MULTI_PAGE_NEEDS_TERMINAL,
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
     WARNED_UPLOAD_LABEL,
@@ -1658,42 +1659,75 @@ class TestManualDuplexPrompt:
         error.  A real process, because only a real process can start with
         no standard input.
         """
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
-        config = tmp_path / "saneless.toml"
-        config.write_text(
-            _CLOSED_STDIN_CONFIG.format(
-                tmp_dir=tmp_path / "scratch",
-                data_dir=data_dir,
-                log_file=tmp_path / "logs" / "saneless.log",
-                profile=_DUPLEX_PROFILE,
-            )
-        )
-        env = {
-            **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_SOURCE": _CLOSED_STDIN_CHILD,
-            "SANELESS_TEST_CONFIG": str(config),
-            "SANELESS_TEST_PROFILE": _DUPLEX_PROFILE,
-        }
-
-        completed = subprocess.run(
-            [
-                "/bin/sh",
-                "-c",
-                'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE" <&-',
-            ],
-            env=env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=Path(__file__).resolve().parents[1],
-            timeout=_CLOSED_STDIN_CHILD_SECONDS,
-        )
+        completed = _scan_with_stdin_closed(tmp_path, ["--profile", _DUPLEX_PROFILE])
 
         assert completed.returncode == ExitCode.CONFIG, completed.stderr
         assert "which needs an interactive terminal" in completed.stderr
+
+    def test_a_closed_stdin_with_multi_page_is_refused(self, tmp_path: Path) -> None:
+        """
+        ``saneless scan --multi-page`` with stdin closed (``<&-``) is refused, exit 2.
+
+        Nobody can answer "another page?" without a stdin, so it gets the
+        off-terminal refusal before the scanner opens, not an unexpected
+        error.
+        """
+        completed = _scan_with_stdin_closed(tmp_path, ["--multi-page"])
+
+        assert completed.returncode == ExitCode.CONFIG, completed.stderr
+        assert MULTI_PAGE_NEEDS_TERMINAL in " ".join(completed.stderr.split())
+
+
+def _scan_with_stdin_closed(
+    tmp_path: Path, args: list[str]
+) -> subprocess.CompletedProcess[str]:
+    """
+    Run the real ``saneless scan`` in a process started with no stdin (``<&-``).
+
+    Every argv element is a literal and the per-run values travel in the
+    environment, which keeps the call on ruff's S603 allow-list.
+
+    Args:
+        tmp_path: The test's scratch directory, for the config and every path
+            the scan would write.
+        args: The arguments after ``scan``, before ``--title``.
+
+    Returns:
+        The finished process, its output captured as text.
+
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config = tmp_path / "saneless.toml"
+    config.write_text(
+        _CLOSED_STDIN_CONFIG.format(
+            tmp_dir=tmp_path / "scratch",
+            data_dir=data_dir,
+            log_file=tmp_path / "logs" / "saneless.log",
+            profile=_DUPLEX_PROFILE,
+        )
+    )
+    env = {
+        **os.environ,
+        "SANELESS_TEST_PYTHON": sys.executable,
+        "SANELESS_TEST_SOURCE": _CLOSED_STDIN_CHILD,
+        "SANELESS_TEST_CONFIG": str(config),
+        "SANELESS_TEST_ARGS": json.dumps(args),
+    }
+    return subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE" <&-',
+        ],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+        timeout=_CLOSED_STDIN_CHILD_SECONDS,
+    )
 
 
 # The thread the flip question was once read on.  Nothing may start it.
@@ -1725,6 +1759,7 @@ duplex = "manual"
 # arguments travelling in the environment.  They are taken out of it before
 # the CLI starts, because saneless reads every SANELESS_ variable as a setting.
 _CLOSED_STDIN_CHILD = """
+import json
 import os
 import sys
 
@@ -1732,7 +1767,7 @@ from saneless import cli as cli_module
 from saneless import main
 
 config = os.environ.pop("SANELESS_TEST_CONFIG")
-profile = os.environ.pop("SANELESS_TEST_PROFILE")
+args = json.loads(os.environ.pop("SANELESS_TEST_ARGS"))
 os.environ.pop("SANELESS_TEST_PYTHON")
 os.environ.pop("SANELESS_TEST_SOURCE")
 
@@ -1742,9 +1777,7 @@ def require_sane():
 
 
 cli_module.require_sane = require_sane
-sys.argv = [
-    "saneless", "--config", config, "scan", "--profile", profile, "--title", "t"
-]
+sys.argv = ["saneless", "--config", config, "scan", *args, "--title", "t"]
 sys.exit(main())
 """
 

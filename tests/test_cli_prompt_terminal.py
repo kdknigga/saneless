@@ -1,10 +1,13 @@
 """
-The flip prompt on a real terminal: every ending exits promptly, with its code.
+The CLI's prompts on a real terminal: every ending exits promptly, with its code.
 
-``saneless scan`` with a manual-duplex profile asks the operator to flip the
-stack between its two passes.  On a real terminal each way of leaving that
-question has to end the process within two seconds, with the documented exit
-code:
+``saneless scan`` asks the operator two kinds of question: with a
+manual-duplex profile, whether the stack has been flipped between its two
+passes; with ``--multi-page``, what to do after each pass.  On a real
+terminal each way of leaving either question has to end the process within
+two seconds, with the documented exit code.
+
+At the flip question:
 
 - Ctrl-C is the operator's cancel: 130.
 - No answer before ``operator_wait_timeout_seconds``: 1, the fronts kept in
@@ -13,6 +16,10 @@ code:
 - A hangup: an interruption, 129, whichever of the hangup and the end of input
   a closing terminal delivers first.
 - An answer: the scan goes on to the backs.
+
+At a multi-page question the same, except that a timeout uploads the pages
+kept, with a warning (7), or keeps them in ``failed/`` when every page was
+blank (8).
 
 Only a real terminal shows the fault these guard against: a process that has
 printed its outcome and then waits at interpreter exit for someone to press
@@ -56,10 +63,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 # How long a prompt ending may take to end the process.
 _EXIT_BOUND_SECONDS = 2.0
 
-# The flip wait, in seconds: the smallest value the config accepts.
+# The operator wait, in seconds: the smallest value the config accepts.
 _FLIP_TIMEOUT_SECONDS = 1
 
-# How long the child may take to start up and reach the flip question: an
+# How long the child may take to start up and reach its first question: an
 # interpreter start, the imports, and one scan pass against a fake scanner.
 _QUESTION_BOUND_SECONDS = 30.0
 
@@ -79,6 +86,11 @@ _TITLE = "Quarterly Report"
 # The question the flip prompt asks, as it appears on the terminal.
 _QUESTION = b"Scan the back sides?"
 
+# The multi-page question after a pass that kept its page, and the one after
+# a pass whose page looks blank, as they appear on the terminal.
+_NEXT_PAGE_QUESTION = b"kept so far."
+_BLANK_PAGE_QUESTION = b"looks blank"
+
 _END_OF_INPUT = b"\x04"
 
 _CONFIG = """\
@@ -96,6 +108,7 @@ log_file = "{log_file}"
 operator_wait_timeout_seconds = {timeout}
 
 [profiles.default]
+source = "Flatbed"
 
 [profiles.{profile}]
 source = "ADF"
@@ -114,6 +127,8 @@ import sys
 
 config = os.environ.pop("SANELESS_TEST_CONFIG")
 args = json.loads(os.environ.pop("SANELESS_TEST_ARGS"))
+passes = json.loads(os.environ.pop("SANELESS_TEST_PASSES"))
+blank = json.loads(os.environ.pop("SANELESS_TEST_BLANK"))
 os.environ.pop("SANELESS_TEST_PYTHON")
 os.environ.pop("SANELESS_TEST_SOURCE")
 
@@ -125,7 +140,7 @@ from tests.golden_support import (
     cli_client_builder,
 )
 
-scanner = DistinctPageScanner(passes=((0, 2, 4), (5, 3, 1)))
+scanner = DistinctPageScanner(passes=passes, blank=blank)
 
 
 def sane_backend(host=""):
@@ -142,6 +157,37 @@ cli_module.PaperlessClient = cli_client_builder(RecordingPaperless())
 sys.argv = ["saneless", "--config", config, *args]
 sys.exit(main())
 """
+
+
+@dataclass(frozen=True)
+class _Scenario:
+    """
+    One ``saneless scan`` to run on a terminal.
+
+    Attributes:
+        args: The arguments after ``scan``.
+        passes: The page indices each scanner pass feeds.
+        blank: The page indices the scanner feeds as blank paper.
+
+    """
+
+    args: tuple[str, ...]
+    passes: tuple[tuple[int, ...], ...]
+    blank: tuple[int, ...] = ()
+
+
+# A manual-duplex scan: three fronts, then the flip question.
+_FLIP = _Scenario(
+    args=("--profile", _PROFILE),
+    passes=((0, 2, 4), (5, 3, 1)),
+)
+
+# A multi-page flatbed scan: one page kept, then "another page?".
+_MULTI_PAGE = _Scenario(args=("--multi-page",), passes=((0,), (1,)))
+
+# A multi-page flatbed scan whose only page looks blank: nothing is kept yet
+# when the blank-page question is asked.
+_MULTI_PAGE_ALL_BLANK = _Scenario(args=("--multi-page",), passes=((0,),), blank=(0,))
 
 
 @dataclass
@@ -206,7 +252,7 @@ class _PtyRun:
 
 
 @pytest.fixture
-def spawn_scan(tmp_path: Path) -> Generator[Callable[[], _PtyRun]]:
+def spawn_scan(tmp_path: Path) -> Generator[Callable[[_Scenario], _PtyRun]]:
     """
     Start ``saneless scan`` children on terminals, and clean up after them.
 
@@ -219,15 +265,18 @@ def spawn_scan(tmp_path: Path) -> Generator[Callable[[], _PtyRun]]:
     """
     runs: list[_PtyRun] = []
 
-    def spawn() -> _PtyRun:
+    def spawn(scenario: _Scenario) -> _PtyRun:
         """
         Start ``saneless scan`` with stdin, stdout and stderr on one new terminal.
+
+        Args:
+            scenario: What to scan, and how.
 
         Returns:
             The running child.
 
         """
-        run = _spawn_scan(tmp_path)
+        run = _spawn_scan(tmp_path, scenario)
         runs.append(run)
         return run
 
@@ -239,7 +288,7 @@ def spawn_scan(tmp_path: Path) -> Generator[Callable[[], _PtyRun]]:
             os.close(run.master)
 
 
-def _spawn_scan(tmp_path: Path) -> _PtyRun:
+def _spawn_scan(tmp_path: Path, scenario: _Scenario) -> _PtyRun:
     """
     Start ``saneless scan`` with stdin, stdout and stderr on one new terminal.
 
@@ -250,6 +299,7 @@ def _spawn_scan(tmp_path: Path) -> _PtyRun:
     Args:
         tmp_path: The test's scratch directory, for the config and every path
             the scan writes.
+        scenario: What to scan, and how.
 
     Returns:
         The running child.
@@ -276,9 +326,9 @@ def _spawn_scan(tmp_path: Path) -> _PtyRun:
         "SANELESS_TEST_PYTHON": sys.executable,
         "SANELESS_TEST_SOURCE": _CHILD,
         "SANELESS_TEST_CONFIG": str(config),
-        "SANELESS_TEST_ARGS": json.dumps(
-            ["scan", "--profile", _PROFILE, "--title", _TITLE]
-        ),
+        "SANELESS_TEST_ARGS": json.dumps(["scan", *scenario.args, "--title", _TITLE]),
+        "SANELESS_TEST_PASSES": json.dumps(scenario.passes),
+        "SANELESS_TEST_BLANK": json.dumps(scenario.blank),
     }
     try:
         proc = subprocess.Popen(
@@ -352,19 +402,26 @@ def _exit_code_within(run: _PtyRun, seconds: float) -> int:
     )
 
 
-def _at_the_question(spawn_scan: Callable[[], _PtyRun]) -> _PtyRun:
+def _at_the_question(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+    scenario: _Scenario = _FLIP,
+    question: bytes = _QUESTION,
+) -> _PtyRun:
     """
-    Start a manual-duplex scan and wait until the flip question is on screen.
+    Start a scan and wait until its first question is on screen.
 
     Args:
         spawn_scan: The fixture's spawner.
+        scenario: What to scan; a manual-duplex scan unless given.
+        question: Part of the question to wait for; the flip question unless
+            given.
 
     Returns:
-        The child, waiting at the flip question.
+        The child, waiting at the question.
 
     """
-    run = spawn_scan()
-    _read_until(run, _QUESTION, time.monotonic() + _QUESTION_BOUND_SECONDS)
+    run = spawn_scan(scenario)
+    _read_until(run, question, time.monotonic() + _QUESTION_BOUND_SECONDS)
     return run
 
 
@@ -382,7 +439,7 @@ def _gap(run: _PtyRun) -> None:
 
 
 def test_ctrl_c_at_the_flip_prompt_exits_130_promptly(
-    spawn_scan: Callable[[], _PtyRun],
+    spawn_scan: Callable[[_Scenario], _PtyRun],
 ) -> None:
     """Ctrl-C at the flip question: the process is gone within 2 s, exit 130."""
     run = _at_the_question(spawn_scan)
@@ -394,7 +451,7 @@ def test_ctrl_c_at_the_flip_prompt_exits_130_promptly(
 
 
 def test_a_flip_timeout_exits_1_promptly_and_keeps_the_fronts(
-    spawn_scan: Callable[[], _PtyRun],
+    spawn_scan: Callable[[_Scenario], _PtyRun],
 ) -> None:
     """Nobody answers: exit 1 within 2 s of the deadline, the fronts in failed/."""
     run = _at_the_question(spawn_scan)
@@ -407,7 +464,7 @@ def test_a_flip_timeout_exits_1_promptly_and_keeps_the_fronts(
 
 
 def test_end_of_input_at_the_flip_prompt_exits_130(
-    spawn_scan: Callable[[], _PtyRun],
+    spawn_scan: Callable[[_Scenario], _PtyRun],
 ) -> None:
     """Ctrl-D at the flip question is a cancel: exit 130 within 2 s."""
     run = _at_the_question(spawn_scan)
@@ -419,7 +476,7 @@ def test_end_of_input_at_the_flip_prompt_exits_130(
 
 
 def test_a_hangup_at_the_flip_prompt_exits_129(
-    spawn_scan: Callable[[], _PtyRun],
+    spawn_scan: Callable[[_Scenario], _PtyRun],
 ) -> None:
     """A hangup at the flip question is an interruption: exit 129 within 2 s."""
     run = _at_the_question(spawn_scan)
@@ -431,7 +488,7 @@ def test_a_hangup_at_the_flip_prompt_exits_129(
 
 
 def test_hangup_then_end_of_input_exits_129(
-    spawn_scan: Callable[[], _PtyRun],
+    spawn_scan: Callable[[_Scenario], _PtyRun],
 ) -> None:
     """A closing terminal's SIGHUP, then its end of input: still exit 129."""
     run = _at_the_question(spawn_scan)
@@ -447,7 +504,7 @@ def test_hangup_then_end_of_input_exits_129(
 
 
 def test_end_of_input_then_hangup_exits_129(
-    spawn_scan: Callable[[], _PtyRun],
+    spawn_scan: Callable[[_Scenario], _PtyRun],
 ) -> None:
     """End of input first, the hangup 50 ms later: the hangup wins, exit 129."""
     run = _at_the_question(spawn_scan)
@@ -462,7 +519,7 @@ def test_end_of_input_then_hangup_exits_129(
 
 
 def test_an_answer_at_the_flip_prompt_continues(
-    spawn_scan: Callable[[], _PtyRun],
+    spawn_scan: Callable[[_Scenario], _PtyRun],
 ) -> None:
     """Answering yes scans the backs and delivers the document: exit 0."""
     run = _at_the_question(spawn_scan)
@@ -472,3 +529,121 @@ def test_an_answer_at_the_flip_prompt_continues(
 
     assert code == ExitCode.SUCCESS, run.shown()
     assert b"Scanning reverse sides" in run.output, run.shown()
+
+
+def _at_the_multi_page_question(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> _PtyRun:
+    """
+    Start a multi-page scan and wait until "another page?" is on screen.
+
+    Args:
+        spawn_scan: The fixture's spawner.
+
+    Returns:
+        The child, waiting at the question with one page kept.
+
+    """
+    return _at_the_question(spawn_scan, _MULTI_PAGE, _NEXT_PAGE_QUESTION)
+
+
+def test_ctrl_c_at_the_multi_page_question_exits_130_promptly(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """Ctrl-C at a multi-page question: the process is gone within 2 s, exit 130."""
+    run = _at_the_multi_page_question(spawn_scan)
+
+    os.kill(run.proc.pid, signal.SIGINT)
+    code = _exit_code_within(run, _EXIT_BOUND_SECONDS)
+
+    assert code == ExitCode.CANCELLED, run.shown()
+
+
+def test_a_multi_page_timeout_exits_7_promptly(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """Nobody answers: the kept page uploads with a warning, exit 7, within 2 s."""
+    run = _at_the_multi_page_question(spawn_scan)
+
+    code = _exit_code_within(run, _FLIP_TIMEOUT_SECONDS + _EXIT_BOUND_SECONDS)
+
+    assert code == ExitCode.UPLOADED_WITH_WARNING, run.shown()
+
+
+def test_an_all_blank_multi_page_timeout_exits_8(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """Nobody answers about the only page, which looks blank: exit 8 within 2 s."""
+    run = _at_the_question(spawn_scan, _MULTI_PAGE_ALL_BLANK, _BLANK_PAGE_QUESTION)
+
+    code = _exit_code_within(run, _FLIP_TIMEOUT_SECONDS + _EXIT_BOUND_SECONDS)
+
+    assert code == ExitCode.ALL_BLANK, run.shown()
+    kept = sorted(run.failed_dir.iterdir()) if run.failed_dir.is_dir() else []
+    assert kept, run.shown()
+
+
+def test_end_of_input_at_the_multi_page_question_exits_130(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """Ctrl-D at a multi-page question is a cancel: exit 130 within 2 s."""
+    run = _at_the_multi_page_question(spawn_scan)
+
+    os.write(run.master, _END_OF_INPUT)
+    code = _exit_code_within(run, _EXIT_BOUND_SECONDS)
+
+    assert code == ExitCode.CANCELLED, run.shown()
+
+
+def test_a_hangup_at_the_multi_page_question_exits_129(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """A hangup at a multi-page question is an interruption: exit 129 within 2 s."""
+    run = _at_the_multi_page_question(spawn_scan)
+
+    os.kill(run.proc.pid, signal.SIGHUP)
+    code = _exit_code_within(run, _EXIT_BOUND_SECONDS)
+
+    assert code == ExitCode.HANGUP, run.shown()
+
+
+def test_hangup_then_end_of_input_at_the_multi_page_question_exits_129(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """A closing terminal's SIGHUP, then its end of input: still exit 129."""
+    run = _at_the_multi_page_question(spawn_scan)
+
+    os.kill(run.proc.pid, signal.SIGHUP)
+    _gap(run)
+    with contextlib.suppress(OSError):
+        os.write(run.master, _END_OF_INPUT)
+    code = _exit_code_within(run, _EXIT_BOUND_SECONDS)
+
+    assert code == ExitCode.HANGUP, run.shown()
+
+
+def test_end_of_input_then_hangup_at_the_multi_page_question_exits_129(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """End of input first, the hangup 50 ms later: the hangup wins, exit 129."""
+    run = _at_the_multi_page_question(spawn_scan)
+
+    os.write(run.master, _END_OF_INPUT)
+    _gap(run)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(run.proc.pid, signal.SIGHUP)
+    code = _exit_code_within(run, _EXIT_BOUND_SECONDS)
+
+    assert code == ExitCode.HANGUP, run.shown()
+
+
+def test_an_answer_at_the_multi_page_question_finishes(
+    spawn_scan: Callable[[_Scenario], _PtyRun],
+) -> None:
+    """Answering ``f`` uploads the page kept: exit 0."""
+    run = _at_the_multi_page_question(spawn_scan)
+
+    os.write(run.master, b"f\n")
+    code = _exit_code_within(run, _DELIVERY_BOUND_SECONDS)
+
+    assert code == ExitCode.SUCCESS, run.shown()

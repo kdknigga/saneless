@@ -17,6 +17,7 @@ patches that one seam to ``True``.
 
 from __future__ import annotations
 
+import errno
 import io
 import logging
 import signal
@@ -64,7 +65,7 @@ from tests.multi_page_support import (
     ScriptedPassCoordinator,
     multi_page_settings,
 )
-from tests.prompt_support import readable
+from tests.prompt_support import FakeClock, broken_read, readable, typed_after
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1056,3 +1057,273 @@ class TestTypeAheadFlush:
 
         assert (first, second) == (PassAnswer.NEXT, PassAnswer.NEXT)
         assert log == ["flush", "prompt", "flush", "prompt"]
+
+
+# The thread the multi-page question was once read on.  Nothing may start it.
+_MULTI_PAGE_PROMPT_THREAD = "saneless-multi-page-prompt"
+
+# The operator wait the confirmation tests run with, in seconds.
+_SHORT = 60
+
+# Where FakeClock starts.
+_CLOCK_START = FakeClock().now
+
+
+def _ask_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: PassPrompt,
+    text: str,
+    delays: Sequence[float] | None = None,
+) -> tuple[PassAnswer, str, list[float], FakeClock]:
+    """
+    Put ``prompt`` to a fresh coordinator, each line typed after its pause.
+
+    Args:
+        monkeypatch: Replaces the prompt's wait and clock.
+        prompt: The question.
+        text: Everything the operator types.
+        delays: The pause before each line, in seconds; no pause at all for
+            any line when omitted.
+
+    Returns:
+        The answer, everything the terminal showed, the timeout each wait
+        was given, and the clock.
+
+    """
+    clock = FakeClock()
+    if delays is None:
+        delays = [0.0] * text.count("\n")
+    waits = typed_after(monkeypatch, clock, delays)
+    answer, shown, _ = _ask(prompt, text)
+    return answer, shown, waits, clock
+
+
+class TestConfirmationHoldsTheClock:
+    """
+    An abort being confirmed holds the clock, for at most one more timeout.
+
+    The operator who typed ``a`` is at the terminal, answering "abort?".  If
+    the wait ran out under them the document would be finished and uploaded
+    while they were confirming they wanted it thrown away.  So the
+    confirmation is due by the question's deadline plus one more timeout.
+    """
+
+    def test_a_yes_after_the_deadline_still_aborts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``a`` at 50 s, ``y`` at 80 s of a 60 s wait: the operator's abort stands."""
+        answer, _, waits, _ = _ask_typed(
+            monkeypatch,
+            _next_pass_prompt(pages_kept=3, timeout=_SHORT),
+            "a\ny\n",
+            [50, 30],
+        )
+
+        assert answer is PassAnswer.ABORT
+        assert waits == [_SHORT, 70]
+
+    def test_a_no_after_the_deadline_times_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``a`` at 50 s, ``n`` at 80 s: not an abort, and the wait is over."""
+        answer, _, waits, _ = _ask_typed(
+            monkeypatch,
+            _next_pass_prompt(pages_kept=3, timeout=_SHORT),
+            "a\nn\n",
+            [50, 30],
+        )
+
+        assert answer is PassAnswer.TIMED_OUT
+        assert waits == [_SHORT, 70]
+
+    def test_a_no_before_the_deadline_asks_again_with_the_time_left(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``a`` at 10 s, ``n`` at 15 s: the question again, for the 45 s left."""
+        answer, shown, waits, _ = _ask_typed(
+            monkeypatch,
+            _next_pass_prompt(pages_kept=3, timeout=_SHORT),
+            "a\nn\nf\n",
+            [10, 5, 5],
+        )
+
+        assert answer is PassAnswer.FINISH
+        assert waits == [_SHORT, 110, 45]
+        assert shown.count("3 pages kept so far.") == 2
+
+    def test_an_unanswered_confirmation_times_out_one_timeout_later(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``a`` at 50 s, then nothing: ``TIMED_OUT`` at 120 s, and not before."""
+        answer, _, waits, clock = _ask_typed(
+            monkeypatch,
+            _next_pass_prompt(pages_kept=3, timeout=_SHORT),
+            "a\n",
+            [50],
+        )
+
+        assert answer is PassAnswer.TIMED_OUT
+        assert waits == [_SHORT, 70]
+        assert clock.now == _CLOCK_START + 2 * _SHORT
+
+    def test_a_yes_after_the_deadline_cancels_the_scan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole run: a held confirmation's yes is a cancel, exit 130."""
+        _interactive(monkeypatch)
+        waits = typed_after(monkeypatch, FakeClock(), [_TIMEOUT - 10, 30])
+
+        run = _scan(
+            tmp_path, monkeypatch, ["--multi-page"], passes=((0,),), text="a\ny\n"
+        )
+
+        assert run.result.exit_code == ExitCode.CANCELLED, run.result.output
+        assert waits == [_TIMEOUT, _TIMEOUT + 10]
+        assert run.recorder.uploads() == []
+        assert run.failed == []
+
+
+class TestTheQuestionOnTheMainThread:
+    """The multi-page question is asked and read on the calling thread."""
+
+    def test_typed_ahead_is_flushed_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        One flush per question, before its first read, and none on a re-ask.
+
+        A refused letter and a declined abort are both answered from what is
+        typed after them, so flushing again would throw a real answer away.
+        """
+        log: list[str] = []
+
+        def flush() -> None:
+            """Record the flush."""
+            log.append("flush")
+
+        def wait(_stream: object, _timeout: float) -> bool:
+            """
+            Record the wait, and report the next line ready.
+
+            Returns:
+                Always ``True``.
+
+            """
+            log.append("wait")
+            return True
+
+        monkeypatch.setattr("saneless.cli._flush_typed_ahead", flush)
+        monkeypatch.setattr("saneless.cli._wait_readable", wait)
+
+        answer, _, _ = _ask(_next_pass_prompt(), "x\na\nn\nn\n")
+
+        assert answer is PassAnswer.NEXT
+        assert log == ["flush", "wait", "wait", "wait", "wait"]
+
+    def test_a_bad_letter_is_asked_again_with_the_hint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``x`` is refused with the offered letters, and the question asked again."""
+        prompt = _next_pass_prompt()
+
+        answer, shown, waits, _ = _ask_typed(monkeypatch, prompt, "x\nn\n")
+
+        assert answer is PassAnswer.NEXT
+        assert f"Error: {cli_choice_hint(prompt)}" in shown
+        assert shown.count("1 page kept so far.") == 2
+        assert len(waits) == 2
+
+    def test_finish_with_nothing_kept_explains(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``f`` with nothing kept says why there is nothing to finish."""
+        answer, shown, waits, _ = _ask_typed(
+            monkeypatch, _next_pass_prompt(pages_kept=0), "f\nn\n"
+        )
+
+        assert answer is PassAnswer.NEXT
+        assert f"Error: {NOTHING_TO_FINISH}" in shown
+        assert len(waits) == 2
+
+    def test_an_empty_line_asks_again_quietly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Return on its own asks the question again, with no error line."""
+        answer, shown, waits, _ = _ask_typed(monkeypatch, _next_pass_prompt(), "\nn\n")
+
+        assert answer is PassAnswer.NEXT
+        assert "Error" not in shown
+        assert shown.count("1 page kept so far.") == 2
+        assert len(waits) == 2
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            OSError(errno.EIO, "Input/output error"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        ],
+        ids=["lost-terminal", "undecodable-input"],
+    )
+    def test_a_broken_read_is_a_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        failure: Exception,
+    ) -> None:
+        """
+        A read that breaks fails the scan: exit 1, logged, the page kept.
+
+        Nobody chose to stop, so it is neither a cancel (130) nor an
+        unexpected error (5), and the log keeps the traceback.
+        """
+        _interactive(monkeypatch)
+        broken_read(monkeypatch, failure)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        run = _scan(tmp_path, monkeypatch, ["--multi-page"], passes=((0,),))
+
+        assert run.result.exit_code == ExitCode.SCAN, run.result.output
+        assert "Multi-page prompt failed: " in run.result.stderr
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "saneless.cli"
+            and "Multi-page prompt failed; treating it as an abort"
+            in record.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert len(run.failed) == 1
+        assert run.recorder.uploads() == []
+
+    def test_no_multi_page_prompt_thread_is_started(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        No thread is started for a question, and none is left behind.
+
+        A thread parked on stdin outlives the command that started it, and on
+        a real terminal it holds the process open at exit until someone
+        presses Enter.
+        """
+        started: list[str] = []
+        real_start = threading.Thread.start
+
+        def recording_start(thread: threading.Thread) -> None:
+            """Note the thread's name, then start it as usual."""
+            started.append(thread.name)
+            real_start(thread)
+
+        _interactive(monkeypatch)
+        readable(monkeypatch)
+        monkeypatch.setattr(threading.Thread, "start", recording_start)
+
+        run = _scan(
+            tmp_path, monkeypatch, ["--multi-page"], passes=((0,), (1,)), text="n\nf\n"
+        )
+
+        assert run.result.exit_code == ExitCode.SUCCESS, run.result.output
+        assert _MULTI_PAGE_PROMPT_THREAD not in started
+        assert _MULTI_PAGE_PROMPT_THREAD not in [
+            thread.name for thread in threading.enumerate()
+        ]
+        assert run.uploaded_pages() == run.spooled((0, 1))

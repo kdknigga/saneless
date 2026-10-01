@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from typing import TextIO
 
     import pytest
@@ -141,3 +142,51 @@ def broken_read(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> None:
         raise exc
 
     monkeypatch.setattr("saneless.cli._wait_readable", broken)
+
+
+def typed_after(
+    monkeypatch: pytest.MonkeyPatch, clock: FakeClock, delays: Sequence[float]
+) -> list[float]:
+    """
+    Make each line on stdin arrive after a pause on ``clock``, then nothing.
+
+    The operator types the next line ``delays[i]`` seconds after the wait
+    for it begins.  A wait shorter than that pause runs out unanswered and
+    the rest of the pause carries over to the next wait, so a line can be
+    typed after a deadline has passed.  Once ``delays`` is used up nobody
+    types anything more, and every wait runs out its whole timeout.  No
+    wall-clock time passes.
+
+    Args:
+        monkeypatch: Replaces ``saneless.cli._wait_readable`` and
+            ``saneless.cli._monotonic``.
+        clock: The clock the prompt reads its deadline from.
+        delays: The pause before each line, in seconds, in order.
+
+    Returns:
+        The timeout each wait was given, filled in as the prompt waits.
+
+    """
+    pending = list(delays)
+    waits: list[float] = []
+
+    def wait(_stream: TextIO, timeout: float) -> bool:
+        """
+        Let time pass until the next line is typed, or ``timeout`` runs out.
+
+        Returns:
+            Whether a line was typed within ``timeout``.
+
+        """
+        waits.append(timeout)
+        if pending and pending[0] <= timeout:
+            clock.advance(pending.pop(0))
+            return True
+        if pending:
+            pending[0] -= max(0.0, timeout)
+        clock.advance(timeout)
+        return False
+
+    monkeypatch.setattr("saneless.cli._monotonic", clock)
+    monkeypatch.setattr("saneless.cli._wait_readable", wait)
+    return waits
