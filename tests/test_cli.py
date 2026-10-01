@@ -6338,7 +6338,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["jobs"])
 
         assert result.exit_code == 2
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith("Job database error: ")
         assert str(settings.output.db_path) in lines[0]
@@ -6361,7 +6361,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["jobs"])
 
         assert result.exit_code == 2
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert str(settings.output.db_path) in lines[0]
         assert "unsupported schema" in lines[0]
@@ -6388,7 +6388,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["jobs"])
 
         assert result.exit_code == 2
-        assert result.stderr.splitlines() == [f"Job database error: {exc}"]
+        assert _failure_lines(result) == [f"Job database error: {exc}"]
         assert "Full details in" not in result.output
         records = _cli_error_records(caplog)
         assert len(records) == 1

@@ -1028,6 +1028,33 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
     return neutralise_controls(line)
 
 
+def _advice_line(exc: SanelessError, category: ErrorCategory) -> str:
+    """
+    Render the ``Try:`` line that follows a classified failure's line.
+
+    A raise site that knows the fix sets ``next_step`` on the error, and that
+    wins: it is advice for this error, where the category's fallback has to be
+    true for every error the category holds and so can only point at the
+    problem.  Every category keeps its fallback, so no classified failure
+    ends without a next step.
+
+    The next step is shown with its control characters as escapes, as the
+    failure line's text is: it is a constant at every raise site today, but
+    some carry a setting key or a file name, and a line on the operator's
+    terminal must stay one line whatever it holds.
+
+    Args:
+        exc: The failure.
+        category: The category whose fallback applies when ``exc`` carries no
+            next step of its own.
+
+    Returns:
+        ``Try: <next step>``.
+
+    """
+    return neutralise_controls(f"Try: {exc.next_step or error_next_step(category)}")
+
+
 def _echo_err(text: str, *, nl: bool = True) -> None:
     """
     Write one line of a command's report to stderr, surviving a dead terminal.
@@ -1125,25 +1152,36 @@ def drain_dead_streams() -> None:
 
 def _log_failure(ctx: click.Context, exc: Exception) -> None:
     """
-    Log a failure with its traceback, but only once logging is configured.
+    Log a classified failure, but only once logging is configured.
 
     The message names the failure too: when the log fell back to stderr the
     traceback is not rendered there, and the record must still say what went
     wrong.  It is quoted with ``%r``, because it can carry text from outside
     saneless and repr shows a control character in it as its escape.
 
+    The traceback goes with the record only when the log is a file.  ``serve``
+    streams its log to stderr, and that stream renders every traceback it is
+    given, so a port that is taken or a scanner library that would not start
+    -- a setup problem the failure line and its ``Try:`` line already explain
+    -- would print a stack of saneless's own frames above them.  A one-shot
+    command's log is a file nobody reads at the terminal, and there the
+    traceback is kept for whoever does.  An unexpected error (exit 5) is not
+    logged here: ``_report_unexpected`` keeps its traceback on both.
+
     Args:
         ctx: The group's context.
         exc: The failure to log.
 
     """
-    if _logging_ready(ctx):
-        logger.error(
-            "saneless %s failed: %r",
-            ctx.invoked_subcommand,
-            failure_text(exc),
-            exc_info=exc,
-        )
+    if not _logging_ready(ctx):
+        return
+    streamed = isinstance(ctx.obj, dict) and bool(ctx.obj.get("log_stream"))
+    logger.error(
+        "saneless %s failed: %r",
+        ctx.invoked_subcommand,
+        failure_text(exc),
+        exc_info=None if streamed else exc,
+    )
 
 
 def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
@@ -1214,7 +1252,8 @@ class _GuardedGroup(click.Group):
        ``SanelessError`` clause because ``ErrorCategory`` is persisted on job
        records, and ``classify_error`` deliberately keeps ``StorageError``
        ``UNKNOWN`` rather than growing a category for it. Its message already
-       names the database path and the reason.
+       names the database path and the reason; its ``Try:`` line is the
+       configuration fallback unless the error carries its own next step.
     5. Any other ``SanelessError`` is classified once, by the same
        ``classify_error`` the web worker uses, so the CLI's exit code and the
        job's category cannot disagree.
@@ -1259,6 +1298,7 @@ class _GuardedGroup(click.Group):
         except StorageError as exc:
             _log_failure(ctx, exc)
             _echo_err(f"Job database error: {failure_text(exc)}")
+            _echo_err(_advice_line(exc, ErrorCategory.CONFIG))
             ctx.exit(ExitCode.CONFIG)
         except SanelessError as exc:
             category = classify_error(exc)
@@ -1271,13 +1311,14 @@ class _GuardedGroup(click.Group):
                 # keeps its documented `<what saneless was doing>: <problem>`
                 # shape, printed unchanged, so a script parsing it and the
                 # doc-truth message-shape tests that pin it are both unaffected.
-                # Line 2 is the same error_next_step string the web error page
-                # renders -- which is why the copy is surface-neutral and never
-                # says "press Scan" or "run the command". The UNEXPECTED branch
-                # above gets no advice: its category is a guess about an
-                # exception saneless did not raise.
+                # Line 2 is the raise site's own fix when it knows one, else
+                # the category's fallback -- the same error_next_step string
+                # the web error page renders, which is why that copy is
+                # surface-neutral and true for every error in the category.
+                # The UNEXPECTED branch above gets no advice: its category is
+                # a guess about an exception saneless did not raise.
                 _echo_err(_failure_line(exc, category))
-                _echo_err(f"Try: {error_next_step(category)}")
+                _echo_err(_advice_line(exc, category))
             ctx.exit(code)
         except Exception as exc:
             _report_unexpected(ctx, exc)
