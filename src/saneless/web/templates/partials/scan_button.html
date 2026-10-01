@@ -49,8 +49,11 @@
    releases the button exactly as an arrived one does.  The visible reason
    is index.html's hold line, which the button names in aria-describedby
    unless the appliance is blocked, whose reason outlasts the wait.  A status
-   poll knows nothing of the lists and may release the button early: that
-   is accepted, because the wait is bounded by the short request budget. #}
+   poll knows nothing of the lists and may release the button early, when a
+   job ends during the load.  A press then still files the right metadata:
+   the page's profile markers say the lists have not answered, so the scan
+   gets the submitted profile's defaults, as the untouched form would once
+   the lists land. #}
 {% set scan_disabled = scan_blocked or (job and job.is_active) or lists_loading %}
 <button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
         {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% elif lists_loading %}aria-describedby="scan-hold-reason"{% endif %}

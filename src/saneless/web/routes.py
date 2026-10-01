@@ -163,6 +163,31 @@ before the handler body runs, which is the same "validate at the boundary"
 shape ``MetadataResource`` uses for ``resource``.
 """
 
+LISTS_LOADING_MARKER: Final = "(lists loading)"
+"""
+What the page's profile markers say while its lists are still loading.
+
+The full page renders the tag list and the correspondent select empty, and
+the lazy list load brings the rows, the ticks and the choice.  Scan is held
+until then, but a status poll renders the Scan button from the job alone, so a
+job ending during the load releases it early.  A marker naming the opening
+profile would then present the empty controls as that profile's answer, and
+the scan would be filed with no tags and no correspondent.  Marked with this
+value instead, neither control answers for the submitted profile, so
+``start_scan`` applies that profile's defaults by the rule it already has for
+a control still showing another profile's: exactly what the untouched form
+files once the lists have landed.  The lazy load's first answer replaces both
+markers with the profile it ticked the defaults of.
+
+It is not empty, because an empty field arrives as no marker at all, which is
+how a script says its values are to be taken as given.  It holds a space and
+brackets, which a bare TOML key cannot hold and ``auto-profiles`` never
+writes, so no generated profile and no profile named without quotes is called
+this.  A quoted TOML key can spell any string, so the guarantee stops there:
+a profile named exactly this in quotes would have its page-marked submits
+taken as given, as before.
+"""
+
 _REQUEST_FETCH_TIMEOUT: Final = httpx2.Timeout(
     PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS
 )
@@ -2287,6 +2312,9 @@ def index(request: Request) -> Response:
             **_no_correspondent_options(shown=show_correspondent),
             # The loading lines where the lists go, one per shown list.
             "tags_loading": show_tags,
+            # What both profile markers say until the lazy list load replaces
+            # them: the lists have not answered for any profile yet.
+            "lists_loading_marker": LISTS_LOADING_MARKER,
             "correspondents_loading": show_correspondent,
             # The third source of a disabled Scan button, beside an active job
             # and a blocked appliance: a shown list has not arrived yet.  The
@@ -2472,8 +2500,11 @@ class _ScanChoice:
 
         A marker naming another profile means the control was still showing
         that profile's defaults: a profile change whose swap had not landed,
-        or had failed.  No marker means the submit did not come from the page
-        -- a script posting its own values -- and those are taken as given.
+        or had failed.  The page's own markers say ``LISTS_LOADING_MARKER``
+        until its lists land, which names no profile, so a submit sent before
+        then is read the same way.  No marker means the submit did not come
+        from the page -- a script posting its own values -- and those are
+        taken as given.
 
         Args:
             marker: The control's profile marker as submitted, or None.
@@ -2900,6 +2931,9 @@ def start_scan(
     # defaults had not landed, or had failed, so it still held the previous
     # profile's.  Taking those values would file this scan with the other
     # profile's metadata, so the submitted profile's defaults apply instead.
+    # The page's markers say the lists have not answered at all until its lazy
+    # list load lands, which names no profile either, so a Scan a status poll
+    # released early files the defaults, not the empty controls.
     tags_answered = state.settings.web.show_tags and choice.shows_own_defaults(
         choice.tags_profile
     )

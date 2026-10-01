@@ -8,11 +8,16 @@
    submitted profile and, when they differ, applies the submitted profile's
    defaults instead of the values that belong to another one.
 
-   The page renders one per shown control, named by marker_id and marker_name,
-   carrying the profile the page opens on.  Only the profile-change responses
-   render it again, out-of-band with oob = true, so it changes in the same swap
-   that replaces the control's defaults and never before.  The filter and the
-   refresh keep the ticks and the profile, so they leave it alone.
+   The page renders one per shown control, named by marker_id and marker_name.
+   It does not carry a profile there: the page's lists are still loading, with
+   no ticks and no choice, so it carries a reserved value that names no
+   profile, and a submit sent before the lists land -- a Scan a status poll
+   released early -- gets the submitted profile's defaults.  The lazy list
+   load's first answer and the profile-change responses render it again,
+   out-of-band with oob = true, naming the profile whose defaults they show, so
+   it changes in the same swap that replaces the control's defaults and never
+   before.  The filter and the refresh keep the ticks and the profile, so they
+   leave it alone.
 
    Turning autocomplete off stops a browser that restores form state on reload
    from bringing back a value the server did not render. #}

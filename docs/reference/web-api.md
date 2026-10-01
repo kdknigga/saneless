@@ -129,6 +129,11 @@ another profile's defaults never files them under the profile you picked. That h
 while the list is still being replaced after a profile change, or when replacing it
 failed. A script that posts its own `tags` and `correspondent` can leave them out.
 
+Until the page's lists have loaded, both fields say `(lists loading)`, which names no
+profile, so a scan started in that moment gets the profile's `default_tags` and
+`default_correspondent`, just as the untouched form does once the lists are in. Scan is
+held while the lists load, but a scan finishing during the load can release it early.
+
 **Responses:**
 
 | Status Code | Meaning |

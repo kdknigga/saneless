@@ -188,7 +188,12 @@
             <small id="tag-filter-help">Type to narrow the list. Ticked tags stay ticked.</small>
 
             {% include "partials/tags.html" %}
-            {% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = selected %}{% include "partials/profile_marker.html" %}{% endwith %}
+            {# Both markers on this page say the lists have not answered yet,
+               never the opening profile: until the lazy list load lands they
+               hold no ticks and no choice, and a Scan a status poll released
+               early must file the profile's defaults, not nothing.  The load's
+               first answer names the profile.  See the marker partial. #}
+            {% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = lists_loading_marker %}{% include "partials/profile_marker.html" %}{% endwith %}
         </fieldset>
         <small id="tags-help">Labels to file this under in paperless-ngx. Optional.</small>
         {% endif %}
@@ -222,7 +227,7 @@
         {% include "partials/correspondent_help.html" %}
         {# After the help line, never between it and the select: the select
            has to stay the element directly before its help line. #}
-        {% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = selected %}{% include "partials/profile_marker.html" %}{% endwith %}
+        {% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = lists_loading_marker %}{% include "partials/profile_marker.html" %}{% endwith %}
         {% endif %}
 
         {% include "partials/scan_button.html" %}
