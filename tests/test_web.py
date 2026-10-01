@@ -5448,6 +5448,34 @@ class TestMetadataRoute:
         assert 'name="correspondent_profile"' not in text
         assert 'id="metadata-loader"' not in text
 
+    def test_metadata_retry_reads_no_correspondent_as_none(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A retry with "No correspondent" chosen is answered, not refused.
+
+        The select sends its empty option as ``correspondent=``, which is what
+        the retry element carries whenever the correspondents are unavailable,
+        so refusing it would leave the list unrecovered for good.
+        """
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = client.get(
+                "/api/metadata",
+                params={"retry": "1", "q": "", "tags": ["3"], "correspondent": ""},
+                headers={"HX-Request": "true"},
+            )
+
+        assert response.status_code == 200, response.text
+        text = response.text
+        assert "HX-Retarget" not in response.headers
+        assert "checked" in _checkbox(text, 3)
+        # No option is marked, so the select stays on "No correspondent".
+        assert "<option value=" in text
+        assert not re.search(r"<option [^>]*\bselected\b", text), text
+        assert 'id="metadata-loader"' not in text
+
     def test_metadata_scan_button_respects_an_active_job(self, tmp_path: Path) -> None:
         """A scan in flight keeps the button disabled after the lists land."""
         app = _pre_ticked_app(tmp_path)
@@ -5519,6 +5547,7 @@ class TestMetadataRoute:
             pytest.param({}, id="no-profile"),
             pytest.param({"profile": "default", "q": "a" * 500}, id="long-filter"),
             pytest.param({"profile": "default", "tags": ["x"]}, id="bad-tag"),
+            pytest.param({"retry": "1", "correspondent": "x"}, id="bad-correspondent"),
         ],
     )
     def test_metadata_rejects_an_unknown_profile(

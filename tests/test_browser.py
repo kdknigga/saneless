@@ -4204,6 +4204,58 @@ class TestLazyListsInTheBrowser:
         expect(page.locator("#correspondent-select")).to_have_value("42")
         assert _ticked_tags(page) == []
 
+    def test_unavailable_correspondents_recover_with_no_correspondent_chosen(
+        self,
+        page: Page,
+        defaults_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The retry recovers the correspondents when "No correspondent" is chosen.
+
+        The select sends "No correspondent" as an empty value, and the retry
+        carries it while the correspondents are unavailable.  Each retry is
+        answered, the alert slot stays empty, and the options appear once
+        paperless-ngx answers, with the choice left as it was.
+        """
+        monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.0)
+        answering = threading.Event()
+        paperless = defaults_server.app.state.paperless
+        monkeypatch.setattr(
+            paperless,
+            "get_correspondents",
+            _flagged_list(answering, _DEFAULTS_CORRESPONDENTS),
+        )
+        defaults_server.app.state.cache.invalidate("correspondents")
+
+        page.goto(defaults_server.url)
+        select = page.locator("#correspondent-select")
+        expect(page.locator("#correspondent-help")).to_contain_text(
+            CORRESPONDENTS_UNAVAILABLE
+        )
+        _await_the_lists(page)
+        page.select_option("#correspondent-select", "")
+        expect(select).to_have_value("")
+
+        with page.expect_response(
+            lambda r: (
+                "/api/metadata?retry=1" in r.url
+                and re.search(r"[?&]correspondent=(&|$)", r.url) is not None
+            )
+        ) as retried:
+            pass
+        assert retried.value.status == 200
+        expect(page.locator("#status-message")).to_be_empty()
+
+        answering.set()
+
+        expect(select.locator("option")).to_have_count(
+            1 + len(_DEFAULTS_CORRESPONDENTS), timeout=15_000
+        )
+        expect(page.locator("#metadata-loader")).to_have_count(0)
+        expect(select).to_have_value("")
+        expect(page.locator("#status-message")).to_be_empty()
+
     def test_opening_profile_defaults_arrive_ticked(
         self, page: Page, defaults_server: _BrowserServer
     ) -> None:

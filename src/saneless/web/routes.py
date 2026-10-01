@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 import httpx2
 from fastapi import APIRouter, Depends, Form, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import AfterValidator
+from pydantic import AfterValidator, BeforeValidator
 from pydantic_core import PydanticCustomError
 
 # A runtime import although only annotations use it, because FastAPI resolves
@@ -3618,13 +3618,35 @@ class _MetadataQuery:
     correspondent: int | None
 
 
+def _blank_as_none(value: object) -> object:
+    """
+    Read an empty query value as none, before it is validated.
+
+    A select whose chosen option has an empty value, "No correspondent",
+    still sends its name: htmx includes it in a GET as ``correspondent=``.
+    FastAPI turns an empty value into the default for a form field but not
+    for a query parameter, so without this the empty string would fail the
+    integer check and refuse a request the page itself sends.
+
+    Args:
+        value: The raw query value.
+
+    Returns:
+        None for an empty string, otherwise ``value`` unchanged.
+
+    """
+    return None if value == "" else value
+
+
 def _metadata_query(
     *,
     profile: Annotated[str | None, Query()] = None,
     retry: Annotated[bool, Query()] = False,
     q: Annotated[str, Query(max_length=TAG_FILTER_MAX_LENGTH)] = "",
     tags: list[PaperlessId] = _TAGS_QUERY_DEFAULT,
-    correspondent: Annotated[PaperlessId | None, Query()] = None,
+    correspondent: Annotated[
+        PaperlessId | None, BeforeValidator(_blank_as_none), Query()
+    ] = None,
 ) -> _MetadataQuery:
     """
     Read the lazy list load's query, bounded as the list routes bound it.
@@ -3638,7 +3660,8 @@ def _metadata_query(
         retry: Whether the retry element is asking.
         q: The tag filter currently in the box.
         tags: The tag ids currently ticked.
-        correspondent: The correspondent currently chosen.
+        correspondent: The correspondent currently chosen; an empty value,
+            which "No correspondent" sends, is none.
 
     Returns:
         The five, together.
