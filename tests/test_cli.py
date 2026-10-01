@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import errno
 import importlib.metadata
+import io
 import json
 import logging
 import logging.handlers
@@ -93,7 +94,12 @@ from tests.conftest import (
     leave_killed_workspace,
     scan_batch,
 )
-from tests.prompt_support import broken_read, readable
+from tests.prompt_support import (
+    FakeClock,
+    broken_read,
+    never_readable,
+    readable,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Generator
@@ -1055,14 +1061,32 @@ class TestManualDuplexPrompt:
     contradictory and are not.  ``CliRunner`` genuinely is not a terminal, so
     the refusal test runs with ``_stdin_is_interactive`` *unpatched* -- it is
     telling the truth about its environment.  The prompt tests patch that one
-    seam to ``True`` so they can reach ``click.confirm`` at all.  Neither test
+    seam to ``True`` so they can reach the question at all.  Neither test
     lies, and neither can be "simplified" into the other: without the seam, one
     of the two could not be written.
+
+    The question waits for stdin to be readable before it reads a line, and
+    ``CliRunner``'s stdin has no descriptor to wait on, so the prompt tests
+    also replace that one wait (``tests.prompt_support``).  The line is then
+    read, parsed and answered for real.
     """
 
     def _interactive(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Pretend stdin is a terminal a human can answer on."""
+        """Pretend stdin is a terminal a human can answer on, readable at once."""
         monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+        readable(monkeypatch)
+
+    def _typed(self, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+        """
+        Give a coordinator called directly ``text`` on stdin, readable at once.
+
+        Args:
+            monkeypatch: Replaces ``sys.stdin`` and the prompt's wait.
+            text: What the operator typed; empty for end of input.
+
+        """
+        monkeypatch.setattr(sys, "stdin", io.StringIO(text))
+        readable(monkeypatch)
 
     def test_prompt_between_passes_then_scans_backs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1163,24 +1187,12 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Ctrl-C at the flip prompt exits 130 with the flip cancel line (D-03).
+        Ctrl-C at the flip prompt exits 130 with the flip cancel line.
 
         The coordinator turns the ``KeyboardInterrupt`` into ``ABORTED``, so
         the guard sees ``ScanCancelledError`` and prints its message -- not the
         generic ``Cancelled (interrupted)`` of a Ctrl-C elsewhere in a command.
         """
-
-        def interrupted_wait(_slot: object, timeout: float) -> None:
-            """Raise as SIGINT would on the main thread."""
-            raise KeyboardInterrupt
-
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
         calls: list[str] = []
         uploads: list[str] = []
         runner, _ = _patch_cli(
@@ -1190,15 +1202,12 @@ class TestManualDuplexPrompt:
             paperless_cls=_recording_paperless(uploads),
         )
         self._interactive(monkeypatch)
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
-        monkeypatch.setattr("saneless.cli.FlipAnswerSlot.wait", interrupted_wait)
+        # Raised out of the wait, as SIGINT is on the main thread.
+        broken_read(monkeypatch, KeyboardInterrupt())
 
-        try:
-            result = runner.invoke(
-                cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Ctrl-C"]
-            )
-        finally:
-            release.set()
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Ctrl-C"]
+        )
 
         assert result.exit_code == 130, result.output
         assert result.stderr.strip().splitlines()[-1] == _FLIP_CANCEL_LINE
@@ -1210,16 +1219,11 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A prompt that breaks is a scan failure, exit 1 -- not a cancel (D-02).
+        A prompt that breaks is a scan failure, exit 1 -- not a cancel.
 
         Nobody chose to stop, so the coordinator's ``abort_cause`` turns the
         ``ABORTED`` into a ``ScanError`` naming what broke.
         """
-
-        def broken_confirm(*_args: object, **_kwargs: object) -> bool:
-            """Fail with a read error, as an I/O error at the terminal does."""
-            raise OSError(errno.EIO, "Input/output error")
-
         calls: list[str] = []
         uploads: list[str] = []
         runner, _ = _patch_cli(
@@ -1229,14 +1233,15 @@ class TestManualDuplexPrompt:
             paperless_cls=_recording_paperless(uploads),
         )
         self._interactive(monkeypatch)
-        monkeypatch.setattr("saneless.cli.click.confirm", broken_confirm)
+        # A read error, as an I/O error at the terminal gives.
+        broken_read(monkeypatch, OSError(errno.EIO, "Input/output error"))
 
         result = runner.invoke(
             cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Lost terminal"]
         )
 
         assert result.exit_code == 1, result.output
-        # A prefix rather than the whole line: since plan 29-09 the fronts pass
+        # A prefix rather than the whole line: the fronts pass
         # A already fed are preserved, because nobody chose to stop, and the
         # error line goes on to name how many were kept and where.  The exit
         # code is unchanged, which is what preserving the exception type buys.
@@ -1256,37 +1261,22 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        Ctrl-C while the prompt is up resolves ``ABORTED``, not a raw interrupt.
+        Ctrl-C while the question waits resolves ``ABORTED``, not a raw interrupt.
 
-        SIGINT is handled on the main thread, so a real Ctrl-C does not reach
-        ``click.confirm`` on the prompt thread at all -- it raises
-        ``KeyboardInterrupt`` out of the calling thread's bounded wait (measured
-        with a real SIGINT against a never-answering stdin).  A real signal
-        cannot be sent here without taking the pytest session down with it if
-        the handling regressed, so the answer slot's wait is made to raise.
+        SIGINT is handled on the main thread, which is the thread the question
+        waits on, so it raises ``KeyboardInterrupt`` out of the wait.  A real
+        signal cannot be sent here without taking the pytest session down with
+        it if the handling regressed, so the wait is made to raise; the real
+        signal is sent on a real terminal in ``test_cli_prompt_terminal``.
         """
-
-        def interrupted_wait(timeout: float) -> None:
-            """Raise as SIGINT would on the main thread."""
-            raise KeyboardInterrupt
-
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        self._typed(monkeypatch, "")
+        broken_read(monkeypatch, KeyboardInterrupt())
         coordinator = ClickFlipCoordinator()
-        monkeypatch.setattr(coordinator._slot, "wait", interrupted_wait)
 
-        try:
-            outcome = coordinator.wait_for_flip(600)
-        finally:
-            release.set()
+        outcome = coordinator.wait_for_flip(600)
 
         assert outcome is FlipOutcome.ABORTED
+        assert coordinator.abort_cause is None
 
     @pytest.mark.parametrize(
         "failure",
@@ -1305,23 +1295,17 @@ class TestManualDuplexPrompt:
         failure: Exception,
     ) -> None:
         """
-        WR-08: an unexpected prompt failure ends the wait now, as ``ABORTED``.
+        An unexpected prompt failure ends the wait now, as ``ABORTED``.
 
-        A prompt thread that died on anything but ``click.Abort`` used to leave
-        the calling thread waiting out the whole ``operator_wait_timeout_seconds`` and
-        then report that nobody confirmed the flip, which was false.  It is an
-        abort, not a fourth outcome (D-09), and the traceback in the log carries
-        the real cause.  The failure itself is kept as ``abort_cause``, so the
-        pipeline reports a broken prompt as a failure rather than as the
-        operator's cancel (D-02).  The suite's ``filterwarnings = ["error"]``
-        also turns a prompt thread that died unhandled into a failure here.
+        A broken read must not leave the scan waiting out the whole
+        ``operator_wait_timeout_seconds`` and then report that nobody confirmed
+        the flip, which would be false.  It is an abort, not a fourth outcome,
+        and the traceback in the log carries the real cause.  The
+        failure itself is kept as ``abort_cause``, so the pipeline reports a
+        broken prompt as a failure rather than as the operator's cancel.
         """
-
-        def broken_confirm(*_args: object, **_kwargs: object) -> bool:
-            """Fail the way a broken terminal does."""
-            raise failure
-
-        monkeypatch.setattr("saneless.cli.click.confirm", broken_confirm)
+        self._typed(monkeypatch, "")
+        broken_read(monkeypatch, failure)
         caplog.set_level(logging.ERROR, logger="saneless.cli")
         coordinator = ClickFlipCoordinator()
 
@@ -1342,30 +1326,55 @@ class TestManualDuplexPrompt:
         assert len(records) == 1
         assert records[0].exc_info is not None
 
+    def test_a_closed_stdin_at_the_question_is_a_broken_prompt(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        No stdin at all when the question is asked: a failure, never a crash.
+
+        The scan refuses a closed stdin before any paper moves, so this is the
+        coordinator's own guard: it answers as a broken read does.
+        """
+        monkeypatch.setattr(sys, "stdin", None)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        coordinator = ClickFlipCoordinator()
+
+        outcome = coordinator.wait_for_flip(600)
+
+        assert outcome is FlipOutcome.ABORTED
+        assert isinstance(coordinator.abort_cause, OSError)
+        assert any(
+            "Flip prompt failed" in record.getMessage() for record in caplog.records
+        )
+
     def test_answering_no_leaves_no_abort_cause(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A no is the operator's own abort, so there is no cause to report (D-02)."""
-        monkeypatch.setattr(
-            "saneless.cli.click.confirm", lambda *_args, **_kwargs: False
-        )
+        """A no is the operator's own abort, so there is no cause to report."""
+        self._typed(monkeypatch, "n\n")
         coordinator = ClickFlipCoordinator()
 
         outcome = coordinator.wait_for_flip(600)
 
         assert outcome is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
+
+    @pytest.mark.parametrize("typed", ["\n", "y\n", "YES\n", " Y \n"])
+    def test_yes_or_just_return_continues(
+        self, monkeypatch: pytest.MonkeyPatch, typed: str
+    ) -> None:
+        """Yes, in any case, or Return on its own (the default) continues."""
+        self._typed(monkeypatch, typed)
+
+        outcome = ClickFlipCoordinator().wait_for_flip(600)
+
+        assert outcome is FlipOutcome.CONTINUED
 
     def test_eof_at_the_prompt_leaves_no_abort_cause(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ctrl-D (``click.Abort`` from the prompt) is an operator abort (D-02)."""
-
-        def end_of_input(*_args: object, **_kwargs: object) -> bool:
-            """Fail the way click.confirm does at EOF."""
-            raise click.Abort
-
-        monkeypatch.setattr("saneless.cli.click.confirm", end_of_input)
+        """Ctrl-D (end of input at the question) is an operator abort."""
+        self._typed(monkeypatch, "")
         coordinator = ClickFlipCoordinator()
 
         outcome = coordinator.wait_for_flip(600)
@@ -1373,52 +1382,26 @@ class TestManualDuplexPrompt:
         assert outcome is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
 
-    def test_ctrl_c_before_a_prompt_failure_leaves_no_abort_cause(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    def test_ctrl_c_leaves_no_abort_cause_and_no_thread(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A Ctrl-C that claimed first keeps its meaning when the prompt then breaks.
+        Ctrl-C keeps its meaning, a cancel, and leaves nothing reading stdin.
 
-        The order is forced, not timed: the prompt stays blocked until
-        ``wait_for_flip`` has already returned the Ctrl-C's ``ABORTED``, and only
-        then fails.  Its offer loses, so no cause is recorded and the run is
-        still the operator's cancel -- but the failure is still logged (D-02,
-        WR-08).
+        The question was read on the calling thread, so once ``wait_for_flip``
+        has returned nothing of it is left behind to answer late.
         """
-
-        def interrupted_wait(timeout: float) -> None:
-            """Raise as SIGINT would on the main thread."""
-            raise KeyboardInterrupt
-
-        release = threading.Event()
-
-        def fails_once_released(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then fail with a terminal I/O error."""
-            release.wait()
-            raise OSError(errno.EIO, "Input/output error")
-
-        monkeypatch.setattr("saneless.cli.click.confirm", fails_once_released)
-        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        self._typed(monkeypatch, "")
+        broken_read(monkeypatch, KeyboardInterrupt())
         coordinator = ClickFlipCoordinator()
-        monkeypatch.setattr(coordinator._slot, "wait", interrupted_wait)
 
-        try:
-            outcome = coordinator.wait_for_flip(600)
-        finally:
-            release.set()
+        outcome = coordinator.wait_for_flip(600)
+
         assert _FLIP_PROMPT_THREAD not in [
             thread.name for thread in threading.enumerate()
         ]
-
         assert outcome is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
-        assert any(
-            "Flip prompt failed" in record.getMessage() and record.exc_info is not None
-            for record in caplog.records
-            if record.name == "saneless.cli"
-        )
 
     def test_the_coordinator_times_out_at_a_zero_timeout(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1427,54 +1410,57 @@ class TestManualDuplexPrompt:
         ``wait_for_flip(0)`` with nobody answering resolves ``TIMED_OUT``.
 
         The coordinator's own contract, independent of the config bounds that
-        keep zero out of ``operator_wait_timeout_seconds`` (WR-01): its ``timeout``
+        keep zero out of ``operator_wait_timeout_seconds``: its ``timeout``
         argument is the zero-cost seam, so no wall clock is spent here.
         """
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        self._typed(monkeypatch, "")
+        never_readable(monkeypatch, FakeClock())
         coordinator = ClickFlipCoordinator()
 
-        try:
-            outcome = coordinator.wait_for_flip(0)
-        finally:
-            release.set()
+        outcome = coordinator.wait_for_flip(0)
 
         assert outcome is FlipOutcome.TIMED_OUT
+
+    def test_a_bad_answer_is_asked_again_with_the_time_left(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A refused answer does not restart the clock: the deadline still stands.
+
+        The first answer is refused at 40 s into a 60 s wait; the question is
+        asked again for the remaining 20 s, and nothing comes.
+        """
+        clock = FakeClock()
+        waits: list[float] = []
+
+        def wait(_stream: object, timeout: float) -> bool:
+            """Answer once after 40 s, then stay silent for the time given."""
+            waits.append(timeout)
+            if len(waits) == 1:
+                clock.advance(40)
+                return True
+            clock.advance(timeout)
+            return False
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO("maybe\n"))
+        monkeypatch.setattr("saneless.cli._monotonic", clock)
+        monkeypatch.setattr("saneless.cli._wait_readable", wait)
+
+        outcome = ClickFlipCoordinator().wait_for_flip(60)
+
+        assert outcome is FlipOutcome.TIMED_OUT
+        assert waits == [60, 20]
 
     def test_unanswered_prompt_times_out_before_pass_b(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        An answer that never arrives fails the job on the flip wait (D-19).
+        An answer that never arrives fails the job on the flip wait.
 
-        The timeout is one second, the smallest value config accepts: zero is
-        no longer a legal ``operator_wait_timeout_seconds`` (WR-01), and the field is
-        typed ``int``, so a fractional float is rejected too.  One second of
-        wall clock buys the whole ``scan`` command end to end -- the bounded
-        wait expires and ``TIMED_OUT`` is claimed before pass B.  The
-        zero-cost version of the coordinator's own contract is
-        ``test_the_coordinator_times_out_at_a_zero_timeout``.
+        The whole ``scan`` command runs end to end: the bounded wait expires
+        and ``TIMED_OUT`` is claimed before pass B.  The wait runs on a fake
+        clock, so the one second the config allows at least costs nothing.
         """
-        # The only test in this class that stubs click.confirm instead of
-        # driving the real one, and it has to.  CliRunner's empty input stream
-        # hits EOF immediately, click.confirm raises Abort, and the coordinator
-        # would claim ABORTED in a race against TIMED_OUT -- a flaky test that
-        # passes on one machine.  This stub makes "the answer never comes"
-        # deterministic, and the finally releases it so the daemon thread ends
-        # with the test instead of lingering in the pytest process.
-        release = threading.Event()
-
-        def never_answered(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then decline."""
-            release.wait()
-            return False
-
         calls: list[str] = []
         uploads: list[str] = []
         runner, _ = _patch_cli(
@@ -1484,16 +1470,13 @@ class TestManualDuplexPrompt:
             paperless_cls=_recording_paperless(uploads),
         )
         self._interactive(monkeypatch)
-        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        never_readable(monkeypatch, FakeClock())
 
-        try:
-            result = runner.invoke(
-                cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Forgotten"]
-            )
-        finally:
-            release.set()
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Forgotten"]
+        )
 
-        # A forgotten prompt is a failure, not a cancel: exit 1, never 130 (D-02).
+        # A forgotten prompt is a failure, not a cancel: exit 1, never 130.
         assert result.exit_code == 1, result.output
         assert "flip wait" in result.output
         assert len(calls) == 1

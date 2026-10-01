@@ -68,6 +68,7 @@ from saneless.config import (
 )
 from saneless.exceptions import ScanError, ScanInterrupted
 from saneless.vocabulary import ExitCode
+from tests.conftest import poll_until
 from tests.golden_support import (
     DOCUMENTS_PATH,
     DistinctPageScanner,
@@ -76,6 +77,7 @@ from tests.golden_support import (
     embedded_streams,
     png_idat,
 )
+from tests.prompt_support import readable
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
@@ -98,6 +100,11 @@ _INTERRUPTING = (signal.SIGTERM, signal.SIGHUP)
 # Short next to pytest-timeout's ceiling, so a flip wait the signal failed to
 # end still finishes inside the test instead of hanging it.
 _FLIP_TIMEOUT_SECONDS = 10
+
+# The longest a prompt's own thread waits for the main thread's handler to
+# run for a signal it has just sent: a bound on a failure, not a pause, since
+# the handler runs at the main thread's next bytecode.
+_SIGNAL_HANDLED_SECONDS = 10
 
 type _Disposition = Callable[[int, FrameType | None], object] | int | None
 
@@ -575,18 +582,19 @@ def test_sighup_at_the_flip_prompt_keeps_the_fronts_and_exits_129(
     """A hangup at the flip prompt: exit 129, the fronts kept, pass B never run."""
     signaller = _Signaller()
 
-    def hang_up(*_args: object, **_kwargs: object) -> bool:
+    def hang_up(_stream: object, _timeout: float) -> bool:
         """
-        Be the terminal closing: SIGHUP, then end of input on the prompt.
+        Be the terminal closing while the question waits: SIGHUP arrives.
 
-        Raises:
-            click.Abort: The end of input a closed terminal gives the prompt.
+        Returns:
+            That stdin is readable, which it is once the terminal closes:
+            at end of input.  Never reached while the handler raises.
 
         """
         signaller.send(signal.SIGHUP)
-        raise click.Abort
+        return True
 
-    monkeypatch.setattr("saneless.cli.click.confirm", hang_up)
+    monkeypatch.setattr("saneless.cli._wait_readable", hang_up)
     scanner = DistinctPageScanner(passes=((0, 2, 4), (5, 3, 1)))
 
     run = _run_cli(tmp_path, monkeypatch, profile=_DUPLEX, scanner=scanner)
@@ -610,38 +618,29 @@ def test_a_hangup_whose_end_of_input_lands_first_still_keeps_the_fronts(
     """
     End of input first, SIGHUP a moment later: still an interruption, not a cancel.
 
-    The other order of the same race.  The prompt thread sees end of input
-    before the main thread sees SIGHUP; the signal is sent from inside the
-    prompt thread's wait for it, so it lands after end of input by
-    construction, with no timed pause.  Settling ABORTED without that wait
-    would end the run as a cancel that keeps nothing.
+    The other order of the same race.  The question reads end of input (the
+    run's stdin is empty) before SIGHUP arrives; the signal is sent from
+    inside the pause end of input makes for it, so it lands after end of
+    input by construction, with no timed pause.  Settling ABORTED without
+    that pause would end the run as a cancel that keeps nothing.
     """
     signaller = _Signaller()
-    real_wait = _INTERRUPTION.wait
+    paused: list[float] = []
 
-    def end_of_input(*_args: object, **_kwargs: object) -> bool:
-        """
-        Be the closed terminal's end of input, arriving ahead of its signal.
-
-        Raises:
-            click.Abort: Always.
-
-        """
-        raise click.Abort
-
-    def signal_arrives(timeout: float) -> bool:
-        """Deliver the hangup's SIGHUP now, then wait for it as the code does."""
+    def signal_arrives(seconds: float) -> None:
+        """Be the grace pause, with the hangup's SIGHUP arriving in it."""
+        paused.append(seconds)
         signaller.send(signal.SIGHUP)
-        return real_wait(timeout)
 
-    monkeypatch.setattr("saneless.cli.click.confirm", end_of_input)
-    monkeypatch.setattr(_INTERRUPTION, "wait", signal_arrives)
+    readable(monkeypatch)
+    monkeypatch.setattr("saneless.cli.time.sleep", signal_arrives)
     scanner = DistinctPageScanner(passes=((0, 2, 4), (5, 3, 1)))
 
     run = _run_cli(tmp_path, monkeypatch, profile=_DUPLEX, scanner=scanner)
 
     assert signaller.refusals == []
     assert signaller.sent == [signal.SIGHUP]
+    assert paused == [_HANGUP_GRACE_SECONDS]
     assert run.result.exit_code == ExitCode.HANGUP, run.result.output
     (kept,) = run.failed
     assert kept.stem.endswith("-quarterly-report-fronts"), kept.name
@@ -754,13 +753,15 @@ def test_a_hangup_whose_end_of_input_lands_first_at_a_multi_page_question(
     End of input first, SIGHUP a moment later, at a multi-page question: kept.
 
     The multi-page question's version of the flip prompt's race.  The
-    signal is sent from inside the prompt thread's wait for it, so it lands
-    after end of input by construction, with no timed pause.  Settling the
-    question as an abort without that wait would end the run as a cancel
+    signal is sent from inside the prompt thread's pause for it, so it lands
+    after end of input by construction, with no timed pause.  The pause then
+    lasts until the handler, on the main thread, has recorded the signal, as
+    the real pause outlasts a signal that arrives within it.  Settling the
+    question as an abort without that pause would end the run as a cancel
     that keeps nothing.
     """
     signaller = _Signaller()
-    real_wait = _INTERRUPTION.wait
+    paused: list[float] = []
     questions: list[str] = []
 
     def prompt(
@@ -781,13 +782,26 @@ def test_a_hangup_whose_end_of_input_lands_first_at_a_multi_page_question(
             return value_proc("n")
         raise click.Abort
 
-    def signal_arrives(timeout: float) -> bool:
-        """Deliver the hangup's SIGHUP now, then wait for it as the code does."""
+    def handled() -> bool:
+        """
+        Say whether the handler has run: its first act replaces itself.
+
+        Returns:
+            Whether SIGHUP's disposition is no longer the handler.
+
+        """
+        return signal.getsignal(signal.SIGHUP) is not _interrupt_handler
+
+    def signal_arrives(seconds: float) -> None:
+        """Be the grace pause, with the hangup's SIGHUP arriving in it."""
+        paused.append(seconds)
         signaller.send(signal.SIGHUP)
-        return real_wait(timeout)
+        # No assertion here: this runs on the prompt's thread, and the test
+        # reads the outcome the main thread reports.
+        poll_until(handled, _SIGNAL_HANDLED_SECONDS)
 
     monkeypatch.setattr("saneless.cli.click.prompt", prompt)
-    monkeypatch.setattr(_INTERRUPTION, "wait", signal_arrives)
+    monkeypatch.setattr("saneless.cli.time.sleep", signal_arrives)
     scanner = DistinctPageScanner(passes=((0,), (1,), (2,)))
 
     run = _run_scan(
@@ -799,6 +813,7 @@ def test_a_hangup_whose_end_of_input_lands_first_at_a_multi_page_question(
 
     assert signaller.refusals == []
     assert signaller.sent == [signal.SIGHUP]
+    assert paused == [_HANGUP_GRACE_SECONDS]
     assert len(questions) == 2
     assert run.result.exit_code == ExitCode.HANGUP, run.result.output
     (kept,) = run.failed
