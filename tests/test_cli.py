@@ -6509,8 +6509,9 @@ class TestEntryPointsCloseTheBackend:
     command that exits 1 has finished with the scanner exactly as much as one
     that exits 0.
 
-    ``serve`` is the exception and is asserted as one: its backend is handed to
-    ``create_app`` and outlives the command body, so the lifespan closes it.
+    ``serve`` is the exception and is asserted as one: once its server has
+    started, the backend outlives the command body and the lifespan closes it.
+    Before that, nobody else will, so a start that fails closes it here.
     """
 
     def test_scan_closes_the_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6667,6 +6668,34 @@ class TestEntryPointsCloseTheBackend:
 
         assert result.exit_code == 2, result.output
         assert [scanner.close_calls for scanner in built] == [1]
+
+    @pytest.mark.usefixtures("uvicorn_loggers_restored")
+    def test_serve_leaves_the_backend_to_a_lifespan_that_took_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Once the lifespan owns the backend, a failed run does not close it here.
+
+        The lifespan keeps SANE open on purpose when a thread will not stop,
+        and that thread may be inside a SANE call that a shutdown from here
+        would pull out from under it.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+        real_create_app = cli_module.create_app
+
+        def taken_over(settings: Settings, scanner: ScannerBackend) -> FastAPI:
+            app = real_create_app(settings, scanner)
+            app.state.lifespan_started = True
+            return app
+
+        monkeypatch.setattr("saneless.cli.create_app", taken_over)
+        _fake_server_run(monkeypatch, started=False)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 2, result.output
+        assert [scanner.close_calls for scanner in built] == [0]
 
     def test_serve_leaves_sane_uninitialised_after_a_failed_start(
         self, monkeypatch: pytest.MonkeyPatch

@@ -2229,12 +2229,31 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         except ScanError as exc:
             msg = f"The web server could not start: {exc}"
             raise ConfigError(msg) from exc
-        # No close callback here, unlike the three one-shot commands: this
-        # backend outlives the command body.  The app is handed it and the
-        # lifespan closes it once the worker confirms it stopped, which is the
-        # only point at which no thread can still be inside SANE.
-        app = create_app(settings, scanner)
-        _run_server(app, sockets, settings.output.log_level)
+        # This backend outlives the command body once the server is up: the
+        # lifespan closes it after the worker confirms it stopped, which is
+        # the only point at which no thread can still be inside SANE, and it
+        # deliberately leaves it open when a thread is stuck. So serve never
+        # closes it after a successful start. Until the lifespan has taken it
+        # over, though, nobody else will: an app that could not be built
+        # (exit 3) or a server that never started (exit 2) would otherwise
+        # leave SANE initialised. The stack holds the close until then.
+        with contextlib.ExitStack() as unowned:
+            unowned.callback(scanner.close)
+            # create_app closes the job store and Paperless client itself if
+            # it raises, and a lifespan whose start-up raises closes them too.
+            app = create_app(settings, scanner)
+            try:
+                _run_server(app, sockets, settings.output.log_level)
+            except BaseException:
+                # Read so that it cannot raise: an error here would replace
+                # the one that ended the run.
+                state = getattr(app, "state", None)
+                if getattr(state, "lifespan_started", False):
+                    unowned.pop_all()
+                raise
+            # A normal return means the server ran, so its lifespan owned the
+            # backend and has already closed it, or kept it open on purpose.
+            unowned.pop_all()
     finally:
         for sock in sockets:
             sock.close()
