@@ -113,6 +113,16 @@ find "$DATA_DIR/failed" -type f -exec chmod 600 {} +
 
 `chmod` reports an error for a path that does not exist yet, such as `failed/` before any scan has been preserved; that path needs nothing.
 
+## Step 5: Start the web server
+
+```bash
+saneless serve
+```
+
+It prints the address it serves on, `0.0.0.0:8080` unless you change `web_host` and `web_port` in [`[output]`](../reference/configuration.md#output) or pass `--host` and `--port`. Ctrl-C or SIGTERM stops it gracefully, with exit code 0.
+
+If you run `saneless serve` as a systemd service, set `TimeoutStopSec=90` in the unit's `[Service]` section. systemd kills a service that is still running when its stop timeout runs out, and the default timeout depends on the distribution and the system's `DefaultTimeoutStopSec`. A stop during a scan may need up to 90 seconds to keep the pages scanned so far, the same time the shipped `docker-compose.yml` gives the container with `stop_grace_period: 90s`.
+
 ## Troubleshooting
 
 **`python-sane` fails to compile**

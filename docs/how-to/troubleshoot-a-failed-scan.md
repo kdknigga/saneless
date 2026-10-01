@@ -563,8 +563,8 @@ Ctrl-C is different. It is a deliberate cancel, exits 130 and keeps nothing (see
 saneless was still moving its pages into `failed/`: pressing Ctrl-C then stops the move, and
 whatever had not reached `failed/` yet is lost, so let a failed scan finish reporting first. To run a long scan over SSH without a dropped
 connection interrupting it, start it under `tmux` or `screen`, or with `nohup`: a signal the
-command was started with ignored stays ignored, so under `nohup` a hangup does not interrupt it. `saneless serve` keeps the web
-server's own signal handling, where SIGTERM is a graceful stop.
+command was started with ignored stays ignored, so under `nohup` a hangup does not interrupt it. Once `saneless serve`
+is running, SIGTERM is a graceful stop that exits 0.
 
 ## A scan stopped by a crash or a power cut
 

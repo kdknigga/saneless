@@ -34,7 +34,7 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | 130 | Cancelled by the operator |
 | 143 | Interrupted by SIGTERM. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 
-Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had when it can, and the `Interrupted:` line says what was kept, or where the pages were left. A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's pages already being kept -- does not change it: the command finishes and exits with that outcome's own code. No path on that line means nothing was kept: the command was not a scan, or it was stopped before its first page. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. `serve` keeps the web server's own handling, where SIGTERM is a graceful stop. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
+Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had when it can, and the `Interrupted:` line says what was kept, or where the pages were left. A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's pages already being kept -- does not change it: the command finishes and exits with that outcome's own code. No path on that line means nothing was kept: the command was not a scan, or it was stopped before its first page. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. A running `serve` stops gracefully on SIGTERM and exits 0, as on Ctrl-C, whether or not it is the container's first process (PID 1). Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
 
 ---
 
@@ -292,7 +292,7 @@ Once the addresses are bound, `serve` prints one `Serving on http://<address>:<p
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean shutdown, including Ctrl-C once the web server is running |
+| 0 | Clean shutdown, including Ctrl-C or SIGTERM once the web server is running |
 | 2 | Cannot start (port already in use, a host that does not resolve or an address that cannot be bound, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
 | 3 | The TLS trust store named by `SSL_CERT_FILE` or `SSL_CERT_DIR` cannot be read |
 | 5 | Unexpected error (a saneless bug; the traceback is in the stream, not a file -- `serve` writes none) |

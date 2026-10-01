@@ -189,8 +189,8 @@ path on that line means nothing was kept: the command was not a scan, or the sca
 before its first page. So after 129 or 143, look for a kept file only where that line names one.
 A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's
 pages already being kept -- does not change it: the command exits with that outcome's own code.
-`saneless serve` is the exception: it keeps the web server's own signal handling, where SIGTERM is
-a graceful stop.
+`saneless serve` is the exception: once the web server is running, SIGTERM is a graceful stop and
+it exits 0, as on Ctrl-C.
 
 Every failure prints one line to stderr (a configuration error prints a header naming the file,
 then one line per problem). [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) explains
