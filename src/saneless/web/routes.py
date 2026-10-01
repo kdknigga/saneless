@@ -3683,14 +3683,18 @@ def _metadata_retry_seconds(ttl: float) -> int:
     """
     Say how often a list that could not be loaded asks again, in seconds.
 
-    As often as the cache forgets the failure, so every retry is a real
-    fetch and none is answered from the cache's memory of it: the negative
-    TTL, or the cache's own TTL when that is shorter.  Rounded up to whole
-    seconds for htmx's trigger, and never under
-    ``METADATA_RETRY_FLOOR_SECONDS``, so a short or disabled cache cannot
-    make every open page ask paperless-ngx once a second.  A floor longer
-    than the memory still leaves every retry a real fetch.  Both constants
-    are read here, at call time, not bound when the module loads.
+    No sooner than the cache forgets the failure: the negative TTL, or the
+    cache's own TTL when that is shorter.  The retry replaces itself with
+    every answer, so it asks again this long after the last answer landed
+    (see ``partials/list_retry.html``).  The cache remembers a failure from
+    when the failed fetch ended, before that answer, so the next ask is past
+    the memory its own last fetch left, and asks paperless-ngx unless
+    another request asked meanwhile.  Rounded up to whole seconds for htmx's
+    trigger, and never under ``METADATA_RETRY_FLOOR_SECONDS``, so a short or
+    disabled cache cannot make every open page ask paperless-ngx once a
+    second.  A floor longer than the memory only leaves the next ask further
+    past it.  Both constants are read here, at call time, not bound when the
+    module loads.
 
     Args:
         ttl: The configured ``paperless_cache_ttl_seconds``.
@@ -3838,34 +3842,42 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
     """
     Say whether a list that could not be loaded can be loaded now.
 
-    A list rendered unavailable carries a hidden retry that asks here every
-    ``_metadata_retry_seconds``, for as long as that rendering is on the
-    page.  The answer changes nothing on the page by itself.  When the list
-    can be loaded, it is a 200 that fires ``<resource>-recovered``, and the
+    A list rendered unavailable carries a hidden retry that asks here, for
+    as long as that rendering is on the page.  The answer is a 200 whose
+    body is a fresh copy of the retry, which replaces the one that asked and
+    nothing else, so the retry asks again ``_metadata_retry_seconds`` after
+    this answer lands (see ``partials/list_retry.html``).  When the list can
+    be loaded, the answer also fires ``<resource>-recovered``, and the
     page's own recovery element for that list asks for it again, carrying
     what the form shows at that moment: the ticks and filter, or the
-    choice.  Otherwise it is a 204, which htmx swaps nowhere.
+    choice.
 
-    The retry carries nothing of the form, and its answer renders nothing,
-    so it can never put back a tick or a choice changed while it was in
-    flight, nor a profile's defaults changed away from.  The list it brings
-    back is asked for only after it lands, and that request is synced with
-    the list's own profile-change request: whichever comes second is
-    abandoned (see ``index.html``).
+    The retry carries nothing of the form, and its answer renders only the
+    retry, so it can never put back a tick or a choice changed while it was
+    in flight, nor a profile's defaults changed away from.  The list it
+    brings back is asked for only after it lands, and that request is
+    synced with the list's own profile-change request: whichever comes
+    second is abandoned (see ``index.html``).  The fresh copy is sent on
+    recovery too, so a recovery request that is dropped or fails is asked
+    again; the recovered list replaces it.
 
     The fetch goes through the cache, as the lists' own do, so a list the
-    cache still remembers failing is answered at once, and the retry's
-    interval makes every other ask a real fetch within the short budget.  A
-    hidden list is never fetched, and its answer is a 204.  Nothing here is
-    refused: the retry polls, and an error would be written into the alert
-    slot on every tick.
+    cache still remembers failing is answered at once.  The cache remembers
+    a failure from when the failed fetch ended, so a retry timed from this
+    answer is past the memory its own fetch left, and asks paperless-ngx
+    within the short budget unless another request asked meanwhile.  A
+    hidden list is never fetched, and no page renders a retry for it, so
+    its answer is a 204, which htmx swaps nowhere.  Nothing here is refused: the
+    retry polls, and an error would be written into the alert slot on every
+    tick.
 
     Args:
         request: The incoming HTTP request.
         resource: The list to ask about, ``tags`` or ``correspondents``.
 
     Returns:
-        A 200 firing the list's recovery event, or a 204.
+        A 200 with a fresh retry, firing the list's recovery event when it
+        can be loaded, or a 204 for a hidden list.
 
     """
     state = request.app.state
@@ -3874,14 +3886,25 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
         if resource == "tags"
         else state.settings.web.show_correspondent
     )
-    if shown and (
+    if not shown:
+        return Response(status_code=204)
+    loaded = (
         _cached_list_or_none(
             state.cache, state.paperless, resource, timeout=_REQUEST_FETCH_TIMEOUT
         )
         is not None
-    ):
-        return Response(headers={"HX-Trigger": f"{resource}-recovered"})
-    return Response(status_code=204)
+    )
+    return state.templates.TemplateResponse(
+        request,
+        "partials/list_retry.html",
+        {
+            "retry_resource": resource,
+            "retry_seconds": _metadata_retry_seconds(
+                state.settings.output.paperless_cache_ttl_seconds
+            ),
+        },
+        headers={"HX-Trigger": f"{resource}-recovered"} if loaded else None,
+    )
 
 
 @router.post("/api/cache/invalidate")

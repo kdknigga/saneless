@@ -45,7 +45,7 @@ Each control has one line of help text beneath it. The form has up to five field
 
 ## Start the scan
 
-The page opens before the tag and correspondent lists arrive from paperless-ngx: each says it is loading, and the **Scan** button stays greyed out with *"Scan waits for the tags and correspondents to load..."* beneath it. That usually takes a moment, but if paperless-ngx is slow to answer it can take ten seconds or more, and longer with a very large tag list. If paperless-ngx cannot be reached, each list says it could not be loaded and **Scan** is offered anyway, with the profile's default tags still ticked (by number) and its default correspondent still selected. The lists try again by themselves about every 15 seconds, and the refresh buttons try at once.
+The page opens before the tag and correspondent lists arrive from paperless-ngx: each says it is loading, and the **Scan** button stays greyed out with *"Scan waits for the tags and correspondents to load..."* beneath it. That usually takes a moment, but if paperless-ngx is slow to answer it can take ten seconds or more, and longer with a very large tag list. If paperless-ngx cannot be reached, each list says it could not be loaded and **Scan** is offered anyway, with the profile's default tags still ticked (by number) and its default correspondent still selected. The lists try again by themselves about 15 seconds after each attempt, and the refresh buttons try at once.
 
 Click the **Scan** button at the bottom of the form. The button disables and reads **Queued…** until the scanner starts on your job, then **Scanning…** while it runs. Do not close the browser tab during scanning.
 

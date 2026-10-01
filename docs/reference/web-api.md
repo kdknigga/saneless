@@ -407,11 +407,13 @@ land in the page's alert slot on every tick and hold the Scan button for good.
 **Response:** `200` with an HTML body whose main part, empty, replaces the loader element
 that asked, which removes it. A list that could not be loaded carries its own hidden retry,
 inside the tag list or inside the help line under the dropdown, which asks
-[`GET /api/metadata/probe`](#get-apimetadataprobe) every 15 seconds, or every
-`paperless_cache_ttl_seconds` if that is shorter, but never more often than once every 5
-seconds: as often as the failure is forgotten, so each retry really asks paperless-ngx,
-with a floor so a short or disabled cache (`0`) cannot make every open page ask
-paperless-ngx once a second while it is down. Whatever later replaces that list, such as a
+[`GET /api/metadata/probe`](#get-apimetadataprobe) 15 seconds after its last answer, or
+`paperless_cache_ttl_seconds` after it if that is shorter, but never sooner than 5 seconds
+after it. Each answer replaces the retry, so the wait starts when the answer lands. The
+failure is forgotten that long after the failed request to paperless-ngx ended, so each
+retry really asks paperless-ngx, unless another request has just asked it. The floor keeps
+a short or disabled cache (`0`) from making every open page ask paperless-ngx once a
+second while it is down. Whatever later replaces that list, such as a
 profile change, a filter or a refresh, brings a retry of its own if the list still could
 not be loaded, and none once it could.
 The rest is out of band:
@@ -436,10 +438,10 @@ A hidden list is neither fetched nor rendered.
 
 Says whether a list that could not be loaded can be loaded now. The hidden retry that such
 a list carries asks this (see [`GET /api/metadata`](#get-apimetadata)). It carries
-nothing of the form, and its answer changes nothing on the page by itself, so a retry in
-flight can never put back a tick or a choice, nor a profile's defaults after Profile has
-changed. The list is fetched through the cache with the budget described under
-`GET /api/tags`.
+nothing of the form, and its answer is a fresh copy of the retry, which replaces the retry
+and nothing else, so a retry in flight can never put back a tick or a choice, nor a
+profile's defaults after Profile has changed. The list is fetched through the cache with
+the budget described under `GET /api/tags`.
 
 **Query parameter:**
 
@@ -449,8 +451,8 @@ changed. The list is fetched through the cache with the budget described under
 
 | Status Code | Meaning |
 |-------------|---------|
-| 200 | The list can be loaded. The body is empty, and an `HX-Trigger` header fires `tags-recovered` or `correspondents-recovered`. The page then asks [`GET /api/tags`](#get-apitags) or [`GET /api/correspondents`](#get-apicorrespondents) for that list, carrying the filter and the ticked tags, or the chosen correspondent, as they are at that moment. It drops that request if the list's own profile change is in flight, and abandons it if Profile changes while it is in flight, because the profile change renders the list afresh |
-| 204 | The list still cannot be loaded, or it is hidden, in which case nothing is fetched. The retry asks again later |
+| 200 | The body is a fresh copy of the hidden retry, which replaces the one that asked, so the next retry comes one interval after this answer. If the list can be loaded, an `HX-Trigger` header also fires `tags-recovered` or `correspondents-recovered`. The page then asks [`GET /api/tags`](#get-apitags) or [`GET /api/correspondents`](#get-apicorrespondents) for that list, carrying the filter and the ticked tags, or the chosen correspondent, as they are at that moment. It drops that request if the list's own profile change is in flight, and abandons it if Profile changes while it is in flight, because the profile change renders the list afresh. Without the header, the list still cannot be loaded, and the retry asks again later |
+| 204 | The list is hidden. Nothing is fetched, and no page renders a retry for it |
 | 422 | Any other `resource` value, or none, before any work |
 
 ---

@@ -3987,7 +3987,7 @@ def _list_retry(resource: str, seconds: int = 15) -> str:
         '<span class="htmx-hidden"'
         f' hx-get="/api/metadata/probe?resource={resource}"'
         f' hx-trigger="every {seconds}s" hx-target="this" hx-include="this"'
-        ' hx-swap="none"></span>'
+        ' hx-swap="outerHTML"></span>'
     )
 
 
@@ -4124,6 +4124,41 @@ class _FailingList(_TimedList):
 
         """
         self.timeouts.append(timeout)
+        msg = "paperless unreachable"
+        raise ConnectionError(msg)
+
+
+class _ClockedFailingList(_TimedList):
+    """A list fetch that always fails, taking ``cost`` seconds of a stepped clock."""
+
+    def __init__(self, now: list[float], *, cost: float) -> None:
+        """
+        Fail after ``cost`` seconds of the clock ``now`` holds.
+
+        Args:
+            now: The clock's reading, one item, which each call moves on.
+            cost: How long each call takes before it fails.
+
+        """
+        super().__init__([])
+        self._now = now
+        self._cost = cost
+
+    def __call__(
+        self, *, timeout: float | httpx2.Timeout | None = None
+    ) -> list[dict[str, object]]:
+        """
+        Note the call, move the clock on by the cost, then fail.
+
+        Args:
+            timeout: The per-request budget.
+
+        Raises:
+            ConnectionError: Always, as an unreachable paperless-ngx does.
+
+        """
+        self.timeouts.append(timeout)
+        self._now[0] += self._cost
         msg = "paperless unreachable"
         raise ConnectionError(msg)
 
@@ -5643,11 +5678,13 @@ class TestListRetry:
     """
     A list that could not be loaded asks whether it can be now, and nothing more.
 
-    The retry carries nothing of the form and its answer swaps nothing: a 200
-    fires the list's recovery event, which the page's recovery element for
-    that list hears, and a 204 means not yet.  The recovery element asks for
-    the list with what the form shows then, so the list routes it uses keep
-    the ticks and the choice they are sent.
+    The retry carries nothing of the form, and its answer is a fresh copy of
+    the retry and nothing else, which replaces the one that asked so that
+    the next ask is timed from this answer.  When the list can be loaded the
+    answer also fires the list's recovery event, which the page's recovery
+    element for that list hears.  The recovery element asks for the list
+    with what the form shows then, so the list routes it uses keep the ticks
+    and the choice they are sent.
     """
 
     @pytest.mark.parametrize(
@@ -5657,7 +5694,12 @@ class TestListRetry:
     def test_a_list_that_loads_fires_its_recovery_event(
         self, tmp_path: Path, resource: str, getter: str
     ) -> None:
-        """A list that can be loaded is fetched once and fires its event."""
+        """
+        A list that can be loaded is fetched once and fires its event.
+
+        The answer still carries a fresh retry, so a recovery request that
+        is dropped or fails is asked again; the recovered list replaces it.
+        """
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
@@ -5670,17 +5712,22 @@ class TestListRetry:
 
         assert response.status_code == 200, response.text
         assert response.headers["HX-Trigger"] == f"{resource}-recovered"
-        assert response.text == ""
+        assert response.text.strip() == _list_retry(resource)
         assert fetch.timeouts == [_REQUEST_BUDGET]
 
     @pytest.mark.parametrize(
         ("resource", "getter"),
         [("tags", "get_tags"), ("correspondents", "get_correspondents")],
     )
-    def test_a_list_still_unavailable_is_a_quiet_no_content(
+    def test_a_list_still_unavailable_answers_a_fresh_retry_quietly(
         self, tmp_path: Path, resource: str, getter: str
     ) -> None:
-        """A list that still cannot be loaded fires nothing and refuses nothing."""
+        """
+        A list that still cannot be loaded fires nothing and refuses nothing.
+
+        It answers a fresh copy of the retry, which replaces the one that
+        asked, so the next ask is timed from this answer.
+        """
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             setattr(app.state.paperless, getter, _FailingList())
@@ -5691,9 +5738,59 @@ class TestListRetry:
                 headers={"HX-Request": "true"},
             )
 
-        assert response.status_code == 204, response.text
+        assert response.status_code == 200, response.text
+        assert response.text.strip() == _list_retry(resource)
         assert "HX-Trigger" not in response.headers
         assert "HX-Retarget" not in response.headers
+
+    def test_a_retry_one_interval_after_its_answer_asks_paperless_ngx(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A retry asked one interval after the last answer is a real fetch.
+
+        The retry's next ask comes one interval after the last answer
+        landed, because each answer replaces it and htmx times the new copy
+        from then.  Here every fetch fails only after the whole 2 s connect
+        budget, and the cache remembers each failure from when it ended.
+        Asked again exactly one interval after each answer, the earliest it
+        can be, every ask still reaches paperless-ngx.  The interval is read
+        from the retry the answer carries.  For contrast, an ask one
+        interval after the previous ask was sent, as a fixed-rate poll would
+        make, is answered from the cache's memory without asking.
+        """
+        now = [1000.0]
+        app = _pre_ticked_app(tmp_path)
+        failing = _ClockedFailingList(now, cost=_REQUEST_BUDGET.connect or 0.0)
+        with TestClient(app) as client:
+            app.state.cache = cache_module.MetadataCache(ttl=60, clock=lambda: now[0])
+            app.state.paperless.get_tags = failing
+
+            def _probe() -> int:
+                response = client.get(
+                    "/api/metadata/probe",
+                    params={"resource": "tags"},
+                    headers={"HX-Request": "true"},
+                )
+                assert response.status_code == 200, response.text
+                assert "HX-Trigger" not in response.headers
+                found = re.search(r'hx-trigger="every (\d+)s"', response.text)
+                assert found is not None, response.text
+                return int(found.group(1))
+
+            sent = now[0]
+            interval = _probe()
+            assert len(failing.timeouts) == 1
+            for asked in (2, 3, 4):
+                now[0] += interval
+                sent = now[0]
+                interval = _probe()
+                assert len(failing.timeouts) == asked
+            now[0] = sent + interval
+            _probe()
+
+        assert interval == 15
+        assert len(failing.timeouts) == 4
 
     @pytest.mark.parametrize(
         ("hidden", "resource", "getter"),

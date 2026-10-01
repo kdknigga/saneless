@@ -6,17 +6,30 @@
    the lazy list load -- replaces the retry with it, and htmx stops polling
    an element that has left the page.
 
-   It asks every retry_seconds, the cache's memory of the failure, so each
-   ask is a real fetch.  It carries nothing of the form and its answer
-   swaps nothing (hx-swap none), so a tick or a choice made while it is in
-   flight is never put back, and an answer landing after a profile change
-   cannot bring back the profile chosen before.  When the list can be loaded
-   the answer fires the list's recovery event, and the page's recovery
-   element for that list asks for it with what the form shows then (see
-   index.html).
+   Every answer is a fresh copy of this element, and it replaces this one
+   and nothing else (hx-swap outerHTML on itself).  htmx starts a polling
+   element's timer when it puts the element on the page, so the next ask is
+   retry_seconds after the last answer landed, not retry_seconds after the
+   last ask was sent.  That matters because the cache remembers a failure
+   from when the failed fetch ended, for no longer than retry_seconds: an
+   ask on a fixed rate would land inside the memory its own last fetch
+   renewed, and every other ask would be answered without asking
+   paperless-ngx.  Timed from the answer, every ask is past that memory,
+   so it asks paperless-ngx unless another request has just done so.  An
+   ask that gets no answer at all (htmx's own timeout, or the server gone)
+   leaves this element in place, still polling, so the retry outlives it.
+
+   It carries nothing of the form, and its answer is only this element, so
+   a tick or a choice made while it is in flight is never put back, and an
+   answer landing after a profile change cannot bring back the profile
+   chosen before.  When the list can be loaded the answer also fires the
+   list's recovery event, and the page's recovery element for that list
+   asks for it with what the form shows then (see index.html).  The copy
+   stays even then, so a recovery request that is dropped or fails is
+   asked again; the recovered list replaces it.
 
    The target and the include are its own, because it sits inside the tag
    list's wrapper and the scan form, whose hx-target and hx-include it would
    otherwise inherit: an inherited include would send the Profile select.
    retry_resource names the list, tags or correspondents, and retry_seconds
-   is that list's own interval from its context. #}<span class="htmx-hidden" hx-get="/api/metadata/probe?resource={{ retry_resource }}" hx-trigger="every {{ retry_seconds }}s" hx-target="this" hx-include="this" hx-swap="none"></span>
+   is that list's own interval from its context. #}<span class="htmx-hidden" hx-get="/api/metadata/probe?resource={{ retry_resource }}" hx-trigger="every {{ retry_seconds }}s" hx-target="this" hx-include="this" hx-swap="outerHTML"></span>

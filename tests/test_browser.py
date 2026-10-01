@@ -3928,6 +3928,10 @@ class TestProfileDefaultsInTheBrowser:
 # test, and long enough that the held page can be read first.
 _SHORT_FETCH_BUDGET = httpx2.Timeout(2.0, connect=2.0)
 
+# A budget a fetch into the black hole always waits out, long enough to put
+# its failure's end well after the moment it was asked.
+_BLACK_HOLE_FETCH_BUDGET = httpx2.Timeout(1.0, connect=1.0)
+
 # The limit the page must render within with paperless-ngx black-holed.
 _PAGE_RENDER_LIMIT_MS = 1000
 
@@ -4111,6 +4115,12 @@ _REQUESTS_SETTLED = """
 () => window.__requestsInFlight === 0
     && document.querySelector(".htmx-added, .htmx-settling") === null
 """
+
+# How many of the tag list's retries the page has had answered and handled.
+_TAG_RETRIES_ANSWERED = (
+    "window.__requestsFinished.filter("
+    '(url) => url.includes("/api/metadata/probe?resource=tags")).length'
+)
 
 # The two requests a profile change sends for the lists.
 _PROFILE_CHANGE_PATHS = frozenset({"/api/profiles/tags", "/api/profiles/correspondent"})
@@ -4415,7 +4425,8 @@ class TestLazyListsInTheBrowser:
             lambda r: "/api/metadata/probe?resource=correspondents" in r.url
         ) as retried:
             pass
-        assert retried.value.status == 204
+        assert retried.value.status == 200
+        assert "hx-trigger" not in retried.value.headers
         expect(page.locator("#status-message")).to_be_empty()
 
         with page.expect_response(
@@ -4436,6 +4447,61 @@ class TestLazyListsInTheBrowser:
         )
         expect(select).to_have_value("")
         expect(page.locator("#status-message")).to_be_empty()
+
+    def test_every_retry_asks_paperless_ngx_again(
+        self,
+        page: Page,
+        tmp_path: Path,
+        egress_allowlist: list[str],
+        black_holed_paperless: socket.socket,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        With paperless-ngx black-holed, each retry of the tag list asks it again.
+
+        Every fetch waits out its whole one-second budget before it fails,
+        and the cache remembers each failure for 1.5 s from when it ended.
+        The retry asks 2 s after each answer lands, so it is past that memory
+        every time, and every retry is a fetch.  A retry polling at a fixed
+        2 s rate would ask one second after its last fetch failed, inside the
+        memory, and every other ask would be answered without asking.
+        """
+        monkeypatch.setattr(
+            routes_module, "_REQUEST_FETCH_TIMEOUT", _BLACK_HOLE_FETCH_BUDGET
+        )
+        monkeypatch.setattr(cache_module, "NEGATIVE_TTL_SECONDS", 1.5)
+        monkeypatch.setattr(routes_module, "METADATA_RETRY_FLOOR_SECONDS", 2)
+        page.add_init_script(_COUNT_REQUESTS)
+        with _serve_black_holed(
+            black_holed_paperless, tmp_path, egress_allowlist
+        ) as server:
+            paperless = server.app.state.paperless
+            fetches: list[object] = []
+            real_fetch = paperless.get_tags
+
+            def _counted(
+                *, timeout: float | httpx2.Timeout | None = None
+            ) -> list[dict[str, object]]:
+                """Note the fetch, then ask the black hole."""
+                fetches.append(timeout)
+                return real_fetch(timeout=timeout)
+
+            monkeypatch.setattr(paperless, "get_tags", _counted)
+
+            page.goto(server.url)
+            tags_list = page.locator("#tags-list")
+            expect(tags_list).to_contain_text(TAGS_UNAVAILABLE, timeout=15_000)
+            expect(
+                tags_list.locator('[hx-get="/api/metadata/probe?resource=tags"]')
+            ).to_have_attribute("hx-trigger", "every 2s")
+            page.wait_for_function(
+                f"() => {_TAG_RETRIES_ANSWERED} >= 3", timeout=30_000
+            )
+            answered = page.evaluate(f"() => {_TAG_RETRIES_ANSWERED}")
+            fetched = len(fetches)
+
+        # One fetch for the page's own load, and one for every retry.
+        assert fetched == 1 + answered, (fetched, answered)
 
     def test_a_job_store_failure_during_the_load_releases_scan_quietly(
         self,
