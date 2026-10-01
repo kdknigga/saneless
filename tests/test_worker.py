@@ -7668,6 +7668,172 @@ class TestPerJobReinitialise:
         ]
 
 
+# How long a test leaves a job waiting on a held gate before it looks at the
+# row.  A SCANNING written ahead of the gate lands within microseconds of the
+# job being taken, so this is generous for the failure it is there to catch.
+_GATE_WAIT_WINDOW = 0.3
+
+
+class _GateStateRecorder:
+    """
+    ``JobStore.update_state`` that notes whether the test had let the gate go.
+
+    Every call records the state it was asked to write beside whether
+    ``released`` was set at that moment, then delegates, so the row the worker
+    writes is the row the test reads back.
+
+    Args:
+        original: The bound ``update_state`` being replaced.
+        released: Set by the test just before it releases the scanner gate.
+
+    """
+
+    def __init__(
+        self, original: Callable[..., None], released: threading.Event
+    ) -> None:
+        """Wrap ``original``, watching ``released``."""
+        self._original = original
+        self._released = released
+        self._lock = threading.Lock()
+        self._writes: list[tuple[JobState, bool]] = []
+
+    @property
+    def writes(self) -> list[tuple[JobState, bool]]:
+        """Each state written so far, with whether the gate had been let go."""
+        with self._lock:
+            return list(self._writes)
+
+    def __call__(
+        self,
+        job_id: str,
+        state: JobState,
+        error: str | None = None,
+        error_category: ErrorCategory | None = None,
+    ) -> None:
+        """Record the state and the gate's release, then delegate."""
+        with self._lock:
+            self._writes.append((state, self._released.is_set()))
+        self._original(job_id, state, error=error, error_category=error_category)
+
+
+def _a_scanner_free_of_startup_generation(
+    settings: Settings,
+) -> _ReinitRecordingScanner:
+    """
+    Give a worker test a recording scanner the worker reaches only for a job.
+
+    A second profile makes the set something other than the bare default, so
+    the worker thread skips startup generation and never takes the gate for
+    it: the first time the worker wants the gate is the job.
+
+    Args:
+        settings: The test's settings, given the second profile in place.
+
+    Returns:
+        A scanner recording every SANE call the worker makes.
+
+    """
+    settings.scanner.device = ""
+    settings.profiles["duplex"] = ProfileConfig(source="ADF Duplex")
+    return _ReinitRecordingScanner()
+
+
+class TestScanningWaitsForTheGate:
+    """
+    SCANNING is recorded only once the worker holds the scanner gate.
+
+    A health check can hold the gate for up to its listing deadline.  A job
+    submitted meanwhile has not started scanning, so its row stays PENDING --
+    the status area keeps "Starting scan..." -- until the worker has the
+    gate and the pipeline reports that the scan has begun.
+    """
+
+    def test_a_job_waiting_for_the_gate_stays_pending(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """With the gate held elsewhere, the taken job's row still reads PENDING."""
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        gate = worker.scanner_gate
+        try:
+            worker.start()
+            assert gate.acquire(timeout=_PASS_B_GATE_CEILING)
+            try:
+                job = store.create_job("default", "Waiting For The Gate")
+                worker.submit(job)
+                taken = poll_until(
+                    lambda: worker.current_job_id == job.id, _STATE_BUDGET
+                )
+                quiet_window(_GATE_WAIT_WINDOW)
+                during = store.get_job(job.id)
+                calls_during = list(scanner.calls)
+            finally:
+                gate.release()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert taken, "the worker never took the job"
+        assert during is not None
+        assert during.state is JobState.PENDING
+        assert calls_during == []
+        assert finished.state is JobState.DONE
+
+    def test_scanning_is_recorded_once_the_gate_is_held(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """SCANNING is written once, after PENDING, and only after the gate is free."""
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
+        store = JobStore()
+        released = threading.Event()
+        recorder = _GateStateRecorder(store.update_state, released)
+        monkeypatch.setattr(store, "update_state", recorder)
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        gate = worker.scanner_gate
+        try:
+            worker.start()
+            assert gate.acquire(timeout=_PASS_B_GATE_CEILING)
+            try:
+                job = store.create_job("default", "Scanning Under The Gate")
+                created = store.get_job(job.id)
+                worker.submit(job)
+                taken = poll_until(
+                    lambda: worker.current_job_id == job.id, _STATE_BUDGET
+                )
+                quiet_window(_GATE_WAIT_WINDOW)
+            finally:
+                released.set()
+                gate.release()
+            scanning = poll_until(
+                lambda: any(s is JobState.SCANNING for s, _ in recorder.writes),
+                _STATE_BUDGET,
+            )
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert taken, "the worker never took the job"
+        assert scanning, "SCANNING was never recorded"
+        assert created is not None
+        sequence = [created.state, *(state for state, _ in recorder.writes)]
+        assert sequence.count(JobState.SCANNING) == 1
+        assert sequence.index(JobState.PENDING) < sequence.index(JobState.SCANNING)
+        assert [
+            after for state, after in recorder.writes if state is JobState.SCANNING
+        ] == [True]
+        assert finished.state is JobState.DONE
+
+
 class TestProfileStorage:
     """
     ``ScanWorker.profile_storage`` records what the startup persist did (A-2).
