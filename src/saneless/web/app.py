@@ -65,7 +65,7 @@ from .throttle import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
     from saneless.config import Settings
     from saneless.scanner.base import ScannerBackend
@@ -260,6 +260,12 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
     are being kept -- during lifespan shutdown, after uvicorn has stopped
     serving.
 
+    This join is the largest part of the server's stop budget.  An idle
+    server stops within 10 seconds, Docker's default grace period: the
+    request drain, these joins, the closes and SANE's shutdown all fit inside
+    it.  A stop that lands while a stopped scan's pages are being preserved
+    may take up to 90 seconds, which the shipped ``stop_grace_period`` covers.
+
     Args:
         worker: The scan worker to stop first.
         refresher: The check refresher, joined with what is left of the bound.
@@ -273,6 +279,67 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
     worker_stopped = worker.stop()
     refresher_stopped = refresher.stop(timeout=max(0.0, deadline - time.monotonic()))
     return worker_stopped, refresher_stopped
+
+
+def _close_logged(name: str, close: Callable[[], object]) -> None:
+    """
+    Run one resource's close, logging a failure instead of raising it.
+
+    The server is on its way down when this runs, and one close that raises
+    must not leave the resources after it open.
+
+    Args:
+        name: What is being closed, as the log line names it.
+        close: The resource's close method.
+
+    """
+    try:
+        close()
+    except Exception:
+        logger.exception("Closing the %s failed; the rest are still closed", name)
+
+
+def _release_after_failed_start(
+    worker: ScanWorker,
+    refresher: CheckRefresher,
+    job_store: JobStore,
+    paperless: PaperlessClient,
+) -> bool:
+    """
+    Undo a lifespan start-up that raised part-way.
+
+    Whichever thread had started is stopped first, against the same deadline
+    as a shutdown.  Stopping a thread that never started is safe, so both are
+    asked.  The Paperless client and the job store are then closed, each on
+    its own, as at shutdown.  The scanner is not closed here: ``serve`` holds
+    it until the lifespan has taken ownership, and closes it itself.
+
+    A thread that does not stop may still be using all three, so then nothing
+    is closed, for the reason the shutdown gives.
+
+    Args:
+        worker: The scan worker, started or not.
+        refresher: The check refresher, started or not.
+        job_store: The job store to close.
+        paperless: The Paperless client to close.
+
+    Returns:
+        Whether both threads stopped and the store and client were closed.
+
+    """
+    worker_stopped, refresher_stopped = _stop_threads(worker, refresher)
+    if not (worker_stopped and refresher_stopped):
+        logger.warning(
+            "A background thread did not stop after the failed start-up; "
+            "leaving the job store, Paperless client and scanner open for "
+            "process exit"
+        )
+        return False
+    with contextlib.ExitStack() as closing:
+        # Last in, first out: the client closes first, then the store.
+        closing.callback(_close_logged, "job store", job_store.close)
+        closing.callback(_close_logged, "Paperless client", paperless.close)
+    return True
 
 
 def _open_job_store(settings: Settings) -> JobStore:
@@ -422,6 +489,13 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     Sets up the paperless client, job store, metadata cache, and scan
     worker. Mounts static files and registers all route handlers.
 
+    The configured directories are validated first, so a refused one leaves
+    nothing created and nothing open.  If anything after that raises, the job
+    store and the Paperless client already opened are closed before the error
+    propagates.  Once the app is built they belong to it, and its lifespan
+    closes them.  The scanner is never closed here: it belongs to the caller
+    until the lifespan has started.
+
     Args:
         settings: Application settings instance.
         scanner: Scanner backend to use for scan jobs.
@@ -429,18 +503,49 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     Returns:
         Configured FastAPI application ready to serve.
 
+    Raises:
+        ConfigError: A configured directory is unusable or unsafe.
+
     """
-    # Before anything that holds a resource, so a refused directory leaves
-    # nothing open.  Scratch space is created 0700 and refused if another
-    # user got to the name first; the lifespan's validate_settings_dirs then
-    # sees the directory this made.
-    ensure_private_dir(settings.output.tmp_dir, key="output.tmp_dir")
-    job_store = _open_job_store(settings)
-    paperless = PaperlessClient(
-        url=settings.paperless.url,
-        token=settings.paperless.token.get_secret_value(),
-        consume_dir=settings.paperless.consume_dir,
-    )
+    validate_settings_dirs(settings)
+    with contextlib.ExitStack() as acquired:
+        # Scratch space is created 0700 and refused if another user got to
+        # the name first.
+        ensure_private_dir(settings.output.tmp_dir, key="output.tmp_dir")
+        job_store = _open_job_store(settings)
+        acquired.callback(job_store.close)
+        # Reading the TLS trust store can fail here, with the store open.
+        paperless = PaperlessClient(
+            url=settings.paperless.url,
+            token=settings.paperless.token.get_secret_value(),
+            consume_dir=settings.paperless.consume_dir,
+        )
+        acquired.callback(paperless.close)
+        app = _assemble_app(settings, scanner, job_store, paperless)
+        # Built: from here the app's lifespan owns the store and the client.
+        acquired.pop_all()
+    return app
+
+
+def _assemble_app(
+    settings: Settings,
+    scanner: ScannerBackend,
+    job_store: JobStore,
+    paperless: PaperlessClient,
+) -> FastAPI:
+    """
+    Build the app around a job store and a Paperless client already open.
+
+    Args:
+        settings: Application settings instance.
+        scanner: Scanner backend to use for scan jobs.
+        job_store: The server's open job store.
+        paperless: The server's Paperless client.
+
+    Returns:
+        Configured FastAPI application ready to serve.
+
+    """
     cache = MetadataCache(ttl=settings.output.paperless_cache_ttl_seconds)
     # Each job checks its ids against the lists the pickers were served from,
     # asking paperless-ngx again only for an id they do not hold.
@@ -456,11 +561,12 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     )
 
     @contextlib.asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+    async def lifespan(running_app: FastAPI) -> AsyncGenerator[None]:
         """
         Recover, prune and start the worker at startup; stop it at shutdown.
 
-        Startup runs in a fixed order: validate the directories, recover
+        The directories were validated when the app was built.  Startup then
+        runs in a fixed order: recover
         the workspaces a killed process left in ``tmp_dir``, fail every job
         a previous process left active, prune history, and only then start
         the worker.  Recovery comes before the worker so the worker never
@@ -488,24 +594,51 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         that would not finish starting because of one is a worse appliance than
         one that starts and says so.
 
+        A startup that raises stops whichever thread it had started, closes
+        the Paperless client and the job store, and re-raises, so the server
+        refuses to start with nothing left open.  The scanner stays with
+        ``serve``, which closes it when the lifespan never took it over.
+        ``app.state.lifespan_started`` is what tells it: true once startup
+        finished, and also when a failed startup left a thread running, since
+        that thread may still be inside SANE.
+
         Shutdown stops both threads before closing anything, and closes the
         Paperless client, the job store and the scanner only when both confirm
-        they stopped.
+        they stopped.  Each close runs on its own: one that raises is logged
+        with its traceback and the others still run, in the same order.  It
+        is not raised again, because the process is stopping either way and
+        every other resource has been released.
+
+        The whole stop fits Docker's default 10-second grace period when the
+        server is idle.  A stop that lands while a stopped scan's pages are
+        being preserved may take up to 90 seconds, which the shipped
+        ``stop_grace_period`` covers.
         """
-        validate_settings_dirs(settings)
-        _recover_interrupted_jobs(settings, job_store, worker)
         try:
-            job_store.prune(
-                settings.output.history_retention_days,
-                settings.output.history_max_rows,
+            _recover_interrupted_jobs(settings, job_store, worker)
+            try:
+                job_store.prune(
+                    settings.output.history_retention_days,
+                    settings.output.history_max_rows,
+                )
+            except Exception:
+                logger.warning("Startup history prune failed", exc_info=True)
+            worker.start()
+            # After the worker, because the refresher's gate accessor reads
+            # worker.scanner_gate at probe time and its context reads
+            # worker.profile_storage.  Starting it costs one thread and no
+            # probe.
+            refresher.start()
+        except BaseException:
+            released = _release_after_failed_start(
+                worker, refresher, job_store, paperless
             )
-        except Exception:
-            logger.warning("Startup history prune failed", exc_info=True)
-        worker.start()
-        # After the worker, because the refresher's gate accessor reads
-        # worker.scanner_gate at probe time and its context reads
-        # worker.profile_storage.  Starting it costs one thread and no probe.
-        refresher.start()
+            # A thread still running may be inside SANE, so the scanner must
+            # not be shut down under it: the lifespan keeps it, as it would
+            # at shutdown.
+            running_app.state.lifespan_started = not released
+            raise
+        running_app.state.lifespan_started = True
         logger.info("App started")
         yield
         worker_stopped, refresher_stopped = _stop_threads(worker, refresher)
@@ -540,13 +673,21 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
                 worker.current_job_id,
             )
             return
-        paperless.close()
-        job_store.close()
-        # Last, and only here: closing the scanner shuts SANE down for the
-        # whole process, and sane_exit() closes every open handle while
-        # holding the GIL.  A worker that did not stop may still be inside a
-        # read, which is why the branch above returns instead.
-        scanner.close()
+        with contextlib.ExitStack() as closing:
+            # Registered in reverse, because the stack runs its callbacks last
+            # in, first out: the Paperless client closes first, then the job
+            # store, then the scanner.  Each is guarded on its own, and the
+            # stack still runs the rest if one raises something the guard
+            # does not catch.
+            #
+            # The scanner is last, and closed only here: closing it shuts SANE
+            # down for the whole process, and sane_exit() closes every open
+            # handle while holding the GIL.  A worker that did not stop may
+            # still be inside a read, which is why the branch above returns
+            # instead.
+            closing.callback(_close_logged, "scanner", scanner.close)
+            closing.callback(_close_logged, "job store", job_store.close)
+            closing.callback(_close_logged, "Paperless client", paperless.close)
         logger.info("App shutdown complete")
 
     # No generated schema and no interactive documentation: an unauthenticated
@@ -558,6 +699,9 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     install_error_handlers(app)
     _install_middleware(app, settings)
 
+    # Set by the lifespan once it owns the scanner; serve closes the scanner
+    # itself while this is still false.
+    app.state.lifespan_started = False
     app.state.worker = worker
     app.state.job_store = job_store
     app.state.settings = settings
