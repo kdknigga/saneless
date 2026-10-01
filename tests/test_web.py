@@ -5541,7 +5541,8 @@ class TestMetadataRoute:
         The loader polls, so an error would be written into the alert slot on
         every tick, and the lists that did load would be thrown away with it.
         The Scan button is rendered as though no job were running, and the
-        status poll, which owns the job, corrects it within a second.
+        status poll, which owns the job, corrects it once it can read the job
+        again.
         """
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:

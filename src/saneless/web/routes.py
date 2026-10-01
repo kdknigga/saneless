@@ -3714,11 +3714,13 @@ def _metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:
     loader polls until it is answered, and a poll cannot usefully receive an
     error: a store read that fails would be written into the alert slot on
     every tick, with the lists that did load thrown away and Scan held for
-    good.  So a
-    failure is logged and the button is rendered as though no job were
-    running, with the blocked verdict, which comes from the settings alone,
-    kept.  The status poll owns the job and corrects the button within a
-    second.
+    good.  So a failure is logged and the button is rendered as though no
+    job were running, with the blocked verdict, which comes from the
+    settings alone, kept.  The status poll owns the job and corrects the
+    button once it can read the job again.  Until then the poll reads the
+    same failing store and answers with its lost-contact fallback, which
+    carries no Scan button, so a press in that window is left to
+    ``start_scan``, which refuses or queues it.
 
     Args:
         request: The incoming request.
