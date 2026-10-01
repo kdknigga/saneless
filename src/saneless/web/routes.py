@@ -3859,9 +3859,16 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
     synced with the list's own profile-change request, which always wins: a
     recovery asked while the profile change is in flight is dropped, and
     one in flight when the profile change starts is abandoned (see
-    ``index.html``).  The fresh copy is sent on
-    recovery too, so a recovery request that is dropped or fails is asked
-    again; the recovered list replaces it.
+    ``index.html``).  The fresh copy is sent on recovery too, so a recovery
+    request that is dropped or fails is asked again; the recovered list
+    replaces it.
+
+    The recovery request does not keep a tick or a choice made while it is
+    itself in flight.  It normally reads the list this fetched from the
+    cache and lands at once.  With the cache disabled
+    (``paperless_cache_ttl_seconds = 0``) nothing is read from the cache, so
+    it fetches the list again, and can be in flight as long as any list
+    fetch.
 
     The fetch goes through the cache, as the lists' own do, so a list the
     cache still remembers failing is answered at once.  The cache remembers
@@ -3869,9 +3876,9 @@ def probe_metadata(request: Request, resource: MetadataResource) -> Response:
     answer is past the memory its own fetch left, and asks paperless-ngx
     within the short budget unless another request asked meanwhile.  A
     hidden list is never fetched, and no page renders a retry for it, so
-    its answer is a 204, which htmx swaps nowhere.  Nothing here is refused: the
-    retry polls, and an error would be written into the alert slot on every
-    tick.
+    its answer is a 204, which htmx swaps nowhere.  Nothing here is
+    refused: the retry polls, and an error would be written into the alert
+    slot on every tick.
 
     Args:
         request: The incoming HTTP request.

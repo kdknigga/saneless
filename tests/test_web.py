@@ -5793,6 +5793,38 @@ class TestListRetry:
         assert len(failing.timeouts) == 4
 
     @pytest.mark.parametrize(
+        ("cache_ttl", "fetches"),
+        [pytest.param(60, 1, id="cached"), pytest.param(0, 2, id="cache-disabled")],
+    )
+    def test_the_recovery_reads_the_list_the_retry_fetched_only_when_cached(
+        self, tmp_path: Path, cache_ttl: int, fetches: int
+    ) -> None:
+        """
+        The recovery reuses the retry's fetch, except with the cache disabled.
+
+        A retry that finds the list loadable fires the recovery, and the
+        page then asks ``GET /api/tags``.  With the cache on, that request
+        reads the list the retry fetched and lands at once.  With it off it
+        asks paperless-ngx again, so a tick made while it is in flight can be
+        undone for as long as a list fetch takes, which the page's comments
+        and the API reference say.
+        """
+        app = _pre_ticked_app(tmp_path, cache_ttl=cache_ttl)
+        with TestClient(app) as client:
+            _cold(app)
+            fetch: _TimedList = app.state.paperless.get_tags
+            probe = client.get(
+                "/api/metadata/probe",
+                params={"resource": "tags"},
+                headers={"HX-Request": "true"},
+            )
+            assert probe.headers["HX-Trigger"] == "tags-recovered"
+            recovered = client.get("/api/tags", headers={"HX-Request": "true"})
+
+        assert recovered.status_code == 200, recovered.text
+        assert fetch.timeouts == [_REQUEST_BUDGET] * fetches
+
+    @pytest.mark.parametrize(
         ("hidden", "resource", "getter"),
         [
             ("show_tags", "tags", "get_tags"),

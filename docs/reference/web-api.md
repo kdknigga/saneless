@@ -48,7 +48,11 @@ that could not be loaded keeps asking whether it can be loaded now, through
 the form. Once it can, the page asks for the list again with what the form shows at that
 moment, and drops or abandons that request if Profile is changing at the same time. So the
 lists never come back for a profile no longer chosen, and a tick or a choice made in the
-meantime is kept. Until the `GET /api/metadata` answer lands, the Scan button
+meantime is kept. A tick or a choice made while that last request is itself in flight is
+not kept, as with a filter or a refresh. That request is normally answered at once from
+the cache, but with the cache disabled (`paperless_cache_ttl_seconds = 0`) it asks
+paperless-ngx for the list again and can take as long as any list request. Until the
+`GET /api/metadata` answer lands, the Scan button
 is disabled with a line beneath it saying it waits for the lists; that answer releases it
 whether the lists arrived or could not be loaded. A form that shows neither list waits for
 nothing.
