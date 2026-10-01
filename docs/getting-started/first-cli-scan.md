@@ -35,8 +35,11 @@ Before you begin, make sure you have:
     For a quick test, run saneless directly:
 
     ```bash
-    docker run -p 8080:8080 ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    docker run --stop-timeout 90 -p 8080:8080 ghcr.io/kdknigga/saneless:0.2.0-rc.6
     ```
+
+    `--stop-timeout 90` gives a stop during a scan time to keep the pages
+    scanned so far.
 
     For a permanent setup alongside paperless-ngx, see the
     [Deploy with Docker Compose](../how-to/deploy-docker-compose.md) guide.

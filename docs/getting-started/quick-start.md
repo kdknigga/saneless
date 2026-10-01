@@ -20,12 +20,15 @@ The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyo
 
     ```bash
     docker run -p 8080:8080 \
+      --stop-timeout 90 \
       -v "$(pwd)/config:/etc/saneless" \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
       ghcr.io/kdknigga/saneless:0.2.0-rc.6
     ```
 
     Replace `192.168.1.50` with the IP address of the machine running `saned`.
+
+    `--stop-timeout 90` gives a stop during a scan time to keep the pages scanned so far. Without it Docker kills the container 10 seconds after asking it to stop.
 
     The container reads its configuration from `saneless.toml` inside the mounted `./config` directory. Put the file in `./config`, and keep the directory writable so saneless can save generated profiles to it.
 

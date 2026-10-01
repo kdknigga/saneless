@@ -60,6 +60,7 @@ on that box, and `SANELESS_SCANNER__HOST` pointing at it -- either
 
     ```bash
     docker run -p 8080:8080 \
+      --stop-timeout 90 \
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
       -e SANELESS_SCANNER__HOST=host.docker.internal \
@@ -97,6 +98,7 @@ machine that has the scanner.
 
     ```bash
     docker run -p 8080:8080 \
+      --stop-timeout 90 \
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
@@ -113,6 +115,10 @@ machine that has the scanner.
   mapping to serve it elsewhere, for example `-p 8888:8080`.
 - **The image runs as UID 1000.** If `id -u` on your host reports something else,
   run `chown -R 1000:1000 ./config` once. See [Docker](../reference/docker.md).
+- **`--stop-timeout 90` belongs on every `docker run`.** Docker kills a
+  container 10 seconds after asking it to stop unless told otherwise, and a stop
+  during a scan may need longer to keep the pages scanned so far. The shipped
+  `docker-compose.yml` sets the same budget as `stop_grace_period: 90s`.
 - **The data volume is part of the minimum** -- without it the job database and
   any preserved scans vanish when the container is recreated.
 

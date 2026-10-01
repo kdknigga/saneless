@@ -1043,8 +1043,9 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     outcome is on the job, not on the process.  Every one-shot
     command but ``serve`` installs handlers for SIGHUP and SIGTERM, so each of
     them has 129 and 143 (128 + the signal number): an interruption that keeps
-    the pages already scanned, unlike the cancel's 130.  ``serve`` keeps
-    uvicorn's own handlers, for which a SIGTERM is a graceful stop, exit 0.
+    the pages already scanned, unlike the cancel's 130.  A running ``serve``
+    turns SIGTERM into uvicorn's graceful stop, exit 0, whether or not it is
+    PID 1, so it has no 143.
     """
     text, name = _read(CLI_REFERENCE)
     tables = _command_exit_tables(text, name)
@@ -2116,6 +2117,48 @@ def test_the_deploy_guide_explains_the_stop_grace_period() -> None:
             f"{DEPLOY_HOWTO.name}: the {_STOPPING_HEADING!r} section does not "
             f"say {needle!r}"
         )
+
+
+# A line that starts a ``docker run`` command, as a code block shows it.
+# Prose naming the command does not start a line with it.
+_DOCKER_RUN_LINE = re.compile(r"^\s*(?:\$\s+)?docker run\b")
+
+
+def test_every_docker_run_of_the_image_sets_the_stop_timeout() -> None:
+    """
+    Every documented ``docker run`` of the image gives a stop the compose budget.
+
+    ``docker run`` stops a container with SIGKILL 10 s after SIGTERM unless
+    told otherwise, and a stop during a scan may need longer to keep its
+    pages.  The shipped compose file's ``stop_grace_period`` is that budget,
+    so each ``docker run`` command shown anywhere passes the same number of
+    seconds as ``--stop-timeout``.  The command is read whole, continuation
+    lines included, since the image is usually on its last line.
+    """
+    shipped = _grace_period_lines(COMPOSE)
+    assert len(shipped) == 1
+    seconds = _grace_seconds(shipped[0][1], COMPOSE.name)
+    flag = f"--stop-timeout {int(seconds)}"
+    commands = 0
+    offenders = []
+    for path in (README, *_doc_pages()):
+        name = path.relative_to(REPO_ROOT)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            if not _DOCKER_RUN_LINE.match(line):
+                continue
+            command = " ".join(_shell_command_at(lines, index).split())
+            if not IMAGE_REFERENCE.search(command):
+                continue
+            commands += 1
+            if flag not in command:
+                offenders.append(f"{name}:{index + 1}: {command}")
+    assert commands, "no documented `docker run` of the image was found"
+    assert not offenders, (
+        f"these `docker run` commands do not pass {flag}, the compose file's "
+        "stop_grace_period, so a stop during a scan could be killed before "
+        "it keeps its pages:\n" + "\n".join(offenders)
+    )
 
 
 def test_the_signal_exit_codes_do_not_promise_a_kept_file() -> None:

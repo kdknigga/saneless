@@ -37,8 +37,11 @@ pip install git+https://github.com/kdknigga/saneless
 The Docker image includes `libsane` and handles `python-sane` compilation automatically:
 
 ```bash
-docker run -p 8080:8080 ghcr.io/kdknigga/saneless:0.2.0-rc.6
+docker run --stop-timeout 90 -p 8080:8080 ghcr.io/kdknigga/saneless:0.2.0-rc.6
 ```
+
+`--stop-timeout 90` gives a stop during a scan time to keep the pages scanned so far,
+as `stop_grace_period: 90s` does in the shipped `docker-compose.yml`.
 
 ## Usage
 
