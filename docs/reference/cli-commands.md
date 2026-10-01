@@ -11,11 +11,11 @@ These options apply to all commands and must appear **before** the subcommand na
 | `--config PATH` | string | *(search path)* | Path to TOML config file (overrides search path). A path that does not exist or is not a regular file is an error (exit code 2) |
 | `-v, --verbose` | flag | off | Raise saneless's own loggers to DEBUG. In a one-shot command the detail goes to the log file and is mirrored to stderr; in `saneless serve` it goes to the stream, which is stderr and the only sink there is. Other libraries and the web server keep the configured `log_level` |
 
-`--help` on any command works without a valid config file; settings are loaded only when a command runs. Every command exits with code 2 when the configuration cannot be loaded, and prints a header naming the file then one line per problem; a TOML syntax error names its line and column (see [Validation](configuration.md#validation)). On start, saneless logs at INFO which config file it loaded and which setting names came from environment variables.
+`--help` on any command works without a valid config file; settings are loaded only when a command runs. Every command exits with code 2 when the configuration cannot be loaded, and prints a header naming the file, then one line per problem, then a `Try:` line; a TOML syntax error names its line and column (see [Validation](configuration.md#validation)). On start, saneless logs at INFO which config file it loaded and which setting names came from environment variables.
 
 ## Exit codes
 
-Every command uses the same exit codes. Each failure prints one line to stderr, with no traceback.
+Every command uses the same exit codes. A failure prints a line to stderr saying what failed, then a `Try:` line with the next step, and no traceback unless `-v` asked for one. The `Try:` line is the fix the failing step knows about when it knows one, and otherwise advice for that kind of failure. `saneless serve` logs these failures to its stream without a traceback too. Three kinds of ending print one line and no `Try:` line: a cancel (130), an interruption (129, 143) and an unexpected error (5). A script that parses the failure should read the first line; the `Try:` line is advice for a person, and its wording may change.
 
 | Code | Meaning |
 |------|---------|
@@ -267,7 +267,7 @@ When the table would have no lines at all -- settings built with no search behin
 
 Unlike `scan`, `devices`, `serve` and `auto-profiles`, `doctor` does **not** refuse to run when python-sane is missing. That machine is exactly the one whose owner needs a diagnosis, so the missing scanner support becomes one failed row among six, and the other five still report.
 
-It does not refuse over a folder either. The other commands stop at start-up with one line when `output.data_dir`, `output.tmp_dir` or `paperless.consume_dir` cannot be used. `doctor` reports the same problem as a red Data folder or Fallback row, and the other rows still print.
+It does not refuse over a folder either. The other commands stop at start-up with a line and a `Try:` line when `output.data_dir`, `output.tmp_dir` or `paperless.consume_dir` cannot be used. `doctor` reports the same problem as a red Data folder or Fallback row, and the other rows still print.
 
 `doctor` has no `--json` mode: it prints a table for a person to read, and a script that runs it should read the exit code, not the rows.
 

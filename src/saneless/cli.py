@@ -5,7 +5,11 @@ The saneless command-line interface: one click group and its six commands.
 SANE can see, ``jobs`` prints the job history, ``serve`` starts the web
 server, ``auto-profiles`` writes scan profiles from a scanner's capabilities,
 and ``doctor`` runs the readiness checks. Every command runs inside one guard
-that turns a failure into a single stderr line and a documented exit code.
+that turns a failure into a stderr line saying what failed, a ``Try:`` line
+with the next step, and a documented exit code.  A configuration error's line
+is the loader's header naming the file and one line per problem.  ``serve``
+logs these expected failures without a traceback; an unexpected error (exit 5)
+keeps its traceback in the log.
 """
 
 from __future__ import annotations
@@ -1242,9 +1246,10 @@ class _GuardedGroup(click.Group):
     """
     The CLI group with one last-resort handler around every command.
 
-    Every failure a command raises becomes one stderr message and its
-    ``ExitCode``, and no user ever sees a traceback unless they asked for one
-    with ``-v``. The ``except`` clauses are ordered, and the order is the
+    Every failure a command raises becomes a stderr message and its
+    ``ExitCode``: the failure line, then a ``Try:`` line when the failure is
+    classified.  A one-shot command shows no traceback unless ``-v`` asked for
+    one; ``serve``'s stream shows one only for an unexpected error. The ``except`` clauses are ordered, and the order is the
     design:
 
     1. click's ``Exit``, ``Abort`` and ``ClickException`` are re-raised first.

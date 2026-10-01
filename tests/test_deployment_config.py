@@ -8148,3 +8148,36 @@ def test_the_multi_page_how_to_states_the_real_page_ceiling() -> None:
         assert re.search(rf"\b{number}\b", text), (
             f"{name} does not state {what}, {number}"
         )
+
+
+# Where each page describes what a failure prints, and the wording each used
+# when it promised a single line.  A classified failure prints its line and
+# then a ``Try:`` line with the next step, so the old wording is now untrue.
+_FAILURE_OUTPUT_PAGES: dict[Path, str] = {
+    CLI_REFERENCE: "prints one line to stderr",
+    CLI_SCRIPTING: "prints one line to stderr",
+    TROUBLESHOOTING: "prints one line to stderr",
+    INSTALL_BARE_METAL: "printing one line with the reason",
+}
+
+
+@pytest.mark.parametrize(
+    "page", list(_FAILURE_OUTPUT_PAGES), ids=lambda page: page.name
+)
+def test_failure_output_is_described_as_two_lines(page: Path) -> None:
+    """
+    Each page says a failure prints a line and then a ``Try:`` line.
+
+    The guard ends every classified failure with the next step, so a page
+    that still promises one line tells a script author to expect less than
+    stderr carries.  Line wrapping is ignored: the phrase may break anywhere.
+    """
+    text, name = _read(page)
+    flowing = " ".join(text.split())
+
+    assert "then a `Try:` line" in flowing, (
+        f"{name} does not say a failure is followed by a `Try:` line"
+    )
+    assert _FAILURE_OUTPUT_PAGES[page] not in flowing, (
+        f"{name} still says a failure prints a single line"
+    )

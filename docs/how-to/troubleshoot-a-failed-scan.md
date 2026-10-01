@@ -2,9 +2,10 @@
 
 Find out why a saneless command failed, starting from its exit code, and what to check next.
 
-When a command fails it prints one line to stderr and exits with a non-zero code. The web UI shows
-the same failure on the job. The exact wording of the messages may change between releases, so
-this page describes what you see rather than quoting each message in full.
+When a command fails it prints a line to stderr saying what failed, then a `Try:` line with the
+next step to take, and exits with a non-zero code. The web UI shows the same failure on the job.
+The exact wording of the messages may change between releases, so this page describes what you
+see rather than quoting each message in full.
 
 ## Start with the exit code
 
@@ -160,11 +161,12 @@ row, what fixes it, and whether pressing **Check again** or a restart clears it.
 
 ## Configuration errors (exit 2)
 
-A problem with the config file prints a header naming the file, then one line per problem. A TOML
-syntax error names the line and column where parsing stopped. Fix each line listed and run the
-command again; [Validation](../reference/configuration.md#validation) describes the rules.
+A problem with the config file prints a header naming the file, then one line per problem, then a
+`Try:` line. A TOML syntax error names the line and column where parsing stopped. Fix each line
+listed and run the command again; [Validation](../reference/configuration.md#validation)
+describes the rules.
 
-Other causes of exit 2, each on one line:
+Other causes of exit 2, each a line naming the problem and then a `Try:` line with the fix:
 
 - **Unknown profile.** The `--profile` name is not a profile in the loaded config. Check the
   spelling against the `[profiles.NAME]` tables.
@@ -179,7 +181,8 @@ Other causes of exit 2, each on one line:
   server failed to start. Stop whatever holds the port or pass `--port`; when SANE failed, the line
   gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)); when the web server
   itself failed, the cause is in the preceding log lines: `serve` streams its log to stderr
-  rather than writing a file.
+  rather than writing a file. `serve` logs these failures without a traceback: the line and its
+  `Try:` line say what to fix.
 - **The working directory cannot be prepared.** The line names `tmp_dir` (in
   [`[output]`](../reference/configuration.md#output)) and the reason: the directory was removed or
   cannot be created, or the disk is full. Check that it exists, that saneless can write to it, and

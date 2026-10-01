@@ -192,9 +192,13 @@ pages already being kept -- does not change it: the command exits with that outc
 `saneless serve` is the exception: once the web server is running, SIGTERM is a graceful stop and
 it exits 0, as on Ctrl-C.
 
-Every failure prints one line to stderr (a configuration error prints a header naming the file,
-then one line per problem). [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) explains
-what each code means and what to check.
+A failure prints a line to stderr saying what failed, then a `Try:` line with the next step (a
+configuration error prints a header naming the file and one line per problem, then the `Try:`
+line). A script that parses the failure should read the first line: the `Try:` line is advice for
+a person, and its wording may change. A cancel (130), an interruption (129, 143) and an
+unexpected error (5) print one line and no `Try:` line.
+[Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) explains what each code means and
+what to check.
 
 ### `saneless doctor`'s exit code
 
