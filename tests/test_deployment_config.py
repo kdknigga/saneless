@@ -2161,6 +2161,90 @@ def test_every_docker_run_of_the_image_sets_the_stop_timeout() -> None:
     )
 
 
+def _indent(line: str) -> int:
+    """Return how many leading spaces ``line`` has."""
+    return len(line) - len(line.lstrip(" "))
+
+
+def _served_compose_services(lines: list[str]) -> list[tuple[int, list[str]]]:
+    """
+    Find each compose service that runs the image and publishes a port.
+
+    A service is found from its ``image:`` line: the service key is the
+    nearest line above it that is indented less, and the service's body is
+    every line below that key indented more than it, up to the first that is
+    not. Read line by line, as an operator copies it, so a block indented
+    inside a tab works the same as one at the margin. A fragment with no
+    ``ports:`` shows one setting and is not a service anyone runs as it
+    stands, so it is not returned.
+
+    Args:
+        lines: Every line of the file, in order.
+
+    Returns:
+        ``(0-based index of the service key, the service's body lines)`` for
+        each service that runs the image and has a ``ports:`` key.
+
+    """
+    services: list[tuple[int, list[str]]] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("image:") or not IMAGE_REFERENCE.search(line):
+            continue
+        key = next(
+            (
+                above
+                for above in range(index - 1, -1, -1)
+                if lines[above].strip() and _indent(lines[above]) < _indent(line)
+            ),
+            None,
+        )
+        if key is None:
+            continue
+        body: list[str] = []
+        for below in lines[key + 1 :]:
+            if below.strip() and _indent(below) <= _indent(lines[key]):
+                break
+            body.append(below)
+        if any(each.strip().startswith("ports:") for each in body):
+            services.append((key, body))
+    return services
+
+
+def test_every_documented_compose_service_sets_the_stop_grace_period() -> None:
+    """
+    Every documented compose service that runs the image gives a stop its budget.
+
+    The ``docker run`` rule above covers one way of starting the image; a
+    compose service copied from the docs is the other. Docker stops a
+    service with SIGKILL 10 s after SIGTERM unless ``stop_grace_period``
+    says otherwise, and a stop during a scan may need longer to keep its
+    pages, so every complete service shown anywhere sets the same grace
+    period as the shipped compose file.
+    """
+    shipped = _grace_period_lines(COMPOSE)
+    assert len(shipped) == 1
+    seconds = _grace_seconds(shipped[0][1], COMPOSE.name)
+    services = 0
+    offenders = []
+    for path in _doc_pages():
+        name = path.relative_to(REPO_ROOT)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for key, body in _served_compose_services(lines):
+            services += 1
+            periods = [
+                each for each in body if each.strip().startswith("stop_grace_period:")
+            ]
+            if len(periods) != 1 or _grace_seconds(periods[0], str(name)) != seconds:
+                offenders.append(f"{name}:{key + 1}: {lines[key].strip()}")
+    assert services, "no documented compose service of the image was found"
+    assert not offenders, (
+        f"these compose services do not set stop_grace_period to the shipped "
+        f"file's {seconds:g} s, so a stop during a scan could be killed before "
+        "it keeps its pages:\n" + "\n".join(offenders)
+    )
+
+
 def test_the_signal_exit_codes_do_not_promise_a_kept_file() -> None:
     """
     After 129 or 143 a script is told to look where the line points, not blindly.
