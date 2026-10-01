@@ -88,6 +88,7 @@ from saneless.vocabulary import (
     exit_code_for,
     job_label,
     local_time,
+    multi_page_manual_duplex_refusal,
     state_label,
 )
 from tests.conftest import (
@@ -6951,6 +6952,429 @@ class TestFailureAdvice:
 
         assert result.exit_code == 130
         assert "Try: " not in result.stderr
+
+
+# Arranges one raise site's failure and returns the runner and the argv.
+type _RaiseSiteSetup = Callable[
+    [pytest.MonkeyPatch, Path, contextlib.ExitStack], tuple[CliRunner, list[str]]
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class _RaiseSite:
+    """
+    One known raise site, and the two lines its failure ends with.
+
+    Attributes:
+        setup: Arranges the failure and returns the runner and the argv.
+        exit_code: The documented exit code.
+        line_one: How the failure line starts, as it did before advice moved
+            to the raise site.
+        next_step: The ``Try:`` line's text: the site's own fix.
+
+    """
+
+    setup: _RaiseSiteSetup
+    exit_code: int
+    line_one: str
+    next_step: str
+
+
+def _site_without_python_sane(
+    monkeypatch: pytest.MonkeyPatch, _tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``devices`` with python-sane missing, through the real ``require_sane``."""
+    runner, _ = _patch_cli(monkeypatch)
+    monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+    _block_sane_import(monkeypatch)
+    return runner, ["devices"]
+
+
+def _site_port_in_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``serve`` on a port a real listening socket already holds."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    holder = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    return runner, ["serve", "--host", "127.0.0.1", "--port", str(port)]
+
+
+def _site_sane_will_not_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``serve`` whose SANE backend raises as ``sane.init()`` failing does."""
+
+    class _UnstartableSane(StubScannerBackend):
+        """A backend whose construction fails the way a broken libsane does."""
+
+        def __init__(self, host: str = "") -> None:
+            """Fail as SaneBackend does when SANE cannot be initialised."""
+            msg = "SANE could not be initialised: Invalid argument"
+            raise ScanError(msg)
+
+    runner, _ = _patch_cli(
+        monkeypatch, settings=_make_settings(tmp_path), scanner_cls=_UnstartableSane
+    )
+    return runner, ["serve", "--host", "127.0.0.1", "--port", "0"]
+
+
+def _site_server_never_started(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``serve`` whose uvicorn start-up fails, so the server never started."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    TestServeCommand._stub_create_app(monkeypatch)
+    _fake_server_run(monkeypatch, started=False)
+    return runner, ["serve", "--host", "127.0.0.1", "--port", "0"]
+
+
+def _site_unreadable_trust_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``serve`` with SSL_CERT_FILE naming no file, through the real app factory."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "absent-ca.crt"))
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    return runner, ["serve", "--host", "127.0.0.1", "--port", "0"]
+
+
+def _site_empty_config_path(
+    _monkeypatch: pytest.MonkeyPatch, _tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--config ""``, as an unset ``$CFG`` gives, through the real loader."""
+    return CliRunner(), ["--config", "", "jobs"]
+
+
+def _site_missing_config_path(
+    _monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--config`` naming a file that is not there, through the real loader."""
+    return CliRunner(), ["--config", str(tmp_path / "absent.toml"), "jobs"]
+
+
+def _site_shared_tmp_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``jobs`` with a group-writable ``output.tmp_dir``."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o770)
+    settings = _make_settings(
+        tmp_path,
+        output=OutputConfig(
+            tmp_dir=str(shared),
+            data_dir=str(tmp_path),
+            log_file=str(tmp_path / "saneless.log"),
+        ),
+    )
+    runner, _ = _patch_cli(monkeypatch, settings=settings)
+    return runner, ["jobs"]
+
+
+def _site_flip_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """Arrange a manual-duplex scan whose flip prompt nobody answers in time."""
+    runner, _ = _patch_cli(
+        monkeypatch,
+        settings=_duplex_settings(tmp_path, operator_wait_timeout_seconds=1),
+        scanner_cls=_counting_scanner([]),
+        paperless_cls=_recording_paperless([]),
+    )
+    monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+    never_readable(monkeypatch, FakeClock())
+    return runner, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Forgotten"]
+
+
+def _site_broken_flip_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """Arrange a manual-duplex scan whose terminal fails at the flip prompt."""
+    runner, _ = _patch_cli(
+        monkeypatch,
+        settings=_duplex_settings(tmp_path),
+        scanner_cls=_counting_scanner([]),
+        paperless_cls=_recording_paperless([]),
+    )
+    monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+    broken_read(monkeypatch, OSError(errno.EIO, "Input/output error"))
+    return runner, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Lost"]
+
+
+def _site_unknown_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``scan --profile`` naming no profile in the configuration."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    return runner, ["scan", "--profile", "nonesuch"]
+
+
+def _site_multi_page_manual_duplex(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--multi-page`` with a manual-duplex profile, at a terminal."""
+    runner, _ = _patch_cli(monkeypatch, settings=_duplex_settings(tmp_path))
+    monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+    return runner, ["scan", "--multi-page", "--profile", _DUPLEX_PROFILE]
+
+
+def _site_multi_page_off_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``--multi-page`` with no terminal to ask on; CliRunner is honestly none."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+    return runner, ["scan", "--multi-page"]
+
+
+def _site_manual_duplex_off_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """Arrange a manual-duplex scan with no terminal to prompt the flip on."""
+    runner, _ = _patch_cli(monkeypatch, settings=_duplex_settings(tmp_path))
+    return runner, ["scan", "--profile", _DUPLEX_PROFILE]
+
+
+def _site_unwritable_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``auto-profiles`` whose write of the config file is refused."""
+    runner, _ = _patch_cli(monkeypatch, settings=_make_settings(tmp_path))
+
+    def unwritable(*_args: object, **_kwargs: object) -> NoReturn:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr("saneless.cli.write_profiles_to_config", unwritable)
+    return runner, ["--config", str(tmp_path / "saneless.toml"), "auto-profiles"]
+
+
+def _site_stale_only_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
+) -> tuple[CliRunner, list[str]]:
+    """``auto-profiles`` when the only config file has the superseded name."""
+    settings = _make_settings(tmp_path)
+    settings._config_discovery = _stale_only_discovery(tmp_path)
+    runner, _ = _patch_cli(monkeypatch, settings=settings)
+    return runner, ["auto-profiles"]
+
+
+_FROM_A_TERMINAL = (
+    "Run the scan again from an interactive terminal, or scan from the web UI."
+)
+
+_RAISE_SITES: dict[str, _RaiseSite] = {
+    "python-sane missing": _RaiseSite(
+        _site_without_python_sane,
+        2,
+        "python-sane cannot be imported",
+        "Install the SANE development package and reinstall saneless, as the "
+        "error says, then run the command again.",
+    ),
+    "port in use": _RaiseSite(
+        _site_port_in_use,
+        2,
+        "Cannot bind to 127.0.0.1:",
+        "Stop the program that is using that port, or set output.web_port (or "
+        "pass --port) to a free port, then start saneless serve again.",
+    ),
+    "SANE will not start": _RaiseSite(
+        _site_sane_will_not_start,
+        2,
+        "The web server could not start: SANE could not be initialised",
+        "Check the SANE setup on this machine and scanner.host (saneless "
+        "doctor shows what is wrong), then start saneless serve again.",
+    ),
+    "server never started": _RaiseSite(
+        _site_server_never_started,
+        2,
+        "The web server could not start on http://127.0.0.1:",
+        "Fix the problem the log lines above name, then start saneless serve again.",
+    ),
+    "unreadable trust store": _RaiseSite(
+        _site_unreadable_trust_store,
+        3,
+        "Paperless error: Could not build the TLS trust store",
+        "Check that SSL_CERT_FILE names a readable CA bundle file and "
+        "SSL_CERT_DIR a readable directory, or unset them, then try again.",
+    ),
+    "empty --config": _RaiseSite(
+        _site_empty_config_path,
+        2,
+        "Config file path is empty (was --config given an unset variable?)",
+        "Give --config the path of a saneless config file, or leave --config "
+        "out to use the usual search.",
+    ),
+    "missing --config": _RaiseSite(
+        _site_missing_config_path,
+        2,
+        "Config file not found or not a regular file: ",
+        "Give --config the path of an existing saneless config file, or leave "
+        "--config out to use the usual search.",
+    ),
+    "shared tmp_dir": _RaiseSite(
+        _site_shared_tmp_dir,
+        2,
+        "output.tmp_dir ",
+        "Make output.tmp_dir a directory you own that nobody else can write "
+        "to, or set output.tmp_dir to another directory, then try again.",
+    ),
+    "flip timeout": _RaiseSite(
+        _site_flip_timeout,
+        1,
+        "Scan error: Manual duplex flip wait timed out",
+        "Start the scan again and answer the flip prompt within "
+        "output.operator_wait_timeout_seconds, or raise that setting.",
+    ),
+    "broken flip prompt": _RaiseSite(
+        _site_broken_flip_prompt,
+        1,
+        "Scan error: Flip prompt failed",
+        "Run the scan again from a working terminal.",
+    ),
+    "unknown profile": _RaiseSite(
+        _site_unknown_profile,
+        2,
+        "Unknown profile: nonesuch",
+        "Pass --profile the name of a profile in the saneless config file, or "
+        "add a profile with that name to it, then run the scan again.",
+    ),
+    "multi-page with manual duplex": _RaiseSite(
+        _site_multi_page_manual_duplex,
+        2,
+        multi_page_manual_duplex_refusal(_DUPLEX_PROFILE),
+        "Run the scan again without --multi-page, or with a profile that is "
+        "not manual duplex.",
+    ),
+    "multi-page off a terminal": _RaiseSite(
+        _site_multi_page_off_a_terminal,
+        2,
+        MULTI_PAGE_NEEDS_TERMINAL,
+        _FROM_A_TERMINAL,
+    ),
+    "manual duplex off a terminal": _RaiseSite(
+        _site_manual_duplex_off_a_terminal,
+        2,
+        f"Profile '{_DUPLEX_PROFILE}' is manual duplex, which needs an "
+        "interactive terminal: saneless must prompt you to flip the stack "
+        "between the two passes. Run it from a terminal, or scan from the web UI.",
+        _FROM_A_TERMINAL,
+    ),
+    "unwritable config": _RaiseSite(
+        _site_unwritable_config,
+        2,
+        "Cannot write ",
+        "Make that file and its folder writable by this user, or pass "
+        "--config naming an existing config file this user can write, then "
+        "run saneless auto-profiles again.",
+    ),
+    "stale-only config": _RaiseSite(
+        _site_stale_only_config,
+        2,
+        "No config file loaded: saneless now reads saneless.toml",
+        f"Rename the {LEGACY_CONFIG_FILENAME} named above to {CONFIG_FILENAME}, "
+        "then run saneless auto-profiles again.",
+    ),
+}
+
+# The five refusals that used to print their line and exit on their own, each
+# with the whole first line it prints, which is unchanged.
+_REFUSALS: dict[str, str] = {
+    "unknown profile": "Unknown profile: nonesuch",
+    "multi-page with manual duplex": multi_page_manual_duplex_refusal(_DUPLEX_PROFILE),
+    "multi-page off a terminal": MULTI_PAGE_NEEDS_TERMINAL,
+    "manual duplex off a terminal": _RAISE_SITES[
+        "manual duplex off a terminal"
+    ].line_one,
+    "unwritable config": "",
+}
+
+
+class TestRaiseSiteAdvice:
+    """
+    Each known raise site's failure ends with its own fix, not its category's.
+
+    Every case runs the whole command, so the next step is shown to travel
+    from where the error is raised, through the group guard, to stderr.
+    """
+
+    @pytest.mark.parametrize("site", list(_RAISE_SITES))
+    def test_each_raise_site_prints_its_own_next_step(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, site: str
+    ) -> None:
+        """Line 1 is the failure as before; line 2 is the site's own fix."""
+        case = _RAISE_SITES[site]
+        with contextlib.ExitStack() as stack:
+            runner, args = case.setup(monkeypatch, tmp_path, stack)
+            result = runner.invoke(cli, args)
+
+        assert result.exit_code == case.exit_code, result.output
+        lines = result.stderr.splitlines()
+        assert lines[-1] == f"Try: {case.next_step}", result.stderr
+        assert lines[-2].startswith(case.line_one), result.stderr
+        fallbacks = {f"Try: {error_next_step(category)}" for category in ErrorCategory}
+        assert lines[-1] not in fallbacks
+        assert "Traceback" not in result.output
+
+    @pytest.mark.parametrize("site", list(_REFUSALS))
+    def test_refusals_are_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        site: str,
+    ) -> None:
+        """
+        A refusal is logged at ERROR, as every other failure is, and exits 2.
+
+        Its first line is the line it printed before it went through the
+        guard, byte for byte.
+        """
+        case = _RAISE_SITES[site]
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        with contextlib.ExitStack() as stack:
+            runner, args = case.setup(monkeypatch, tmp_path, stack)
+            result = runner.invoke(cli, args)
+
+        assert result.exit_code == 2, result.output
+        line_one = _failure_lines(result)[-1]
+        expected = _REFUSALS[site] or (
+            f"Cannot write {tmp_path / 'saneless.toml'}: Permission denied"
+        )
+        assert line_one == expected
+        records = [
+            record
+            for record in _cli_error_records(caplog)
+            if record.getMessage().startswith(
+                ("saneless scan failed", "saneless auto-profiles failed")
+            )
+        ]
+        assert len(records) == 1, caplog.text
+        assert expected in records[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    ("error", "fragment"),
+    [
+        (errno.EADDRINUSE, "Stop the program that is using that port"),
+        (errno.EACCES, "not allowed to listen on that port"),
+        (errno.EADDRNOTAVAIL, "set output.web_host (or pass --host)"),
+        (errno.EAFNOSUPPORT, "Check output.web_host and output.web_port"),
+    ],
+)
+def test_a_bind_failure_next_step_fits_its_cause(error: int, fragment: str) -> None:
+    """
+    The bind advice follows the errno, so it cannot send anyone the wrong way.
+
+    A port in use, a port this user may not take and an address this machine
+    does not have are three different fixes; anything else gets advice that
+    names both settings without guessing which is wrong.
+    """
+    step = cli_module._bind_next_step(OSError(error, os.strerror(error)))
+
+    assert fragment in step
+    assert step.endswith("then start saneless serve again.")
 
 
 def _refusing_paperless() -> type:

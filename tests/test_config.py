@@ -556,6 +556,24 @@ class TestUnresolvableHome:
         assert _NO_HOME_FIX in str(exc_info.value)
 
     @pytest.mark.usefixtures("no_home")
+    def test_unresolvable_home_carries_its_own_next_step(self) -> None:
+        """
+        The ``Try:`` line names the variables, not the config file.
+
+        A missing home directory is not something the config file can fix, so
+        the category's advice would leave the operator nothing to act on.
+        """
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(None)
+
+        step = exc_info.value.next_step
+        assert step is not None
+        assert "HOME" in step
+        assert "XDG_CONFIG_HOME" in step
+        assert "XDG_STATE_HOME" in step
+        assert "restart" not in step
+
+    @pytest.mark.usefixtures("no_home")
     def test_unresolvable_home_exits_2_from_the_cli(self) -> None:
         """A command that loads settings exits 2 with the fix, not a traceback."""
         result = CliRunner().invoke(cli, ["jobs"])
@@ -563,6 +581,56 @@ class TestUnresolvableHome:
         assert result.exit_code == 2, result.output
         assert _NO_HOME_FIX in result.output
         assert "Traceback" not in result.output
+
+
+class TestConfigPathNextSteps:
+    """
+    Each way ``--config`` can name nothing carries a next step about ``--config``.
+
+    None of these is a problem inside a config file, so the advice is about
+    the path that was given, and says how to fall back to the usual search.
+    """
+
+    @pytest.mark.parametrize(
+        "config_path",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("~saneless-no-such-user-xyz/c.toml", id="unexpandable"),
+            pytest.param("absent.toml", id="missing"),
+        ],
+    )
+    def test_a_config_path_that_names_nothing_says_what_to_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_path: str
+    ) -> None:
+        """The next step names ``--config`` and how to leave it out."""
+        monkeypatch.chdir(tmp_path)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(config_path)
+
+        step = exc_info.value.next_step
+        assert step is not None
+        assert "--config" in step
+        assert "leave --config out" in step
+        assert "restart" not in step
+
+    def test_the_unexpandable_path_step_is_about_the_tilde(self) -> None:
+        """A ``~`` that names no user is told apart from a missing file."""
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings("~saneless-no-such-user-xyz/c.toml")
+
+        step = exc_info.value.next_step
+        assert step is not None
+        assert "'~'" in step
+
+    def test_a_directory_is_told_to_be_a_file(self, tmp_path: Path) -> None:
+        """A directory where the file should be gets the missing-file advice."""
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(str(tmp_path))
+
+        step = exc_info.value.next_step
+        assert step is not None
+        assert "existing saneless config file" in step
 
 
 class _OpenOptions(TypedDict, total=False):
