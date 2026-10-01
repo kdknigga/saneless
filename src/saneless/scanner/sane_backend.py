@@ -149,7 +149,12 @@ def require_sane() -> None:
         raise ConfigError(msg) from exc
 
 
-def _launch_listing(request: ListingRequest, *, configured_host: str) -> ListingReply:
+def _launch_listing(
+    request: ListingRequest,
+    *,
+    configured_host: str,
+    abort: threading.Event | None = None,
+) -> ListingReply:
     """
     Start one listing child and return its reply.
 
@@ -160,12 +165,14 @@ def _launch_listing(request: ListingRequest, *, configured_host: str) -> Listing
     Args:
         request: What to ask the child for beyond the listing.
         configured_host: The ``scanner.host`` setting, possibly empty.
+        abort: Set by another thread to stop the listing part way, or
+            ``None``.
 
     Returns:
         The child's validated reply.
 
     """
-    return run_listing_child(request, configured_host=configured_host)
+    return run_listing_child(request, configured_host=configured_host, abort=abort)
 
 
 def _listed_devices(reply: ListingReply) -> tuple[DeviceInfo, ...]:
@@ -3680,7 +3687,9 @@ class SaneBackend(ScannerBackend):
             raise ScanError(list_msg)
         return list(_listed_devices(reply))
 
-    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
         """
         List the devices and open an unlisted configured one, in one child.
 
@@ -3701,6 +3710,8 @@ class SaneBackend(ScannerBackend):
         Args:
             open_if_unlisted: The configured device id, or ``""`` when none
                 is configured.
+            abort: Set by another thread to stop the child part way; the
+                launcher then kills and reaps it on this thread.
 
         Returns:
             What the child's listing and open found.
@@ -3710,6 +3721,7 @@ class SaneBackend(ScannerBackend):
             ListingTimedOutError: The listing child did not finish in time.
             ListingNoAnswerError: The listing child gave no usable answer, or
                 could not be started.
+            ListingAbortedError: ``abort`` was set while the child ran.
             ScanError: If a previous read has not returned, in which case no
                 child is started.
 
@@ -3718,6 +3730,7 @@ class SaneBackend(ScannerBackend):
         reply = _launch_listing(
             ListingRequest(open=open_if_unlisted or None),
             configured_host=self._host,
+            abort=abort,
         )
         return DeviceSurvey(
             devices=_listed_devices(reply),

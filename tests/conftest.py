@@ -356,12 +356,15 @@ class ListingSeam:
     Attributes:
         calls: One ``(request, configured_host)`` pair per listing, as the
             backend passed them to its launcher.
+        aborts: The abort Event each of those listings was given, or
+            ``None`` for one given none, in the same order.
 
     """
 
     def __init__(self) -> None:
         """Start with no listings recorded."""
         self.calls: list[tuple[ListingRequest, str]] = []
+        self.aborts: list[threading.Event | None] = []
 
 
 @pytest.fixture(autouse=True)
@@ -404,9 +407,13 @@ def listing_seam(
         return seam
 
     def launch_in_process(
-        listing_request: ListingRequest, *, configured_host: str
+        listing_request: ListingRequest,
+        *,
+        configured_host: str,
+        abort: threading.Event | None = None,
     ) -> ListingReply:
         seam.calls.append((listing_request, configured_host))
+        seam.aborts.append(abort)
         module = sane_backend_mod.sane
         if module is None:
             raise AssertionError(_NO_REAL_LIBSANE)

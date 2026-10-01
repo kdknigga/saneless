@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Literal, assert_never
 
 from saneless.exceptions import (
+    ListingAbortedError,
     ListingCrashedError,
     ListingNoAnswerError,
     ListingTimedOutError,
@@ -22,6 +23,7 @@ from saneless.exceptions import (
 from saneless.text_safety import neutralise_controls
 
 if TYPE_CHECKING:
+    import threading
     from pathlib import Path
 
     from PIL import Image
@@ -548,7 +550,9 @@ class ScannerBackend(ABC):
         """
         self.get_capabilities(device_id)
 
-    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
         """
         List the devices, then open a configured device the listing lacks.
 
@@ -563,15 +567,18 @@ class ScannerBackend(ABC):
         unchanged.  A real backend overrides it to list and open in one
         isolated step.
 
-        A listing that crashed, was stopped at its deadline or gave no usable
-        answer is not a failed listing: it propagates, so the caller can
-        report it as what it was.
+        A listing that crashed, was stopped at its deadline or on ``abort``,
+        or gave no usable answer is not a failed listing: it propagates, so
+        the caller can report it as what it was.
         Any other failure, of the listing or of the open, is recorded by
         class name.  Nothing is logged here; the caller logs type names.
 
         Args:
             open_if_unlisted: The configured device id, or ``""`` when none
                 is configured.
+            abort: Set by another thread to stop the listing part way; the
+                backend passes it to its listing.  The default makes two
+                calls that cannot be stopped part way, and ignores it.
 
         Returns:
             What the listing and the open found.
@@ -580,13 +587,20 @@ class ScannerBackend(ABC):
             ListingCrashedError: The listing died from a signal.
             ListingTimedOutError: The listing did not finish in time.
             ListingNoAnswerError: The listing gave no usable answer.
+            ListingAbortedError: The listing was stopped on ``abort``.
 
         """
+        _ = abort
         devices: tuple[DeviceInfo, ...] = ()
         list_error: str | None = None
         try:
             devices = tuple(self.get_devices())
-        except ListingCrashedError, ListingTimedOutError, ListingNoAnswerError:
+        except (
+            ListingCrashedError,
+            ListingTimedOutError,
+            ListingNoAnswerError,
+            ListingAbortedError,
+        ):
             raise
         except Exception as exc:
             list_error = type(exc).__name__

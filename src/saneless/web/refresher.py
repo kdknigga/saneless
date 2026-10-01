@@ -169,6 +169,14 @@ class CheckRefresher:
         Setting the event is the whole of it, so this never blocks, and calling
         it on a refresher that was never started -- a lifespan that failed
         during startup -- is safe.
+
+        The same event is the abort every probe runs under, so it also stops
+        a probe in flight: a scanner listing ends within a fraction of a
+        second, its child killed and reaped by the refresher thread that
+        started it, and no check after it runs.  Without that, a stop would
+        wait out a listing for up to its whole deadline, far past the few
+        seconds an idle server is given to shut down.  This thread never
+        signals the child itself; it only sets the event.
         """
         self._stopping.set()
 
@@ -177,7 +185,9 @@ class CheckRefresher:
         Stop the refresher and report whether the thread actually stopped.
 
         The event is set first, so a loop already awake finishes its tick and
-        then exits rather than starting another.  The join is bounded by the
+        then exits rather than starting another, and a probe in flight is
+        aborted as :meth:`request_stop` describes, so the thread is normally
+        gone within about a second even mid-listing.  The join is bounded by the
         worker's ``STOP_JOIN_SECONDS``, or by the caller's remaining share of
         it: the lifespan takes one deadline for both threads, so what the
         worker's join already spent is not spent again here.  When this
@@ -326,6 +336,11 @@ class CheckRefresher:
         inside, and how a raising write ended the refresher thread for the life
         of the process.
 
+        The probe runs under the refresher's own stop Event, as the context's
+        ``abort``: a stop ends a scanner listing in flight and the run with it,
+        and a run that ended that way, or that finished after the stop was
+        asked for, stores nothing, for the same last-known-good reason.
+
         Returns:
             "Did this call probe", which is deliberately *not* "did this call
             store".  The ``except`` arm probed and stored nothing, and it
@@ -339,9 +354,16 @@ class CheckRefresher:
         if not self._probe_lock.acquire(blocking=False):
             return False
         try:
-            context = replace(self.build_context(), skip_scanner=self._scan_active())
+            context = replace(
+                self.build_context(),
+                skip_scanner=self._scan_active(),
+                abort=self._stopping,
+            )
             results = run_checks(context, scanner_gate=self._scanner_gate())
-            self._cache.store(results)
+            # A run the stop cut short holds only the checks that finished.
+            # The previous entry is kept rather than replaced by part of one.
+            if not self._stopping.is_set():
+                self._cache.store(results)
         except Exception:
             # No exception text goes anywhere near the cache or the page; the
             # strip keeps showing the developer-authored rows it already had.

@@ -59,16 +59,21 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from saneless.exceptions import (
+    ListingAbortedError,
     ListingCrashedError,
     ListingNoAnswerError,
     ListingTimedOutError,
 )
 from saneless.scanner.net_hosts import SANE_NET_HOSTS, effective_sane_net_hosts
+
+if TYPE_CHECKING:
+    import threading
 
 __all__ = [
     "LISTING_DEADLINE_SECONDS",
@@ -97,6 +102,13 @@ LISTING_DEADLINE_SECONDS: Final = 30.0
 # child whose parent died -- killed, or out of memory -- cannot stay inside
 # libsane after the parent's own deadline would have stopped it.
 _ALARM_MARGIN_SECONDS: Final = 5
+
+# The longest the launcher waits on a child before it looks at the caller's
+# abort Event again.  So a stopping saneless ends an in-flight listing within
+# about this long, rather than waiting out the deadline: the thread that is
+# stopping only sets the Event, and the thread that started the child kills
+# and reaps it, so no other thread ever signals a PID it does not own.
+_ABORT_POLL_SECONDS: Final = 0.1
 
 # The largest reply accepted.  A real reply is a few hundred bytes per device;
 # anything larger is not a reply.
@@ -338,7 +350,12 @@ def child_environment(configured_host: str) -> dict[str, str]:
     return env
 
 
-def run_listing_child(request: ListingRequest, *, configured_host: str) -> ListingReply:
+def run_listing_child(
+    request: ListingRequest,
+    *,
+    configured_host: str,
+    abort: threading.Event | None = None,
+) -> ListingReply:
     """
     Run one listing in a fresh child process, under a hard deadline.
 
@@ -347,6 +364,13 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     still running when the wait is interrupted by a Ctrl-C or a server stop.
     A caller that holds the scanner gate around this call therefore releases
     it with nothing still inside libsane.
+
+    A caller that may have to stop part way passes ``abort``.  The wait is
+    made in short slices, and between two of them the launcher looks at the
+    Event: once it is set, the child is killed and reaped here, on the thread
+    that started it, and the listing ends as aborted.  The thread that sets
+    the Event never touches the child, so no thread signals a process it did
+    not start, whose PID may already belong to another by then.
 
     The child starts in a session of its own, so a signal sent to saneless's
     whole process group, such as a terminal's Ctrl-C on ``saneless serve``,
@@ -365,6 +389,8 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
     Args:
         request: What to ask the child for beyond the listing.
         configured_host: The ``scanner.host`` setting, possibly empty.
+        abort: Set by another thread to stop the listing part way, or
+            ``None`` for a listing only the deadline ends.
 
     Returns:
         The child's validated reply.
@@ -375,6 +401,7 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
             or its own alarm ended it.
         ListingNoAnswerError: The child exited without a reply that fits
             the schema, or could not be started.
+        ListingAbortedError: ``abort`` was set while the child ran.
 
     """
     deadline = LISTING_DEADLINE_SECONDS
@@ -401,16 +428,7 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
         # limit: nothing ran, so nothing could be seen.
         raise _not_started(exc) from exc
     with proc:
-        try:
-            out, _ = proc.communicate(line, timeout=deadline)
-        except subprocess.TimeoutExpired:
-            _kill_and_reap(proc)
-            raise _timed_out(deadline) from None
-        except BaseException:
-            # A KeyboardInterrupt or ScanInterrupted: the child is stopped
-            # here, before the caller's gate release runs.
-            _kill_and_reap(proc)
-            raise
+        out = _wait_for_child(proc, line, deadline, abort)
     returncode = proc.returncode
     if returncode == -signal.SIGALRM:
         raise _timed_out(deadline)
@@ -431,6 +449,62 @@ def run_listing_child(request: ListingRequest, *, configured_host: str) -> Listi
             len(out),
         )
         raise
+
+
+def _wait_for_child(
+    proc: subprocess.Popen[bytes],
+    line: bytes,
+    deadline: float,
+    abort: threading.Event | None,
+) -> bytes:
+    """
+    Send the child its request and wait for it to finish, in short slices.
+
+    The request goes with the first slice only: ``communicate`` keeps writing
+    what is left of it, and keeps what it has read, across a retry after a
+    timeout, and refuses input sent again.  After each slice that ends with
+    the child still running, the abort is looked at first and then the
+    deadline.  The child is killed and reaped before anything is raised, so
+    a caller holding the scanner gate releases it with nothing still inside
+    libsane.
+
+    Args:
+        proc: The child process, just started.
+        line: The request line.
+        deadline: Seconds the whole wait may take.
+        abort: The caller's abort Event, or ``None``.
+
+    Returns:
+        Everything the child wrote to stdout.
+
+    Raises:
+        ListingAbortedError: ``abort`` was set while the child ran.
+        ListingTimedOutError: The child was still running at the deadline.
+
+    """
+    end = time.monotonic() + deadline
+    payload: bytes | None = line
+    while True:
+        remaining = max(0.0, end - time.monotonic())
+        try:
+            out, _ = proc.communicate(
+                payload, timeout=min(_ABORT_POLL_SECONDS, remaining)
+            )
+        except subprocess.TimeoutExpired:
+            payload = None
+            if abort is not None and abort.is_set():
+                _kill_and_reap(proc)
+                raise _aborted() from None
+            if time.monotonic() >= end:
+                _kill_and_reap(proc)
+                raise _timed_out(deadline) from None
+        except BaseException:
+            # A KeyboardInterrupt or ScanInterrupted: the child is stopped
+            # here, before the caller's gate release runs.
+            _kill_and_reap(proc)
+            raise
+        else:
+            return out
 
 
 def _not_started(exc: OSError) -> ListingNoAnswerError:
@@ -498,6 +572,23 @@ def _timed_out(deadline: float) -> ListingTimedOutError:
         f"({deadline:.0f} s)"
     )
     return ListingTimedOutError(message)
+
+
+def _aborted() -> ListingAbortedError:
+    """
+    Log the listing stopped for saneless's own stop, and build its error.
+
+    Logged at INFO: the caller asked for the stop, so it says nothing about
+    the scanner.
+
+    Returns:
+        The error for the caller to raise.
+
+    """
+    logger.info("Scanner listing stopped because saneless is stopping")
+    return ListingAbortedError(
+        "The scanner listing was stopped because saneless is stopping"
+    )
 
 
 def _crashed(signum: int) -> ListingCrashedError:

@@ -31,7 +31,7 @@ import socket
 import struct
 import tempfile
 import threading
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 from time import monotonic
@@ -73,6 +73,7 @@ from saneless.config import (
     discover_config,
 )
 from saneless.exceptions import (
+    ListingAbortedError,
     ListingCrashedError,
     ListingNoAnswerError,
     ListingTimedOutError,
@@ -2143,12 +2144,15 @@ class _ListingFailureBackend(_CountingBackend):
         super().__init__()
         self.error = error
 
-    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
         """
         Fail the way the configured error says.
 
         Args:
             open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
 
         Returns:
             Never returns.
@@ -2157,7 +2161,7 @@ class _ListingFailureBackend(_CountingBackend):
             ScanError: Always, the error this backend was built with.
 
         """
-        _ = open_if_unlisted
+        _ = open_if_unlisted, abort
         raise self.error
 
 
@@ -2181,19 +2185,62 @@ class _SurveyRecordingBackend(_CountingBackend):
         self.survey = survey
         self.asked: list[str] = []
 
-    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
         """
         Record the id the check asked to have opened, and answer.
 
         Args:
             open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
 
         Returns:
             The survey this backend was built with.
 
         """
+        _ = abort
         self.asked.append(open_if_unlisted)
         return self.survey
+
+
+class _AbortedListingBackend(_CountingBackend):
+    """
+    A backend whose listing is stopped part way, as a stopping caller's is.
+
+    ``list_and_open`` records the abort Event it was handed, sets it the way
+    the stopping thread would, and then raises what the launcher raises once
+    it has killed and reaped the child.
+    """
+
+    def __init__(self) -> None:
+        """Record no abort Event yet."""
+        super().__init__()
+        self.aborts: list[threading.Event | None] = []
+
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
+        """
+        Record the abort, set it, and raise the aborted listing.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ListingAbortedError: Always.
+
+        """
+        _ = open_if_unlisted
+        self.aborts.append(abort)
+        if abort is not None:
+            abort.set()
+        msg = "The scanner listing was stopped because saneless is stopping"
+        raise ListingAbortedError(msg)
 
 
 # The id ``_device()`` reports, and the ``scanner.device`` ``_settings()``
@@ -8000,3 +8047,103 @@ class TestConfigurationRow:
         assert terminal.message == strip.message
         assert str(discovery.stale[0].absolute()) in terminal.next_step
         assert str(tmp_path) not in strip.next_step
+
+
+class TestAbortedRun:
+    """A run whose caller is stopping ends between checks and never raises."""
+
+    @pytest.mark.parametrize("gated", [False, True], ids=["ungated", "gated"])
+    def test_run_checks_stops_once_aborted(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        *,
+        gated: bool,
+    ) -> None:
+        """
+        Nothing after an aborted scanner check runs, and nothing is a fault.
+
+        The Paperless check would otherwise spend its whole budget after the
+        listing was already stopped.  The run returns only the rows before
+        the scanner, logs no warning, and hands the gate back.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Replaces the Paperless check with a spy.
+            caplog: The log capture.
+            gated: Whether the run is handed a free scanner gate.
+
+        """
+        caplog.set_level(logging.INFO)
+        paperless_calls: list[CheckContext] = []
+
+        def paperless_spy(context: CheckContext) -> CheckResult:
+            paperless_calls.append(context)
+            return CheckResult(key=CheckKey.PAPERLESS, state=CheckState.OK, message="")
+
+        monkeypatch.setattr(checks, "_check_paperless", paperless_spy)
+        backend = _AbortedListingBackend()
+        abort = threading.Event()
+        context = replace(_context(_settings(tmp_path), scanner=backend), abort=abort)
+        gate = threading.Lock()
+
+        results = run_checks(context, scanner_gate=gate if gated else None)
+
+        assert backend.aborts == [abort]
+        assert [result.key for result in results] == [CheckKey.CONFIGURATION]
+        assert paperless_calls == []
+        assert not gate.locked()
+        assert [
+            record
+            for record in caplog.records
+            if record.name.startswith("saneless") and record.levelno >= logging.WARNING
+        ] == []
+
+    def test_run_checks_runs_nothing_once_already_aborted(self, tmp_path: Path) -> None:
+        """
+        A caller already stopping gets no rows and starts no listing.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _AbortedListingBackend()
+        abort = threading.Event()
+        abort.set()
+        context = replace(_context(_settings(tmp_path), scanner=backend), abort=abort)
+
+        assert run_checks(context) == ()
+        assert backend.aborts == []
+
+    def test_an_aborted_listing_is_its_own_arm(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        An aborted listing propagates rather than reading as a failed one.
+
+        Caught as any other exception it would be recorded as a listing that
+        failed, logged as a warning and drawn as a scanner fault; it is the
+        caller stopping, and the launcher has already logged it at INFO.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.checks")
+        backend = _AbortedListingBackend()
+        abort = threading.Event()
+
+        with pytest.raises(ListingAbortedError):
+            checks._scanner_enumeration(backend, _DEVICE_ID, may_open=True, abort=abort)
+
+        assert backend.aborts == [abort]
+        assert [
+            record for record in caplog.records if record.name == "saneless.checks"
+        ] == []
+
+    def test_a_context_has_no_abort_by_default(self, tmp_path: Path) -> None:
+        """
+        A caller that cannot be stopped part way, such as doctor, passes none.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        assert _context(_settings(tmp_path)).abort is None
