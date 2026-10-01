@@ -1254,25 +1254,34 @@ class TestResultColumns:
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-            and node.name == "_row_to_job"
+            and node.name == "_job_from_row"
         ]
         assert len(definitions) == 1
 
     def test_single_mapping_constructs_a_job_in_one_place(self) -> None:
-        """JobStore builds a Job only inside _row_to_job (STOR-04)."""
+        """job.py builds a Job only inside the module-level row mapper (STOR-04)."""
         tree = ast.parse(_job_source())
-        store = next(
+        job_from_row = next(
             node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ClassDef) and node.name == "JobStore"
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_job_from_row"
         )
+        assert _count_job_constructions(tree) == 1
+        assert _count_job_constructions(job_from_row) == 1
+
+    def test_the_store_maps_rows_through_the_shared_mapper(self) -> None:
+        """The store's own row conversion delegates rather than copying (STOR-04)."""
         row_to_job = next(
             node
-            for node in store.body
+            for node in _job_store_classdef().body
             if isinstance(node, ast.FunctionDef) and node.name == "_row_to_job"
         )
-        assert _count_job_constructions(store) == 1
-        assert _count_job_constructions(row_to_job) == 1
+        calls = [
+            node.func.id
+            for node in ast.walk(row_to_job)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert calls == ["_job_from_row"]
 
 
 class TestFinishJob:
@@ -3095,3 +3104,201 @@ class TestCreatedAtIndex:
             assert len(_created_at_indexes(store._conn)) == 1
         finally:
             store.close()
+
+
+def _sha256(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file's bytes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _names(directory: Path) -> list[str]:
+    """Return the sorted names of every entry in a directory."""
+    return sorted(entry.name for entry in directory.iterdir())
+
+
+def _skip_if_root() -> None:
+    """Skip the calling test when root runs it, since root ignores directory modes."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permission bits")
+
+
+class TestReadRecentJobs:
+    """The read-only history read: it never creates, migrates or writes."""
+
+    def test_a_missing_database_reads_as_empty_and_creates_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """No database is no history, and the read leaves no file behind."""
+        data = tmp_path / "data"
+        data.mkdir()
+
+        assert job_module.read_recent_jobs(data / "jobs.db", 10) == []
+        assert _names(data) == []
+
+    def test_rows_match_the_store(self, tmp_path: Path) -> None:
+        """The read returns what the open store's own listing returns."""
+        db = tmp_path / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            first = store.create_job("default", "First", tags=[1, 2])
+            store.create_job("receipts", "Second", correspondent=7)
+            store.create_job("default", "Third")
+            store.finish_job(
+                first.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=3,
+                    pages_removed=1,
+                    pages_uploaded=2,
+                    removed_positions=(2,),
+                ),
+            )
+
+            read = job_module.read_recent_jobs(db, 10)
+
+            assert read == store.list_recent(10)
+            assert len(read) == 3
+            assert job_module.read_recent_jobs(db, 2) == store.list_recent(2)
+        finally:
+            store.close()
+
+    def test_an_older_schema_is_refused_and_left_alone(self, tmp_path: Path) -> None:
+        """A version 2 database is named as too old and is not upgraded."""
+        db = tmp_path / "jobs.db"
+        _build_v2_schema(str(db))
+        before = _sha256(db)
+
+        with pytest.raises(StorageError) as excinfo:
+            job_module.read_recent_jobs(db, 10)
+
+        message = str(excinfo.value)
+        assert str(db) in message
+        assert "schema version 2" in message
+        assert f"({HEAD_VERSION})" in message
+        assert "saneless serve" in message
+        assert _sha256(db) == before
+        assert _read_schema_raw(str(db))[0] == 2
+        assert _names(tmp_path) == ["jobs.db"]
+
+    def test_a_legacy_unversioned_table_is_refused(self, tmp_path: Path) -> None:
+        """An unstamped jobs table reads as version 1, too old to list."""
+        db = tmp_path / "jobs.db"
+        _build_s3_schema(str(db))
+        before = _sha256(db)
+
+        with pytest.raises(StorageError) as excinfo:
+            job_module.read_recent_jobs(db, 10)
+
+        message = str(excinfo.value)
+        assert str(db) in message
+        assert "schema version 1" in message
+        assert f"({HEAD_VERSION})" in message
+        assert "saneless serve" in message
+        assert _sha256(db) == before
+        assert _read_schema_raw(str(db))[0] == 0
+        assert _names(tmp_path) == ["jobs.db"]
+
+    def test_an_empty_unversioned_database_reads_as_empty(self, tmp_path: Path) -> None:
+        """A database with no jobs table yet holds no history."""
+        db = tmp_path / "jobs.db"
+        db.touch()
+
+        assert job_module.read_recent_jobs(db, 10) == []
+        assert db.stat().st_size == 0
+        assert _names(tmp_path) == ["jobs.db"]
+
+    def test_a_newer_schema_is_refused(self, tmp_path: Path) -> None:
+        """A database from a newer release gets the read-write open's wording."""
+        db = tmp_path / "jobs.db"
+        _build_stamped_schema(str(db), HEAD_VERSION + 1)
+        before = _sha256(db)
+
+        with pytest.raises(StorageError) as excinfo:
+            job_module.read_recent_jobs(db, 10)
+
+        message = str(excinfo.value)
+        assert str(db) in message
+        assert f"schema version {HEAD_VERSION + 1}" in message
+        assert "newer than this release supports" in message
+        assert _sha256(db) == before
+
+    def test_a_negative_schema_is_refused(self, tmp_path: Path) -> None:
+        """A negative stamp no release writes is refused as on the read-write open."""
+        db = tmp_path / "jobs.db"
+        _build_stamped_schema(str(db), -1)
+
+        with pytest.raises(StorageError, match="which no saneless release writes"):
+            job_module.read_recent_jobs(db, 10)
+
+    def test_a_path_with_uri_characters_opens_that_file(self, tmp_path: Path) -> None:
+        """A '?', '#' or space in the path is part of the file name, not the URI."""
+        directory = tmp_path / "a dir?x#y"
+        directory.mkdir()
+        db = directory / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            store.create_job("default", "Odd Path")
+            expected = store.list_recent(10)
+        finally:
+            store.close()
+
+        read = job_module.read_recent_jobs(db, 10)
+
+        assert read == expected
+        assert [job.title for job in read] == ["Odd Path"]
+        assert not (tmp_path / "a dir").exists()
+        assert _names(tmp_path) == ["a dir?x#y"]
+
+    def test_a_read_only_directory_is_read(self, tmp_path: Path) -> None:
+        """A closed database in a directory nobody can write to is still listed."""
+        _skip_if_root()
+        directory = tmp_path / "ro"
+        directory.mkdir()
+        db = directory / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            store.create_job("default", "Kept One")
+            store.create_job("default", "Kept Two")
+            expected = store.list_recent(10)
+        finally:
+            store.close()
+        assert _names(directory) == ["jobs.db"]
+
+        directory.chmod(0o555)
+        try:
+            read = job_module.read_recent_jobs(db, 10)
+            assert _names(directory) == ["jobs.db"]
+        finally:
+            directory.chmod(0o755)
+
+        assert read == expected
+
+    def test_a_read_only_directory_with_a_pending_wal_is_a_storage_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Unapplied WAL pages in a read-only directory are a StorageError."""
+        _skip_if_root()
+        live = tmp_path / "live"
+        live.mkdir()
+        copy = tmp_path / "copy"
+        copy.mkdir()
+        store = JobStore(db_path=live / "jobs.db")
+        try:
+            store.create_job("default", "Pending")
+            (copy / "jobs.db").write_bytes((live / "jobs.db").read_bytes())
+            (copy / "jobs.db-wal").write_bytes((live / "jobs.db-wal").read_bytes())
+        finally:
+            store.close()
+        db = copy / "jobs.db"
+
+        copy.chmod(0o555)
+        try:
+            with pytest.raises(StorageError) as excinfo:
+                job_module.read_recent_jobs(db, 10)
+        finally:
+            copy.chmod(0o755)
+
+        assert str(db) in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, sqlite3.Error)
