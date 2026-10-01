@@ -1944,6 +1944,27 @@ class ScanWorker:
         self._finish_or_owe(job_id, owed)
         logger.info("Job %s ended by shutdown: %r", job_id, error)
 
+    def _refuse_to_start_while_stopping(self) -> None:
+        """
+        End a job that is handed the scanner gate after the server began to stop.
+
+        A stop can end a health check that was holding the gate, so a job
+        waiting for it may be handed it in the middle of shutdown.  Starting
+        the scan then would feed paper that the stop's bounded join walks away
+        from, so the job ends before it touches the scanner.  The interruption
+        is raised rather than written here: the gate is released before
+        ``_scan_job``'s handler writes the row, and since nothing has been
+        announced yet, the row gets the restart text for a job that never
+        reached the scanner.
+
+        Raises:
+            ScanInterrupted: When the server is stopping.
+
+        """
+        if self._stopping.is_set():
+            msg = "The server stopped before the scan started"
+            raise ScanInterrupted(msg)
+
     def _idle_housekeeping(self) -> None:
         """
         Use an idle tick: retry owed writes (probing while degraded), then prune.
@@ -2377,6 +2398,7 @@ class ScanWorker:
             # a read never returned raises ScanError into the except Exception
             # below, and fails the job just as a refused scan does.
             with self._scanner_gate:
+                self._refuse_to_start_while_stopping()
                 self._scanner.reinitialise()
                 result = run_pipeline(
                     self._scanner,
