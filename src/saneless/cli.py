@@ -154,6 +154,7 @@ from .vocabulary import (
     state_label,
 )
 from .web.app import create_app
+from .web.refresher import CheckRefresher
 from .workspace import sweep_orphans
 
 if TYPE_CHECKING:
@@ -2401,6 +2402,63 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
             sock.close()
 
 
+def _stop_the_refresher_early(app: FastAPI) -> None:
+    """
+    Tell the app's check refresher to stop, as soon as the server is told to.
+
+    The lifespan stops the refresher too, but only after uvicorn's request
+    drain.  Told this early instead, the refresher starts no check after the
+    one it is in, and a check that cannot be cut short has the drain as well
+    as the lifespan's join to end in.  A refresher still running when that
+    join ends makes the lifespan leave the job store, the Paperless client and
+    the scanner open.
+
+    Setting the refresher's stop event is all this does, and it never waits on
+    a check, so it is safe from a signal handler.  The lifespan's own request
+    is then a second one, which is harmless.  An app with no refresher, as in
+    a test, is left alone.
+
+    Args:
+        app: The app being served.
+
+    """
+    refresher = getattr(getattr(app, "state", None), "refresher", None)
+    if isinstance(refresher, CheckRefresher):
+        refresher.request_stop()
+
+
+class _StoppingServer(uvicorn.Server):
+    """A uvicorn server that tells the check refresher when it is told to stop."""
+
+    def __init__(self, config: uvicorn.Config, app: FastAPI) -> None:
+        """
+        Build the server for ``config``, serving ``app``.
+
+        Args:
+            config: uvicorn's configuration, built for ``app``.
+            app: The app being served, whose refresher a stop is passed to.
+
+        """
+        super().__init__(config)
+        self._served_app = app
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        """
+        Stop the server as uvicorn does, then tell the check refresher.
+
+        uvicorn installs this as its SIGTERM and SIGINT handler while it runs,
+        so it is where both a ``kill`` and a Ctrl-C arrive, before uvicorn
+        starts waiting for the requests still being answered.
+
+        Args:
+            sig: The signal received.
+            frame: The frame the signal interrupted.
+
+        """
+        super().handle_exit(sig, frame)
+        _stop_the_refresher_early(self._served_app)
+
+
 def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> None:
     """
     Announce the bound addresses and run uvicorn on the given sockets.
@@ -2432,19 +2490,21 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
     # uvicorn.access and uvicorn.asgi propagate to saneless's root handlers.
     # Leaving the access log on therefore puts per-request lines, and
     # uvicorn's own startup lines, on the same stream for free.
-    server = uvicorn.Server(
+    server = _StoppingServer(
         uvicorn.Config(
             app,
             log_config=None,
             log_level=log_level.lower(),
             access_log=True,
             timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_SECONDS,
-        )
+        ),
+        app,
     )
 
     def _stop_requested(_signum: int, _frame: FrameType | None) -> None:
-        """Ask the server to stop, as uvicorn's own SIGTERM handler does."""
+        """Ask the server, and the check refresher, to stop, as uvicorn's does."""
         server.should_exit = True
+        _stop_the_refresher_early(app)
 
     # A running server stopped with SIGTERM is a normal stop, exit 0, whether
     # or not it is PID 1. uvicorn installs its own handler while it runs, and
@@ -2455,11 +2515,12 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
     # one more stop request to a server that has already stopped, and the
     # command returns normally. It also covers a SIGTERM that lands before
     # uvicorn has installed its own: the server stops instead of the signal
-    # being lost or ending the process mid-start-up. The previous handler is
-    # put back however the run ends. As in _install_interrupt_handlers, a
-    # handler installed from outside Python (getsignal returns None) is left
-    # alone, since it could not be put back, and only the main thread may
-    # install one at all.
+    # being lost or ending the process mid-start-up. Like uvicorn's handler
+    # in _StoppingServer, it tells the check refresher to stop as well. The
+    # previous handler is put back however the run ends. As in
+    # _install_interrupt_handlers, a handler installed from outside Python
+    # (getsignal returns None) is left alone, since it could not be put back,
+    # and only the main thread may install one at all.
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     owns_sigterm = (
         previous_sigterm is not None
@@ -2473,7 +2534,9 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
         # server being stopped is a normal stop, exit 0, so it is swallowed
         # here; a Ctrl-C before this point -- while settings load or the app
         # is built -- is not uvicorn's to handle and reaches the group guard,
-        # exit 130.
+        # exit 130. The Ctrl-C itself reached _StoppingServer.handle_exit,
+        # which told the check refresher before the drain; by the time the
+        # re-raise arrives here the lifespan has already stopped it.
         with contextlib.suppress(KeyboardInterrupt):
             server.run(sockets=sockets)
     except SystemExit:

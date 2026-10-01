@@ -211,9 +211,15 @@ class CheckRefresher:
         Two waits cannot be cut short, and a stop that lands in one waits
         for it.  A name lookup takes no timeout at all.  The Paperless check
         is one HTTP request of up to ``PROBE_CONNECT_SECONDS`` plus
-        ``PROBE_READ_SECONDS``, longer than the lifespan's shared join, so a
-        stop early in it can find the thread still running, and the lifespan
-        then closes nothing.
+        ``PROBE_READ_SECONDS``, longer than the lifespan's shared join.
+        ``serve`` therefore calls this as soon as the server is told to stop,
+        before uvicorn waits for the requests still being answered, and the
+        lifespan calls it again afterwards.  The run then ends after the check
+        in flight instead of going on to the next, and that check has the
+        request drain as well as the join to end in.  An idle server's drain
+        is short, though, so a stop early in a Paperless check, or in a slow
+        name lookup, can still find the thread running when the join ends, and
+        the lifespan then closes nothing.
 
         A request waiting in :meth:`request_probe` is woken as well and told
         its probe is still pending, so no request thread waits out its whole
@@ -233,7 +239,8 @@ class CheckRefresher:
         gone within about a second even mid-listing or waiting on a silent
         saned host.  It is not when the stop lands in the Paperless check's
         request or in a name lookup, which :meth:`request_stop` cannot cut
-        short.  The join is bounded by the
+        short, and which ``serve``'s early :meth:`request_stop` gives only the
+        request drain more to end in.  The join is bounded by the
         worker's ``STOP_JOIN_SECONDS``, or by the caller's remaining share of
         it: the lifespan takes one deadline for both threads, so what the
         worker's join already spent is not spent again here.  When this

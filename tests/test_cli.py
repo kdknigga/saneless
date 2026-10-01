@@ -32,13 +32,21 @@ import tomlkit
 import uvicorn
 from click.testing import CliRunner
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
+import saneless.checks as checks_module
 import saneless.cli as cli_module
 import saneless.config as config_module
 import saneless.job as job_module
 import saneless.vocabulary as vocabulary_module
-from saneless.checks import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
+from saneless.checks import (
+    PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
+    CheckKey,
+    CheckResult,
+    CheckState,
+)
 from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
     CONFIG_FILENAME,
@@ -94,10 +102,13 @@ from saneless.vocabulary import (
     multi_page_manual_duplex_refusal,
     state_label,
 )
+from saneless.web import app as app_module
+from saneless.web.app import create_app
 from tests.conftest import (
     StubScannerBackend,
     build_settings,
     leave_killed_workspace,
+    poll_until,
     scan_batch,
 )
 from tests.fake_sane import UNNAMED_OPTION_ENTRIES, FakeSaneDev, FakeSaneModule
@@ -113,8 +124,10 @@ if TYPE_CHECKING:
 
     from click.testing import Result
 
+    from saneless.checks import CheckContext
     from saneless.config import LogLevel
     from saneless.scanner.base import PageSink, ScanSettings
+    from saneless.web.refresher import CheckRefresher
     from saneless.workspace import RecoveredWorkspace
 
 
@@ -3388,6 +3401,9 @@ class TestJobsCommand:
 
 _UVICORN_LOGGERS = ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")
 
+# The longest a serve test waits for a thread it started to reach a point.
+_THREAD_JOIN_TIMEOUT = 5.0
+
 
 @pytest.fixture
 def uvicorn_loggers_restored() -> Generator[None]:
@@ -3656,6 +3672,105 @@ def _invoke_on_a_worker_thread(runner: CliRunner, args: list[str]) -> Result:
     return outcome[0]
 
 
+@dataclasses.dataclass
+class _HeldRefresherChecks:
+    """
+    The refresher's scanner and Paperless checks, each held on an Event.
+
+    Neither looks at the stop: each waits for its release, as a request that
+    cannot be cut short does, so only what the refresher does between checks
+    decides whether a stop ends its run.
+    """
+
+    scanner_entered: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    scanner_release: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    paperless_entered: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+    paperless_release: threading.Event = dataclasses.field(
+        default_factory=threading.Event
+    )
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Put both held checks in place of the real ones."""
+
+        def held_scanner_check(
+            _context: CheckContext, _gate: threading.Lock
+        ) -> CheckResult:
+            self.scanner_entered.set()
+            self.scanner_release.wait(_THREAD_JOIN_TIMEOUT)
+            return CheckResult(key=CheckKey.SCANNER, state=CheckState.OK, message="")
+
+        def held_paperless_check(_context: CheckContext) -> CheckResult:
+            self.paperless_entered.set()
+            self.paperless_release.wait(_THREAD_JOIN_TIMEOUT)
+            return CheckResult(key=CheckKey.PAPERLESS, state=CheckState.OK, message="")
+
+        monkeypatch.setattr(checks_module, "_scanner_result", held_scanner_check)
+        monkeypatch.setattr(checks_module, "_check_paperless", held_paperless_check)
+
+    def release(self) -> None:
+        """Let both checks finish, so no thread a test started is left waiting."""
+        self.scanner_release.set()
+        self.paperless_release.set()
+
+
+@dataclasses.dataclass
+class _RecordedCloses:
+    """The closes the lifespan ran, and the real ones it may have skipped."""
+
+    calls: list[str]
+    skipped: list[Callable[[], None]]
+
+    def release_leftovers(self) -> None:
+        """Close the job store and Paperless client if the lifespan did not."""
+        if not self.calls:
+            for close in self.skipped:
+                close()
+
+
+def _record_closes(
+    monkeypatch: pytest.MonkeyPatch, app: FastAPI, scanner: StubScannerBackend
+) -> _RecordedCloses:
+    """
+    Record the lifespan's three closes, in order, still running the real two.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        app: The app whose job store and Paperless client are watched.
+        scanner: The scanner backend the app was built with.
+
+    Returns:
+        The record the closes are appended to.
+
+    """
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    real_store_close = store.close
+    real_paperless_close = paperless.close
+    closes = _RecordedCloses(calls=[], skipped=[real_paperless_close, real_store_close])
+
+    def recording_store_close() -> None:
+        closes.calls.append("job_store.close")
+        real_store_close()
+
+    def recording_paperless_close() -> None:
+        closes.calls.append("paperless.close")
+        real_paperless_close()
+
+    def recording_scanner_close() -> None:
+        closes.calls.append("scanner.close")
+
+    monkeypatch.setattr(store, "close", recording_store_close)
+    monkeypatch.setattr(paperless, "close", recording_paperless_close)
+    monkeypatch.setattr(scanner, "close", recording_scanner_close)
+    return closes
+
+
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeCommand:
     """
@@ -3746,6 +3861,108 @@ class TestServeCommand:
         assert isinstance(bound, int)
         assert bound > PROBE_CONNECT_SECONDS + PROBE_READ_SECONDS
         assert bound == 8
+
+    def test_a_stop_ends_the_refreshers_run_before_its_paperless_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A stop tells the refresher at once, so the drain does not let it go on.
+
+        The stop lands while the refresher's scanner check is running, and the
+        check finishes during the request drain.  The Paperless check after
+        it is one request that cannot be cut short; here it never ends.  Told
+        to stop only by the lifespan, after the drain, the refresher would
+        already be inside that request and miss its join, and the lifespan
+        would close nothing.  Told when the stop is asked for, it ends its run
+        after the scanner check, and all three closes run.
+
+        uvicorn is replaced by a run that does what it does around a SIGTERM:
+        start the lifespan, hand the signal to ``handle_exit`` as its own
+        handler would, wait out the drain, then shut the lifespan down.  The
+        join is cut to 1 s so a broken stop fails fast.
+        """
+        monkeypatch.setattr(app_module, "STOP_JOIN_SECONDS", 1.0)
+        held = _HeldRefresherChecks()
+        held.install(monkeypatch)
+        scanner = StubScannerBackend()
+        app = create_app(self._loopback_settings(tmp_path), scanner)
+        refresher: CheckRefresher = app.state.refresher
+        closes = _record_closes(monkeypatch, app, scanner)
+
+        def stopped_run(
+            self: uvicorn.Server, sockets: list[socket.socket] | None = None
+        ) -> None:
+            del sockets
+            with TestClient(app):
+                self.started = True
+                refresher.note_watcher()
+                assert held.scanner_entered.wait(_THREAD_JOIN_TIMEOUT)
+                self.handle_exit(signal.SIGTERM, None)
+                held.scanner_release.set()
+                # The drain: requests still being answered keep the lifespan
+                # waiting until the refresher has either gone on to the
+                # Paperless check or ended its run.
+                assert poll_until(
+                    lambda: (
+                        held.paperless_entered.is_set() or not refresher.probe_in_flight
+                    ),
+                    _THREAD_JOIN_TIMEOUT,
+                )
+
+        monkeypatch.setattr(uvicorn.Server, "run", stopped_run)
+        sock = socket.create_server(("127.0.0.1", 0))
+        try:
+            cli_module._run_server(app, [sock], "WARNING")
+            assert not held.paperless_entered.is_set()
+            assert closes.calls == [
+                "paperless.close",
+                "job_store.close",
+                "scanner.close",
+            ]
+        finally:
+            sock.close()
+            held.release()
+            assert refresher.stop(timeout=_THREAD_JOIN_TIMEOUT) is True
+            closes.release_leftovers()
+
+    def test_a_sigterm_before_uvicorn_takes_it_also_tells_the_refresher(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``serve``'s own SIGTERM handler stops the refresher as well as the server.
+
+        It is in place around uvicorn's run, so it is what a SIGTERM reaches
+        before uvicorn has installed its own handler.  The run below is a
+        stand-in that installs none, so the signal it raises lands there.
+        """
+        assert threading.current_thread() is threading.main_thread()
+        app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
+        refresher: CheckRefresher = app.state.refresher
+        asked: list[str] = []
+        should_exit: list[bool] = []
+
+        def recording_request_stop() -> None:
+            asked.append("request_stop")
+
+        def signalled_run(
+            self: uvicorn.Server, sockets: list[socket.socket] | None = None
+        ) -> None:
+            del sockets
+            signal.raise_signal(signal.SIGTERM)
+            should_exit.append(self.should_exit)
+            self.started = True
+
+        monkeypatch.setattr(refresher, "request_stop", recording_request_stop)
+        monkeypatch.setattr(uvicorn.Server, "run", signalled_run)
+        sock = socket.create_server(("127.0.0.1", 0))
+        try:
+            cli_module._run_server(app, [sock], "WARNING")
+            assert should_exit == [True]
+            assert asked == ["request_stop"]
+        finally:
+            sock.close()
+            app.state.paperless.close()
+            app.state.job_store.close()
 
     def test_serve_port_0_binds_an_os_chosen_port_and_reports_it(
         self, monkeypatch: pytest.MonkeyPatch
