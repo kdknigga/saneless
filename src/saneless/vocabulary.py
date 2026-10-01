@@ -3618,7 +3618,16 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
     The wording is surface-neutral.  Both the web page and the CLI render the
     same string, so a next step never says "press Scan" (the CLI has no
     button) and never says "run the command" (the page has no command line);
-    it says "start the scan again", which is true on both.
+    it says "start the scan again", which is true on both.  CONFIG, SCANNER
+    and UPLOAD say "try again" instead: they also reach commands that scan
+    nothing, such as ``saneless devices`` and ``saneless serve``.
+
+    A next step is the fallback for every error in its category that does not
+    carry one of its own, so it must be true for all of them.  Where the
+    members' fixes differ (a port in use, a missing libsane, a typo in an
+    environment variable and a bad setting are all CONFIG), the step points at
+    the problem the error names rather than guessing one fix that would send
+    some reader the wrong way.
 
     Every string is a developer-authored constant.  None of them interpolates
     exception text, request input, a URL, a token or a filesystem path, so
@@ -3653,25 +3662,27 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
             )
         case ErrorCategory.CONFIG:
             advice = ErrorAdvice(
-                message="The saneless configuration is invalid.",
-                next_step=(
-                    "Correct the saneless configuration file, then restart saneless."
-                ),
+                # Not "the configuration is invalid": a port in use, a missing
+                # libsane or an unwritable folder lands here too.
+                message="saneless is not set up correctly.",
+                next_step="Fix the problem the error names, then try again.",
             )
         case ErrorCategory.SCANNER:
             advice = ErrorAdvice(
                 message="The scanner could not complete the scan.",
                 next_step=(
-                    "Check the scanner is switched on and connected, then "
-                    "start the scan again."
+                    "Check the scanner is switched on and connected, then try again."
                 ),
             )
         case ErrorCategory.UPLOAD:
             advice = ErrorAdvice(
                 message="The document could not be sent to paperless-ngx.",
+                # The settings are examples, not the diagnosis: a refused
+                # document or an unmounted consume folder lands here too.
                 next_step=(
-                    "Check paperless-ngx is running and the API token is "
-                    "correct, then start the scan again."
+                    "Fix the problem the error names (for example, "
+                    "paperless-ngx is not running, or paperless.url or "
+                    "paperless.token is wrong), then try again."
                 ),
             )
         case ErrorCategory.UNKNOWN:

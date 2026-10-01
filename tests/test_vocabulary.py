@@ -1058,6 +1058,23 @@ class TestErrorAdvice:
                 "Load the pages squarely in the feeder, clear any jam, then "
                 "start the scan again.",
             ),
+            # CONFIG, SCANNER and UPLOAD also reach commands that scan
+            # nothing, so they say "try again"; CONFIG and UPLOAD point at the
+            # error itself because their members' fixes differ.
+            (
+                ErrorCategory.CONFIG,
+                "Fix the problem the error names, then try again.",
+            ),
+            (
+                ErrorCategory.SCANNER,
+                "Check the scanner is switched on and connected, then try again.",
+            ),
+            (
+                ErrorCategory.UPLOAD,
+                "Fix the problem the error names (for example, paperless-ngx is "
+                "not running, or paperless.url or paperless.token is wrong), "
+                "then try again.",
+            ),
             (
                 ErrorCategory.ASSEMBLY,
                 "Start the scan again. If it keeps failing, check the server's "
@@ -1085,7 +1102,7 @@ class TestErrorAdvice:
     def test_error_next_step_strings(
         self, category: ErrorCategory, expected: str
     ) -> None:
-        """The seven next steps are the approved UI-SPEC S2 copy (APPL-04)."""
+        """The next steps are the approved copy (APPL-04)."""
         assert error_next_step(category) == expected
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
@@ -1102,12 +1119,17 @@ class TestErrorAdvice:
         assert "run the command" not in next_step
 
     def test_error_message_strings(self) -> None:
-        """The messages are byte identical to what shipped before (APPL-04, D-10)."""
+        """
+        The messages are the approved copy (APPL-04).
+
+        CONFIG's no longer calls the configuration invalid, because a port in
+        use, a missing libsane or an unwritable folder is filed there too.
+        """
         assert error_message(ErrorCategory.FEEDER) == (
             "The document feeder is empty or jammed."
         )
         assert error_message(ErrorCategory.CONFIG) == (
-            "The saneless configuration is invalid."
+            "saneless is not set up correctly."
         )
         assert error_message(ErrorCategory.SCANNER) == (
             "The scanner could not complete the scan."

@@ -461,7 +461,7 @@ _FILING_HEADLINE = "received the document but did not confirm"
 _UPLOAD_HEADLINE = "could not be sent to paperless-ngx"
 _DISK_HEADLINE = "ran out of disk space"
 _AMBER_NEXT = "Check paperless-ngx's document list before scanning again"
-_UPLOAD_NEXT = "API token is correct"
+_UPLOAD_NEXT = "paperless.url or paperless.token is wrong"
 _DISK_NEXT = "Free space on the server"
 
 _CASES = [
