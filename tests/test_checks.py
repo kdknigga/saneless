@@ -49,6 +49,8 @@ from saneless.checks import (
     CheckKey,
     CheckResult,
     CheckState,
+    PaperlessRefusal,
+    ScannerRefusal,
     _saned_hosts,
     _scanner_busy,
     _scanner_skipped,
@@ -5978,11 +5980,12 @@ class TestPaperlessCheck:
 
     def test_no_client_is_an_address_problem(self, tmp_path: Path) -> None:
         """
-        A client that could not be built at all is reported as a bad address.
+        A client missing for no stated reason is reported as a bad address.
 
-        The only way ``PaperlessClient.__init__`` refuses is an unusable URL,
-        so this reuses the "not found at that URL" row rather than inventing a
-        sixth sentence.
+        ``PaperlessClient.__init__`` refuses a URL or token it cannot use and a
+        TLS trust store it cannot read, and a caller that knows which says so
+        on the context (``TestRefusalRows``).  One that says nothing keeps the
+        "not found at that URL" row.
 
         Args:
             tmp_path: The test's own directory.
@@ -8770,3 +8773,150 @@ class TestStripWording:
         line = "The checks have not run yet. Press Check again to try now."
         assert line == checks.POLL_GAVE_UP_LINE
         assert render_check_step(checks.POLL_GAVE_UP_LINE, CheckSurface.STRIP) == line
+
+
+class TestRefusalRows:
+    """
+    A client or backend that could not be built is reported by why it was not.
+
+    ``saneless doctor`` builds its own Paperless client and scanner backend, and
+    each can be refused for more than one reason.  Folding every refusal into one
+    row sent the reader to the wrong place: an unreadable TLS trust store read
+    as a wrong address, and a scanner library that would not start read as one
+    that was never installed.  The kind of refusal reaches the registry on the
+    context, and each kind is its own row.
+    """
+
+    def test_an_unreadable_trust_store_is_its_own_row(self, tmp_path: Path) -> None:
+        """
+        The trust-store row names the two variables that steer it.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        context = replace(
+            _context(_settings(tmp_path), paperless=None),
+            paperless_refusal=PaperlessRefusal.TRUST_STORE,
+        )
+        row = _row(run_checks(context), CheckKey.PAPERLESS)
+        assert row.state is CheckState.FAIL
+        assert row.message == "The TLS trust store could not be read."
+        assert "SSL_CERT_FILE" in row.next_step
+        assert "SSL_CERT_DIR" in row.next_step
+        assert "not found" not in row.message
+
+    def test_an_unusable_url_or_token_is_a_configuration_row(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A URL or token the client refused is the configuration row, not an address.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        context = replace(
+            _context(_settings(tmp_path), paperless=None),
+            paperless_refusal=PaperlessRefusal.CONFIGURATION,
+        )
+        row = _row(run_checks(context), CheckKey.PAPERLESS)
+        assert row.state is CheckState.FAIL
+        assert row.message == connection_status_message(ConnectionStatus.MISCONFIGURED)
+        assert "paperless.url" in row.next_step
+        assert "paperless.token" in row.next_step
+
+    def test_a_missing_client_with_no_reason_keeps_the_address_row(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A caller that says nothing about why keeps the row it always had.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        row = _row(
+            run_checks(_context(_settings(tmp_path), paperless=None)),
+            CheckKey.PAPERLESS,
+        )
+        assert row.message == connection_status_message(ConnectionStatus.NOT_FOUND)
+
+    def test_a_scanner_library_that_will_not_start_is_its_own_row(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A SANE that refused to start is not reported as one never installed.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        context = replace(
+            _context(_settings(tmp_path), scanner=None),
+            scanner_refusal=ScannerRefusal.START_FAILED,
+        )
+        row = _row(run_checks(context), CheckKey.SCANNER)
+        assert row.state is CheckState.FAIL
+        assert row.message == "Scanner support could not be started."
+        assert "install" not in row.next_step.lower()
+        assert "log" in row.next_step
+        doctor = render_check_step(row.next_step, CheckSurface.DOCTOR)
+        assert "Check again" not in doctor
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [None, ScannerRefusal.NOT_INSTALLED],
+        ids=["no-reason", "not-installed"],
+    )
+    def test_a_missing_python_sane_is_still_not_installed(
+        self, tmp_path: Path, refusal: ScannerRefusal | None
+    ) -> None:
+        """
+        No scanner library at all keeps the install row.
+
+        Args:
+            tmp_path: The test's own directory.
+            refusal: What the caller said about the missing backend.
+
+        """
+        context = replace(
+            _context(_settings(tmp_path), scanner=None), scanner_refusal=refusal
+        )
+        row = _row(run_checks(context), CheckKey.SCANNER)
+        assert row.message == "Scanner support is not installed on this machine."
+
+    @pytest.mark.parametrize(
+        ("paperless_refusal", "scanner_refusal"),
+        [
+            (PaperlessRefusal.TRUST_STORE, ScannerRefusal.START_FAILED),
+            (PaperlessRefusal.CONFIGURATION, ScannerRefusal.NOT_INSTALLED),
+        ],
+        ids=["trust-store", "configuration"],
+    )
+    def test_no_refusal_row_names_a_path(
+        self,
+        tmp_path: Path,
+        paperless_refusal: PaperlessRefusal,
+        scanner_refusal: ScannerRefusal,
+    ) -> None:
+        """
+        The rows are fixed copy, which the strip could show without a leak.
+
+        Args:
+            tmp_path: The test's own directory.
+            paperless_refusal: Why the client was not built.
+            scanner_refusal: Why the backend was not built.
+
+        """
+        context = replace(
+            _context(_settings(tmp_path), scanner=None, paperless=None),
+            paperless_refusal=paperless_refusal,
+            scanner_refusal=scanner_refusal,
+        )
+        results = run_checks(context)
+        for key in (CheckKey.PAPERLESS, CheckKey.SCANNER):
+            row = _row(results, key)
+            for text in (row.message, row.next_step):
+                assert str(tmp_path) not in text
+                assert "/" not in text

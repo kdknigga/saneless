@@ -78,9 +78,14 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.job import JobStore
-from saneless.paperless import ConnectionProbe
+from saneless.paperless import ConnectionProbe, PaperlessClient
 from saneless.scanner.base import DeviceInfo
-from saneless.vocabulary import ConnectionStatus, ExitCode, ProfileStorage
+from saneless.vocabulary import (
+    ConnectionStatus,
+    ExitCode,
+    ProfileStorage,
+    connection_status_message,
+)
 from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend
 
@@ -1460,7 +1465,8 @@ class TestDoctorKeepsItsDocumentedExitCodes:
         ``PaperlessClient.__init__`` raises ``PaperlessError`` for a URL httpx2
         will not parse, which the group guard would turn into exit 3 -- a code
         ``doctor``'s documented table does not list, and a refusal that would
-        cost the operator the other four rows.
+        cost the operator the other five rows.  The row it becomes names the
+        two settings the client refused, not an address that answered wrongly.
         """
 
         class _UnbuildablePaperless:
@@ -1477,7 +1483,14 @@ class TestDoctorKeepsItsDocumentedExitCodes:
         result = runner.invoke(cli, ["doctor"])
         rows = [line for line in _lines(result.output) if line.startswith("[")]
         assert len(rows) == len(CheckKey)
-        assert "The paperless-ngx API was not found at that URL." in result.output
+        assert "not found at that URL" not in result.output
+        assert (
+            connection_status_message(ConnectionStatus.MISCONFIGURED) in result.output
+        )
+        assert (
+            f"{_NEXT_STEP_INDENT}Correct paperless.url and paperless.token in the "
+            "saneless config file, then restart saneless.\n"
+        ) in result.output
         assert result.exit_code == ExitCode.CONFIG
 
 
@@ -1782,3 +1795,107 @@ class TestDoctorNamesItsOwnRetry:
         assert "Check again" not in result.output
         assert "saneless doctor again" in result.output
         assert f"{_NEXT_STEP_INDENT}{expected}\n" in result.output, result.output
+
+
+def _row_and_step(output: str, key: CheckKey) -> tuple[str, str]:
+    """
+    Find one check's row line and the line printed under it.
+
+    Args:
+        output: The captured command output.
+        key: The check wanted.
+
+    Returns:
+        The row line, and the line after it (its next step, when it has one).
+
+    """
+    lines = _rows(output)
+    index = next(i for i, line in enumerate(lines) if check_name(key) in line)
+    following = lines[index + 1] if index + 1 < len(lines) else ""
+    return lines[index], following
+
+
+class TestDoctorNamesEachConfigurationFault:
+    """
+    Each reason doctor could not build a client or a backend is its own row.
+
+    An unreadable TLS trust store used to read "not found at that URL", and a
+    scanner library that would not start read "not installed".  Both sent the
+    reader to fix something that was not broken.
+    """
+
+    def test_an_unreadable_trust_store_is_named(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The real client refuses the trust store, and the row says so.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+
+        """
+        monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing-bundle.pem"))
+        runner = _patch_doctor(
+            monkeypatch, _make_settings(tmp_path), paperless_cls=PaperlessClient
+        )
+
+        result = runner.invoke(cli, ["doctor"])
+
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        assert len(rows) == len(CheckKey), result.output
+        row, step = _row_and_step(result.output, CheckKey.PAPERLESS)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert "trust store" in row
+        assert step.startswith(_NEXT_STEP_INDENT)
+        assert "SSL_CERT_FILE" in step
+        assert "SSL_CERT_DIR" in step
+        assert "not found at that URL" not in result.output
+        assert result.exit_code == ExitCode.CONFIG
+
+    def test_a_scanner_library_that_will_not_start_is_not_missing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        ``sane.init()`` refusing is its own row, and the log keeps the reason.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            caplog: pytest's log capture.
+
+        """
+        reason = "Could not initialise SANE: Error during device I/O"
+
+        class _SaneWillNotStart:
+            """A backend class whose ``sane.init()`` fails."""
+
+            def __init__(self, host: str = "") -> None:
+                """Fail the way a libsane that will not initialise does."""
+                raise ScanError(reason)
+
+        runner = _patch_doctor(
+            monkeypatch, _make_settings(tmp_path), scanner_cls=_SaneWillNotStart
+        )
+
+        with caplog.at_level("INFO"):
+            result = runner.invoke(cli, ["doctor"])
+
+        row, step = _row_and_step(result.output, CheckKey.SCANNER)
+        assert row.startswith(_state_marker(CheckState.FAIL)), row
+        assert "Scanner support could not be started." in row
+        assert step.startswith(_NEXT_STEP_INDENT)
+        assert "not installed" not in result.output
+        assert "Install saneless" not in step
+        assert "log" in step
+        assert "Check again" not in result.output
+        assert result.exit_code == ExitCode.CONFIG
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelname == "WARNING"
+        ]
+        assert any(reason in message for message in warnings), warnings
