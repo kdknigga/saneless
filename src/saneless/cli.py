@@ -2088,7 +2088,9 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     settings = _load_cli_settings(ctx)
     # A read and nothing more: the history may belong to a running server, so
     # this neither creates the database or its folder nor upgrades an older
-    # schema under it.  No database yet is an empty history.
+    # schema under it, and run by anyone but the database's owner it creates
+    # no -wal or -shm file beside it either.  No database yet is an empty
+    # history; one that cannot be reached is an error.
     recent = read_recent_jobs(settings.output.db_path, limit)
     if as_json:
         click.echo(

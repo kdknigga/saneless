@@ -1017,6 +1017,22 @@ def _open_uri(uri: str) -> tuple[sqlite3.Connection, int]:
     return conn, version
 
 
+def _has_side_files(db_path: Path) -> bool:
+    """
+    Report whether a job database has a ``-wal`` or ``-shm`` file beside it.
+
+    Args:
+        db_path: Path of the job database file.
+
+    Returns:
+        True when either side file exists.
+
+    """
+    return any(
+        db_path.with_name(db_path.name + suffix).exists() for suffix in ("-wal", "-shm")
+    )
+
+
 def _immutable_read_is_safe(db_path: Path) -> bool:
     """
     Report whether a job database can be read with ``immutable=1``.
@@ -1029,18 +1045,16 @@ def _immutable_read_is_safe(db_path: Path) -> bool:
         its ``-wal`` nor its ``-shm`` file exists.
 
     """
-    sidecars = (db_path.with_name(db_path.name + suffix) for suffix in ("-wal", "-shm"))
-    return not os.access(db_path.parent, os.W_OK) and not any(
-        sidecar.exists() for sidecar in sidecars
-    )
+    return not os.access(db_path.parent, os.W_OK) and not _has_side_files(db_path)
 
 
-def _connect_read_only(db_path: Path) -> tuple[sqlite3.Connection, int]:
+def _connect_read_only(db_path: Path, owner: int) -> tuple[sqlite3.Connection, int]:
     """
     Open a job database read-only and read its schema version.
 
     Args:
         db_path: Path of an existing job database file.
+        owner: The user id that owns the file.
 
     Returns:
         The open connection and the database's ``PRAGMA user_version``.
@@ -1049,6 +1063,19 @@ def _connect_read_only(db_path: Path) -> tuple[sqlite3.Connection, int]:
     # as_uri() percent-encodes the path, so a '?', '#' or space in it stays
     # part of the file name rather than starting the URI's query or fragment.
     uri = db_path.resolve().as_uri() + "?mode=ro"
+    # A read-only connection to a WAL database creates the -wal and -shm files
+    # beside it, and being read-only it cannot remove them when it closes.
+    # Left by another user -- root, for a sudo saneless jobs -- they belong to
+    # that user, and the server that owns the folder can then no longer write
+    # its own database.  So a reader who does not own the file, finding no
+    # side files, reads it immutable and creates none.  No side files means no
+    # connection holds the database and no committed page lives outside the
+    # file.  A server that opens it during the read writes to a new -wal, not
+    # to this file, until it checkpoints; a checkpoint landing mid-read can at
+    # worst spoil this one read, and never the file, which an immutable
+    # connection does not write.
+    if owner != os.geteuid() and not _has_side_files(db_path):
+        return _open_uri(uri + "&immutable=1")
     try:
         return _open_uri(uri)
     except sqlite3.OperationalError:
@@ -1070,7 +1097,13 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
     The listing can run beside a server that has the same database open, so
     it must never change the file under it: it opens the database read-only,
     and never creates the file, switches its journal mode, sets
-    ``auto_vacuum`` or runs a migration step.  Upgrading a database belongs
+    ``auto_vacuum`` or runs a migration step.  What it may leave behind is
+    stated here, because SQLite decides it: read by the user who owns the
+    database, with no server holding it, a WAL database gains the empty
+    ``-wal`` and the ``-shm`` index a read-only connection creates and cannot
+    remove, owned by that same user, and the next writer reuses both.  Any
+    other user, root included, reads without creating either, so it never
+    leaves a file the server cannot write in the server's folder.  Upgrading a database belongs
     to the server that writes it, so one at an older schema is refused rather
     than migrated.  A missing file, or one with no jobs table yet, is an
     empty history; a file that cannot be looked up for any other reason is
@@ -1088,7 +1121,7 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
         StorageError: If the database cannot be looked up, opened or read, or
             its schema version is older than this release reads, newer than
             it supports, or negative.  Every message names ``db_path``.  The
-            file is left exactly as it was found.
+            database file itself is left exactly as it was found.
 
     """
     name = str(db_path)
@@ -1097,13 +1130,13 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
     # enter, a symlink loop -- and a listing that took that for "no jobs"
     # would print an empty table, and [] on the JSON contract.
     try:
-        db_path.stat()
+        owner = db_path.stat().st_uid
     except FileNotFoundError:
         return []
     except OSError as exc:
         raise _open_failure(name, exc) from exc
     try:
-        conn, stamped = _connect_read_only(db_path)
+        conn, stamped = _connect_read_only(db_path, owner)
     except sqlite3.Error as exc:
         raise _open_failure(name, exc) from exc
     try:

@@ -3164,6 +3164,35 @@ class TestReadRecentJobs:
         assert str(data / "jobs.db") in str(excinfo.value)
         assert isinstance(excinfo.value.__cause__, PermissionError)
 
+    def test_another_users_read_creates_no_side_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A reader who does not own the database leaves its folder as it was.
+
+        A read-only open of a WAL database creates the ``-wal`` and ``-shm``
+        files beside it and cannot remove them, so ``sudo saneless jobs``
+        would leave root-owned files in the server's ``data_dir``.  With no
+        server holding the database, another user's read creates neither.
+        """
+        directory = tmp_path / "data"
+        directory.mkdir()
+        db = directory / "jobs.db"
+        store = JobStore(db_path=db)
+        try:
+            store.create_job("default", "Theirs")
+            expected = store.list_recent(10)
+        finally:
+            store.close()
+        assert _names(directory) == ["jobs.db"]
+        someone_else = db.stat().st_uid + 1
+        monkeypatch.setattr(os, "geteuid", lambda: someone_else)
+
+        read = job_module.read_recent_jobs(db, 10)
+
+        assert _names(directory) == ["jobs.db"]
+        assert read == expected
+
     def test_rows_match_the_store(self, tmp_path: Path) -> None:
         """The read returns what the open store's own listing returns."""
         db = tmp_path / "jobs.db"
