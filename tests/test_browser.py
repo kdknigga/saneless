@@ -110,8 +110,12 @@ from saneless.vocabulary import (
     MULTI_PAGE_DISABLED_REASON,
     MULTI_PAGE_HELP,
     MULTI_PAGE_LABEL,
+    NO_SCRIPT_HEADING,
+    NO_SCRIPT_LINE,
+    NO_SCRIPT_PAGE_TITLE,
     NOTHING_TO_FINISH,
     SCAN_BLOCKED_REASON,
+    TAG_FILTER_LABEL,
     TAGS_LOADING,
     TAGS_UNAVAILABLE,
     TERMINAL_STATES,
@@ -1201,7 +1205,7 @@ def _refresh_both_lists(page: Page) -> None:
         with page.expect_response(
             lambda r, name=resource: r.url.endswith(f"resource={name}")
         ) as refreshed:
-            page.click(f'button[aria-label="Refresh {resource}"]')
+            page.click(f"#{resource}-refresh")
         assert refreshed.value.status == 200, resource
     # A function, not a bare expression: Playwright evals a bare expression
     # inside the page, and the page's Content-Security-Policy refuses eval.
@@ -3323,7 +3327,7 @@ class TestPageLoadAsksForNoList:
             with page.expect_response(
                 lambda r: r.url.endswith("resource=tags")
             ) as tag_refresh:
-                page.click('button[aria-label="Refresh tags"]')
+                page.click("#tags-refresh")
             assert tag_refresh.value.status == 200
             expect(page.locator("label.tag-option")).to_have_count(len(tags))
             expect(page.locator("#tags-list")).to_contain_text("garden")
@@ -3331,7 +3335,7 @@ class TestPageLoadAsksForNoList:
             with page.expect_response(
                 lambda r: r.url.endswith("resource=correspondents")
             ) as correspondent_refresh:
-                page.click('button[aria-label="Refresh correspondents"]')
+                page.click("#correspondents-refresh")
             assert correspondent_refresh.value.status == 200
             expect(
                 page.locator('#correspondent-select option[value="42"]')
@@ -8889,3 +8893,314 @@ class TestFocusMap:
             assert violations == [], (
                 f"a page violated its Content-Security-Policy: {violations}"
             )
+
+
+# Where a heading's text, its refresh button and the control under it sit, as
+# rectangles: the heading element is the text's line box, and the range over
+# its one text node is the text itself.
+_HEADING_LAYOUT = """
+([headingSelector, buttonSelector, controlSelector]) => {
+    const box = (node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+            top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right,
+        };
+    };
+    const heading = document.querySelector(headingSelector);
+    const text = [...heading.childNodes].find(
+        (node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim() !== "",
+    );
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    return {
+        line: box(heading),
+        text: box(range),
+        button: box(document.querySelector(buttonSelector)),
+        control: box(document.querySelector(controlSelector)),
+    };
+}
+"""
+
+# Each refresh button's heading, the button, and the control under both, as
+# selectors.
+_REFRESH_ROWS = [
+    pytest.param(
+        ("fieldset:has(#tags-list) > legend", "#tags-refresh", "#tag-filter"),
+        id="tags",
+    ),
+    pytest.param(
+        (
+            'label[for="correspondent-select"]',
+            "#correspondents-refresh",
+            "#correspondent-select",
+        ),
+        id="correspondents",
+    ),
+]
+
+
+def _is_tags_request(request: Request) -> bool:
+    """Say whether ``request`` is the tag filter's own fetch."""
+    return urlsplit(request.url).path == "/api/tags"
+
+
+@pytest.mark.browser
+class TestFormControls:
+    """
+    The tag and correspondent controls, as a browser and a screen reader see them.
+
+    Each control is announced by its own name and nothing else, the filter
+    follows every edit and its own clear button, and each refresh button
+    keeps focus and the current choice while it sits beside its heading
+    rather than inside it.
+    """
+
+    def test_accessible_name_of_tags_and_correspondent(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """A heading names its control only; the filter has a label of its own."""
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+
+        expect(page.locator("fieldset:has(#tags-list)")).to_have_accessible_name("Tags")
+        expect(page.locator("#correspondent-select")).to_have_accessible_name(
+            "Correspondent"
+        )
+        expect(page.locator('label[for="tag-filter"]')).to_have_count(1)
+        expect(page.locator("#tag-filter")).to_have_accessible_name(TAG_FILTER_LABEL)
+
+    def test_tag_filter_fill_and_search_clear(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        One request per edit, and the box's own clear brings the list back.
+
+        ``fill`` sets the value and fires ``input`` with no key at all, as a
+        paste or a dictation does.  The clear is the ``search`` event alone,
+        which is what the box's clear button and Escape fire, so the list is
+        restored by that trigger and not by an ``input`` riding along.
+        """
+        requested: list[str] = []
+
+        def _record(request: Request) -> None:
+            if _is_tags_request(request):
+                requested.append(request.url)
+
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+        page.on("request", _record)
+        tags_list = page.locator("#tags-list")
+        filter_box = page.locator("#tag-filter")
+
+        with page.expect_response(
+            lambda r: _is_tags_request(r.request), timeout=5_000
+        ) as narrowed:
+            filter_box.fill("gar")
+        assert narrowed.value.status == 200
+        expect(tags_list).to_contain_text("garden")
+        expect(tags_list).not_to_contain_text("school")
+        assert len(requested) == 1, requested
+
+        with page.expect_response(
+            lambda r: _is_tags_request(r.request), timeout=5_000
+        ) as cleared:
+            filter_box.evaluate(
+                "box => { box.value = ''; box.dispatchEvent(new Event('search')); }"
+            )
+        assert cleared.value.status == 200
+        expect(page.locator("label.tag-option")).to_have_count(len(_DEFAULTS_TAGS))
+        assert len(requested) == 2, requested
+
+    def test_focus_map_tags_refresh_keeps_focus(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """Pressing the tags refresh from the keyboard leaves focus on it."""
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+        button = page.locator("#tags-refresh")
+        button.focus()
+
+        with page.expect_response(lambda r: r.url.endswith("resource=tags")) as done:
+            page.keyboard.press("Enter")
+
+        assert done.value.status == 200
+        expect(page.locator("#tags-list.htmx-added")).to_have_count(0)
+        expect(button).to_be_focused()
+
+    def test_focus_map_correspondents_refresh_keeps_focus(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """Pressing the correspondents refresh from the keyboard leaves focus on it."""
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+        button = page.locator("#correspondents-refresh")
+        button.focus()
+
+        with page.expect_response(
+            lambda r: r.url.endswith("resource=correspondents")
+        ) as done:
+            page.keyboard.press("Enter")
+
+        assert done.value.status == 200
+        expect(page.locator("#correspondent-select.htmx-settling")).to_have_count(0)
+        expect(button).to_be_focused()
+
+    def test_correspondent_refresh_keeps_the_choice(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        A refresh changes the list, never what is chosen in it.
+
+        The profile opens on 41, so 42 is a choice the operator made.  The
+        options are marked before the press and the wait is for the marks to
+        be gone, so the value is read from the swapped-in options.  The button
+        is found by its name, which it had before it had an id.
+        """
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+        select = page.locator("#correspondent-select")
+        select.select_option("42")
+        select.locator("option").evaluate_all(
+            "options => options.forEach(o => o.setAttribute('data-stale', ''))"
+        )
+
+        with page.expect_response(
+            lambda r: r.url.endswith("resource=correspondents")
+        ) as done:
+            page.get_by_role("button", name="Refresh correspondents").click()
+
+        assert done.value.status == 200
+        expect(select.locator("option[data-stale]")).to_have_count(0)
+        expect(select).to_have_value("42")
+
+    @pytest.mark.parametrize("width", [1280, 320])
+    @pytest.mark.parametrize("row", _REFRESH_ROWS)
+    def test_refresh_buttons_keep_their_place(
+        self,
+        page: Page,
+        defaults_server: _BrowserServer,
+        width: int,
+        row: tuple[str, str, str],
+    ) -> None:
+        """
+        Each button sits on its heading's line, right of the text, above the control.
+
+        Moving the buttons out of the legend and the label must not move them
+        on the screen, at a desktop width or at the narrowest phone.
+        """
+        page.set_viewport_size({"width": width, "height": 800})
+        page.goto(defaults_server.url)
+        _await_the_lists(page)
+
+        layout = page.evaluate(_HEADING_LAYOUT, list(row))
+
+        line, text, refresh, below = (
+            layout["line"],
+            layout["text"],
+            layout["button"],
+            layout["control"],
+        )
+        middle = (refresh["top"] + refresh["bottom"]) / 2
+        assert line["top"] <= middle <= line["bottom"], layout
+        assert refresh["top"] < text["bottom"], layout
+        assert refresh["bottom"] > text["top"], layout
+        assert refresh["left"] >= text["right"], layout
+        assert below["top"] >= max(line["bottom"], refresh["bottom"]), layout
+
+
+# A title the refusal must keep out of the URL and off the page.
+_NO_SCRIPT_TITLE = "Kept-Out-Of-The-URL-5c1d"
+
+
+def _listless_settings(tmp_dir: Path) -> Settings:
+    """
+    Build the browser test settings with neither list on the form.
+
+    With JavaScript off the lists never load, so Scan stays held on a form
+    that shows one.  A form showing neither has nothing to wait for, so
+    Scan can be pressed and the browser posts the form by itself.
+    """
+    return _browser_test_settings(tmp_dir).model_copy(
+        update={"web": WebConfig(show_tags=False, show_correspondent=False)}
+    )
+
+
+@pytest.mark.browser
+class TestJavaScriptOff:
+    """
+    A browser with JavaScript off is told why Scan cannot work, and leaks nothing.
+
+    Each context is built by hand with JavaScript off, installs the egress
+    gate and the policy recorder, and is checked after it closes.  With
+    scripting off the recorder's init script never runs, so the egress gate
+    is the check that means something here.
+    """
+
+    def test_javascript_off_scan_lands_on_the_refusal_page(
+        self, browser: Browser, tmp_path: Path, egress_allowlist: list[str]
+    ) -> None:
+        """Scan posts the form, the server refuses it, and no row is written."""
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        with _serve(_listless_settings(tmp_path), _BrowserTestScanner()) as server:
+            egress_allowlist.append(server.url)
+            job_store: JobStore = server.app.state.job_store
+            before = len(job_store.list_recent(limit=1_000))
+            ctx = browser.new_context(java_script_enabled=False)
+            try:
+                ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+                _make_csp_gate(ctx, violations)
+                page = ctx.new_page()
+                page.goto(server.url)
+                expect(page.locator("#scan-btn")).to_be_enabled()
+                page.fill("#title-input", _NO_SCRIPT_TITLE)
+
+                page.click("#scan-btn")
+
+                expect(page).to_have_title(NO_SCRIPT_PAGE_TITLE)
+                expect(
+                    page.get_by_role("heading", name=NO_SCRIPT_HEADING)
+                ).to_be_visible()
+                assert urlsplit(page.url).path == "/api/scan", page.url
+                assert _NO_SCRIPT_TITLE not in page.url
+                assert _NO_SCRIPT_TITLE not in page.content()
+                assert len(job_store.list_recent(limit=1_000)) == before
+            finally:
+                ctx.close()
+        assert seen, "the hand-built context's gate handled no request"
+        assert blocked == [], f"a page tried to reach the network: {blocked}"
+        assert violations == [], (
+            f"a page violated its Content-Security-Policy: {violations}"
+        )
+
+    def test_javascript_off_page_explains_itself(
+        self,
+        browser: Browser,
+        browser_server: _BrowserServer,
+        egress_allowlist: list[str],
+    ) -> None:
+        """The line under the heading shows, and Scan is held: the lists never load."""
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        ctx = browser.new_context(java_script_enabled=False)
+        try:
+            ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(ctx, violations)
+            page = ctx.new_page()
+            page.goto(browser_server.url)
+
+            # Read by locator and inner text: Playwright's text matching skips
+            # the inside of a noscript element, whatever the browser renders.
+            line = page.locator("noscript > p.status-fallback")
+            expect(line).to_be_visible()
+            assert line.inner_text() == f"\u26a0 {NO_SCRIPT_LINE}"
+            expect(page.locator("#scan-btn")).to_be_disabled()
+        finally:
+            ctx.close()
+        assert seen, "the hand-built context's gate handled no request"
+        assert blocked == [], f"a page tried to reach the network: {blocked}"
+        assert violations == [], (
+            f"a page violated its Content-Security-Policy: {violations}"
+        )

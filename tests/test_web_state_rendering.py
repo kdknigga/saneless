@@ -54,6 +54,7 @@ from saneless.vocabulary import (
     PASS_WAIT_STATES,
     SCAN_BLOCKED_REASON,
     SCAN_BLOCKED_URL_REASON,
+    TAG_FILTER_LABEL,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
@@ -83,6 +84,7 @@ from saneless.vocabulary import (
 )
 from saneless.web import app as app_module
 from saneless.web.app import create_app
+from saneless.web.routes import TAG_FILTER_MAX_LENGTH
 from saneless.worker import WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, load_the_lists, poll_until
 
@@ -3090,10 +3092,82 @@ class TestFormHelpTextAndTagPicker:
             'hx-get="/api/tags"',
             'hx-target="#tags-list"',
             'hx-swap="outerHTML"',
-            'hx-trigger="keyup changed delay:300ms"',
+            'hx-trigger="input changed delay:300ms, search"',
             'hx-include="#tags-list"',
         ):
             assert attribute in match.group(0), attribute
+
+    def test_tag_filter_trigger_length_and_label(self, client: TestClient) -> None:
+        """
+        The filter follows every edit, is bounded, and has a real name.
+
+        ``input`` catches a paste, a dictation and an autocorrection, which
+        ``keyup`` misses; ``search`` is what the box's own clear button fires.
+        The length is the route's own bound, so the box never sends what the
+        route refuses.  The visually hidden label says what the placeholder
+        says, so the spoken name and the visible hint agree.
+        """
+        page = client.get("/").text
+        match = _TAG_FILTER_INPUT.search(page)
+
+        assert match is not None, "tag filter input not rendered"
+        tag = match.group(0)
+        assert 'hx-trigger="input changed delay:300ms, search"' in tag
+        assert "keyup" not in tag
+        assert f'maxlength="{TAG_FILTER_MAX_LENGTH}"' in tag
+        label = (
+            f'<label for="tag-filter" class="sr-only">'
+            f"{html.escape(TAG_FILTER_LABEL)}</label>"
+        )
+        assert page.count(label) == 1
+        assert re.search(rf"{re.escape(label)}\s*<input[^>]*id=\"tag-filter\"", page)
+
+    def test_refresh_buttons_sit_outside_legend_and_label(
+        self, client: TestClient
+    ) -> None:
+        """
+        The legend names the tags, the label the correspondent, and nothing else.
+
+        A button inside a legend or a label becomes part of the name its
+        control is announced by.  The buttons keep everything they had, and
+        gain ids so focus can be returned to them after their swap.
+        """
+        page = client.get("/").text
+
+        legend = re.search(r"<legend>(?P<body>.*?)</legend>", page, re.DOTALL)
+        assert legend is not None, page
+        assert legend.group("body") == "Tags"
+        label = re.search(
+            r'<label for="correspondent-select">(?P<body>.*?)</label>', page, re.DOTALL
+        )
+        assert label is not None, page
+        assert label.group("body") == "Correspondent"
+        for button_id, resource, name in (
+            ("tags-refresh", "tags", "Refresh tags"),
+            ("correspondents-refresh", "correspondents", "Refresh correspondents"),
+        ):
+            assert page.count(f'id="{button_id}"') == 1, button_id
+            button = re.search(
+                rf'<button type="button" id="{button_id}"(?P<attrs>[^>]*)>'
+                r"(?P<body>.*?)</button>",
+                page,
+                re.DOTALL,
+            )
+            assert button is not None, button_id
+            attrs = button.group("attrs")
+            assert f'hx-post="/api/cache/invalidate?resource={resource}"' in attrs
+            assert 'class="refresh-btn"' in attrs
+            assert f'title="{name}"' in attrs
+            assert f'aria-label="{name}"' in attrs
+            assert (
+                button.group("body") == f'&#x21bb;<span class="sr-only">{name}</span>'
+            )
+        heading = re.search(
+            r'<div class="field-heading">\s*<label for="correspondent-select">'
+            r'Correspondent</label>\s*<button type="button" id="correspondents-refresh"',
+            page,
+        )
+        assert heading is not None, page
 
     def test_the_tag_filter_form_is_an_empty_sibling_after_the_scan_form(
         self, client: TestClient
