@@ -275,9 +275,17 @@
        nothing from the form and the form's attribute list stays exactly as
        written.  It asks again every 20 s until an answer lands: a first
        request lost to htmx's own timeout, which leaves the element in place,
-       must not hold Scan for good. #}
+       must not hold Scan for good.
+
+       It also asks again whenever Profile changes, and each request replaces
+       the one in flight (hx-sync this:replace aborts it).  Otherwise an
+       answer for the profile chosen before would land after the
+       profile-change swaps and put that profile's ticks, choice and markers
+       back under the new one: the form would show one profile's defaults
+       under another's name, and the markers would make the scan discard what
+       the person then adjusted. #}
     {% if lists_loading %}
-    <div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata" hx-include="#profile-select" hx-trigger="load, every 20s" hx-swap="outerHTML"></div>
+    <div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata" hx-include="#profile-select" hx-trigger="load, change from:#profile-select, every 20s" hx-sync="this:replace" hx-swap="outerHTML"></div>
     {% endif %}
 
     {# The filter box belongs to this form, not to the scan form.  An input with

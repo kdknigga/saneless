@@ -40,7 +40,9 @@ Renders the main web UI page with scan form, live status indicator, and job hist
 The page asks paperless-ngx for nothing, so it renders at once even when paperless-ngx is
 slow or down. Where the tag list and the correspondent dropdown go, it says each is
 loading, and once the page has rendered it asks [`GET /api/metadata`](#get-apimetadata)
-for both, naming the profile the dropdown shows. Until that answer lands, the Scan button
+for both, naming the profile the dropdown shows. If Profile changes before the answer
+lands, the page asks again for the new profile and abandons the earlier request, so the
+lists never come back for a profile no longer chosen. Until that answer lands, the Scan button
 is disabled with a line beneath it saying it waits for the lists; the answer releases it
 whether the lists arrived or could not be loaded. A form that shows neither list waits for
 nothing.
@@ -385,9 +387,10 @@ are done, and the Scan button is held until they are. Both lists are fetched wit
 
 - **First load** (no `retry`): the tag list comes back with the profile's `default_tags`
   ticked and the dropdown with its `default_correspondent` selected, and both profile
-  markers (`tags_profile`, `correspondent_profile`) come back naming the profile. The
-  markers are always sent again, so if Profile changes while this request is in flight,
-  whichever answer lands last leaves each list agreeing with its marker (see
+  markers (`tags_profile`, `correspondent_profile`) come back naming the profile. The page
+  sends the first load again whenever Profile changes before it is answered, abandoning
+  the request in flight. The markers are always sent all the same, so whichever answer
+  lands last leaves each list agreeing with its marker (see
   [`POST /api/scan`](#post-apiscan)).
 - **First load naming no configured profile** (none, or a profile removed from the
   configuration since the page rendered): the lists come back with nothing ticked or

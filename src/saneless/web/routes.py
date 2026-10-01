@@ -3755,11 +3755,14 @@ def get_metadata(
 
     The first load names the profile the page's select shows now, and shows
     that profile's default ticks and correspondent with both profile markers
-    out of band.  The markers are sent again on purpose: a person who changes
-    Profile before this answer lands starts a profile-change swap of each
-    control, and the two responses can land in either order.  Whichever lands
-    last, its list and its marker agree, so the next submit never files one
-    profile's scan with another profile's defaults.  A retry carries the
+    out of band.  A person who changes Profile before this answer lands
+    starts a profile-change swap of each control, and the loader asks here
+    again for the new profile, abandoning the request in flight, so an
+    answer for the profile chosen before never lands over the new one.  The
+    markers are sent again all the same, so whichever of this answer and a
+    profile-change swap lands last, its list and its marker agree, and the
+    next submit never files one profile's scan with another profile's
+    defaults.  A retry carries the
     form's current ticks, filter and choice instead, and sends no marker, as
     a refresh does.
 

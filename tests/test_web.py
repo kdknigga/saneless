@@ -5672,12 +5672,15 @@ def _break_the_job_store(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # The page's hidden loader: it asks for both lists once the page has rendered,
-# carrying the profile the select shows, and again every 20 s until one
-# response lands and removes it.
+# carrying the profile the select shows, again whenever Profile changes, and
+# again every 20 s until one response lands and removes it.  A new request
+# replaces the one in flight, so an answer for a profile no longer chosen
+# never lands.
 _LOADER = (
     '<div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata"'
-    ' hx-include="#profile-select" hx-trigger="load, every 20s"'
-    ' hx-swap="outerHTML"></div>'
+    ' hx-include="#profile-select"'
+    ' hx-trigger="load, change from:#profile-select, every 20s"'
+    ' hx-sync="this:replace" hx-swap="outerHTML"></div>'
 )
 _TAGS_LIST_BODY = re.compile(r'<div id="tags-list"[^>]*>(?P<body>.*?)</div>', re.DOTALL)
 _CORRESPONDENT_SELECT_BODY = re.compile(

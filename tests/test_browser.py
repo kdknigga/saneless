@@ -4330,32 +4330,45 @@ class TestLazyListsInTheBrowser:
         self, page: Page, defaults_server: _BrowserServer
     ) -> None:
         """
-        A profile chosen before the lists land never files another's defaults.
+        A profile chosen before the lists land is the one the form shows.
 
         The lazy request, asked for ``default``, is held while ``receipts``
-        is chosen and its profile-change swaps land; released, it lands last.
-        Whatever it shows, each list and its marker agree, and the scan files
-        ``receipts``' own defaults because the markers name another profile.
+        is chosen.  The change sends the load again for ``receipts`` and
+        abandons the first request, so the answer for a profile no longer
+        chosen never lands.  The lists, their markers and the Profile select
+        then agree on ``receipts``, and the scan files its own defaults.
         """
         held = _hold_the_list_load(page)
         page.goto(defaults_server.url)
-        load = _await_the_held_load(page, held)
+        first = _await_the_held_load(page, held)
 
         page.select_option("#profile-select", _RECEIPTS)
         expect(page.locator("#tags-profile")).to_have_value(_RECEIPTS)
         expect(page.locator("#correspondent-profile")).to_have_value(_RECEIPTS)
         expect(page.locator('#tags-list input[value="32"]')).to_be_checked()
 
-        load.continue_()
+        def _replaced() -> bool:
+            # Each check is a round trip, so the route and the failure of the
+            # abandoned request reach this client (see _await_the_held_load).
+            page.evaluate("() => true")
+            return len(held) == 2 and first.request.failure is not None
+
+        assert poll_until(_replaced, _HELD_LOAD_BUDGET), (
+            "the profile change did not replace the list load",
+            len(held),
+            first.request.failure,
+        )
+        second = held[1]
+        assert parse_qs(urlsplit(second.request.url).query)["profile"] == [_RECEIPTS]
+
+        second.continue_()
         _await_the_lists(page)
 
-        ticks = _ticked_tags(page)
-        marker = page.locator("#tags-profile").input_value()
-        correspondent = page.locator("#correspondent-select").input_value()
-        correspondent_marker = page.locator("#correspondent-profile").input_value()
-        expected = {"default": (["31"], "41"), _RECEIPTS: (["32", "33"], "42")}
-        assert (ticks, correspondent) == expected[marker], (ticks, marker)
-        assert correspondent_marker == marker
+        expect(page.locator("#profile-select")).to_have_value(_RECEIPTS)
+        expect(page.locator("#tags-profile")).to_have_value(_RECEIPTS)
+        expect(page.locator("#correspondent-profile")).to_have_value(_RECEIPTS)
+        expect(page.locator("#correspondent-select")).to_have_value("42")
+        assert _ticked_tags(page) == ["32", "33"]
         page.fill("#title-input", "Changed While Loading")
 
         with page.expect_request("**/api/scan"):
