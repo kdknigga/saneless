@@ -3600,8 +3600,8 @@ class _MetadataQuery:
     What one lazy list load asks for.
 
     Attributes:
-        profile: The profile whose defaults to show, or None; required on the
-            first load, optional on a retry.
+        profile: The profile whose defaults the first load shows, or None;
+            a retry reads none.
         retry: Whether this is the retry element asking again, which keeps
             the form's ticks and choice, rather than the first load, which
             shows the profile's defaults.
@@ -3653,7 +3653,9 @@ def _metadata_query(
 
     Keyword-only so the boolean is never a positional flag.  ``q`` over
     ``TAG_FILTER_MAX_LENGTH``, more than ``TAGS_MAX_COUNT`` tags, or an id
-    that is not a paperless-ngx key is a 422 before the handler runs.
+    that is not a paperless-ngx key is a 422 before the handler runs.  The
+    profile is not checked here: the handler decides what a missing or
+    unknown one means.
 
     Args:
         profile: The profile whose defaults the first load shows.
@@ -3696,6 +3698,46 @@ def _metadata_retry_seconds(ttl: float) -> int:
     return max(1, math.ceil(min(ttl, web_cache.NEGATIVE_TTL_SECONDS)))
 
 
+def _metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:
+    """
+    Read what the lazy list load's Scan button is rendered from, never failing.
+
+    The job comes from the same status context the page builds, for the job
+    this browser follows, so an active job still disables the button.  The
+    loader and its retry poll, and a poll cannot usefully receive an error: a
+    store read that fails would be written into the alert slot on every tick,
+    with the lists that did load thrown away and Scan held for good.  So a
+    failure is logged and the button is rendered as though no job were
+    running, with the blocked verdict, which comes from the settings alone,
+    kept.  The status poll owns the job and corrects the button within a
+    second.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The job view, or None, and whether the appliance blocks a scan.
+
+    """
+    state = request.app.state
+    try:
+        live = _status_context(
+            state.worker,
+            state.job_store,
+            _status_facts(
+                request,
+                followed_job_id=_owned_active_job_id(
+                    state.worker, state.job_store, _presented_owner(request)
+                ),
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to read the job for the lazy list load")
+        return None, _scan_block(state.settings) is not None
+    job = live["job"]
+    return (job if isinstance(job, JobView) else None), bool(live["scan_blocked"])
+
+
 @router.get("/api/metadata")
 def get_metadata(
     request: Request, query: Annotated[_MetadataQuery, Depends(_metadata_query)]
@@ -3729,9 +3771,15 @@ def get_metadata(
     it is bounded by the short budget and the profile-marker rule still
     protects what the scan files.
 
-    The profile is validated as the profile routes validate it: one locked
-    lookup, and an unknown name is a 422 before any fetch.  The first load
-    needs one; a retry may omit it.
+    The loader and its retry poll, so nothing they send is refused: an error
+    would be written into the alert slot on every tick and hold Scan for good.
+    A first load whose profile is missing, or was rewritten away since the
+    page rendered, answers the lists with no ticks, no choice and no markers,
+    so the markers keep saying the lists have not answered and a submit gets
+    the submitted profile's own defaults.  A retry reads no profile.  A job
+    store that cannot be read costs the lists nothing either (see
+    ``_metadata_scan_state``).  Only input out of bounds is a 422, as on the
+    list routes.
 
     Args:
         request: The incoming HTTP request.
@@ -3740,15 +3788,13 @@ def get_metadata(
     Returns:
         The retry element or nothing, with the out-of-band parts.
 
-    Raises:
-        RequestRejected: The profile is not configured, or the first load
-            named none.
-
     """
     state = request.app.state
-    found = None if query.profile is None else state.worker.get_profile(query.profile)
-    if query.profile is not None and found is None:
-        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    found = (
+        None
+        if query.retry or query.profile is None
+        else state.worker.get_profile(query.profile)
+    )
     if query.retry:
         ticked, chosen, follows = query.tags, query.correspondent, None
     elif found is not None:
@@ -3756,23 +3802,18 @@ def get_metadata(
         chosen = found.default_correspondent
         follows = query.profile
     else:
-        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+        logger.warning(
+            "The lazy list load named no configured profile; answering the"
+            " lists with no profile's defaults"
+        )
+        ticked, chosen, follows = [], None, None
     tag_list = _tag_list_context(
         state, q=query.q, selected=ticked, timeout=_REQUEST_FETCH_TIMEOUT
     )
     options = _correspondent_options_context(
         state, chosen, timeout=_REQUEST_FETCH_TIMEOUT
     )
-    live = _status_context(
-        state.worker,
-        state.job_store,
-        _status_facts(
-            request,
-            followed_job_id=_owned_active_job_id(
-                state.worker, state.job_store, _presented_owner(request)
-            ),
-        ),
-    )
+    job, scan_blocked = _metadata_scan_state(request)
     return state.templates.TemplateResponse(
         request,
         "partials/metadata_response.html",
@@ -3782,8 +3823,8 @@ def get_metadata(
             "follows_profile": follows,
             "show_tags": state.settings.web.show_tags,
             "show_correspondent": state.settings.web.show_correspondent,
-            "job": live["job"],
-            "scan_blocked": live["scan_blocked"],
+            "job": job,
+            "scan_blocked": scan_blocked,
             "retry_seconds": _metadata_retry_seconds(
                 state.settings.output.paperless_cache_ttl_seconds
             ),

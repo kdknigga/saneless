@@ -40,7 +40,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from http import HTTPStatus
 from itertools import pairwise
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn
 from urllib.parse import parse_qs, urlsplit
 
 if TYPE_CHECKING:
@@ -4254,6 +4254,47 @@ class TestLazyListsInTheBrowser:
         )
         expect(page.locator("#metadata-loader")).to_have_count(0)
         expect(select).to_have_value("")
+        expect(page.locator("#status-message")).to_be_empty()
+
+    def test_a_job_store_failure_during_the_load_releases_scan_quietly(
+        self,
+        page: Page,
+        defaults_server: _BrowserServer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The lists land and Scan is released though the job store cannot be read.
+
+        The lazy request is held while the store's reads are broken, so it
+        certainly meets the failure.  Nothing is written into the alert slot,
+        the lists arrive with the profile's defaults, and Scan is released
+        with its hold line emptied.
+        """
+        held = _hold_the_list_load(page)
+        page.goto(defaults_server.url)
+        load = _await_the_held_load(page, held)
+        expect(page.locator("#scan-btn")).to_be_disabled()
+
+        job_store: JobStore = defaults_server.app.state.job_store
+
+        def _fail(*_args: object, **_kwargs: object) -> NoReturn:
+            msg = "disk I/O error"
+            raise sqlite3.OperationalError(msg)
+
+        for name in ("get_job", "latest_run_job", "list_pending"):
+            monkeypatch.setattr(job_store, name, _fail)
+        with page.expect_response(
+            lambda r: urlsplit(r.url).path == "/api/metadata"
+        ) as answered:
+            load.continue_()
+        assert answered.value.status == 200
+
+        _await_the_lists(page)
+        expect(page.locator('#tags-list input[value="31"]')).to_be_checked()
+        expect(page.locator("#correspondent-select")).to_have_value("41")
+        expect(page.locator("#scan-btn")).to_be_enabled()
+        expect(page.locator("#scan-hold-reason")).to_be_empty()
+        expect(page.locator("#metadata-loader")).to_have_count(0)
         expect(page.locator("#status-message")).to_be_empty()
 
     def test_opening_profile_defaults_arrive_ticked(

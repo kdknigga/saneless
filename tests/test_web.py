@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -5540,20 +5541,107 @@ class TestMetadataRoute:
         # The list that is shown failed, so the retry element stays.
         assert _has_retry_element(response.text)
 
+    def test_metadata_answers_the_lists_when_the_job_store_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A job store that cannot be read costs the lists nothing.
+
+        The loader polls, so an error would be written into the alert slot on
+        every tick, and the lists that did load would be thrown away with it.
+        The Scan button is rendered as though no job were running, and the
+        status poll, which owns the job, corrects it within a second.
+        """
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            _break_the_job_store(app, monkeypatch)
+            with caplog.at_level(logging.ERROR, logger="saneless.web.routes"):
+                response = client.get(
+                    "/api/metadata",
+                    params={"profile": "default"},
+                    headers={"HX-Request": "true"},
+                )
+
+        assert response.status_code == 200, response.text
+        assert "HX-Retarget" not in response.headers
+        text = response.text
+        assert "checked" in _checkbox(text, 3)
+        assert "selected" in _option(text, _OPENING_CORRESPONDENT)
+        assert 'value="default"' in _marker(text, "tags_profile")
+        assert "disabled" not in _metadata_scan_button(text)
+        assert _EMPTIED_HOLD_REASON in text
+        assert 'id="metadata-loader"' not in text
+        assert "disk I/O error" not in text
+        assert "Failed to read the job for the lazy list load" in caplog.text
+
+    def test_metadata_keeps_a_blocked_appliance_blocked_when_the_store_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the job, the blocked verdict still holds the button."""
+        app = _simple_form_app(tmp_path, credential="changeme")
+        with TestClient(app) as client:
+            _break_the_job_store(app, monkeypatch)
+            response = client.get("/api/metadata", params={"profile": "default"})
+
+        assert response.status_code == 200, response.text
+        button = _metadata_scan_button(response.text)
+        assert "disabled" in button
+        assert 'aria-describedby="scan-blocked-reason"' in button
+
     @pytest.mark.parametrize(
         "params",
         [
-            pytest.param({"profile": "nope"}, id="unknown-profile"),
+            pytest.param({"profile": "nope"}, id="profile-gone"),
             pytest.param({}, id="no-profile"),
+        ],
+    )
+    def test_metadata_first_load_without_a_profile_answers_unmarked_lists(
+        self, tmp_path: Path, params: dict[str, str]
+    ) -> None:
+        """
+        A first load naming no configured profile answers, with no markers.
+
+        The page's select can name a profile rewritten away since the page
+        rendered.  Refusing it would write an error into the alert slot on
+        every tick and hold Scan for good, so the lists come back unticked and
+        unchosen, and the markers keep saying the lists have not answered: a
+        submit then gets the submitted profile's own defaults.
+        """
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            _cold(app)
+            response = client.get(
+                "/api/metadata", params=params, headers={"HX-Request": "true"}
+            )
+
+        assert response.status_code == 200, response.text
+        assert "HX-Retarget" not in response.headers
+        text = response.text
+        assert _TAGS_WRAPPER.search(text) is not None, text
+        assert "checked" not in _checkbox(text, 3)
+        assert not re.search(r"<option [^>]*\bselected\b", text), text
+        assert 'name="tags_profile"' not in text
+        assert 'name="correspondent_profile"' not in text
+        assert "disabled" not in _metadata_scan_button(text)
+        assert _EMPTIED_HOLD_REASON in text
+        assert 'id="metadata-loader"' not in text
+
+    @pytest.mark.parametrize(
+        "params",
+        [
             pytest.param({"profile": "default", "q": "a" * 500}, id="long-filter"),
             pytest.param({"profile": "default", "tags": ["x"]}, id="bad-tag"),
             pytest.param({"retry": "1", "correspondent": "x"}, id="bad-correspondent"),
         ],
     )
-    def test_metadata_rejects_an_unknown_profile(
+    def test_metadata_rejects_input_out_of_bounds(
         self, tmp_path: Path, params: dict[str, str | list[str]]
     ) -> None:
-        """A profile nobody configured, or an input out of bounds, is a 422."""
+        """An input out of bounds is a 422, before any fetch."""
         app = _pre_ticked_app(tmp_path)
         with TestClient(app) as client:
             _cold(app)
@@ -5562,6 +5650,25 @@ class TestMetadataRoute:
         assert response.status_code == 422
         tags: _TimedList = app.state.paperless.get_tags
         assert tags.timeouts == []
+
+
+def _break_the_job_store(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Make every job store read the status context makes raise a store error.
+
+    Args:
+        app: The app whose store to break.
+        monkeypatch: Restores the reads when the test ends.
+
+    """
+    store: JobStore = app.state.job_store
+
+    def _fail(*_args: object, **_kwargs: object) -> NoReturn:
+        msg = "disk I/O error"
+        raise sqlite3.OperationalError(msg)
+
+    for name in ("get_job", "latest_run_job", "list_pending"):
+        monkeypatch.setattr(store, name, _fail)
 
 
 # The page's hidden loader: it asks for both lists once the page has rendered,

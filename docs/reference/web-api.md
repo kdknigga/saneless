@@ -375,7 +375,7 @@ are done, and the Scan button is held until they are. Both lists are fetched wit
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `profile` | string | on the first load | The profile whose defaults to show. Validated against the configured profiles before anything else happens; an unknown name, or none on the first load, is rejected with `422` |
+| `profile` | string | no | The profile whose defaults the first load shows. Not read on a retry |
 | `retry` | boolean | no | `1` for a retry, which keeps the form's current ticks and choice instead of the profile's defaults |
 | `q` | string | no | The tag filter, bounded as for `GET /api/tags` |
 | `tags` | int[] | no | The tag ids currently ticked, bounded as for `GET /api/tags`. Read on a retry |
@@ -389,6 +389,12 @@ are done, and the Scan button is held until they are. Both lists are fetched wit
   markers are always sent again, so if Profile changes while this request is in flight,
   whichever answer lands last leaves each list agreeing with its marker (see
   [`POST /api/scan`](#post-apiscan)).
+- **First load naming no configured profile** (none, or a profile removed from the
+  configuration since the page rendered): the lists come back with nothing ticked or
+  chosen and no marker is sent, so the page's markers still say the lists have not
+  answered, and a scan submitted from it gets the submitted profile's defaults. It is not
+  refused: the loader polls, so an error would land in the page's alert slot on every
+  tick and hold the Scan button for good.
 - **Retry** (`retry=1`): the lists keep the ticks, filter and choice the request carries,
   and no marker is sent, as a refresh does.
 
@@ -406,7 +412,7 @@ The rest is out of band:
 | The tag list (`#tags-list`), whole | When `show_tags` is on. A list that could not be loaded says so, and the ticked ids still come back ticked |
 | The correspondent dropdown (`#correspondent-select`), whole, and its help line (`#correspondent-help`) | When `show_correspondent` is on. A list that could not be loaded says so in the help line |
 | The profile markers | On the first load, for each shown list |
-| The Scan button (`#scan-btn`) | Always. It is disabled only while a scan is active or the appliance is blocked, exactly as on the page: a list that could not be loaded releases it just as a loaded one does |
+| The Scan button (`#scan-btn`) | Always. It is disabled only while a scan is active or the appliance is blocked, exactly as on the page: a list that could not be loaded releases it just as a loaded one does. If the job store cannot be read, the failure is logged and the button is rendered as though no scan were active, still disabled on a blocked appliance; the status poll corrects it within a second |
 | The Scan hold reason (`#scan-hold-reason`) | Always, emptied |
 
 A hidden list is neither fetched nor rendered.
@@ -414,7 +420,7 @@ A hidden list is neither fetched nor rendered.
 | Status Code | Meaning |
 |-------------|---------|
 | 200 | The HTML described above |
-| 422 | The profile does not exist, the first load named none, or a parameter is out of bounds |
+| 422 | A parameter is out of bounds |
 
 ---
 
