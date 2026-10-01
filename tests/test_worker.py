@@ -67,6 +67,8 @@ from saneless.vocabulary import (
     SubmitResult,
     WorkerHealth,
     classify_error,
+    restart_category,
+    restart_error,
 )
 from saneless.web.cache import CachedMetadataLookup, MetadataCache
 from saneless.web.job_view import build_job_view
@@ -7844,6 +7846,71 @@ class TestScanningWaitsForTheGate:
             after for state, after in recorder.writes if state is JobState.SCANNING
         ] == [True]
         assert finished.state is JobState.DONE
+
+    def test_a_stop_while_waiting_for_the_gate_ends_the_job_untouched(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A job that gets the gate only once the server is stopping never scans.
+
+        A stop can end the check that held the gate, so the waiting job is
+        handed the gate in the middle of shutdown.  Starting the scan then
+        would feed paper the stop's bounded join walks away from; the job
+        ends instead, with the restart text for a job that never started.
+        """
+        scanner = _a_scanner_free_of_startup_generation(default_settings)
+        pipelines: list[str] = []
+
+        def spy_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            pipelines.append(request.job_id)
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", spy_pipeline)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        gate = worker.scanner_gate
+        stopped: list[bool] = []
+
+        def stop_the_worker() -> None:
+            stopped.append(worker.stop())
+
+        stopper = threading.Thread(target=stop_the_worker, name="test-stopper")
+        try:
+            worker.start()
+            assert gate.acquire(timeout=_PASS_B_GATE_CEILING)
+            try:
+                job = store.create_job("default", "Stopped At The Gate")
+                worker.submit(job)
+                taken = poll_until(
+                    lambda: worker.current_job_id == job.id, _STATE_BUDGET
+                )
+                stopper.start()
+                stopping = poll_until(worker._stopping.is_set, _STATE_BUDGET)
+            finally:
+                gate.release()
+            stopper.join(worker_module.STOP_JOIN_SECONDS + _STATE_BUDGET)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert taken, "the worker never took the job"
+        assert stopping, "the stop never began"
+        assert stopped == [True]
+        assert finished.state is JobState.ERROR
+        assert finished.error == restart_error(JobState.PENDING, None)
+        assert finished.error_category is restart_category(JobState.PENDING)
+        assert scanner.calls == []
+        assert pipelines == []
 
 
 class TestProfileStorage:
