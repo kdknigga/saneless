@@ -12,6 +12,7 @@ __all__ = [
     "ConfigError",
     "DiskSpaceError",
     "FeederEmptyError",
+    "ListingAbortedError",
     "ListingCrashedError",
     "ListingNoAnswerError",
     "ListingTimedOutError",
@@ -93,6 +94,17 @@ class ListingTimedOutError(ScanError):
 
     The listing was stopped: the process running it was killed and reaped
     before this was raised.
+    """
+
+
+class ListingAbortedError(ScanError):
+    """
+    A listing was stopped part way because saneless is stopping.
+
+    Not a fault of the scanner or of the scanner library: the caller asked
+    for the listing to end, and the process running it was killed and reaped
+    before this was raised.  The listing saw nothing, so what it would have
+    found is unknown, not absent.
     """
 
 
