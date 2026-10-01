@@ -4389,6 +4389,38 @@ class TestLazyListsInTheBrowser:
         assert job.tags == [32, 33]
         assert job.correspondent == 42
 
+    def test_a_released_scan_hides_the_hold_line(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        A Scan button released during the load is not described as waiting.
+
+        A status poll renders the button from the job alone, so a job ending
+        during the load brings it back enabled while the hold line still
+        says Scan waits.  That is done here by hand, with the lazy request
+        held, as the poll's out-of-band swap would: the line must go with the
+        wait it describes, and come back if the button is held again.
+        """
+        held = _hold_the_list_load(page)
+        page.goto(defaults_server.url)
+        load = _await_the_held_load(page, held)
+        scan = page.locator("#scan-btn")
+        hold = page.locator("#scan-hold-reason")
+        try:
+            expect(scan).to_be_disabled()
+            expect(hold).to_be_visible()
+
+            scan.evaluate("button => button.removeAttribute('disabled')")
+            expect(scan).to_be_enabled()
+            expect(hold).to_be_hidden()
+
+            scan.evaluate("button => button.setAttribute('disabled', '')")
+            expect(hold).to_be_visible()
+        finally:
+            load.continue_()
+        _await_the_lists(page)
+        expect(hold).to_be_hidden()
+
     def test_a_scan_released_during_the_load_files_the_profile_defaults(
         self, page: Page, defaults_server: _BrowserServer
     ) -> None:

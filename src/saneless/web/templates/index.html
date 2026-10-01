@@ -256,6 +256,9 @@
            the blocked reason it does not outlast the page: the lazy list load
            empties it out of band, byte-empty so the stylesheet's :empty rule
            hides it, once both lists have arrived or could not be loaded.  A
+           status poll can release the button before that, and the stylesheet
+           hides the line whenever the button after which it sits is enabled,
+           so it never describes a wait that is over.  A
            blocked appliance renders only its own reason, which still holds
            the button after the lists arrive.  The sentence comes from
            vocabulary.py through the route; this template composes no prose,

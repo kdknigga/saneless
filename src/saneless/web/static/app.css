@@ -413,6 +413,16 @@ details.tech-details > summary {
     display: none;
 }
 
+/* The line explains a held button, so it goes whenever the button is not
+   held.  A status poll re-renders Scan from the job alone and can release it
+   while the lists still load, leaving the line in place; without this the
+   page would show an enabled Scan directly above text saying Scan waits.
+   display: none also takes it out of the accessibility tree. The line follows
+   the button inside the scan form, so the sibling selector reaches it. */
+#scan-btn:enabled ~ #scan-hold-reason {
+    display: none;
+}
+
 /* A profile with no description would otherwise leave Pico's help-text
    margins behind as a stray gap. The route answers with a byte-empty body for
    exactly this reason: a single whitespace text node is a child, and :empty
