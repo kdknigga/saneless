@@ -27,13 +27,16 @@ import logging
 import os
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 import pytest
 
+from saneless import exceptions
 from saneless.exceptions import (
+    ListingAbortedError,
     ListingCrashedError,
     ListingNoAnswerError,
     ListingTimedOutError,
@@ -83,6 +86,19 @@ import sys
 
 line = sys.stdin.readline().rstrip("\\n")
 sys.stdout.write(json.dumps({"devices": [[line, "v", "m", "t"]]}) + "\\n")
+"""
+
+# Reads everything sent on stdin, up to the end of the stream, then takes long
+# enough over its answer that the launcher waits more than once before it
+# comes, and echoes all of it back.
+_SLOW_ECHO_CHILD = """\
+import json
+import sys
+import time
+
+received = sys.stdin.read()
+time.sleep(0.35)
+sys.stdout.write(json.dumps({"devices": [[received, "v", "m", "t"]]}) + "\\n")
 """
 
 _NOISY_CHILD = """\
@@ -636,7 +652,8 @@ class TestDeadline:
         records = _warnings(caplog)
         assert len(records) == 1
         assert "net:" not in records[0].getMessage()
-        assert len(started) == 1
+        # The wait is made in slices, every one of them on the same child.
+        assert len(set(started)) == 1
         assert started[0].returncode is not None
         _assert_reaped(started[0].pid)
 
@@ -783,6 +800,138 @@ class TestInterrupt:
         assert len(started) == 1
         assert started[0].returncode is not None
         _assert_reaped(started[0].pid)
+
+
+def _pid_written(pidfile: Path) -> bool:
+    """
+    Tell whether a stand-in child has written its whole PID yet.
+
+    Args:
+        pidfile: The file the child writes its PID into.
+
+    Returns:
+        Whether the file holds a PID.
+
+    """
+    try:
+        return pidfile.read_text(encoding="utf-8").strip().isdigit()
+    except FileNotFoundError:
+        return False
+
+
+class TestAbort:
+    """
+    An abort set on another thread ends the child at once.
+
+    The thread that sets the abort never touches the child: the launcher, on
+    the thread that started it, sees the abort between two slices of its
+    wait, and kills and reaps the child itself.
+    """
+
+    def test_an_abort_ends_the_child_promptly_and_reaps_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        The abort error comes within a second, with the child already gone.
+
+        It is logged once at INFO and never as a warning: saneless stopping
+        is not a fault of the scanner.
+        """
+        caplog.set_level(logging.INFO, logger=_LOGGER)
+        _use_child(monkeypatch, tmp_path, _SLEEPER_CHILD)
+        pidfile = _pidfile(monkeypatch, tmp_path)
+        abort = threading.Event()
+        set_at: list[float] = []
+
+        def abort_once_running() -> None:
+            if poll_until(lambda: _pid_written(pidfile), _ELAPSED_CEILING_SECONDS):
+                set_at.append(time.monotonic())
+                abort.set()
+
+        helper = threading.Thread(target=abort_once_running, daemon=True)
+        helper.start()
+        with pytest.raises(ListingAbortedError) as aborted:
+            run_listing_child(ListingRequest(), configured_host="", abort=abort)
+        ended = time.monotonic()
+        helper.join(_ELAPSED_CEILING_SECONDS)
+
+        assert isinstance(aborted.value, ScanError)
+        assert set_at, "the child never wrote its PID"
+        assert ended - set_at[0] < 1.0
+        _assert_reaped(int(pidfile.read_text(encoding="utf-8")))
+        assert _warnings(caplog) == []
+        infos = [
+            record
+            for record in caplog.records
+            if record.name == _LOGGER and record.levelno == logging.INFO
+        ]
+        assert len(infos) == 1
+
+    def test_the_deadline_still_ends_a_slow_child(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An abort that is never set leaves the deadline in charge.
+
+        The deadline is still read at call time, so a patched one stops the
+        sleeper and reports a timeout, not an abort.
+        """
+        monkeypatch.setattr(listing, "LISTING_DEADLINE_SECONDS", 0.3)
+        started = _spy_on_communicate(monkeypatch)
+        _use_child(monkeypatch, tmp_path, _SLEEPER_CHILD)
+        _pidfile(monkeypatch, tmp_path)
+
+        began = time.monotonic()
+        with pytest.raises(ListingTimedOutError):
+            run_listing_child(
+                ListingRequest(), configured_host="", abort=threading.Event()
+            )
+        elapsed = time.monotonic() - began
+
+        assert 0.3 <= elapsed < _ELAPSED_CEILING_SECONDS
+        assert len(set(started)) == 1
+        assert started[0].returncode is not None
+        _assert_reaped(started[0].pid)
+
+    def test_the_request_is_sent_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A child slower than one slice of the wait still reads one request.
+
+        The request goes with the first slice only.  Every later slice sends
+        nothing, and what the child wrote across the slices is all kept.
+        """
+        _use_child(monkeypatch, tmp_path, _SLOW_ECHO_CHILD)
+        started = _spy_on_communicate(monkeypatch)
+
+        reply = run_listing_child(
+            ListingRequest(open=_NET_ID), configured_host="", abort=threading.Event()
+        )
+
+        assert len(started) > 1
+        assert reply.devices[0][0] == (
+            '{"open": "net:scanbox.lan:test:0", "alarm": 35}\n'
+        )
+
+    def test_a_fast_child_answers_unchanged_with_no_abort(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With no abort at all, a child that answers is decoded as before."""
+        _use_child(monkeypatch, tmp_path, _REPLY_CHILD)
+
+        reply = run_listing_child(ListingRequest(), configured_host="", abort=None)
+
+        assert reply == ListingReply(devices=(_TEST_DEVICE,))
+
+    def test_the_abort_error_is_a_scan_error_and_exported(self) -> None:
+        """Every ``except ScanError`` boundary catches an aborted listing."""
+        assert issubclass(ListingAbortedError, ScanError)
+        assert "ListingAbortedError" in exceptions.__all__
 
 
 def _valid_device_line(name: str) -> bytes:
@@ -1030,8 +1179,13 @@ def test_the_deadline_is_thirty_seconds() -> None:
 
 
 def test_the_listing_failure_errors_are_distinct_scan_errors() -> None:
-    """Every existing ``except ScanError`` boundary still catches all three."""
-    failures = (ListingCrashedError, ListingTimedOutError, ListingNoAnswerError)
+    """Every existing ``except ScanError`` boundary still catches all four."""
+    failures = (
+        ListingCrashedError,
+        ListingTimedOutError,
+        ListingNoAnswerError,
+        ListingAbortedError,
+    )
     for failure in failures:
         assert issubclass(failure, ScanError)
         for other in failures:

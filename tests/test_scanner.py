@@ -1343,6 +1343,27 @@ class TestTheMainProcessNeverLists:
         backend.list_and_open("")
         assert listing_seam.calls[-1] == (ListingRequest(), "scanbox.lan")
 
+    def test_list_and_open_passes_abort_to_the_launcher(
+        self, fake_sane_module: FakeSaneModule, listing_seam: ListingSeam
+    ) -> None:
+        """
+        The caller's abort Event reaches the launcher, which watches it.
+
+        A listing made without one is given none, so only a caller that can
+        be stopped hands its child an abort.
+        """
+        _ = fake_sane_module  # side-effect: patches the sane module
+        backend = SaneBackend()
+        abort = threading.Event()
+
+        backend.list_and_open(_NET_DEVICE, abort=abort)
+        assert listing_seam.aborts[-1] is abort
+
+        backend.list_and_open(_NET_DEVICE)
+        assert listing_seam.aborts[-1] is None
+        backend.get_devices()
+        assert listing_seam.aborts[-1] is None
+
     @pytest.mark.parametrize(
         "error",
         [
@@ -1459,9 +1480,12 @@ class TestTheMainProcessNeverLists:
         """A reply that says the open failed but not why never reads "(None)"."""
 
         def unexplained_failure(
-            _request: ListingRequest, *, configured_host: str
+            _request: ListingRequest,
+            *,
+            configured_host: str,
+            abort: threading.Event | None = None,
         ) -> ListingReply:
-            _ = configured_host
+            _ = configured_host, abort
             return ListingReply(devices=(), opened=False)
 
         monkeypatch.setattr(sane_backend_mod, "_launch_listing", unexplained_failure)

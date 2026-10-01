@@ -2143,12 +2143,15 @@ class _ListingFailureBackend(_CountingBackend):
         super().__init__()
         self.error = error
 
-    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
         """
         Fail the way the configured error says.
 
         Args:
             open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
 
         Returns:
             Never returns.
@@ -2157,7 +2160,7 @@ class _ListingFailureBackend(_CountingBackend):
             ScanError: Always, the error this backend was built with.
 
         """
-        _ = open_if_unlisted
+        _ = open_if_unlisted, abort
         raise self.error
 
 
@@ -2181,17 +2184,21 @@ class _SurveyRecordingBackend(_CountingBackend):
         self.survey = survey
         self.asked: list[str] = []
 
-    def list_and_open(self, open_if_unlisted: str) -> DeviceSurvey:
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
         """
         Record the id the check asked to have opened, and answer.
 
         Args:
             open_if_unlisted: The id the check asked to have opened.
+            abort: The caller's abort Event, unused.
 
         Returns:
             The survey this backend was built with.
 
         """
+        _ = abort
         self.asked.append(open_if_unlisted)
         return self.survey
 
