@@ -37,7 +37,9 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, override
 
 import click
@@ -48,7 +50,15 @@ from fastapi import FastAPI
 from saneless import pipeline as pipeline_module
 from saneless import preservation
 from saneless import workspace as workspace_module
-from saneless.cli import _INTERRUPTION, _interrupt_handler, _Interruption, cli
+from saneless.cli import (
+    _HANGUP_GRACE_SECONDS,
+    _INTERRUPTION,
+    _end_of_input,
+    _install_interrupt_handlers,
+    _interrupt_handler,
+    _Interruption,
+    cli,
+)
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -1417,3 +1427,79 @@ def test_a_signal_anywhere_inside_settling_leaves_the_retry_free(
 
     # Before the flag is stored the handler raises; the test is not vacuous.
     assert raised_at
+
+
+def test_the_interruption_flag_takes_no_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    However a signal splits recording or clearing a signal, both still return.
+
+    The handler records the signal it raises for, on the main thread, and
+    the prompts wait on that same thread.  A flag guarded by a lock could be
+    left locked by a handler that raised part way through, and the next
+    record or clear would block forever; so nothing waits on the flag, and
+    the handler is run at every opcode of each call to prove neither leaves
+    anything held.
+    """
+    interruption = _Interruption()
+    assert not hasattr(interruption, "wait")
+    monkeypatch.setattr("saneless.cli._INTERRUPTION", interruption)
+    record = partial(interruption.record, signal.SIGHUP)
+    raised_at: list[tuple[str, int]] = []
+    for name, action in (("record", record), ("clear", interruption.clear)):
+        at = 1
+        while True:
+            if name == "clear":
+                interruption.record(signal.SIGHUP)
+            reached, raised = _signal_at_opcode(action, at)
+            if not reached:
+                break
+            if raised:
+                raised_at.append((name, at))
+            assert _returns(record), f"handler at {name} opcode {at}: record blocked"
+            assert interruption.received()
+            assert _returns(interruption.clear), (
+                f"handler at {name} opcode {at}: clear blocked"
+            )
+            assert not interruption.received()
+            at += 1
+
+    # The handler raised out of both calls somewhere; the test is not vacuous.
+    assert {name for name, _ in raised_at} == {"record", "clear"}
+
+
+def test_a_hangup_during_the_end_of_input_grace_raises_on_the_main_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    SIGHUP during end of input's grace pause ends it as the interruption.
+
+    The pause runs on the main thread, where the handler raises: the
+    ``ScanInterrupted`` must come out of the pause, and the cancel that end
+    of input alone would mean must never be settled.  The signal is sent
+    from inside the pause itself, so it lands there by construction.
+    """
+    signaller = _Signaller()
+    cancels: list[str] = []
+    paused: list[float] = []
+
+    def grace(seconds: float) -> None:
+        """Be the grace pause, with the closing terminal's SIGHUP arriving in it."""
+        paused.append(seconds)
+        signaller.send(signal.SIGHUP)
+
+    restore = _install_interrupt_handlers()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(time, "sleep", grace)
+            with pytest.raises(ScanInterrupted) as caught:
+                _end_of_input(partial(cancels.append, "cancel"), "Flip prompt")
+    finally:
+        restore()
+
+    assert signaller.refusals == []
+    assert paused == [_HANGUP_GRACE_SECONDS]
+    assert caught.value.signum == signal.SIGHUP
+    assert cancels == []
+    # Raising out of the pause left nothing held for the next command.
+    assert _returns(partial(_INTERRUPTION.record, signal.SIGHUP))
+    assert _returns(_INTERRUPTION.clear)

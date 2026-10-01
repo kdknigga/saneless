@@ -15,6 +15,7 @@ import signal
 import socket
 import sqlite3
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -76,6 +77,7 @@ from saneless.vocabulary import (
     UNCONFIRMED_SEND_LABEL,
     WARNED_UPLOAD_LABEL,
     ErrorCategory,
+    ExitCode,
     FlipOutcome,
     JobState,
     ScanOutcome,
@@ -91,6 +93,7 @@ from tests.conftest import (
     leave_killed_workspace,
     scan_batch,
 )
+from tests.prompt_support import broken_read, readable
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Generator
@@ -1405,9 +1408,9 @@ class TestManualDuplexPrompt:
             outcome = coordinator.wait_for_flip(600)
         finally:
             release.set()
-        for thread in threading.enumerate():
-            if thread.name == "saneless-flip-prompt":
-                thread.join(timeout=5)
+        assert _FLIP_PROMPT_THREAD not in [
+            thread.name for thread in threading.enumerate()
+        ]
 
         assert outcome is FlipOutcome.ABORTED
         assert coordinator.abort_cause is None
@@ -1536,6 +1539,231 @@ class TestManualDuplexPrompt:
         assert _FLIP_PROMPT_FRAGMENT not in result.output
         assert "interactive terminal" not in result.output
         assert len(calls) == 1
+
+    def test_no_flip_prompt_thread_is_started(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The flip question is asked on the calling thread: no prompt thread at all.
+
+        A thread parked on stdin outlives the command that started it, and on
+        a real terminal it holds the process open at exit until someone
+        presses Enter.  So no thread is started for the question, and none is
+        left behind once the command is over.
+        """
+        started: list[str] = []
+        real_start = threading.Thread.start
+
+        def recording_start(thread: threading.Thread) -> None:
+            """Note the thread's name, then start it as usual."""
+            started.append(thread.name)
+            real_start(thread)
+
+        calls: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+        )
+        self._interactive(monkeypatch)
+        readable(monkeypatch)
+        monkeypatch.setattr(threading.Thread, "start", recording_start)
+
+        result = runner.invoke(
+            cli,
+            ["scan", "--profile", _DUPLEX_PROFILE, "--title", "No thread"],
+            input="n\n",
+        )
+
+        assert result.exit_code == ExitCode.CANCELLED, result.output
+        assert result.stderr.strip().splitlines()[-1] == _FLIP_CANCEL_LINE
+        assert _FLIP_PROMPT_THREAD not in started
+        assert _FLIP_PROMPT_THREAD not in [
+            thread.name for thread in threading.enumerate()
+        ]
+        assert len(calls) == 1
+
+    def test_a_bad_flip_answer_is_asked_again(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An answer that is neither yes nor no is refused, and the question asked again.
+
+        The refusal is click's own wording, so an operator used to the old
+        prompt sees nothing new.
+        """
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+        readable(monkeypatch)
+
+        result = runner.invoke(
+            cli,
+            ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Asked twice"],
+            input="maybe\ny\n",
+        )
+
+        assert result.exit_code == ExitCode.SUCCESS, result.output
+        assert "Error: invalid input" in result.output
+        assert result.output.count(_FLIP_PROMPT_FRAGMENT) == 2
+        assert len(calls) == 2
+        assert uploads == ["uploaded"]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            OSError(errno.EIO, "Input/output error"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        ],
+        ids=["lost-terminal", "undecodable-input"],
+    )
+    def test_a_broken_flip_read_is_a_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tmp_path: Path,
+        failure: Exception,
+    ) -> None:
+        """
+        A read that breaks at the flip question fails the scan: exit 1, logged.
+
+        Nobody chose to stop, so it is neither a cancel (130) nor an
+        unexpected error (5), and the log keeps the traceback.
+        """
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+        broken_read(monkeypatch, failure)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Broken read"]
+        )
+
+        assert result.exit_code == ExitCode.SCAN, result.output
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "saneless.cli"
+            and "Flip prompt failed; treating it as an abort" in record.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert len(calls) == 1
+        assert uploads == []
+
+    def test_a_closed_stdin_with_a_manual_duplex_profile_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        ``saneless scan`` with stdin closed (``<&-``) is refused, exit 2.
+
+        With no stdin at all there is nobody to flip the stack, the same as
+        from cron, so it gets the same refusal rather than an unexpected
+        error.  A real process, because only a real process can start with
+        no standard input.
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        config = tmp_path / "saneless.toml"
+        config.write_text(
+            _CLOSED_STDIN_CONFIG.format(
+                tmp_dir=tmp_path / "scratch",
+                data_dir=data_dir,
+                log_file=tmp_path / "logs" / "saneless.log",
+                profile=_DUPLEX_PROFILE,
+            )
+        )
+        env = {
+            **os.environ,
+            "SANELESS_TEST_PYTHON": sys.executable,
+            "SANELESS_TEST_SOURCE": _CLOSED_STDIN_CHILD,
+            "SANELESS_TEST_CONFIG": str(config),
+            "SANELESS_TEST_PROFILE": _DUPLEX_PROFILE,
+        }
+
+        completed = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE" <&-',
+            ],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=Path(__file__).resolve().parents[1],
+            timeout=_CLOSED_STDIN_CHILD_SECONDS,
+        )
+
+        assert completed.returncode == ExitCode.CONFIG, completed.stderr
+        assert "which needs an interactive terminal" in completed.stderr
+
+
+# The thread the flip question was once read on.  Nothing may start it.
+_FLIP_PROMPT_THREAD = "saneless-flip-prompt"
+
+_CLOSED_STDIN_CHILD_SECONDS = 60
+
+_CLOSED_STDIN_CONFIG = """\
+[scanner]
+device = "test:device:001"
+
+[paperless]
+url = "http://paperless.invalid:8000"
+token = "closed-stdin-token"
+
+[output]
+tmp_dir = "{tmp_dir}"
+data_dir = "{data_dir}"
+log_file = "{log_file}"
+
+[profiles.default]
+
+[profiles.{profile}]
+source = "ADF"
+duplex = "manual"
+"""
+
+# The console script's shim with the SANE library check replaced, the
+# arguments travelling in the environment.  They are taken out of it before
+# the CLI starts, because saneless reads every SANELESS_ variable as a setting.
+_CLOSED_STDIN_CHILD = """
+import os
+import sys
+
+from saneless import cli as cli_module
+from saneless import main
+
+config = os.environ.pop("SANELESS_TEST_CONFIG")
+profile = os.environ.pop("SANELESS_TEST_PROFILE")
+os.environ.pop("SANELESS_TEST_PYTHON")
+os.environ.pop("SANELESS_TEST_SOURCE")
+
+
+def require_sane():
+    return None
+
+
+cli_module.require_sane = require_sane
+sys.argv = [
+    "saneless", "--config", config, "scan", "--profile", profile, "--title", "t"
+]
+sys.exit(main())
+"""
 
 
 class _RangeScanner(StubScannerBackend):
