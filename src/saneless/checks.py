@@ -58,6 +58,7 @@ from saneless.config import (
     is_placeholder_token,
 )
 from saneless.exceptions import (
+    ListingAbortedError,
     ListingCrashedError,
     ListingNoAnswerError,
     ListingTimedOutError,
@@ -509,6 +510,11 @@ class CheckContext:
         profile_storage: What the profile write actually did.
         skip_scanner: True while a scan is running, which pauses the scanner
             check without touching the backend.
+        abort: Set when the caller is stopping, or ``None`` for a caller
+            that is never stopped part way, such as ``saneless doctor``.
+            The scanner check hands it to the listing, which then ends
+            within a fraction of a second, and ``run_checks`` stops between
+            checks once it is set.
 
     """
 
@@ -517,6 +523,7 @@ class CheckContext:
     paperless: PaperlessClient | None
     profile_storage: ProfileStorage
     skip_scanner: bool = False
+    abort: threading.Event | None = None
 
 
 def check_name(key: CheckKey) -> str:
@@ -2861,7 +2868,11 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
 
 
 def _scanner_enumeration(
-    scanner: ScannerBackend, configured_device: str, *, may_open: bool
+    scanner: ScannerBackend,
+    configured_device: str,
+    *,
+    may_open: bool,
+    abort: threading.Event | None,
 ) -> _Enumeration:
     """
     Ask the backend what it can see, which is the part that enters SANE.
@@ -2905,21 +2916,33 @@ def _scanner_enumeration(
     knows of, including any the preflight could not probe;
     ``_scanner_preflight`` lists which those are.
 
+    A listing stopped on ``abort`` is none of those: the caller is stopping,
+    so there is no row to give, and recording it as a failed listing would
+    log a warning and draw a scanner fault for a stop.  It propagates, and
+    ``run_checks`` ends the run there.  The launcher has already logged it,
+    at INFO.
+
     Args:
         scanner: The backend to ask.
         configured_device: The configured ``scanner.device``, possibly empty.
         may_open: Whether an unlisted configured device may be opened; False
             for a ``net:`` device whose host the preflight could not probe.
+        abort: The caller's abort Event, handed to the listing, or ``None``.
 
     Returns:
         What was listed, whether an unlisted configured device opened or was
         deliberately left unopened, and whether the listing crashed, ran out
         of time or gave no usable answer.
 
+    Raises:
+        ListingAbortedError: The listing was stopped on ``abort``.
+
     """
     open_target = configured_device if may_open else ""
     try:
-        survey = scanner.list_and_open(open_target)
+        survey = scanner.list_and_open(open_target, abort=abort)
+    except ListingAbortedError:
+        raise
     except ListingCrashedError:
         return _Enumeration(devices=(), failure=_ListingFailure.CRASHED)
     except ListingTimedOutError:
@@ -3006,7 +3029,10 @@ def _check_scanner(context: CheckContext) -> CheckResult:
         return pre
     configured_device = context.settings.scanner.device
     enumeration = _scanner_enumeration(
-        pre.scanner, configured_device, may_open=pre.may_open
+        pre.scanner,
+        configured_device,
+        may_open=pre.may_open,
+        abort=context.abort,
     )
     return _scanner_verdict(pre.probes, enumeration, configured_device)
 
@@ -3392,7 +3418,10 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
         return _scanner_busy()
     try:
         enumeration = _scanner_enumeration(
-            pre.scanner, configured_device, may_open=pre.may_open
+            pre.scanner,
+            configured_device,
+            may_open=pre.may_open,
+            abort=context.abort,
         )
     finally:
         scanner_gate.release()
@@ -3443,6 +3472,14 @@ def run_checks(
     That handler covers the gated scanner branch too, and the gate is released
     on the way out of it.
 
+    A caller that is stopping sets ``context.abort``.  The run then ends
+    before the next check, and a scanner listing in flight ends as aborted,
+    which also ends the run there, so a stop never waits out the Paperless
+    check's budget after the listing was stopped.  What is returned then is
+    only the rows of the checks that finished, which is the one case where
+    there is not one row per member: it exists only for a stopping caller,
+    and that caller stores none of it.
+
     Args:
         context: The injected dependencies and configuration.
         scanner_gate: The worker's scanner gate, held around the scanner check
@@ -3450,11 +3487,14 @@ def run_checks(
             exclude -- which is what ``saneless doctor`` is.
 
     Returns:
-        One result per ``CheckKey`` member, in member order.
+        One result per ``CheckKey`` member, in member order, or fewer when
+        ``context.abort`` was set part way.
 
     """
     results: list[CheckResult] = []
     for key in CheckKey:
+        if context.abort is not None and context.abort.is_set():
+            break
         if key is CheckKey.SCANNER and context.skip_scanner:
             results.append(_scanner_skipped())
             continue
@@ -3463,6 +3503,9 @@ def run_checks(
                 results.append(_scanner_result(context, scanner_gate))
             else:
                 results.append(_dispatch(key, context))
+        except ListingAbortedError:
+            # The caller is stopping: no row, and not a check that failed.
+            break
         except Exception as exc:
             logger.warning("Check %s raised %s", key.value, type(exc).__name__)
             results.append(

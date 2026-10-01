@@ -7767,7 +7767,9 @@ class TestSaneBoundary:
         backend = _backend_with(dev, monkeypatch)
 
         with caplog.at_level(logging.DEBUG):
-            enumeration = checks._scanner_enumeration(backend, device_id, may_open=True)
+            enumeration = checks._scanner_enumeration(
+                backend, device_id, may_open=True, abort=None
+            )
 
         assert enumeration.configured_opened is True
         assert dev.close_calls == 1

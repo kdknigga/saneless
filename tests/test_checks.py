@@ -8128,10 +8128,12 @@ class TestAbortedRun:
         """
         caplog.set_level(logging.INFO, logger="saneless.checks")
         backend = _AbortedListingBackend()
+        abort = threading.Event()
 
         with pytest.raises(ListingAbortedError):
-            checks._scanner_enumeration(backend, _DEVICE_ID, may_open=True)
+            checks._scanner_enumeration(backend, _DEVICE_ID, may_open=True, abort=abort)
 
+        assert backend.aborts == [abort]
         assert [
             record for record in caplog.records if record.name == "saneless.checks"
         ] == []
