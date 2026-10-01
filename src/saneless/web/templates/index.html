@@ -15,9 +15,10 @@
       the status block -- is preserved untouched.
    #checks-strip is silent: it is not a live region, and its rows stay reachable
    by navigation.  A health list that spoke on its own would talk over the scan,
-   so the status area is the one thing on the page that speaks: #status-live
-   below is the page's one polite region and is never swapped, and the
-   #status-message slot stays the one assertive region.  #checks-body is still
+   so the status area is the only thing on the page that speaks without a
+   user action: #status-live below is never swapped, and the #status-message
+   slot stays the one assertive region.  The profile description is a polite
+   region too, but it changes only when the operator picks a profile.  #checks-body is still
    the swap target, and #checks-strip the container that survives every swap. #}
 <article id="checks-card">
     <h2>System status</h2>
@@ -319,9 +320,11 @@
 </article>
 
 {# --- Section 2: Request errors, then status --- #}
-{# #status-live is the page's one polite region, and it is on the page before
-   anything inside it changes: a screen reader announces changes to a region it
-   already knows about, not a region that arrives with the change.  So it is
+{# #status-live is the polite region that speaks without a user action (the
+   profile description, the other polite region, changes only when a profile
+   is picked), and it is on the page before anything inside it changes: a
+   screen reader announces changes to a region it already knows about, not a
+   region that arrives with the change.  So it is
    never a swap target and no response carries it; every status response swaps
    #status-area inside it, and because an unchanged poll is answered 204, each
    visible change is heard once.  role="status" already implies polite and

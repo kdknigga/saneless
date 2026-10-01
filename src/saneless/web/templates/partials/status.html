@@ -12,8 +12,9 @@
    (focus_status_area), never in a poll's or the page's: a poll that took focus
    would pull it out of the Title box once a second while a scan runs.
 
-   The area is always rendered inside index.html's #status-live, the page's
-   polite region, and never carries that region itself.  So no line in here is
+   The area is always rendered inside index.html's #status-live, the polite
+   region that speaks without a user action, and never carries that region
+   itself.  So no line in here is
    marked aria-busy: a screen reader may hold back a busy subtree inside a live
    region until it stops being busy, and "Scanning..." would then never be
    heard.  A line the machine is working on carries class="busy-line" instead,
