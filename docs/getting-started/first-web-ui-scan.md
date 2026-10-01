@@ -21,7 +21,7 @@ The panel at the top answers "can this thing scan right now?" before you feed an
 - **Paperless** -- whether saneless can reach paperless-ngx and whether the API token works.
 - **Profiles** -- how many scan profiles are configured.
 - **Fallback** -- whether a folder is set up to keep scans if paperless-ngx is down.
-- **Data folder** -- whether saneless can write its durable state.
+- **Data folder** -- whether saneless can write its durable state and its scans in progress, or create the folders for them.
 
 Under the rows, a line says when the checks last ran, in your server's local time. The **Check again** button re-runs them all immediately: press it after plugging the scanner back in rather than reloading the page. While a scan is running the scanner check is paused -- saneless will not interrupt a scan to probe the device -- and the panel says so.
 

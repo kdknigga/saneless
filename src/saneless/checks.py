@@ -40,7 +40,9 @@ import contextlib
 import errno
 import ipaddress
 import logging
+import os
 import socket
+import stat
 import struct
 import tempfile
 from dataclasses import dataclass
@@ -56,13 +58,16 @@ from saneless.config import (
     LEGACY_CONFIG_FILENAME,
     config_file_state,
     is_placeholder_token,
+    nearest_existing_ancestor,
 )
 from saneless.exceptions import (
+    ConfigError,
     ListingAbortedError,
     ListingCrashedError,
     ListingNoAnswerError,
     ListingTimedOutError,
 )
+from saneless.private_dirs import check_private_dir
 from saneless.scanner.base import DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
@@ -3292,6 +3297,9 @@ def _check_fallback(context: CheckContext) -> CheckResult:
                 "when paperless-ngx is down."
             ),
         )
+    # Unlike the data and working folders, a missing consume folder is a fault
+    # and not judged by the folder above it: saneless never creates this one,
+    # because it belongs to paperless-ngx, which has to be watching it.
     if _directory_accepts_a_write(consume_dir):
         return CheckResult(
             key=CheckKey.FALLBACK,
@@ -3306,12 +3314,200 @@ def _check_fallback(context: CheckContext) -> CheckResult:
     )
 
 
+# The two settings the Data folder row judges, in the order it judges them.
+# The row names whichever is wrong by its key: a key is in the saneless config
+# file the reader will open, and a path would put a host filesystem path on a
+# LAN-visible page.
+_DATA_DIR_KEY: Final = "output.data_dir"
+_TMP_DIR_KEY: Final = "output.tmp_dir"
+
+
+@dataclass(frozen=True, slots=True)
+class _FolderFault:
+    """
+    What is wrong with one folder setting, in words the status strip may show.
+
+    Attributes:
+        problem: A phrase that follows the setting's key, naming no path.
+        private: Whether the problem is that another local user could reach
+            the folder, rather than that saneless cannot use it.
+
+    """
+
+    problem: str
+    private: bool = False
+
+
+def _folder_fault(path: Path) -> _FolderFault | None:
+    """
+    Judge a folder setting the way saneless will use it.
+
+    A folder that exists has to be a folder and take a write.  One that does
+    not exist yet is created when it is first needed, so it is judged by its
+    nearest existing ancestor, which is where creating it would fail: that has
+    to be a folder and take a write too.  Anything named by the setting -- a
+    file, or a dangling link -- counts as existing, because creating a folder
+    there would fail.
+
+    Args:
+        path: The configured folder.
+
+    Returns:
+        None when saneless can use or create the folder, else what is wrong.
+
+    """
+    if os.path.lexists(path):
+        if not path.is_dir():
+            return _FolderFault("is not a folder")
+        if _directory_accepts_a_write(path):
+            return None
+        return _FolderFault("cannot be written to")
+    ancestor = nearest_existing_ancestor(path)
+    if not ancestor.is_dir():
+        return _FolderFault("is under a file, not a folder")
+    if _directory_accepts_a_write(ancestor):
+        return None
+    return _FolderFault(
+        "does not exist and cannot be created, because the folder it would go "
+        "in cannot be written to"
+    )
+
+
+def _privacy_fault(path: Path) -> _FolderFault:
+    """
+    Say why ``check_private_dir`` refused a working folder, without its path.
+
+    The verdict is ``check_private_dir``'s, so the row refuses exactly what
+    start-up refuses.  Its message names the path, which the status strip must
+    not show, so the kind of problem is read back here for the row's words.
+
+    Args:
+        path: The working folder that was refused.
+
+    Returns:
+        The problem, in words that name no path.
+
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return _FolderFault("could not be checked")
+    if stat.S_ISLNK(info.st_mode):
+        return _FolderFault(
+            "is a symbolic link, so another local user could redirect the scans "
+            "kept there",
+            private=True,
+        )
+    if not stat.S_ISDIR(info.st_mode):
+        return _FolderFault("is not a folder")
+    if info.st_uid != os.geteuid():
+        return _FolderFault(
+            "is owned by another user, who could read or replace the scans kept there",
+            private=True,
+        )
+    return _FolderFault(
+        "can be written by other users, who could read or replace the scans kept there",
+        private=True,
+    )
+
+
+def _working_folder_fault(path: Path) -> _FolderFault | None:
+    """
+    Judge the working folder the way start-up does: private first, then usable.
+
+    An existing working folder must be a real folder this user owns that
+    nobody else can write to, because scans in progress are kept there.  A
+    missing one is created 0700 when it is first needed, so only where it
+    would be created is judged.
+
+    Args:
+        path: The configured working folder.
+
+    Returns:
+        None when saneless can use or create the folder, else what is wrong.
+
+    """
+    if os.path.lexists(path):
+        try:
+            check_private_dir(path, key=_TMP_DIR_KEY)
+        except ConfigError:
+            return _privacy_fault(path)
+    return _folder_fault(path)
+
+
+def _data_folder_failure(key: str, fault: _FolderFault) -> CheckResult:
+    """
+    Build the red Data folder row for the setting that is wrong.
+
+    Args:
+        key: The setting, ``output.data_dir`` or ``output.tmp_dir``.
+        fault: What is wrong with the folder it names.
+
+    Returns:
+        A FAIL row naming the setting and the problem, and what to do.
+
+    """
+    if fault.private:
+        next_step = (
+            f"Remove that folder or link so saneless creates it privately, or set "
+            f"{key} in the saneless config to a folder only saneless's user can "
+            f"write to, then restart saneless."
+        )
+    else:
+        next_step = (
+            f"Fix that folder, or set {key} in the saneless config to a folder "
+            f"saneless can write to, then restart saneless."
+        )
+    return CheckResult(
+        key=CheckKey.DATA_DIR,
+        state=CheckState.FAIL,
+        message=f"{key} {fault.problem}.",
+        next_step=next_step,
+    )
+
+
+def _data_folder_ready(*, data_exists: bool, tmp_exists: bool) -> str:
+    """
+    Word the green Data folder row for which folders exist yet.
+
+    Args:
+        data_exists: Whether the data folder is already there.
+        tmp_exists: Whether the working folder is already there.
+
+    Returns:
+        The row's message.
+
+    """
+    if data_exists and tmp_exists:
+        return "The data folder is writable."
+    if tmp_exists:
+        return "The data folder will be created when first needed."
+    if data_exists:
+        return (
+            "The data folder is writable, and the working folder will be created "
+            "when first needed."
+        )
+    return "The data and working folders will be created when first needed."
+
+
 def _check_data_dir(context: CheckContext) -> CheckResult:
     """
-    Report whether the folder holding the job database will take a write.
+    Report whether the data and working folders will work, as start-up asks.
 
-    Unlike the fallback folder this one is not optional: the job store and the
-    preserved scans live in it, so a data folder that refuses a write is red.
+    Unlike the fallback folder these are not optional: the job store and the
+    preserved scans live in ``output.data_dir``, and every scan is built in
+    ``output.tmp_dir``.  Both are judged here, so the row asks the question
+    start-up asks and a fault in either is red:
+
+    - a folder that exists has to be a folder that takes a write;
+    - one that does not exist yet is fine when it can be created, judged by
+      its nearest existing ancestor, the way saneless will create it;
+    - an existing working folder must also be private, as
+      ``check_private_dir`` decides: not a symbolic link, owned by this user,
+      and not writable by anyone else.
+
+    The data folder is judged first, and the first setting that fails decides
+    the row, which names it by its key and never by its path.
 
     Args:
         context: The injected dependencies and configuration.
@@ -3320,19 +3516,18 @@ def _check_data_dir(context: CheckContext) -> CheckResult:
         Exactly one result for ``CheckKey.DATA_DIR``.
 
     """
-    if _directory_accepts_a_write(context.settings.output.data_dir):
-        return CheckResult(
-            key=CheckKey.DATA_DIR,
-            state=CheckState.OK,
-            message="The data folder is writable.",
-        )
+    output = context.settings.output
+    data_fault = _folder_fault(output.data_dir)
+    if data_fault is not None:
+        return _data_folder_failure(_DATA_DIR_KEY, data_fault)
+    tmp_fault = _working_folder_fault(output.tmp_dir)
+    if tmp_fault is not None:
+        return _data_folder_failure(_TMP_DIR_KEY, tmp_fault)
     return CheckResult(
         key=CheckKey.DATA_DIR,
-        state=CheckState.FAIL,
-        message="The data folder cannot be written to.",
-        next_step=(
-            "Check the folder exists and saneless can write to it, "
-            "then restart saneless."
+        state=CheckState.OK,
+        message=_data_folder_ready(
+            data_exists=output.data_dir.exists(), tmp_exists=output.tmp_dir.exists()
         ),
     )
 

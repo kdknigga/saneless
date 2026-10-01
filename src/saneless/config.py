@@ -85,6 +85,7 @@ __all__ = [
     "is_placeholder_token",
     "load_settings",
     "log_config_sources",
+    "nearest_existing_ancestor",
     "profile_storage_for_loaded",
     "resolve_job_title",
     "validate_settings_dirs",
@@ -2247,9 +2248,13 @@ def _build_settings(
     raise ConfigError(msg) from None
 
 
-def _nearest_existing_ancestor(path: Path) -> Path:
+def nearest_existing_ancestor(path: Path) -> Path:
     """
     Find the deepest existing path among ``path`` and its ancestors.
+
+    A directory that does not exist yet is created there, so this is where
+    creating it would fail. Start-up judges a missing directory setting by it,
+    and so does the status strip's Data folder row.
 
     Args:
         path: A directory that may not exist yet.
@@ -2288,7 +2293,7 @@ def _require_writable(label: str, directory: Path) -> None:
             writable.
 
     """
-    ancestor = _nearest_existing_ancestor(directory)
+    ancestor = nearest_existing_ancestor(directory)
     if not ancestor.is_dir():
         if ancestor == directory:
             msg = f"{label} is not a directory: {directory}"
