@@ -33,6 +33,7 @@ from .exceptions import (
     PaperlessError,
     PaperlessIncompatibleError,
     PaperlessTimeoutError,
+    PaperlessTrustStoreError,
     PaperlessUncertainSendError,
     PaperlessUnconfirmedError,
     describe,
@@ -1219,7 +1220,14 @@ class PaperlessClient:
                 f"{describe(exc)}; "
                 "check SSL_CERT_FILE and SSL_CERT_DIR"
             )
-            raise PaperlessError(msg) from exc
+            raise PaperlessTrustStoreError(
+                msg,
+                next_step=(
+                    "Check that SSL_CERT_FILE names a readable CA bundle file "
+                    "and SSL_CERT_DIR a readable directory, or unset them, "
+                    "then try again."
+                ),
+            ) from exc
         self._consume_dir = consume_dir
         self._send_budget = timing.send_budget
         self._clock = timing.clock

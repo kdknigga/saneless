@@ -20,6 +20,7 @@ __all__ = [
     "PaperlessError",
     "PaperlessIncompatibleError",
     "PaperlessTimeoutError",
+    "PaperlessTrustStoreError",
     "PaperlessUncertainSendError",
     "PaperlessUnconfirmedError",
     "PdfError",
@@ -46,7 +47,36 @@ _OUT_OF_SPACE_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT})
 
 
 class SanelessError(Exception):
-    """Base exception for all saneless errors."""
+    """
+    Base exception for all saneless errors.
+
+    Every saneless error is filed under a category whose advice is a
+    fallback: it has to be true for every error in the category, so it says
+    nothing specific.  A raise site that knows the fix for its own failure
+    passes it as ``next_step``, and the CLI prints that instead of the
+    category's fallback.  It is kept apart from the message, so ``str(exc)``,
+    the log and ``job.error`` are unchanged by it.
+
+    Attributes:
+        next_step: The one sentence telling the operator what to do, or
+            ``None`` when only the category's fallback applies.
+
+    """
+
+    def __init__(self, *args: object, next_step: str | None = None) -> None:
+        """
+        Record the exception's arguments and the fix its raise site knows.
+
+        Args:
+            *args: The exception's arguments, as for ``Exception``; the first
+                is its message.
+            next_step: What the operator should do about this failure, or
+                ``None`` to use the category's fallback.  Keyword-only, so a
+                second positional argument is never taken for it.
+
+        """
+        super().__init__(*args)
+        self.next_step = next_step
 
 
 class ConfigError(SanelessError):
@@ -255,6 +285,19 @@ class PaperlessIncompatibleError(PaperlessError):
     stores nothing, so ``classify_error`` files it as
     ``ErrorCategory.PAPERLESS_VERSION``, whose advice is to upgrade
     paperless-ngx rather than to check the token.
+    """
+
+
+class PaperlessTrustStoreError(PaperlessError):
+    """
+    The TLS trust store named by SSL_CERT_FILE or SSL_CERT_DIR could not be read.
+
+    The trust anchors are read while the paperless-ngx client is built, so
+    this is raised before any request is sent: the address, the token and
+    paperless-ngx itself are untested, and nothing suggests any of them is
+    wrong.  It stays a ``PaperlessError``, so ``classify_error`` files it as
+    ``ErrorCategory.UPLOAD`` and ``serve`` exits 3 for it as before, and it
+    carries a ``next_step`` naming the two variables.
     """
 
 
