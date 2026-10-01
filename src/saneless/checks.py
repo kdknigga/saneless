@@ -106,6 +106,8 @@ __all__ = [
     "CheckKey",
     "CheckResult",
     "CheckState",
+    "PaperlessRefusal",
+    "ScannerRefusal",
     "check_name",
     "check_row_class",
     "check_row_glyph",
@@ -488,6 +490,36 @@ class CheckResult:
     skipped: bool = False
 
 
+class PaperlessRefusal(StrEnum):
+    """
+    Why a Paperless client could not be built, for the Paperless row.
+
+    ``PaperlessClient.__init__`` refuses for two kinds of reason, and they are
+    fixed in different places.  ``TRUST_STORE`` is the TLS trust store named by
+    ``SSL_CERT_FILE`` or ``SSL_CERT_DIR`` that could not be read: the settings
+    are fine and the environment is not.  ``CONFIGURATION`` is a
+    ``paperless.url`` or ``paperless.token`` the client cannot send.  Reporting
+    either as a wrong address sends the reader to the wrong file.
+    """
+
+    TRUST_STORE = "TRUST_STORE"
+    CONFIGURATION = "CONFIGURATION"
+
+
+class ScannerRefusal(StrEnum):
+    """
+    Why a scanner backend could not be built, for the Scanner row.
+
+    ``NOT_INSTALLED`` is python-sane missing, which installing it fixes.
+    ``START_FAILED`` is python-sane present and ``sane.init()`` refusing:
+    the scanner library is there and would not start, which reinstalling
+    does not fix and the log explains.
+    """
+
+    NOT_INSTALLED = "NOT_INSTALLED"
+    START_FAILED = "START_FAILED"
+
+
 @dataclass(frozen=True, slots=True)
 class CheckContext:
     """
@@ -499,16 +531,22 @@ class CheckContext:
     backend it opened at startup; ``saneless doctor`` has none of those and
     builds what it needs for one command.
 
-    ``scanner=None`` is how "python-sane is not installed on this machine" is
-    represented.  That is what lets ``doctor`` report all six rows on such a
-    machine instead of refusing at ``require_sane()`` and reporting none --
-    the thing an operator most needs a diagnostic for is the
-    machine where the diagnostic would otherwise not run.
+    ``scanner=None`` means no scanner backend could be built.  That is what
+    lets ``doctor`` report all six rows on such a machine instead of refusing
+    at ``require_sane()`` and reporting none -- the thing an operator most
+    needs a diagnostic for is the machine where the diagnostic would otherwise
+    not run.  ``scanner_refusal`` says why: python-sane is not installed, or
+    it is installed and the scanner library would not start.  The two need
+    different remedies, so they are different rows; a caller that does not
+    say gets the not-installed row.
 
     ``paperless=None`` means no usable client could be built at all:
     ``PaperlessClient.__init__`` refused, for a URL httpx2 will not parse or
     that carries a user name or password, a token an HTTP header cannot
-    carry, or a TLS trust store it could not read.
+    carry, or a TLS trust store it could not read.  ``paperless_refusal``
+    tells the trust store apart from the URL and token, because the remedy
+    for one is an environment variable and for the other a setting.  A caller
+    that does not say gets the "not found at that URL" row.
 
     ``profile_storage`` is the outcome the worker recorded when it wrote the
     generated profiles, not something re-derived here.  ``doctor`` derives its
@@ -528,6 +566,10 @@ class CheckContext:
             The scanner check hands it to the listing, which then ends
             within a fraction of a second, and ``run_checks`` stops between
             checks once it is set.
+        paperless_refusal: Why ``paperless`` is None, or None when the
+            caller does not know or a client was built.
+        scanner_refusal: Why ``scanner`` is None, or None when the caller
+            does not know or a backend was built.
 
     """
 
@@ -537,6 +579,8 @@ class CheckContext:
     profile_storage: ProfileStorage
     skip_scanner: bool = False
     abort: threading.Event | None = None
+    paperless_refusal: PaperlessRefusal | None = None
+    scanner_refusal: ScannerRefusal | None = None
 
 
 def check_name(key: CheckKey) -> str:
@@ -2327,6 +2371,30 @@ def _scanner_support_missing() -> CheckResult:
     )
 
 
+def _scanner_would_not_start() -> CheckResult:
+    """
+    Build the "the scanner library is installed and would not start" row.
+
+    Not the not-installed row: python-sane imported, and ``sane.init()``
+    refused.  Installing scanner support again changes nothing, and the
+    reason is in the log, which is where the next step sends the reader.
+    The row names no backend, path or host, because the log has those.
+
+    Returns:
+        The red scanner-support-would-not-start row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.FAIL,
+        message="Scanner support could not be started.",
+        next_step=(
+            "See the saneless log for why the scanner library would not start, "
+            f"fix the SANE setup on this machine, then {RETRY_PLACEHOLDER}."
+        ),
+    )
+
+
 # The outcomes that reach enumeration and explain why a configured ``net:``
 # device is missing: its host refused the connection, refused this machine, or
 # could not be found by name.  A timed-out host ends the check before
@@ -2863,6 +2931,8 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     """
     scanner = context.scanner
     if scanner is None:
+        if context.scanner_refusal is ScannerRefusal.START_FAILED:
+            return _scanner_would_not_start()
         return _scanner_support_missing()
     probes = tuple(
         _HostProbe(
@@ -3140,13 +3210,15 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     and only whether it was a plain switch to ``https://`` reaches the next
     step.
 
-    A ``None`` client means one could not be constructed.
-    ``PaperlessClient.__init__`` refuses a URL httpx2 will not parse or that
-    carries a user name or password, a token an HTTP header cannot carry, and
-    a TLS trust store it cannot read; every one of them is shown as the "not
-    found at that URL" row, not a new sentence.  Load-time validation of
-    ``paperless.url`` and ``paperless.token`` rejects the first three before a
-    client is ever built, so in practice the row is reached by the last.
+    A ``None`` client means one could not be constructed, and
+    ``context.paperless_refusal`` says why.  ``PaperlessClient.__init__``
+    refuses a URL httpx2 will not parse or that carries a user name or
+    password, a token an HTTP header cannot carry, and a TLS trust store it
+    cannot read.  The first three are the configuration row that names
+    ``paperless.url`` and ``paperless.token``; the trust store is a row of its
+    own that names ``SSL_CERT_FILE`` and ``SSL_CERT_DIR``, because the settings
+    are not what is wrong.  A caller that does not say why keeps the "not
+    found at that URL" row.
 
     Args:
         context: The injected dependencies and configuration.
@@ -3177,8 +3249,23 @@ def _check_paperless(context: CheckContext) -> CheckResult:
         )
     client = context.paperless
     https_upgrade = False
+    if client is None and context.paperless_refusal is PaperlessRefusal.TRUST_STORE:
+        return CheckResult(
+            key=CheckKey.PAPERLESS,
+            state=CheckState.FAIL,
+            message="The TLS trust store could not be read.",
+            next_step=(
+                "Check that SSL_CERT_FILE names a readable CA bundle file and "
+                "SSL_CERT_DIR a readable directory, or unset them, then restart "
+                "saneless."
+            ),
+        )
     if client is None:
-        status = ConnectionStatus.NOT_FOUND
+        status = (
+            ConnectionStatus.MISCONFIGURED
+            if context.paperless_refusal is PaperlessRefusal.CONFIGURATION
+            else ConnectionStatus.NOT_FOUND
+        )
     else:
         probe = client.probe_connection(
             timeout=httpx2.Timeout(PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS)

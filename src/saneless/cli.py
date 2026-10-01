@@ -44,6 +44,8 @@ from .checks import (
     CheckKey,
     CheckResult,
     CheckState,
+    PaperlessRefusal,
+    ScannerRefusal,
     check_name,
     configuration_check,
     leftover_config_check,
@@ -68,6 +70,7 @@ from .exceptions import (
     ConfigError,
     NoScannerFoundError,
     PaperlessError,
+    PaperlessTrustStoreError,
     SanelessError,
     ScanCancelledError,
     ScanError,
@@ -2840,73 +2843,89 @@ def _echo_config_resolution(settings: Settings) -> None:
         click.echo(line)
 
 
-def _doctor_scanner(settings: Settings) -> ScannerBackend | None:
+def _doctor_scanner(
+    settings: Settings,
+) -> tuple[ScannerBackend | None, ScannerRefusal | None]:
     """
-    Build a scanner backend for one ``doctor`` run, or report that there is none.
+    Build a scanner backend for one ``doctor`` run, or say why there is none.
 
-    ``None`` is how ``CheckContext`` represents "no scanner support on this
-    machine", and producing it here rather than letting the failure out is what
-    lets ``doctor`` report a machine without scanner support instead of
-    refusing to run on it.
-
-    All three failure shapes collapse to ``None``. ``ImportError`` is the bare
-    missing module; ``ConfigError`` is what ``require_sane`` -- which
-    ``SaneBackend.__init__`` calls for itself -- raises once it has translated
-    that ``ImportError``; and ``ScanError`` is ``sane.init()`` refusing. The
-    last is the least obvious of the three and is deliberate: a libsane that
-    will not initialise is SANE support this machine does not actually have,
-    the row's "install scanner support, then restart" is the right advice for
-    it, and letting it out instead would exit 1 -- a code ``doctor``'s
+    ``None`` is how ``CheckContext`` represents "no scanner backend", and
+    producing it here rather than letting the failure out is what lets
+    ``doctor`` report a machine without scanner support instead of refusing
+    to run on it.  Letting it out would also exit 1 -- a code ``doctor``'s
     documented table does not list, for a command that scans nothing.
+
+    The three failure shapes are two different faults.  ``ImportError`` is
+    the bare missing module, and ``ConfigError`` is what ``require_sane`` --
+    which ``SaneBackend.__init__`` calls for itself -- raises once it has
+    translated that ``ImportError``: both mean python-sane is not installed,
+    and installing it is the remedy.  ``ScanError`` is ``sane.init()``
+    refusing: python-sane is there and the scanner library would not start,
+    which installing again does not fix.  That one is its own row, and its
+    reason is logged at WARNING, because the row sends the reader to the log
+    for it.
 
     Args:
         settings: The loaded configuration, for the sane-net host.
 
     Returns:
-        A backend, or None when none could be built.
+        A backend and None, or None and the reason none could be built.
 
     """
     try:
-        return SaneBackend(host=settings.scanner.host)
-    except (ImportError, ConfigError, ScanError) as exc:
+        return SaneBackend(host=settings.scanner.host), None
+    except (ImportError, ConfigError) as exc:
         # The type name only. The ConfigError's own message names the install
         # hint and the ImportError names a shared object path, and neither
-        # belongs on a report a household member is meant to act on.
+        # adds anything to "not installed" for the person reading the log.
         logger.info("Scanner support unavailable: %s", type(exc).__name__)
-        return None
+        return None, ScannerRefusal.NOT_INSTALLED
+    except ScanError as exc:
+        logger.warning("Scanner support could not be started: %s", describe(exc))
+        return None, ScannerRefusal.START_FAILED
 
 
-def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
+def _doctor_paperless(
+    settings: Settings,
+) -> tuple[PaperlessClient | None, PaperlessRefusal | None]:
     """
-    Build a Paperless client for one ``doctor`` run, or report that there is none.
+    Build a Paperless client for one ``doctor`` run, or say why there is none.
 
-    ``PaperlessClient.__init__`` refuses exactly one thing -- a URL httpx2 will
-    not parse -- and it refuses it with ``PaperlessError``, which the group
-    guard would turn into exit 3. That would cost the operator the other four
-    rows to report a fact the Paperless row already has a sentence for, and it
-    would put a code in ``doctor``'s output that its documented table does not
-    list. ``None`` reaches ``checks.py`` as the "not found at that URL" row.
+    ``PaperlessClient.__init__`` refuses a URL httpx2 will not parse or that
+    carries a user name or password, a token an HTTP header cannot carry, and
+    a TLS trust store it cannot read.  Each is a ``PaperlessError``, which the
+    group guard would turn into exit 3: that would cost the operator the
+    other five rows, and put a code in ``doctor``'s output that its
+    documented table does not list.  So each becomes the Paperless row
+    instead, and which row depends on the reason.  The trust store is caught
+    first, because its type is a ``PaperlessError`` too: its remedy is
+    ``SSL_CERT_FILE`` or ``SSL_CERT_DIR``, not a setting.  Everything else the
+    constructor refuses is ``paperless.url`` or ``paperless.token``.
+
+    The refusal is logged at WARNING with its message.  The constructor's
+    messages are built from the URL with its user name and password removed,
+    and never quote the token, so the line carries no secret.
 
     Args:
         settings: The loaded configuration.
 
     Returns:
-        A client, or None when none could be built.
+        A client and None, or None and the reason none could be built.
 
     """
     try:
-        return PaperlessClient(
+        client = PaperlessClient(
             settings.paperless.url,
             settings.paperless.token.get_secret_value(),
             settings.paperless.consume_dir,
         )
+    except PaperlessTrustStoreError as exc:
+        logger.warning("Paperless client unavailable: %s", describe(exc))
+        return None, PaperlessRefusal.TRUST_STORE
     except PaperlessError as exc:
-        # Only the class name. A URL carrying credentials is refused when the
-        # config loads, so the message holds no secret; it is left out because
-        # the Paperless row already explains the failure to the operator, and
-        # this line only has to record which exception it was.
-        logger.info("Paperless client unavailable: %s", type(exc).__name__)
-        return None
+        logger.warning("Paperless client unavailable: %s", describe(exc))
+        return None, PaperlessRefusal.CONFIGURATION
+    return client, None
 
 
 # This command deliberately does NOT call require_sane(), which is the first
@@ -2939,18 +2958,20 @@ def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
 def doctor(ctx: click.Context) -> None:
     """Check that saneless is ready to scan."""
     settings = _load_cli_settings(ctx)
-    scanner = _doctor_scanner(settings)
+    scanner, scanner_refusal = _doctor_scanner(settings)
     if scanner is not None:
         # Registered before the first SANE call, so a check that fails still
         # leaves the process with SANE shut down.
         ctx.call_on_close(scanner.close)
-    paperless = _doctor_paperless(settings)
+    paperless, paperless_refusal = _doctor_paperless(settings)
     try:
         results = run_checks(
             CheckContext(
                 settings=settings,
                 scanner=scanner,
                 paperless=paperless,
+                paperless_refusal=paperless_refusal,
+                scanner_refusal=scanner_refusal,
                 # A one-shot command attempts no persist, so this is the
                 # derivation it is entitled to; the function's docstring has
                 # the reasoning, including why it cannot report the third
