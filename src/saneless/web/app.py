@@ -195,9 +195,9 @@ def _build_check_machinery(
     Returns:
         The cold cache and the unstarted refresher that fills it.  The
         refresher also hands the context factory back out through
-        :meth:`~saneless.web.refresher.CheckRefresher.build_context`, which is
-        how ``POST /api/checks/refresh`` probes from the same assembled
-        dependencies rather than putting them together a second time.
+        :meth:`~saneless.web.refresher.CheckRefresher.build_context`, so
+        every probe, a tick's or one ``POST /api/checks/refresh`` asked for,
+        runs on the same assembled dependencies rather than a second set.
 
     """
     # No ttl is passed: unlike the Paperless metadata cache there is no config

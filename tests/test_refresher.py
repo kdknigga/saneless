@@ -1575,6 +1575,20 @@ class TestRequestProbe:
         assert len(spy.calls) == 1
         assert cache.current().results is None
 
-    def test_the_request_thread_probe_is_gone(self) -> None:
-        """No caller can run a probe on its own thread any more."""
-        assert not hasattr(CheckRefresher, "probe_now")
+    def test_the_only_public_way_to_probe_is_to_ask(self) -> None:
+        """
+        No public method runs a probe on its caller's thread.
+
+        The public surface is pinned whole, so a method that probes in place
+        cannot come back under its old name or a new one without this failing.
+        """
+        public = {name for name in dir(CheckRefresher) if not name.startswith("_")}
+        assert public == {
+            "build_context",
+            "note_watcher",
+            "probe_in_flight",
+            "request_probe",
+            "request_stop",
+            "start",
+            "stop",
+        }

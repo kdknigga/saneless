@@ -249,10 +249,10 @@ class CheckCache:
         """
         Give a granted claim back, because the probe it bought never happened.
 
-        ``POST /api/checks/refresh`` claims before it probes, and it has to:
-        the claim is what decides whether it may probe at all.  But
-        ``CheckRefresher.probe_now`` collapses into an in-flight probe and
-        does nothing, and a click that collapsed spent the floor for no probe
+        ``POST /api/checks/refresh`` claims before it asks for a probe, and
+        it has to: the claim is what decides whether it may ask at all.  But
+        ``CheckRefresher.request_probe`` collapses into an in-flight probe and
+        asks for nothing, and a click that collapsed spent the floor for no probe
         -- so the clicker's very next press, inside two seconds, was refused
         for traffic nobody generated: the button appeared to do nothing, twice
         in a row.  This hands the claim
@@ -272,7 +272,8 @@ class CheckCache:
         bound what an unauthenticated LAN endpoint can make the appliance do.
 
         It cannot be abused to defeat the floor.  The
-        release happens only where ``probe_now`` returned False, and that
+        release happens only where ``request_probe`` reported a collapse, and that
+
         branch issued no Paperless request, no saned TCP dial and no
         filesystem write, so a scripted loop that always collides always gets
         its claim back and still generates zero probe traffic.  The moment a
