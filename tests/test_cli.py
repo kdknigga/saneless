@@ -3509,6 +3509,27 @@ class TestServeCommand:
         assert run.config.log_config is None
         assert run.config.access_log is True
 
+    def test_serve_bounds_the_graceful_shutdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A stop waits at most 3 s for requests to finish, per uvicorn's config.
+
+        An int, because uvicorn types the setting ``int | None``.  Three
+        seconds of request drain plus the background threads' shared stop fit
+        inside Docker's default 10 s grace period.
+        """
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        bound = run.config.timeout_graceful_shutdown
+        assert isinstance(bound, int)
+        assert bound <= 3
+
     def test_serve_port_0_binds_an_os_chosen_port_and_reports_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
