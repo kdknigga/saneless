@@ -96,7 +96,7 @@
                    c | check_row_glyph,
                    c | check_row_label,
                    c.message,
-                   c.next_step) }}
+                   c.next_step | check_step(CheckSurface.STRIP)) }}
       {% endfor %}
     {% endif %}
   </ul>

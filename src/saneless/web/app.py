@@ -31,6 +31,7 @@ from saneless.vocabulary import (
     PASS_WAIT_STATES,
     TAGS_LOADING,
     TAGS_UNAVAILABLE,
+    CheckSurface,
     JobState,
     error_message,
     error_next_step,
@@ -44,6 +45,7 @@ from saneless.vocabulary import (
     pass_answer_label,
     progress_label,
     removed_pages,
+    render_check_step,
     scan_button_label,
 )
 from saneless.worker import PRESERVATION_JOIN_SECONDS, STOP_JOIN_SECONDS, ScanWorker
@@ -134,6 +136,12 @@ def _build_templates() -> Jinja2Templates:
     templates.env.filters["check_row_class"] = check_row_class
     templates.env.filters["check_row_glyph"] = check_row_glyph
     templates.env.filters["check_row_label"] = check_row_label
+    # One check row, two endings: a next step that says to try again holds a
+    # placeholder, and the strip renders it as pressing the Check again button
+    # beside it, where ``saneless doctor`` renders the same row as running the
+    # command again.  The surface reaches the template as the enum member, by
+    # the same route as ``JobState``, so the call site names no string.
+    templates.env.filters["check_step"] = render_check_step
     templates.env.filters["error_message"] = error_message
     templates.env.filters["error_next_step"] = error_next_step
     templates.env.filters["local_time"] = local_time
@@ -150,6 +158,8 @@ def _build_templates() -> Jinja2Templates:
     # resulting false positive with a comment.
     job_state_global: Any = JobState
     templates.env.globals["JobState"] = job_state_global
+    check_surface_global: Any = CheckSurface
+    templates.env.globals["CheckSurface"] = check_surface_global
     # The multi-page waiting states, by the same route and for the same reason.
     # The status area and the Scan button test membership of this one set, so
     # a template never lists the states by hand and cannot drift from it.

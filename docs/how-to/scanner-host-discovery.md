@@ -99,7 +99,7 @@ Some scanners need to be explicitly configured in `saned` for network sharing. C
 **What the Scanner row says**
 {: #what-the-scanner-row-says }
 
-Before it asks SANE for scanners, the Scanner check in the status strip and in `saneless doctor` opens a connection to `saned` on each configured scanner host and starts the SANE network handshake, so it can tell why a host is not usable. Each row below names the problem, and its next step says what fixes it. "Pressing **Check again**" means the status strip's **Check again** button; `saneless doctor` checks afresh every time it runs.
+Before it asks SANE for scanners, the Scanner check in the status strip and in `saneless doctor` opens a connection to `saned` on each configured scanner host and starts the SANE network handshake, so it can tell why a host is not usable. Each row below names the problem, and its next step says what fixes it. "Pressing **Check again**" means the status strip's **Check again** button; `saneless doctor` checks afresh every time it runs, so where the strip says "press Check again", `doctor` says "run saneless doctor again".
 
 | The row says | What it means | What fixes it | Cleared by |
 |--------------|---------------|---------------|------------|

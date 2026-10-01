@@ -71,6 +71,8 @@ from saneless.private_dirs import check_private_dir
 from saneless.scanner.base import DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
+    RETRY_PLACEHOLDER,
+    RETRY_SENTENCE_PLACEHOLDER,
     ConfigFileState,
     ConnectionStatus,
     ProfileStorage,
@@ -348,7 +350,8 @@ POLL_PROBE_ATTEMPT_CAP: Final = 90
 # ``CHECKING_MESSAGE`` does: templates own no vocabulary.  It names the button
 # that is still on the page and nothing else: no path, no URL, no host and no
 # exception text, because this sentence is rendered on a page the whole LAN can
-# read.
+# read.  Only the strip shows it, never ``saneless doctor``, so it names the
+# button directly instead of holding a retry placeholder.
 POLL_GAVE_UP_LINE: Final = "The checks have not run yet. Press Check again to try now."
 
 # What the strip says instead, while it is still asking because a probe is
@@ -377,7 +380,7 @@ _DEVICE_LABEL_MAX_LENGTH: Final = 60
 # exception that produced them is exactly the thing that must not reach the
 # page.
 _CHECK_FAILED_MESSAGE: Final = "This check could not be completed."
-_CHECK_FAILED_NEXT_STEP: Final = "Restart saneless, then press Check again."
+_CHECK_FAILED_NEXT_STEP: Final = f"Restart saneless, then {RETRY_PLACEHOLDER}."
 
 
 class CheckState(StrEnum):
@@ -452,7 +455,11 @@ class CheckResult:
 
     ``next_step`` is empty for every ``OK`` row and non-empty for every
     ``WARN`` and ``FAIL`` row, because a red row that does not say what to do
-    about it is a red row a household member can only escalate.
+    about it is a red row a household member can only escalate.  A next step
+    that tells the reader to try again holds a retry placeholder from
+    ``saneless.vocabulary`` instead of the words, because the two surfaces
+    retry differently: the strip has a Check again button and ``saneless
+    doctor`` is run again.  Each surface renders it with ``render_check_step``.
 
     ``skipped`` is the "not checked while a scan is running" row.  It is a
     separate flag rather than a fourth state because the row still has to carry
@@ -468,7 +475,8 @@ class CheckResult:
             superseded-name states, carries one of three fixed documented
             spellings of the file to rename -- never a resolved host path, and
             never in ``message``.
-        next_step: What to do about it, for ``WARN`` and ``FAIL`` rows.
+        next_step: What to do about it, for ``WARN`` and ``FAIL`` rows, with
+            any retry still a placeholder.
         skipped: True when the probe was deliberately not run.
 
     """
@@ -1765,13 +1773,13 @@ def _host_problem_next_step(outcome: _SanedOutcome) -> str:
     """
     match outcome:
         case _SanedOutcome.TIMED_OUT:
-            next_step = "Check the scanner host is switched on and on the network, then press Check again."
+            next_step = f"Check the scanner host is switched on and on the network, then {RETRY_PLACEHOLDER}."
         case _SanedOutcome.REFUSED:
-            next_step = "Start saned on the scanner host, or check it is listening on the network, then press Check again."
+            next_step = f"Start saned on the scanner host, or check it is listening on the network, then {RETRY_PLACEHOLDER}."
         case _SanedOutcome.UNRESOLVED:
-            next_step = "Check the host name in [scanner] host or [scanner] device, or in SANE_NET_HOSTS if that is set. If you fixed the name in DNS or the hosts file, press Check again; if you changed a setting, restart saneless."
+            next_step = f"Check the host name in [scanner] host or [scanner] device, or in SANE_NET_HOSTS if that is set. If you fixed the name in DNS or the hosts file, {RETRY_PLACEHOLDER}; if you changed a setting, restart saneless."
         case _SanedOutcome.REJECTED:
-            next_step = "Add this machine to saned.conf on the scanner host, then press Check again."
+            next_step = f"Add this machine to saned.conf on the scanner host, then {RETRY_PLACEHOLDER}."
         case _SanedOutcome.HEALTHY:
             next_step = ""
         case _:
@@ -2504,7 +2512,7 @@ def _scanner_configured_missing_row() -> CheckResult:
         key=CheckKey.SCANNER,
         state=CheckState.FAIL,
         message="The configured scanner was not found.",
-        next_step="Check it is switched on and connected, then press Check again. If saneless devices does not list it, set [scanner] device to one it lists, then restart saneless.",
+        next_step=f"Check it is switched on and connected, then {RETRY_PLACEHOLDER}. If saneless devices does not list it, set [scanner] device to one it lists, then restart saneless.",
     )
 
 
@@ -2558,7 +2566,7 @@ def _scanner_listing_crashed_row() -> CheckResult:
         key=CheckKey.SCANNER,
         state=CheckState.WARN,
         message="The scanner library failed while listing scanners, so the scanner could not be checked.",
-        next_step="Press Check again.",
+        next_step=f"{RETRY_SENTENCE_PLACEHOLDER}.",
     )
 
 
@@ -2586,7 +2594,7 @@ def _scanner_listing_timed_out_row() -> CheckResult:
         key=CheckKey.SCANNER,
         state=CheckState.WARN,
         message="The scanner library did not finish listing scanners in time, so the scanner could not be checked.",
-        next_step="Check the scanner, and its scanner host if it has one, are switched on and reachable, then press Check again.",
+        next_step=f"Check the scanner, and its scanner host if it has one, are switched on and reachable, then {RETRY_PLACEHOLDER}.",
     )
 
 
@@ -2611,7 +2619,7 @@ def _scanner_listing_no_answer_row() -> CheckResult:
         key=CheckKey.SCANNER,
         state=CheckState.WARN,
         message="The scanner library gave no usable answer while listing scanners, so the scanner could not be checked.",
-        next_step="Press Check again.",
+        next_step=f"{RETRY_SENTENCE_PLACEHOLDER}.",
     )
 
 
@@ -2636,7 +2644,7 @@ def _scanner_nothing_found_row(hosts: int) -> CheckResult:
             key=CheckKey.SCANNER,
             state=CheckState.FAIL,
             message="No scanner was found.",
-            next_step="Check the scanner is switched on and connected, then press Check again.",
+            next_step=f"Check the scanner is switched on and connected, then {RETRY_PLACEHOLDER}.",
         )
     message = (
         "The scanner host is answering, but no scanner was found on it."
@@ -2647,7 +2655,7 @@ def _scanner_nothing_found_row(hosts: int) -> CheckResult:
         key=CheckKey.SCANNER,
         state=CheckState.FAIL,
         message=message,
-        next_step="Check the scanner is switched on and connected to the scanner host, then press Check again.",
+        next_step=f"Check the scanner is switched on and connected to the scanner host, then {RETRY_PLACEHOLDER}.",
     )
 
 
@@ -3080,16 +3088,16 @@ def _paperless_next_step(
         case ConnectionStatus.NOT_FOUND:
             next_step = "Check the paperless-ngx address in the saneless config file."
         case ConnectionStatus.SERVER_ERROR:
-            next_step = "Check paperless-ngx is healthy, then press Check again."
+            next_step = f"Check paperless-ngx is healthy, then {RETRY_PLACEHOLDER}."
         case ConnectionStatus.UNREACHABLE:
             next_step = (
                 "Check paperless-ngx is running and on the network, "
-                "then press Check again."
+                f"then {RETRY_PLACEHOLDER}."
             )
         case ConnectionStatus.INCOMPATIBLE:
             next_step = (
                 "saneless needs paperless-ngx 2.16 or later (API version 9 or 10); "
-                "upgrade paperless-ngx, then press Check again."
+                f"upgrade paperless-ngx, then {RETRY_PLACEHOLDER}."
             )
         case ConnectionStatus.REDIRECTED if https_upgrade:
             next_step = (

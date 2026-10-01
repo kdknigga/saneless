@@ -233,7 +233,7 @@ Config files searched, in order:
   not found  /etc/saneless/saneless.toml
 ```
 
-Every `[WARN]` and `[FAIL]` row is followed by an indented next step. An `[ OK ]` row has nothing to do about it and prints no second line.
+Every `[WARN]` and `[FAIL]` row is followed by an indented next step. An `[ OK ]` row has nothing to do about it and prints no second line. Where the web UI's next step says to press **Check again**, `doctor` says to run `saneless doctor` again instead, because a terminal has no button; the rest of the sentence is the same on both.
 
 **The config resolution table.** After the rows, `doctor` lists every location its search looked at, with absolute paths, whether the run was healthy or not. This is the section to read when the settings are not the ones you expected: it is the only place that says which of the candidate files won, and it is printed by `doctor` only -- the web page carries the `Configuration` row and no paths at all, because it is visible to everyone on your network.
 

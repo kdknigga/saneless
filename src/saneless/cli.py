@@ -102,6 +102,7 @@ from .vocabulary import (
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
     WARNED_UPLOAD_LABEL,
+    CheckSurface,
     ConfigFileState,
     ErrorCategory,
     ExitCode,
@@ -128,6 +129,7 @@ from .vocabulary import (
     progress_label,
     rejection_message,
     removed_pages_note,
+    render_check_step,
     root_owned_config_note,
     root_per_user_config_note,
     state_label,
@@ -2967,7 +2969,10 @@ def doctor(ctx: click.Context) -> None:
             f"{check_name(result.key):<{_NAME_COL_WIDTH}} {result.message}"
         )
         if result.next_step:
-            click.echo(f"{_NEXT_STEP_INDENT}{result.next_step}")
+            # The row's retry is spelled for a terminal: there is no Check
+            # again button here, so it says to run this command again.
+            step = render_check_step(result.next_step, CheckSurface.DOCTOR)
+            click.echo(f"{_NEXT_STEP_INDENT}{step}")
 
     _echo_config_resolution(settings)
 

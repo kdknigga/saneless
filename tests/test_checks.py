@@ -2588,6 +2588,24 @@ def _row(results: tuple[CheckResult, ...], key: CheckKey) -> CheckResult:
     return next(result for result in results if result.key is key)
 
 
+def _strip(step: str) -> str:
+    """
+    Render a row's next step the way the status strip shows it.
+
+    A next step that says to try again is stored with a placeholder, and each
+    surface spells the retry its own way.  The sentences these tests pin are
+    the strip's, so a stored step is compared after rendering it for the strip.
+
+    Args:
+        step: The next step as the registry stored it.
+
+    Returns:
+        The sentence the strip shows.
+
+    """
+    return render_check_step(step, CheckSurface.STRIP)
+
+
 def _without_allowed_spellings(text: str) -> str:
     """
     Remove the three documented path spellings a row may legitimately carry.
@@ -2798,7 +2816,7 @@ class TestScannerCheck:
         row = _row(results, CheckKey.SCANNER)
         assert row.state is CheckState.FAIL
         assert row.message == "No scanner was found."
-        assert row.next_step == _NOTHING_FOUND_NEXT
+        assert _strip(row.next_step) == _NOTHING_FOUND_NEXT
         assert "Not reachable" not in row.message
 
     def test_a_raising_backend_finds_no_scanner(
@@ -2915,7 +2933,7 @@ class TestScannerCheck:
         assert row.message == (
             "Brother ADS-2700W is ready, but the scanner host is refusing this machine."
         )
-        assert row.next_step == _REJECTED_NEXT
+        assert _strip(row.next_step) == _REJECTED_NEXT
 
     @pytest.mark.parametrize("surface", _SURFACES)
     def test_an_unresolved_host_is_enumerated_and_named(
@@ -2937,7 +2955,7 @@ class TestScannerCheck:
         assert backend.calls == 1
         assert row.state is CheckState.FAIL
         assert row.message == "The scanner host could not be found by name."
-        assert row.next_step == _UNRESOLVED_NEXT
+        assert _strip(row.next_step) == _UNRESOLVED_NEXT
 
     @pytest.mark.parametrize("surface", _SURFACES)
     def test_an_unresolved_name_from_the_environment_points_at_the_variable(
@@ -3029,7 +3047,7 @@ class TestScannerCheck:
             "The configured scanner is ready, but the scanner service is not "
             "running on the scanner host."
         )
-        assert row.next_step == _REFUSED_NEXT_STEP
+        assert _strip(row.next_step) == _REFUSED_NEXT_STEP
 
     @pytest.mark.parametrize("surface", _SURFACES)
     @pytest.mark.parametrize(
@@ -3136,7 +3154,7 @@ class TestScannerCheck:
             "The configured scanner is ready, but the scanner service is not "
             f"running on {hosts_subject}."
         )
-        assert row.next_step == _REFUSED_NEXT_STEP
+        assert _strip(row.next_step) == _REFUSED_NEXT_STEP
 
     @pytest.mark.parametrize("surface", _SURFACES)
     def test_a_configured_net_device_on_a_probed_host_is_dialled_once(
@@ -3448,7 +3466,7 @@ class TestScannerCheck:
         assert backend.calls == 1
         assert row.state is CheckState.WARN
         assert row.message == _REFUSED_READY_MESSAGE
-        assert row.next_step == _REFUSED_NEXT_STEP
+        assert _strip(row.next_step) == _REFUSED_NEXT_STEP
 
     def test_a_healthy_saned_reaches_the_backend(self, tmp_path: Path) -> None:
         """
@@ -3490,7 +3508,7 @@ class TestScannerCheck:
         assert backend.calls == 0
         assert row.state is CheckState.WARN
         assert row.message == _TIMED_OUT_MESSAGE
-        assert row.next_step == _TIMED_OUT_NEXT_STEP
+        assert _strip(row.next_step) == _TIMED_OUT_NEXT_STEP
 
     def test_every_configured_host_is_probed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3769,7 +3787,7 @@ class TestScannerCheck:
         assert backend.calls == 0
         assert row.state is CheckState.WARN
         assert row.skipped is False
-        assert (row.message, row.next_step) == expected
+        assert (row.message, _strip(row.next_step)) == expected
 
     @pytest.mark.parametrize(
         ("host", "outcomes", "hosts_subject"),
@@ -3843,7 +3861,7 @@ class TestScannerCheck:
             "Brother ADS-2700W is ready, but the scanner service is not running "
             f"on {hosts_subject}."
         )
-        assert row.next_step == _REFUSED_NEXT_STEP
+        assert _strip(row.next_step) == _REFUSED_NEXT_STEP
 
     def test_the_timed_out_and_refused_rows_advise_different_things(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3875,9 +3893,9 @@ class TestScannerCheck:
         assert timed_out.state is CheckState.WARN
         assert refused.state is CheckState.FAIL
         assert refused.message == _REFUSED_MESSAGE
-        assert timed_out.next_step != refused.next_step
-        assert timed_out.next_step.endswith("press Check again.")
-        assert refused.next_step.endswith("press Check again.")
+        assert _strip(timed_out.next_step) != _strip(refused.next_step)
+        assert _strip(timed_out.next_step).endswith("press Check again.")
+        assert _strip(refused.next_step).endswith("press Check again.")
 
     def test_an_unanswered_host_does_not_turn_a_health_gate_red(
         self, tmp_path: Path
@@ -4022,7 +4040,7 @@ class TestScannerCheck:
         assert row.message == (
             "The scanner host is answering, but no scanner was found on it."
         )
-        assert row.next_step == _HOST_ANSWERS_NOTHING_FOUND_NEXT
+        assert _strip(row.next_step) == _HOST_ANSWERS_NOTHING_FOUND_NEXT
         assert "Not reachable" not in row.message
 
     def test_a_reachable_host_whose_backend_raises_is_still_red(
@@ -4849,7 +4867,7 @@ class TestScannerVerdict:
         """
         row = _verdict(case)
         assert row.key is CheckKey.SCANNER
-        assert (row.state, row.message, row.next_step) == (
+        assert (row.state, row.message, _strip(row.next_step)) == (
             case.state,
             case.message,
             case.next_step,
@@ -4892,22 +4910,22 @@ class TestScannerVerdict:
 
         """
         row = _verdict(case)
+        step = _strip(row.next_step)
         match _advice_kind(row.message):
             case "check-again":
-                assert row.next_step.endswith("ress Check again.")
-                assert "restart" not in row.next_step
+                assert step.endswith("ress Check again.")
+                assert "restart" not in step
             case "check-again-or-restart-after-edit":
-                assert "press Check again" in row.next_step
-                assert row.next_step.endswith("restart saneless.")
+                assert "press Check again" in step
+                assert step.endswith("restart saneless.")
                 assert (
-                    "if you changed a setting" in row.next_step
-                    or "set [scanner] device" in row.next_step
+                    "if you changed a setting" in step or "set [scanner] device" in step
                 )
             case "restart":
-                assert row.next_step.endswith("restart saneless.")
-                assert "press Check again" not in row.next_step
+                assert step.endswith("restart saneless.")
+                assert "press Check again" not in step
             case _:
-                assert "restart" not in row.next_step
+                assert "restart" not in step
 
     def test_the_restart_property_covers_every_kind_of_advice(self) -> None:
         """Every kind of next step is exercised by at least one case above."""
@@ -5326,9 +5344,9 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.backend.calls == 1
             assert run.row.state is CheckState.FAIL
             assert run.row.message == _REJECTED_MESSAGE
-            assert run.row.next_step == _REJECTED_NEXT
-            assert "saned.conf" in run.row.next_step
-            for text in (run.row.message, run.row.next_step):
+            assert _strip(run.row.next_step) == _REJECTED_NEXT
+            assert "saned.conf" in _strip(run.row.next_step)
+            for text in (run.row.message, _strip(run.row.next_step)):
                 assert "switched on and connected" not in text
         _assert_names_nothing(runs, caplog, fake.port)
 
@@ -5356,7 +5374,7 @@ class TestScannerCheckAgainstAFakeSaned:
                 "Brother ADS-2700W is ready, but the scanner host is refusing "
                 "this machine."
             )
-            assert run.row.next_step == _REJECTED_NEXT
+            assert _strip(run.row.next_step) == _REJECTED_NEXT
         _assert_names_nothing(runs, caplog, fake.port)
 
     def test_a_failure_status_reads_the_same_as_accept_then_close(
@@ -5380,7 +5398,7 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.backend.calls == 1
             assert run.row.state is CheckState.FAIL
             assert run.row.message == _REJECTED_MESSAGE
-            assert run.row.next_step == _REJECTED_NEXT
+            assert _strip(run.row.next_step) == _REJECTED_NEXT
         _assert_names_nothing(runs, caplog, fake.port)
 
     def test_a_refused_host_is_enumerated_and_red_when_nothing_is_listed(
@@ -5409,7 +5427,7 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.backend.calls == 1
             assert run.row.state is CheckState.FAIL
             assert run.row.message == _REFUSED_MESSAGE
-            assert run.row.next_step == _REFUSED_NEXT_STEP
+            assert _strip(run.row.next_step) == _REFUSED_NEXT_STEP
         backend = _CountingBackend()
         doctor_row = checks._check_scanner(_context(settings, scanner=backend))
         assert backend.calls == 1
@@ -5438,7 +5456,7 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.backend.calls == 1
             assert run.row.state is CheckState.WARN
             assert run.row.message == _REFUSED_READY_MESSAGE
-            assert run.row.next_step == _REFUSED_NEXT_STEP
+            assert _strip(run.row.next_step) == _REFUSED_NEXT_STEP
         _assert_names_nothing(runs, caplog, port)
 
     def test_a_configured_net_device_on_a_refusing_host_is_opened_and_reports_its_host(
@@ -5478,7 +5496,7 @@ class TestScannerCheckAgainstAFakeSaned:
                 "The configured scanner's host is on, but its scanner service "
                 "is not running."
             )
-            assert run.row.next_step == _REFUSED_NEXT_STEP
+            assert _strip(run.row.next_step) == _REFUSED_NEXT_STEP
         _assert_names_nothing(runs, caplog, port)
 
     def test_a_silent_peer_is_amber_bounded_and_never_enumerated(
@@ -5510,7 +5528,7 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.backend.calls == 0
             assert run.row.state is CheckState.WARN
             assert run.row.message == _TIMED_OUT_MESSAGE
-            assert run.row.next_step == _TIMED_OUT_NEXT_STEP
+            assert _strip(run.row.next_step) == _TIMED_OUT_NEXT_STEP
             assert run.seconds < 4 * _PROBE_BUDGET
         _assert_names_nothing(runs, caplog, listening_port)
 
@@ -5565,7 +5583,7 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.backend.calls == 1
             assert run.row.state is CheckState.FAIL
             assert run.row.message == _ANSWERING_NOTHING_FOUND_MESSAGE
-            assert run.row.next_step == _HOST_ANSWERS_NOTHING_FOUND_NEXT
+            assert _strip(run.row.next_step) == _HOST_ANSWERS_NOTHING_FOUND_NEXT
         _assert_names_nothing(runs, caplog, fake.port)
 
     def test_a_name_that_does_not_resolve_is_red_and_says_restart(
@@ -5599,7 +5617,7 @@ class TestScannerCheckAgainstAFakeSaned:
             assert run.backend.calls == 1
             assert run.row.state is CheckState.FAIL
             assert run.row.message == "The scanner host could not be found by name."
-            assert run.row.next_step == _UNRESOLVED_NEXT
+            assert _strip(run.row.next_step) == _UNRESOLVED_NEXT
         _assert_names_nothing(runs, caplog, SANED_PORT)
 
     def test_one_answering_host_beside_a_refusing_one_is_enumerated(
@@ -5634,7 +5652,7 @@ class TestScannerCheckAgainstAFakeSaned:
                 "Brother ADS-2700W is ready, but the scanner service is not "
                 "running on 1 of 2 scanner hosts."
             )
-            assert run.row.next_step == _REFUSED_NEXT_STEP
+            assert _strip(run.row.next_step) == _REFUSED_NEXT_STEP
         assert b"".join(fake.received) == (INIT_REQUEST + EXIT_REQUEST) * len(runs)
         _assert_names_nothing(runs, caplog, fake.port)
 
@@ -5793,7 +5811,7 @@ class TestPaperlessCheck:
         row = _row(results, CheckKey.PAPERLESS)
         assert row.state is CheckState.FAIL
         assert row.message == "Could not reach paperless-ngx."
-        assert row.next_step == (
+        assert _strip(row.next_step) == (
             "Check paperless-ngx is running and on the network, then press Check again."
         )
 
@@ -5824,7 +5842,7 @@ class TestPaperlessCheck:
         assert row.message == (
             "This paperless-ngx does not speak an API version saneless supports."
         )
-        assert row.next_step == (
+        assert _strip(row.next_step) == (
             "saneless needs paperless-ngx 2.16 or later (API version 9 or 10); "
             "upgrade paperless-ngx, then press Check again."
         )
@@ -7960,7 +7978,7 @@ class TestIsolatedListingWiring:
         backend = _ListingFailureBackend(error)
         settings = _with_device(_settings(tmp_path), "")
         row = _scanner_row_on(surface, _context(settings, scanner=backend))
-        assert (row.state, row.message, row.next_step) == expected
+        assert (row.state, row.message, _strip(row.next_step)) == expected
         assert backend.calls == 0
         assert backend.opens == 0
 
@@ -7995,7 +8013,7 @@ class TestIsolatedListingWiring:
         with caplog.at_level(logging.WARNING):
             results = run_checks(context, scanner_gate=threading.Lock())
         row = _row(results, CheckKey.SCANNER)
-        assert (row.state, row.message, row.next_step) == (
+        assert (row.state, row.message, _strip(row.next_step)) == (
             CheckState.WARN,
             _LISTING_CRASHED_MESSAGE,
             _LISTING_CRASHED_NEXT,
@@ -8037,7 +8055,7 @@ class TestIsolatedListingWiring:
         context, fake, _handle = isolated_context(_LOCAL_DEVICE_ID)
         results = run_checks(context, scanner_gate=threading.Lock())
         row = _row(results, CheckKey.SCANNER)
-        assert (row.state, row.message, row.next_step) == (
+        assert (row.state, row.message, _strip(row.next_step)) == (
             CheckState.WARN,
             _LISTING_NO_ANSWER_MESSAGE,
             _LISTING_NO_ANSWER_NEXT,
@@ -8077,7 +8095,7 @@ class TestIsolatedListingWiring:
             run_checks(context, scanner_gate=cast("threading.Lock", gate)),
             CheckKey.SCANNER,
         )
-        assert (row.state, row.message, row.next_step) == (
+        assert (row.state, row.message, _strip(row.next_step)) == (
             CheckState.WARN,
             _LISTING_TIMED_OUT_MESSAGE,
             _LISTING_TIMED_OUT_NEXT,

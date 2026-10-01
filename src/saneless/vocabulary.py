@@ -68,6 +68,8 @@ __all__ = [
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
     "RESTART_UPLOADING_REASON",
+    "RETRY_PLACEHOLDER",
+    "RETRY_SENTENCE_PLACEHOLDER",
     "SCAN_BLOCKED_REASON",
     "SCAN_BLOCKED_URL_REASON",
     "TAGS_LOADING",
@@ -84,6 +86,7 @@ __all__ = [
     "WARNED_UPLOAD_LABEL",
     "WORKER_DEGRADED_JOB_ERROR",
     "WORKER_DOWN_JOB_ERROR",
+    "CheckSurface",
     "CliChoice",
     "ConfigFileState",
     "ConnectionStatus",
@@ -156,6 +159,7 @@ __all__ = [
     "rejection_status_code",
     "removed_pages",
     "removed_pages_note",
+    "render_check_step",
     "restart_category",
     "restart_error",
     "root_owned_config_note",
@@ -3858,6 +3862,63 @@ def connection_status_message(status: ConnectionStatus) -> str:
         case _:
             assert_never(status)
     return message
+
+
+class CheckSurface(StrEnum):
+    """
+    Where a health-check row is shown, which decides how it says "try again".
+
+    One check row, two endings.  The status strip has a Check again button
+    beside its rows, so a retry there is a press of that button.
+    ``saneless doctor`` prints the same rows to a terminal, where no button
+    exists, so a retry there is running the command again.
+    """
+
+    STRIP = "STRIP"
+    DOCTOR = "DOCTOR"
+
+
+# What a check's next step holds where it tells the reader to try again: one
+# for a retry inside a sentence, one for a retry that opens one.  The row text
+# stores these and ``render_check_step`` turns them into the surface's words,
+# so the registry writes each next step once for both surfaces.
+RETRY_PLACEHOLDER: Final = "{retry}"
+RETRY_SENTENCE_PLACEHOLDER: Final = "{Retry}"
+
+
+def render_check_step(step: str, surface: CheckSurface) -> str:
+    """
+    Return a check's next step as the given surface shows it.
+
+    One check row, two endings: the strip has a Check again button, and
+    ``saneless doctor`` is run again from a terminal.  Each retry placeholder
+    in the step becomes that surface's phrase, capitalised when it opens a
+    sentence.  A step with no placeholder is returned unchanged.
+
+    The placeholders are replaced with ``str.replace``, never ``str.format``,
+    so any other brace in the row text is left as it is.
+
+    Args:
+        step: The next step as the registry stored it.
+        surface: Where the row is shown.
+
+    Returns:
+        The next step with each retry spelled for that surface.
+
+    Raises:
+        AssertionError: If the value is not a CheckSurface member.
+
+    """
+    match surface:
+        case CheckSurface.STRIP:
+            retry = "press Check again"
+        case CheckSurface.DOCTOR:
+            retry = "run saneless doctor again"
+        case _:
+            assert_never(surface)
+    return step.replace(RETRY_PLACEHOLDER, retry).replace(
+        RETRY_SENTENCE_PLACEHOLDER, retry[0].upper() + retry[1:]
+    )
 
 
 def worker_health_detail(health: WorkerHealth) -> str:
