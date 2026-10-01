@@ -8357,3 +8357,118 @@ class TestControlCharactersInFailureSinks:
         assert reason == _HOSTILE_SCAN_FAILURE
         [record] = [r for r in caplog.records if r.name == "saneless.cli"]
         assert _control_free(record.getMessage()), record.getMessage()
+
+
+# Enough history that either rendering overflows the pipe's buffer: the
+# command is still writing when its reader goes away, as under
+# `saneless jobs | head`, rather than finished before the reader closed.
+_CLOSED_PIPE_JOBS = 3000
+
+_CLOSED_PIPE_CHILD_SECONDS = 60
+
+# The shell's code for a process its reader went away from: 128 + SIGPIPE.
+_CLOSED_PIPE_EXIT = 128 + signal.SIGPIPE
+
+_CLOSED_PIPE_CONFIG = """\
+[paperless]
+url = "http://paperless.invalid:8000"
+token = "closed-pipe-token"
+
+[output]
+tmp_dir = "{tmp_dir}"
+data_dir = "{data_dir}"
+log_file = "{log_file}"
+
+[profiles.default]
+"""
+
+# The console script's shim, the arguments travelling in the environment and
+# taken out of it before the CLI starts, because saneless reads every
+# SANELESS_ variable as a setting.
+_CLOSED_PIPE_CHILD = """
+import json
+import os
+import sys
+
+from saneless import main
+
+config = os.environ.pop("SANELESS_TEST_CONFIG")
+args = json.loads(os.environ.pop("SANELESS_TEST_ARGS"))
+os.environ.pop("SANELESS_TEST_PYTHON")
+os.environ.pop("SANELESS_TEST_SOURCE")
+sys.argv = ["saneless", "--config", config, "jobs", *args]
+sys.exit(main())
+"""
+
+
+class TestJobsIntoAClosedPipe:
+    """``saneless jobs | head``: the reader goes away and saneless exits quietly."""
+
+    @pytest.mark.parametrize(
+        ("args", "taken"),
+        [([], "lines"), (["--json"], "bytes")],
+        ids=["table", "json"],
+    )
+    def test_jobs_into_a_closed_pipe_exits_141(
+        self, tmp_path: Path, args: list[str], taken: str
+    ) -> None:
+        """
+        A reader that stops early ends ``jobs`` with 141 and nothing on stderr.
+
+        The reader taking a few lines and closing its end is not a failure of
+        saneless's and not a bug: it is the shell's broken pipe, 128 plus
+        SIGPIPE.  Nothing is printed about it, and the log keeps no traceback,
+        because there is nothing for anyone to fix.  A real process and a real
+        pipe, because the interpreter's own last flush of stdout is part of
+        what has to stay quiet.
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        log_file = tmp_path / "logs" / "saneless.log"
+        store = JobStore(db_path=data_dir / "saneless.db")
+        try:
+            for index in range(_CLOSED_PIPE_JOBS):
+                store.create_job(profile="default", title=f"Closed pipe {index}")
+        finally:
+            store.close()
+        config = tmp_path / "saneless.toml"
+        config.write_text(
+            _CLOSED_PIPE_CONFIG.format(
+                tmp_dir=tmp_path / "scratch", data_dir=data_dir, log_file=log_file
+            )
+        )
+        env = {
+            **os.environ,
+            "SANELESS_TEST_PYTHON": sys.executable,
+            "SANELESS_TEST_SOURCE": _CLOSED_PIPE_CHILD,
+            "SANELESS_TEST_CONFIG": str(config),
+            "SANELESS_TEST_ARGS": json.dumps(
+                [*args, "--limit", str(_CLOSED_PIPE_JOBS + 2000)]
+            ),
+        }
+        with subprocess.Popen(
+            [
+                "/bin/sh",
+                "-c",
+                'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE"',
+            ],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=Path(__file__).resolve().parents[1],
+        ) as child:
+            assert child.stdout is not None
+            if taken == "lines":
+                read = [child.stdout.readline() for _ in range(3)]
+                assert all(read), read
+            else:
+                assert len(child.stdout.read(40)) == 40
+            child.stdout.close()
+            _, stderr = child.communicate(timeout=_CLOSED_PIPE_CHILD_SECONDS)
+
+        assert child.returncode == _CLOSED_PIPE_EXIT, stderr
+        assert stderr == b"", stderr
+        log = log_file.read_text() if log_file.exists() else ""
+        assert "Traceback" not in log, log
+        assert "Unexpected error" not in log, log
