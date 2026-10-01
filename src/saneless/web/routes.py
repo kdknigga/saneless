@@ -58,6 +58,7 @@ from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
     SCAN_BLOCKED_URL_REASON,
+    TAG_FILTER_LABEL,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
     URL_UNSET_JOB_ERROR,
@@ -2309,6 +2310,10 @@ def index(request: Request) -> Response:
             # What a browser with JavaScript off reads under the Scan heading:
             # Scan cannot work there, and the server refuses its post.
             "no_script_line": NO_SCRIPT_LINE,
+            # The tag filter's visually hidden label, and its maxlength: the
+            # same bound the filter routes refuse a longer filter with.
+            "tag_filter_label": TAG_FILTER_LABEL,
+            "tag_filter_max_length": TAG_FILTER_MAX_LENGTH,
             # The reason line's copy, which only the full page renders: it is
             # never an out-of-band swap target, so no status response needs it
             # and it never has to exist as an empty placeholder.

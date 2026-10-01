@@ -134,11 +134,25 @@
            An input with a form attribute is owned by the form it names, so the
            filter text is never submitted with a scan and pressing Enter in it
            filters the list instead of starting one.  The
-           debounce is htmx's own: a keyup that changed the value, delayed, so
+           debounce is htmx's own: an input that changed the value, delayed, so
            a household member typing three letters makes one request and not
-           three.  The include is mandatory on a GET -- htmx does not gather the
-           enclosing form for one -- and it is what carries the current ticks to
-           the server so the swap can re-render them ticked.
+           three.  input rather than keyup, because a paste, a dictation or an
+           autocorrection changes the value with no key at all; search as well,
+           because that is what the box's own clear button and Escape fire.  The
+           maxlength is the route's own bound on the filter, so the box never
+           sends a filter the route would refuse.  The include is mandatory on a
+           GET -- htmx does not gather the enclosing form for one -- and it is
+           what carries the current ticks to the server so the swap can
+           re-render them ticked.
+
+           The refresh button sits beside the legend and never inside it, and
+           the filter has a label of its own.  Everything inside a legend is
+           part of the name the group is announced by, so a button there made
+           the tags "Tags Refresh tags".  The label is visually hidden and says
+           what the placeholder says, so the spoken name and the visible hint
+           agree.  The stylesheet keeps the button on the legend's line.  The
+           button has an id so focus can be put back on it after a swap: its
+           own swap targets the list and never the button, so focus stays.
 
            The whole block is behind a config key: one appliance, one
            form shape, not a per-browser toggle a household member could switch
@@ -153,23 +167,23 @@
            falls back to the profile's title through resolve_job_title. #}
         {% if show_tags %}
         <fieldset aria-describedby="tags-help">
-            <legend>
-                Tags
-                <button type="button"
-                        hx-post="/api/cache/invalidate?resource=tags"
-                        hx-target="#tags-list"
-                        hx-swap="outerHTML"
-                        hx-include="#tag-filter, #tags-list"
-                        class="refresh-btn"
-                        title="Refresh tags"
-                        aria-label="Refresh tags">&#x21bb;<span class="sr-only">Refresh tags</span></button>
-            </legend>
+            <legend>Tags</legend>
+            <button type="button" id="tags-refresh"
+                    hx-post="/api/cache/invalidate?resource=tags"
+                    hx-target="#tags-list"
+                    hx-swap="outerHTML"
+                    hx-include="#tag-filter, #tags-list"
+                    class="refresh-btn"
+                    title="Refresh tags"
+                    aria-label="Refresh tags">&#x21bb;<span class="sr-only">Refresh tags</span></button>
 
+            <label for="tag-filter" class="sr-only">{{ tag_filter_label }}</label>
             <input type="search" id="tag-filter" name="q" form="tag-filter-form"
                    placeholder="Filter tags"
+                   maxlength="{{ tag_filter_max_length }}"
                    aria-describedby="tag-filter-help"
                    hx-get="/api/tags" hx-target="#tags-list" hx-swap="outerHTML"
-                   hx-trigger="keyup changed delay:300ms"
+                   hx-trigger="input changed delay:300ms, search"
                    hx-include="#tags-list">
             <small id="tag-filter-help">Type to narrow the list. Ticked tags stay ticked.</small>
 
@@ -185,11 +199,17 @@
            default still applies.  The refresh carries the current choice with
            it, as the tag refresh carries the ticks, so refreshing the list
            never changes what is chosen.  The select is rendered by its
-           partial because it is the profile-change swap's own target. #}
+           partial because it is the profile-change swap's own target.
+
+           The refresh button sits beside the label, inside a heading row, and
+           never inside the label: everything in a label is part of the name its
+           control is announced by, so a button there made the select
+           "Correspondent Refresh correspondents".  The row keeps the button on
+           the label's line, and the id lets focus be put back on it. #}
         {% if show_correspondent %}
-        <label for="correspondent-select">
-            Correspondent
-            <button type="button"
+        <div class="field-heading">
+            <label for="correspondent-select">Correspondent</label>
+            <button type="button" id="correspondents-refresh"
                     hx-post="/api/cache/invalidate?resource=correspondents"
                     hx-target="#correspondent-select"
                     hx-swap="innerHTML"
@@ -197,7 +217,7 @@
                     class="refresh-btn"
                     title="Refresh correspondents"
                     aria-label="Refresh correspondents">&#x21bb;<span class="sr-only">Refresh correspondents</span></button>
-        </label>
+        </div>
         {% with help_elsewhere = true %}{% include "partials/correspondent_select.html" %}{% endwith %}
         {% include "partials/correspondent_help.html" %}
         {# After the help line, never between it and the select: the select
@@ -260,7 +280,7 @@
        never submitted with a scan and pressing Enter in it filters the list
        instead of starting one.  This form is empty and has no submit button;
        htmx handles its submit event and sends the same request the debounced
-       keyup sends.
+       input sends.
 
        This is also the decisive advantage over the alternative, which was to
        drop the filter field on the way out of the scan form with a parameter

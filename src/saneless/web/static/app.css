@@ -288,6 +288,24 @@
     color: var(--pico-primary-hover);
 }
 
+/* The refresh buttons sit beside their headings but outside them, so the
+   heading names only its control.  A floated legend is laid out as ordinary
+   content (not on the fieldset border), which lets the button share its line;
+   the filter clears it.  Baseline alignment and the label's own Pico margin
+   keep the correspondent row exactly as tall as it was. */
+fieldset > legend:has(+ .refresh-btn) {
+    float: left;
+}
+
+#tag-filter {
+    clear: both;
+}
+
+.field-heading {
+    display: flex;
+    align-items: baseline;
+}
+
 /* Job history */
 article > .history-table-wrap {
     overflow-x: auto;
