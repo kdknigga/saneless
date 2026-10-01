@@ -2481,19 +2481,25 @@ def paperless_test(request: Request) -> JSONResponse:
     token-bearing request to paperless-ngx per window rather than one per
     call.  Concurrent callers do not each probe either, and while a probe is
     in flight a caller with a previous answer gets that answer at once rather
-    than holding a worker thread behind it -- against an unreachable
-    paperless-ngx the probe takes the client's full timeout.  Only the very
-    first callers, before any answer exists, wait for the probe, two at most
-    at a time; a wait that outlasts its bound, and a caller refused a place
-    to wait, answers 503 naming ``TimeoutError``, with a ``Retry-After``
-    header saying when to ask again.  That answer is not shared: the caller
-    never got a turn, so there is no result to reuse.
+    than holding a worker thread behind it.
+
+    The probe runs on the status strip's budget, ``_REQUEST_FETCH_TIMEOUT``
+    (2 s to connect, 5 s to read), not the client's own 30 s default, so
+    against an unreachable paperless-ngx it ends within seconds.  Only the
+    very first callers, before any answer exists, wait for the probe, two at
+    most at a time, and for at most ``PAPERLESS_TEST_WAIT_SECONDS``: longer
+    than the probe budget, so a follower shares the answer, and shorter than
+    the time an idle server is given to stop, so no request waiting here
+    holds a shutdown open.  A wait that outlasts its bound, and a caller
+    refused a place to wait, answers 503 naming ``TimeoutError``, with a
+    ``Retry-After`` header saying when to ask again.  That answer is not
+    shared: the caller never got a turn, so there is no result to reuse.
     """
     state = request.app.state
 
     def probe() -> _PaperlessTestAnswer:
         try:
-            status = state.paperless.test_connection()
+            status = state.paperless.test_connection(timeout=_REQUEST_FETCH_TIMEOUT)
         except Exception as exc:
             return _paperless_test_error(exc)
         return _PaperlessTestAnswer(status_code=200, body={"status": str(status)})

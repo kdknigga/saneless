@@ -44,15 +44,15 @@ __all__ = [
 MIN_MANUAL_REFRESH_SECONDS: Final = 2.0
 
 # How long the first connection test's followers wait for the in-flight one.
-# It only applies before any result exists -- once per process -- and it has
-# to outlast the probe it waits on: ``PaperlessClient.test_connection`` with no
-# argument runs on the client's own 30 s default timeout, which is what an
-# unreachable host costs, so a bound of 35 s lets a follower share that answer
-# rather than time out a few milliseconds before it lands.  A leader slower
-# than this (a connect and a trickling read both near their budgets) leaves
-# the follower a TimeoutError, which the route answers as 503 with
-# Retry-After.
-PAPERLESS_TEST_WAIT_SECONDS: Final = 35.0
+# It only applies before any result exists -- once per process -- and it is
+# bounded on both sides.  It has to outlast the probe it waits on, which the
+# route runs on the status probe's budget of 2 s to connect and 5 s to read,
+# so a follower shares that answer rather than time out just before it lands.
+# And it has to stay below the 10 s an idle server is given to stop, so no
+# request waiting here holds a shutdown open.  A leader slower than this (a
+# connect and a trickling read both near their budgets) leaves the follower a
+# TimeoutError, which the route answers as 503 with Retry-After.
+PAPERLESS_TEST_WAIT_SECONDS: Final = 8.0
 
 
 class MinimumInterval:
