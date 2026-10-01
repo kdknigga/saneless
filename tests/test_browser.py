@@ -4280,6 +4280,47 @@ class TestLazyListsInTheBrowser:
         assert job.tags == [32, 33]
         assert job.correspondent == 42
 
+    def test_a_scan_released_during_the_load_files_the_profile_defaults(
+        self, page: Page, defaults_server: _BrowserServer
+    ) -> None:
+        """
+        Scan pressed while the lists still load files the profile's defaults.
+
+        The page holds Scan until the lists land, but a status poll renders
+        the button from the job alone: a job ending during the load brings it
+        back enabled.  That is done here by hand, with the lazy request held,
+        so the press certainly comes first.  The tag list holds no ticks and
+        the select no choice, and the job still carries ``default``'s tag and
+        correspondent, as an untouched form does once the lists are in.
+        """
+        held = _hold_the_list_load(page)
+        page.goto(defaults_server.url)
+        load = _await_the_held_load(page, held)
+        scan = page.locator("#scan-btn")
+        expect(scan).to_be_disabled()
+        expect(page.locator("#tags-list")).to_have_text(TAGS_LOADING)
+
+        scan.evaluate("button => button.removeAttribute('disabled')")
+        page.fill("#title-input", "Released Early")
+        try:
+            with page.expect_response(
+                lambda r: r.url.endswith("/api/scan")
+            ) as submitted:
+                scan.click()
+            assert submitted.value.status == 200
+        finally:
+            load.continue_()
+
+        status = page.locator("#status-area")
+        expect(status.locator(".status-done").first).to_be_visible(timeout=15_000)
+        job_store: JobStore = defaults_server.app.state.job_store
+        job = next(
+            job for job in job_store.list_recent(100) if job.title == "Released Early"
+        )
+        assert job.profile == "default"
+        assert job.tags == [31]
+        assert job.correspondent == 41
+
 
 # ---------------------------------------------------------------------------
 # Which profile the page opens on, and what the Profile select offers.

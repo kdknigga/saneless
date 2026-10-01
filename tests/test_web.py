@@ -31,7 +31,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from saneless.auto_profiles import generate_profiles
+from saneless.auto_profiles import generate_profiles, source_to_slug
 from saneless.checks import (
     check_name,
     check_row_class,
@@ -4563,16 +4563,23 @@ class TestMetadataFollowsTheSubmittedProfile:
         assert select is not None, page
         assert 'autocomplete="off"' in select.group(0)
 
-    def test_the_page_marks_both_controls_with_the_opening_profile(
+    def test_the_page_marks_both_controls_as_not_answered_yet(
         self, tmp_path: Path
     ) -> None:
-        """Each marker names the profile the page ticked the defaults of."""
+        """
+        Each marker says its list has not answered, until the lists land.
+
+        The page shows no ticks and no choice while the lists load; the lazy
+        load's answer names the profile whose defaults it ticked.
+        """
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             page = client.get("/").text
 
-        for name in ("tags_profile", "correspondent_profile"):
+        assert _marker_values(page) == dict.fromkeys(
+            _MARKER_NAMES, routes_module.LISTS_LOADING_MARKER
+        )
+        for name in _MARKER_NAMES:
             marker = _marker(page, name)
-            assert 'value="default"' in marker, marker
             assert 'autocomplete="off"' in marker, marker
             assert "hx-swap-oob" not in marker, marker
 
@@ -4694,6 +4701,145 @@ class TestMetadataFollowsTheSubmittedProfile:
             job = _newest_job(client)
             assert job.tags == _OPENING_TAGS
             assert job.correspondent == _OPENING_CORRESPONDENT
+
+
+_MARKER_VALUE = re.compile(r'value="(?P<value>[^"]*)"')
+
+# The two profile markers, by form name.
+_MARKER_NAMES = ("tags_profile", "correspondent_profile")
+
+
+def _marker_values(markup: str) -> dict[str, str]:
+    """
+    Return each profile marker's value in ``markup``, as a browser would post it.
+
+    Args:
+        markup: The page or partial holding both markers.
+
+    Returns:
+        Each marker's form name and its unescaped value.
+
+    """
+    values: dict[str, str] = {}
+    for name in _MARKER_NAMES:
+        found = _MARKER_VALUE.search(_marker(markup, name))
+        assert found is not None, markup
+        values[name] = html.unescape(found.group("value"))
+    return values
+
+
+@pytest.mark.usefixtures("offline_paperless")
+class TestScanReleasedDuringTheListLoad:
+    """
+    A Scan pressed before the lists land files the profile's defaults.
+
+    The page holds Scan while the lists load, but a status poll re-renders
+    the Scan button from the job alone, so a job ending during the load can
+    release it early.  The tag list then holds no ticks and the select no
+    choice.  The page's markers say the lists have not answered yet, so the
+    submitted profile's defaults apply: exactly what the untouched form
+    files once the lists have landed.
+    """
+
+    def test_a_scan_released_during_the_list_load_files_the_profile_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        """The page's own markers, posted before the load, give the defaults."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            page = client.get("/").text
+            markers = _marker_values(page)
+
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Released early", **markers},
+                headers={"HX-Request": "true"},
+            )
+
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == _OPENING_TAGS
+            assert job.correspondent == _OPENING_CORRESPONDENT
+
+    def test_the_page_never_marks_the_lists_with_a_profile(
+        self, tmp_path: Path
+    ) -> None:
+        """While the lists load, neither marker names any configured profile."""
+        app = _pre_ticked_app(tmp_path)
+        with TestClient(app) as client:
+            markers = _marker_values(client.get("/").text)
+            names = set(app.state.worker.profile_names())
+
+        assert set(markers.values()) == {routes_module.LISTS_LOADING_MARKER}
+        assert names.isdisjoint(markers.values())
+
+    def test_the_loading_marker_can_be_no_bare_or_generated_profile_name(
+        self,
+    ) -> None:
+        """
+        The value is one a profile name written plainly could never be.
+
+        It is not empty, because an empty field reads as absent, which means a
+        script's values taken as given.  It holds a character outside what a
+        bare TOML key may use, and so outside what ``auto-profiles`` writes,
+        whose names are lower-case slugs: no generated profile, and no profile
+        named without quotes, can be called this.
+        """
+        value = routes_module.LISTS_LOADING_MARKER
+
+        assert value.strip()
+        assert re.search(r"[^A-Za-z0-9_-]", value), value
+        assert source_to_slug(value) != value
+
+    def test_an_unmarked_submit_still_files_its_own_values(
+        self, tmp_path: Path
+    ) -> None:
+        """A script that sends no marker and no metadata files none."""
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "From a script"},
+                headers={"HX-Request": "true"},
+            )
+
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == []
+            assert job.correspondent is None
+
+    @pytest.mark.parametrize("cleared", [False, True])
+    def test_after_the_list_load_the_markers_answer_for_the_profile(
+        self, tmp_path: Path, *, cleared: bool
+    ) -> None:
+        """
+        The first load names the profile, so the form is the operator's answer.
+
+        Untouched, it files the defaults it shows ticked; cleared, it files
+        none, which it could not if the markers still said the lists had not
+        answered.
+        """
+        with TestClient(_pre_ticked_app(tmp_path)) as client:
+            lists = load_the_lists(client, client.get("/").text)
+            markers = _marker_values(lists)
+            data: dict[str, str | list[str]] = {
+                "profile": "default",
+                "title": "After the load",
+                **markers,
+            }
+            if not cleared:
+                data |= {
+                    "tags": [str(tag) for tag in _OPENING_TAGS],
+                    "correspondent": str(_OPENING_CORRESPONDENT),
+                }
+
+            response = client.post(
+                "/api/scan", data=data, headers={"HX-Request": "true"}
+            )
+
+            assert markers == dict.fromkeys(_MARKER_NAMES, "default")
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == ([] if cleared else _OPENING_TAGS)
+            assert job.correspondent == (None if cleared else _OPENING_CORRESPONDENT)
 
 
 def _unreachable(*, timeout: float | None = None) -> NoReturn:
@@ -5500,8 +5646,9 @@ class TestLazyPageLoad:
         assert page.count('id="correspondent-help"') == 1
         assert page.count(_LOADER) == 1
         assert page.index(_LOADER) > _scan_form_end(page)
-        for name in ("tags_profile", "correspondent_profile"):
-            assert 'value="default"' in _marker(page, name)
+        assert _marker_values(page) == dict.fromkeys(
+            _MARKER_NAMES, routes_module.LISTS_LOADING_MARKER
+        )
 
     @pytest.mark.parametrize(
         ("show_tags", "show_correspondent"),
