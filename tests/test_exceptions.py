@@ -9,7 +9,8 @@ Also covers the all-blank failure's own type, the "interrupted, not cancelled"
 signal exception, and ``failure_text``, which renders an exception together
 with the notes ``add_note`` attached to it.  The delivery-uncertainty, API
 version, disk-space and no-scanner types, and ``is_out_of_space``, which finds
-a full disk anywhere in an exception's cause chain, are covered too.
+a full disk anywhere in an exception's cause chain, are covered too, as is
+the ``next_step`` a raise site can attach to any saneless error.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import signal
 import httpx2
 import pytest
 
+from saneless import exceptions as exceptions_module
 from saneless.exceptions import (
     AllPagesBlankError,
     ConfigError,
@@ -156,6 +158,69 @@ class TestDeliveryAndDiskTypes:
     def test_single_message_constructor(self, exc_type: type[Exception]) -> None:
         """Each type builds from one message, like every other saneless type."""
         assert str(exc_type("rebuilt")) == "rebuilt"
+
+
+def _saneless_error_types() -> list[type[SanelessError]]:
+    """Return every saneless error type the exceptions module exports."""
+    return sorted(
+        (
+            exported
+            for exported in vars(exceptions_module).values()
+            if isinstance(exported, type) and issubclass(exported, SanelessError)
+        ),
+        key=lambda exported: exported.__name__,
+    )
+
+
+class TestNextStep:
+    """
+    A saneless error can carry the fix its raise site knows.
+
+    The category's advice is a fallback that must be true for every error in
+    the category, so it is generic.  A raise site that knows the specific fix
+    attaches it as ``next_step``, and the CLI prints that instead.
+    """
+
+    def test_no_next_step_by_default(self) -> None:
+        """An error raised without one has none, so the fallback is used."""
+        assert ConfigError("x").next_step is None
+
+    def test_a_next_step_is_kept_and_stays_out_of_the_message(self) -> None:
+        """The fix is its own field; the one-line message is unchanged."""
+        exc = ConfigError("x", next_step="Do y.")
+        assert exc.next_step == "Do y."
+        assert str(exc) == "x"
+        assert exc.args == ("x",)
+        assert describe(exc) == "x"
+
+    def test_next_step_is_keyword_only(self) -> None:
+        """A second positional argument stays an argument, never the fix."""
+        exc = ScanError("a", "b")
+        assert exc.args == ("a", "b")
+        assert exc.next_step is None
+
+    @pytest.mark.parametrize("exc_type", _saneless_error_types())
+    def test_every_saneless_error_accepts_a_next_step(
+        self, exc_type: type[SanelessError]
+    ) -> None:
+        """Every type takes the keyword, so any raise site can attach a fix."""
+        exc = exc_type("message", next_step="Do this.")
+        assert exc.next_step == "Do this."
+        assert str(exc) == "message"
+        assert exc_type("message").next_step is None
+
+    def test_an_interrupt_is_not_a_saneless_error_and_is_unchanged(self) -> None:
+        """
+        ScanInterrupted keeps its own constructor.
+
+        It is a ``BaseException`` outside the saneless hierarchy: an
+        interruption is reported by the signal that caused it, not with a
+        category's advice, so it takes no next step.
+        """
+        exc = ScanInterrupted("m", signum=signal.SIGTERM)
+        assert not isinstance(exc, SanelessError)
+        assert exc.signum == signal.SIGTERM
+        assert str(exc) == "m"
 
 
 class TestIsOutOfSpace:

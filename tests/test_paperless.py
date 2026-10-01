@@ -23,6 +23,7 @@ from saneless.exceptions import (
     PaperlessError,
     PaperlessIncompatibleError,
     PaperlessTimeoutError,
+    PaperlessTrustStoreError,
     PaperlessUncertainSendError,
     PaperlessUnconfirmedError,
     describe,
@@ -45,7 +46,7 @@ from saneless.paperless import (
     _without_userinfo,
 )
 from saneless.text_safety import has_control_characters
-from saneless.vocabulary import ConnectionStatus
+from saneless.vocabulary import ConnectionStatus, ErrorCategory, classify_error
 from tests.fake_clock import FakeClock
 from tests.golden_support import (
     DOCUMENTS_PATH,
@@ -756,6 +757,44 @@ class TestTrustStoreConfigErrors:
             PaperlessClient("https://paperless.example.com", "tok-SECRET-5d1")
         assert "SSL_CERT_FILE" in str(exc_info.value)
         assert isinstance(exc_info.value.__cause__, IsADirectoryError)
+
+    @pytest.mark.parametrize(
+        "make_path",
+        [
+            pytest.param(lambda root: root / "absent-ca.crt", id="missing-file"),
+            pytest.param(lambda root: root, id="directory"),
+        ],
+    )
+    def test_an_unreadable_trust_store_is_its_own_error_with_its_own_fix(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        make_path: Callable[[Path], Path],
+    ) -> None:
+        """
+        The trust-store refusal is a PaperlessTrustStoreError with a next step.
+
+        It stays a PaperlessError, so ``classify_error`` keeps filing it under
+        UPLOAD and ``serve`` keeps exiting 3, but the fix it carries names
+        the two variables rather than the category's generic advice.
+        """
+        monkeypatch.setenv("SSL_CERT_FILE", str(make_path(tmp_path)))
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+        # No transport= argument, for the reason given in the first test.
+        with pytest.raises(PaperlessTrustStoreError) as exc_info:
+            PaperlessClient("https://paperless.example.com", "tok-SECRET-5d1")
+        exc = exc_info.value
+        assert isinstance(exc, PaperlessError)
+        assert classify_error(exc) is ErrorCategory.UPLOAD
+        assert str(exc).startswith(
+            "Could not build the TLS trust store for Paperless at "
+            "https://paperless.example.com: "
+        )
+        assert str(exc).endswith("; check SSL_CERT_FILE and SSL_CERT_DIR")
+        assert exc.next_step is not None
+        assert "SSL_CERT_FILE" in exc.next_step
+        assert "SSL_CERT_DIR" in exc.next_step
+        assert "tok-SECRET-5d1" not in exc.next_step
 
 
 _URL_SECRET = "pr0xy-S3CRET"
