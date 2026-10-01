@@ -118,7 +118,7 @@ if TYPE_CHECKING:
     from saneless.web.checks_cache import CachedChecks
     from saneless.worker import ScanWorker
 
-__all__ = ["router"]
+__all__ = ["router", "scan_is_blocked"]
 
 logger = logging.getLogger(__name__)
 
@@ -2656,6 +2656,25 @@ def _scan_block(settings: Settings) -> _ScanBlock | None:
     if not settings.paperless.url:
         return _URL_UNSET_BLOCK
     return None
+
+
+def scan_is_blocked(settings: Settings) -> bool:
+    """
+    Say whether this appliance refuses every scan, from ``_scan_block``'s rule.
+
+    The one answer outside this module needs: ``create_app`` records it on
+    the app's state once, because the settings cannot change while the
+    process runs, and the error rendering reads it there, so a refused Scan
+    press on a blocked appliance never hands back an enabled button.
+
+    Args:
+        settings: The settings the process started with.
+
+    Returns:
+        True when no scan can start.
+
+    """
+    return _scan_block(settings) is not None
 
 
 def _record_refused_submit(

@@ -324,9 +324,11 @@ def render_error(
     out-of-band, enabled and with ``autofocus``; the next status rendering
     re-renders its true state.  Focus is never moved into ``#status-message``:
     the slot is the page's alert region and speaks the error from where it
-    is.  The refusals in ``_BLOCKED_SCAN_REJECTIONS`` are the exception, as
-    the button on a blocked appliance is disabled by design.  No other
-    request's error carries the button.
+    is.  A blocked appliance is the exception, as its button is disabled by
+    design: neither the refusals in ``_BLOCKED_SCAN_REJECTIONS`` nor any
+    refusal decided before the block (an unknown profile, a title the
+    validator throws out) carries the button there, so a forced press never
+    gets it back enabled.  No other request's error carries the button.
 
     Args:
         request: The request being answered.
@@ -358,9 +360,10 @@ def render_error(
             headers["HX-Retarget"] = "#status-message"
             headers["HX-Reswap"] = "innerHTML"
         refocus_scan = (
-            request.method,
-            request.url.path,
-        ) == _SCAN_SUBMIT and rejection not in _BLOCKED_SCAN_REJECTIONS
+            (request.method, request.url.path) == _SCAN_SUBMIT
+            and rejection not in _BLOCKED_SCAN_REJECTIONS
+            and not request.app.state.scan_blocked
+        )
         return request.app.state.templates.TemplateResponse(
             request,
             "partials/error.html",

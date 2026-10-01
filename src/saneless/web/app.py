@@ -55,7 +55,7 @@ from .cross_origin import CrossOriginGuard
 from .errors import install_error_handlers
 from .host_guard import HostGuard
 from .refresher import CheckRefresher
-from .routes import router
+from .routes import router, scan_is_blocked
 from .security_headers import STATIC_PATH, SecurityHeaders
 from .throttle import (
     MIN_MANUAL_REFRESH_SECONDS,
@@ -582,6 +582,11 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     # ahead of time.  A restart mints a new key, which costs each open page
     # one full render on its next poll and nothing else.
     app.state.status_token_key = secrets.token_bytes(32)
+    # Whether paperless-ngx is configured well enough for any scan to start.
+    # The settings are fixed for the life of the process, so it is decided
+    # once; the error rendering reads it so a refusal on a blocked appliance
+    # never re-renders Scan enabled.
+    app.state.scan_blocked = scan_is_blocked(settings)
 
     app.mount(STATIC_PATH, StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)

@@ -31,5 +31,6 @@
    button is re-rendered out-of-band, enabled and with autofocus: the press
    came from an enabled button, and the next status rendering re-renders its
    true state.  Focus never moves into this slot; the slot speaks the error
-   from where it is.  render_error decides when this applies. #}
+   from where it is.  render_error decides when this applies, and never on a
+   blocked appliance, so scan_blocked = false below is the truth. #}
 {% if refocus_scan %}{% with oob = true, autofocus_scan = true, job = none, scan_blocked = false %}{% include "partials/scan_button.html" %}{% endwith %}{% endif %}

@@ -2386,6 +2386,32 @@ def test_blocked_refusal_does_not_offer_the_scan_button(
 
 
 @pytest.mark.parametrize(
+    "refusal", ["title_too_long", "unknown_profile"], ids=lambda name: name
+)
+def test_refusals_before_the_block_do_not_offer_the_scan_button(
+    web_settings: Settings, web_scanner: StubScannerBackend, refusal: str
+) -> None:
+    """
+    A refusal checked before the block still carries no Scan button there.
+
+    Some refusals are decided before the appliance's block is, so a forced
+    press on the disabled button meets them instead.  Their button would be
+    enabled and focused, overriding the server's own disabled state, so on a
+    blocked appliance none is sent, as for the block's own refusal.
+    """
+    data, rejection = _RECOVERABLE_REFUSALS[refusal]
+    with _appliance_with_credential(
+        web_settings, web_scanner, _SHIPPED_PLACEHOLDER
+    ) as blocked:
+        response = blocked.post("/api/scan", data=data, headers=HTMX_HEADERS)
+
+    assert response.status_code == rejection_status_code(rejection)
+    assert _error_paragraph(rejection) in response.text
+    assert "scan-btn" not in response.text
+    assert _AUTOFOCUS.search(response.text) is None
+
+
+@pytest.mark.parametrize(
     ("method", "path", "data"),
     [
         ("GET", "/api/scan", None),
