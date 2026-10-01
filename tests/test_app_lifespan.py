@@ -1280,6 +1280,49 @@ def test_a_failed_start_releases_the_store_and_client(
         original_store_close()
 
 
+def test_a_failed_start_with_a_stuck_worker_leaves_everything_open(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A thread that will not stop keeps the store, client and scanner open.
+
+    This is the shutdown rule applied to a failed start: the worker was
+    already running when the refresher failed to start, and a worker that did
+    not stop may still be using all three.  The app reports the lifespan as
+    the owner, so ``serve`` does not shut SANE down under it either.
+    """
+    app = _build_app(settings)
+    worker = app.state.worker
+    refresher = app.state.refresher
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    calls: list[str] = []
+    real_stop = worker.stop
+    real_store_close = store.close
+    real_paperless_close = paperless.close
+
+    def failing_start() -> None:
+        msg = "the refresher start failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(refresher, "start", failing_start)
+    monkeypatch.setattr(worker, "stop", lambda: False)
+    monkeypatch.setattr(paperless, "close", lambda: calls.append("paperless.close"))
+    monkeypatch.setattr(store, "close", lambda: calls.append("job_store.close"))
+    try:
+        with (
+            pytest.raises(RuntimeError, match="the refresher start failed"),
+            TestClient(app),
+        ):
+            pass
+        assert calls == []
+        assert app.state.lifespan_started is True
+    finally:
+        assert real_stop()
+        real_paperless_close()
+        real_store_close()
+
+
 def test_shutdown_leaves_the_scanner_open_when_the_worker_does_not_stop(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
