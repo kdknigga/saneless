@@ -21,11 +21,16 @@ import inspect
 import logging
 import re
 import threading
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from saneless.checks import CheckContext, CheckKey, CheckResult, CheckState
+from saneless.scanner import listing
+from saneless.scanner.base import DeviceSurvey
+from saneless.scanner.listing import ListingRequest, run_listing_child
 from saneless.vocabulary import ProfileStorage
 from saneless.web import refresher as refresher_module
 from saneless.web.checks_cache import CheckCache
@@ -46,6 +51,67 @@ _JOIN_TIMEOUT_SECONDS = 5.0
 # message is entitled to say it.  The word boundaries are the whole point, so a
 # plain substring test would not do.
 _NAMES_A_SCAN = re.compile(r"\bscan(s|ning)?\b", re.IGNORECASE)
+
+# A listing child that never answers: it records its PID and then waits for
+# a signal.  Standard library only, because the launcher runs it isolated.
+_SLEEPER_CHILD = """\
+import os
+import signal
+from pathlib import Path
+
+Path(os.environ["LISTING_TEST_PIDFILE"]).write_text(str(os.getpid()))
+signal.pause()
+"""
+
+
+class _RealListingBackend(StubScannerBackend):
+    """
+    A backend whose list-then-open runs a real listing child.
+
+    The child is whatever script the launcher is pointed at, and the abort
+    Event the check hands over goes to the launcher unchanged, as the real
+    backend's does.
+    """
+
+    def __init__(self) -> None:
+        """Record no abort Event yet."""
+        self.aborts: list[threading.Event | None] = []
+
+    def list_and_open(
+        self, open_if_unlisted: str, *, abort: threading.Event | None = None
+    ) -> DeviceSurvey:
+        """
+        Run one listing child, under the caller's abort.
+
+        Args:
+            open_if_unlisted: The id the check asked to have opened, unused.
+            abort: The caller's abort Event.
+
+        Returns:
+            An empty survey, should the child ever answer.
+
+        """
+        _ = open_if_unlisted
+        self.aborts.append(abort)
+        run_listing_child(ListingRequest(), configured_host="", abort=abort)
+        return DeviceSurvey(devices=())
+
+
+def _pid_written(pidfile: Path) -> bool:
+    """
+    Tell whether the sleeper child has written its whole PID yet.
+
+    Args:
+        pidfile: The file the child writes its PID into.
+
+    Returns:
+        Whether the file holds a PID.
+
+    """
+    try:
+        return pidfile.read_text(encoding="utf-8").strip().isdigit()
+    except FileNotFoundError:
+        return False
 
 
 class _FakeClock:
@@ -1141,3 +1207,94 @@ def test_reading_probe_in_flight_does_not_take_the_probe_lock(
     refresher._probe_lock.release()
     assert refresher._probe_lock.acquire(blocking=False) is True
     refresher._probe_lock.release()
+
+
+def test_the_probe_context_carries_the_stop_event(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refresher's own stop Event is the abort its probe runs under."""
+    spy = _spy(monkeypatch)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.note_watcher()
+    refresher._tick()
+    assert len(spy.calls) == 1
+    assert spy.calls[0].abort is refresher._stopping
+
+
+def test_an_aborted_probe_stores_nothing(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A run cut short by a stop leaves the previous entry in place.
+
+    What it returns is partial: the checks after the stop never ran.  Storing
+    it would replace rows that were correct with a strip missing some of
+    them, on an appliance that is stopping anyway.
+    """
+    clock = _FakeClock()
+    refresher, cache = _build(default_settings, clock, threading.Lock())
+    before = _results("Before the stop.")
+    cache.store(before)
+    clock.advance(60.0)
+
+    def stopping_run_checks(
+        context: CheckContext, *, scanner_gate: threading.Lock | None = None
+    ) -> tuple[CheckResult, ...]:
+        _ = context, scanner_gate
+        refresher.request_stop()
+        return _results("Partial.")
+
+    monkeypatch.setattr("saneless.web.refresher.run_checks", stopping_run_checks)
+
+    assert refresher.probe_now() is True
+    assert cache.current().results == before
+
+
+def test_stop_aborts_an_in_flight_listing(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    poll_until: Callable[..., bool],
+    started_refreshers: list[CheckRefresher],
+) -> None:
+    """
+    A stop during a listing returns within about a second, child and all.
+
+    The real registry runs on the refresher thread and its scanner check is
+    inside a real listing child that never answers.  The stop sets the
+    refresher's Event; the launcher, on the refresher thread, sees it within
+    one slice of its wait and kills and reaps the child, and the run that
+    was cut short stores nothing.  The deadline is patched only to bound
+    what a broken stop would leak.
+    """
+    monkeypatch.setattr(refresher_module, "TICK_SECONDS", 0.01)
+    monkeypatch.setattr(listing, "LISTING_DEADLINE_SECONDS", 10.0)
+    child = tmp_path / "listing_child_sleeper.py"
+    child.write_text(_SLEEPER_CHILD, encoding="utf-8")
+    monkeypatch.setattr(listing, "_CHILD_FILE", child)
+    pidfile = tmp_path / "child.pid"
+    monkeypatch.setenv("LISTING_TEST_PIDFILE", str(pidfile))
+    clock = _FakeClock()
+    backend = _RealListingBackend()
+    refresher, cache = _build(
+        default_settings, clock, threading.Lock(), scanner=backend
+    )
+    before = _results("Before the stop.")
+    cache.store(before)
+    clock.advance(60.0)
+    refresher.note_watcher()
+    started_refreshers.append(refresher)
+
+    refresher.start()
+    assert poll_until(lambda: _pid_written(pidfile), _JOIN_TIMEOUT_SECONDS)
+    pid = int(pidfile.read_text(encoding="utf-8"))
+
+    began = time.monotonic()
+    stopped = refresher.stop(timeout=5.0)
+    elapsed = time.monotonic() - began
+
+    assert stopped is True
+    assert elapsed < 1.5
+    assert not Path(f"/proc/{pid}").exists()
+    assert backend.aborts == [refresher._stopping]
+    assert cache.current().results == before
