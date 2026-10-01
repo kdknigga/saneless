@@ -39,6 +39,7 @@ __all__ = [
     "ACTIVE_STATES",
     "BACKS_SUFFIX",
     "BUSY_STATES",
+    "CONFIG_WRITE_NEXT_STEP",
     "CORRESPONDENTS_LOADING",
     "CORRESPONDENTS_UNAVAILABLE",
     "FALLBACK_NOT_UPLOADED_LINE",
@@ -54,6 +55,7 @@ __all__ = [
     "MULTI_PAGE_DISABLED_REASON",
     "MULTI_PAGE_HELP",
     "MULTI_PAGE_LABEL",
+    "MULTI_PAGE_MANUAL_DUPLEX_NEXT_STEP",
     "MULTI_PAGE_NEEDS_TERMINAL",
     "MULTI_PAGE_OPTION_HELP",
     "NOTHING_TO_FINISH",
@@ -72,6 +74,13 @@ __all__ = [
     "RETRY_SENTENCE_PLACEHOLDER",
     "SCAN_BLOCKED_REASON",
     "SCAN_BLOCKED_URL_REASON",
+    "SCAN_FROM_A_TERMINAL_NEXT_STEP",
+    "SERVE_ADDRESS_NEXT_STEP",
+    "SERVE_BIND_NEXT_STEP",
+    "SERVE_NEVER_STARTED_NEXT_STEP",
+    "SERVE_PORT_IN_USE_NEXT_STEP",
+    "SERVE_PORT_NOT_ALLOWED_NEXT_STEP",
+    "SERVE_SANE_START_NEXT_STEP",
     "TAGS_LOADING",
     "TAGS_UNAVAILABLE",
     "TAG_FILTER_LABEL",
@@ -81,6 +90,7 @@ __all__ = [
     "TOKEN_UNSET_JOB_ERROR",
     "UNCONFIRMED_FILING_LABEL",
     "UNCONFIRMED_SEND_LABEL",
+    "UNKNOWN_PROFILE_NEXT_STEP",
     "URL_UNSET_JOB_ERROR",
     "WAITING_STATES",
     "WARNED_UPLOAD_LABEL",
@@ -141,6 +151,7 @@ __all__ = [
     "last_scan_detail",
     "last_scan_line",
     "local_time",
+    "manual_duplex_needs_terminal_refusal",
     "multi_page_manual_duplex_refusal",
     "non_owner_wait_line",
     "outcome_line",
@@ -2952,6 +2963,102 @@ MULTI_PAGE_NEEDS_TERMINAL: Final = (
     "web UI."
 )
 """The refusal when ``--multi-page`` is given without a terminal to ask on."""
+
+
+def manual_duplex_needs_terminal_refusal(profile: str) -> str:
+    """
+    Return the refusal for a manual-duplex scan with no terminal to prompt on.
+
+    This is the one source of that refusal's wording.
+
+    Args:
+        profile: The profile name the operator gave.
+
+    Returns:
+        The refusal, naming the profile and why it needs a terminal.
+
+    """
+    return (
+        f"Profile '{profile}' is manual duplex, which needs an interactive "
+        "terminal: saneless must prompt you to flip the stack between the "
+        "two passes. Run it from a terminal, or scan from the web UI."
+    )
+
+
+# The next steps the CLI's own refusals and start-up failures print on their
+# ``Try:`` line.  Each is advice for one raise site, so unlike a category's
+# fallback it may name the fix; none says "restart saneless" unless the
+# command is the service, because a one-shot command has nothing to restart.
+
+SCAN_FROM_A_TERMINAL_NEXT_STEP: Final = (
+    "Run the scan again from an interactive terminal, or scan from the web UI."
+)
+"""The next step for a scan refused because nobody could answer its prompts."""
+
+MULTI_PAGE_MANUAL_DUPLEX_NEXT_STEP: Final = (
+    "Run the scan again without --multi-page, or with a profile that is not "
+    "manual duplex."
+)
+"""The next step for ``--multi-page`` refused with a manual-duplex profile."""
+
+UNKNOWN_PROFILE_NEXT_STEP: Final = (
+    "Pass --profile the name of a profile in the saneless config file, or add "
+    "a profile with that name to it, then run the scan again."
+)
+"""
+The next step for ``scan --profile`` naming no configured profile.
+
+It does not suggest leaving ``--profile`` out: the default profile can be the
+one that is missing.
+"""
+
+CONFIG_WRITE_NEXT_STEP: Final = (
+    "Make that file and its folder writable by this user, or pass --config "
+    "naming an existing config file this user can write, then run saneless "
+    "auto-profiles again."
+)
+"""The next step for ``auto-profiles`` when the config file cannot be written."""
+
+SERVE_PORT_IN_USE_NEXT_STEP: Final = (
+    "Stop the program that is using that port, or set output.web_port (or "
+    "pass --port) to a free port, then start saneless serve again."
+)
+"""The next step for ``serve`` when another process holds the port."""
+
+SERVE_PORT_NOT_ALLOWED_NEXT_STEP: Final = (
+    "This user is not allowed to listen on that port: set output.web_port (or "
+    "pass --port) to a port above 1023, or give saneless that permission, "
+    "then start saneless serve again."
+)
+"""The next step for ``serve`` when binding the port is not permitted."""
+
+SERVE_ADDRESS_NEXT_STEP: Final = (
+    "Set output.web_host (or pass --host) to an address or name of this "
+    "machine, then start saneless serve again."
+)
+"""The next step for ``serve`` when the host does not resolve or is not local."""
+
+SERVE_BIND_NEXT_STEP: Final = (
+    "Check output.web_host and output.web_port (or --host and --port), then "
+    "start saneless serve again."
+)
+"""The next step for any other failure to bind, which names neither setting."""
+
+SERVE_SANE_START_NEXT_STEP: Final = (
+    "Check the SANE setup on this machine and scanner.host (saneless doctor "
+    "shows what is wrong), then start saneless serve again."
+)
+"""The next step for ``serve`` when the scanner library will not start."""
+
+SERVE_NEVER_STARTED_NEXT_STEP: Final = (
+    "Fix the problem the log lines above name, then start saneless serve again."
+)
+"""
+The next step for a web server that never started.
+
+uvicorn has already logged why, and ``serve``'s log is on the same stream,
+directly above the failure line.
+"""
 
 _FINISH_LABEL: Final = "Finish document"
 _ABORT_LABEL: Final = "Abort scan"

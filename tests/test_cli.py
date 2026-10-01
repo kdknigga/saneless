@@ -6589,11 +6589,11 @@ class TestEntryPointsCloseTheBackend:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A ``ctx.exit()`` taken mid-command is not a way to skip the close.
+        The refusal to write the config file is not a way to skip the close.
 
-        An unwritable config file ends ``auto-profiles`` through
-        ``ctx.exit(ExitCode.CONFIG)`` rather than by returning or raising, and
-        that is the path most likely to be forgotten.
+        An unwritable config file ends ``auto-profiles`` with a configuration
+        error raised after the scanner was opened, exit 2, and an early exit
+        is the path most likely to be forgotten.
         """
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
@@ -7359,7 +7359,7 @@ class TestRaiseSiteAdvice:
     [
         (errno.EADDRINUSE, "Stop the program that is using that port"),
         (errno.EACCES, "not allowed to listen on that port"),
-        (errno.EADDRNOTAVAIL, "set output.web_host (or pass --host)"),
+        (errno.EADDRNOTAVAIL, "Set output.web_host (or pass --host)"),
         (errno.EAFNOSUPPORT, "Check output.web_host and output.web_port"),
     ],
 )

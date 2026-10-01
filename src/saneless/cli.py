@@ -54,6 +54,7 @@ from .checks import (
 )
 from .config import (
     CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
     Settings,
     absolute_or_as_spelled,
     config_file_state,
@@ -97,13 +98,23 @@ from .scan_metadata import resolve_scan_metadata
 from .scanner.sane_backend import SaneBackend, require_sane
 from .text_safety import neutralise_controls
 from .vocabulary import (
+    CONFIG_WRITE_NEXT_STEP,
     FALLBACK_NOT_UPLOADED_LINE,
+    MULTI_PAGE_MANUAL_DUPLEX_NEXT_STEP,
     MULTI_PAGE_NEEDS_TERMINAL,
     MULTI_PAGE_OPTION_HELP,
     NOTHING_TO_FINISH,
+    SCAN_FROM_A_TERMINAL_NEXT_STEP,
+    SERVE_ADDRESS_NEXT_STEP,
+    SERVE_BIND_NEXT_STEP,
+    SERVE_NEVER_STARTED_NEXT_STEP,
+    SERVE_PORT_IN_USE_NEXT_STEP,
+    SERVE_PORT_NOT_ALLOWED_NEXT_STEP,
+    SERVE_SANE_START_NEXT_STEP,
     TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
+    UNKNOWN_PROFILE_NEXT_STEP,
     WARNED_UPLOAD_LABEL,
     CheckSurface,
     ConfigFileState,
@@ -127,6 +138,7 @@ from .vocabulary import (
     job_label,
     job_state_for,
     local_time,
+    manual_duplex_needs_terminal_refusal,
     multi_page_manual_duplex_refusal,
     outcome_line,
     progress_label,
@@ -1622,9 +1634,12 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
     # this one goes ahead.
     _recover_orphaned_workspaces(settings)
 
+    # Every refusal below is raised rather than printed, so the group guard
+    # logs it and ends it with a Try: line like any other failure; the first
+    # line is the message, printed as-is, and the exit code is 2.
     if profile not in settings.profiles:
-        click.echo(f"Unknown profile: {profile}", err=True)
-        ctx.exit(ExitCode.CONFIG)
+        msg = f"Unknown profile: {profile}"
+        raise ConfigError(msg, next_step=UNKNOWN_PROFILE_NEXT_STEP)
 
     now = datetime.now(tz=UTC)
     resolved_title = _scan_title(title, settings.profiles[profile], now=now)
@@ -1662,21 +1677,21 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
     # operator is told the reason that would.  Off a terminal nobody can say
     # whether there is another page, so cron or a pipe never drives the loop.
     if multi_page and manual_duplex:
-        click.echo(multi_page_manual_duplex_refusal(profile), err=True)
-        ctx.exit(ExitCode.CONFIG)
+        raise ConfigError(
+            multi_page_manual_duplex_refusal(profile),
+            next_step=MULTI_PAGE_MANUAL_DUPLEX_NEXT_STEP,
+        )
     if multi_page and not _stdin_is_interactive():
-        click.echo(MULTI_PAGE_NEEDS_TERMINAL, err=True)
-        ctx.exit(ExitCode.CONFIG)
+        raise ConfigError(
+            MULTI_PAGE_NEEDS_TERMINAL, next_step=SCAN_FROM_A_TERMINAL_NEXT_STEP
+        )
     # Refused here, before the backend exists, so no paper moves: from cron or a
     # pipe there is nobody to flip the stack, and pass A would be wasted.
     if manual_duplex and not _stdin_is_interactive():
-        click.echo(
-            f"Profile '{profile}' is manual duplex, which needs an interactive "
-            "terminal: saneless must prompt you to flip the stack between the "
-            "two passes. Run it from a terminal, or scan from the web UI.",
-            err=True,
+        raise ConfigError(
+            manual_duplex_needs_terminal_refusal(profile),
+            next_step=SCAN_FROM_A_TERMINAL_NEXT_STEP,
         )
-        ctx.exit(ExitCode.CONFIG)
 
     scanner = SaneBackend(host=settings.scanner.host)
     # click runs close callbacks when this command's Context leaves its `with`
@@ -2118,6 +2133,33 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
         store.close()
 
 
+def _bind_next_step(exc: OSError) -> str:
+    """
+    Choose the advice for an address ``serve`` could not bind, from its errno.
+
+    A port another program holds, a port this user may not take and an
+    address this machine does not have are three different fixes, and the
+    advice for one is wrong for the others.  Anything else names both
+    settings without guessing which of them is wrong.
+
+    Args:
+        exc: The error ``socket()``, ``bind()`` or ``listen()`` raised.
+
+    Returns:
+        The next step for the ``Try:`` line.
+
+    """
+    match exc.errno:
+        case errno.EADDRINUSE:
+            return SERVE_PORT_IN_USE_NEXT_STEP
+        case errno.EACCES:
+            return SERVE_PORT_NOT_ALLOWED_NEXT_STEP
+        case errno.EADDRNOTAVAIL:
+            return SERVE_ADDRESS_NEXT_STEP
+        case _:
+            return SERVE_BIND_NEXT_STEP
+
+
 def _bind_listening_sockets(host: str, port: int) -> list[socket.socket]:
     """
     Bind and listen on every address ``serve`` was given, before uvicorn starts.
@@ -2153,8 +2195,9 @@ def _bind_listening_sockets(host: str, port: int) -> list[socket.socket]:
             host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
         )
     except OSError as exc:
+        # The name did not resolve: the host is what to change.
         msg = f"Cannot bind to {host}:{port}: {describe(exc)}"
-        raise ConfigError(msg) from exc
+        raise ConfigError(msg, next_step=SERVE_ADDRESS_NEXT_STEP) from exc
     sockets: list[socket.socket] = []
     seen: set[tuple[int, str]] = set()
     try:
@@ -2217,7 +2260,7 @@ def _bind_one(
         sock = socket.socket(family, socktype, proto)
     except OSError as exc:
         msg = f"Cannot bind to {where}: {describe(exc)}"
-        raise ConfigError(msg) from exc
+        raise ConfigError(msg, next_step=_bind_next_step(exc)) from exc
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if family == socket.AF_INET6:
@@ -2227,7 +2270,7 @@ def _bind_one(
     except OSError as exc:
         sock.close()
         msg = f"Cannot bind to {where}: {describe(exc)}"
-        raise ConfigError(msg) from exc
+        raise ConfigError(msg, next_step=_bind_next_step(exc)) from exc
     return sock
 
 
@@ -2285,7 +2328,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
             scanner = SaneBackend(host=settings.scanner.host)
         except ScanError as exc:
             msg = f"The web server could not start: {exc}"
-            raise ConfigError(msg) from exc
+            raise ConfigError(msg, next_step=SERVE_SANE_START_NEXT_STEP) from exc
         # This backend outlives the command body once the server is up: the
         # lifespan closes it after the worker confirms it stopped, which is
         # the only point at which no thread can still be inside SANE, and it
@@ -2409,7 +2452,7 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
             f"The web server could not start on {', '.join(urls)}; "
             "the cause is in the preceding log lines"
         )
-        raise ConfigError(msg)
+        raise ConfigError(msg, next_step=SERVE_NEVER_STARTED_NEXT_STEP)
 
 
 def _echo_write_result(
@@ -2590,14 +2633,22 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         # error.
         row = configuration_check(settings, absolute_paths=True)
         msg = f"{row.message} {row.next_step}"
-        raise ConfigError(msg)
+        # The row's own next step ends "restart saneless", which is right for
+        # the service it was written for; this command is run again instead.
+        raise ConfigError(
+            msg,
+            next_step=(
+                f"Rename the {LEGACY_CONFIG_FILENAME} named above to "
+                f"{CONFIG_FILENAME}, then run saneless auto-profiles again."
+            ),
+        )
     # Not stale-only, so nothing is refused; an old file sitting beside the
     # loaded one still gets said once, here rather than at load.
     _warn_stale_config(settings)
 
     scanner = SaneBackend(host=settings.scanner.host)
-    # This command ends through ctx.exit() as well as by returning and by
-    # raising; a close callback covers all three.
+    # This command ends by returning or by raising, the refusal to write the
+    # config file included; a close callback covers both.
     ctx.call_on_close(scanner.close)
     device_list = scanner.get_devices()
     if not device_list:
@@ -2651,11 +2702,8 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         passed_over = (
             _passed_over_system_dir(settings) if settings.config_path is None else ""
         )
-        click.echo(
-            f"Cannot write {config_path}: {exc.strerror or exc}{passed_over}",
-            err=True,
-        )
-        ctx.exit(ExitCode.CONFIG)
+        msg = f"Cannot write {config_path}: {exc.strerror or exc}{passed_over}"
+        raise ConfigError(msg, next_step=CONFIG_WRITE_NEXT_STEP) from exc
     _echo_write_result(result, profiles)
     if created:
         _note_root_owned_config(

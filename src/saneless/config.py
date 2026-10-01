@@ -476,7 +476,13 @@ def _xdg_base(variable: str, *fallback: str) -> Path:
             "Cannot determine the home directory: set HOME, or set "
             "XDG_CONFIG_HOME and XDG_STATE_HOME to absolute paths"
         )
-        raise ConfigError(msg) from None
+        raise ConfigError(
+            msg,
+            next_step=(
+                "Set HOME, or set XDG_CONFIG_HOME and XDG_STATE_HOME to "
+                "absolute paths, then try again."
+            ),
+        ) from None
     return home.joinpath(*fallback)
 
 
@@ -2435,6 +2441,10 @@ def _pin_relative_paths(settings: Settings, base: Path | None) -> None:
         )
 
 
+_USUAL_SEARCH: Final = "to use the usual search"
+"""How the ``--config`` next steps end: what leaving the option out does."""
+
+
 def load_settings(config_path: str | None = None) -> Settings:
     """
     Load settings from TOML file with env var overrides.
@@ -2471,19 +2481,37 @@ def load_settings(config_path: str | None = None) -> Settings:
         # names nothing, not "no path": discovery here would load, and
         # auto-profiles would write, whatever file happens to be found.
         msg = "Config file path is empty (was --config given an unset variable?)"
-        raise ConfigError(msg)
+        raise ConfigError(
+            msg,
+            next_step=(
+                "Give --config the path of a saneless config file, or leave "
+                f"--config out {_USUAL_SEARCH}."
+            ),
+        )
     if config_path is not None:
         try:
             explicit = Path(config_path).expanduser()
         except RuntimeError:
             # ``~nosuchuser/...``, or ``~`` with no home directory.
             msg = f"Cannot expand '~' in --config path: {config_path}"
-            raise ConfigError(msg) from None
+            raise ConfigError(
+                msg,
+                next_step=(
+                    "Give --config a path without '~', or one whose '~' names "
+                    f"an existing user, or leave --config out {_USUAL_SEARCH}."
+                ),
+            ) from None
         # A directory counts as missing: Docker creates one where a
         # single-file bind mount's source does not exist.
         if not explicit.is_file():
             msg = f"Config file not found or not a regular file: {explicit}"
-            raise ConfigError(msg)
+            raise ConfigError(
+                msg,
+                next_step=(
+                    "Give --config the path of an existing saneless config "
+                    f"file, or leave --config out {_USUAL_SEARCH}."
+                ),
+            )
         # Recorded absolute, as the searched paths are: every surface that
         # names this file reads the recording, and a relative path means
         # nothing without the directory it was relative to.
