@@ -27,6 +27,7 @@ from click.testing import CliRunner
 from saneless.auto_profiles import generate_profiles, write_profiles_to_config
 from saneless.cli import cli
 from saneless.config import CONFIG_FILENAME, load_settings
+from saneless.exceptions import ScanError
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -58,6 +59,11 @@ HP_3030_CAPS = DeviceCapabilities(
     modes=["Lineart", "Gray", "Color"],
 )
 
+# The JSON sample's second device: SANE's test backend, busy when probed.
+# "Device busy" is SANE's own text for SANE_STATUS_DEVICE_BUSY.
+TEST_0 = DeviceInfo("test:0", "Noname", "frontend-tester", "virtual device")
+SANE_DEVICE_BUSY = "Device busy"
+
 # The aside's example: a sheet-fed scanner with no glass at all.
 FI_7160 = DeviceInfo(
     "net:192.168.1.50:fujitsu:fi-7160:12345",
@@ -79,6 +85,7 @@ NO_GLASS_ASIDE = '!!! note "If your scanner has no glass"'
 # The lines that introduce the reference page's samples.
 DEVICES_TABLE_MARKER = "**Example output (table):**"
 AUTO_PROFILES_MARKER = "**Example output (first run):**"
+JSON_CAPABILITIES_MARKER = "**Example output (`--json --capabilities`):**"
 
 # The service the shipped compose file defines, and the program in the image.
 COMPOSE_EXEC = "docker compose exec saneless saneless"
@@ -108,6 +115,36 @@ def _scanner_for(device: DeviceInfo, caps: DeviceCapabilities) -> type:
             return caps
 
     return _DocumentedScanner
+
+
+def _busy_second_device_scanner() -> type:
+    """Build a double listing the HP 3030 and a ``test:0`` too busy to open."""
+
+    class _BusyScanner(StubScannerBackend):
+        """The HP 3030, and a test device another program holds open."""
+
+        def __init__(self, host: str = "") -> None:
+            """Accept the host the CLI passes."""
+
+        def get_devices(self) -> list[DeviceInfo]:
+            """Report both devices."""
+            return [HP_3030, TEST_0]
+
+        def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+            """
+            Report the HP 3030's capabilities; fail to open ``test:0``.
+
+            Raises:
+                ScanError: For ``test:0``, worded as the SANE backend's
+                    open failure.
+
+            """
+            if device_id == TEST_0.name:
+                msg = f"Could not open scanner {device_id}: {SANE_DEVICE_BUSY}"
+                raise ScanError(msg)
+            return HP_3030_CAPS
+
+    return _BusyScanner
 
 
 def _write_config() -> Path:
@@ -141,16 +178,43 @@ def _render(
     """
     Run the real CLI against the documented device and return its output.
 
-    Only what a test cannot have is replaced: the python-sane check, the log
-    handler and SANE itself. The config is a real file loaded by the real
-    loader, so ``auto-profiles`` writes where it would for the reader.
-
     Args:
         device: The device the scanner double reports.
         caps: The capabilities the scanner double reports.
         args: The command line after ``saneless``.
         monkeypatch: Replaces the names in ``saneless.cli``.
         shown_path: The path the doc prints in place of the real config path.
+
+    Returns:
+        The command's stdout and stderr, in that order.
+
+    """
+    return _render_with(
+        _scanner_for(device, caps), args, monkeypatch, shown_path=shown_path
+    )
+
+
+def _render_with(
+    scanner: type,
+    args: Sequence[str],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    shown_path: str = "",
+    exit_code: int = 0,
+) -> tuple[str, str]:
+    """
+    Run the real CLI against a scanner double and return its output.
+
+    Only what a test cannot have is replaced: the python-sane check, the log
+    handler and SANE itself. The config is a real file loaded by the real
+    loader, so ``auto-profiles`` writes where it would for the reader.
+
+    Args:
+        scanner: The scanner double, standing in for ``SaneBackend``.
+        args: The command line after ``saneless``.
+        monkeypatch: Replaces the names in ``saneless.cli``.
+        shown_path: The path the doc prints in place of the real config path.
+        exit_code: The exit status the command must end with.
 
     Returns:
         The command's stdout and stderr, in that order.
@@ -169,11 +233,11 @@ def _render(
 
     monkeypatch.setattr("saneless.cli.require_sane", require_sane)
     monkeypatch.setattr("saneless.cli.configure_logging", configure_logging)
-    monkeypatch.setattr("saneless.cli.SaneBackend", _scanner_for(device, caps))
+    monkeypatch.setattr("saneless.cli.SaneBackend", scanner)
 
     result = CliRunner().invoke(cli, list(args), env={"COLUMNS": COLUMNS})
 
-    assert result.exit_code == 0, (result.stdout, result.stderr)
+    assert result.exit_code == exit_code, (result.stdout, result.stderr)
     stdout = result.stdout
     if shown_path:
         stdout = stdout.replace(str(config_path), shown_path)
@@ -359,6 +423,34 @@ def test_reference_devices_sample_is_the_cli_output(
     block = _fenced_after(text, DEVICES_TABLE_MARKER)
 
     _assert_devices_block(block, stdout, stderr)
+
+
+def test_reference_json_capabilities_sample_is_the_cli_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The ``--json --capabilities`` sample is what the CLI prints.
+
+    The HP 3030 reports its capabilities and ``test:0`` cannot be opened, so
+    the command writes the whole document and exits 1.
+    """
+    stdout, stderr = _render_with(
+        _busy_second_device_scanner(),
+        ["devices", "--json", "--capabilities"],
+        monkeypatch,
+        exit_code=1,
+    )
+    text = CLI_REFERENCE.read_text(encoding="utf-8")
+
+    block = _fenced_after(text, JSON_CAPABILITIES_MARKER, lang="json")
+
+    assert f"Capabilities for {TEST_0.name}: " in stderr, stderr
+    assert block.splitlines() == stdout.splitlines(), (
+        "the --json --capabilities sample is not what the CLI prints:\n"
+        + stdout
+        + "\n---- doc ----\n"
+        + block
+    )
 
 
 @pytest.mark.parametrize(

@@ -163,21 +163,6 @@ Without `--capabilities` the JSON has exactly these four keys per device, in thi
         "Lineart",
         "Gray",
         "Color"
-      ],
-      "raw_options": [
-        "mode",
-        "resolution",
-        "contrast",
-        "brightness",
-        "compression",
-        "jpeg-quality",
-        "batch-scan",
-        "source",
-        "length-measurement",
-        "tl-x",
-        "tl-y",
-        "br-x",
-        "br-y"
       ]
     }
   },
@@ -192,7 +177,7 @@ Without `--capabilities` the JSON has exactly these four keys per device, in thi
 ]
 ```
 
-The output is one JSON document. A `capabilities` object has a key only for what the device reported. A device that constrains resolution with a range gets `"resolution_range": {"min": 1.0, "max": 1200.0, "step": 1.0}` instead of `resolutions`, and the numbers are the ones the device gave. When a device's capabilities cannot be read, that device gets `"capabilities": null` and a one-line `"capabilities_error"`. Every other device is still reported, the same reason is printed on stderr as `Capabilities for <name>: <reason>`, and the command exits 1 after writing the whole document. The table mode does the same: it prints that stderr line for the failed device, lists the others, and exits 1.
+The output is one JSON document. A `capabilities` object has a key only for what the device reported. A device that reports its SANE options also gets `raw_options`, the option names in the order the device lists them, such as `"mode"`, `"resolution"` and `"source"`. A device that constrains resolution with a range gets `"resolution_range": {"min": 1.0, "max": 1200.0, "step": 1.0}` instead of `resolutions`, and the numbers are the ones the device gave. When a device's capabilities cannot be read, that device gets `"capabilities": null` and a one-line `"capabilities_error"`. Every other device is still reported, the same reason is printed on stderr as `Capabilities for <name>: <reason>`, and the command exits 1 after writing the whole document. The table mode does the same: it prints that stderr line for the failed device, lists the others, and exits 1.
 
 ---
 
