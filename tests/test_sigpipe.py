@@ -85,6 +85,11 @@ def probe():
         print("broken-pipe", flush=True)
     finally:
         a.close()
+    # After a read that ends in an error status, libsane's reader thread is
+    # cancelled, and now and then that leaves a loader lock held, so the
+    # process hangs in its exit handlers -- with or without SIGPIPE blocked.
+    # The verdict is already printed, so the probe leaves without them.
+    os._exit(0)
 
 
 saneless.cli.cli = probe
