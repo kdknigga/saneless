@@ -14,7 +14,7 @@ Navigate to `http://<host>:8080` in your browser, replacing `<host>` with the IP
 
 ## Check the System status panel first
 
-The panel at the top answers "can this thing scan right now?" before you feed any paper. It has one row per check -- six of them -- each with a tick, a warning triangle or a cross, a short sentence, and -- when something is wrong -- the next step to take:
+The panel at the top answers "can this thing scan right now?" before you feed any paper. It has one row per check -- six of them -- each marked with a tick (`✓`), an exclamation mark (`!`) for a warning or a cross (`✗`), with a short sentence, and -- when something is wrong -- the next step to take:
 
 - **Configuration** -- whether a configuration file was loaded, and whether one is being ignored.
 - **Scanner** -- whether a scanner is reachable, and which one.
@@ -25,13 +25,13 @@ The panel at the top answers "can this thing scan right now?" before you feed an
 
 Under the rows, a line says when the checks last ran, in your server's local time. The **Check again** button re-runs them all immediately: press it after plugging the scanner back in rather than reloading the page. While a scan is running the scanner check is paused -- saneless will not interrupt a scan to probe the device -- and the panel says so.
 
-A red **Configuration** row naming a `config.toml` means saneless found a file under the name it used to read: rename that file to `saneless.toml` and restart saneless, and the row goes green with your settings loaded.
+A red **Configuration** row naming a `config.toml` means saneless found a settings file under a name it does not read: it reads `saneless.toml` only. Rename that file to `saneless.toml` and restart saneless, and the row goes green with your settings loaded. [Where saneless reads settings](../reference/configuration.md#where-saneless-reads-settings) lists every place it looks.
 
 These are the same checks `saneless doctor` prints from a terminal. If the Paperless row is red because the API token or the paperless-ngx address has not been set, the **Scan** button is greyed out with the reason beneath it, and no scan can start until the config file is fixed.
 
 ## Fill in scan details
 
-Each control has one line of help text beneath it. The form has up to five fields -- an operator can hide Tags and Correspondent with `show_tags` and `show_correspondent` in the `[web]` section of the config file, for a simpler form; see [Configuration](../reference/configuration.md#web). Hiding them does not change what a scan does: the profile's default tags and correspondent still apply.
+Each control has a line of help text beneath it, and the Tags list has two: one for its filter box and one for the list. The form has up to five fields -- an operator can hide Tags and Correspondent with `show_tags` and `show_correspondent` in the `[web]` section of the config file, for a simpler form; see [Configuration](../reference/configuration.md#web). Hiding them does not change what a scan does: the profile's default tags and correspondent still apply.
 
 1. **Profile** -- A dropdown listing your configured scan profiles. Select the one that matches your scan type. Beneath it, a description line explains the selected profile in a sentence ("Scans both sides of every page using the document feeder.", for example) and updates as you change the selection. The profile named "default" is selected when the page loads, or, when `auto-profiles` made it an exact copy of another profile, that profile, which then stands in for it: the dropdown lists the two only once. Profiles control scanner source, resolution, color mode, and default metadata. See [Configure Scan Profiles](../how-to/configure-scan-profiles.md) to create additional profiles.
 
@@ -47,19 +47,28 @@ Each control has one line of help text beneath it. The form has up to five field
 
 The page opens before the tag and correspondent lists arrive from paperless-ngx: each says it is loading, and the **Scan** button stays greyed out with *"Scan waits for the tags and correspondents to load..."* beneath it. That usually takes a moment, but if paperless-ngx is slow to answer it can take ten seconds or more, and longer with a very large tag list. If paperless-ngx cannot be reached, each list says it could not be loaded and **Scan** is offered anyway, with the profile's default tags still ticked (by number) and its default correspondent still selected. The lists try again by themselves about 15 seconds after each attempt, and the refresh buttons try at once.
 
-Click the **Scan** button at the bottom of the form. The button disables and reads **Queued…** until the scanner starts on your job, then **Scanning…** while it runs. Do not close the browser tab during scanning.
+Click the **Scan** button at the bottom of the form. The button disables and reads **Queued…** until the scanner starts on your job, then **Scanning…** while it runs. The scan runs on the server, so closing the tab does not stop it: open the page again in the same browser and it picks your scan up where it is, including any flip prompt or multi-page question waiting for you.
 
 ## Monitor progress
 
-The status area below the form updates as the scan progresses through these stages:
+The status area below the form says what the scan is doing, one line at a time:
 
-- **Scanning** -- The scanner is acquiring pages.
-- **Waiting for flip** -- Manual duplex profiles only: the front sides are scanned and saneless is waiting for you to flip the stack (see below).
-- **Scanning backs** -- Manual duplex profiles only: the scanner is acquiring the back sides.
-- **Waiting for more pages**, **Waiting: blank pages found** or **Waiting: last scan failed** -- Multiple pages only: saneless is waiting for you to say whether there is another page, what to do about pages that look blank, or what to do after a scan that failed (see below).
-- **Assembling** -- Pages are being assembled into a PDF.
-- **Uploading** -- The PDF is being uploaded to paperless-ngx.
-- **Done** -- The document has been successfully uploaded.
+- **Starting scan...** -- The job has been accepted and the scanner is being opened. While another scan runs first, this line names the scan you are waiting for instead (see below).
+- **Scanning...** -- The scanner is acquiring pages.
+- **The flip prompt** -- Manual duplex profiles only: the front sides are scanned and saneless is waiting for you to flip the stack (see below).
+- **Scanning reverse sides...** -- Manual duplex profiles only: the scanner is acquiring the back sides, and the line starts with how many fronts were scanned.
+- **The multi-page question** -- **Multiple pages** only: saneless is waiting for you to say whether there is another page, what to do about pages that look blank, or what to do after a scan that failed (see below).
+- **Assembling PDF...** -- Pages are being assembled into a PDF.
+- **Uploading to paperless-ngx...** -- The PDF is being uploaded.
+
+The scan then ends on one of these headlines, followed by the document's title:
+
+- **✓ Done:** -- The document was uploaded to paperless-ngx.
+- **⚠ Uploaded with a warning:** -- The document was uploaded, but something did not go cleanly -- a sheet the scanner skipped, say -- and the warning is on the line beneath.
+- **→ Saved to folder:** -- paperless-ngx could not take the upload, so saneless saved the PDF in the consume folder for paperless-ngx to pick up; see [Consume Directory Fallback](../explanation/consume-directory-fallback.md).
+- **⊘ Cancelled:** -- The scan was aborted, and nothing was uploaded.
+
+A scan that failed ends instead on a red `✗` and a sentence saying what went wrong and what to do next (see below). A failure that may already have reached paperless-ngx is drawn in amber with a `⚠`, so look in paperless-ngx before scanning the stack again.
 
 When a scan finishes, a line beneath the result sums up what happened to the paper -- "12 pages scanned, 2 blank removed, 10 uploaded". A scan that ended in an error or was cancelled has no counts to show, and shows none.
 
