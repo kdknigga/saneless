@@ -1517,14 +1517,13 @@ def _probe_saned(
     a stop costs at most what is left of the connect budget.  Resolution
     itself still cannot be interrupted.
 
-    **Failure policy.**  This raises nothing but the abort.  Every
-    ``OSError`` becomes an
-    outcome, and an empty resolver answer needs no guard of its own: the walk
-    holds no subscript, so nothing to dial is a loop body that never runs and
-    the answer is ``UNRESOLVED``.  Subscripting the resolver's first answer
-    once raised ``IndexError``, which is not an ``OSError`` and so escaped
-    into ``run_checks``' generic red row.  Log lines carry the outcome and
-    ``type(exc).__name__`` only -- no host, no address, no port and no
+    **Failure policy.**  This raises nothing but the abort.  Every ``OSError``
+    becomes an outcome, and an empty resolver answer needs no guard of its own:
+    the walk holds no subscript, so nothing to dial is a loop body that never
+    runs and the answer is ``UNRESOLVED``.  Subscripting the resolver's first
+    answer once raised ``IndexError``, which is not an ``OSError`` and so
+    escaped into ``run_checks``' generic red row.  Log lines carry the outcome
+    and ``type(exc).__name__`` only -- no host, no address, no port and no
     exception text (ASVS V7).
 
     Args:

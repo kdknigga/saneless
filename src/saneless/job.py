@@ -1103,11 +1103,11 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
     ``-wal`` and the ``-shm`` index a read-only connection creates and cannot
     remove, owned by that same user, and the next writer reuses both.  Any
     other user, root included, reads without creating either, so it never
-    leaves a file the server cannot write in the server's folder.  Upgrading a database belongs
-    to the server that writes it, so one at an older schema is refused rather
-    than migrated.  A missing file, or one with no jobs table yet, is an
-    empty history; a file that cannot be looked up for any other reason is
-    an error, never an empty history.
+    leaves a file the server cannot write in the server's folder.  Upgrading
+    a database belongs to the server that writes it, so one at an older
+    schema is refused rather than migrated.  A missing file, or one with no
+    jobs table yet, is an empty history; a file that cannot be looked up for
+    any other reason is an error, never an empty history.
 
     Args:
         db_path: Path of the job database file.

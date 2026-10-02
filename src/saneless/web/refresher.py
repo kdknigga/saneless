@@ -264,10 +264,10 @@ class CheckRefresher:
         told to stop, before uvicorn waits for the requests still being
         answered, and the lifespan calls this afterwards.  The run then ends
         after the check in flight instead of going on to the next, and that
-        check has the request drain as well as the join to end in.  An idle server's drain
-        is short, though, so a stop early in a Paperless check, or in a slow
-        name lookup, can still find the thread running when the join ends, and
-        the lifespan then closes nothing.
+        check has the request drain as well as the join to end in.  An idle
+        server's drain is short, though, so a stop early in a Paperless check,
+        or in a slow name lookup, can still find the thread running when the
+        join ends, and the lifespan then closes nothing.
 
         A request waiting in :meth:`request_probe` is woken as well and told
         its probe is still pending, so no request thread waits out its whole
