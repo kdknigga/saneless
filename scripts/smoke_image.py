@@ -46,6 +46,17 @@ releases Scan, so only the token on the fake's record proves the mounted
 config was read. On Podman the container reaches the fake as
 ``host.containers.internal``; on Docker Engine, at the default bridge
 network's gateway.
+
+Under Podman the fake listens on every host interface for the length of each
+documented run, so any machine on the LAN can reach it then. The exposure is
+small: the token is random per run, the fake serves only empty lists, and a
+stray request cannot pass the token check. It is not narrowed because no one
+host address is right for every Podman network: rootless pasta maps
+``host.containers.internal`` to a link-local address it translates to the
+host, and other setups to an address Podman picks itself or reads from
+``host_containers_internal_ip`` in containers.conf. Run the smoke checks
+on a trusted network, or under Docker Engine, which binds only the bridge
+gateway.
 """
 
 from __future__ import annotations
@@ -1558,7 +1569,8 @@ def _host_endpoint(engine: Engine, gateway: str) -> tuple[str, str]:
     Choose where the fake paperless-ngx listens and how a container reaches it.
 
     Podman maps ``host.containers.internal`` to the host, but not to the
-    host's loopback, so the fake listens on every interface. Docker Engine
+    host's loopback, so the fake listens on every interface; the module
+    docstring says why that is not narrowed and what it exposes. Docker Engine
     gives no such name without an extra flag; there the host is the default
     bridge network's gateway, and the fake listens on that address only.
 
