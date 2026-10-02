@@ -11,27 +11,27 @@ see rather than quoting each message in full.
 
 In a shell, `echo $?` right after the command prints its exit code.
 
-| Exit code | What happened | Where to look |
-|---|---|---|
-| 0 | The command succeeded | -- |
-| 1 | No scanner was found, the scanner failed, or the scan produced no usable pages | [Scanner errors](#scanner-errors-exit-1) |
-| 2 | saneless could not start: configuration, profile or setup; or `paperless.url` is not set when a scan is started | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
-| 3 | paperless-ngx could not be reached, rejected the upload, or is older than 2.16 | [Paperless errors](#paperless-errors-exit-3) |
-| 4 | The scanned pages could not be written as a PDF | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
-| 5 | An error saneless did not anticipate: a bug | [Unexpected errors](#unexpected-errors-exit-5) |
-| 6 | The scan was saved to the consume folder, not uploaded: its title, tags and correspondent were not applied | [Saved to the consume folder](#saved-to-the-consume-folder-exit-6) |
-| 7 | The scan was uploaded, but with a warning | [Uploaded with a warning](#uploaded-with-a-warning-exit-7) |
-| 8 | Every page looked blank to empty-page detection, so nothing was uploaded | [Every page looked blank](#every-page-looked-blank-exit-8) |
-| 9 | The document may already be in paperless-ngx: check before scanning again | [The document may already be in paperless-ngx](#the-document-may-already-be-in-paperless-ngx-exit-9) |
-| 10 | The server ran out of disk space | [Out of disk space](#out-of-disk-space-exit-10) |
-| 129 | A SIGHUP interrupted the command, for example a dropped SSH session | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
-| 130 | You cancelled the scan | [Cancelled scans](#cancelled-scans-exit-130) |
-| 141 | The program reading the output closed it early: a broken pipe, not a failure | [The output was cut off](#the-output-was-cut-off-exit-141) |
-| 143 | A SIGTERM interrupted the command | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
+| Exit code | Where to look |
+|---|---|
+| 0 | Nothing to look for |
+| 1 | [Scanner errors](#scanner-errors-exit-1) |
+| 2 | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
+| 3 | [Paperless errors](#paperless-errors-exit-3) |
+| 4 | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
+| 5 | [Unexpected errors](#unexpected-errors-exit-5) |
+| 6 | [Saved to the consume folder](#saved-to-the-consume-folder-exit-6) |
+| 7 | [Uploaded with a warning](#uploaded-with-a-warning-exit-7) |
+| 8 | [Every page looked blank](#every-page-looked-blank-exit-8) |
+| 9 | [The document may already be in paperless-ngx](#the-document-may-already-be-in-paperless-ngx-exit-9) |
+| 10 | [Out of disk space](#out-of-disk-space-exit-10) |
+| 129 | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
+| 130 | [Cancelled scans](#cancelled-scans-exit-130) |
+| 141 | [The output was cut off](#the-output-was-cut-off-exit-141) |
+| 143 | [Interrupted by a signal](#interrupted-by-a-signal-exit-129-and-143) |
 
-[Use the CLI for Scripting](cli-scripting.md#exit-codes) shows how to branch on these codes in a
-script, and [CLI Commands](../reference/cli-commands.md#exit-codes) lists the codes each command
-can return.
+[CLI Commands](../reference/cli-commands.md#exit-codes) defines what each code means and lists the
+codes each command can return, and [Use the CLI for Scripting](cli-scripting.md#exit-codes) shows
+how to branch on them in a script.
 
 ## Scanner errors (exit 1)
 
@@ -199,8 +199,8 @@ Other causes of exit 2, each a line naming the problem and then a `Try:` line wi
   that saneless can read and write it and its directory, and that the file really is saneless's
   job database. If it is damaged, move it aside: saneless then starts with an empty job history,
   and the moved file is kept for inspection or restoring.
-  `saneless jobs` only reads the history, so it also refuses a database an earlier release left
-  at an older schema, and says so. Only `saneless serve` upgrades a job database: start it once
+  `saneless jobs` only reads the history, so it also refuses a job database at an older schema,
+  and says so. Only `saneless serve` upgrades a job database: start it once
   with the same config, even on an install that otherwise only uses the CLI, stop it, then run
   `saneless jobs` again.
 - **`paperless.url` or `paperless.token` refused.** Spaces and line breaks around either value
@@ -221,15 +221,6 @@ Other causes of exit 2, each a line naming the problem and then a `Try:` line wi
   http or https scheme`. It is not retried, and nothing is copied to the consume folder even when
   one is configured: the PDF is kept in `failed/` in the data directory and the line ends with its
   path. Set the URL, then upload the kept PDF yourself or scan again.
-
-**If an earlier version of saneless ever showed your API token in an error, rotate the token.**
-Earlier versions sent a token with a trailing space or line break -- easy to get from a secret
-file or a `.env` file with Windows line endings -- exactly as written, and the request then failed
-with an error that quoted the token. That error could be printed, logged and stored on the job,
-where the job history shows it. saneless now ignores those characters, and when a reply from
-paperless-ngx or a proxy, or an HTTP library error, quotes the token, it is replaced by `***` in the
-message, the log and any traceback. saneless does not rewrite job records or logs written before. Generate a new API token in paperless-ngx and
-put it in `paperless.token`, so the copy left behind no longer works.
 
 ## python-sane is not installed (exit 2)
 
@@ -284,12 +275,9 @@ The line starts with `Paperless error:`.
   certificate that cannot be verified means the connection never established, and saneless
   classifies that as unreachable -- it is reported as the **Unreachable.** case above, with the
   SSL detail dropped. If your web UI says Unreachable, this bullet may be why. The message on the
-  scan path is OpenSSL's own and has not changed; what
-  changed is which certificate authorities are trusted. saneless now verifies against the
-  operating system's trust store instead of a certificate bundle shipped inside a Python package.
-  So a private or corporate CA installed on the machine now works where it used to fail, and one
-  installed only by editing that Python bundle now gives you this error, which you may not have
-  been getting before. There are two fixes. Install the CA into the operating system's trust
+  scan path is OpenSSL's own. saneless verifies the certificate against the operating system's
+  trust store, not a certificate bundle inside a Python package, so a private or corporate CA
+  must be trusted by the operating system, or named with `SSL_CERT_FILE`. There are two fixes. Install the CA into the operating system's trust
   store, which is the better option wherever it is available -- in the container, copy the
   certificate to `/usr/local/share/ca-certificates/my-ca.crt` and run `update-ca-certificates`.
   Or point OpenSSL at the certificate file directly with `SSL_CERT_FILE`, described in
@@ -610,18 +598,14 @@ They are recovered the next time saneless starts: when `saneless serve` starts, 
   paperless-ngx's document list before scanning it again.
 - A web job that was waiting for someone -- at the flip prompt, or at a multi-page question -- is
   marked failed the same way at the next start of `saneless serve`, so the page stops waiting for
-  an answer that can no longer arrive. Start this release at least once before going back to an
-  older one: a release from before multi-page scanning cannot read a job left waiting at a
-  multi-page question.
+  an answer that can no longer arrive.
 
 Nothing recovered is uploaded. Check the kept file, then upload it yourself or scan the stack
 again, and delete it once the document is in paperless-ngx.
 
 A scan still running is never touched, even by a `saneless scan` started beside it or by a server
-sharing the same `tmp_dir`. Scratch directories left by versions of saneless from before this
-recovery existed are named `tmp` followed by random characters. They are not recovered, because
-nothing can prove their scan is over. Look through them, and delete them yourself when you are
-done.
+sharing the same `tmp_dir`. Recovery takes only saneless's own `job-*` scratch directories whose
+scan has ended; anything else in `tmp_dir` is left alone.
 
 ## Cancelled scans (exit 130)
 
@@ -659,6 +643,4 @@ or `journalctl` instead of restarting the service.
 
 Please report it as a bug and attach the log file. Attach the log only, never your config file,
 which holds your Paperless API token. saneless keeps the HTTP libraries' own debug output out of
-the log whatever `log_level` says, because it can include the authorization header. A log that an
-earlier version wrote with `log_level = "DEBUG"` may still hold it, so search such a log for your
-token before sharing it.
+the log whatever `log_level` says, because it can include the authorization header.
