@@ -15,9 +15,12 @@ to the Phase 27 behaviour: strict keys and ``SANELESS_*`` names, XDG paths,
 validated log levels, ``-v``, the literal profile title, and the optional
 ``--title`` (CFG-01..CFG-08, CFG-10, CFG-11).
 
-The Phase 28 tests pin the exit-code tables in the scripting how-to and the CLI
-reference, and the troubleshooting how-to, to ``ExitCode``: every documented
-code is a real one, and every real one is documented (D-07, D-13).
+The exit-code tests pin the CLI reference's global exit-code table to
+``ExitCode`` -- every documented code is a real one, and every real one is
+documented -- hold each command's table to exactly the codes that command
+can exit with, and hold the troubleshooting how-to's opening table to real
+codes. The scripting how-to's table lists only the codes its example
+branches on, and ``test_doc_exit_codes.py`` checks it.
 
 The Phase 29 test pins the architecture page's "Memory, disk and timeouts"
 subsection, and the absence of the two claims that phase falsified (D-20).
