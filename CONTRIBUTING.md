@@ -31,8 +31,8 @@ sudo apt-get install libsane-dev
 # Build the environment from the committed lockfile
 uv sync --locked
 
-# Install the git hooks (run this from the main checkout, not from a worktree)
-uv run prek install --git-dir "$(git rev-parse --path-format=absolute --git-common-dir)"
+# Install the git hooks
+uv run prek install
 ```
 
 Use `uv sync --locked` rather than a bare `uv sync`. `--locked` fails if `uv.lock`
@@ -42,20 +42,19 @@ letting your machine and the runner drift apart.
 
 The last command installs three hooks, `pre-commit`, `pre-merge-commit` and
 `pre-push`, which are listed under `default_install_hook_types` in
-`.pre-commit-config.yaml`. The `--git-dir` form is needed because prek 0.3.6 refuses
-to install when `core.hooksPath` is set locally, which is the case in a clone that
-shares its hooks with its git worktrees.
+`.pre-commit-config.yaml`. It writes them where git looks for hooks, so they also run
+in any git worktree of the clone.
 
 **If you installed the hooks before `pre-merge-commit` and `pre-push` were added to
 `default_install_hook_types`, re-run that install command.** `prek install` writes
 the shims that exist when it runs; adding a hook type to the config afterwards does
 not reach back into a clone that already has one. Such a checkout still gets the
 commit-stage `src/` checks, but nothing at merge or push, and nothing tells you the
-other two stages exist. To confirm, list the hook directory -- all three names
-should be there:
+other two stages exist. To confirm, list the directory git runs hooks from -- all
+three names should be there:
 
 ```bash
-ls "$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
+ls "$(git rev-parse --git-path hooks)"
 ```
 
 To add a dependency, use `uv add <package>` (or `uv add --dev <package>`) and commit
@@ -102,7 +101,7 @@ uv run prek run --stage pre-push --all-files --show-diff-on-failure
 uv audit --preview-features audit-command
 uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"
 uv run env HOME="$(mktemp -d)" pytest -m sane_hardware
-uv run playwright install chromium   # once, to fetch the browser
+uv run playwright install chromium firefox   # once, to fetch the browsers
 uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser
 docker build -t saneless:ci .
 uv run --no-project python scripts/smoke_image.py saneless:ci
@@ -115,9 +114,9 @@ that the suite never reads or writes your real home: no `~/.config/saneless` con
 itself -- every test gets a fake `HOME` and XDG tree and runs in its own working
 directory -- so a plain `uv run pytest` is safe too; the empty `HOME` is what checks
 that isolation holds. The browser line names Playwright's browser directory because
-Playwright looks for Chromium under `HOME`, and `$HOME` there is expanded by your
+Playwright looks for its browsers under `HOME`, and `$HOME` there is expanded by your
 shell, before `env` changes it, so it is your real home, where `playwright install`
-put Chromium. If you set `PLAYWRIGHT_BROWSERS_PATH` or `XDG_CACHE_HOME` for the
+put them. If you set `PLAYWRIGHT_BROWSERS_PATH` or `XDG_CACHE_HOME` for the
 install, use that directory instead.
 
 The `docker` job builds the image from the `Dockerfile` and never pushes it, then
@@ -159,8 +158,10 @@ commit, merge or push that adds one, and a test in `tests/test_deployment_config
 fails CI.
 
 The `test` job deselects the `browser` marker because the `browser` job runs those
-Playwright tests, with Chromium installed (`uv run playwright install --with-deps
-chromium`). They need no internet: every page is routed through an egress gate that
+Playwright tests, with Chromium and Firefox installed (`uv run playwright install
+--with-deps chromium firefox`). Firefox is there for one test: it restores a ticked
+checkbox on reload where Chromium does not, so only Firefox can show that the Multiple
+pages box starts unticked on every page load. They need no internet: every page is routed through an egress gate that
 fails the test if the UI tries to reach anything but the local test server, so they
 pass the same way on a laptop with no network as in CI.
 
@@ -192,8 +193,8 @@ uv run prek run --all-files
 your work is already committed. A bare `uv run prek run` in that state skips almost
 every hook -- no ruff lint, no format check, no `debug-statements`, no
 `detect-private-key` -- and prints a wall of `Skipped` that is easy to read as a
-clean tree. Only the two type checkers, which are `always_run`, actually look at
-anything. Use the bare `uv run prek run` only when the staged set is the point, such
+clean tree. Only the hooks marked `always_run` -- ty, pyrefly and the `zizmor`
+workflow audit -- actually look at anything. Use the bare `uv run prek run` only when the staged set is the point, such
 as inspecting what a commit is about to run.
 
 `prek` is a drop-in replacement for the older hook runner -- invoke it as
@@ -226,7 +227,7 @@ branch by name, the hook checks the wrong files.
 A merge with conflicts is the one gap. When you resolve the conflicts and finish the
 merge with `git commit`, git runs the commit-stage hooks rather than
 `pre-merge-commit`, so only `src/` is type-checked. A type error in `tests/` that gets
-through there is still caught at push, in CI and by the phase verifier.
+through there is still caught at push and in CI.
 
 If the hook rejects a merge:
 
