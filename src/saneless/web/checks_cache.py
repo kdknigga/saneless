@@ -271,14 +271,13 @@ class CheckCache:
         second release would each have lowered a floor whose whole job is to
         bound what an unauthenticated LAN endpoint can make the appliance do.
 
-        It cannot be abused to defeat the floor.  The
-        release happens only where ``request_probe`` reported a collapse, and that
-
-        branch issued no Paperless request, no saned TCP dial and no
-        filesystem write, so a scripted loop that always collides always gets
-        its claim back and still generates zero probe traffic.  The moment a
-        probe is actually granted, the stamp stands and the next call inside
-        the interval is refused like any other.
+        It cannot be abused to defeat the floor.  The release happens only
+        where ``request_probe`` reported a collapse, and that branch issued no
+        Paperless request, no saned TCP dial and no filesystem write, so a
+        scripted loop that always collides always gets its claim back and
+        still generates zero probe traffic.  The moment a probe is actually
+        granted, the stamp stands and the next call inside the interval is
+        refused like any other.
 
         Args:
             stamp: The value :meth:`claim_manual_refresh` returned for the
