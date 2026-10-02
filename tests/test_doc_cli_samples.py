@@ -85,6 +85,8 @@ COMPOSE_EXEC = "docker compose exec saneless saneless"
 
 TAB_LINE = re.compile(r'^=== "(?P<label>[^"]+)"\s*$')
 PROFILES_IN = re.compile(r"^\s*Profiles in (?P<path>\S+):$", re.MULTILINE)
+# Where one sentence ends and the next begins, for the glass-wording check.
+SENTENCE_END = re.compile(r"(?<=[.;])\s+")
 PROFILE_OPTION = re.compile(r"--profile(?:=|\s+)(?P<name>\S+)")
 
 
@@ -318,6 +320,11 @@ def _glass_profiles(settings: Settings) -> set[str]:
     return glass
 
 
+def _named_profiles(text: str, settings: Settings) -> set[str]:
+    """Return the generated profiles that ``text`` names in backticks."""
+    return {name for name in settings.profiles if f"`{name}`" in text}
+
+
 def _assert_devices_block(block: str, stdout: str, stderr: str) -> None:
     """Assert the block is the stderr status line above the stdout table."""
     assert stderr.splitlines(), "devices printed no status line on stderr"
@@ -442,12 +449,20 @@ def test_tutorial_scans_from_the_glass_with_a_glass_profile(
         used = option["name"] if option else "default"
         assert used in glass, f"{command!r} scans with {used!r}, not {glass}"
 
-    glass_lines = [
-        line
-        for line in text.splitlines()
-        if "glass" in line and any(f"`{name}`" in line for name in glass)
+    sentences = [
+        (sentence, _named_profiles(sentence, settings))
+        for sentence in SENTENCE_END.split(text)
+        if "glass" in sentence
     ]
-    assert glass_lines, f"no sentence names {sorted(glass)} as the glass profile"
+    naming = [(sentence, names) for sentence, names in sentences if names]
+    assert naming, f"no sentence names {sorted(glass)} as the glass profile"
+    wrong = [sentence for sentence, names in naming if not names <= glass]
+    assert not wrong, "a glass sentence names a feeder profile:\n" + "\n".join(wrong)
+
+    scan_step = text.split("saneless scan ", 1)[1].split("\n## ", 1)[0]
+    named = _named_profiles(scan_step, settings)
+    assert named, "the scan step does not say which profile it scans with"
+    assert named <= glass, f"the scan step names {sorted(named - glass)}"
 
 
 def test_tutorial_generates_profiles_between_config_and_first_scan() -> None:
