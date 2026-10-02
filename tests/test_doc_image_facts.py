@@ -12,7 +12,10 @@ page follows.
 The page's compose examples are checked too: every named volume an example
 mounts, commented mounts included, must be declared under that example's
 top-level ``volumes:``, or compose refuses the file once the mount is
-uncommented.
+uncommented. And every example that mounts the config directory -- a whole
+saneless service a reader might copy -- mounts the data volume too, without
+which the job database and preserved scans vanish when the container is
+recreated.
 
 Each checker returns its offences as strings, and a seeded bad input proves it
 can fail.
@@ -275,6 +278,33 @@ def _volume_offences(page_text: str) -> list[str]:
     return offences
 
 
+CONFIG_TARGET = "/etc/saneless"
+DATA_TARGET = "/var/lib/saneless"
+
+
+def _data_volume_offences(page_text: str) -> list[str]:
+    """
+    Return each compose example that mounts the config but not the data.
+
+    An example mounting ``/etc/saneless`` is a whole saneless service, and
+    one without a live mount at ``/var/lib/saneless`` loses the job database
+    and ``failed/`` the next time compose recreates the container.
+    """
+    offences: list[str] = []
+    for start, block in _compose_blocks(page_text):
+        live = {
+            mount.group("target").rstrip("/")
+            for mount in map(_MOUNT.match, block)
+            if mount is not None and not mount.group("comment")
+        }
+        if CONFIG_TARGET in live and DATA_TARGET not in live:
+            offences.append(
+                f"docker.md:{start}: mounts {CONFIG_TARGET} but not the data "
+                f"volume at {DATA_TARGET}"
+            )
+    return offences
+
+
 # --- seeded: each checker can fail -----------------------------------------
 
 _SEEDED_DOCKERFILE = """\
@@ -377,6 +407,26 @@ def test_seeded_commented_mount_needs_a_declaration() -> None:
     assert "'spare'" in offences[0]
 
 
+def test_seeded_service_without_the_data_volume_is_reported() -> None:
+    """A service mounting the config without the data volume is one offence."""
+    whole = """\
+```yaml
+services:
+  saneless:
+    volumes:
+      - ./config:/etc/saneless
+      - saneless-data:/var/lib/saneless
+```
+"""
+    assert _data_volume_offences(whole) == []
+    commented = whole.replace("      - saneless-data", "      # - saneless-data")
+    without = whole.replace("      - saneless-data:/var/lib/saneless\n", "")
+    for page in (commented, without):
+        offences = _data_volume_offences(page)
+        assert len(offences) == 1, offences
+        assert DATA_TARGET in offences[0]
+
+
 # --- the real page -----------------------------------------------------------
 
 
@@ -405,4 +455,11 @@ def test_every_compose_example_declares_the_volumes_it_mounts() -> None:
     mounts = [line for _, block in blocks for line in block if _MOUNT.match(line)]
     assert mounts, "docker.md's compose examples mount nothing"
     offences = _volume_offences(page)
+    assert not offences, "\n".join(offences)
+
+
+def test_every_whole_service_example_mounts_the_data_volume() -> None:
+    """Each docker.md example mounting the config mounts the data volume too."""
+    page = DOCKER_REFERENCE.read_text(encoding="utf-8")
+    offences = _data_volume_offences(page)
     assert not offences, "\n".join(offences)

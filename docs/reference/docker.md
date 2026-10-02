@@ -350,8 +350,12 @@ services:
       - "8080:8080"
     volumes:
       - ./config:/etc/saneless
+      - saneless-data:/var/lib/saneless
     environment:
       - SANELESS_SCANNER__HOST=192.168.1.50
+
+volumes:
+  saneless-data:
 ```
 
 saneless injects this value into `SANE_NET_HOSTS`, unless `SANE_NET_HOSTS` is already set to a non-empty value, before initializing the SANE backend, enabling automatic scanner discovery inside the container.
