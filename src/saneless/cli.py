@@ -1273,8 +1273,8 @@ class _GuardedGroup(click.Group):
     Every failure a command raises becomes a stderr message and its
     ``ExitCode``: the failure line, then a ``Try:`` line when the failure is
     classified.  A one-shot command shows no traceback unless ``-v`` asked for
-    one; ``serve``'s stream shows one only for an unexpected error. The ``except`` clauses are ordered, and the order is the
-    design:
+    one; ``serve``'s stream shows one only for an unexpected error. The
+    ``except`` clauses are ordered, and the order is the design:
 
     1. click's ``Exit``, ``Abort`` and ``ClickException`` are re-raised first.
        ``Exit`` and ``Abort`` subclass ``RuntimeError``, so a later
