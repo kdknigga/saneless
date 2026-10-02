@@ -55,7 +55,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 |---|---|---|---|
 | `label` | string | `""` | The name shown in the web UI's profile dropdown. `auto-profiles` fills this in -- `Feeder, single-sided`, `Feeder, double-sided`, `Feeder, front side only`, `Glass (flatbed)` or, on a scanner with no choice of source, `Standard scan` -- and owns it; see [Auto-generated profiles](#auto-generated-profiles). A profile with an empty label is listed under its profile name. When two profiles on the scan page would show the same label, each is followed by its profile name in brackets |
 | `description` | string | `""` | The sentence shown beneath the profile dropdown, such as `Scans both sides of every page using the document feeder.`. Also filled in and owned by `auto-profiles` |
-| `source` | string | `"Flatbed"` | Paper source: `"Flatbed"`, `"ADF"`, or `"ADF Duplex"` |
+| `source` | string | `"Flatbed"` | Paper source, spelled as your scanner names it; run `saneless devices --capabilities` to list them. The names differ from scanner to scanner: an HP LaserJet 3030 reports `Auto` and `ADF`, and a Fujitsu fi-7160 reports `ADF Front`, `ADF Back` and `ADF Duplex`. See [Source values](#source-values) |
 | `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow. `"hardware"` scans both sides through the source: most scanners do that because of the source's name, and on scanners with a separate ADF mode option (`adf-mode`) saneless sets it to `Duplex`; see [ADF Hardware Duplex](set-up-adf-duplex.md#adf-hardware-duplex) |
 | `resolution` | integer | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `"Color"`, `"Gray"`, or `"Lineart"` |
@@ -279,7 +279,7 @@ paperless-ngx lists only the tags and correspondents the API token's user may se
 
 ## Empty page detection tuning
 
-Empty page detection removes blank sides from duplex scans. It is enabled by default. To disable it for a specific profile:
+Empty page detection removes blank pages from every scan, single-sided or duplex, flatbed or feeder. It is enabled by default. To disable it for a specific profile:
 
 ```toml
 [profiles.photos]

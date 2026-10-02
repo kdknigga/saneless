@@ -9,7 +9,7 @@ Scan both sides of multi-page documents using your scanner's Automatic Document 
 
 ## The three ADF modes
 
-The profile names below are hand-written, but they match what `saneless auto-profiles` generates, because every profile is named after the scanner's own source name -- a device reporting `ADF` gets a profile called `adf`.
+The `adf` and `adf-duplex` profiles below are written by hand, but they match what `saneless auto-profiles` generates for a scanner that reports `ADF` and `ADF Duplex` sources, because every generated profile is named after the scanner's own source name. `auto-profiles` never generates the other two, the ADF-mode duplex profile and the manual duplex profile, so you write those yourself.
 
 ### ADF Simplex
 
@@ -31,7 +31,7 @@ saneless scan --profile adf --title "Meeting Notes"
 The scanner scans both sides of each page automatically in a single pass. This requires hardware duplex support -- check your scanner's specifications.
 
 ```toml
-[profiles.duplex]
+[profiles.adf-duplex]
 source = "ADF Duplex"
 duplex = "hardware"
 resolution = 300
@@ -39,16 +39,16 @@ mode = "Color"
 ```
 
 ```bash
-saneless scan --profile duplex --title "Contract"
+saneless scan --profile adf-duplex --title "Contract"
 ```
 
 Most scanners select duplex by source name, so on them `source = "ADF Duplex"` is what makes this a duplex scan, and `duplex = "hardware"` records what the source does. `saneless auto-profiles` writes it for sources whose name says they scan both sides.
 
-Some scanners have no duplex source. The epson2, kodakaio and magicolor drivers, and older epsonds ones, list a single feeder source and a separate ADF mode option, `adf-mode`, that switches it between `Simplex` and `Duplex`. On those, `duplex = "hardware"` is what makes the scan double-sided: saneless sets `adf-mode` to `Duplex` right after selecting the source. On every other scan where the option is in use it sets `Simplex`, so a `Duplex` left behind by an earlier scan does not carry over. `auto-profiles` does not generate this profile, because such a scanner may not report the option as usable until its feeder is selected, so write it yourself:
+Some scanners have no duplex source. The epson2, kodakaio and magicolor drivers, and older epsonds ones, list a single feeder source, `Automatic Document Feeder`, and a separate ADF mode option, `adf-mode`, that switches it between `Simplex` and `Duplex`. On those, `duplex = "hardware"` is what makes the scan double-sided: saneless sets `adf-mode` to `Duplex` right after selecting the source. On every other scan where the option is in use it sets `Simplex`, so a `Duplex` left behind by an earlier scan does not carry over. `auto-profiles` does not generate this profile, because such a scanner may not report the option as usable until its feeder is selected, so write it yourself:
 
 ```toml
 [profiles.duplex]
-source = "ADF"
+source = "Automatic Document Feeder"
 duplex = "hardware"
 resolution = 300
 mode = "Color"
@@ -173,7 +173,7 @@ Manual duplex needs a single-sided document feeder, and this device's list of so
 When scanning duplex documents, blank back sides are common. saneless detects and removes empty pages by default, by measuring how much of each page is ink. This is controlled per profile:
 
 ```toml
-[profiles.duplex]
+[profiles.adf-duplex]
 source = "ADF Duplex"
 resolution = 300
 mode = "Color"

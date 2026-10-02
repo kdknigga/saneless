@@ -87,16 +87,16 @@ Tests the connection to the configured paperless-ngx instance.
 
 | Status Code | Body | Condition |
 |-------------|------|-----------|
-| 200 | `{"status": "connected"}` | paperless-ngx answered with a 2xx |
-| 200 | `{"status": "token_rejected"}` | Server reachable, token rejected (401 or 403) |
-| 200 | `{"status": "not_found"}` | Server reachable, but the paperless-ngx API is not at the configured URL (404) |
-| 200 | `{"status": "server_error"}` | Server reachable, but answered 5xx or another status not listed here |
-| 200 | `{"status": "unreachable"}` | Server is not reachable (connection refused, DNS failure, connect or read timeout) |
-| 200 | `{"status": "incompatible_version"}` | Server reachable, but refused the API version (406): saneless needs paperless-ngx 2.16 or later, which allows API version 9 or 10 |
-| 200 | `{"status": "redirected"}` | Server reachable, but answered a redirect (3xx): paperless.url is not the address paperless-ngx answers on. The redirect is not followed, and where it points is written to the saneless log, never into this body |
-| 200 | `{"status": "misconfigured"}` | Nothing was sent: paperless.url has no `http` or `https` scheme, or paperless.url or paperless.token holds a character an HTTP request cannot carry |
-| 500 | `{"status": "error", "detail": "..."}` | Unexpected failure inside saneless while running the test |
-| 503 | `{"status": "error", "detail": "TimeoutError"}` | The caller could not get a turn to wait for a running test; carries a `Retry-After` header |
+| 200 | `{"status":"connected"}` | paperless-ngx answered with a 2xx |
+| 200 | `{"status":"token_rejected"}` | Server reachable, token rejected (401 or 403) |
+| 200 | `{"status":"not_found"}` | Server reachable, but the paperless-ngx API is not at the configured URL (404) |
+| 200 | `{"status":"server_error"}` | Server reachable, but answered 5xx or another status not listed here |
+| 200 | `{"status":"unreachable"}` | Server is not reachable (connection refused, DNS failure, connect or read timeout) |
+| 200 | `{"status":"incompatible_version"}` | Server reachable, but refused the API version (406): saneless needs paperless-ngx 2.16 or later, which allows API version 9 or 10 |
+| 200 | `{"status":"redirected"}` | Server reachable, but answered a redirect (3xx): paperless.url is not the address paperless-ngx answers on. The redirect is not followed, and where it points is written to the saneless log, never into this body |
+| 200 | `{"status":"misconfigured"}` | Nothing was sent: paperless.url has no `http` or `https` scheme, or paperless.url or paperless.token holds a character an HTTP request cannot carry |
+| 500 | `{"status":"error","detail":"..."}` | Unexpected failure inside saneless while running the test |
+| 503 | `{"status":"error","detail":"TimeoutError"}` | The caller could not get a turn to wait for a running test; carries a `Retry-After` header |
 
 The eight 200 values are the complete set, and each is a stable wire contract: `connected`
 is returned for a 2xx and nothing else, so a 404 or a 500 is reported as its own
@@ -597,7 +597,7 @@ Every error response saneless renders -- a refused scan, a validation failure, a
 | Request | Body | Extra headers |
 |---------|------|---------------|
 | `HX-Request: true` (the web UI) | HTML fragment containing the message | `HX-Retarget: #status-message` and `HX-Reswap: innerHTML`, so the message appears in the page's message area instead of the element the request was aimed at |
-| Anything else | `{"status": "error", "detail": "<message>"}` | none |
+| Anything else | `{"status":"error","detail":"<message>"}` | none |
 
 A `429` carries `Retry-After: 30` in both forms.
 
@@ -614,7 +614,7 @@ A script or `curl` is unaffected: they send `Accept: */*`, or no `Accept` at all
 
 A refused `POST /api/scan` from the web UI also carries the Scan button out-of-band, enabled and marked `autofocus`, so keyboard focus returns to the button that was pressed rather than being left on the page body. Focus is never moved into the message area. A refusal because the paperless-ngx token or address is unset carries no button: the button is disabled on such an appliance, so there is nothing to return focus to.
 
-The message is a fixed sentence chosen by saneless for the kind of error. It never echoes request input or internal exception text. One refusal repeats one value beside the sentence: a `421` names the `Host` it refused, so you know which name to add to `[web] allowed_hosts`. The value is shown under Technical details in the HTML fragment and as a separate `"host"` field in the JSON form (`{"status": "error", "detail": "<message>", "host": "<host>"}`). Control characters in it are shown as visible escapes, and it is cut to at most 255 characters. The error from [`GET /api/paperless/test`](#get-apipaperlesstest) and the `503` bodies from [`GET /health`](#get-health) keep their own shapes, documented above.
+The message is a fixed sentence chosen by saneless for the kind of error. It never echoes request input or internal exception text. One refusal repeats one value beside the sentence: a `421` names the `Host` it refused, so you know which name to add to `[web] allowed_hosts`. The value is shown under Technical details in the HTML fragment and as a separate `"host"` field in the JSON form (`{"status":"error","detail":"<message>","host":"<host>"}`). Control characters in it are shown as visible escapes, and it is cut to at most 255 characters. The error from [`GET /api/paperless/test`](#get-apipaperlesstest) and the `503` bodies from [`GET /health`](#get-health) keep their own shapes, documented above.
 
 ### Every rejection
 

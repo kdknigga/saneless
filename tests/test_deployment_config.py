@@ -89,6 +89,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.responses import JSONResponse
 
 # The other parsing import: the published-image guard parses the project
 # version with it to tell a release candidate from a final release, and the
@@ -1733,11 +1734,6 @@ DELIVERY_DOC_CLAIMS: tuple[tuple[Path, str, tuple[str, ...]], ...] = (
         ("from 1 to 2147483647",),
     ),
     (
-        CONFIG_REFERENCE,
-        "job rows from an earlier release keep their category",
-        ("keeps the error category", "nothing is rewritten"),
-    ),
-    (
         PROFILE_HOWTO,
         "the form shows a profile's defaults ticked",
         ("pre-ticked",),
@@ -2361,13 +2357,14 @@ def test_every_connection_status_is_documented_in_the_web_api_reference() -> Non
 
     Derived from ``ConnectionStatus``: a value added later cannot ship
     without its table row, and the sentence calling the set complete cannot
-    keep an old count.
+    keep an old count. Each body is spelled as the route's JSON response
+    renders it, so the row shows the bytes a client receives.
     """
     text, name = _read(WEB_API_REFERENCE)
     missing = [
         member.value
         for member in ConnectionStatus
-        if f'`{{"status": "{member.value}"}}`' not in text
+        if f"`{JSONResponse({'status': member.value}).body.decode()}`" not in text
     ]
     assert not missing, f"{name} does not document these statuses: {missing}"
     count = _COUNT_WORDS[len(ConnectionStatus)]

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
 import httpx2
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
@@ -293,6 +294,78 @@ def test_web_api_reference_health_bodies_match_the_app(
         f"web-api.md shows no {response.status_code} row with the body "
         f"{response.text!r}; its rows are {rows}"
     )
+
+
+@pytest.mark.parametrize("status", list(ConnectionStatus))
+def test_web_api_reference_paperless_test_bodies_match_the_app(
+    client: TestClient, status: ConnectionStatus
+) -> None:
+    """
+    Every connection test answer is shown in the reference exactly as it is sent.
+
+    The probe is made to report each status in turn, and the body the route
+    really returns must be the body in one of the rows for its status code.
+    """
+    _app(client).state.paperless.test_connection = lambda timeout=None: status
+    response = client.get("/api/paperless/test")
+    rows = _table_row(
+        _doc_section(WEB_API_DOC, "### `GET /api/paperless/test`"),
+        response.status_code,
+    )
+    assert any(f"`{response.text}`" in row for row in rows), (
+        f"web-api.md shows no {response.status_code} row with the body "
+        f"{response.text!r}"
+    )
+
+
+def _json_spelling_offences(text: str) -> list[str]:
+    """
+    Report each backticked JSON object not written as the app's responses are.
+
+    Every JSON answer saneless sends goes through the same response class, so
+    an object shown with other spacing, placeholders included, is not what a
+    client sees. Text in backticks that is not JSON is left alone.
+
+    Args:
+        text: The Markdown page.
+
+    Returns:
+        ``line: shown -> sent`` for each object written another way.
+
+    """
+    offences: list[str] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        for span in _INLINE_CODE.findall(line):
+            if not span.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(span)
+            except ValueError:
+                continue
+            sent = JSONResponse(parsed).body.decode()
+            if span != sent:
+                offences.append(f"{number}: {span} -> {sent}")
+    return offences
+
+
+def test_web_api_reference_writes_json_as_the_app_sends_it() -> None:
+    """Every JSON body in the API reference is spelled as the app renders it."""
+    text = WEB_API_DOC.read_text(encoding="utf-8")
+    assert _INLINE_CODE.search(text)
+    offences = _json_spelling_offences(text)
+    assert not offences, "\n".join(offences)
+
+
+def test_seeded_json_spelling_offences() -> None:
+    """Spaced JSON is reported; compact JSON and code that is not JSON are not."""
+    text = (
+        '| 200 | `{"status": "connected"}` | ok |\n'
+        '| 500 | `{"status":"error","detail":"<message>"}` | ok |\n'
+        "Run `{a, b}` in a shell.\n"
+    )
+    assert _json_spelling_offences(text) == [
+        '1: {"status": "connected"} -> {"status":"connected"}'
+    ]
 
 
 # Every page a reader may compare a ``/health`` probe's output with.

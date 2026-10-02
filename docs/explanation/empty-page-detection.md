@@ -33,7 +33,7 @@ A page is blank, and is removed, when both of these are true:
 
 A page whose paper is darker than mid-grey is not blank-looking paper at all -- a dark cover with white type, a photograph, a coloured sheet -- so it is kept whatever its coverage.
 
-The rule asks whether a page carries marks, not how bright it is on average. So a tinted or slightly noisy blank sheet is still blank, and a white page with one small mark on it is not.
+The rule asks how much of a page is ink, not how bright it is on average. So a tinted or slightly noisy blank sheet is still blank, and so is a white page whose only mark is smaller than the threshold allows -- a speck of dust, or a dot under about 0.75 mm across at the default. A mark bigger than that, such as a lone page number, keeps the page.
 
 ### Keep when unsure
 

@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Final, cast
 
 import pytest
+from fastapi.responses import JSONResponse
 
 import saneless.job
 from saneless import preservation
@@ -2320,10 +2321,10 @@ class TestConnectionStatus:
         assert json.dumps({"status": status}) == json.dumps({"status": status.value})
 
     def test_connected_serialises_to_the_documented_body(self) -> None:
-        """The success body is exactly what web-api.md shows (OUTC-08)."""
+        """The success body, as a JSON response renders it, is what web-api.md shows."""
         assert (
-            json.dumps({"status": ConnectionStatus.CONNECTED})
-            == '{"status": "connected"}'
+            JSONResponse({"status": ConnectionStatus.CONNECTED}).body
+            == b'{"status":"connected"}'
         )
 
     @pytest.mark.parametrize("status", list(ConnectionStatus))

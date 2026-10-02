@@ -127,10 +127,10 @@ The first line is on stderr; the table is on stdout. The table fits the terminal
 ```json
 [
   {
-    "name": "net:192.168.1.50:pixma:MF740C",
-    "vendor": "Canon",
-    "model": "MF740C Series",
-    "type": "scanner"
+    "name": "net:192.168.1.50:hpaio:/usb/hp_LaserJet_3030?serial=00MXBM121742",
+    "vendor": "Hewlett-Packard",
+    "model": "hp_LaserJet_3030",
+    "type": "all-in-one"
   }
 ]
 ```
@@ -142,15 +142,43 @@ Without `--capabilities` the JSON has exactly these four keys per device, in thi
 ```json
 [
   {
-    "name": "net:192.168.1.50:pixma:MF740C",
-    "vendor": "Canon",
-    "model": "MF740C Series",
-    "type": "scanner",
+    "name": "net:192.168.1.50:hpaio:/usb/hp_LaserJet_3030?serial=00MXBM121742",
+    "vendor": "Hewlett-Packard",
+    "model": "hp_LaserJet_3030",
+    "type": "all-in-one",
     "capabilities": {
-      "sources": ["Flatbed", "ADF Simplex", "ADF Duplex"],
-      "resolutions": [150, 300, 600],
-      "modes": ["Color", "Gray", "Lineart"],
-      "raw_options": ["source", "mode", "resolution"]
+      "sources": [
+        "Auto",
+        "ADF"
+      ],
+      "resolutions": [
+        75,
+        100,
+        150,
+        200,
+        300,
+        600
+      ],
+      "modes": [
+        "Lineart",
+        "Gray",
+        "Color"
+      ],
+      "raw_options": [
+        "mode",
+        "resolution",
+        "contrast",
+        "brightness",
+        "compression",
+        "jpeg-quality",
+        "batch-scan",
+        "source",
+        "length-measurement",
+        "tl-x",
+        "tl-y",
+        "br-x",
+        "br-y"
+      ]
     }
   },
   {
@@ -197,7 +225,7 @@ The table's `Timestamp` column renders each job's start time in the server's loc
 
 Each `--json` entry also carries an `error` field: the full stored text of what stopped the job, file paths on the server and the paperless-ngx URL included, or `null`. The web page shows a failure only as a sentence without paths, and points here for the rest.
 
-`jobs` does not need python-sane. It only reads the history, so it is safe to run while `saneless serve` is using the same database: it never creates the database and never upgrades it. On a fresh install, with no database yet, it prints an empty history. A database left at an older schema by an earlier release is refused with exit 2. Only `saneless serve` upgrades a job database, so the message says to start it once with the same config, stop it, and run `saneless jobs` again; this works on an install that otherwise only uses the CLI too.
+`jobs` does not need python-sane. It only reads the history, so it is safe to run while `saneless serve` is using the same database: it never creates the database and never upgrades it. On a fresh install, with no database yet, it prints an empty history. A database at an older schema is refused with exit 2. Only `saneless serve` upgrades a job database, so the message says to start it once with the same config, stop it, and run `saneless jobs` again; this works on an install that otherwise only uses the CLI too.
 
 ---
 
