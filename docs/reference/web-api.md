@@ -231,6 +231,8 @@ The self-poll also gives up on its own. With no check running, it stops after ab
 
 A failure inside the strip's own rendering comes back as that given-up body: six named rows, the `Check again` button and the line saying the checks have not run yet, with no poll attached. A poll carrying a counter that is not a number, which the page never sends, gets an error response that replaces the strip; reloading the page restores it. A poll that gets no response at all, because the server is off or the connection was reset, keeps asking every couple of seconds until the tab is closed.
 
+Why the strip polls and stops this way is explained in [The status strip's polling](../explanation/architecture.md#the-status-strips-polling).
+
 ---
 
 ### `POST /api/checks/refresh`
@@ -250,6 +252,8 @@ A refresh that arrives while another is under way -- another click, or the backg
 A refresh is honoured at most once every couple of seconds. A request arriving sooner re-renders the current strip without probing, with the same status code and the same partial as an honoured one. A collapsed refresh does not count against that floor, so the next press after it is honoured at once. Holding the button down, or scripting the endpoint in a loop, therefore generates no scanner or paperless-ngx traffic beyond that rate.
 
 If the check registry itself fails, the previous results stay on the page rather than blanking, and the failure is logged.
+
+The reasons for the collapse and the floor are in [The status strip's polling](../explanation/architecture.md#the-status-strips-polling).
 
 ---
 
