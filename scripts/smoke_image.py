@@ -929,26 +929,47 @@ def check_config_data_dir(engine: Engine) -> None:
     """
     Check that a mounted ``saneless.toml`` ``[output] data_dir`` takes effect.
 
+    Only the server creates the job database; every one-shot command reads
+    it and leaves it alone. So the image's default command is started with
+    the config mounted, and once it answers ``/health`` the probe asks,
+    inside the same container, that ``saneless jobs`` reads the history and
+    that the database sits in the configured directory and nowhere else.
+
     Args:
         engine: The engine and image under test.
 
     Raises:
-        SmokeFailure: The database did not land in the configured directory,
-            or also landed in the default one.
+        SmokeFailure: The server did not start, or the database did not
+            land in the configured directory, or also landed in the default
+            one.
 
     """
     directory = Path(tempfile.mkdtemp(prefix="saneless-smoke-"))
+    name = _container_name()
     try:
         _write_config(directory)
         # :z relabels the directory for SELinux hosts; elsewhere it is a no-op.
-        result = engine.sh(
-            'exec "$SMOKE_DOCKER" run --rm --name "$SMOKE_NAME" '
+        started = engine.sh(
+            'exec "$SMOKE_DOCKER" run -d --name "$SMOKE_NAME" '
             '-v "$SMOKE_CONFIG_DIR:/etc/saneless:ro,z" '
-            '--entrypoint sh "$SMOKE_IMAGE" -c "$SMOKE_PROBE"',
+            '-p "127.0.0.1::$SMOKE_PORT" "$SMOKE_IMAGE"',
+            name=name,
             config_dir=str(directory),
+            port=str(_PORT),
+        )
+        _require_success(started, "starting the server with the config mounted")
+        try:
+            _wait_for_health(engine, _host_port(engine, name))
+        except SmokeFailure as exc:
+            msg = f"{exc}\ncontainer log:\n{_logs(engine, name)}"
+            raise SmokeFailure(msg) from exc
+        result = engine.sh(
+            'exec "$SMOKE_DOCKER" exec "$SMOKE_NAME" sh -c "$SMOKE_PROBE"',
+            name=name,
             probe=_DATA_DIR_PROBE,
         )
     finally:
+        engine.sh('exec "$SMOKE_DOCKER" rm -f -v "$SMOKE_NAME"', name=name)
         shutil.rmtree(directory, ignore_errors=True)
     if result.returncode != 0:
         msg = (
