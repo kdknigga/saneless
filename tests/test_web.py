@@ -76,6 +76,7 @@ from saneless.vocabulary import (
     page_counts,
     progress_label,
     rejection_message,
+    rejection_status_code,
     scan_hold_reason,
 )
 from saneless.web import app as app_module
@@ -84,7 +85,7 @@ from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
-from saneless.web.routes import _profile_options, _ProfileOption
+from saneless.web.routes import OWNER_COOKIE, _profile_options, _ProfileOption
 from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
 from saneless.web.throttle import PAPERLESS_TEST_WAIT_SECONDS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
@@ -207,6 +208,186 @@ def test_health_endpoint_ok(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+# The documentation pages the checks below hold to what the app really answers.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WEB_API_DOC = REPO_ROOT / "docs" / "reference" / "web-api.md"
+ARCHITECTURE_DOC = REPO_ROOT / "docs" / "explanation" / "architecture.md"
+
+# The headings of the three endpoints that answer a waiting scan.
+ANSWER_HEADINGS = (
+    "### `POST /api/flip/continue`",
+    "### `POST /api/flip/abort`",
+    "### `POST /api/multi-page/answer`",
+)
+
+
+def _doc_section(path: Path, heading: str) -> str:
+    """
+    Return one section of a documentation page, its sub-sections included.
+
+    The section runs from the line holding ``heading`` to the next heading of
+    the same level or higher, so a ``####`` inside a ``###`` section is kept.
+    A ``#`` line inside a fenced code block is a comment, not a heading.
+
+    Args:
+        path: The Markdown page.
+        heading: The whole heading line, hashes included.
+
+    Returns:
+        The section's text, without its heading line.
+
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert heading in lines, f"{path.name} has no {heading!r} heading"
+    level = len(heading) - len(heading.lstrip("#"))
+    body: list[str] = []
+    fenced = False
+    for line in lines[lines.index(heading) + 1 :]:
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        hashes = len(line) - len(line.lstrip("#"))
+        if not fenced and 0 < hashes <= level and line[hashes : hashes + 1] == " ":
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _table_row(section: str, status: int) -> list[str]:
+    """
+    Return every table row in a section whose first cell is a status code.
+
+    Args:
+        section: The section text.
+        status: The status code the rows must start with.
+
+    Returns:
+        The matching rows, in page order.
+
+    """
+    return [
+        line
+        for line in section.splitlines()
+        if line.startswith("|") and line.split("|")[1].strip() == str(status)
+    ]
+
+
+@pytest.mark.parametrize("health", list(WorkerHealth))
+def test_web_api_reference_health_bodies_match_the_app(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, health: WorkerHealth
+) -> None:
+    """
+    Every ``/health`` answer is shown in the reference exactly as it is sent.
+
+    The worker's health is set to each value in turn and the body the route
+    really returns, byte for byte, must be the body in the row for its status,
+    so a reader who compares a probe's output with the page sees the same text.
+    """
+    monkeypatch.setattr(ScanWorker, "health", property(lambda _self: health))
+    response = client.get("/health")
+    rows = _table_row(
+        _doc_section(WEB_API_DOC, "### `GET /health`"), response.status_code
+    )
+    assert any(f"`{response.text}`" in row for row in rows), (
+        f"web-api.md shows no {response.status_code} row with the body "
+        f"{response.text!r}; its rows are {rows}"
+    )
+
+
+def test_web_api_reference_states_what_head_health_answers(
+    client: TestClient,
+) -> None:
+    """
+    The health section says what a ``HEAD /health`` probe gets back.
+
+    A monitor that probes with HEAD gets whatever the app answers for it, so
+    the section must name the status the app really returns.
+    """
+    status = client.head("/health").status_code
+    section = _doc_section(WEB_API_DOC, "### `GET /health`")
+    sentences = [
+        sentence for sentence in re.split(r"(?<=\.)\s+", section) if "HEAD" in sentence
+    ]
+    assert sentences, "web-api.md's /health section does not mention HEAD"
+    assert any(f"`{status}`" in sentence for sentence in sentences), (
+        f"web-api.md's /health section does not say HEAD /health answers {status}: "
+        f"{sentences}"
+    )
+
+
+def test_web_api_reference_scan_503_rejection_row_matches_the_vocabulary() -> None:
+    """
+    The scan endpoint's 503 row names exactly the refusals sent as a 503.
+
+    The set is derived from the rejection vocabulary, so a new refusal sent as
+    a 503 cannot ship while the row still lists only the old causes.
+    """
+    expected = {
+        member.name
+        for member in RequestRejection
+        if rejection_status_code(member) == 503
+    }
+    rows = _table_row(_doc_section(WEB_API_DOC, "### `POST /api/scan`"), 503)
+    assert len(rows) == 1, f"web-api.md's POST /api/scan has {len(rows)} 503 rows"
+    named = set(re.findall(r"`([A-Z][A-Z_]+)`", rows[0]))
+    assert named == expected, (
+        f"web-api.md's POST /api/scan 503 row names {sorted(named)}, but the "
+        f"refusals sent as a 503 are {sorted(expected)}"
+    )
+
+
+def test_web_api_reference_answer_sections_name_the_owner_cookie() -> None:
+    """
+    Every answer endpoint says an answer needs the owner cookie.
+
+    A script that answers a flip or a multi-page question without the cookie
+    its own scan submit received is dropped, so each answer section names the
+    cookie, and the flip sections show a request sequence that keeps it: a
+    scan submit that stores the cookie and an answer that sends it back.
+    """
+    sections = {
+        heading: _doc_section(WEB_API_DOC, heading) for heading in ANSWER_HEADINGS
+    }
+    missing = [
+        heading for heading, text in sections.items() if f"`{OWNER_COOKIE}`" not in text
+    ]
+    assert not missing, f"web-api.md does not name `{OWNER_COOKIE}` under {missing}"
+    flip = "\n".join(sections[heading] for heading in ANSWER_HEADINGS[:2])
+    curls = [
+        line.split() for line in flip.splitlines() if line.strip().startswith("curl ")
+    ]
+    submits = [
+        c for c in curls if "-c" in c and "-b" in c and any("/api/scan" in w for w in c)
+    ]
+    answers = [
+        c for c in curls if "-b" in c and any("/api/flip/continue" in w for w in c)
+    ]
+    assert submits, "web-api.md's flip sections have no `curl -c … -b …` scan submit"
+    assert answers, "web-api.md's flip sections have no `curl -b …` flip answer"
+
+
+def test_architecture_owner_token_bullet_states_what_it_grants() -> None:
+    """
+    The architecture page says what the owner token grants, through its cookie.
+
+    The token is what decides who may see a job's details and answer its
+    prompt, so the bullet describing the column names the cookie that carries
+    it and does not claim the token grants nothing.
+    """
+    bullets = [
+        line
+        for line in ARCHITECTURE_DOC.read_text(encoding="utf-8").splitlines()
+        if line.startswith("- `owner_token`")
+    ]
+    assert len(bullets) == 1, f"architecture.md has {len(bullets)} owner_token bullets"
+    assert f"`{OWNER_COOKIE}`" in bullets[0], (
+        f"architecture.md's owner_token bullet does not name `{OWNER_COOKIE}`"
+    )
+    assert "grants nothing" not in bullets[0], (
+        "architecture.md still says the owner token grants nothing, though it "
+        "decides who may see a job's details and answer its prompts"
+    )
 
 
 def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
