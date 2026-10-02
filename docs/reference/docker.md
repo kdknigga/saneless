@@ -197,41 +197,11 @@ is an operator task.
   rejects a duplicate, so dropping a preserved PDF back into the consume
   directory cannot create a second copy of a document it already holds.
 
-Upgrading from a release where the job database lived under `/tmp/saneless`?
-See [Upgrading from a pre-`data_dir` release](../how-to/deploy-docker-compose.md#upgrading-from-a-pre-data_dir-release).
-
-### Upgrading from an earlier release
-
-This release checks more of `config/saneless.toml` at startup. [Upgrading: settings are checked when saneless loads](../how-to/deploy-docker-compose.md#upgrading-settings-are-checked-when-saneless-loads) has the details and the commands; in short:
-
-- A `0` or out-of-range number, or `true`/`false` in place of one, stops saneless loading (exit 2). Replace `history_retention_days = 0` with `36500` (about a century) and `history_max_rows = 0` with the number of jobs to keep, up to `1000000`.
-- A relative path setting is resolved against the directory of the config file that loaded, `/etc/saneless` in the container, instead of the working directory `/var/lib/saneless`. Write it absolute to keep the old location.
-- Generated profile labels and descriptions change only when you run `saneless auto-profiles --force`, which rewrites only tables marked `auto_generated = true`.
-- `min_free_space_mb` counts a megabyte as 1,000,000 bytes, so the reserve is about 5% smaller.
-- `default_title` in a profile is refused (exit 2); write `title`.
-- A `/var/lib/saneless/saneless.toml` that an earlier release's `auto-profiles` left in the data volume loads ahead of `./config`. Merge anything you need from it into `config/saneless.toml`, then delete it.
-
-saneless now keeps what it writes under `/var/lib/saneless` to its own user.
+saneless keeps what it writes under `/var/lib/saneless` to its own user.
 The image's `/var/lib/saneless` is `0700`, and a new volume starts with that
 mode. A new job database (`saneless.db`, with its `-wal` and `-shm` files) is created
 `0600`. `failed/` and each preserved page directory are created `0700`, and
 each preserved PDF and page file is `0600`.
-
-Files and directories an earlier release created keep their modes: saneless
-does not change them at startup. To tighten them, run this once:
-
-```bash
-docker compose exec saneless sh -c '
-  chmod 700 /var/lib/saneless /var/lib/saneless/failed
-  chmod 600 /var/lib/saneless/saneless.db*
-  find /var/lib/saneless/failed -mindepth 1 -type d -exec chmod 700 {} +
-  find /var/lib/saneless/failed -type f -exec chmod 600 {} +
-'
-```
-
-`chmod` reports an error for a path that does not exist yet, such as `failed/`
-before any scan has been preserved; that path needs nothing. These commands
-change only the modes, not the owner, so the container keeps full access.
 
 ## Environment Variables
 

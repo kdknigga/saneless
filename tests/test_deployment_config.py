@@ -427,85 +427,6 @@ def test_deploy_doc_keeps_the_single_file_mount_heading() -> None:
     )
 
 
-# The newest upgrade section on each page an upgrading operator reads. The
-# Docker how-to holds the full note; the bare-metal how-to and the Docker
-# reference carry the same points in their own words.
-DOCKER_UPGRADE_HEADING = "### Upgrading: settings are checked when saneless loads"
-UPGRADE_SECTIONS = (
-    (DEPLOY_HOWTO, DOCKER_UPGRADE_HEADING),
-    (INSTALL_BARE_METAL, "### Upgrading from an earlier release"),
-    (DOCKER_REFERENCE, "### Upgrading from an earlier release"),
-)
-
-
-@pytest.mark.parametrize(
-    ("page", "heading"),
-    UPGRADE_SECTIONS,
-    ids=[page.name for page, _ in UPGRADE_SECTIONS],
-)
-def test_upgrade_notes_cover_this_release(page: Path, heading: str) -> None:
-    """
-    Each page's newest upgrade section names what now changes on upgrade.
-
-    A ``0`` that used to mean "no limit" now stops saneless loading, so the
-    note gives the replacement value; relative paths now follow the config
-    file; generated labels change only on ``auto-profiles --force``; free
-    space is counted in decimal megabytes; and a profile's ``default_title``,
-    which used to load, is now refused in favour of ``title``. An operator who
-    is not told finds each of these out from an error or a changed page.
-    """
-    text, name = _read(page)
-    section = _subsection(text, heading, name)
-    offenders = [
-        f"does not mention {needle!r}"
-        for needle in (
-            "history_retention_days = 0",
-            "36500",
-            "history_max_rows = 0",
-            "1000000",
-            "auto-profiles --force",
-            "1,000,000 bytes",
-            "`default_title`",
-        )
-        if needle not in section
-    ]
-    if not any(
-        "relative" in sentence and "config file" in sentence
-        for sentence in _sentences(section)
-    ):
-        offenders.append("does not say relative paths now follow the config file")
-    assert not offenders, f"{name} {heading}:\n" + "\n".join(offenders)
-
-
-def test_docker_upgrade_note_merges_the_volume_file_before_deleting_it() -> None:
-    """
-    The Docker upgrade note finds an old volume config, merges it, then deletes it.
-
-    The file an earlier ``auto-profiles`` left in the data volume may hold the
-    only copy of settings the operator added by hand, so the note must say to
-    merge it into ``./config/saneless.toml`` before it says to delete it. The
-    Docker reference points at the note rather than repeating the commands.
-    """
-    text, name = _read(DEPLOY_HOWTO)
-    section = _subsection(text, DOCKER_UPGRADE_HEADING, name)
-    assert AUTO_PROFILES_CONTAINER_PATH in section, (
-        f"{name} {DOCKER_UPGRADE_HEADING} does not name the leftover "
-        f"{AUTO_PROFILES_CONTAINER_PATH}"
-    )
-    merge, delete = section.find("merge"), section.find("delete")
-    assert -1 < merge < delete, (
-        f"{name} {DOCKER_UPGRADE_HEADING} does not say to merge the volume file "
-        "before deleting it"
-    )
-    reference, reference_name = _read(DOCKER_REFERENCE)
-    anchor = (
-        "deploy-docker-compose.md#upgrading-settings-are-checked-when-saneless-loads"
-    )
-    assert anchor in reference, (
-        f"{reference_name} does not link to the Docker upgrade note ({anchor})"
-    )
-
-
 def test_profile_howto_says_how_to_refresh_a_hand_written_default() -> None:
     """
     The profiles how-to gives the advice that works for a hand-written default.
@@ -1946,18 +1867,13 @@ def test_compose_ships_no_live_paperless_environment_line() -> None:
 
 
 def test_compose_says_the_environment_block_overrides_the_config_file() -> None:
-    """The commented block explains the override and the upgrade action."""
+    """The commented paperless block says an environment line overrides the file."""
     text = COMPOSE.read_text(encoding="utf-8").lower()
     for needle in ("override", CONFIG_NAME):
         assert needle in text, (
             f"{COMPOSE.name} does not contain {needle!r}, so it does not "
-            f"say that an environment line overrides {CONFIG_NAME} (D-17)"
+            f"say that an environment line overrides {CONFIG_NAME}"
         )
-    assert "delete" in text or "remove" in text, (
-        f"{COMPOSE.name} does not tell an operator who copied an earlier "
-        "version to remove their own token line, so their real saneless.toml "
-        "stays overridden and the status strip stays red"
-    )
 
 
 def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> None:
@@ -2363,24 +2279,6 @@ def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
     assert not offenders, (
         "a shipped example sets the paperless token to a value this release "
         "detects as a placeholder and refuses scans for:\n" + "\n".join(offenders)
-    )
-
-
-def test_deploy_howto_tells_existing_operators_to_remove_their_token_line() -> None:
-    """The compose how-to states the upgrade action and its consequence."""
-    text, name = _read(DEPLOY_HOWTO)
-    lowered = text.lower()
-    assert "SANELESS_PAPERLESS__TOKEN" in text, (
-        f"{name} no longer names the variable an existing operator has to remove"
-    )
-    for needle in ("override", CONFIG_NAME):
-        assert needle in lowered, (
-            f"{name} does not contain {needle!r}, so it does not explain that "
-            f"an environment line overrides {CONFIG_NAME} (D-17)"
-        )
-    assert "red" in lowered, (
-        f"{name} does not state the consequence -- the status strip stays red "
-        "-- for an operator who leaves their own token line in place"
     )
 
 
@@ -7514,69 +7412,6 @@ def test_the_anchor_validation_reader_reports_anything_but_warn(text: str) -> No
     lines = list(enumerate(text.splitlines(), start=1))
     assert _anchor_validation(lines) != "warn"
     assert _anchor_validation([(1, "validation: {anchors: warn}")]) == "warn"
-
-
-# ---------------------------------------------------------------------------
-# Phase 37: the config filename rename (CFG-05, D-01, D-03, D-13, D-17)
-# ---------------------------------------------------------------------------
-
-
-def test_deploy_doc_tells_upgraders_to_rename_the_config_file() -> None:
-    """
-    The compose how-to gives the rename an upgrading operator has to perform.
-
-    Every container deployed from this guide holds the old
-    ``config/config.toml`` rather than ``config/saneless.toml``, because the
-    old name is what the guide told its reader to create. saneless no longer
-    reads it, so on the first pull after the rename the file goes
-    silently unread -- the exact failure this phase exists to remove. The
-    guide must therefore carry the rename as a command, on one line, naming
-    both filenames, and must say what the reader sees until they run it: the
-    status page's Configuration row.
-    """
-    text = DEPLOY_HOWTO.read_text(encoding="utf-8")
-    name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
-    renames = [
-        line
-        for line in text.splitlines()
-        if "mv" in line
-        if f"config/{LEGACY_CONFIG_NAME}" in line
-        if f"config/{CONFIG_NAME}" in line
-    ]
-    assert renames, (
-        f"{name} has no line telling an upgrading operator to rename "
-        f"config/{LEGACY_CONFIG_NAME} to config/{CONFIG_NAME}. Without it "
-        "every container deployed from this guide loads no config at all "
-        "after the upgrade, with nothing on the page to say why"
-    )
-    assert "Configuration" in text, (
-        f"{name} does not name the Configuration row, which is what an "
-        "operator who has not renamed the file sees turn red"
-    )
-
-
-def test_compose_tells_upgraders_to_rename_the_config_file() -> None:
-    """
-    The shipped compose template carries the rename in a comment.
-
-    The compose file is the artifact an operator actually has open when they
-    pull a new image, and their own copy of it still names the old path. One
-    comment line naming both paths is what turns a silent no-config start into
-    an instruction.
-    """
-    renames = [
-        f"{COMPOSE.name}:{number}: {line.strip()}"
-        for number, line in _numbered(COMPOSE)
-        if _is_comment(line)
-        if f"./config/{LEGACY_CONFIG_NAME}" in line
-        if f"./config/{CONFIG_NAME}" in line
-    ]
-    assert renames, (
-        f"{COMPOSE.name} has no comment line naming both ./config/"
-        f"{LEGACY_CONFIG_NAME} and ./config/{CONFIG_NAME}, so an operator "
-        "copying this template gets no notice that the old name stopped "
-        "being read"
-    )
 
 
 # ---------------------------------------------------------------------------

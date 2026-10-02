@@ -59,15 +59,6 @@ services:
       # variable set here OVERRIDES that file silently: saneless would use this
       # value and ignore the token you edited into saneless.toml, and the
       # status strip would stay red with nothing on screen to say why.
-      #
-      # UPGRADING: earlier versions of this file shipped these two lines live,
-      # so your own compose file probably still has them. Delete your
-      # SANELESS_PAPERLESS__TOKEN line, or your real saneless.toml stays
-      # overridden and the status strip stays red after you fix it.
-      #
-      # UPGRADING: rename ./config/config.toml to ./config/saneless.toml. The
-      # old name is no longer read at all, and until you rename it the status
-      # page's first row, Configuration, is red and names the file.
       # - SANELESS_PAPERLESS__URL=http://paperless:8000
       # - SANELESS_PAPERLESS__TOKEN=your-api-token-here
       # Uncomment to discover scanners on a remote host via SANE net backend:
