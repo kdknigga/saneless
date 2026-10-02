@@ -17,13 +17,22 @@ saneless service a reader might copy -- mounts the data volume too, without
 which the job database and preserved scans vanish when the container is
 recreated.
 
+The "Verifying the image" section says which published images carry no
+attestations. That caveat names a fixed tag, the last one released before the
+attestations were added, so a version bump that rewrites every
+release-candidate tag must not rewrite it, and once the declared version is
+final the caveat has to go.
+
 Each checker returns its offences as strings, and a seeded bad input proves it
 can fail.
 """
 
 import json
 import re
+import tomllib
 from pathlib import Path
+
+from packaging.version import Version
 
 from tests.workflow_support import (
     WORKFLOW_DIR,
@@ -36,6 +45,7 @@ from tests.workflow_support import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 DOCKER_REFERENCE = REPO_ROOT / "docs" / "reference" / "docker.md"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 RELEASE_WORKFLOW = WORKFLOW_DIR / "release.yml"
 
 # The job that pushes the image, and the action that builds it.
@@ -278,6 +288,48 @@ def _volume_offences(page_text: str) -> list[str]:
     return offences
 
 
+# The last image the release pipeline published without attestations.
+LAST_UNATTESTED_TAG = "0.2.0-rc.6"
+VERIFYING_HEADING = "## Verifying the image"
+_RC_TAG = re.compile(r"\b\d+\.\d+\.\d+-rc\.\d+\b")
+
+
+def _section(page_text: str, heading: str) -> str:
+    """Return the text under ``heading`` up to the next level-2 heading."""
+    lines = page_text.splitlines()
+    starts = [n for n, line in enumerate(lines) if line.strip() == heading]
+    assert starts, f"no {heading!r} heading"
+    body: list[str] = []
+    for line in lines[starts[0] + 1 :]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _attestation_caveat_offences(section: str, declared: str) -> list[str]:
+    """
+    Return what is wrong with the unattested-images caveat for a version.
+
+    While the declared version is a release candidate, every candidate tag
+    the section names must be the last unattested one; a bump that rewrote it
+    would claim the new candidate has no attestations. Once the version is
+    final, the section names no candidate tag at all.
+    """
+    tags = _RC_TAG.findall(section)
+    if Version(declared).is_prerelease:
+        return [
+            f"names {tag} as an unattested image; the last one is {LAST_UNATTESTED_TAG}"
+            for tag in tags
+            if tag != LAST_UNATTESTED_TAG
+        ]
+    return [
+        f"still names the release candidate {tag} under the final release "
+        f"{declared}; state only that images carry the two attestations"
+        for tag in tags
+    ]
+
+
 CONFIG_TARGET = "/etc/saneless"
 DATA_TARGET = "/var/lib/saneless"
 
@@ -427,6 +479,16 @@ services:
         assert DATA_TARGET in offences[0]
 
 
+def test_seeded_attestation_caveat_offences() -> None:
+    """A rewritten tag, and any candidate tag after the final release, fail."""
+    caveat = f"Images up to {LAST_UNATTESTED_TAG} carry neither."
+    assert _attestation_caveat_offences(caveat, "0.2.0-rc.7") == []
+    rewritten = caveat.replace(LAST_UNATTESTED_TAG, "0.2.0-rc.7")
+    assert len(_attestation_caveat_offences(rewritten, "0.2.0-rc.7")) == 1
+    assert len(_attestation_caveat_offences(caveat, "0.2.0")) == 1
+    assert _attestation_caveat_offences("Images carry both.", "0.2.0") == []
+
+
 # --- the real page -----------------------------------------------------------
 
 
@@ -462,4 +524,15 @@ def test_every_whole_service_example_mounts_the_data_volume() -> None:
     """Each docker.md example mounting the config mounts the data volume too."""
     page = DOCKER_REFERENCE.read_text(encoding="utf-8")
     offences = _data_volume_offences(page)
+    assert not offences, "\n".join(offences)
+
+
+def test_the_attestation_caveat_fits_the_declared_version() -> None:
+    """The unattested-images caveat names the right tag, and only before 0.2.0."""
+    declared = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
+        "version"
+    ]
+    section = _section(DOCKER_REFERENCE.read_text(encoding="utf-8"), VERIFYING_HEADING)
+    assert "attestation" in section, "the verifying section names no attestation"
+    offences = _attestation_caveat_offences(section, declared)
     assert not offences, "\n".join(offences)

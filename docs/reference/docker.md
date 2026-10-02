@@ -73,13 +73,12 @@ does not exist yet. From its first final release on, they pin `X.Y`.
 
 ## Verifying the image
 
-Images published by the release pipeline from the next release onward carry
-two signed attestations, recorded with GitHub and pushed beside the image to
-the registry: a SLSA
-build-provenance attestation, recording which workflow run in
+Every image the release pipeline publishes after 0.2.0-rc.6 carries two signed
+attestations, recorded with GitHub and pushed beside the image to the registry:
+a SLSA build-provenance attestation, recording which workflow run in
 `kdknigga/saneless` built it from which commit, and an SPDX SBOM attestation
-listing what the image contains. **Images published before that -- 0.2.0-rc.6
-and every earlier tag -- carry neither**, so verifying one of them fails.
+listing what the image contains. **0.2.0-rc.6 and every earlier tag carry
+neither**, so verifying one of them fails.
 
 Attestations are bound to the image's digest, not to a tag, so start from the
 digest of the image you actually run. Replace `<image>` with the reference you
