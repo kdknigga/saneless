@@ -342,7 +342,7 @@ def _json_spelling_offences(text: str) -> list[str]:
                 parsed = json.loads(span)
             except ValueError:
                 continue
-            sent = JSONResponse(parsed).body.decode()
+            sent = bytes(JSONResponse(parsed).body).decode()
             if span != sent:
                 offences.append(f"{number}: {span} -> {sent}")
     return offences

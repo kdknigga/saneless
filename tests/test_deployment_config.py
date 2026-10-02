@@ -2364,7 +2364,8 @@ def test_every_connection_status_is_documented_in_the_web_api_reference() -> Non
     missing = [
         member.value
         for member in ConnectionStatus
-        if f"`{JSONResponse({'status': member.value}).body.decode()}`" not in text
+        if f"`{bytes(JSONResponse({'status': member.value}).body).decode()}`"
+        not in text
     ]
     assert not missing, f"{name} does not document these statuses: {missing}"
     count = _COUNT_WORDS[len(ConnectionStatus)]
