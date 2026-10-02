@@ -2933,7 +2933,8 @@ def test_the_citation_hook_covers_src_and_scripts() -> None:
 README_DOCS_LINK = re.compile(r"kdknigga\.github\.io/saneless/(?P<path>[^)\s]+)/")
 
 SCAN_EXAMPLE = "saneless scan"
-README_SOURCE_ASSIGNMENT = re.compile(r'source = "(?P<value>[^"]*)"')
+# A fenced TOML block in the README, at the left margin where it shows them.
+README_TOML_BLOCK = re.compile(r"^```toml\n(?P<body>.*?)^```", re.MULTILINE | re.DOTALL)
 
 
 def test_readme_scan_example_carries_a_title() -> None:
@@ -2951,29 +2952,34 @@ def test_readme_scan_example_carries_a_title() -> None:
     )
 
 
-def test_readme_source_values_are_real_sane_spellings() -> None:
+def test_readme_example_configs_leave_profile_generation_on(tmp_path: Path) -> None:
     """
-    Every README ``source`` value is the spelling the profile model ships.
+    Every README config example loads with only the untouched default profile.
 
-    saneless compares the configured source against the names the backend
-    reports, and that comparison is case-sensitive: ``"flatbed"`` does not
-    match the ``"Flatbed"`` every SANE backend returns, which is exactly why
-    the lowercase spelling in the README was a real bug and not a typo. The
-    expectation is read off ``ProfileConfig`` rather than written out here, so
-    changing the default cannot leave the front page quietly wrong.
+    The README tells the reader that profiles come from ``auto-profiles``, and
+    ``serve`` generates them at startup only while the config holds nothing
+    but the untouched ``default`` profile. A hand-written profile in a
+    front-page example would switch that off, and one with a source the
+    scanner does not offer (the ``Flatbed`` default on a sheet-fed scanner)
+    fails the first scan. Each block is loaded by the real loader and compared
+    with ``ProfileConfig()``, so the check cannot drift from the model.
     """
-    expected = ProfileConfig.model_fields["source"].default
-    offenders = [
-        f"{number}: {line.strip()}"
-        for number, line in _numbered(README)
-        for match in README_SOURCE_ASSIGNMENT.finditer(line)
-        if match.group("value") != expected
+    blocks = [
+        match.group("body")
+        for match in README_TOML_BLOCK.finditer(README.read_text(encoding="utf-8"))
     ]
+    assert blocks, "README.md shows no TOML config example to check"
+    offenders = []
+    for number, body in enumerate(blocks, start=1):
+        config = tmp_path / f"readme-{number}.toml"
+        config.write_text(body, encoding="utf-8")
+        profiles = load_settings(str(config)).profiles
+        if profiles != {"default": ProfileConfig()}:
+            offenders.append(f"block {number}: profiles {sorted(profiles)}")
     assert not offenders, (
-        f"a README profile example sets source to something other than "
-        f"{expected!r}, the spelling ProfileConfig defaults to and SANE "
-        "reports. The comparison is case-sensitive, so a near-miss selects no "
-        "source at all:\n" + "\n".join(offenders)
+        "a README config example writes its own scan profiles, which stops "
+        "`saneless serve` generating them from what the scanner reports and "
+        "can name a source the scanner does not have:\n" + "\n".join(offenders)
     )
 
 
