@@ -665,10 +665,11 @@ class ClickFlipCoordinator(FlipCoordinator):
             return FlipOutcome.ABORTED
         except _PromptTimedOut:
             return FlipOutcome.TIMED_OUT
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            # The read broke, so the scan stops now: ABORTED rather than a
-            # fourth outcome, with the exception kept as abort_cause so the
-            # pipeline reports a failure, not a cancel.
+        except (OSError, ValueError) as exc:
+            # The read broke, or the line could not be decoded (ValueError
+            # covers UnicodeDecodeError), so the scan stops now: ABORTED
+            # rather than a fourth outcome, with the exception kept as
+            # abort_cause so the pipeline reports a failure, not a cancel.
             logger.exception("Flip prompt failed; treating it as an abort")
             self._abort_cause = exc
             return FlipOutcome.ABORTED
@@ -869,10 +870,11 @@ class ClickPassCoordinator(PassCoordinator):
             return PassAnswer.ABORT
         except _PromptTimedOut:
             return PassAnswer.TIMED_OUT
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            # The read broke, so the scan stops now: ABORT, with the
-            # exception kept as abort_cause so the run reports a failure that
-            # keeps its pages rather than a cancel.
+        except (OSError, ValueError) as exc:
+            # The read broke, or the line could not be decoded (ValueError
+            # covers UnicodeDecodeError), so the scan stops now: ABORT, with
+            # the exception kept as abort_cause so the run reports a failure
+            # that keeps its pages rather than a cancel.
             logger.exception("Multi-page prompt failed; treating it as an abort")
             self._abort_cause = exc
             return PassAnswer.ABORT
