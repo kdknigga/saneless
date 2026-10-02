@@ -38,6 +38,7 @@ from saneless.scanner import listing as listing_mod
 from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
 from saneless.scanner.listing import ListingReply
+from saneless.sigpipe import block_sigpipe
 from saneless.vocabulary import FlipOutcome
 from tests.fake_clock import FakeClock
 
@@ -154,6 +155,27 @@ def _config_file_stamp(path: Path) -> tuple[int, int] | None:
     except FileNotFoundError:
         return None
     return status.st_mtime_ns, status.st_size
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _sigpipe_blocked_like_saneless() -> None:
+    """
+    Run the suite with SIGPIPE blocked, the way ``saneless.main()`` runs.
+
+    The suite drives libsane in this very process, as the shipped program
+    does, and libsane puts SIGPIPE back to its default action after a read
+    that ends with an error status.  ``saneless.main()`` blocks the signal
+    before anything else, but pytest never calls it, so without this a later
+    test's write to a closed socket would kill the whole run.
+
+    Defined first among the session fixtures, so it runs before any test or
+    fixture starts a thread: the mask belongs to a thread and is copied to
+    the threads it starts.  The check below makes a late call fail loudly
+    instead of leaving some threads unprotected.
+    """
+    assert threading.current_thread() is threading.main_thread()
+    assert threading.active_count() == 1, threading.enumerate()
+    block_sigpipe()
 
 
 @pytest.fixture(autouse=True, scope="session")
