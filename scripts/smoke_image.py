@@ -1031,8 +1031,7 @@ def check_config_data_dir(engine: Engine) -> None:
             probe=_DATA_DIR_PROBE,
         )
     finally:
-        engine.sh('exec "$SMOKE_DOCKER" rm -f -v "$SMOKE_NAME"', name=name)
-        shutil.rmtree(directory, ignore_errors=True)
+        _remove_leftovers(engine, name, directory=directory)
     if result.returncode != 0:
         msg = (
             f"with data_dir = {_SMOKE_DATA_DIR!r} in /etc/saneless/saneless.toml, "
@@ -1197,7 +1196,43 @@ def _served(engine: Engine, health_cmd: str | None = None) -> Generator[str]:
         _require_success(started, "starting the served container")
         yield name
     finally:
+        _remove_leftovers(engine, name)
+
+
+def _remove_leftovers(
+    engine: Engine,
+    name: str,
+    *,
+    volume: str | None = None,
+    directory: Path | None = None,
+) -> None:
+    """
+    Remove what a check created, every step even when one of them fails.
+
+    Called from a ``finally``, so it never raises: an engine command that
+    overruns is reported on stderr and the next step still runs, and the
+    exception the check itself raised, if any, is the one that propagates.
+
+    Args:
+        engine: The engine the container ran under.
+        name: The container to remove, with its anonymous volumes.
+        volume: A named volume to remove as well.
+        directory: A scratch directory to delete as well.
+
+    """
+    try:
         engine.sh('exec "$SMOKE_DOCKER" rm -f -v "$SMOKE_NAME"', name=name)
+    except SmokeFailure as exc:
+        sys.stderr.write(f"smoke test: cleanup of container {name}: {exc}\n")
+    if volume is not None:
+        try:
+            engine.sh(
+                'exec "$SMOKE_DOCKER" volume rm -f "$SMOKE_VOLUME"', volume=volume
+            )
+        except SmokeFailure as exc:
+            sys.stderr.write(f"smoke test: cleanup of volume {volume}: {exc}\n")
+    if directory is not None:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def _logs(engine: Engine, name: str) -> str:
@@ -1804,9 +1839,7 @@ def _run_documented(engine: Engine, page: Path) -> str:
                 msg = f"{exc}\ncontainer log:\n{_logs(engine, name)}"
                 raise SmokeFailure(msg) from exc
     finally:
-        engine.sh('exec "$SMOKE_DOCKER" rm -f -v "$SMOKE_NAME"', name=name)
-        engine.sh('exec "$SMOKE_DOCKER" volume rm -f "$SMOKE_VOLUME"', volume=volume)
-        shutil.rmtree(directory, ignore_errors=True)
+        _remove_leftovers(engine, name, volume=volume, directory=directory)
     return f"200 after {healthy:.1f} s, Scan enabled after {enabled:.1f} s"
 
 

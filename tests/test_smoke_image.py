@@ -26,6 +26,7 @@ import json
 import socket
 import tomllib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -37,6 +38,7 @@ from scripts.smoke_image import (
     SmokeFailure,
     _argv_lines,
     _host_endpoint,
+    _remove_leftovers,
     documented_docker_runs,
     fake_paperless,
     parse_documented_run,
@@ -44,6 +46,9 @@ from scripts.smoke_image import (
     scan_button_enabled,
     substitute_documented_run,
 )
+
+if TYPE_CHECKING:
+    import subprocess
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 README = REPO_ROOT / "README.md"
@@ -635,6 +640,31 @@ def test_docker_without_a_bridge_gateway_fails() -> None:
     """No gateway means the container could not reach the fake: say so."""
     with pytest.raises(SmokeFailure):
         _host_endpoint(_engine(podman=False), "")
+
+
+def test_a_cleanup_step_that_overruns_does_not_stop_the_rest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Container, volume and directory are each removed, and nothing raises."""
+    calls: list[str] = []
+
+    def overrun(
+        _engine: Engine, script: str, **_values: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(script)
+        msg = "engine command timed out"
+        raise SmokeFailure(msg)
+
+    monkeypatch.setattr(Engine, "sh", overrun)
+    directory = tmp_path / "scratch"
+    directory.mkdir()
+    _remove_leftovers(_engine(podman=False), "c", volume="v", directory=directory)
+    assert len(calls) == 2, calls
+    assert "volume rm" in calls[1]
+    assert not directory.exists()
+    assert capsys.readouterr().err.count("timed out") == 2
 
 
 def test_the_argv_travels_one_word_per_line() -> None:
