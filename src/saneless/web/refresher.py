@@ -57,6 +57,49 @@ class ManualProbe(StrEnum):
     PENDING = "pending"
 
 
+class _StopEvent(threading.Event):
+    """
+    The refresher's stop event, which a signal handler can also set, lock-free.
+
+    ``threading.Event.set`` holds the Event's own lock, which is not
+    reentrant.  ``serve``'s signal handlers run on the main thread, and the
+    lifespan stops the refresher on that same thread.  A handler that called
+    ``set`` while the call it interrupted was inside one would wait for ever
+    on that frame's lock, and the server would hang until it was killed.
+
+    :meth:`notice` is a single attribute store instead, as in
+    ``pipeline.Settled``, so a signal that lands anywhere, including inside a
+    ``set``, is safe.  :meth:`is_set` reports a notice as well as a ``set``.
+    That is all a notice reaches, and it is enough: every reader of this
+    event asks ``is_set``.  The idle loop and a waiting request sleep on the
+    refresher's condition, not on this event, and every probe polls its
+    abort.  So a probe in flight sees a notice at its next poll, and the run
+    starts no check after it.  :meth:`wait` would not see a notice, and
+    nothing calls it.  A notice cannot wake a sleeper either, because that
+    takes the condition's lock.  The idle loop sees it within
+    ``TICK_SECONDS`` instead, and turns it into a full stop on its own thread.
+    """
+
+    def __init__(self) -> None:
+        """Start clear: no stop has been asked for or noticed."""
+        super().__init__()
+        self._noticed = False
+
+    def notice(self) -> None:
+        """Record a stop, taking no lock."""
+        self._noticed = True
+
+    def is_set(self) -> bool:
+        """
+        Say whether a stop was noticed or set.
+
+        Returns:
+            Whether :meth:`notice` or ``set`` has been called.
+
+        """
+        return self._noticed or super().is_set()
+
+
 class CheckRefresher:
     """
     A daemon thread that refills the check cache, but only while someone looks.
@@ -117,7 +160,8 @@ class CheckRefresher:
         # cache read.
         self._probe_lock = threading.Lock()
         # Set once by stop(); read by the idle wait, which it wakes at once.
-        self._stopping = threading.Event()
+        # note_stop() only notices it, which wakes nobody; see _StopEvent.
+        self._stopping = _StopEvent()
         # Guards _requested and _completed, and is what a waiting request and
         # the idle loop both sleep on.  It is held only to read or move a
         # counter, never across a probe, so a request thread never waits
@@ -195,7 +239,11 @@ class CheckRefresher:
         Setting the event and waking whoever sleeps on the condition is the
         whole of it, and the condition is never held across a probe, so this
         never waits on one.  Calling it on a refresher that was never started
-        -- a lifespan that failed during startup -- is safe.
+        -- a lifespan that failed during startup -- is safe.  It does take the
+        condition's lock and the event's, though, and the event's is not
+        reentrant.  So a signal handler must not call it: it runs on the main
+        thread, and the main thread may be inside this very call when the
+        signal lands.  A signal handler calls :meth:`note_stop` instead.
 
         The same event is the abort every probe runs under, so it also stops
         a probe in flight, and no check after it runs.  A scanner listing ends
@@ -212,11 +260,11 @@ class CheckRefresher:
         for it.  A name lookup takes no timeout at all.  The Paperless check
         is one HTTP request of up to ``PROBE_CONNECT_SECONDS`` plus
         ``PROBE_READ_SECONDS``, longer than the lifespan's shared join.
-        ``serve`` therefore calls this as soon as the server is told to stop,
-        before uvicorn waits for the requests still being answered, and the
-        lifespan calls it again afterwards.  The run then ends after the check
-        in flight instead of going on to the next, and that check has the
-        request drain as well as the join to end in.  An idle server's drain
+        ``serve`` therefore calls :meth:`note_stop` as soon as the server is
+        told to stop, before uvicorn waits for the requests still being
+        answered, and the lifespan calls this afterwards.  The run then ends
+        after the check in flight instead of going on to the next, and that
+        check has the request drain as well as the join to end in.  An idle server's drain
         is short, though, so a stop early in a Paperless check, or in a slow
         name lookup, can still find the thread running when the join ends, and
         the lifespan then closes nothing.
@@ -229,6 +277,27 @@ class CheckRefresher:
             self._stopping.set()
             self._changed.notify_all()
 
+    def note_stop(self) -> None:
+        """
+        Record that the server has been told to stop, taking no lock.
+
+        This is the stop a signal handler gives.  It is one attribute store,
+        so it is safe wherever the signal lands, including inside the
+        lifespan's own :meth:`request_stop` on the same thread.  It is seen
+        everywhere :meth:`request_stop`'s event is read.  A probe in flight
+        sees it at its next poll, so a scanner listing or a saned probe is
+        aborted as by :meth:`request_stop`, and the run starts no check after
+        the one in flight.  The refresher's run then ends.
+
+        It wakes nobody, because waking takes the condition's lock.  An idle
+        refresher sees it within ``TICK_SECONDS``, and turns it into a full
+        :meth:`request_stop` on its own thread, which a signal never runs on.
+        That wakes any request still waiting.  The lifespan still calls
+        :meth:`request_stop` and joins the thread, so nothing closes under it.
+        Calling this more than once, or on a refresher never started, is safe.
+        """
+        self._stopping.notice()
+
     def stop(self, timeout: float | None = None) -> bool:
         """
         Stop the refresher and report whether the thread actually stopped.
@@ -239,16 +308,16 @@ class CheckRefresher:
         gone within about a second even mid-listing or waiting on a silent
         saned host.  It is not when the stop lands in the Paperless check's
         request or in a name lookup, which :meth:`request_stop` cannot cut
-        short, and which ``serve``'s early :meth:`request_stop` gives only the
-        request drain more to end in.  The join is bounded by the
-        worker's ``STOP_JOIN_SECONDS``, or by the caller's remaining share of
-        it: the lifespan takes one deadline for both threads, so what the
-        worker's join already spent is not spent again here.  When this
-        returns ``False`` the thread is still inside a probe and may still
-        write to the cache, so the lifespan must leave the Paperless client and
-        the scanner open.  Calling it again, or on a refresher never
-        started, is safe -- including after :meth:`request_stop`, which sets
-        the same event.
+        short, and which ``serve``'s early :meth:`note_stop` gives only the
+        request drain more to end in.  The join is bounded by the worker's
+        ``STOP_JOIN_SECONDS``, or by the caller's remaining share of it: the
+        lifespan takes one deadline for both threads, so what the worker's
+        join already spent is not spent again here.  When this returns
+        ``False`` the thread is still inside a probe and may still write to
+        the cache, so the lifespan must leave the Paperless client and the
+        scanner open.  Calling it again, or on a refresher never started, is
+        safe -- including after :meth:`request_stop` or :meth:`note_stop`,
+        which set the same event.
 
         Args:
             timeout: Seconds to wait for the thread, or ``None`` for the whole
@@ -292,6 +361,10 @@ class CheckRefresher:
                 self._changed.wait_for(self._woken, TICK_SECONDS)
                 requested = self._requested > self._completed
             if self._stopping.is_set():
+                # A stop note_stop() only noticed has woken nobody.  Made a
+                # full stop here, on a thread no signal handler runs on, it
+                # wakes a request still waiting for a probe that will not run.
+                self.request_stop()
                 return
             try:
                 if requested:

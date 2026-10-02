@@ -2413,10 +2413,14 @@ def _stop_the_refresher_early(app: FastAPI) -> None:
     join ends makes the lifespan leave the job store, the Paperless client and
     the scanner open.
 
-    Setting the refresher's stop event is all this does, and it never waits on
-    a check, so it is safe from a signal handler.  The lifespan's own request
-    is then a second one, which is harmless.  An app with no refresher, as in
-    a test, is left alone.
+    It runs in a signal handler, on the main thread, and the lifespan stops the
+    refresher on that same thread, both at shutdown and after a start-up that
+    failed part way.  A handler that took the refresher's locks could land
+    while the lifespan's own stop holds one, and wait on it for ever.  So this
+    only notes the stop, one attribute store that takes no lock, and the
+    refresher acts on it from its own thread.  The lifespan's own stop is then
+    a second one, which is harmless.  An app with no refresher, as in a test,
+    is left alone.
 
     Args:
         app: The app being served.
@@ -2424,7 +2428,7 @@ def _stop_the_refresher_early(app: FastAPI) -> None:
     """
     refresher = getattr(getattr(app, "state", None), "refresher", None)
     if isinstance(refresher, CheckRefresher):
-        refresher.request_stop()
+        refresher.note_stop()
 
 
 class _StoppingServer(uvicorn.Server):

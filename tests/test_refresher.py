@@ -1027,6 +1027,55 @@ def test_request_stop_on_a_refresher_that_never_started_is_safe(
     assert refresher.stop() is True
 
 
+def test_a_noted_stop_is_the_abort_a_probe_runs_under(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A stop a signal handler noted aborts a probe as a requested stop does.
+
+    The note takes no lock, so it cannot set the event itself.  Every probe
+    polls its abort, though, so the abort has to read as set.  A run that
+    ends that way stores nothing.
+    """
+    spy = _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+
+    refresher.note_stop()
+
+    assert refresher._probe_and_store() is True
+    [context] = spy.calls
+    assert context.abort is not None
+    assert context.abort.is_set() is True
+    assert cache.current().results is None
+    assert refresher.request_probe(wait=_JOIN_TIMEOUT_SECONDS) is ManualProbe.PENDING
+
+
+def test_a_noted_stop_ends_an_idle_refresher_with_a_full_stop(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    started_refreshers: list[CheckRefresher],
+) -> None:
+    """
+    An idle refresher sees a noted stop within a tick, and makes it a full stop.
+
+    The note wakes nobody, so the idle loop finds it on its next tick.  The
+    thread then sets the event for real, on its own thread, which is what
+    wakes a request still waiting.
+    """
+    _spy(monkeypatch)
+    monkeypatch.setattr(refresher_module, "TICK_SECONDS", 0.01)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    started_refreshers.append(refresher)
+    refresher.start()
+
+    refresher.note_stop()
+    refresher._thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
+
+    assert refresher._thread.is_alive() is False
+    assert threading.Event.is_set(refresher._stopping) is True
+    assert refresher.stop() is True
+
+
 def test_stop_is_safe_to_call_twice(
     default_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -1585,6 +1634,7 @@ class TestRequestProbe:
         public = {name for name in dir(CheckRefresher) if not name.startswith("_")}
         assert public == {
             "build_context",
+            "note_stop",
             "note_watcher",
             "probe_in_flight",
             "request_probe",

@@ -3941,8 +3941,8 @@ class TestServeCommand:
         asked: list[str] = []
         should_exit: list[bool] = []
 
-        def recording_request_stop() -> None:
-            asked.append("request_stop")
+        def recording_note_stop() -> None:
+            asked.append("note_stop")
 
         def signalled_run(
             self: uvicorn.Server, sockets: list[socket.socket] | None = None
@@ -3952,17 +3952,82 @@ class TestServeCommand:
             should_exit.append(self.should_exit)
             self.started = True
 
-        monkeypatch.setattr(refresher, "request_stop", recording_request_stop)
+        monkeypatch.setattr(refresher, "note_stop", recording_note_stop)
         monkeypatch.setattr(uvicorn.Server, "run", signalled_run)
         sock = socket.create_server(("127.0.0.1", 0))
         try:
             cli_module._run_server(app, [sock], "WARNING")
             assert should_exit == [True]
-            assert asked == ["request_stop"]
+            assert asked == ["note_stop"]
         finally:
             sock.close()
             app.state.paperless.close()
             app.state.job_store.close()
+
+    @pytest.mark.parametrize(
+        "stopping",
+        [
+            pytest.param(True, id="during-the-shutdown"),
+            pytest.param(False, id="after-a-failed-start-up"),
+        ],
+    )
+    def test_a_stop_signal_inside_the_refreshers_stop_does_not_hang(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, stopping: bool
+    ) -> None:
+        """
+        A signal that lands while the main thread stops the refresher is safe.
+
+        The lifespan stops the refresher on the main thread, both at shutdown
+        and after a start-up that failed part way, and uvicorn's signal handler
+        is installed throughout and runs on that same thread.  Setting a
+        ``threading.Event`` holds the Event's own lock, which is not
+        reentrant, so a handler that set the same Event from inside that call
+        would wait on the frame it interrupted, for ever.  The server would
+        then hang until it was killed.  After a failed start-up the server has
+        not been told to stop, so the handler cannot tell the two cases apart
+        by ``should_exit``.
+
+        The patched ``set`` stands in for the Event's lock: a second ``set``
+        of the refresher's stop event that begins while the first is still
+        inside is recorded instead of blocking.  The handler is called from
+        inside the first, as a signal arriving there would run it.
+        """
+        app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
+        refresher: CheckRefresher = app.state.refresher
+        server = cli_module._StoppingServer(uvicorn.Config(app), app)
+        server.should_exit = stopping
+        stop_event = refresher._stopping
+        real_set = threading.Event.set
+        inside = threading.Lock()
+        reentered: list[str] = []
+        signalled: list[signal.Signals] = []
+
+        def interrupted_set(event: threading.Event) -> None:
+            if event is not stop_event:
+                real_set(event)
+                return
+            if not inside.acquire(blocking=False):
+                reentered.append("set")
+                return
+            try:
+                if not signalled:
+                    signalled.append(signal.SIGTERM)
+                    server.handle_exit(signal.SIGTERM, None)
+                real_set(event)
+            finally:
+                inside.release()
+
+        monkeypatch.setattr(threading.Event, "set", interrupted_set)
+        try:
+            refresher.request_stop()
+        finally:
+            monkeypatch.undo()
+            app.state.paperless.close()
+            app.state.job_store.close()
+        assert signalled == [signal.SIGTERM]
+        assert reentered == []
+        assert server.should_exit is True
+        assert stop_event.is_set() is True
 
     def test_serve_port_0_binds_an_os_chosen_port_and_reports_it(
         self, monkeypatch: pytest.MonkeyPatch
