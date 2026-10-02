@@ -74,6 +74,7 @@ Replace the URL and token with your actual paperless-ngx address and API token. 
     - The container reads `/etc/saneless/saneless.toml` from the mounted `config` directory.
     - `saneless-data` is a named volume for the job database and any scans kept after a failed upload. Without it they vanish when the container is recreated.
     - `--stop-timeout 90` gives a stop during a scan time to keep the pages scanned so far. Without it Docker kills the container 10 seconds after asking it to stop.
+    - On a host with SELinux enforcing (Fedora, RHEL, Rocky), the container cannot read `config` until it is relabelled: write that mount as `-v "$(pwd)/config:/etc/saneless:z"`. See [Docker volumes](../reference/docker.md#volumes).
 
     !!! note "`SANELESS_SCANNER__HOST` is always required in a container"
         A container never reaches a USB scanner, and the image's `net.conf` is empty, so saneless finds no scanner until this variable names the machine running `saned`, even when that is the container's own host. For a `saned` on the Docker host, see [Which setup do I have?](which-setup.md). For multi-host setups, see [Scanner Host Discovery](../how-to/scanner-host-discovery.md).

@@ -63,6 +63,7 @@ docker run -d --name saneless -p 8080:8080 \
 - `SANELESS_SCANNER__HOST` names the machine running `saned`. A container always needs it, because it reaches scanners only over the network.
 - `saneless-data` is a named volume for the job database and any scans kept after a failed upload.
 - `--stop-timeout 90` gives a stop during a scan time to keep the pages scanned so far, as `stop_grace_period: 90s` does in the shipped `docker-compose.yml`.
+- On a host with SELinux enforcing (Fedora, RHEL, Rocky), the container cannot read `config` until it is relabelled: write that mount as `-v "$(pwd)/config:/etc/saneless:z"`. See [Docker volumes](https://kdknigga.github.io/saneless/reference/docker/#volumes).
 
 Open `http://localhost:8080` to scan. `docker exec saneless saneless doctor` checks the setup, and `docker exec saneless saneless auto-profiles` writes scan profiles into `config/saneless.toml` from what your scanner reports.
 
