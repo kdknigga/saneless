@@ -2099,10 +2099,15 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     """List recent scan job history."""
     settings = _load_cli_settings(ctx)
     # A read and nothing more: the history may belong to a running server, so
-    # this neither creates the database or its folder nor upgrades an older
-    # schema under it, and run by anyone but the database's owner it creates
-    # no -wal or -shm file beside it either.  No database yet is an empty
-    # history; one that cannot be reached is an error.
+    # the read neither creates the database or its folder nor upgrades an
+    # older schema under it, and run by anyone but the database's owner it
+    # creates no -wal or -shm file beside it either.  No database yet is an
+    # empty history; one that cannot be reached is an error.  The log file is
+    # outside that promise.  Like every one-shot command, this one has
+    # already set up the rotating log file above, and that may create
+    # data_dir and the log, or rotate the log into a fresh one, owned by
+    # whoever ran the command: root under sudo, in a data_dir the server
+    # shares.
     recent = read_recent_jobs(settings.output.db_path, limit)
     if as_json:
         click.echo(
