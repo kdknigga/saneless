@@ -2529,7 +2529,12 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
     # previous handler is put back however the run ends. As in
     # _install_interrupt_handlers, a handler installed from outside Python
     # (getsignal returns None) is left alone, since it could not be put back,
-    # and only the main thread may install one at all.
+    # and only the main thread may install one at all. Unlike there, a
+    # SIGTERM the command was started with ignored is replaced for the run:
+    # uvicorn replaces it with its own handler while it runs anyway, so a
+    # serve started that way still stops on SIGTERM, and this handler makes
+    # the moments before and after uvicorn's agree. The ignored disposition
+    # is what is put back.
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     owns_sigterm = (
         previous_sigterm is not None

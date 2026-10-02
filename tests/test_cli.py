@@ -3964,6 +3964,44 @@ class TestServeCommand:
             app.state.paperless.close()
             app.state.job_store.close()
 
+    def test_an_inherited_ignored_sigterm_still_stops_serve_and_is_put_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``serve`` stops on SIGTERM even when it was started with SIGTERM ignored.
+
+        uvicorn replaces an ignored SIGTERM with its own handler while it
+        runs, so ``serve``'s handler replaces it too, and a SIGTERM before
+        uvicorn's handler is in place stops the server as one during the run
+        would.  The ignored disposition is put back once the run returns.
+        """
+        assert threading.current_thread() is threading.main_thread()
+        app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
+        refresher: CheckRefresher = app.state.refresher
+        should_exit: list[bool] = []
+
+        def signalled_run(
+            self: uvicorn.Server, sockets: list[socket.socket] | None = None
+        ) -> None:
+            del sockets
+            signal.raise_signal(signal.SIGTERM)
+            should_exit.append(self.should_exit)
+            self.started = True
+
+        monkeypatch.setattr(refresher, "note_stop", lambda: None)
+        monkeypatch.setattr(uvicorn.Server, "run", signalled_run)
+        previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        sock = socket.create_server(("127.0.0.1", 0))
+        try:
+            cli_module._run_server(app, [sock], "WARNING")
+            assert should_exit == [True]
+            assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+            sock.close()
+            app.state.paperless.close()
+            app.state.job_store.close()
+
     @pytest.mark.parametrize(
         "stopping",
         [
