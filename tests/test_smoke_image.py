@@ -48,6 +48,7 @@ from scripts.smoke_image import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 README = REPO_ROOT / "README.md"
 QUICK_START = REPO_ROOT / "docs" / "getting-started" / "quick-start.md"
+WHICH_SETUP = REPO_ROOT / "docs" / "getting-started" / "which-setup.md"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 # The published image, assembled from its parts: every tracked file is swept
@@ -464,6 +465,27 @@ def test_real_readme_and_quick_start_show_the_same_complete_run() -> None:
     assert any(item.startswith(SCANNER_HOST_ENV) for item in run.env), run.env
     assert run.stop_timeout == "90"
     assert run.image == f"{IMAGE_NAME}:{_declared_version()}"
+
+
+def test_real_which_setup_runs_have_the_quick_start_shape() -> None:
+    """
+    The setup-shape runs pass the allow-list and match README's shape.
+
+    Quick Start, which these shapes lead to, runs ``docker exec saneless``,
+    so each run must start detached under that name. The smoke run does not
+    execute these commands, so this is where their flags are validated.
+    """
+    runs = documented_docker_runs(WHICH_SETUP.read_text(encoding="utf-8"))
+    assert len(runs) == 2, f"which-setup.md shows {len(runs)} runs: {runs}"
+    parsed = [parse_documented_run(argv) for argv in runs]
+    for run in parsed:
+        assert run.name == "saneless", run
+        assert run.detach, run
+        assert run.data_volume, run
+        assert any(item.startswith(SCANNER_HOST_ENV) for item in run.env), run.env
+        assert run.stop_timeout == "90", run
+        assert run.image == f"{IMAGE_NAME}:{_declared_version()}", run
+    assert parsed[0].add_hosts == ("host.docker.internal:host-gateway",)
 
 
 # ---------------------------------------------------------------------------

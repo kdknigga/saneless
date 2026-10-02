@@ -62,7 +62,7 @@ on that box, and `SANELESS_SCANNER__HOST` pointing at it -- either
 === "docker run"
 
     ```bash
-    docker run -p 8080:8080 \
+    docker run -d --name saneless -p 8080:8080 \
       --stop-timeout 90 \
       --add-host=host.docker.internal:host-gateway \
       -v "$(pwd)/config:/etc/saneless" \
@@ -131,7 +131,7 @@ machine that has the scanner.
 === "docker run"
 
     ```bash
-    docker run -p 8080:8080 \
+    docker run -d --name saneless -p 8080:8080 \
       --stop-timeout 90 \
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
