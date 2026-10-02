@@ -79,7 +79,8 @@ services:
       - TZ=America/Chicago
       # The paperless URL and token are NOT set here on purpose: anything set
       # here overrides saneless.toml silently. See below.
-      # Uncomment for network scanners:
+      # Required: uncomment and set to the machine running saned, even when
+      # that is this Docker host. See "Scanner host" below.
       # - SANELESS_SCANNER__HOST=192.168.1.50
     restart: unless-stopped
     # Time for a stopped scan's pages to be copied into failed/ before Docker
@@ -114,7 +115,7 @@ Key details:
 - **Config mount:** `./config:/etc/saneless` -- a read-write directory mount. saneless replaces `saneless.toml` atomically (it writes a temp file in the same directory, then renames it over the original). A single-file bind mount makes that rename fail with EBUSY; see [Moving from a single-file config mount](#moving-from-a-single-file-config-mount)
 - **Data volume:** `saneless-data:/var/lib/saneless` is required, not optional. It holds the job database and the `failed/` directory, where saneless preserves any scan it could not deliver to paperless-ngx. The image sets `XDG_STATE_HOME=/var/lib`, so its defaults put the job database, `failed/` and the log of one-shot commands such as `saneless jobs` under `/var/lib/saneless`, and mounting the volume there is all that is needed. See [Docker volumes](../reference/docker.md#volumes) for what accumulates in `failed/` and how to drain it
 - **Reaching paperless-ngx:** the two stacks are separate compose projects, so each gets its own network and the name `paperless` does not resolve from here on its own. Either join the paperless-ngx network -- uncomment both `networks:` blocks above, after checking the real name with `docker network ls` -- and keep `url = "http://paperless:8000"`, or leave the networks alone and point `url` at the host the paperless-ngx stack publishes on, such as `http://192.168.1.10:8000`. Whichever you pick, the URL has to resolve from *inside* the saneless container: `localhost` there is the container itself, not your host
-- **Network scanners:** Set `SANELESS_SCANNER__HOST=192.168.1.50` to discover scanners on a remote host. See [Scanner Host Discovery](scanner-host-discovery.md) for details
+- **Scanner host (required):** uncomment `SANELESS_SCANNER__HOST` and set it to the machine running `saned`. A container reaches every scanner over the SANE network protocol and the image's `net.conf` is empty, so without it saneless finds no scanner at all -- even one plugged into the Docker host itself. For a `saned` on the Docker host, set it to `host.docker.internal` and add `extra_hosts: ["host.docker.internal:host-gateway"]` to the service, as [Which setup do I have?](../getting-started/which-setup.md) shows. See [Scanner Host Discovery](scanner-host-discovery.md) for details
 
 ### Moving from a single-file config mount
 

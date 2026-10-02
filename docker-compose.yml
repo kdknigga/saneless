@@ -62,7 +62,12 @@ services:
       # status strip would stay red with nothing on screen to say why.
       # - SANELESS_PAPERLESS__URL=http://paperless:8000
       # - SANELESS_PAPERLESS__TOKEN=your-api-token-here
-      # Uncomment to discover scanners on a remote host via SANE net backend:
+      # REQUIRED: uncomment and set this to the machine running saned. A
+      # container reaches scanners only over the SANE network protocol, so
+      # saneless finds none without it -- even a USB scanner plugged into this
+      # Docker host. For a saned on this host, set it to host.docker.internal
+      # and add  extra_hosts: ["host.docker.internal:host-gateway"]  to the
+      # service.
       # - SANELESS_SCANNER__HOST=192.168.1.50
       # Multiple hosts use colons: SANELESS_SCANNER__HOST=192.168.1.50:192.168.1.51
     restart: unless-stopped

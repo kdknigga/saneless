@@ -37,7 +37,9 @@ The examples use an HP LaserJet 3030, an all-in-one with a glass and a document 
     This tutorial assumes the compose deployment. Follow Steps 1 to 3 of
     [Deploy with Docker Compose](../how-to/deploy-docker-compose.md): they create
     `config/saneless.toml` and `docker-compose.yml`, and start the `saneless`
-    service. Every command in this tutorial then runs inside that service, as
+    service. In Step 2 there, uncomment `SANELESS_SCANNER__HOST` and set it to
+    the machine running `saned`: a container finds no scanner without it, even
+    one plugged into its own host. Every command in this tutorial then runs inside that service, as
     `docker compose exec saneless saneless …`.
 
 ## Step 2: Create a configuration file
@@ -60,7 +62,7 @@ token = "your-api-token-here"
 
 Replace the URL and token with your actual paperless-ngx address and API token. Leave scan profiles out: Step 4 asks the scanner what it offers and writes them into this file. [Where saneless reads settings](../reference/configuration.md#where-saneless-reads-settings) explains how saneless finds the file.
 
-If your scanner is attached to another machine running `saned`, as the example scanner is, saneless needs that machine's address. On bare metal, add `host = "192.168.1.50"` under a `[scanner]` table in this file. In the compose deployment, `SANELESS_SCANNER__HOST` in the compose file sets it.
+If your scanner is attached to another machine running `saned`, as the example scanner is, saneless needs that machine's address. On bare metal, add `host = "192.168.1.50"` under a `[scanner]` table in this file. In the compose deployment, `SANELESS_SCANNER__HOST` in the compose file sets it, and it is required there whatever machine the scanner is attached to.
 
 ## Step 3: Verify your scanner is detected
 
