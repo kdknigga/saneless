@@ -71,6 +71,7 @@ from saneless.exceptions import (
     ListingTimedOutError,
 )
 from saneless.scanner.net_hosts import SANE_NET_HOSTS, effective_sane_net_hosts
+from saneless.sigpipe import sigpipe_unblocked
 
 if TYPE_CHECKING:
     import threading
@@ -410,19 +411,22 @@ def run_listing_child(
     env[_CHILD_VARIABLE] = str(_CHILD_FILE)
     line = request.to_line(math.ceil(deadline) + _ALARM_MARGIN_SECONDS)
     try:
-        proc = subprocess.Popen(
-            (
-                "/bin/sh",
-                "-c",
-                'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
-            ),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=None,
-            env=env,
-            close_fds=True,
-            start_new_session=True,
-        )
+        # The child inherits this thread's signal mask, and must not start
+        # with SIGPIPE blocked the way saneless runs.
+        with sigpipe_unblocked():
+            proc = subprocess.Popen(
+                (
+                    "/bin/sh",
+                    "-c",
+                    'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
+                ),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
+            )
     except OSError as exc:
         # The fork or the exec failed, for instance under a process or memory
         # limit: nothing ran, so nothing could be seen.
