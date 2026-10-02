@@ -34,6 +34,8 @@ markdown_extensions:
   - attr_list
   - def_list
   - tables
+  - pymdownx.snippets:
+      check_paths: true
 
 # By default mkdocs only logs a dead `page.md#anchor` at INFO, so `--strict` lets
 # it through. At `warn`, `mkdocs build --strict` fails on one. Do not add `-q` to
@@ -68,3 +70,4 @@ nav:
     - Architecture Overview: explanation/architecture.md
     - Empty Page Detection: explanation/empty-page-detection.md
     - Consume Directory Fallback: explanation/consume-directory-fallback.md
+  - Changelog: changelog.md
