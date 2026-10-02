@@ -175,6 +175,12 @@ CI runs this marker too, as its own step in the `test` job, so these are not
 optional local extras: a red `sane_hardware` run blocks merge exactly like a red
 lint or a red unit test.
 
+The `slow` marker labels a test that takes tens of seconds: the loop in
+`tests/test_libsane_reader_exit.py` that runs a hundred whole saneless processes to
+show a failed libsane read never leaves one hung. It is also `sane_hardware`, so CI
+runs it in that step; nothing deselects `slow` by default. Add `-m "not slow"` for a
+quicker local run.
+
 A test that hangs is not allowed to hang the run: `pytest-timeout` is configured in
 `pyproject.toml` with `timeout = 60` and `timeout_method = "signal"`, so a stuck test
 fails on its own with a traceback while the rest of the suite keeps going.

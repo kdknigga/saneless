@@ -63,16 +63,23 @@ def _sigpipe_ignored():
 def probe():
     import sane
 
+    from saneless.scanner import sane_backend
+
     sane.init()
     device = sane.open("test:0")
     try:
         device.source = "Flatbed"
         device.read_return_value = STATUS
+        # Read and cancel the way saneless does: the cancel waits for the
+        # backend's reader thread to end, so it cannot kill it holding a lock.
+        before = sane_backend._native_thread_ids()
         device.start()
         try:
-            device.snap()
+            device.snap(no_cancel=True)
         except Exception:  # the test backend's read error is the point
             pass
+        sane_backend._await_backend_threads(before)
+        device.cancel()
         if not _sigpipe_ignored():
             print("sigpipe-default", flush=True)
     finally:
@@ -85,11 +92,6 @@ def probe():
         print("broken-pipe", flush=True)
     finally:
         a.close()
-    # After a read that ends in an error status, libsane's reader thread is
-    # cancelled, and now and then that leaves a loader lock held, so the
-    # process hangs in its exit handlers -- with or without SIGPIPE blocked.
-    # The verdict is already printed, so the probe leaves without them.
-    os._exit(0)
 
 
 saneless.cli.cli = probe

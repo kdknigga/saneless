@@ -42,6 +42,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Protocol, assert_never
 
 from PIL import Image
@@ -1658,6 +1659,112 @@ _READER_THREAD_PREFIX = "sane-read-"
 # a cancel the scanner is slow to answer leaves it running past the grace.
 _CANCEL_THREAD_NAME = "sane-cancel"
 
+# How long a failed read waits for the threads the backend started for it to
+# end, before anything may cancel the read.
+#
+# Some backends read the scanner on a native thread of their own, started by
+# ``sane_start``, and stop it from ``sane_cancel`` with an *asynchronous*
+# ``pthread_cancel``, which kills the thread at whatever instruction it has
+# reached: libsane's ``test`` backend on every cancel, and ``avision``, ``hp``,
+# ``umax`` and ``hp3500`` when a scan is cancelled.  When the thread is inside
+# the C library holding one of its locks -- a ``malloc`` arena lock, as it
+# frees its buffers on the way out -- the lock is never released.  The thread
+# then deadlocks on itself as it ends, and ``sane_cancel``, which waits for it,
+# never returns; or another lock is left held and the process hangs later.
+#
+# A read that fails does so within a fraction of a millisecond of
+# ``sane_start`` when the backend reports the error before reading, and the
+# cancel used to follow at once: python-sane's ``snap()`` sends it itself, and
+# the feeder iterator's finaliser right after.  The reader thread was then
+# still running, about one time in twenty measured.  So a failed read now
+# waits for the threads it started to end, and only then is it cancelled --
+# by the device context, or by the feeder iterator's finaliser.  The ``test``
+# backend's reader ends within a millisecond when nothing is reading from it;
+# one second is ample, and it bounds the cost when a reader does not end on
+# its own, such as one blocked writing a page nobody will read.  The cancel
+# then finds it blocked in a system call, where a cancel is harmless.
+#
+# Which threads?  The process's native thread ids (``/proc/self/task``) are
+# read immediately before the read starts, and the wait is for ids that are
+# new since then and are not Python threads.  Python threads -- the web
+# server's, the job worker's, this module's own reader and cancel threads --
+# are recognised by ``threading.enumerate()``'s ``native_id`` and never waited
+# for, re-read on every poll so one that starts during the wait is recognised
+# too.  No second read can be running alongside: the server's scans all hold
+# the worker's scanner gate, and the CLI makes one scan at a time.  A native thread some other library starts in the
+# window would be waited for until it ends or the bound runs out: one second
+# at most, and only after a read has already failed.  A thread id reused
+# within the window would go unnoticed, which only means not waiting.
+#
+# What this does not cover: a read cancelled while it is still running -- a
+# page that timed out, Ctrl-C, a server stop -- has to be cancelled then and
+# there, so on the backends above that cancel can still hit a reader holding
+# a lock, and nothing here bounds what follows.  Nor does it reach a backend
+# that cancels its own reader inside ``sane_read`` as a page ends normally.
+_BACKEND_THREAD_EXIT_SECONDS: Final = 1.0
+
+# How often the wait above looks again.  A reader ends in well under a
+# millisecond once it has finished, so finer polling would buy nothing.
+_BACKEND_THREAD_POLL_SECONDS: Final = 0.001
+
+# Where Linux lists this process's native threads, one directory per id.
+_TASK_DIR: Final = Path("/proc/self/task")
+
+
+def _native_thread_ids() -> frozenset[int] | None:
+    """
+    List this process's native thread ids.
+
+    Returns:
+        The ids, or ``None`` where the kernel does not list them, in which
+        case there is nothing to wait for.
+
+    """
+    try:
+        return frozenset(int(entry.name) for entry in _TASK_DIR.iterdir())
+    except OSError:
+        return None
+
+
+def _await_backend_threads(
+    before: frozenset[int] | None,
+    limit: float = _BACKEND_THREAD_EXIT_SECONDS,
+) -> bool:
+    """
+    Wait, bounded, for native threads started since ``before`` to end.
+
+    Python threads are excluded, as the comment on
+    ``_BACKEND_THREAD_EXIT_SECONDS`` explains.
+
+    Args:
+        before: The ids ``_native_thread_ids`` returned just before the read
+            started, or ``None`` when they could not be listed.
+        limit: The most seconds to wait.
+
+    Returns:
+        True if no such thread is left; False if one still was when the wait
+        ran out.
+
+    """
+    if before is None:
+        return True
+    deadline = time.monotonic() + limit
+    while True:
+        current = _native_thread_ids()
+        if current is None:
+            return True
+        python_threads = {thread.native_id for thread in threading.enumerate()}
+        if not current - before - python_threads:
+            return True
+        if time.monotonic() >= deadline:
+            logger.debug(
+                "A thread the scanner backend started was still running %.1fs "
+                "after its read failed; cancelling anyway",
+                limit,
+            )
+            return False
+        time.sleep(_BACKEND_THREAD_POLL_SECONDS)
+
 
 def _restore_sane_net_hosts() -> None:
     """
@@ -2289,6 +2396,13 @@ def _acquire_with_timeout(
     ``start()`` returned, and the liveness check for one that landed inside it,
     after the thread had already been handed to the OS.
 
+    When the work fails, the reader waits, up to a second, for the native
+    threads the backend started for the read to end before it reports the
+    failure, so that no cancel sent afterwards -- by the device context or by
+    the feeder iterator's finaliser -- can land on a backend thread that is
+    still running (``_BACKEND_THREAD_EXIT_SECONDS``).  The timeout path cannot
+    wait like that: a read still running has to be cancelled as it is.
+
     The reader catches ``BaseException`` and stores it: nothing may reach
     ``threading.excepthook``, where an unhandled thread exception becomes a
     ``PytestUnhandledThreadExceptionWarning`` and, under this project's
@@ -2317,11 +2431,17 @@ def _acquire_with_timeout(
     slot = _Slot()
 
     def read() -> None:
+        # Listed before the work starts the read, so the threads the backend
+        # starts for it are the ones that are new afterwards.
+        before = _native_thread_ids()
         try:
             slot.value = work()
         except BaseException as exc:
             # Handed to the waiter rather than raised: see the docstring.
             slot.error = exc
+            # Before ``done`` is set, so nothing can cancel this failed read
+            # while the backend's own reader is still running.
+            _await_backend_threads(before)
         finally:
             done.set()
             _release_wedge(dev, done, _READER)
@@ -3368,7 +3488,11 @@ def _snap_flatbed(
 
     def start_and_snap() -> Image.Image:
         dev.start()
-        return dev.snap()
+        # No cancel from snap() itself when the read fails: it would go out
+        # while the backend's reader thread may still be running.  The device
+        # context cancels instead, once the reader has ended
+        # (``_acquire_with_timeout``, ``_BACKEND_THREAD_EXIT_SECONDS``).
+        return dev.snap(no_cancel=True)
 
     try:
         image = _acquire_with_timeout(dev, start_and_snap, _page_label(0), budget)
@@ -3426,7 +3550,7 @@ class SaneDevice(Protocol):
     def get_options(self) -> list: ...
     def get_parameters(self) -> tuple[str, int, tuple[int, int], int, int]: ...
     def start(self) -> None: ...
-    def snap(self) -> Image.Image: ...
+    def snap(self, *, no_cancel: bool = False) -> Image.Image: ...
     def multi_scan(self) -> Iterator[Image.Image]: ...
     def cancel(self) -> None: ...
     def close(self) -> None: ...
@@ -3569,6 +3693,11 @@ class SaneBackend(ScannerBackend):
         has released it, so a close racing a blocked read is the one sequence
         python-sane cannot survive.  The handle is released later by
         the reader thread itself, and until then the wedge record holds it.
+
+        After a failed flatbed read the routine cancel is that read's cancel
+        as well, since ``snap()`` is told not to send one, and it comes only
+        once the backend's reader thread has ended
+        (``_BACKEND_THREAD_EXIT_SECONDS``).
 
         Every handle is counted from a successful open until its close was
         attempted (``_OpenHandles``), so ``reinitialise()`` can refuse to

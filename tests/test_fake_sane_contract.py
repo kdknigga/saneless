@@ -72,6 +72,9 @@ _UNKNOWN_NAME = "no_such_option"
 # A method name, assigned to spy on it: python-sane stores any name that is not
 # an option on the handle itself, which shadows the method of that name.
 _CANCEL = "cancel"
+# The other two the libsane target wraps, by the same route.
+_START = "start"
+_CLOSE = "close"
 
 # The options the rows below assign on the real device, in the order they are
 # put back.  Read once before the first row touches them and written back
@@ -154,6 +157,46 @@ class _FakeTarget:
                 self._device.load_feeder([])
 
 
+def _cancel_only_once_the_reader_has_ended(handle: SaneDevice) -> None:
+    """
+    Make the handle's cancel and close wait for the reader its start began.
+
+    The ``test`` backend reads on a thread of its own and stops it with an
+    asynchronous cancel, which can kill it holding a C library lock if it is
+    still running -- and this suite runs in one process, so a lock left held
+    would hang a later test or the run's exit.  The handle is told to wait,
+    up to a second, exactly as saneless waits after a failed read
+    (``_await_backend_threads``).  A row that spies on ``cancel`` replaces
+    this wrapper with its spy, which is fine: such a row reads nothing.
+
+    Args:
+        handle: A freshly opened python-sane handle.
+
+    """
+    real_start = handle.start
+    real_cancel = handle.cancel
+    real_close = handle.close
+    started: list[frozenset[int] | None] = [None]
+
+    def start() -> None:
+        started[0] = sane_backend_mod._native_thread_ids()
+        real_start()
+
+    def cancel() -> None:
+        sane_backend_mod._await_backend_threads(started[0])
+        real_cancel()
+
+    def close() -> None:
+        sane_backend_mod._await_backend_threads(started[0])
+        real_close()
+
+    # python-sane keeps any name that is not an option on the handle itself,
+    # where it shadows the method of that name.
+    setattr(handle, _START, start)
+    setattr(handle, _CANCEL, cancel)
+    setattr(handle, _CLOSE, close)
+
+
 class _LibsaneTarget:
     """libsane's ``test:0`` device, opened through python-sane."""
 
@@ -186,6 +229,7 @@ class _LibsaneTarget:
 
         """
         handle = self._sane.open(_DEVICE)
+        _cancel_only_once_the_reader_has_ended(handle)
         self._handles.append(handle)
         return handle
 
@@ -263,6 +307,10 @@ def _read_one_page(handle: SaneDevice) -> Image.Image:
     """
     Start a frame and read it, as a single-page scan does.
 
+    Like saneless's flatbed scan, it tells ``snap()`` not to cancel by itself
+    when the read fails: the cancel comes later, once the backend's reader
+    has ended.
+
     Args:
         handle: The open handle.
 
@@ -271,7 +319,7 @@ def _read_one_page(handle: SaneDevice) -> Image.Image:
 
     """
     handle.start()
-    return handle.snap()
+    return handle.snap(no_cancel=True)
 
 
 class TestStringLists:

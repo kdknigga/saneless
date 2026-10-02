@@ -39,6 +39,7 @@ from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
 from saneless.scanner.listing import ListingReply
 from saneless.sigpipe import block_sigpipe
+from saneless.thread_unwinder import load_thread_unwinder
 from saneless.vocabulary import FlipOutcome
 from tests.fake_clock import FakeClock
 
@@ -162,6 +163,9 @@ def _sigpipe_blocked_like_saneless() -> None:
     """
     Run the suite with SIGPIPE blocked, the way ``saneless.main()`` runs.
 
+    It also loads the C library's thread unwinder, the next thing
+    ``saneless.main()`` does, for the reason given at the call below.
+
     The suite drives libsane in this very process, as the shipped program
     does, and libsane puts SIGPIPE back to its default action after a read
     that ends with an error status.  ``saneless.main()`` blocks the signal
@@ -176,6 +180,11 @@ def _sigpipe_blocked_like_saneless() -> None:
     assert threading.current_thread() is threading.main_thread()
     assert threading.active_count() == 1, threading.enumerate()
     block_sigpipe()
+    # And the unwinder is loaded up front, as ``saneless.main()`` loads it
+    # next: otherwise the first libsane reader thread to end loads it, and a
+    # cancel landing in that load leaves the loader's lock held, which hangs
+    # the run in its exit handlers after the last test has passed.
+    load_thread_unwinder()
 
 
 @pytest.fixture(autouse=True, scope="session")
