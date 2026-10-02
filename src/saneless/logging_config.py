@@ -190,7 +190,7 @@ def configure_logging(
     ``None`` rather than a separate ``stream=True`` flag is deliberate twice
     over: a service genuinely has no log file, so the two modes cannot be
     asked for contradictorily; and ruff's ``PLR0913`` ceiling is five
-    parameters, which this signature already sits on, and CLAUDE.md forbids
+    parameters, which this signature already sits on, and the project forbids
     both a suppression and raising the limit.
 
     Args:

@@ -1436,7 +1436,7 @@ class _Init:
 
     Module-level and **mutated, never rebound**, for the reason ``_Wedge``
     gives: rebinding a module-level name needs a ``global`` statement, which
-    the ``PL`` rules in ruff's ``select`` reject, and CLAUDE.md forbids adding
+    the ``PL`` rules in ruff's ``select`` reject, and the project forbids adding
     a second suppression to say otherwise.  Keeping it beside ``_WEDGE`` also
     keeps this module's process-global state in one place rather than two.
 

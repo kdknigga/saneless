@@ -1202,7 +1202,7 @@ class _StatusFacts:
 
     Bundled rather than passed one by one because passing them separately
     would take ``_status_context`` past ``PLR0913``'s five-parameter ceiling.
-    A suppression is forbidden (CLAUDE.md), and ``create_job`` already
+    A suppression is forbidden in this project, and ``create_job`` already
     had to take the same route, so the frozen dataclass is the established
     answer here.
 
