@@ -21,12 +21,13 @@ services:
     # The image already runs as UID/GID 1000, so on a single-user Linux host --
     # where ./config is 1000:1000 because you created it -- this needs no
     # action and stays commented. Uncomment and edit it only if your own UID
-    # differs, or instead run `chown -R 1000:1000 ./config` once. Either way
-    # the ./config mount below has to stay writable: saneless rewrites profiles
-    # by renaming a temp file over saneless.toml, and it cannot do that in a
-    # directory it cannot write. A literal, not "${UID}:${GID}" -- compose does
-    # not populate UID unless your shell exports it, and the silent fallback is
-    # a container that fails to start for no visible reason.
+    # differs, or instead run `sudo chown -R 1000:1000 ./config` once (giving
+    # files to another UID needs root). Either way the ./config mount below
+    # has to stay writable: saneless rewrites profiles by renaming a temp file
+    # over saneless.toml, and it cannot do that in a directory it cannot write.
+    # A literal, not "${UID}:${GID}" -- compose does not populate UID unless
+    # your shell exports it, and the silent fallback is a container that fails
+    # to start for no visible reason.
     # user: "1000:1000"
     volumes:
       # ./config holds saneless.toml. Mount the directory, not the file, and

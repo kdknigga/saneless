@@ -31,10 +31,10 @@ Leave the scan profiles out. When the file holds none, saneless [generates profi
     The container reads `/etc/saneless/saneless.toml` from the mounted `./config` directory. If `saneless.toml` is missing, saneless uses its defaults plus environment variables and the container still starts. The directory must be writable by the container, because `saneless auto-profiles` and the profile generation at startup rewrite `saneless.toml` there. With no `saneless.toml`, `docker compose exec saneless saneless auto-profiles` creates `/etc/saneless/saneless.toml` in the mounted `./config` directory, because that directory exists and the container can write to it; you do not need to create the file first. The new file has mode `0600`, and when the command runs as root it is given the directory's owner. The profile generation at startup never creates the file: without `saneless.toml`, the server keeps the profiles it generates in memory only. If the container cannot write to `./config`, `auto-profiles` does not fall back to the data volume. It tries the per-user file under the container user's home instead, which the image does not provide, and exits 2 naming it and saying why `/etc/saneless` was passed over: `mounted read-only` means the volume line ends in `:ro`, so remove it; `not writable by this user` means fix the ownership as the next note describes. Then run it again. Keep only `saneless.toml` in the directory, and do not let untrusted users write to it.
 
 !!! note "If your user ID is not 1000"
-    The container runs as UID/GID **1000**, not root, so it writes to `./config` as 1000 no matter who owns the directory on the host. On a single-user Linux machine your own account is already 1000 and the directory you just created belongs to it, so there is nothing to do. If `id -u` reports anything else, hand the directory over once:
+    The container runs as UID/GID **1000**, not root, so it writes to `./config` as 1000 no matter who owns the directory on the host. On a single-user Linux machine your own account is already 1000 and the directory you just created belongs to it, so there is nothing to do. If `id -u` reports anything else, hand the directory over once. Only root can give a file to another user, so this needs `sudo`; a plain `chown` fails with `Operation not permitted`:
 
     ```bash
-    chown -R 1000:1000 ./config
+    sudo chown -R 1000:1000 ./config
     ```
 
     A bind mount keeps the host's ownership -- unlike the named data volume, which inherits 1000 from the image -- so without this the container cannot rewrite `saneless.toml`, and saving a generated profile fails. The alternative is the commented `user:` line in the compose file below, which runs the container as your UID instead.
@@ -55,9 +55,10 @@ services:
     # The image already runs as UID/GID 1000, so on a single-user Linux host --
     # where ./config is 1000:1000 because you created it -- this needs no
     # action and stays commented. Uncomment and edit it only if your own UID
-    # differs, or run `chown -R 1000:1000 ./config` once instead. A literal,
-    # not "${UID}:${GID}": compose does not populate UID unless your shell
-    # exports it, and the silent fallback is a container that will not start.
+    # differs, or run `sudo chown -R 1000:1000 ./config` once instead. A
+    # literal, not "${UID}:${GID}": compose does not populate UID unless your
+    # shell exports it, and the silent fallback is a container that will not
+    # start.
     # user: "1000:1000"
     volumes:
       - ./config:/etc/saneless

@@ -148,7 +148,8 @@ machine that has the scanner.
 - **The container's port is fixed at 8080.** Change the left-hand half of the
   mapping to serve it elsewhere, for example `-p 8888:8080`.
 - **The image runs as UID 1000.** If `id -u` on your host reports something else,
-  run `chown -R 1000:1000 ./config` once. See [Docker](../reference/docker.md).
+  run `sudo chown -R 1000:1000 ./config` once; a plain `chown` to another user
+  fails without root. See [Docker](../reference/docker.md).
 - **`--stop-timeout 90` belongs on every `docker run`.** Docker kills a
   container 10 seconds after asking it to stop unless told otherwise, and a stop
   during a scan may need longer to keep the pages scanned so far. The shipped

@@ -32,7 +32,7 @@ Write your paperless-ngx connection details into `saneless.toml` before you star
     token = "your-api-token-here"
     ```
 
-    The container runs as UID 1000 and saves the profiles it generates into this directory, so keep it writable by that user. If `id -u` reports something else, run `chown -R 1000:1000 config` once.
+    The container runs as UID 1000 and saves the profiles it generates into this directory, so keep it writable by that user. If `id -u` reports something else, run `sudo chown -R 1000:1000 config` once. Giving a file to another user needs root, so a plain `chown` fails with `Operation not permitted`.
 
 === "Bare metal"
 

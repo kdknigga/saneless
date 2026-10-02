@@ -117,10 +117,12 @@ mounted host directory is owned by 1000. On a single-user Linux host your own
 account is 1000, so the `./config` directory you created is already correct and
 nothing further is needed.
 
-If `id -u` reports something else, hand the config directory over once:
+If `id -u` reports something else, hand the config directory over once. Only root
+can give a file to another user, so this needs `sudo`; a plain `chown` fails
+with `Operation not permitted`:
 
 ```bash
-chown -R 1000:1000 ./config
+sudo chown -R 1000:1000 ./config
 ```
 
 This applies to bind mounts only. A named or anonymous volume -- what
@@ -132,10 +134,12 @@ shipped `docker-compose.yml` also carries a commented `user:` line for running
 the container as your own UID instead.
 
 `config/saneless.toml` holds your paperless-ngx API token, so make it readable
-by the container's user alone:
+by the container's user alone. Both steps run as root: the `chown` needs it to
+give the file to UID 1000, and the `chmod` needs it once the file is no longer
+yours:
 
 ```bash
-chown 1000:1000 config/saneless.toml && chmod 600 config/saneless.toml
+sudo sh -c 'chown 1000:1000 config/saneless.toml && chmod 600 config/saneless.toml'
 ```
 
 saneless keeps that mode and owner each time it rewrites the file.
