@@ -113,7 +113,14 @@ sudo ufw allow 6566/tcp
 sudo ufw allow 10000:10100/tcp
 ```
 
-On a Linux firewall, loading the `nf_conntrack_sane` module is the alternative [saned(8)](http://www.sane-project.org/man/saned.8.html) recommends over a fixed port range: it follows each scan's data connection, so only 6566/tcp needs opening.
+On a Linux firewall, the `nf_conntrack_sane` helper is the alternative [saned(8)](http://www.sane-project.org/man/saned.8.html) recommends over a fixed port range: it follows each scan's data connection, so only 6566/tcp needs opening. Loading the module is not enough on its own. Since Linux 4.7 the kernel no longer attaches a helper to a connection by port, so a rule must assign it to 6566/tcp as well, and the firewall must accept connections it marks as related (ufw does by default). The firewalld `sane` service above does both for you. Elsewhere, for example:
+
+```bash
+sudo modprobe nf_conntrack_sane
+sudo iptables -t raw -A PREROUTING -p tcp --dport 6566 -j CT --helper sane
+```
+
+Neither line survives a reboot unless you persist it, so with ufw the `data_portrange` route above is usually simpler.
 
 **Scanner host not in net mode**
 
