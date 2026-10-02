@@ -383,7 +383,7 @@ def test_substitution_validates_first() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_readme_and_quick_start_show_the_same_complete_run() -> None:
+def test_real_readme_and_quick_start_show_the_same_complete_run() -> None:
     """
     README and Quick Start each show one complete run, and it is the same one.
 

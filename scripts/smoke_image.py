@@ -26,6 +26,16 @@ written in this module; ``Engine.sh`` takes it as ``LiteralString`` so the type
 checkers reject anything built at run time. The obvious alternatives are both
 rejected by this project's lint rules: a bare ``docker`` relying on PATH trips
 ruff S607, and a resolved path (or any non-literal element) in argv trips S603.
+
+The ``docker run`` commands the getting-started pages tell a reader to paste
+are read out of those pages, not copied into this file, so a documented
+command that stops working is caught. That text is editable by anyone who can
+open a pull request, so it is split into words with ``shlex`` (never by a
+shell), and held to an allow-list of flags and mounts before anything runs:
+only the config directory and one named data volume may be mounted, and no
+word may contain a newline. Only then are the values a test run needs swapped
+in: the image under test, a loopback port, a scratch config directory, a
+throwaway data volume and a unique container name.
 """
 
 from __future__ import annotations
@@ -36,6 +46,8 @@ import dataclasses
 import http.client
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -259,6 +271,549 @@ def _require_success(result: subprocess.CompletedProcess[str], what: str) -> Non
     if result.returncode != 0:
         msg = f"{what} exited {result.returncode}\n{_tail(result.stderr)}"
         raise SmokeFailure(msg)
+
+
+# ---------------------------------------------------------------------------
+# The documented ``docker run`` commands
+# ---------------------------------------------------------------------------
+
+# The published image, assembled from its parts: the repository guard that
+# pins every image reference to the released tag reads this file too, and a
+# literal name here would read as a reference that carries no tag.
+_IMAGE_REGISTRY = "ghcr.io"
+_IMAGE_OWNER = "kdknigga"
+_PROJECT_NAME = "saneless"
+PUBLISHED_IMAGE = f"{_IMAGE_REGISTRY}/{_IMAGE_OWNER}/{_PROJECT_NAME}"
+
+# Every flag a getting-started ``docker run`` needs, and nothing that widens
+# what the container can reach: no privileges, no host network, no devices,
+# no other entrypoint.
+ALLOWED_RUN_FLAGS = (
+    "-d",
+    "--rm",
+    "--name",
+    "-p",
+    "-v",
+    "-e",
+    "--stop-timeout",
+    "--add-host",
+)
+# The allowed flags that take no value.
+_SWITCH_FLAGS = frozenset({"-d", "--rm"})
+
+_CONFIG_TARGET = "/etc/saneless"
+_DATA_TARGET = "/var/lib/saneless"
+# Read-only/read-write and the SELinux relabels; nothing that changes mount
+# propagation.
+_MOUNT_OPTIONS = frozenset({"ro", "rw", "z", "Z"})
+_SELINUX_RELABELS = frozenset({"z", "Z"})
+# Loopback only, on a port the engine picks.
+_SMOKE_PUBLISH = f"127.0.0.1::{_PORT}"
+
+# A Markdown code fence opener or closer, at any indentation: the
+# getting-started pages nest their commands four spaces deep under a tab.
+_FENCE = re.compile(r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})")
+# A command line that starts a ``docker run``, with or without a ``$`` prompt.
+_DOCKER_RUN = re.compile(r"^(?:\$\s+)?docker\s+run(?:\s|$)")
+_PROMPT = re.compile(r"^\$\s+")
+# A Docker object name: a named volume or a container name.
+_OBJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+# ``NAME=value``. A bare ``-e NAME`` would copy that variable from the
+# environment of whoever runs the command, which on CI holds its secrets.
+_ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_ADD_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*[:=][^\s]+")
+_SECONDS = re.compile(r"[0-9]+")
+
+
+@dataclasses.dataclass(frozen=True)
+class DocumentedRun:
+    """
+    A documented ``docker run``, validated and split into its parts.
+
+    Attributes:
+        publish: The ``-p`` value, ``HOST:8080``.
+        config_source: The host side of the ``/etc/saneless`` mount.
+        config_options: That mount's options, ``""`` when it has none.
+        data_volume: The named volume mounted at ``/var/lib/saneless``.
+        env: Every ``-e NAME=value``, in order.
+        stop_timeout: The ``--stop-timeout`` seconds, as written.
+        name: The ``--name`` value, or ``None`` when there is none.
+        detach: Whether ``-d`` is given.
+        image: The image reference, tag included.
+        add_hosts: Every ``--add-host`` value, in order.
+        remove: Whether ``--rm`` is given.
+
+    """
+
+    publish: str
+    config_source: str
+    config_options: str
+    data_volume: str
+    env: tuple[str, ...]
+    stop_timeout: str
+    name: str | None
+    detach: bool
+    image: str
+    add_hosts: tuple[str, ...] = ()
+    remove: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _Option:
+    """
+    One flag of a documented command, where it sits, and its value.
+
+    Attributes:
+        index: Position of the flag's word in the argv.
+        flag: The flag, without any ``=value``.
+        value: Its value, or ``None`` for a switch.
+        joined: Whether the value is in the flag's own word, after ``=``.
+
+    """
+
+    index: int
+    flag: str
+    value: str | None
+    joined: bool
+
+
+def _refuse(argv: list[str], reason: str) -> SmokeFailure:
+    """
+    Build the failure for a documented command the smoke run will not execute.
+
+    Args:
+        argv: The documented command.
+        reason: What is wrong with it.
+
+    Returns:
+        The exception to raise.
+
+    """
+    return SmokeFailure(f"documented command {shlex.join(argv)!r}: {reason}")
+
+
+def _is_published_image(word: str) -> bool:
+    """
+    Say whether a word names the published image, by tag or digest.
+
+    Args:
+        word: One word of a command.
+
+    Returns:
+        True for the bare name, ``NAME:tag`` or ``NAME@digest``.
+
+    """
+    return word == PUBLISHED_IMAGE or word.startswith(
+        (f"{PUBLISHED_IMAGE}:", f"{PUBLISHED_IMAGE}@")
+    )
+
+
+def _strip_indent(line: str, indent: int) -> str:
+    """
+    Remove up to ``indent`` characters of leading whitespace from a line.
+
+    Args:
+        line: A line inside a code fence.
+        indent: The indentation of the fence that opened it.
+
+    Returns:
+        The line as it reads at the fence's own indentation.
+
+    """
+    leading = len(line) - len(line.lstrip(" \t"))
+    return line[min(leading, indent) :]
+
+
+def _fenced_blocks(text: str) -> list[str]:
+    """
+    Return the body of every fenced code block in a Markdown page.
+
+    Args:
+        text: The page.
+
+    Returns:
+        Each block's lines, dedented to the fence's indentation and joined.
+
+    """
+    lines = text.splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        opener = _FENCE.match(lines[index])
+        index += 1
+        if opener is None:
+            continue
+        indent = len(opener["indent"])
+        mark = opener["fence"]
+        body: list[str] = []
+        while index < len(lines):
+            stripped = lines[index].strip()
+            index += 1
+            if len(stripped) >= len(mark) and set(stripped) == {mark[0]}:
+                break
+            body.append(_strip_indent(lines[index - 1], indent))
+        blocks.append("\n".join(body))
+    return blocks
+
+
+def _block_commands(block: str) -> list[str]:
+    """
+    Return each command in a code block, backslash continuations joined.
+
+    Args:
+        block: A fenced block's body.
+
+    Returns:
+        One string per command, in order.
+
+    """
+    commands: list[str] = []
+    parts: list[str] = []
+    for line in block.splitlines():
+        stripped = line.rstrip()
+        if stripped.endswith("\\"):
+            parts.append(stripped[:-1])
+            continue
+        parts.append(stripped)
+        commands.append(" ".join(parts).strip())
+        parts = []
+    if parts:
+        commands.append(" ".join(parts).strip())
+    return commands
+
+
+def documented_docker_runs(text: str) -> list[list[str]]:
+    """
+    Read every fenced ``docker run`` of the published image out of a page.
+
+    Fences at any indentation count, so a command inside a tab is found.
+    Each command is split into words by ``shlex``, the way a POSIX shell
+    would, but nothing is expanded or executed: ``"$(pwd)/config"`` comes
+    back as the literal word ``$(pwd)/config``. Runs of other images,
+    ``docker compose`` blocks and commands outside a fence are ignored.
+
+    Args:
+        text: A Markdown page.
+
+    Returns:
+        One argv per command, each starting ``["docker", "run", ...]``, in
+        page order.
+
+    Raises:
+        SmokeFailure: A command naming the image cannot be split into words,
+            so what it would run cannot be known.
+
+    """
+    runs: list[list[str]] = []
+    for block in _fenced_blocks(text):
+        for command in _block_commands(block):
+            if not _DOCKER_RUN.match(command) or PUBLISHED_IMAGE not in command:
+                continue
+            try:
+                argv = shlex.split(_PROMPT.sub("", command), comments=True)
+            except ValueError as exc:
+                msg = f"cannot split the documented command {command!r}: {exc}"
+                raise SmokeFailure(msg) from exc
+            if any(_is_published_image(word) for word in argv):
+                runs.append(argv)
+    return runs
+
+
+def _run_options(argv: list[str]) -> tuple[list[_Option], int]:
+    """
+    Walk a documented command's flags, refusing any outside the allow-list.
+
+    Args:
+        argv: The documented command, ``["docker", "run", ...]``.
+
+    Returns:
+        Every flag in order, and the position of the image, which is the
+        last word.
+
+    Raises:
+        SmokeFailure: The command is not a ``docker run``, a word holds a
+            newline, a flag is not allowed or lacks its value, or the last
+            word is not the published image.
+
+    """
+    if argv[:2] != ["docker", "run"]:
+        raise _refuse(argv, "is not a `docker run`")
+    if any("\n" in word for word in argv):
+        raise _refuse(argv, "a word contains a newline")
+    options: list[_Option] = []
+    index = 2
+    while index < len(argv) and argv[index].startswith("-"):
+        flag, joined, value = argv[index].partition("=")
+        if flag not in ALLOWED_RUN_FLAGS:
+            raise _refuse(argv, f"{flag} is not an allowed flag")
+        if flag in _SWITCH_FLAGS:
+            if joined:
+                raise _refuse(argv, f"{flag} takes no value")
+            options.append(_Option(index, flag, None, joined=False))
+            index += 1
+        elif joined:
+            options.append(_Option(index, flag, value, joined=True))
+            index += 1
+        elif index + 1 < len(argv):
+            options.append(_Option(index, flag, argv[index + 1], joined=False))
+            index += 2
+        else:
+            raise _refuse(argv, f"{flag} has no value")
+    if index != len(argv) - 1:
+        raise _refuse(argv, "the image must be the last word, with no command")
+    if not _is_published_image(argv[index]):
+        raise _refuse(argv, f"{argv[index]!r} is not the published image")
+    return options, index
+
+
+def _values(options: list[_Option], flag: str) -> list[str]:
+    """
+    Return the values given to one flag, in order.
+
+    Args:
+        options: The command's flags.
+        flag: The flag to collect.
+
+    Returns:
+        Each value, ``""`` for a switch.
+
+    """
+    return [option.value or "" for option in options if option.flag == flag]
+
+
+def _split_mount(argv: list[str], value: str) -> tuple[str, str, str]:
+    """
+    Split a ``-v`` value into its source, target and options.
+
+    Args:
+        argv: The documented command, for the failure message.
+        value: ``SOURCE:TARGET`` or ``SOURCE:TARGET:OPTIONS``.
+
+    Returns:
+        The source, the target and the options (``""`` when none).
+
+    Raises:
+        SmokeFailure: The value has another shape, or an option outside the
+            read-only, read-write and SELinux relabel options.
+
+    """
+    parts = value.split(":")
+    if len(parts) not in {2, 3} or not all(parts[:2]):
+        raise _refuse(argv, f"cannot read the mount {value!r}")
+    source, target = parts[:2]
+    options = parts[2] if len(parts) == 3 else ""
+    if options and not set(options.split(",")) <= _MOUNT_OPTIONS:
+        raise _refuse(argv, f"mount option {options!r} is not allowed")
+    return source, target, options
+
+
+def _mounts(argv: list[str], options: list[_Option]) -> tuple[str, str, str]:
+    """
+    Check the command mounts the config directory and one named data volume.
+
+    Args:
+        argv: The documented command.
+        options: Its flags.
+
+    Returns:
+        The config mount's source and options, and the data volume's name.
+
+    Raises:
+        SmokeFailure: Either mount is missing or repeated, the data mount is
+            not a named volume, or anything else is mounted.
+
+    """
+    config: list[tuple[str, str]] = []
+    data: list[str] = []
+    for value in _values(options, "-v"):
+        source, target, mount_options = _split_mount(argv, value)
+        if target == _CONFIG_TARGET:
+            config.append((source, mount_options))
+        elif target == _DATA_TARGET and _OBJECT_NAME.fullmatch(source):
+            data.append(source)
+        elif target == _DATA_TARGET:
+            raise _refuse(argv, f"{_DATA_TARGET} must be a named volume")
+        else:
+            raise _refuse(argv, f"mounting {target!r} is not allowed")
+    if len(config) != 1:
+        raise _refuse(argv, f"needs exactly one mount at {_CONFIG_TARGET}")
+    if len(data) != 1:
+        raise _refuse(argv, f"needs exactly one named volume at {_DATA_TARGET}")
+    return config[0][0], config[0][1], data[0]
+
+
+def _single(argv: list[str], options: list[_Option], flag: str) -> str:
+    """
+    Return the value of a flag the command must give exactly once.
+
+    Args:
+        argv: The documented command.
+        options: Its flags.
+        flag: The flag.
+
+    Returns:
+        Its value.
+
+    Raises:
+        SmokeFailure: The flag is missing or repeated.
+
+    """
+    values = _values(options, flag)
+    if len(values) != 1:
+        raise _refuse(argv, f"needs exactly one {flag}, found {len(values)}")
+    return values[0]
+
+
+def parse_documented_run(argv: list[str]) -> DocumentedRun:
+    """
+    Validate a documented ``docker run`` and split it into its parts.
+
+    The command must publish container port 8080 exactly once, mount the
+    config directory at ``/etc/saneless`` and one named volume at
+    ``/var/lib/saneless`` and nothing else, give ``--stop-timeout`` in
+    seconds, pass only ``NAME=value`` variables, use only the flags in
+    ``ALLOWED_RUN_FLAGS``, and end with the published image.
+
+    Args:
+        argv: The command as ``documented_docker_runs`` returns it.
+
+    Returns:
+        The command's parts.
+
+    Raises:
+        SmokeFailure: The command has any other shape.
+
+    """
+    options, image_index = _run_options(argv)
+    publish = _single(argv, options, "-p")
+    host, colon, container = publish.rpartition(":")
+    if not colon or not host or container.removesuffix("/tcp") != str(_PORT):
+        raise _refuse(argv, f"-p {publish} must publish container port {_PORT}")
+    config_source, config_options, data_volume = _mounts(argv, options)
+    stop_timeout = _single(argv, options, "--stop-timeout")
+    if not _SECONDS.fullmatch(stop_timeout):
+        raise _refuse(argv, f"--stop-timeout {stop_timeout!r} is not seconds")
+    names = _values(options, "--name")
+    if len(names) > 1 or not all(_OBJECT_NAME.fullmatch(name) for name in names):
+        raise _refuse(argv, f"cannot use the container name(s) {names}")
+    env = _values(options, "-e")
+    if bad := [item for item in env if not _ENV_ASSIGNMENT.fullmatch(item)]:
+        raise _refuse(argv, f"-e must assign a value: {bad}")
+    add_hosts = _values(options, "--add-host")
+    if bad := [item for item in add_hosts if not _ADD_HOST.fullmatch(item)]:
+        raise _refuse(argv, f"cannot read --add-host {bad}")
+    return DocumentedRun(
+        publish=publish,
+        config_source=config_source,
+        config_options=config_options,
+        data_volume=data_volume,
+        env=tuple(env),
+        stop_timeout=stop_timeout,
+        name=names[0] if names else None,
+        detach=bool(_values(options, "-d")),
+        image=argv[image_index],
+        add_hosts=tuple(add_hosts),
+        remove=bool(_values(options, "--rm")),
+    )
+
+
+def _substituted(
+    option: _Option, *, config_dir: str, name: str, volume: str
+) -> str | None:
+    """
+    Return the value a smoke run gives one flag, or ``None`` to keep it.
+
+    Args:
+        option: One flag of a validated command.
+        config_dir: The scratch config directory.
+        name: The container name.
+        volume: The data volume name.
+
+    Returns:
+        The replacement value, or ``None`` when the documented one stays.
+
+    """
+    if option.value is None:
+        return None
+    if option.flag == "-p":
+        return _SMOKE_PUBLISH
+    if option.flag == "--name":
+        return name
+    if option.flag == "-v":
+        return _substituted_mount(option.value, config_dir=config_dir, volume=volume)
+    return None
+
+
+def _substituted_mount(value: str, *, config_dir: str, volume: str) -> str:
+    """
+    Return the ``-v`` value a smoke run uses in place of a validated one.
+
+    Args:
+        value: The documented ``SOURCE:TARGET[:OPTIONS]``.
+        config_dir: The scratch config directory.
+        volume: The data volume name.
+
+    Returns:
+        The config mount on ``config_dir`` with ``z`` in its options, or the
+        data mount on ``volume`` with its options kept.
+
+    """
+    _, target, *rest = value.split(":")
+    options = rest[0] if rest else ""
+    if target != _CONFIG_TARGET:
+        return f"{volume}:{target}" + (f":{options}" if options else "")
+    if not _SELINUX_RELABELS & set(options.split(",")):
+        options = f"{options},z" if options else "z"
+    return f"{config_dir}:{target}:{options}"
+
+
+def substitute_documented_run(
+    run_argv: list[str], *, image: str, config_dir: str, name: str, volume: str
+) -> list[str]:
+    """
+    Turn a documented ``docker run`` into the one a smoke run executes.
+
+    The command is validated first. Then, in place: the image becomes
+    ``image``; the port publish becomes loopback-only on a port the engine
+    picks; the config mount's host side becomes ``config_dir`` with the
+    SELinux ``z`` relabel added to its options; the data volume becomes
+    ``volume``; the container name becomes ``name``. ``-d`` and ``--name``
+    are added after ``run`` when the page leaves them out, so the container
+    can always be found and removed. Every other word is kept, in order.
+
+    Args:
+        run_argv: The command as ``documented_docker_runs`` returns it.
+        image: The image under test.
+        config_dir: The scratch config directory to mount.
+        name: A container name no other run uses.
+        volume: A data volume name no other run uses.
+
+    Returns:
+        The argv to hand the engine, after ``docker``: it starts with
+        ``run``.
+
+    Raises:
+        SmokeFailure: The command fails validation.
+
+    """
+    parse_documented_run(run_argv)
+    options, image_index = _run_options(run_argv)
+    words = list(run_argv)
+    for option in options:
+        value = _substituted(option, config_dir=config_dir, name=name, volume=volume)
+        if value is None:
+            continue
+        if option.joined:
+            words[option.index] = f"{option.flag}={value}"
+        else:
+            words[option.index + 1] = value
+    words[image_index] = image
+    prefix = ["run"]
+    if not _values(options, "-d"):
+        prefix.append("-d")
+    if not _values(options, "--name"):
+        prefix.extend(["--name", name])
+    return [*prefix, *words[2:]]
 
 
 def check_help(engine: Engine) -> None:
