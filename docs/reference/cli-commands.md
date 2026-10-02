@@ -113,11 +113,11 @@ Only data goes to stdout. The `Discovering scanners...` and `No scanners found.`
 
 **Example output (table):**
 
-```
+```text
 Discovering scanners...
-Name                 Vendor          Model                Type
-------------------------------------------------------------
-net:192.168.1.50:pi  Canon           MF740C Series        scanner
+Name                           Vendor          Model                Type
+------------------------------------------------------------------------
+net:192.168.1.50:hpaio:/usb/h… Hewlett-Packard hp_LaserJet_3030     all-in-one
 ```
 
 The first line is on stderr; the table is on stdout. The table fits the terminal: the Name column takes the width the other three leave, and a value too long for its column is cut short with `…`. `--json` prints every value whole.
@@ -348,6 +348,19 @@ Skipped (already exists; use --force to refresh): ...
 Removed (scanner no longer offers it): ...
 Pinned [scanner] device: ...
 ```
+
+**Example output (first run):**
+
+```text
+Profiles in /home/you/saneless.toml:
+Added: 'auto', 'adf', 'default'
+  auto: source=Auto, resolution=300, mode=Color
+  adf: source=ADF, resolution=300, mode=Color
+  default: source=Auto, resolution=300, mode=Color
+Pinned [scanner] device: 'net:192.168.1.50:hpaio:/usb/hp_LaserJet_3030?serial=00MXBM121742'
+```
+
+This is the HP LaserJet 3030 from [First CLI Scan](../getting-started/first-cli-scan.md), with its config file at `/home/you/saneless.toml`. It reports the sources `Auto` and `ADF`, so the command writes one profile for each and a `default` that copies `auto`.
 
 **`auto-profiles` pins the scanner it used.** When no device is configured (`[scanner] device` is empty in the file and `SANELESS_SCANNER__DEVICE` is not set), the command generates profiles for the first device SANE lists and writes that device's id into `[scanner] device`, so later scans keep going to it rather than to whichever scanner appears first on the network. A device that is already set is never overwritten, with `--force` or without: that key has no `auto_generated` marker, so it is yours. Run [`saneless devices`](#saneless-devices) first if more than one scanner is visible, and set `[scanner] device` yourself when the first one listed is not the one you use. `saneless serve`'s startup generation does not pin a device.
 
