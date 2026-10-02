@@ -160,4 +160,4 @@ A server stop while a scan is still feeding paper is handled the way it is for a
 | 130 | You aborted with a confirmed `a`, or pressed Ctrl-C or Ctrl-D at a question; nothing is kept |
 | 143 | SIGTERM; the pages kept are in `failed/` |
 
-The other codes mean what they mean for any scan; see [CLI Commands](../reference/cli-commands.md#saneless-scan).
+[CLI Commands](../reference/cli-commands.md#exit-codes) defines every code, and lists the codes [`saneless scan`](../reference/cli-commands.md#saneless-scan) can return.

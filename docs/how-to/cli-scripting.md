@@ -141,8 +141,7 @@ a manual duplex scan uploaded as two documents -- and the table view labels it
 refused submit or a cancellation -- or `null`. It includes any file path on the
 server and the paperless-ngx URL. The web page shows the same failure only as a sentence with
 no paths in it, which points here: `saneless jobs --json` is where to find
-where a failed scan's PDF was kept. `error` was added after the other keys, so
-a script that reads only those is unaffected.
+where a failed scan's PDF was kept.
 
 `pages_scanned`, `pages_removed` and `pages_uploaded` are the page counts the
 web page shows under a finished scan: how many pages the scanner produced, how
@@ -155,43 +154,36 @@ kept, so these numbers are how you find the sheets to rescan if a real page
 was taken for a blank one. The list is information, not a warning: a `DONE`
 job that removed blank pages keeps `"warning": null`.
 
-All four are `null` when the job never recorded them: a failed, cancelled or
-refused job, or one that ran before saneless recorded them. A measured zero is
-`0` and an empty list is `[]`, never `null`. The four keys come after all
-the others, so a script that reads only the earlier keys is unaffected.
+All four are `null` when the job never recorded them, as for a failed, cancelled
+or refused job. A measured zero is `0` and an empty list is `[]`, never `null`.
 
 ## Exit codes
 
-saneless uses distinct exit codes so scripts can handle different failure modes:
+A script that runs `saneless scan` needs to know which exit codes to treat differently. The
+[basic scan example](#basic-scan-with-error-handling) branches on these codes and sends any
+other code to a fallback that prints it. [CLI Commands](../reference/cli-commands.md#exit-codes)
+defines every code, including 129 and 143, which the example leaves to its fallback, and 141,
+which `saneless scan` never returns.
 
-| Exit Code | Meaning | Example |
-|---|---|---|
-| 0 | Success | Scan completed and uploaded |
-| 1 | Scan error | No scanner found, scanner disconnected mid-scan, empty feeder, no pages scanned, flip wait timed out |
-| 2 | Configuration, profile or setup error | Unknown profile name, a `--config` file that does not exist, a TOML syntax error, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, `saneless scan --multi-page` without an interactive terminal or with a manual duplex profile, python-sane not installed, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set (a scan is refused before the scanner is opened) |
-| 3 | Paperless upload error | paperless-ngx unreachable, invalid API token |
-| 4 | PDF assembly error | The scanned pages could not be written as a PDF: a page image the PDF library refused, or an unwritable output directory. A full disk is exit 10 |
-| 5 | Unexpected error (a saneless bug) | Prints one line; the traceback is in the log file -- attach it to a bug report |
-| 6 | Saved to the consume folder | paperless-ngx could not be reached, so the PDF went to the consume folder without its title, tags or correspondent; stdout reads `Saved to folder: <title>`. The document was delivered: do not rescan |
-| 7 | Uploaded with a warning | A sheet the scanner skipped, manual-duplex front and back counts that differed (uploaded as two documents), or a multi-page document finished because nobody answered in time or it reached the page limit; stdout reads `Uploaded with a warning: <title>` and the warning is on stderr. The document was delivered: do not rescan the whole stack |
-| 8 | Every page looked blank | Empty-page detection judged every page blank, so nothing was uploaded; the pages were kept in `failed/`, normally as one PDF, and stderr names what was kept. The scanner worked: lower `empty_page_coverage_threshold` or turn detection off if the pages are not blank |
-| 9 | The document may already be in paperless-ngx | The upload was sent but no answer came back, or paperless-ngx received the document but did not confirm filing it (a long OCR can outlast `paperless_task_timeout`). Never rescan on 9: check paperless-ngx's document list first. When the error line names a copy kept in `failed/`, import it only if the document is not in paperless-ngx |
-| 10 | Out of disk space | The server ran out of disk space while scanning or assembling the PDF; the error line names the folder, and how much space is needed when saneless found the shortfall before writing. Free space, then scan again |
-| 129 | Interrupted by SIGHUP | The terminal or SSH session running the command went away. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
-| 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; a confirmed abort, Ctrl-D or Ctrl-C at a multi-page question; Ctrl-C during a one-shot command |
-| 141 | Broken pipe | The program reading the output of `devices`, `jobs`, `auto-profiles` or `doctor` closed it early, as `head` does once it has its lines. Nothing failed and nothing is printed. `scan` never exits 141: its outcome's code stands |
-| 143 | Interrupted by SIGTERM | `kill`, a service manager or a container runtime stopped the command. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
+| Exit code | What a script should do |
+|---|---|
+| 0 | Nothing: the document was uploaded |
+| 1 | Check that the scanner is switched on, connected and loaded, then scan again |
+| 2 | Fix the configuration, the profile name or the job database first: scanning again unchanged fails the same way |
+| 3 | Fix paperless-ngx or the connection to it (stderr says which), then scan again |
+| 4 | Check that the output directory can be written, because the scanned pages could not be written as a PDF. A full disk is exit 10 |
+| 5 | Report a bug and attach the log file |
+| 6 | Do not rescan: the document was delivered to the consume folder. Fix the connection to paperless-ngx so the next scan keeps its title, tags and correspondent |
+| 7 | Do not rescan the whole stack: the document was delivered. Check it in paperless-ngx; the warning is on stderr |
+| 8 | Check the pages kept in `failed/` before scanning again: the scanner worked, but every page looked blank. If they are not blank, lower `empty_page_coverage_threshold` |
+| 9 | Never rescan on 9: check paperless-ngx's document list first, and import the copy the error line names only if the document is not there |
+| 10 | Free disk space on the server, then scan again |
+| 130 | Nothing: someone cancelled the scan |
 
-130 means someone chose to stop, so nothing was kept. 129 and 143 (128 plus the signal number)
-mean the command was stopped from outside without anyone choosing to discard the scan, so a scan
-that had pages keeps them in `failed/` when it can, and its `Interrupted:` line on stderr names
-the path, or says where the pages were left when they could not be kept. No
-path on that line means nothing was kept: the command was not a scan, or the scan was stopped
-before its first page. So after 129 or 143, look for a kept file only where that line names one.
-A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's
-pages already being kept -- does not change it: the command exits with that outcome's own code.
-`saneless serve` is the exception: once the web server is running, SIGTERM is a graceful stop and
-it exits 0, as on Ctrl-C.
+129 and 143 mean the command was stopped from outside, by a hangup or by SIGTERM. After either,
+look for a kept file only where the `Interrupted:` line on stderr names one: a line that names no
+path means nothing was kept. A signal that arrives once a scan's outcome is settled does not
+change it, so the script sees that outcome's own code instead.
 
 141 is 128 plus SIGPIPE, the shell's own code for a broken pipe. A pipeline reports the last
 command's status unless `set -o pipefail` is set, so `saneless jobs --json | head` gives `head`'s
@@ -202,8 +194,7 @@ configuration error prints a header naming the file and one line per problem, th
 line). A script that parses the failure should read the first line: the `Try:` line is advice for
 a person, and its wording may change. A cancel (130), an interruption (129, 143) and an
 unexpected error (5) print one line and no `Try:` line, and a broken pipe (141) prints nothing.
-[Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) explains what each code means and
-what to check.
+[Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) says what to check for each code.
 
 ### `saneless doctor`'s exit code
 
@@ -273,19 +264,23 @@ case $exit_code in
   1) echo "Scan failed -- check the scanner is switched on and connected" ;;
   2) echo "Configuration error -- check the profile name and the config" ;;
   3) echo "Upload failed -- check paperless-ngx connection" ;;
-  4) echo "PDF assembly failed -- check disk space and the output directory" ;;
+  4) echo "PDF assembly failed -- check the output directory" ;;
   5) echo "Unexpected error -- see the log file and report a bug" ;;
   6) echo "Saved to the consume folder without its title, tags or correspondent -- do not rescan; fix the paperless-ngx connection" ;;
   7) echo "Uploaded with a warning -- check the document in paperless-ngx (see stderr)" ;;
+  8) echo "Every page looked blank -- check the pages kept in failed/ before scanning again" ;;
+  9) echo "May already be in paperless-ngx -- do not rescan; check its document list first" ;;
+  10) echo "Out of disk space -- free space on the server, then scan again" ;;
   130) echo "Cancelled" ;;
+  *) echo "saneless exited with code $exit_code -- see stderr" ;;
 esac
 exit $exit_code
 ```
 
-Only exit 0 is a clean success. Exits 6 and 7 both mean the document was delivered, so the
-script must not scan the stack again on either, but neither is a success to ignore: 6 means
-every scan is going to the consume folder until the connection to paperless-ngx is fixed, and
-7 means a document needs checking. `saneless scan` is not recorded in the job history, so its
+Only exit 0 is a clean success. Exits 6 and 7 both mean the document was delivered, and 9 means
+it may have been, so the script must not scan the stack again on any of them. Neither 6 nor 7
+is a success to ignore: 6 means every scan is going to the consume folder until the connection
+to paperless-ngx is fixed, and 7 means a document needs checking. `saneless scan` is not recorded in the job history, so its
 exit code and stderr are the only report a script gets.
 
 ### Checking readiness before a scan
@@ -338,22 +333,31 @@ Add a cron job to scan at a specific time (useful for shared office scanners wit
 
 ```bash
 # Scan every weekday at 9:00 AM
-0 9 * * 1-5 saneless scan --profile adf --title "Morning batch $(date +\%Y-\%m-\%d)"
+0 9 * * 1-5 $HOME/.local/bin/saneless --config $HOME/.config/saneless/saneless.toml scan --profile adf --title "Morning batch $(date +\%Y-\%m-\%d)" >> $HOME/saneless-cron.log 2>&1
 ```
 
-## Configuration via environment variables
+Cron runs a job with almost none of your login environment. Its `PATH` is `/usr/bin:/bin`, so
+a `saneless` that `pipx` installed in `~/.local/bin` is not found by name: give the full path.
+The job also starts in your home directory, so a `./saneless.toml` in the directory you
+usually scan from is not the file it loads, and an `XDG_CONFIG_HOME` your shell sets is not set.
+`--config` names the file, and it goes before the subcommand because it is an option of
+`saneless` itself, not of `scan`. `%` is special in a crontab line, so the date format escapes
+it as `\%`.
 
-For containerized or automated environments, configure saneless entirely through environment variables using the `SANELESS_` prefix with `__` as the nested delimiter:
+## Configuration in scripts and containers
+
+A set `SANELESS_*` environment variable overrides the same setting in `saneless.toml`; see
+[Where saneless reads settings](../reference/configuration.md#where-saneless-reads-settings).
+In a script or a container, keep the paperless-ngx URL and API token in `saneless.toml`
+rather than in the environment, so there is one place to change them and nothing overrides
+the file without saying so. The variable a script or container usually sets is the scanner
+host, which differs from one machine to the next:
 
 ```bash
-export SANELESS_PAPERLESS__URL="http://paperless:8000"
-export SANELESS_PAPERLESS__TOKEN="your-api-token"
 export SANELESS_SCANNER__HOST="192.168.1.50"
 
 saneless scan --profile default --title "Scripted scan"
 ```
-
-This is particularly useful in CI/CD pipelines or Docker containers where config files are impractical.
 
 ## Regenerating profiles
 
