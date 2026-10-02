@@ -297,3 +297,123 @@ def test_seeded_firewall_check_reports_each_gap_once() -> None:
 def test_seeded_firewall_check_accepts_working_advice() -> None:
     """Advice that opens both connections is not reported."""
     assert _firewall_offenders(GOOD_FIREWALL) == []
+
+
+# ---------------------------------------------------------------------------
+# A saned on the container's own host
+# ---------------------------------------------------------------------------
+
+WHICH_SETUP_PAGE = DOCS_DIR / "getting-started" / "which-setup.md"
+SHAPE_TWO_HEADING = re.compile(r"^## Shape 2\b.*$", re.MULTILINE)
+HOST_GATEWAY = "host.docker.internal:host-gateway"
+# A compose `extra_hosts:` key whose entry maps the name to the host gateway,
+# as a block sequence item or a flow sequence, the value quoted or not.
+EXTRA_HOSTS_ENTRY = re.compile(
+    r"^(?P<indent>[ \t]*)extra_hosts:[ \t]*"
+    r"(?:\[[ \t]*[\"']?" + re.escape(HOST_GATEWAY) + r"[\"']?[ \t]*\]"
+    r"|\n(?P=indent)[ \t]+-[ \t]*[\"']?" + re.escape(HOST_GATEWAY) + r"[\"']?)"
+    r"[ \t]*$",
+    re.MULTILINE,
+)
+ADD_HOST_FLAG = re.compile(r"--add-host(?:=|\s+)" + re.escape(HOST_GATEWAY) + r"(?!\S)")
+
+
+def _section(text: str, heading: re.Pattern[str]) -> str:
+    """Return the text under the first ``##`` heading ``heading`` matches."""
+    match = heading.search(text)
+    if match is None:
+        return ""
+    return text[match.end() :].split("\n## ", 1)[0]
+
+
+def _shape_two_offenders(section: str) -> list[str]:
+    """
+    Report what the same-host container recipe leaves out.
+
+    On Linux Docker Engine, ``host.docker.internal`` resolves only when the
+    container is given it, and saned refuses every client its ``saned.conf``
+    does not list, so the recipe needs both, plus the way to find the subnet
+    to list.
+
+    Returns:
+        One line per problem: no compose ``extra_hosts`` entry mapping the
+        name to ``host-gateway``, no ``docker run`` passing ``--add-host`` for
+        it, no ``saned.conf`` step, or no ``docker network inspect`` to find
+        the container network's subnet.
+
+    """
+    offenders: list[str] = []
+    if not EXTRA_HOSTS_ENTRY.search(section):
+        offenders.append(f'no compose `extra_hosts: - "{HOST_GATEWAY}"`')
+    runs = [command for _, command in _commands(section) if "docker run" in command]
+    if not any(ADD_HOST_FLAG.search(command) for command in runs):
+        offenders.append(f"no `docker run --add-host={HOST_GATEWAY}`")
+    if "saned.conf" not in section:
+        offenders.append("no `saned.conf` line allowing the container network")
+    if "docker network inspect" not in section:
+        offenders.append("no `docker network inspect` to find the subnet")
+    return offenders
+
+
+GOOD_SHAPE_TWO = f"""\
+```yaml
+services:
+  saneless:
+    extra_hosts:
+      - "{HOST_GATEWAY}"
+```
+
+```bash
+docker run -d \\
+  --add-host={HOST_GATEWAY} \\
+  image
+```
+
+Find the subnet with `docker network inspect saneless_default` and add it to
+`/etc/sane.d/saned.conf`.
+"""
+
+
+def test_same_host_recipe_reaches_the_host_saned() -> None:
+    """Which-setup's same-host shape maps the host gateway and opens saned to it."""
+    section = _section(WHICH_SETUP_PAGE.read_text(encoding="utf-8"), SHAPE_TWO_HEADING)
+    assert section, f"{WHICH_SETUP_PAGE.name} has no `## Shape 2` section"
+    offenders = _shape_two_offenders(section)
+    assert not offenders, (
+        "the same-host container recipe cannot reach saned as written:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_seeded_same_host_check_reports_each_gap_once() -> None:
+    """Each missing piece of the same-host recipe is reported, and only once."""
+    seeds = {
+        "no extra_hosts": GOOD_SHAPE_TWO.replace("extra_hosts:", "labels:"),
+        "wrong gateway": GOOD_SHAPE_TWO.replace(
+            f'"{HOST_GATEWAY}"', '"host.docker.internal:10.0.0.1"'
+        ),
+        "no add-host": GOOD_SHAPE_TWO.replace(f"  --add-host={HOST_GATEWAY} \\\n", ""),
+        "no saned.conf": GOOD_SHAPE_TWO.replace(
+            "`/etc/sane.d/saned.conf`", "the allow list"
+        ),
+        "no inspect": GOOD_SHAPE_TWO.replace(
+            "`docker network inspect saneless_default`", "your tools"
+        ),
+    }
+    for name, text in seeds.items():
+        assert text != GOOD_SHAPE_TWO, name
+        offenders = _shape_two_offenders(text)
+        assert len(offenders) == 1, (name, offenders)
+
+
+def test_seeded_same_host_check_accepts_a_complete_recipe() -> None:
+    """A recipe with every piece, in either flag form, is not reported."""
+    assert _shape_two_offenders(GOOD_SHAPE_TWO) == []
+    spaced = GOOD_SHAPE_TWO.replace(
+        f"--add-host={HOST_GATEWAY}", f"--add-host {HOST_GATEWAY}"
+    ).replace(
+        f'    extra_hosts:\n      - "{HOST_GATEWAY}"',
+        f'    extra_hosts: ["{HOST_GATEWAY}"]',
+    )
+    assert spaced != GOOD_SHAPE_TWO
+    assert _shape_two_offenders(spaced) == []
