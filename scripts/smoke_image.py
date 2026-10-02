@@ -36,6 +36,16 @@ only the config directory and one named data volume may be mounted, and no
 word may contain a newline. Only then are the values a test run needs swapped
 in: the image under test, a loopback port, a scratch config directory, a
 throwaway data volume and a unique container name.
+
+Two checks run those commands, one from README.md and one from the Quick
+Start, each as the page writes it apart from those values. The scratch config
+names a fake paperless-ngx this script serves, and a token made for the run.
+Each started container must answer ``/health``, render the Scan button
+enabled, and have called the fake with that token: a failed list load also
+releases Scan, so only the token on the fake's record proves the mounted
+config was read. On Podman the container reaches the fake as
+``host.containers.internal``; on Docker Engine, at the default bridge
+network's gateway.
 """
 
 from __future__ import annotations
@@ -53,10 +63,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+import urllib.parse
 import uuid
+from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, LiteralString
+from typing import TYPE_CHECKING, Any, LiteralString, override
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -1243,25 +1257,492 @@ def check_host_health(engine: Engine) -> str:
     """
     with _served(engine) as name:
         port = _host_port(engine, name)
-        start = time.monotonic()
-        deadline = start + engine.health_seconds
-        last = "no answer"
-        while time.monotonic() < deadline:
-            try:
-                status = _health_status(port)
-            except (OSError, http.client.HTTPException) as exc:
-                last = f"{type(exc).__name__}: {exc}"
+        try:
+            healthy = _wait_for_health(engine, port)
+        except SmokeFailure as exc:
+            msg = f"{exc}\ncontainer log:\n{_logs(engine, name)}"
+            raise SmokeFailure(msg) from exc
+        return f"200 after {healthy:.1f} s"
+
+
+# ---------------------------------------------------------------------------
+# Running the documented ``docker run`` commands
+# ---------------------------------------------------------------------------
+
+# The repository the script lives in: the documented commands are read from
+# its pages, never from a copy here.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_README = Path("README.md")
+_QUICK_START = Path("docs") / "getting-started" / "quick-start.md"
+
+# How a container under Podman finds the host it runs on.
+_PODMAN_HOST = "host.containers.internal"
+_HTTP_UNAUTHORIZED = 401
+_REQUEST_SECONDS = 10.0
+_SCAN_BUTTON_ID = "scan-btn"
+# The bare default profile every fresh appliance has.
+_METADATA_PATH = "/api/metadata?profile=default"
+
+# Rebuilds the argv from ``$SMOKE_ARGV``, one word per line, and hands it to
+# the engine. The here-document expands ``$SMOKE_ARGV`` once and never scans
+# the result again, so ``$(pwd)`` or ``$HOME`` inside a word stays literal
+# text; ``read -r`` with an empty IFS keeps every backslash and space.
+_RUN_ARGV: LiteralString = (
+    "set --\n"
+    'while IFS= read -r arg; do set -- "$@" "$arg"; done <<SMOKE_ARGV_END\n'
+    "$SMOKE_ARGV\n"
+    "SMOKE_ARGV_END\n"
+    'exec "$SMOKE_DOCKER" "$@"\n'
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class FakeHit:
+    """
+    One request the fake paperless-ngx received.
+
+    Attributes:
+        method: The HTTP method.
+        path: The URL path, without the query string.
+        authorization: The ``Authorization`` header, or ``None``.
+
+    """
+
+    method: str
+    path: str
+    authorization: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class FakePaperless:
+    """
+    A running fake paperless-ngx: where a container reaches it, and its log.
+
+    Attributes:
+        url: The base URL to write into the container's config.
+        hits: Every request received, in arrival order.
+
+    """
+
+    url: str
+    hits: list[FakeHit]
+
+
+def _fake_handler(hits: list[FakeHit], token: str) -> type[BaseHTTPRequestHandler]:
+    """
+    Build a request handler that records into ``hits``.
+
+    Args:
+        hits: The list every request is appended to.
+        token: The only API token the fake accepts.
+
+    Returns:
+        A handler class for ``ThreadingHTTPServer``.
+
+    """
+    expected = f"Token {token}"
+
+    class _Handler(BaseHTTPRequestHandler):
+        """Answer every GET with an empty list, as a fresh paperless-ngx does."""
+
+        def do_GET(self) -> None:
+            """Record the request, then answer the list or refuse the token."""
+            authorization = self.headers.get("Authorization")
+            path = urllib.parse.urlsplit(self.path).path
+            hits.append(FakeHit(self.command, path, authorization))
+            if authorization == expected:
+                status = _HTTP_OK
+                payload: object = {
+                    "count": 0,
+                    "next": None,
+                    "previous": None,
+                    "results": [],
+                }
             else:
-                if status == _HTTP_OK:
-                    return f"200 after {time.monotonic() - start:.1f} s"
-                last = f"HTTP {status}"
-            time.sleep(_POLL_SECONDS)
+                status = _HTTP_UNAUTHORIZED
+                payload = {"detail": "Invalid token."}
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        @override
+        def log_message(self, format: str, *args: object) -> None:
+            """Stay silent: the default writes every request to stderr."""
+
+    return _Handler
+
+
+@contextlib.contextmanager
+def fake_paperless(
+    bind_host: str, url_host: str, token: str
+) -> Generator[FakePaperless]:
+    """
+    Serve a minimal paperless-ngx that records every request.
+
+    Every GET is recorded and answered: the empty list paperless-ngx gives
+    for tags and correspondents when the request carries ``Token <token>``,
+    401 otherwise. A failed list load releases the Scan button just as a
+    loaded one does, so only the record proves the container read its config
+    and called this server with the token. The server listens on a port the
+    kernel picks and is shut down and closed on exit.
+
+    Args:
+        bind_host: The address to listen on; ``""`` for every interface.
+        url_host: The host name or address a container reaches it by.
+        token: The API token to accept.
+
+    Yields:
+        The URL to configure, and every request received.
+
+    """
+    hits: list[FakeHit] = []
+    server = ThreadingHTTPServer((bind_host, 0), _fake_handler(hits, token))
+    thread = threading.Thread(
+        target=server.serve_forever, name="fake-paperless", daemon=True
+    )
+    thread.start()
+    try:
+        yield FakePaperless(url=f"http://{url_host}:{server.server_port}", hits=hits)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def require_token_seen(hits: list[FakeHit], token: str) -> None:
+    """
+    Fail unless the fake paperless-ngx received ``Token <token>``.
+
+    Args:
+        hits: Every request the fake received.
+        token: The token written into the container's config.
+
+    Raises:
+        SmokeFailure: No request carried that exact token, so the mounted
+            config was not read, or something else overrode it.
+
+    """
+    expected = f"Token {token}"
+    if any(hit.authorization == expected for hit in hits):
+        return
+    seen = ", ".join(
+        f"{hit.method} {hit.path}"
+        + (" (another Authorization)" if hit.authorization else " (no Authorization)")
+        for hit in hits
+    )
+    msg = (
+        "the fake paperless-ngx never received the token from the mounted "
+        f"config; it received {len(hits)} request(s){': ' + seen if seen else ''}"
+    )
+    raise SmokeFailure(msg)
+
+
+class _ScanButtonReader(HTMLParser):
+    """Collect the attributes of every ``<button id="scan-btn">``."""
+
+    def __init__(self) -> None:
+        """Start with no buttons seen."""
+        super().__init__(convert_charrefs=True)
+        self.buttons: list[dict[str, str | None]] = []
+
+    @override
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Keep the attributes of a Scan button start tag."""
+        attributes = dict(attrs)
+        if tag == "button" and attributes.get("id") == _SCAN_BUTTON_ID:
+            self.buttons.append(attributes)
+
+
+def scan_button_enabled(html: str) -> bool:
+    """
+    Say whether a page fragment renders the Scan button enabled.
+
+    Args:
+        html: The fragment.
+
+    Returns:
+        False when the button carries ``disabled`` in any form, else True.
+
+    Raises:
+        SmokeFailure: The fragment holds no Scan button, or more than one.
+
+    """
+    reader = _ScanButtonReader()
+    reader.feed(html)
+    reader.close()
+    if len(reader.buttons) != 1:
         msg = (
-            f"GET http://127.0.0.1:{port}/health gave no 200 within "
-            f"{engine.health_seconds:.0f} s; last: {last}\n"
-            f"container log:\n{_logs(engine, name)}"
+            f'expected one <button id="{_SCAN_BUTTON_ID}">, found {len(reader.buttons)}'
         )
         raise SmokeFailure(msg)
+    return "disabled" not in reader.buttons[0]
+
+
+def _host_endpoint(engine: Engine, gateway: str) -> tuple[str, str]:
+    """
+    Choose where the fake paperless-ngx listens and how a container reaches it.
+
+    Podman maps ``host.containers.internal`` to the host, but not to the
+    host's loopback, so the fake listens on every interface. Docker Engine
+    gives no such name without an extra flag; there the host is the default
+    bridge network's gateway, and the fake listens on that address only.
+
+    Args:
+        engine: The engine the container runs under.
+        gateway: The Docker bridge gateway; ignored under Podman.
+
+    Returns:
+        The address to bind, and the host to put in the configured URL.
+
+    Raises:
+        SmokeFailure: Docker reported no bridge gateway.
+
+    """
+    if engine.podman:
+        return "", _PODMAN_HOST
+    if not gateway:
+        msg = "the docker bridge network reports no gateway to reach the host by"
+        raise SmokeFailure(msg)
+    return gateway, gateway
+
+
+def _bridge_gateway(engine: Engine) -> str:
+    """
+    Read the IPv4 gateway of Docker's default bridge network.
+
+    Args:
+        engine: A Docker engine.
+
+    Returns:
+        The gateway address, or ``""`` when there is none.
+
+    """
+    result = engine.sh(
+        'exec "$SMOKE_DOCKER" network inspect bridge '
+        "--format '{{range .IPAM.Config}}{{.Gateway}} {{end}}'"
+    )
+    _require_success(result, "reading the bridge network's gateway")
+    return next((word for word in result.stdout.split() if "." in word), "")
+
+
+def _argv_lines(argv: list[str]) -> str:
+    """
+    Join an argv one word per line, for ``$SMOKE_ARGV``.
+
+    Args:
+        argv: The words to hand the engine.
+
+    Returns:
+        The words, joined by newlines.
+
+    Raises:
+        SmokeFailure: A word holds a newline, so it would arrive as two.
+
+    """
+    if bad := [word for word in argv if "\n" in word]:
+        msg = f"cannot pass a word holding a newline: {bad!r}"
+        raise SmokeFailure(msg)
+    return "\n".join(argv)
+
+
+def _write_paperless_config(directory: Path, url: str, token: str) -> None:
+    """
+    Write a config naming the fake paperless-ngx, readable by any UID.
+
+    Args:
+        directory: An empty directory to mount at ``/etc/saneless``.
+        url: The fake's URL, as the container reaches it.
+        token: The token the fake accepts.
+
+    """
+    config = directory / "saneless.toml"
+    config.write_text(
+        f'[paperless]\nurl = "{url}"\ntoken = "{token}"\n', encoding="utf-8"
+    )
+    directory.chmod(0o755)
+    config.chmod(0o644)
+
+
+def _get(port: int, path: str) -> tuple[int, str]:
+    """
+    GET a path from the published server once, from the host.
+
+    Args:
+        port: The loopback port the server is published on.
+        path: The path, query string included.
+
+    Returns:
+        The HTTP status code and the body.
+
+    """
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=_REQUEST_SECONDS)
+    try:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        return response.status, response.read().decode("utf-8", errors="replace")
+    finally:
+        connection.close()
+
+
+def _wait_for_health(engine: Engine, port: int) -> float:
+    """
+    Poll the published ``/health`` until it answers 200.
+
+    Args:
+        engine: The engine and image under test.
+        port: The loopback port the server is published on.
+
+    Returns:
+        Seconds until the 200.
+
+    Raises:
+        SmokeFailure: No 200 arrived before the health deadline.
+
+    """
+    start = time.monotonic()
+    deadline = start + engine.health_seconds
+    last = "no answer"
+    while time.monotonic() < deadline:
+        try:
+            status = _health_status(port)
+        except (OSError, http.client.HTTPException) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+        else:
+            if status == _HTTP_OK:
+                return time.monotonic() - start
+            last = f"HTTP {status}"
+        time.sleep(_POLL_SECONDS)
+    msg = (
+        f"GET http://127.0.0.1:{port}/health gave no 200 within "
+        f"{engine.health_seconds:.0f} s; last: {last}"
+    )
+    raise SmokeFailure(msg)
+
+
+def _wait_for_scan(engine: Engine, port: int) -> float:
+    """
+    Poll the lazy list load until it renders the Scan button enabled.
+
+    The page itself always holds Scan while its lists load; the list load's
+    answer is the rendering that releases it.
+
+    Args:
+        engine: The engine and image under test.
+        port: The loopback port the server is published on.
+
+    Returns:
+        Seconds until Scan was enabled.
+
+    Raises:
+        SmokeFailure: Scan was still disabled, or never rendered, at the
+            health deadline.
+
+    """
+    start = time.monotonic()
+    deadline = start + engine.health_seconds
+    last = "no answer"
+    while time.monotonic() < deadline:
+        try:
+            status, body = _get(port, _METADATA_PATH)
+        except (OSError, http.client.HTTPException) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+        else:
+            if status != _HTTP_OK:
+                last = f"HTTP {status}"
+            elif scan_button_enabled(body):
+                return time.monotonic() - start
+            else:
+                last = "Scan rendered disabled"
+        time.sleep(_POLL_SECONDS)
+    msg = (
+        f"GET {_METADATA_PATH} gave no enabled Scan button within "
+        f"{engine.health_seconds:.0f} s; last: {last}"
+    )
+    raise SmokeFailure(msg)
+
+
+def _run_documented(engine: Engine, page: Path) -> str:
+    """
+    Run a page's documented ``docker run`` and prove the appliance works.
+
+    The page must show exactly one run of the published image. It is
+    validated and substituted (see ``substitute_documented_run``) with a
+    scratch config naming a fake paperless-ngx and a token made for this run,
+    then started. The server must answer ``/health`` with 200, render Scan
+    enabled, and have called the fake with the token. The container, its
+    data volume, the config directory and the fake are removed afterwards,
+    pass or fail.
+
+    Args:
+        engine: The engine and image under test.
+        page: The page, relative to the repository root.
+
+    Returns:
+        How long the server took to answer and to enable Scan.
+
+    Raises:
+        SmokeFailure: The command could not be read, validated or started,
+            or the appliance it started did not work.
+
+    """
+    runs = documented_docker_runs((_REPO_ROOT / page).read_text(encoding="utf-8"))
+    if len(runs) != 1:
+        msg = f"{page} shows {len(runs)} docker runs of {PUBLISHED_IMAGE}, expected 1"
+        raise SmokeFailure(msg)
+    parse_documented_run(runs[0])
+    gateway = "" if engine.podman else _bridge_gateway(engine)
+    bind_host, url_host = _host_endpoint(engine, gateway)
+    token = uuid.uuid4().hex
+    name = _container_name()
+    volume = f"saneless-smoke-data-{uuid.uuid4().hex[:12]}"
+    directory = Path(tempfile.mkdtemp(prefix="saneless-smoke-"))
+    try:
+        with fake_paperless(bind_host, url_host, token) as fake:
+            _write_paperless_config(directory, fake.url, token)
+            argv = substitute_documented_run(
+                runs[0],
+                image=engine.image,
+                config_dir=str(directory),
+                name=name,
+                volume=volume,
+            )
+            started = engine.sh(_RUN_ARGV, argv=_argv_lines(argv), name=name)
+            _require_success(started, f"starting the docker run from {page}")
+            try:
+                port = _host_port(engine, name)
+                healthy = _wait_for_health(engine, port)
+                enabled = _wait_for_scan(engine, port)
+                require_token_seen(fake.hits, token)
+            except SmokeFailure as exc:
+                msg = f"{exc}\ncontainer log:\n{_logs(engine, name)}"
+                raise SmokeFailure(msg) from exc
+    finally:
+        engine.sh('exec "$SMOKE_DOCKER" rm -f -v "$SMOKE_NAME"', name=name)
+        engine.sh('exec "$SMOKE_DOCKER" volume rm -f "$SMOKE_VOLUME"', volume=volume)
+        shutil.rmtree(directory, ignore_errors=True)
+    return f"200 after {healthy:.1f} s, Scan enabled after {enabled:.1f} s"
+
+
+def _documented_run_check(page: Path) -> Callable[[Engine], str]:
+    """
+    Make a check that runs one page's documented ``docker run``.
+
+    Args:
+        page: The page, relative to the repository root.
+
+    Returns:
+        The check's function.
+
+    """
+
+    def check(engine: Engine) -> str:
+        """Run the page's command; see ``_run_documented``."""
+        return _run_documented(engine, page)
+
+    return check
 
 
 def check_dll_conf(engine: Engine) -> None:
@@ -1374,6 +1855,11 @@ CHECKS: tuple[Check, ...] = (
     Check("dll.conf holds exactly net and escl, dll.d empty", check_dll_conf),
     Check("no interpreter can import pip", check_no_pip),
     Check("no curl, compiler, uv or pip on PATH", check_no_tools),
+    Check("README docker run serves and enables Scan", _documented_run_check(_README)),
+    Check(
+        "Quick Start docker run serves and enables Scan",
+        _documented_run_check(_QUICK_START),
+    ),
 )
 
 
