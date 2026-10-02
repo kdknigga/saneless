@@ -13,11 +13,17 @@ config directory, a throwaway data volume and a unique container name.
 These tests pin that contract without a container engine: what the extractor
 finds in a page, every shape the validator refuses, what the substitution
 changes and leaves alone, and that README and Quick Start show the same,
-complete command.
+complete command. They also pin the pieces the smoke run starts the command
+with: the fake paperless-ngx it serves and the token it must see, the Scan
+button reader, where the container finds the host, and how the argv reaches
+the engine.
 """
 
 from __future__ import annotations
 
+import http.client
+import json
+import socket
 import tomllib
 from pathlib import Path
 
@@ -26,9 +32,16 @@ import pytest
 from scripts.smoke_image import (
     ALLOWED_RUN_FLAGS,
     DocumentedRun,
+    Engine,
+    FakeHit,
     SmokeFailure,
+    _argv_lines,
+    _host_endpoint,
     documented_docker_runs,
+    fake_paperless,
     parse_documented_run,
+    require_token_seen,
+    scan_button_enabled,
     substitute_documented_run,
 )
 
@@ -407,3 +420,164 @@ def test_real_readme_and_quick_start_show_the_same_complete_run() -> None:
     assert any(item.startswith(SCANNER_HOST_ENV) for item in run.env), run.env
     assert run.stop_timeout == "90"
     assert run.image == f"{IMAGE_NAME}:{_declared_version()}"
+
+
+# ---------------------------------------------------------------------------
+# What the smoke run starts the command with
+# ---------------------------------------------------------------------------
+
+EMPTY_LIST = {"count": 0, "next": None, "previous": None, "results": []}
+
+
+def _get(url: str, path: str, authorization: str) -> tuple[int, object]:
+    """GET ``path`` from the server at ``url`` and return status and JSON body."""
+    host_port = url.removeprefix("http://")
+    host, _, port = host_port.rpartition(":")
+    connection = http.client.HTTPConnection(host, int(port), timeout=5)
+    try:
+        connection.request("GET", path, headers={"Authorization": authorization})
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+def test_the_fake_paperless_answers_a_list_and_records_the_call() -> None:
+    """A tag-list GET with the token gets the empty list, and is recorded."""
+    with fake_paperless("127.0.0.1", "127.0.0.1", "t") as fake:
+        assert fake.url.startswith("http://127.0.0.1:")
+        status, body = _get(fake.url, "/api/tags/", "Token t")
+        assert (status, body) == (200, EMPTY_LIST)
+        assert fake.hits == [FakeHit("GET", "/api/tags/", "Token t")]
+
+
+def test_the_fake_paperless_refuses_another_token_but_records_it() -> None:
+    """A wrong token is answered 401, as paperless-ngx would, and still recorded."""
+    with fake_paperless("127.0.0.1", "127.0.0.1", "t") as fake:
+        status, _ = _get(fake.url, "/api/correspondents/", "Token other")
+        assert status == 401
+        assert fake.hits == [FakeHit("GET", "/api/correspondents/", "Token other")]
+
+
+def test_the_fake_paperless_stops_listening_on_exit() -> None:
+    """Once the context exits, nothing accepts connections on its port."""
+    with fake_paperless("127.0.0.1", "127.0.0.1", "t") as fake:
+        port = int(fake.url.rpartition(":")[2])
+    with (
+        pytest.raises(ConnectionRefusedError),
+        socket.create_connection(("127.0.0.1", port), 2),
+    ):
+        pass
+
+
+def test_the_token_check_passes_when_the_smoke_token_arrived() -> None:
+    """One request carrying the token is enough."""
+    require_token_seen(
+        [
+            FakeHit("GET", "/api/tags/", None),
+            FakeHit("GET", "/api/correspondents/", "Token smoke"),
+        ],
+        "smoke",
+    )
+
+
+@pytest.mark.parametrize(
+    "hits",
+    [
+        [],
+        [FakeHit("GET", "/api/tags/", None)],
+        [FakeHit("GET", "/api/tags/", "Token another")],
+        [FakeHit("GET", "/api/tags/", "Token smoke-and-more")],
+        [FakeHit("GET", "/api/tags/", "Bearer smoke")],
+    ],
+    ids=["nothing", "no header", "another token", "longer token", "another scheme"],
+)
+def test_the_token_check_fails_unless_the_smoke_token_arrived(
+    hits: list[FakeHit],
+) -> None:
+    """No request carrying ``Token <smoke token>`` means the config was not used."""
+    with pytest.raises(SmokeFailure):
+        require_token_seen(hits, "smoke")
+
+
+@pytest.mark.parametrize(
+    ("html", "enabled"),
+    [
+        ('<button type="submit" id="scan-btn" class="x">Scan</button>', True),
+        ('<button type="submit" id="scan-btn" autofocus>Scan</button>', True),
+        ('<button type="submit" id="scan-btn" disabled>Scan</button>', False),
+        (
+            '<button type="submit" id="scan-btn" disabled="disabled">Scan</button>',
+            False,
+        ),
+        (
+            '<div hx-swap-oob="true"><ul></ul></div>\n'
+            '<button type="submit" id="scan-btn" hx-swap-oob="true"\n'
+            '        aria-describedby="scan-blocked-reason"\n'
+            "        disabled>\n    Scan\n</button>",
+            False,
+        ),
+    ],
+    ids=["enabled", "autofocus", "bare disabled", "valued disabled", "multi-line"],
+)
+def test_the_scan_button_reader_sees_disabled(html: str, *, enabled: bool) -> None:
+    """Only a ``disabled`` attribute on the Scan button makes it disabled."""
+    assert scan_button_enabled(html) is enabled
+
+
+def test_the_scan_button_reader_ignores_other_disabled_buttons() -> None:
+    """Another disabled button does not disable Scan."""
+    html = (
+        '<button id="retry" disabled>Retry</button>'
+        '<button type="submit" id="scan-btn">Scan</button>'
+    )
+    assert scan_button_enabled(html) is True
+
+
+@pytest.mark.parametrize(
+    "html",
+    ["", "<p>Scan</p>", '<input id="scan-btn" disabled>', '<button id="scan">'],
+    ids=["empty", "no button", "not a button", "another id"],
+)
+def test_a_page_without_the_scan_button_fails(html: str) -> None:
+    """No Scan button at all is a failure, never a pass."""
+    with pytest.raises(SmokeFailure):
+        scan_button_enabled(html)
+
+
+def _engine(*, podman: bool) -> Engine:
+    """Return an engine value that never runs anything."""
+    return Engine(
+        docker="/usr/bin/docker", image="saneless:ci", podman=podman, health_seconds=1.0
+    )
+
+
+def test_podman_reaches_the_host_by_name_and_the_fake_listens_everywhere() -> None:
+    """Podman maps ``host.containers.internal`` to the host, not to its loopback."""
+    assert _host_endpoint(_engine(podman=True), "") == ("", "host.containers.internal")
+
+
+def test_docker_reaches_the_host_at_the_bridge_gateway() -> None:
+    """On Docker the fake binds the bridge gateway and the container uses it."""
+    assert _host_endpoint(_engine(podman=False), "172.17.0.1") == (
+        "172.17.0.1",
+        "172.17.0.1",
+    )
+
+
+def test_docker_without_a_bridge_gateway_fails() -> None:
+    """No gateway means the container could not reach the fake: say so."""
+    with pytest.raises(SmokeFailure):
+        _host_endpoint(_engine(podman=False), "")
+
+
+def test_the_argv_travels_one_word_per_line() -> None:
+    """Each word is one line, kept exactly, ``$(pwd)`` and spaces included."""
+    argv = ["run", "-d", "-v", "$(pwd)/a b:/etc/saneless:z", "-e", "X=$HOME"]
+    assert _argv_lines(argv) == "run\n-d\n-v\n$(pwd)/a b:/etc/saneless:z\n-e\nX=$HOME"
+
+
+def test_a_word_with_a_newline_cannot_travel() -> None:
+    """A newline would split one word into two flags, so it is refused."""
+    with pytest.raises(SmokeFailure):
+        _argv_lines(["run", "--name", "a\n--privileged", "saneless:ci"])
