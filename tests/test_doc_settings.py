@@ -30,8 +30,10 @@ from saneless.config import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_REFERENCE = REPO_ROOT / "docs" / "reference" / "configuration.md"
-ENV_REFERENCE = REPO_ROOT / "docs" / "reference" / "environment-variables.md"
+DOCS_DIR = REPO_ROOT / "docs"
+README = REPO_ROOT / "README.md"
+CONFIG_REFERENCE = DOCS_DIR / "reference" / "configuration.md"
+ENV_REFERENCE = DOCS_DIR / "reference" / "environment-variables.md"
 
 CANONICAL_HEADING = "## Where saneless reads settings"
 
@@ -45,6 +47,10 @@ _FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
 _NUMBERED_ITEM = re.compile(r"^\d+\.\s+(.*)$")
 _LEADING_CODE_SPAN = re.compile(r"^`([^`]+)`")
 _CODE_SPAN = re.compile(r"`([^`]+)`")
+# A Markdown list item: a bullet or a number, after any indentation.
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+# A fence opener or closer, at any indentation (tabbed content is indented).
+_FENCE_MARK = re.compile(r"^\s*(```|~~~)")
 
 
 def _mkdocs_slug(heading: str) -> str:
@@ -212,6 +218,135 @@ def _canonical_link_offenders(text: str) -> list[str]:
     if f"({target})" in text:
         return []
     return [f"no link to {target}"]
+
+
+def _blank_fences(text: str) -> list[str]:
+    """
+    Return the page's lines with every fenced block blanked, not removed.
+
+    A fenced block is sample output or a command, such as ``doctor``'s table of
+    the files it looked at; it is not the page restating the search list.
+    Blanking keeps line numbers right for the offence messages.
+    """
+    lines: list[str] = []
+    opener = ""
+    for line in text.splitlines():
+        mark = _FENCE_MARK.match(line)
+        if opener:
+            if mark and mark.group(1) == opener:
+                opener = ""
+            lines.append("")
+        elif mark:
+            opener = mark.group(1)
+            lines.append("")
+        else:
+            lines.append(line)
+    return lines
+
+
+def _blocks(text: str) -> list[tuple[str, int, str]]:
+    """
+    Split a page into its lists and paragraphs, fenced code left out.
+
+    A list runs from its first item to the first line after a blank that is
+    neither an item nor indented, so a loose list (blank lines between items)
+    and an item's wrapped or indented continuation stay one list. Everything
+    else is cut into paragraphs at blank lines.
+
+    Returns:
+        ``(kind, first line number, text)`` for each block, ``kind`` being
+        ``"list"`` or ``"paragraph"``.
+
+    """
+    blocks: list[tuple[str, int, str]] = []
+    kind = ""
+    start = 0
+    current: list[str] = []
+    after_blank = True
+
+    def flush() -> None:
+        if current:
+            blocks.append((kind, start, "\n".join(current)))
+            current.clear()
+
+    for number, line in enumerate(_blank_fences(text), start=1):
+        if not line.strip():
+            if kind == "paragraph":
+                flush()
+                kind = ""
+            after_blank = True
+            continue
+        if _LIST_ITEM.match(line):
+            if kind != "list":
+                flush()
+                kind, start = "list", number
+        elif kind == "list" and (line[:1].isspace() or not after_blank):
+            pass
+        elif kind != "paragraph":
+            flush()
+            kind, start = "paragraph", number
+        current.append(line)
+        after_blank = False
+    flush()
+    return blocks
+
+
+def _occurrences(text: str, groups: list[tuple[str, ...]]) -> list[int]:
+    """
+    Return which searched path each mention in ``text`` names, in text order.
+
+    ``groups`` holds every spelling of each searched path, in search order; a
+    mention of any spelling counts as that path.
+    """
+    found: list[tuple[int, int]] = []
+    for index, spellings in enumerate(groups):
+        for spelling in spellings:
+            found.extend(
+                (match.start(), index)
+                for match in re.finditer(re.escape(spelling), text)
+            )
+    return [index for _position, index in sorted(found)]
+
+
+def _in_search_order(mentions: list[int], count: int) -> bool:
+    """Say whether the mentions name every path, one after another, in order."""
+    wanted = 0
+    for index in mentions:
+        if index == wanted:
+            wanted += 1
+            if wanted == count:
+                return True
+    return False
+
+
+def _restated_search_lists(
+    text: str, groups: list[tuple[str, ...]], name: str = "page"
+) -> list[str]:
+    """
+    Report where a page restates the config search list instead of linking it.
+
+    A list that names two or more of the searched paths is a restated list. A
+    paragraph is one only when it names every path in search order: a
+    sentence that names them in another order, such as where ``auto-profiles``
+    writes a new file, is about something else. A single path used inline is
+    what the reader needs, and is fine.
+    """
+    offences: list[str] = []
+    for kind, line, block in _blocks(text):
+        mentions = _occurrences(block, groups)
+        named = sorted(set(mentions))
+        if kind == "list" and len(named) >= 2:
+            paths = [groups[index][0] for index in named]
+            offences.append(f"{name}:{line}: a list names {paths}")
+        elif kind == "paragraph" and _in_search_order(mentions, len(groups)):
+            offences.append(f"{name}:{line}: a paragraph names every path in order")
+    return offences
+
+
+def _other_pages() -> list[Path]:
+    """Return README and every docs page except the configuration reference."""
+    pages = [README, *sorted(DOCS_DIR.rglob("*.md"))]
+    return [page for page in pages if page != CONFIG_REFERENCE]
 
 
 @pytest.fixture
@@ -394,3 +529,156 @@ def test_seeded_missing_heading_is_reported() -> None:
     """A page without the canonical heading fails loudly, naming the page."""
     with pytest.raises(AssertionError, match="Where saneless reads settings"):
         _settings_section("# Configuration\n\n## Config File Search Path\n", "page")
+
+
+@pytest.fixture
+def path_spellings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[str, ...]]:
+    """
+    Every way a page may spell each searched path, in search order.
+
+    The loader's list is rendered twice: under a sentinel ``$XDG_CONFIG_HOME``
+    for the spellings the configuration reference uses, and with the variable
+    unset under a sentinel home for the ``~/.config`` default a page may name
+    instead.
+    """
+    xdg_home = tmp_path / "sentinel-xdg-config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    documented = _documented_spellings(xdg_home)
+    home = tmp_path / "sentinel-home"
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setenv("HOME", str(home))
+    groups: list[tuple[str, ...]] = []
+    for spelling, path in zip(documented, config_search_paths(), strict=True):
+        if path.is_absolute() and path.is_relative_to(home):
+            groups.append((spelling, f"~/{path.relative_to(home).as_posix()}"))
+        else:
+            groups.append((spelling,))
+    return groups
+
+
+def test_path_spellings_include_the_home_default(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """The per-user path is matched by its variable and by its ``~`` default."""
+    assert len(path_spellings) == len(config_search_paths())
+    per_user = [group for group in path_spellings if len(group) == 2]
+    assert len(per_user) == 1
+    assert per_user[0][0].startswith(f"{XDG_SPELLING}/")
+    assert per_user[0][1].startswith("~/.config/")
+
+
+def test_no_other_page_restates_the_search_list(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """
+    Only the configuration reference lists the files saneless searches.
+
+    Every other page uses the one path its reader needs and links the
+    canonical section, so a change to the search list is made in one place.
+    """
+    offences: list[str] = []
+    for page in _other_pages():
+        offences.extend(
+            _restated_search_lists(
+                page.read_text(encoding="utf-8"),
+                path_spellings,
+                str(page.relative_to(REPO_ROOT)),
+            )
+        )
+    assert not offences, "\n".join(offences)
+
+
+def test_the_canonical_page_is_what_the_sweep_would_report(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """
+    The sweep reports the configuration reference's own search list.
+
+    The canonical list is the one place the sweep is meant to find, so it is
+    left out on purpose, not because the sweep is blind to it.
+    """
+    text = CONFIG_REFERENCE.read_text(encoding="utf-8")
+    assert _restated_search_lists(text, path_spellings)
+    assert CONFIG_REFERENCE not in _other_pages()
+    assert README in _other_pages()
+
+
+def test_seeded_numbered_search_list_is_reported(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """A numbered list of the searched paths is one offence."""
+    text = (
+        "saneless looks for its config here:\n\n"
+        + "\n".join(
+            f"{index}. `{group[0]}`"
+            for index, group in enumerate(path_spellings, start=1)
+        )
+        + "\n\nThen it starts.\n"
+    )
+    offences = _restated_search_lists(text, path_spellings)
+    assert len(offences) == 1, offences
+    assert ":3: a list names" in offences[0]
+
+
+def test_seeded_loose_bullet_list_with_home_spelling_is_reported(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """Two paths in a loose bullet list, one spelt with ``~``, are an offence."""
+    per_user = next(group for group in path_spellings if len(group) == 2)
+    text = (
+        f"- `{path_spellings[0][0]}` in the working directory\n\n"
+        f"- `{per_user[1]}` for your user\n"
+    )
+    assert len(_restated_search_lists(text, path_spellings)) == 1
+
+
+def test_seeded_paragraph_in_search_order_is_reported(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """A paragraph naming every path in search order is a restated list."""
+    text = "saneless reads " + ", then ".join(
+        f"`{group[0]}`" for group in path_spellings
+    )
+    assert len(_restated_search_lists(text + ".\n", path_spellings)) == 1
+
+
+def test_seeded_write_target_sentence_is_not_reported(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """
+    Naming every path in another order is about something else, and is fine.
+
+    This is the shape of the sentence saying where ``auto-profiles`` writes a
+    new file: the system path, then the per-user one, and never the first.
+    """
+    first, per_user, system = path_spellings
+    text = (
+        f"`auto-profiles` creates `{system[0]}` if its directory exists, and "
+        f"otherwise `{per_user[0]}` (by default `{per_user[1]}`). It never "
+        f"writes `{first[0]}`.\n"
+    )
+    assert not _restated_search_lists(text, path_spellings)
+
+
+def test_seeded_single_inline_path_is_not_reported(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """One path used inline, in a paragraph or a list item, is what a reader needs."""
+    per_user = next(group for group in path_spellings if len(group) == 2)
+    text = (
+        f"Save it as `{per_user[1]}`.\n\n"
+        f"- The container reads `{path_spellings[-1][0]}`.\n"
+        "- It is mounted from `./config`.\n"
+    )
+    assert not _restated_search_lists(text, path_spellings)
+
+
+def test_seeded_fenced_output_is_not_reported(
+    path_spellings: list[tuple[str, ...]],
+) -> None:
+    """A fenced sample of program output naming the paths is not a restatement."""
+    lines = "\n".join(f"- {group[0]}" for group in path_spellings)
+    text = f"Example:\n\n    ```text\n{lines}\n    ```\n"
+    assert not _restated_search_lists(text, path_spellings)

@@ -295,6 +295,108 @@ def test_web_api_reference_health_bodies_match_the_app(
     )
 
 
+# Every page a reader may compare a ``/health`` probe's output with.
+DOC_PAGES = (REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").rglob("*.md")))
+
+_FENCE_LINE = re.compile(r"^\s*(```|~~~)")
+_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+_JSON_OBJECT = re.compile(r"\{[^{}]*\}")
+
+
+def _health_ok_bodies(text: str) -> list[tuple[int, str]]:
+    """
+    Return every JSON object in a page's code that shows ``status`` as ``ok``.
+
+    Code is a fenced block or an inline code span, where a page shows a body a
+    reader will compare with real output. An object may span lines inside a
+    fence, as pretty-printed JSON does.
+
+    Args:
+        text: The Markdown page.
+
+    Returns:
+        ``(line number, object text)`` pairs, in page order.
+
+    """
+    lines = text.splitlines()
+    code: list[tuple[int, str]] = []
+    fence: list[str] = []
+    opener = ""
+    start = 0
+    for number, line in enumerate(lines, start=1):
+        mark = _FENCE_LINE.match(line)
+        if opener:
+            if mark and mark.group(1) == opener:
+                code.append((start, "\n".join(fence)))
+                opener = ""
+            else:
+                fence.append(line)
+        elif mark:
+            opener, start, fence = mark.group(1), number + 1, []
+        else:
+            code.extend((number, span) for span in _INLINE_CODE.findall(line))
+    bodies: list[tuple[int, str]] = []
+    for first, block in code:
+        for match in _JSON_OBJECT.finditer(block):
+            body = match.group(0)
+            if '"status"' in body and '"ok"' in body:
+                bodies.append((first + block.count("\n", 0, match.start()), body))
+    return bodies
+
+
+def test_every_documented_health_ok_body_is_the_one_the_app_sends(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Every page that shows the healthy ``/health`` body shows the real bytes.
+
+    The reference's table is held to the route above; this holds the same body
+    on every other page, such as the deployment guide's ``curl`` output, so a
+    reader never sees one spelling in one place and another in the next.
+    """
+    monkeypatch.setattr(
+        ScanWorker, "health", property(lambda _self: WorkerHealth.HEALTHY)
+    )
+    response = client.get("/health")
+    assert response.status_code == 200
+    shown = [
+        (f"{page.relative_to(REPO_ROOT)}:{line}", body)
+        for page in DOC_PAGES
+        for line, body in _health_ok_bodies(page.read_text(encoding="utf-8"))
+    ]
+    assert len({place.split(":")[0] for place, _body in shown}) >= 2, (
+        f"expected the healthy body on the reference and a guide, found {shown}"
+    )
+    wrong = [f"{place}: {body}" for place, body in shown if body != response.text]
+    assert not wrong, f"pages show a /health body other than {response.text!r}:\n" + (
+        "\n".join(wrong)
+    )
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        (
+            'Probe it:\n\n```\n$ curl /health\n{"status": "ok"}\n```\n',
+            [(5, '{"status": "ok"}')],
+        ),
+        (
+            'Probe it:\n\n    ```json\n    {\n      "status": "ok"\n    }\n    ```\n',
+            [(4, '{\n      "status": "ok"\n    }')],
+        ),
+        ('| 200 | `{"status":"ok"}` | healthy |\n', [(1, '{"status":"ok"}')]),
+        ('The body {"status": "ok"} in prose is not code.\n', []),
+        ('```\n{"status":"connected"}\n```\n', []),
+    ],
+    ids=["fenced", "pretty-printed", "inline", "prose", "another-status"],
+)
+def test_seeded_health_ok_bodies_are_found(
+    page: str, expected: list[tuple[int, str]]
+) -> None:
+    """The reader finds the body in fences and code spans, and nothing else."""
+    assert _health_ok_bodies(page) == expected
+
+
 def test_web_api_reference_states_what_head_health_answers(
     client: TestClient,
 ) -> None:

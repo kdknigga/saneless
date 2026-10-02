@@ -594,21 +594,16 @@ def test_environment_reference_documents_unknown_variables() -> None:
 
 
 def test_search_path_lists_name_xdg_config_home() -> None:
-    """Every page listing the per-user config path names ``$XDG_CONFIG_HOME``."""
-    offenders = []
-    for page in (
-        CONFIG_REFERENCE,
-        ARCHITECTURE,
-        FIRST_CLI_SCAN,
-        INSTALL_BARE_METAL,
-        QUICK_START,
-    ):
-        text, name = _read(page)
-        if ".config/saneless" in text and "XDG_CONFIG_HOME" not in text:
-            offenders.append(str(name))
-    assert not offenders, (
-        "pages list ~/.config/saneless without $XDG_CONFIG_HOME: "
-        + ", ".join(offenders)
+    """
+    The configuration reference names the per-user path by ``$XDG_CONFIG_HOME``.
+
+    It is the only page that lists the files saneless searches, so it is the
+    only page where a bare ``~/.config/saneless`` would mislead a reader who
+    has moved their config home.
+    """
+    text, name = _read(CONFIG_REFERENCE)
+    assert ".config/saneless" not in text or "XDG_CONFIG_HOME" in text, (
+        f"{name} lists ~/.config/saneless without $XDG_CONFIG_HOME"
     )
 
 
