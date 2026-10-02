@@ -1,8 +1,8 @@
 # Configuration (TOML)
 
-saneless uses a TOML configuration file with environment variable overrides. All settings have sensible defaults -- a minimal config only needs `[paperless]` credentials and a `[profiles.default]` section.
+saneless uses a TOML configuration file with environment variable overrides. All settings have sensible defaults -- a minimal config only needs a `[paperless]` section with `url` and `token`. Scan profiles come from `saneless auto-profiles`, which asks the scanner what it offers, or from the built-in `default` profile until you run it.
 
-## Config File Search Path
+## Where saneless reads settings
 
 Settings are loaded from the first file found, in priority order:
 
@@ -15,15 +15,23 @@ The file is called `saneless.toml` in every searched location. No other filename
 
 If no file is found, defaults and environment variables are used.
 
+Each setting then takes its value from the first of these that sets it:
+
+1. An environment variable, `SANELESS_<SECTION>__<FIELD>` (see [Environment Variables](environment-variables.md))
+2. The loaded `saneless.toml`
+3. The built-in default
+
+A set variable wins over the file silently: nothing warns that the value in the file was ignored, and the startup log lists only the names of the settings that came from the environment. So keep the paperless-ngx URL and token in `saneless.toml` and nowhere else, and do not also set `SANELESS_PAPERLESS__URL` or `SANELESS_PAPERLESS__TOKEN` in a compose file or shell profile, where a stale value would go on overriding the one you edit.
+
 Only one file is ever read. If more than one `saneless.toml` is found, the first one in this list is read and the others are not: the log warns once for each file it is not reading, and the [Configuration check](#the-configuration-check) is amber and names the file in use and every file that is not read. One file reached twice -- through a symlink, or because the working directory is one of the other locations -- counts once.
 
 When no config file was loaded, `saneless auto-profiles` writes `/etc/saneless/saneless.toml` if the `/etc/saneless` directory already exists and is writable (in the container, the mounted `./config` directory), otherwise `$XDG_CONFIG_HOME/saneless/saneless.toml`, and never `./saneless.toml`, which would be read ahead of both. It creates a missing XDG directory with mode `0700`, owned like the directory it is created in when the command may set that (so `sudo -E` leaves nothing root-only in your home), and it never creates `/etc/saneless`.
 
 A path that is not a regular file (for example a directory) is skipped. An explicit `--config PATH` that does not exist, or is not a regular file, is an error (exit code 2). A leading `~` in `--config` is expanded to your home directory.
 
-!!! warning "Upgrading from config.toml to saneless.toml"
+!!! warning "saneless reads saneless.toml, never config.toml"
 
-    Earlier versions looked for `config.toml` in the XDG and `/etc` locations. saneless now reads `saneless.toml` there too, and the old name is no longer a fallback: a file still called `config.toml` in a searched directory is recognised by its name, never opened, and never merged into your settings.
+    saneless reads only `saneless.toml`. A file called `config.toml` in a searched directory is recognised by its name, never opened, and never merged into your settings.
 
     Rename it:
 
@@ -35,7 +43,7 @@ A path that is not a regular file (for example a directory) is skipped. An expli
 
     Until you do, saneless says so in four places rather than starting up quietly on defaults: the log names the file it ignored, the [Configuration check](#the-configuration-check) is red and names both the file and the rename, `saneless doctor` lists it in its resolution table and exits 2, and `saneless auto-profiles` refuses to run -- a fresh `saneless.toml` would load ahead of the old file and bury the URL and token in the file you have not renamed yet.
 
-    If the old file sits beside a `saneless.toml` that did load, the check is amber instead: the right file is in use, but the leftover may still hold settings that are now being ignored. Move anything you still need out of it into the loaded file, and only then delete it. Do not delete it first: after an upgrade the leftover `config.toml` may hold the only copy of your paperless-ngx URL and token, and the `saneless.toml` in use may have been written by `auto-profiles` with profiles and nothing else.
+    If the `config.toml` sits beside a `saneless.toml` that did load, the check is amber instead: the right file is in use, but the `config.toml` may hold settings that are being ignored. Move anything you still need out of it into the loaded file, and only then delete it. Do not delete it first: the `config.toml` may hold the only copy of your paperless-ngx URL and token, and the `saneless.toml` in use may have been written by `auto-profiles` with profiles and nothing else.
 
     A `./config.toml` belonging to some other tool in your working directory is flagged in the same way, because saneless cannot tell the two apart and will not read either. Run saneless from another directory, or create the `saneless.toml` it is looking for.
 

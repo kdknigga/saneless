@@ -1,6 +1,6 @@
 # Environment Variables
 
-All configuration can be set via environment variables, which override values from the TOML config file.
+All configuration can be set via environment variables. A set variable overrides the same setting in the TOML config file; see [Where saneless reads settings](configuration.md#where-saneless-reads-settings) for the full order.
 
 ## Naming Convention
 
@@ -11,14 +11,6 @@ SANELESS_{SECTION}__{FIELD}
 ```
 
 For example, `scanner.host` in TOML becomes `SANELESS_SCANNER__HOST`.
-
-## Priority Order
-
-Settings are resolved in this order (highest to lowest priority):
-
-1. Environment variables (`SANELESS_*`)
-2. TOML config file
-3. Built-in defaults
 
 ## Variable Reference
 
@@ -99,7 +91,7 @@ A container's clock reports UTC unless `TZ` is set, so **without it every one of
 | `SSL_CERT_FILE` | path | `/etc/ssl/certs/my-ca.crt` |
 | `SSL_CERT_DIR` | path | `/etc/ssl/my-ca-dir` |
 
-These are OpenSSL's own variables, not `SANELESS_` settings, and saneless never reads them -- the TLS layer beneath its HTTP client does. They name the certificate authorities to trust when saneless connects to paperless-ngx over `https://`, and they **replace** the operating system's trust store rather than adding to it: once either is set, the OS trust store is not consulted at all, so the file or directory you name must carry every CA saneless needs -- not just the private one. A container that sets `SSL_CERT_FILE` to a single private CA therefore trusts exactly that one CA, so a `paperless.url` that is publicly signed -- now, or later when it moves behind Let's Encrypt -- fails inside the container while working everywhere else. Their behaviour is unchanged: the previous HTTP client honoured them too. What changed is the default, which is now the operating system's trust store rather than a certificate bundle shipped inside a Python package. Set one of these only when your paperless-ngx certificate is signed by a private or corporate CA that is not installed on this machine; installing that CA into the OS trust store is the better fix wherever you can do it. [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#paperless-errors-exit-3) describes the failure they resolve, under **TLS certificate not trusted**.
+These are OpenSSL's own variables, not `SANELESS_` settings, and saneless never reads them -- the TLS layer beneath its HTTP client does. They name the certificate authorities to trust when saneless connects to paperless-ngx over `https://`, and they **replace** the operating system's trust store rather than adding to it: once either is set, the OS trust store is not consulted at all, so the file or directory you name must carry every CA saneless needs -- not just the private one. A container that sets `SSL_CERT_FILE` to a single private CA therefore trusts exactly that one CA, so a `paperless.url` that is publicly signed -- today, or later when it moves behind Let's Encrypt -- fails inside the container while working everywhere else. With neither set, saneless trusts the operating system's trust store. Set one of these only when your paperless-ngx certificate is signed by a private or corporate CA that is not installed on this machine; installing that CA into the OS trust store is the better fix wherever you can do it. [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#paperless-errors-exit-3) describes the failure they resolve, under **TLS certificate not trusted**.
 
 Prefer `SSL_CERT_FILE`. It takes a single PEM file and needs nothing else. `SSL_CERT_DIR` takes a directory and carries a trap: OpenSSL reads only files named `<8-hex-hash>.<n>` in it, so dropping a bare `.pem` into the directory fails exactly as if you had set nothing at all, with no diagnostic anywhere to tell you why. Run `c_rehash` over the directory, or make the link yourself with `ln -s my-ca.pem "$(openssl x509 -hash -noout -in my-ca.pem).0"`.
 
@@ -113,7 +105,7 @@ A path that does not exist, or one that is a directory where `SSL_CERT_FILE` exp
 
 - **saneless logs where its settings came from.** At startup it writes one INFO line naming the config file it loaded (or saying there was none) and the dotted names of the settings that came from environment variables, for example `paperless.url, paperless.token`. Names only, never values.
 
-- **Docker deployments** commonly use environment variables for `SANELESS_PAPERLESS__URL`, `SANELESS_PAPERLESS__TOKEN`, and `SANELESS_SCANNER__HOST` while mounting a TOML file for profile definitions.
+- **In a container**, keep the paperless-ngx URL and token in the mounted `saneless.toml` rather than in `SANELESS_PAPERLESS__URL` and `SANELESS_PAPERLESS__TOKEN`: a set variable silently overrides the file (see [Where saneless reads settings](configuration.md#where-saneless-reads-settings)), so a token left in the compose file goes on winning after you change the one in `saneless.toml`. `SANELESS_SCANNER__HOST` is the variable a container usually sets.
 
 - **A relative path follows the config file.** A relative `SANELESS_OUTPUT__TMP_DIR`, `SANELESS_OUTPUT__DATA_DIR`, `SANELESS_OUTPUT__LOG_FILE` or `SANELESS_PAPERLESS__CONSUME_DIR` is resolved against the directory of the config file that was loaded, exactly as the same value in the file would be, or against the working directory when no config file was loaded. The log and `saneless doctor` show the absolute result. See [`[output]`](configuration.md#output).
 

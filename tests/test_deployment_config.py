@@ -839,7 +839,7 @@ def test_configuration_reference_names_the_new_config_target() -> None:
     assert "/var/lib/saneless/saneless.toml" not in text, (
         f"{name} still names the data volume as a place auto-profiles writes"
     )
-    search = _section(text, "## Config File Search Path", name)
+    search = _section(text, "## Where saneless reads settings", name)
     target = [
         sentence
         for sentence in _sentences(search)
