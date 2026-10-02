@@ -1535,21 +1535,32 @@ class TestCheckAgainOnTheRefresherThread:
         """
         A probe still running at the end of the wait leaves the strip asking.
 
-        The response arrives while the probe is still held, carrying the
-        trigger that collects its answer, and the answer is there once the
-        probe finishes.
+        The route waits ``CHECK_AGAIN_WAIT_SECONDS`` for the probe and no
+        longer: the probe is held until after the response, so a response at
+        all, with the request reported pending, is the wait ending on its own.
+        The response carries the trigger that collects the answer, and the
+        answer is there once the probe finishes.  No clock is read, so a slow
+        machine cannot fail it.
         """
+        monkeypatch.setattr(routes_module, "CHECK_AGAIN_WAIT_SECONDS", 0.2)
         spy = _HeldProbeSpy()
         monkeypatch.setattr(refresher_module, "run_checks", spy)
+        refresher = _refresher(client)
+        real_request_probe = refresher.request_probe
+        asked: list[tuple[float, ManualProbe]] = []
+
+        def recording_request_probe(*, wait: float) -> ManualProbe:
+            outcome = real_request_probe(wait=wait)
+            asked.append((wait, outcome))
+            return outcome
+
+        monkeypatch.setattr(refresher, "request_probe", recording_request_probe)
         try:
-            began = time.monotonic()
             response = client.post("/api/checks/refresh")
-            elapsed = time.monotonic() - began
 
             assert response.status_code == 200
-            assert elapsed < 4.0
-            assert elapsed >= routes_module.CHECK_AGAIN_WAIT_SECONDS - 0.5
-            assert spy.entered.is_set()
+            assert asked == [(0.2, refresher_module.ManualProbe.PENDING)]
+            assert spy.entered.wait(_HELD_PROBE_SECONDS) is True
             assert spy.calls == 0
             assert "hx-trigger" in _body_attrs(response.text)
         finally:
