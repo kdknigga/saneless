@@ -29,15 +29,14 @@ token = "your-api-token-here"
 consume_dir = "/path/to/paperless/consume"
 ```
 
-In Docker, mount the consume directory as a shared volume between the saneless and paperless-ngx containers:
+In Docker, mount one volume into both containers: in saneless at the path `consume_dir` names, and in paperless-ngx at its `PAPERLESS_CONSUMPTION_DIR`:
 
 ```yaml
 services:
   saneless:
     volumes:
+      - ./config:/etc/saneless
       - consume:/consume
-    environment:
-      SANELESS_PAPERLESS__CONSUME_DIR: /consume
 
   paperless:
     volumes:
@@ -48,6 +47,15 @@ services:
 volumes:
   consume:
 ```
+
+Then name the container path in `./config/saneless.toml`, beside the URL and token:
+
+```toml
+[paperless]
+consume_dir = "/consume"
+```
+
+The mount alone changes nothing: saneless falls back only when `consume_dir` names a directory. Keep the setting in the file rather than in the compose `environment:` block; see [Where saneless reads settings](../reference/configuration.md#where-saneless-reads-settings).
 
 ### Who can read the copy
 
@@ -121,7 +129,7 @@ This is a deliberate trade-off: saving the document without metadata is better t
 - `saneless jobs` prints `Saved to folder` in the Status column.
 - `saneless jobs --json` reports `"state": "FALLBACK"` and `"outcome": "FALLBACK"`. The JSON output is deliberately not humanised: it stays the raw enum value, so scripts can compare against it.
 
-So the job history does mark which documents arrived without metadata. You no longer have to spot them from the paperless-ngx side.
+So the job history marks which documents arrived without their metadata, and which ones to finish by hand in paperless-ngx.
 
 **A CLI scan reports it on the terminal instead.** `saneless scan` does not write to the job store, so its scans never appear in the job history or in `saneless jobs`. A CLI scan that fell back prints `Saved to folder: <title>` on stdout, then two lines on stderr -- `Not uploaded: saved to the consume folder without its title, tags or correspondent`, and `Warning: ` followed by the sentence quoted below -- and exits with code 6. A script should treat exit 6 as "delivered, but fix the connection": the document is in paperless-ngx's hands, so scanning the stack again would only file it twice. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#saved-to-the-consume-folder-exit-6).
 
