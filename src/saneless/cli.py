@@ -187,8 +187,11 @@ _LISTEN_BACKLOG: Final = 2048
 # by a 2 s connect and a 5 s read, 7 s in all, so one such call that was under
 # way when the stop came ends inside the drain, and the lifespan does not
 # close the Paperless client under it.  Not every request fits.  A list
-# fetch of more than one page is one such call per page, and a name lookup
-# takes no timeout at all, so either can outlast the drain.  uvicorn then
+# fetch of more than one page is one such call per page.  A request that
+# fetches both lists, as the scan form's lazy load (``GET /api/metadata``)
+# does, makes two such calls in a row, and each may first wait as long again
+# for another request's fetch of the same list.  A name lookup takes no
+# timeout at all.  Any of these can outlast the drain.  uvicorn then
 # cancels the request, but its worker thread keeps running, and so keeps the
 # process alive, after the lifespan has closed what that thread was using.
 #
