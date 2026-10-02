@@ -23,12 +23,9 @@ Then create `config/saneless.toml` with your paperless-ngx connection details:
 [paperless]
 url = "http://paperless:8000"
 token = "your-api-token-here"
-
-[profiles.default]
-source = "Flatbed"
-resolution = 300
-mode = "Color"
 ```
+
+Leave the scan profiles out. When the file holds none, saneless [generates profiles at startup](configure-scan-profiles.md#generation-at-server-startup) from what the scanner reports and writes them into this file; `docker compose exec saneless saneless auto-profiles` does the same on demand once the container is running. A hand-written `[profiles.default]` turns off that generation at startup.
 
 !!! note
     The container reads `/etc/saneless/saneless.toml` from the mounted `./config` directory. If `saneless.toml` is missing, saneless uses its defaults plus environment variables and the container still starts. The directory must be writable by the container, because `saneless auto-profiles` and the profile generation at startup rewrite `saneless.toml` there. With no `saneless.toml`, `docker compose exec saneless saneless auto-profiles` creates `/etc/saneless/saneless.toml` in the mounted `./config` directory, because that directory exists and the container can write to it; you do not need to create the file first. The new file has mode `0600`, and when the command runs as root it is given the directory's owner. The profile generation at startup never creates the file: without `saneless.toml`, the server keeps the profiles it generates in memory only. If the container cannot write to `./config`, `auto-profiles` does not fall back to the data volume. It tries the per-user file under the container user's home instead, which the image does not provide, and exits 2 naming it and saying why `/etc/saneless` was passed over: `mounted read-only` means the volume line ends in `:ro`, so remove it; `not writable by this user` means fix the ownership as the next note describes. Then run it again. Keep only `saneless.toml` in the directory, and do not let untrusted users write to it.
@@ -156,26 +153,14 @@ curl http://localhost:8080/health
 Expected response:
 
 ```json
-{"status": "ok"}
+{"status":"ok"}
 ```
 
 Then open the web UI at `http://localhost:8080` in your browser. You should see the scan interface with your configured profiles.
 
 ## Environment variable configuration
 
-You can configure saneless entirely through environment variables using the `SANELESS_` prefix with `__` as the nested delimiter. This is useful when you prefer not to mount a config file:
-
-!!! warning "An environment variable overrides `saneless.toml`"
-    Environment variables sit above the config file, so a variable set in your compose file wins over the same setting in `config/saneless.toml` -- silently, with nothing in the UI to say where the value came from. That is why the example above sets the paperless-ngx connection in the file and not here. Pick one place per setting; for the token, make it `config/saneless.toml`.
-
-| Setting | Environment Variable |
-|---|---|
-| Paperless URL | `SANELESS_PAPERLESS__URL` |
-| Paperless token | `SANELESS_PAPERLESS__TOKEN` |
-| Scanner host | `SANELESS_SCANNER__HOST` |
-| Log level | `SANELESS_OUTPUT__LOG_LEVEL` |
-
-See [Environment Variables](../reference/environment-variables.md) for the full list.
+`SANELESS_SCANNER__HOST` belongs in the `environment:` block, as in the compose file above. Keep the paperless-ngx URL and token in `./config/saneless.toml` instead, because a variable that is set silently overrides the file. [Where saneless reads settings](../reference/configuration.md#where-saneless-reads-settings) gives the order, and [Environment Variables](../reference/environment-variables.md) lists every variable.
 
 ## Running behind a reverse proxy
 

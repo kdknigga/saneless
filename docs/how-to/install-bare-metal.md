@@ -59,22 +59,23 @@ You should see output listing your scanner's name, vendor, model, and type. If y
 
 ## Step 4: Create a configuration file
 
-Create `saneless.toml` in your working directory (or `$XDG_CONFIG_HOME/saneless/saneless.toml`, default `~/.config/saneless/saneless.toml`):
+Create `saneless.toml` in your working directory (or `$XDG_CONFIG_HOME/saneless/saneless.toml`, default `~/.config/saneless/saneless.toml`; [Where saneless reads settings](../reference/configuration.md#where-saneless-reads-settings) lists every place saneless looks):
 
 ```toml
 [paperless]
 url = "http://paperless.local:8000"
 token = "your-api-token-here"
-
-[profiles.default]
-source = "Flatbed"
-resolution = 300
-mode = "Color"
 ```
 
-See [Configure Scan Profiles](configure-scan-profiles.md) for more profile options.
+Then, from the same directory, write scan profiles into that file from what your scanner reports:
 
-If `auto-profiles` creates the config file from scratch -- you ran `saneless auto-profiles` before writing one -- it lands in `$XDG_CONFIG_HOME/saneless/saneless.toml` (by default `~/.config/saneless/saneless.toml`), or in `/etc/saneless/saneless.toml` when the `/etc/saneless` directory already exists and you can write to it. It never lands in `./saneless.toml` in the working directory, which would outrank both on the next start. Add the `[paperless]` table above to that file.
+```bash
+saneless auto-profiles
+```
+
+Leave `[profiles.default]` out of the file you write by hand: a hand-written default turns off the profile generation `saneless serve` runs at startup. See [Configure Scan Profiles](configure-scan-profiles.md) for more profile options.
+
+If `auto-profiles` creates the config file from scratch -- you ran it before writing one -- it lands in `$XDG_CONFIG_HOME/saneless/saneless.toml` (by default `~/.config/saneless/saneless.toml`), or in `/etc/saneless/saneless.toml` when the `/etc/saneless` directory already exists and you can write to it, and never in `./saneless.toml`. Add the `[paperless]` table above to that file.
 
 If you run `sudo saneless auto-profiles` and `/etc/saneless` belongs to root, the new file is owned by root with mode `0600`. saneless running as your own user then finds that file on the next start and cannot read it, so every command stops with a configuration error. The command prints a note naming the file when this happens. Before you start saneless, give the file to the user saneless runs as; for your own user:
 
