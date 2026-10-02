@@ -1149,7 +1149,8 @@ def read_recent_jobs(db_path: Path, limit: int) -> list[Job]:
             msg = (
                 f"job database at {name} is at schema version {version}, "
                 f"older than this saneless reads ({supported}); "
-                "start saneless serve once to upgrade it"
+                "only saneless serve upgrades a job database: start it once "
+                "with the same config, stop it, then run saneless jobs again"
             )
             raise StorageError(msg)
         rows = conn.execute(_SELECT_RECENT, (limit,)).fetchall()

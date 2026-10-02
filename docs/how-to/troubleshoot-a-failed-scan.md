@@ -200,7 +200,8 @@ Other causes of exit 2, each a line naming the problem and then a `Try:` line wi
   job database. If it is damaged, move it aside: saneless then starts with an empty job history,
   and the moved file is kept for inspection or restoring.
   `saneless jobs` only reads the history, so it also refuses a database an earlier release left
-  at an older schema, and says so; start `saneless serve` once, which upgrades it, then run
+  at an older schema, and says so. Only `saneless serve` upgrades a job database: start it once
+  with the same config, even on an install that otherwise only uses the CLI, stop it, then run
   `saneless jobs` again.
 - **`paperless.url` or `paperless.token` refused.** Spaces and line breaks around either value
   are ignored. What is left of `paperless.url` must be empty, or an `http://` or `https://`

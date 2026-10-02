@@ -3252,7 +3252,12 @@ class TestReadRecentJobs:
         assert str(db) in message
         assert "schema version 2" in message
         assert f"({HEAD_VERSION})" in message
-        assert "saneless serve" in message
+        # The remedy names the one command that upgrades the file without
+        # implying that every install runs a server: a CLI-only install may
+        # hold a database an earlier release's listing created.
+        assert "only saneless serve upgrades a job database" in message
+        assert "start it once with the same config, stop it" in message
+        assert message.endswith("then run saneless jobs again")
         assert _sha256(db) == before
         assert _read_schema_raw(str(db))[0] == 2
         assert _names(tmp_path) == ["jobs.db"]
