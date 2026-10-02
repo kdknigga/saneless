@@ -27,7 +27,8 @@ The first release, 0.2.0.
   [Set Up ADF Duplex Scanning](https://kdknigga.github.io/saneless/how-to/set-up-adf-duplex/)
   and
   [Scan a Multi-Page Document](https://kdknigga.github.io/saneless/how-to/scan-a-multi-page-document/).
-- Empty-page detection, which drops blank pages from feeder scans. See
+- Empty-page detection, which drops blank pages from every scan, flatbed or
+  feeder. See
   [Empty Page Detection](https://kdknigga.github.io/saneless/explanation/empty-page-detection/).
 - A consume-directory fallback that saves the PDF to a folder paperless-ngx
   watches when the paperless-ngx API cannot take the upload. See
