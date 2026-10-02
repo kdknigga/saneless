@@ -179,7 +179,7 @@ A number outside its key's range stops saneless when the config loads (exit 2), 
 
 ## `[web]`
 
-Which optional controls the scan form shows, and which extra host names saneless answers to. Both form keys default to `true`, so an existing deployment's form is unchanged by upgrading.
+Which optional controls the scan form shows, and which extra host names saneless answers to. Both form keys default to `true`, so the form shows both controls unless you turn one off.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
