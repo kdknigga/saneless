@@ -3994,7 +3994,9 @@ class TestServeCommand:
         """
         app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
         refresher: CheckRefresher = app.state.refresher
-        server = cli_module._StoppingServer(uvicorn.Config(app), app)
+        # serve's own config: no log_config, so uvicorn rewires no loggers
+        # for the rest of the session.
+        server = cli_module._StoppingServer(uvicorn.Config(app, log_config=None), app)
         server.should_exit = stopping
         stop_event = refresher._stopping
         real_set = threading.Event.set
