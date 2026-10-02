@@ -200,6 +200,50 @@ def test_a_command_the_shell_could_not_parse_is_refused() -> None:
         documented_docker_runs(text)
 
 
+def test_a_hash_inside_a_word_stays_in_the_word() -> None:
+    """``A=b#c`` is one word, as in a shell; a ``#`` there starts no comment."""
+    text = f"```bash\ndocker run -e A=b#c -p 8080:8080 {SEED_IMAGE}\n```\n"
+    assert documented_docker_runs(text) == [
+        ["docker", "run", "-e", "A=b#c", "-p", "8080:8080", SEED_IMAGE],
+    ]
+
+
+def test_a_whole_line_comment_before_the_run_is_skipped() -> None:
+    """A comment line in the block is not part of the command after it."""
+    text = (
+        "```bash\n"
+        "  # Start it in the background:\n"
+        f"docker run -p 8080:8080 {SEED_IMAGE}\n"
+        "```\n"
+    )
+    assert documented_docker_runs(text) == [
+        ["docker", "run", "-p", "8080:8080", SEED_IMAGE],
+    ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"docker run -p 8080:8080 {SEED_IMAGE}  # serves the UI",
+        f"docker run -p 8080:8080 #-v x:/y \\\n  {SEED_IMAGE}",
+    ],
+    ids=["trailing comment", "comment inside a continuation"],
+)
+def test_a_comment_inside_a_command_is_refused(command: str) -> None:
+    """A mid-command comment hides words, so the command is refused."""
+    text = f"```bash\n{command}\n```\n"
+    with pytest.raises(SmokeFailure, match="comment"):
+        documented_docker_runs(text)
+
+
+def test_a_quoted_hash_is_not_a_comment() -> None:
+    """A word that opens with a quote holds its ``#`` literally."""
+    text = f"```bash\ndocker run -e 'A=#x' -e \"#y\" {SEED_IMAGE}\n```\n"
+    assert documented_docker_runs(text) == [
+        ["docker", "run", "-e", "A=#x", "-e", "#y", SEED_IMAGE],
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------

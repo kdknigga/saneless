@@ -474,6 +474,10 @@ def _block_commands(block: str) -> list[str]:
     """
     Return each command in a code block, backslash continuations joined.
 
+    A line whose first non-blank character is ``#`` is a whole-line comment
+    and is skipped when it starts a command. One inside a continuation is
+    kept, so the caller sees it and refuses the command.
+
     Args:
         block: A fenced block's body.
 
@@ -485,6 +489,8 @@ def _block_commands(block: str) -> list[str]:
     parts: list[str] = []
     for line in block.splitlines():
         stripped = line.rstrip()
+        if not parts and stripped.lstrip().startswith("#"):
+            continue
         if stripped.endswith("\\"):
             parts.append(stripped[:-1])
             continue
@@ -494,6 +500,47 @@ def _block_commands(block: str) -> list[str]:
     if parts:
         commands.append(" ".join(parts).strip())
     return commands
+
+
+def _comment_start(command: str) -> int | None:
+    """
+    Find where a POSIX shell would start a comment in a command.
+
+    A shell starts a comment only at an unquoted ``#`` that begins a word,
+    so ``A=b#c`` and ``"#c"`` hold no comment and ``img  # note`` does.
+
+    Args:
+        command: One command line, continuations already joined.
+
+    Returns:
+        The index of the ``#`` that starts the comment, or ``None``.
+
+    """
+    quote = ""
+    escaped = False
+    word_start = True
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            word_start = False
+        elif quote:
+            if char == quote:
+                quote = ""
+            elif char == "\\" and quote == '"':
+                escaped = True
+        elif char == "\\":
+            escaped = True
+            word_start = False
+        elif char in "'\"":
+            quote = char
+            word_start = False
+        elif char.isspace():
+            word_start = True
+        elif char == "#" and word_start:
+            return index
+        else:
+            word_start = False
+    return None
 
 
 def documented_docker_runs(text: str) -> list[list[str]]:
@@ -515,7 +562,8 @@ def documented_docker_runs(text: str) -> list[list[str]]:
 
     Raises:
         SmokeFailure: A command naming the image cannot be split into words,
-            so what it would run cannot be known.
+            or holds a comment after its first word, so what it would run
+            cannot be known.
 
     """
     runs: list[list[str]] = []
@@ -523,8 +571,11 @@ def documented_docker_runs(text: str) -> list[list[str]]:
         for command in _block_commands(block):
             if not _DOCKER_RUN.match(command) or PUBLISHED_IMAGE not in command:
                 continue
+            if _comment_start(command) is not None:
+                msg = f"the documented command {command!r} holds a comment"
+                raise SmokeFailure(msg)
             try:
-                argv = shlex.split(_PROMPT.sub("", command), comments=True)
+                argv = shlex.split(_PROMPT.sub("", command))
             except ValueError as exc:
                 msg = f"cannot split the documented command {command!r}: {exc}"
                 raise SmokeFailure(msg) from exc
