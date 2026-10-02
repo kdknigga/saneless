@@ -1747,23 +1747,32 @@ def _run_documented(engine: Engine, page: Path) -> str:
     return f"200 after {healthy:.1f} s, Scan enabled after {enabled:.1f} s"
 
 
-def _documented_run_check(page: Path) -> Callable[[Engine], str]:
+def check_readme_run(engine: Engine) -> str:
     """
-    Make a check that runs one page's documented ``docker run``.
+    Check that README.md's documented ``docker run`` gives a working appliance.
 
     Args:
-        page: The page, relative to the repository root.
+        engine: The engine and image under test.
 
     Returns:
-        The check's function.
+        How long the server took to answer and to enable Scan.
 
     """
+    return _run_documented(engine, _README)
 
-    def check(engine: Engine) -> str:
-        """Run the page's command; see ``_run_documented``."""
-        return _run_documented(engine, page)
 
-    return check
+def check_quick_start_run(engine: Engine) -> str:
+    """
+    Check that the Quick Start's documented ``docker run`` gives one too.
+
+    Args:
+        engine: The engine and image under test.
+
+    Returns:
+        How long the server took to answer and to enable Scan.
+
+    """
+    return _run_documented(engine, _QUICK_START)
 
 
 def check_dll_conf(engine: Engine) -> None:
@@ -1876,11 +1885,8 @@ CHECKS: tuple[Check, ...] = (
     Check("dll.conf holds exactly net and escl, dll.d empty", check_dll_conf),
     Check("no interpreter can import pip", check_no_pip),
     Check("no curl, compiler, uv or pip on PATH", check_no_tools),
-    Check("README docker run serves and enables Scan", _documented_run_check(_README)),
-    Check(
-        "Quick Start docker run serves and enables Scan",
-        _documented_run_check(_QUICK_START),
-    ),
+    Check("README docker run serves and enables Scan", check_readme_run),
+    Check("Quick Start docker run serves and enables Scan", check_quick_start_run),
 )
 
 
