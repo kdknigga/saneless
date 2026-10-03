@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import html
+import importlib
 import json
 import logging
 import os
@@ -20,7 +21,6 @@ from unittest.mock import MagicMock
 
 import httpx2
 import pytest
-from fastapi.routing import _IncludedRouter
 from PIL import Image, ImageDraw
 
 from saneless import logging_config
@@ -47,7 +47,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
     from fastapi import FastAPI
+    from fastapi.routing import _IncludedRouter
     from fastapi.testclient import TestClient
+    from playwright.sync_api import Page
     from starlette.routing import BaseRoute
 
     from saneless.job import Job, JobStore
@@ -1092,6 +1094,9 @@ def wait_for_state(
     whole class of states -- ``TERMINAL_STATES`` in particular -- without
     knowing which member the run will land on.
 
+    Every pause is followed by another read, including the last one after the
+    deadline, so a state reached while the helper slept is still returned.
+
     The default budget is deliberately far below pytest-timeout's 60 s SIGALRM:
     a wait that hits this ceiling raises a message naming the job, the awaited
     state and the state actually observed, which a SIGALRM traceback would not.
@@ -1111,25 +1116,34 @@ def wait_for_state(
     """
     wanted = state if isinstance(state, frozenset) else frozenset([state])
     observed = "<no such job>"
-    found: Job | None = None
-    tick = threading.Event()  # never set: each wait() is a bounded pause
-    for _ in range(max(1, int(timeout / _POLL_INTERVAL))):
+
+    def arrived() -> Job | None:
+        """Read the job once, recording its state, and return it if awaited."""
+        nonlocal observed
         job = store.get_job(job_id)
-        if job is not None:
-            observed = job.state.value
-            if job.state in wanted:
-                found = job
-                break
+        if job is None:
+            return None
+        observed = job.state.value
+        return job if job.state in wanted else None
+
+    deadline = time.monotonic() + timeout
+    tick = threading.Event()  # never set: each wait() is a bounded pause
+    while True:
+        found = arrived()
+        if found is not None:
+            return found
         tick.wait(_POLL_INTERVAL)
-    else:
-        names = ", ".join(sorted(s.value for s in wanted))
-        msg = (
-            f"Job {job_id} did not reach {names} within {timeout}s "
-            f"(last observed: {observed})"
-        )
-        raise RuntimeError(msg)
-    assert found is not None
-    return found
+        if time.monotonic() >= deadline:
+            break
+    found = arrived()
+    if found is not None:
+        return found
+    names = ", ".join(sorted(s.value for s in wanted))
+    msg = (
+        f"Job {job_id} did not reach {names} within {timeout}s "
+        f"(last observed: {observed})"
+    )
+    raise RuntimeError(msg)
 
 
 @pytest.fixture(name="wait_for_state")
@@ -1215,6 +1229,24 @@ def quiet_window(seconds: float) -> None:
     """
     never_set = threading.Event()
     never_set.wait(seconds)
+
+
+def browser_quiet_window(page: Page, milliseconds: float) -> None:
+    """
+    Let the page run for ``milliseconds`` while nothing is expected to happen.
+
+    The browser counterpart of ``quiet_window``: Playwright's synchronous API
+    dispatches page events only during its own calls, so the wait goes through
+    the page, which keeps receiving events throughout. A request or swap that
+    should not happen is then recorded by the test's listeners. Import it as
+    ``from tests.conftest import browser_quiet_window``.
+
+    Args:
+        page: The page to leave running.
+        milliseconds: How long to leave it alone. Keep it short.
+
+    """
+    page.wait_for_timeout(milliseconds)
 
 
 # The child enters a real JobWorkspace, spools blank pages the way the scanner
@@ -1351,8 +1383,9 @@ def _flatten_routes(routes: Sequence[BaseRoute]) -> list[BaseRoute]:
     ``getattr`` defaulting to ``None`` when ``original_router`` is missing
     would silently return nothing the moment that attribute were renamed while
     the wrapper survived, which is exactly the hole the raise in
-    ``leaf_routes`` exists to close.  Importing the private class fails loudly
-    at import time instead.
+    ``leaf_routes`` exists to close.  The private class is imported when the
+    routes are walked, so its disappearance fails the tests that walk routes,
+    loudly, without stopping the rest of the suite from importing this module.
 
     Args:
         routes: The routes to walk, at any depth.
@@ -1361,9 +1394,12 @@ def _flatten_routes(routes: Sequence[BaseRoute]) -> list[BaseRoute]:
         The leaves, with every wrapper expanded in place.
 
     """
+    included: type[_IncludedRouter] = importlib.import_module(
+        "fastapi.routing"
+    )._IncludedRouter
     found: list[BaseRoute] = []
     for route in routes:
-        if isinstance(route, _IncludedRouter):
+        if isinstance(route, included):
             found.extend(_flatten_routes(route.original_router.routes))
         else:
             found.append(route)

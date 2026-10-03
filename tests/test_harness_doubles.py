@@ -290,7 +290,7 @@ def test_gated_loopback_holds_its_upload_answer() -> None:
                 except httpx2.ReadTimeout as error:
                     failures.append(error)
 
-        sender = threading.Thread(target=post, name="gated-upload")
+        sender = threading.Thread(target=post, name="gated-upload", daemon=True)
         sender.start()
         sender.join(timeout=5.0)
         assert not sender.is_alive()
