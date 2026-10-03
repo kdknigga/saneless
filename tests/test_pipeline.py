@@ -6276,11 +6276,9 @@ class TestTheDpiTheDeviceActuallyChose:
     """
     The PDF declares the resolution the scanner used, not the one asked for.
 
-    Phase 23 made the profile's requested resolution authoritative for
-    ``img2pdf.get_fixed_dpi_layout_fun``. SANE substitutes silently -- measured,
-    5000 comes back as 1200 -- so a device that substitutes produced both a
-    mis-cropped page and a MediaBox disagreeing with its own content, which
-    re-opened part of OUTC-06 (T-24-22).
+    SANE substitutes a resolution silently (a request for 5000 can come back
+    as 1200), so laying pages out at the requested value would give a
+    mis-cropped page and a MediaBox that disagrees with its own content.
     """
 
     def test_the_pdf_is_assembled_at_the_resolution_the_device_chose(
@@ -6322,7 +6320,8 @@ class TestTheDpiTheDeviceActuallyChose:
         The profile asks for 300 and the device reads back 150; two A4 rasters
         at 150 dpi go through, then the third sheet jams.  The scan never
         returned a batch, so the only place the 150 can come from is the pages
-        themselves.  Laid out at the requested 300, the kept PDF was half size.
+        themselves.  Laid out at the requested 300, the kept PDF would be half
+        size.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].resolution = 300
@@ -6505,13 +6504,12 @@ class TestTheDpiTheDeviceActuallyChose:
 
 class TestRejectedPagesAreNotBlankPages:
     """
-    D-07: a sheet the scanner could not read is counted, and counted apart.
+    A sheet the scanner could not read is counted, and counted apart.
 
-    ``pages_scanned`` is ``len(records)``, which already excludes a skipped
-    sheet, so a ten-sheet stack with one unreadable page reported nine and
-    nobody learned a page was lost (T-24-23). The count must not be folded into
-    the blank-page total, which Phase 30 renders as pages removed for being
-    blank (T-24-24).
+    ``pages_scanned`` is ``len(records)``, which excludes a skipped sheet, so
+    without its own count a ten-sheet stack with one unreadable page would
+    report nine and nobody would learn a page was lost.  The count stays out
+    of the blank-page total, which is shown as pages removed for being blank.
     """
 
     def test_rejected_pages_are_reported_without_touching_the_blank_count(
@@ -7068,19 +7066,13 @@ class TestManualDuplexPassCap:
 
 class TestTitleLogEscaping:
     """
-    A job title in a pipeline log line is escaped, not pasted (IN-03).
+    A job title in a pipeline log line is escaped, not pasted.
 
-    ``web/errors.py``'s module docstring states the discipline: request input
-    goes into a log line with ``%r`` "so a control character in them is escaped
-    and cannot forge a log line".  A job title is request input, is bounded
-    only in length (``TITLE_MAX_LENGTH``) and never in character set, so a
-    title carrying a newline could otherwise append a record of the operator's
-    own choosing to the log an operator and any log shipper reads.
-
-    Every assertion here is on ``record.getMessage()`` -- the formatted line --
-    rather than on ``record.args``, because the raw argument is the unescaped
-    title by design and asserting on it would pass whatever the format string
-    said.
+    A job title is request input bounded only in length, never in character
+    set, so a title carrying a newline could append a forged record to the
+    log an operator and any log shipper reads.  Every assertion is on
+    ``record.getMessage()``, the formatted line, because ``record.args``
+    holds the unescaped title whatever the format string says.
     """
 
     #: A title whose newline would start a plausible-looking second record.
@@ -7091,9 +7083,8 @@ class TestTitleLogEscaping:
         """
         Drive ``_note_pass_count``'s failure path and return its log line.
 
-        Every observer failure is now logged by one best-effort helper, at
-        WARNING, as "Observer failed at ..."; the pass-count call used to log
-        its own "Pass-count observer failed" line at ERROR.
+        Every observer failure is logged by one best-effort helper, at
+        WARNING, as "Observer failed at ...".
 
         Args:
             title: The request title to put through the log line.
@@ -7193,7 +7184,7 @@ class TestTitleLogEscaping:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        The call this phase added escapes the title it logs (IN-03).
+        The pass-count observer's failure line escapes the title it logs.
 
         Args:
             caplog: pytest's log capture fixture.
@@ -7211,13 +7202,12 @@ class TestTitleLogEscaping:
         default_settings: Settings,
     ) -> None:
         """
-        The simplex completion line gets the same treatment.
+        The simplex completion line escapes the title too.
 
         Args:
             caplog: pytest's log capture fixture.
             mock_paperless: The stub Paperless client.
             default_settings: The fixture settings.
-            tmp_path: pytest's per-test temporary directory.
 
         """
         scanner = MagicMock(spec=ScannerBackend)
@@ -7243,13 +7233,12 @@ class TestTitleLogEscaping:
         default_settings: Settings,
     ) -> None:
         """
-        So does the duplex-mismatch recovery's completion line.
+        The duplex-mismatch recovery's completion line escapes the title too.
 
         Args:
             caplog: pytest's log capture fixture.
             mock_paperless: The stub Paperless client.
             default_settings: The fixture settings.
-            tmp_path: pytest's per-test temporary directory.
 
         """
         default_settings.profiles["default"].source = "ADF"
@@ -7911,9 +7900,9 @@ class TestRunGuard:
         """
         A ``TypeError`` from the upload stays a ``TypeError``, with the PDF kept.
 
-        The old delivery window re-raised it as a ``PaperlessError``, so a bug
-        in saneless's own code read as "paperless-ngx is unreachable" and the
-        CLI exited 3.  It is now UNKNOWN, which the CLI exits 5 for.
+        Re-raised as a ``PaperlessError``, a bug in saneless's own code would
+        read as "paperless-ngx is unreachable" and exit 3; kept as itself it
+        is UNKNOWN, which the CLI exits 5 for.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         original = TypeError("upload_document() got an unexpected keyword argument")
