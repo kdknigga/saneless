@@ -295,7 +295,7 @@ class TestUnownedRow:
     def test_an_unowned_flip_still_offers_its_buttons_to_anyone(
         self, owner: TestClient, other: TestClient
     ) -> None:
-        """The flip rule is unchanged: a NULL owner may be answered by anybody."""
+        """An unowned row's flip prompt offers its buttons to any browser."""
         store = _store(owner)
         job = store.create_job(profile="duplex", title=OWNER_TITLE)
         store.update_thumbnail(job.id, THUMBNAIL)
@@ -419,7 +419,7 @@ class TestNoHostPathOnTheWeb:
     def test_no_response_names_a_host_path_or_the_paperless_address(
         self, owner: TestClient, other: TestClient, view_settings: Settings
     ) -> None:
-        """Sweep every GET route and both flip answers, as owner and as not."""
+        """No GET route or flip answer names a host path, for owner or anyone else."""
         failed, fallback = self._seed(_store(owner), view_settings)
         forbidden = self._secrets(view_settings)
         paths = self._get_paths(_app(owner), (failed.id, fallback.id))
@@ -455,7 +455,11 @@ class TestTemplateContract:
     """Templates receive a JobView and read nothing a JobView does not carry."""
 
     def test_templates_read_only_job_view_attributes(self) -> None:
-        """A template reading a Job-only attribute would bypass the owner gate."""
+        """
+        Every job attribute a template reads is one a JobView carries.
+
+        A template reading a Job-only attribute would bypass the owner gate.
+        """
         allowed = {field.name for field in dataclasses.fields(JobView)}
         allowed |= {"is_active", "is_busy"}
         environment = jinja2.Environment(autoescape=True)
