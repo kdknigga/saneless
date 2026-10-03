@@ -4832,24 +4832,56 @@ def test_the_timeout_key_scan_reads_bare_keys_and_variables() -> None:
     assert keys == ["flip_timeout_seconds", "operator_wait_timeout_seconds"]
 
 
+# The old name a rename note gives, as in "was renamed from `old_key`". Only
+# the key inside it is exempt, not the rest of the line it sits on.
+RENAMED_FROM = re.compile(
+    r"\brenamed from `(?P<old>(?:SANELESS_[A-Z]+__)?[a-z_]*timeout_seconds)`",
+    re.IGNORECASE,
+)
+
+
+def _unknown_timeout_keys(line: str) -> list[str]:
+    """
+    Return each timeout key ``line`` names that is not an ``OutputConfig`` field.
+
+    The old name in a "renamed from" note is the one place an unknown key may
+    appear, and only that occurrence is exempt.
+    """
+    fields = set(OutputConfig.model_fields)
+    exempt = [match.span("old") for match in RENAMED_FROM.finditer(line)]
+    return [
+        match["key"]
+        for match in TIMEOUT_KEY.finditer(line)
+        if match["key"].lower() not in fields
+        if not any(start <= match.start() < end for start, end in exempt)
+    ]
+
+
+def test_the_timeout_key_scan_exempts_only_the_renamed_key() -> None:
+    """A rename note excuses its old key, not another unknown key on its line."""
+    line = (
+        "| `operator_wait_timeout_seconds` | Set `wait_timeout_seconds` to 0 to "
+        "wait forever. This key was renamed from `flip_timeout_seconds` |"
+    )
+
+    assert _unknown_timeout_keys(line) == ["wait_timeout_seconds"]
+
+
 def test_every_timeout_key_a_page_names_is_an_output_field() -> None:
     """
     Every ``*_timeout_seconds`` key a page names is an ``OutputConfig`` field.
 
     A config or environment that sets an unknown key fails to load, so a page
-    naming one hands the reader a setting that cannot load. A line with the
-    word "renamed" in it is the one place an old name may appear.
+    naming one hands the reader a setting that cannot load. The old name in a
+    "renamed from" note is the one place an unknown key may appear.
     """
-    fields = set(OutputConfig.model_fields)
     offenders = [
-        f"{page.relative_to(REPO_ROOT)}:{number}: {match['key']}"
+        f"{page.relative_to(REPO_ROOT)}:{number}: {key}"
         for page in [README, *_doc_pages()]
         for number, line in enumerate(
             page.read_text(encoding="utf-8").splitlines(), start=1
         )
-        if not _says(line, "renamed")
-        for match in TIMEOUT_KEY.finditer(line)
-        if match["key"].lower() not in fields
+        for key in _unknown_timeout_keys(line)
     ]
     assert not offenders, "\n".join(offenders)
 
