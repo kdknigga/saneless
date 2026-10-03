@@ -1,76 +1,16 @@
 """
-Static text tests for the documented Docker deployment (CFG-09, M-30, D-09).
+Static text tests for the deployment, the docs, packaging and the repository.
 
-saneless rewrites ``saneless.toml`` atomically: it writes a temp file beside the
-config and renames it over the original. That rename only works when the
-container sees the config *directory*. A single-file bind mount makes the kernel
-refuse the rename with EBUSY, so every profile write fails on the deployment the
-docs used to recommend. These tests hold the compose example and every doc page
-to the read-write directory mount ``./config:/etc/saneless``, and they keep out
-the old, false claim that the container fails to start without ``saneless.toml``.
+The compose example and every doc page mount the config *directory*, because
+saneless renames a temp file over ``saneless.toml`` and a single-file bind
+mount makes that rename fail with EBUSY. The references, how-tos and examples
+are held to the code: exit codes, config keys, routes and checks are read
+from the source rather than written down here. Repository guards keep shipped
+files free of the old owner, planning citations, stale image tags and
+unpinned actions, and hold the declared dependency floors to ``uv.lock``.
 
-The later tests hold the configuration, environment-variable and CLI references,
-the scripting how-to, the empty-page explanation and ``saneless.toml.example``
-to the Phase 27 behaviour: strict keys and ``SANELESS_*`` names, XDG paths,
-validated log levels, ``-v``, the literal profile title, and the optional
-``--title`` (CFG-01..CFG-08, CFG-10, CFG-11).
-
-The exit-code tests pin the CLI reference's global exit-code table to
-``ExitCode`` -- every documented code is a real one, and every real one is
-documented -- hold each command's table to exactly the codes that command
-can exit with, and hold the troubleshooting how-to's opening table to real
-codes. The scripting how-to's table lists only the codes its example
-branches on, and ``test_doc_exit_codes.py`` checks it.
-
-The Phase 29 test pins the architecture page's "Memory, disk and timeouts"
-subsection, and the absence of the two claims that phase falsified (D-20).
-
-The Phase 30 tests hold the shipped compose template to D-17 -- the paperless
-connection is commented out, because a live line there silently overrides
-``./config/saneless.toml`` -- and to APPL-11's consume-directory mount and
-APPL-12's ``TZ``. They derive the documentation's expectations from the
-source: the route decorators, the ``WebConfig`` fields and the
-``RequestRejection`` members, so a future addition cannot ship undocumented
-(APPL-05, APPL-07, APPL-10, APPL-11, APPL-12).
-
-The Phase 31 tests pin the packaging identity ``pyproject.toml`` publishes:
-the 0.2.0 series, the PEP 639 license keys, the Alpha maturity classifier, the
-absence of the deprecated ``License ::`` classifier -- which nothing in the
-build or publish toolchain rejects, so this is the only thing that does -- and
-the unchanged ``saneless`` distribution name (D-01, D-02, D-05, DLVR-08).
-
-The Phase 31 identity guard then holds every tracked file outside
-``.planning/`` to the current GitHub owner, so a stale project URL cannot
-reach a reader or a registry (CI-02, DLVR-01, D-08..D-12). Its README tests
-hold the front page's own examples to the source and to the filesystem: the
-scan example shows ``--title``, every ``source`` value is the spelling the
-profile model defaults to, and every documentation deep link names a page
-that exists (DOCS-02, D-45).
-
-The citation guard holds every source, template, style and script file under
-``src/``, and every release script under ``scripts/``, to comments that give
-their own reasons, because the planning records they might otherwise point at
-do not ship with the product.
-
-The Phase 35 tests hold the declared ``>=`` floors to the versions ``uv.lock``
-resolves, and hold the ``anyio`` ceiling to its declaration. The container
-builds its environment with ``uv sync --locked`` in the builder stage, so the
-floors no longer decide what ships; the published wheel's metadata still carries them, so they
-remain the only thing a downstream non-lock install obeys (DEP-12, DEP-13,
-D-09, D-10, D-11, D-17).
-
-Plain-text assertions, with two stated exceptions: the contract is what an
-operator copies, not what a YAML parser makes of it. The first is the
-floor-to-lock guard at the foot of this file, which parses ``uv.lock`` with
-``tomllib`` because that file is machine-generated, is copied by nobody, and
-hides the one failure a line scanner cannot see -- two ``[[package]]`` entries
-for a single declared name. The second is ``packaging``, used wherever a guard
-has to decide what a version or a version range means: the published-image
-guard reads ``project.version`` to tell a release candidate from a final
-release, the uv guard asks whether each pinned uv lies inside the declared
-``required-version`` range, and the interpreter guard asks whether
-``.python-version`` satisfies ``requires-python``. PEP 440 ordering and range
-membership are not things to re-implement with a regular expression.
+Text is read as an operator copies it; ``tomllib`` parses only the TOML files
+nobody copies, and ``packaging`` decides what a version or a range means.
 """
 
 from __future__ import annotations
@@ -85,7 +25,8 @@ import sys
 # serves the floor-to-lock guard at the foot of the file, where the reason is
 # set out in full: `uv.lock` is machine-generated TOML that no operator
 # copies, and a line scanner cannot see two `[[package]]` entries for one
-# name. It also reads `project.version` for the published-image guard.
+# name. It also reads `pyproject.toml`'s `[project]` table for the packaging
+# and published-image guards.
 import tomllib
 from pathlib import Path
 from typing import Any, get_args
@@ -164,11 +105,11 @@ DOCS_DIR = REPO_ROOT / "docs"
 
 DIRECTORY_MOUNT = "./config:/etc/saneless"
 # The same directory at the same container path, spelled for a bind-mount flag,
-# where the host side has to be absolute and quoted (row 31).
+# where the host side has to be absolute and quoted.
 ABSOLUTE_DIRECTORY_MOUNT = '"$(pwd)/config:/etc/saneless"'
 DIRECTORY_MOUNT_FORMS = (DIRECTORY_MOUNT, ABSOLUTE_DIRECTORY_MOUNT)
 
-# The one config filename saneless reads, and the one it used to read. The
+# The one config filename saneless reads, and the legacy one it does not. The
 # legacy name is assembled from named parts in an f-string rather than written
 # as a single literal, because the repository sweep guard forbids that literal
 # in every shipped file -- this one included -- and a literal here would make
@@ -205,16 +146,14 @@ TOML_EXAMPLE = REPO_ROOT / "saneless.toml.example"
 CLI_REFERENCE = DOCS_DIR / "reference" / "cli-commands.md"
 CLI_SCRIPTING = DOCS_DIR / "how-to" / "cli-scripting.md"
 
-# Where an earlier release's `saneless auto-profiles` put a new config inside
-# the image: it wrote `./saneless.toml`, and the image's working directory is
-# the data volume. That file outlived the container and, being first in the
-# search order, loaded ahead of the mounted `/etc/saneless` for good -- the
-# command meant to help built the shadowing trap itself. No page may name it
-# as a place `auto-profiles` writes again; the upgrade notes may still name it
-# as a leftover to merge and delete.
+# The working-directory config inside the image, which is on the data volume.
+# A `saneless.toml` there outlives the container and, being first in the search
+# order, loads ahead of the mounted `/etc/saneless`, so no page names it as a
+# place `auto-profiles` writes; the upgrade notes name it as a leftover to
+# merge and delete.
 AUTO_PROFILES_CONTAINER_PATH = "`/var/lib/saneless/saneless.toml`"
 # The system config file, which the container's `./config` mount provides and
-# which `auto-profiles` now creates when that directory exists and is writable.
+# which `auto-profiles` creates when that directory exists and is writable.
 SYSTEM_CONFIG_PATH = "`/etc/saneless/saneless.toml`"
 # The per-user config file, the no-file target everywhere else.
 XDG_CONFIG_PATH = "`$XDG_CONFIG_HOME/saneless/saneless.toml`"
@@ -262,14 +201,11 @@ def test_no_single_file_config_mount_anywhere() -> None:
 
 def test_the_single_file_mount_guard_fires_for_both_spellings() -> None:
     """
-    The guard above can fail, for the old filename and for the new one.
+    The single-file mount guard fires for the legacy filename and the current one.
 
-    The rename is what makes this worth asserting. A guard written around one
-    literal filename goes quietly vacuous the moment the file is renamed: it
-    keeps passing, on every page, forever, while the mount it was written to
-    catch sails through under the other name. Feeding one synthetic line per
-    spelling through the same predicate the guard uses is the cheapest proof
-    that neither spelling is a blind spot.
+    A guard written around one literal filename passes on every page while
+    the mount it exists to catch goes through under the other name, so one
+    synthetic line per spelling goes through the predicate the guard uses.
     """
     for mount in SINGLE_FILE_MOUNTS:
         line = f"      - ./{mount}:ro"
@@ -289,9 +225,9 @@ def test_deploy_docs_use_the_directory_mount() -> None:
 
     Two spellings satisfy this, and which one is correct depends on the syntax:
     a compose ``volumes:`` entry names the directory relative to the compose
-    file, while a bind-mount flag needs the absolute form (row 31). Both name
-    the same directory at the same container path, which is the thing Phase 27
-    D-09 requires; the single-file mount is banned separately.
+    file, while a bind-mount flag needs the absolute form. Both name the same
+    directory at the same container path; the single-file mount is banned
+    separately.
     """
     for page in (DEPLOY_HOWTO, DOCKER_REFERENCE, QUICK_START):
         text = page.read_text(encoding="utf-8")
@@ -406,7 +342,7 @@ def test_cli_reference_says_doctor_warns_on_a_shadowed_config() -> None:
 
 def test_deploy_doc_keeps_the_single_file_mount_heading() -> None:
     """
-    The heading the config-write errors link to is still there, spelled once.
+    The heading the config-write errors link to exists, spelled once.
 
     The error saneless prints for a single-file bind mount carries a link to
     this section's anchor, which the heading text decides; rewording the
@@ -426,7 +362,7 @@ def test_profile_howto_says_how_to_refresh_a_hand_written_default() -> None:
     ``default`` cannot be renamed or deleted like other profiles, so the page
     must show the skip line ``auto-profiles`` prints for it -- rendered here by
     the code itself -- and say how to hand it back. It must also show the label
-    wording generation now uses, and say that a generated ``default`` that is a
+    wording generation uses, and say that a generated ``default`` that is a
     copy of another profile is offered once on the scan page.
     """
     text, name = _read(PROFILE_HOWTO)
@@ -877,7 +813,7 @@ def test_cli_reference_help_needs_no_config() -> None:
 
 
 def test_no_log_level_option_documented() -> None:
-    """No doc page (other than the historical PRD) cites a ``--log-level`` option."""
+    """No doc page but the PRD cites a ``--log-level`` option."""
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
         for path in _doc_pages()
@@ -969,46 +905,8 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     """
     Every command's table lists exactly the codes that command can exit with.
 
-    ``serve`` has no 1: it scans nothing itself, and SANE failing to initialise
-    is a start-up failure, exit 2 (D-07 amendment, WR-07). It does have 130:
-    Ctrl-C before uvicorn has started is a cancel through the CLI guard, while
-    Ctrl-C once uvicorn is running is its graceful stop, exit 0 (D-03). No
-    command but ``scan`` builds a PDF, so only ``scan`` has 4; only ``scan``
-    and ``serve`` construct a Paperless client, so only they have 3; ``jobs``
-    never touches SANE, so it has no 1.  Only ``scan`` delivers a document, so
-    only ``scan`` has 6 (saved to the consume folder) and 7 (uploaded with a
-    warning).  ``serve``'s 3 is a TLS trust store it cannot read when it
-    builds the Paperless client; a malformed Paperless URL never gets that
-    far, because the config load refuses it with a 2.
-
-    ``doctor`` has the same codes as ``jobs``, and lacks 1, 3 and 4 for three
-    separate reasons.
-    No 1: it never fails on SANE at all -- Amendment A-1 turns a missing
-    python-sane, or a scanner library that will not start, into a ``FAIL``
-    row rather than a refusal, and the scanner check reports an unreachable
-    device instead of raising. No 3: it does construct a Paperless client,
-    but ``probe_connection`` returns a status
-    rather than raising, and a client the constructor refuses -- for its URL,
-    its token or an unreadable TLS trust store -- becomes a ``FAIL`` row
-    instead of a ``PaperlessError``. No 4: it assembles nothing.
-
-    Only ``scan`` judges pages blank, so only ``scan`` has 8.  Only ``scan``
-    uploads a document and writes pages to disk, so only ``scan`` has 9 (the
-    document may already be in paperless-ngx) and 10 (the server ran out of
-    disk space).  ``serve`` exits with neither: its scans are jobs, whose
-    outcome is on the job, not on the process.  Every one-shot
-    command but ``serve`` installs handlers for SIGHUP and SIGTERM, so each of
-    them has 129 and 143 (128 + the signal number): an interruption that keeps
-    the pages already scanned, unlike the cancel's 130.  A running ``serve``
-    turns SIGTERM into uvicorn's graceful stop, exit 0, whether or not it is
-    PID 1, so it has no 143.
-
-    141 (128 + SIGPIPE) is a command whose stdout reader went away, as under
-    ``saneless jobs | head``, so ``devices``, ``jobs``, ``auto-profiles`` and
-    ``doctor``, which print their results to stdout, have it.  ``serve``
-    prints nothing to stdout, so it has none.  ``scan`` has none either: its
-    progress and closing lines survive a dead stdout on purpose, so that the
-    scan's own outcome code stands.
+    Each expected set below carries the reasons the command has, and lacks,
+    its codes, and every documented code is an ``ExitCode`` value.
     """
     text, name = _read(CLI_REFERENCE)
     tables = _command_exit_tables(text, name)
@@ -1019,6 +917,13 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
             f"{name}: `saneless {command}` documents unknown codes "
             f"{sorted(codes - EXIT_CODES)}"
         )
+    # Only ``scan`` builds a PDF (4), delivers a document (6 saved to the
+    # consume folder, 7 uploaded with a warning), judges pages blank (8), and
+    # uploads and writes pages to disk (9 the document may already be in
+    # paperless-ngx, 10 out of disk space). Only ``scan`` and ``serve`` build a
+    # Paperless client, so only they have 3. ``scan`` has no 141: its progress
+    # and closing lines survive a dead stdout on purpose, so the scan's own
+    # outcome code stands.
     assert _documented_codes(tables["scan"]) == {
         0,
         1,
@@ -1035,8 +940,21 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
         130,
         143,
     }
+    # Every one-shot command but ``serve`` installs SIGHUP and SIGTERM
+    # handlers, so it has 129 and 143 (128 + the signal number): an
+    # interruption that keeps the pages already scanned, unlike the cancel's
+    # 130. A command that prints its results to stdout has 141 (128 + SIGPIPE)
+    # for a reader that went away, as under ``saneless jobs | head``. ``jobs``
+    # never touches SANE, so it has no 1.
     assert _documented_codes(tables["devices"]) == {0, 1, 2, 5, 129, 130, 141, 143}
     assert _documented_codes(tables["jobs"]) == {0, 2, 5, 129, 130, 141, 143}
+    # ``serve`` scans nothing itself: SANE failing to initialise is a start-up
+    # failure, 2, and its scans are jobs whose outcome is on the job, so it has
+    # no 1, 9 or 10. Its 3 is a TLS trust store it cannot read when it builds
+    # the Paperless client; the config load refuses a malformed URL with a 2.
+    # Ctrl-C before uvicorn starts is a cancel, 130; once uvicorn runs, Ctrl-C
+    # and SIGTERM are its graceful stop, exit 0, PID 1 or not, so it has no
+    # 143. It prints nothing to stdout, so it has no 141.
     assert _documented_codes(tables["serve"]) == {0, 2, 3, 5, 130}
     assert _documented_codes(tables["auto-profiles"]) == {
         0,
@@ -1048,6 +966,12 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
         141,
         143,
     }
+    # ``doctor`` has the codes ``jobs`` has. No 1: a missing python-sane or a
+    # scanner library that will not start is a ``FAIL`` row, and an
+    # unreachable device is reported rather than raised. No 3:
+    # ``probe_connection`` returns a status, and a client the constructor
+    # refuses -- for its URL, its token or an unreadable TLS trust store -- is
+    # a ``FAIL`` row, not a ``PaperlessError``. No 4: it assembles nothing.
     assert _documented_codes(tables["doctor"]) == {0, 2, 5, 129, 130, 141, 143}
     assert "abort" not in _table_row(tables["scan"], "1").lower(), (
         f"{name}: scan's exit-1 row still describes a flip-prompt abort"
@@ -1068,10 +992,9 @@ def test_cli_reference_command_count_matches_its_sections() -> None:
     """
     The opening sentence's command count equals the number of command sections.
 
-    Derived rather than pinned to a literal: the sentence said "five" for as
-    long as there were five commands and would have gone on saying it for the
-    sixth, the seventh and the eighth. Comparing it against the sections that
-    are actually present is the only form of this test that keeps working.
+    The count is compared with the sections present rather than with a
+    literal, so a sentence that keeps its old number after a command is added
+    fails here.
     """
     text, name = _read(CLI_REFERENCE)
     match = _COUNT_SENTENCE.search(text)
@@ -1157,7 +1080,7 @@ def test_the_scripting_readiness_gate_uses_devices() -> None:
 
 def test_the_doctor_reference_says_an_unanswered_host_is_a_warning() -> None:
     """
-    The doctor section stops promising exit 2 for a scanner that is not there.
+    The doctor section does not promise exit 2 for a scanner that is not there.
 
     A scanner host that does not answer is a warning even when it is the only
     one configured, so the exit table may not list it as a failure, and the
@@ -1177,10 +1100,8 @@ def test_scripting_documents_jobs_json_created_at_as_utc() -> None:
     """
     The documented ``created_at`` example carries the ``+00:00`` offset.
 
-    ``jobs --json`` is a machine contract: APPL-12 localised the human table
-    and deliberately left the JSON in UTC, so the worked example a script
-    author copies has to show the offset. Without this assertion a later plan
-    could localise the contract and the document would agree with it.
+    ``jobs --json`` is a machine contract in UTC, while the human table shows
+    local time, so the worked example a script author copies shows the offset.
     """
     text, name = _read(CLI_SCRIPTING)
     examples = re.findall(r'"created_at": "([^"]+)"', text)
@@ -1197,7 +1118,7 @@ def test_scripting_documents_jobs_json_created_at_as_utc() -> None:
 
 def test_job_database_documented_under_exit_code_two() -> None:
     """
-    A job database saneless cannot use is exit 2, never exit 5 (D-07 amendment).
+    A job database saneless cannot use is exit 2, never exit 5.
 
     ``StorageError`` is a setup problem; exit 5 is only for an exception that is
     not a saneless type.
@@ -1320,7 +1241,7 @@ def test_scripting_exit_9_row_says_never_to_rescan() -> None:
 @pytest.mark.parametrize("path", [CLI_REFERENCE, CLI_SCRIPTING], ids=lambda p: p.name)
 def test_exit_4_rows_do_not_claim_a_full_disk(path: Path) -> None:
     """
-    A full disk is exit 10, so no exit-4 row may still say it is exit 4.
+    A full disk is exit 10, so no exit-4 row says a full disk is exit 4.
 
     Exit 4 means only that the scanned pages could not be written as a PDF.
     A row may point a script at exit 10, and that pointer is the one mention
@@ -1403,8 +1324,8 @@ ARCHITECTURE_MEMORY_HEADING = "### Memory, disk and timeouts"
 # that enforces it.
 PAGE_TIMEOUT_FLOOR = f"{sane_backend._PAGE_TIMEOUT_FLOOR_SECONDS:g}"
 
-# The Phase 29 claims the architecture page now makes, each with the substrings
-# that carry it.
+# The claims the architecture page makes about memory, disk and timeouts, each
+# with the substrings that carry it.
 #
 # Substrings rather than whole sentences, deliberately: rewording the page for
 # clarity should not fail this test, but dropping a guarantee should. Each entry
@@ -1412,10 +1333,6 @@ PAGE_TIMEOUT_FLOOR = f"{sane_backend._PAGE_TIMEOUT_FLOOR_SECONDS:g}"
 # `min_free_space_mb` is for, whether a hung scanner can be waited out or has to
 # be restarted -- so an assertion firing here means the page stopped answering a
 # question someone actually asks it.
-#
-# 29-RESEARCH.md Finding 11 enumerated fourteen doc sentences this phase
-# falsified and found that no doc-truth test pinned a single one of them, which
-# is why nothing would have caught a page left stale. This is that test.
 ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "roughly one decoded page is held in memory while scanning",
@@ -1791,11 +1708,11 @@ def test_operator_pages_state_the_delivery_rules(
 
 
 # ---------------------------------------------------------------------------
-# Phase 30: the shipped deployment template (D-17, APPL-07, APPL-11, APPL-12)
+# The shipped deployment template
 # ---------------------------------------------------------------------------
 
 # Every environment variable that carries the paperless-ngx connection. A live
-# line here silently overrides ``./config/saneless.toml`` -- the U-01 finding.
+# line here silently overrides ``./config/saneless.toml``.
 OVERRIDING_ENV_KEYS = ("SANELESS_PAPERLESS__URL", "SANELESS_PAPERLESS__TOKEN")
 
 _TOKEN_ASSIGNMENT = re.compile(r"SANELESS_PAPERLESS__TOKEN=(\S*)")
@@ -1820,7 +1737,7 @@ def _comment_block_above(lines: list[tuple[int, str]], index: int) -> str:
 
 
 def test_compose_ships_no_live_paperless_environment_line() -> None:
-    """No live ``environment:`` line sets the paperless URL or token (D-17)."""
+    """No live ``environment:`` line sets the paperless URL or token."""
     offenders = [
         f"{COMPOSE.name}:{number}: {line.strip()}"
         for number, line in _numbered(COMPOSE)
@@ -1830,7 +1747,7 @@ def test_compose_ships_no_live_paperless_environment_line() -> None:
     assert not offenders, (
         "the shipped compose template still sets the paperless connection in "
         "its environment: block, which silently overrides "
-        "./config/saneless.toml (D-17, U-01):\n" + "\n".join(offenders)
+        "./config/saneless.toml; comment the line out:\n" + "\n".join(offenders)
     )
 
 
@@ -1852,7 +1769,7 @@ def test_compose_says_the_environment_block_overrides_the_config_file() -> None:
 
 
 def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> None:
-    """The consume-directory mount is present with two lines of why (APPL-11)."""
+    """The consume-directory mount is present with two lines of why."""
     lines = _numbered(COMPOSE)
     mounts = [
         index
@@ -1866,7 +1783,8 @@ def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> Non
     explanation = _comment_lines_above(lines, mounts[0])
     assert explanation >= 2, (
         f"{COMPOSE.name}: the consume-directory mount has {explanation} "
-        "comment lines above it; APPL-11 asks for a two-line explanation"
+        "comment lines above it; an operator needs at least two lines saying "
+        "what the mount is for"
     )
     assert _says(_comment_block_above(lines, mounts[0]), "set paperless.consume_dir"), (
         f"{COMPOSE.name}: the consume mount's comment does not say that "
@@ -1876,7 +1794,7 @@ def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> Non
 
 
 def test_compose_sets_the_timezone_with_an_explanation() -> None:
-    """The compose template sets ``TZ`` and says why (APPL-12, Pitfall 10)."""
+    """The compose template sets ``TZ`` and says why."""
     lines = _numbered(COMPOSE)
     settings = [index for index, (_, line) in enumerate(lines) if "TZ=" in line]
     assert len(settings) == 1, (
@@ -2233,12 +2151,10 @@ def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
     """
     No live ``SANELESS_PAPERLESS__TOKEN=`` example is a detected placeholder.
 
-    ``changeme`` used to be the shipped value in both the compose template and
-    the Docker reference. This release detects it, shows the status strip red
-    and refuses scans (APPL-07, D-14), so presenting it as a working example
-    hands the reader a deployment that cannot scan. The expectation is derived
-    from ``is_placeholder_token`` rather than a hard-coded word list, so
-    widening that set cannot leave a stale example behind (T-30-86).
+    saneless detects a placeholder token, shows the status strip red and
+    refuses scans, so an example carrying one hands the reader a deployment
+    that cannot scan. The check calls ``is_placeholder_token`` rather than
+    keeping a word list, so widening that set cannot leave a stale example.
     """
     offenders: list[str] = []
     for path in (COMPOSE, DOCKER_REFERENCE, DEPLOY_HOWTO):
@@ -2275,7 +2191,7 @@ def test_docker_reference_documents_the_consume_mount_and_the_timezone() -> None
 
 
 # ---------------------------------------------------------------------------
-# Phase 30: the reference documents, derived from the source (T-30-89)
+# The reference documents, derived from the source
 # ---------------------------------------------------------------------------
 
 WEB_API_REFERENCE = DOCS_DIR / "reference" / "web-api.md"
@@ -2302,8 +2218,8 @@ def test_every_route_is_documented_in_the_web_api_reference() -> None:
     Every route in ``routes.py`` has its own heading in ``web-api.md``.
 
     The expectation is derived from the decorators rather than a hard-coded
-    list, so a route added in a later phase cannot ship undocumented: adding it
-    fails this test until the reference gains its section (T-30-89).
+    list, so a new route fails this test until the reference gains its
+    section.
     """
     text, name = _read(WEB_API_REFERENCE)
     headings = "\n".join(line for line in text.splitlines() if line.startswith("#"))
@@ -2363,8 +2279,8 @@ def test_every_web_config_field_is_documented() -> None:
     """
     Each ``[web]`` key is in the config reference with a ``SANELESS_WEB__`` row.
 
-    Derived from ``WebConfig.model_fields``: a key added to the section later
-    cannot ship without both references gaining it (APPL-10, T-30-89).
+    Derived from ``WebConfig.model_fields``, so a new key in the section
+    cannot ship without both references gaining it.
     """
     config_text, config_name = _read(CONFIG_REFERENCE)
     env_text, env_name = _read(ENV_REFERENCE)
@@ -2378,7 +2294,7 @@ def test_every_web_config_field_is_documented() -> None:
 
 
 def test_config_reference_says_where_the_bind_address_lives() -> None:
-    """The ``[web]`` section admits ``web_host``/``web_port`` stayed in ``[output]``."""
+    """The ``[web]`` section says ``web_host``/``web_port`` live in ``[output]``."""
     text, name = _read(CONFIG_REFERENCE)
     body = _section(text, "## `[web]`", name)
     for needle in ("`web_host`", "`web_port`", "`[output]`"):
@@ -2415,7 +2331,7 @@ def test_first_web_ui_scan_walks_the_current_form() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: packaging identity (D-01, D-02, D-05, DLVR-08)
+# Packaging identity
 # ---------------------------------------------------------------------------
 
 # The trove classifier family PEP 639 deprecates in favour of the license
@@ -2429,7 +2345,7 @@ def _project_table() -> dict[str, Any]:
 
 
 def test_pyproject_uses_the_pep_639_license_keys() -> None:
-    """The license is the PEP 639 SPDX string plus ``license-files`` (D-05)."""
+    """The license is the PEP 639 SPDX string plus ``license-files``."""
     project = _project_table()
     assert project.get("license") == "MIT", (
         "pyproject.toml does not declare the PEP 639 SPDX expression "
@@ -2443,12 +2359,10 @@ def test_pyproject_uses_the_pep_639_license_keys() -> None:
 
 def test_pyproject_has_no_legacy_license_classifier() -> None:
     """
-    The deprecated ``License ::`` classifier is gone (D-05).
+    ``pyproject.toml`` carries no deprecated ``License ::`` classifier.
 
-    This needs its own assertion because nothing else catches it. Neither the
-    build backend nor ``twine check`` errors when the classifier ships beside a
-    PEP 639 ``License-Expression`` -- both were measured doing exactly that --
-    so no build or publish step would fail if it came back.
+    Neither the build backend nor ``twine check`` rejects the classifier beside
+    a PEP 639 ``License-Expression``, so no build or publish step catches it.
     """
     legacy = [
         classifier
@@ -2496,7 +2410,7 @@ def test_maturity_classifier_stays_below_stable_before_one_point_zero() -> None:
 
 
 def test_pyproject_distribution_name_is_saneless() -> None:
-    """The PyPI distribution name stays ``saneless`` (DLVR-01)."""
+    """The PyPI distribution name is ``saneless``."""
     declared = _project_table()["name"]
     assert declared == "saneless", (
         f"pyproject.toml declares the distribution name {declared!r}, not "
@@ -2506,15 +2420,15 @@ def test_pyproject_distribution_name_is_saneless() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the identity guard (CI-02, DLVR-01, D-08..D-12)
+# The identity guard
 # ---------------------------------------------------------------------------
 
 # The forbidden owner slug is assembled at runtime from these two halves. The
 # obvious spelling is a single literal, but the guard below scans *every*
-# tracked file outside ``.planning/`` -- including this one -- so a literal here
-# would make the guard report itself and go red with no real regression behind
-# it. No file is exempt, which is exactly the point: there is nowhere a genuine
-# stale reference could hide (D-11). The other obvious spelling, a ``"-".join``
+# tracked file outside the planning directory -- including this one -- so a
+# literal here would make the guard report itself and go red with no real
+# stale reference behind it. No file is exempt, so there is nowhere a genuine
+# stale reference could hide. The other obvious spelling, a ``"-".join``
 # over an inline literal sequence, is no good either: ruff's FLY002 rewrites it
 # straight back into the literal string, and suppressing the rule is forbidden.
 # An f-string over named constants is the form FLY002 leaves alone. Fold this
@@ -2528,11 +2442,11 @@ _EXCLUDED_PREFIX = ".planning/"
 
 def _shipped_files() -> list[str]:
     """
-    Return every tracked path outside ``.planning/`` (DLVR-01, D-10).
+    Return every tracked path outside the planning directory.
 
     "Shipped" is defined as ``git ls-files`` rather than a hand-maintained
-    list, so a file added in a later phase is covered without anyone
-    remembering to extend anything. ``site/`` is ignored by version control and
+    list, so a new file is covered without anyone remembering to extend
+    anything. ``site/`` is ignored by version control and
     therefore never reaches ``git ls-files``, so the built documentation site
     is excluded for free.
 
@@ -2562,7 +2476,7 @@ def _shipped_files() -> list[str]:
 
 
 def test_no_shipped_file_references_the_old_owner() -> None:
-    """No tracked file outside ``.planning/`` names the old GitHub owner."""
+    """No tracked file outside the planning directory names the old GitHub owner."""
     offenders: list[str] = []
     for name in _shipped_files():
         # Two clauses rather than one tuple: at this project's ruff
@@ -2582,8 +2496,9 @@ def test_no_shipped_file_references_the_old_owner() -> None:
             if FORBIDDEN_OWNER_SLUG in line
         )
     assert not offenders, (
-        "a shipped file still references the old GitHub owner, which DLVR-01 "
-        "renames. Every project URL must use the kdknigga forms -- "
+        "a shipped file still references the old GitHub owner, which no "
+        "longer hosts the project. Every project URL must use the kdknigga "
+        "forms -- "
         "github.com/kdknigga/saneless, kdknigga.github.io/saneless and "
         f"{PUBLISHED_IMAGE}:\n" + "\n".join(offenders)
     )
@@ -2681,19 +2596,12 @@ def test_no_src_file_cites_a_planning_artefact() -> None:
     """
     No shipped source or script file points at the planning records.
 
-    A comment that says only "see decision so-and-so" tells a reader of the
-    product nothing, because the planning directory does not ship with it.
-    Each comment in src/ and scripts/ has to carry its own reason in plain
-    words: the release scripts ship with the repository just as the package
-    does, and a workflow reader lands in them first.
-
-    This test and the no-planning-citations hook share one pattern, but not
-    quite one file set: the test picks files by suffix (``.py``, ``.html``,
-    ``.css``, ``.js``), while the hook picks them by the type ``identify``
-    detects, which also takes in, for example, an extensionless script with
-    a Python shebang or a ``.mjs`` file. src/ holds neither today, so the two
-    check the same files; the drift is accepted rather than making the test
-    depend on ``identify``.
+    The planning directory does not ship, so a comment in src/ or scripts/
+    that says only "see decision so-and-so" tells a reader nothing; each
+    carries its own reason in plain words. The test picks files by suffix and
+    the no-planning-citations hook by the type ``identify`` detects, which
+    also takes in an extensionless Python script or a ``.mjs`` file; src/
+    holds neither, so the two check the same files.
     """
     offenders = _citation_offenders(_shipped_source_files(), REPO_ROOT)
     assert not offenders, (
@@ -2788,7 +2696,7 @@ README_TOML_BLOCK = re.compile(r"^```toml\n(?P<body>.*?)^```", re.MULTILINE | re
 
 
 def test_readme_scan_example_carries_a_title() -> None:
-    """Every ``saneless scan`` line in the README shows ``--title`` (DOCS-02)."""
+    """Every ``saneless scan`` line in the README shows ``--title``."""
     offenders = [
         f"{number}: {line.strip()}"
         for number, line in _numbered(README)
@@ -2796,9 +2704,8 @@ def test_readme_scan_example_carries_a_title() -> None:
     ]
     assert not offenders, (
         "a README scan example omits --title. The flag is optional at runtime "
-        "-- saneless resolves a default -- but DOCS-02 asks the front-page "
-        "example to show the reader how a document gets its name:\n"
-        + "\n".join(offenders)
+        "-- saneless resolves a default -- but the front-page example has to "
+        "show the reader how a document gets its name:\n" + "\n".join(offenders)
     )
 
 
@@ -2834,7 +2741,7 @@ def test_readme_example_configs_leave_profile_generation_on(tmp_path: Path) -> N
 
 
 def test_every_readme_docs_link_resolves_to_a_page() -> None:
-    """Every README documentation deep link names a page that exists (DOCS-02)."""
+    """Every README documentation deep link names a page that exists."""
     offenders = [
         f"{number}: {match.group(0)}"
         for number, line in _numbered(README)
@@ -2844,8 +2751,8 @@ def test_every_readme_docs_link_resolves_to_a_page() -> None:
     assert not offenders, (
         "a README documentation link points at a path with no page behind it, "
         "so the reader lands on a 404. The expectation is the docs/ tree "
-        "itself rather than a hard-coded list, so a page renamed in a later "
-        "phase cannot leave a dead link on the front page:\n" + "\n".join(offenders)
+        "itself rather than a hard-coded list, so a renamed page cannot leave "
+        "a dead link on the front page:\n" + "\n".join(offenders)
     )
 
 
@@ -3234,7 +3141,7 @@ def test_the_pip_install_guard_tells_the_index_from_the_repository(
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the container build context (D-29, D-30, D-33, DLVR-06, DLVR-09)
+# The container build context
 # ---------------------------------------------------------------------------
 
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
@@ -3242,11 +3149,11 @@ GITIGNORE = REPO_ROOT / ".gitignore"
 
 # Path fragments that must never appear on a ``!`` re-include line. ``config``
 # and ``saneless.toml`` are where a live paperless-ngx token lives; ``tests``
-# and ``.planning`` are bulk the image has no use for, and ``.planning`` in
-# particular carries the phase audit artifacts. The legacy filename stays on
-# this list although saneless no longer reads it: a file left behind under the
-# old name still holds whatever token its owner put there, so it must never
-# reach the daemon either.
+# and the planning directory are bulk the image has no use for, and the
+# planning directory holds internal records. The legacy filename is on this
+# list although saneless does not read it: a file left under that name still
+# holds whatever token its owner put there, so it must never reach the daemon
+# either.
 FORBIDDEN_CONTEXT_PATHS = (
     ".env",
     ".git",
@@ -3274,8 +3181,8 @@ def _significant_lines(path: Path) -> list[tuple[int, str]]:
     Return ``(line number, stripped line)`` for non-blank, non-comment lines.
 
     Filtering comments out rather than matching raw text is what stops these
-    tests self-invalidating: a comment that quotes ``*.png`` to explain why the
-    glob was removed would otherwise read as the glob itself.
+    tests self-invalidating: a comment that quotes ``*.png`` to explain why
+    there is no such glob would otherwise read as the glob itself.
 
     Args:
         path: The file to read.
@@ -3293,7 +3200,7 @@ def _significant_lines(path: Path) -> list[tuple[int, str]]:
 
 def test_dockerignore_starts_with_a_deny_everything_line() -> None:
     """
-    ``.dockerignore``'s first meaningful line is exactly ``*`` (D-29, D-30).
+    ``.dockerignore``'s first meaningful line is exactly ``*``.
 
     The file is an allow-list: ``*`` excludes the whole working tree and each
     ``!`` line below re-includes one path the image build needs. That only
@@ -3315,11 +3222,10 @@ def test_dockerignore_starts_with_a_deny_everything_line() -> None:
 
 def test_dockerignore_never_reincludes_a_secret_or_test_path() -> None:
     """
-    No ``!`` line re-includes a config, a secret, ``.planning/`` or tests (D-30).
+    No ``!`` line re-includes a config, a secret, the planning directory or tests.
 
-    Nothing else in CI would notice the allow-list being weakened: there is no
-    docker-build-and-inspect step, and a leak is only visible by unpacking a
-    layer. This test is the guard.
+    A leaked file is visible only by unpacking an image layer, so the
+    allow-list itself is checked here, as text.
     """
     name = DOCKERIGNORE.relative_to(REPO_ROOT)
     offenders = [
@@ -3361,7 +3267,7 @@ def test_dockerignore_reincludes_everything_the_build_needs() -> None:
 
 def test_gitignore_has_no_blanket_png_glob() -> None:
     """
-    ``.gitignore`` no longer blanket-ignores every PNG in the tree (DLVR-09).
+    ``.gitignore`` does not blanket-ignore every PNG in the tree.
 
     A repository-wide ``*.png`` silently swallows an asset someone means to
     commit -- a documentation screenshot, a favicon -- and gives no signal at
@@ -3382,14 +3288,10 @@ def test_gitignore_has_no_blanket_png_glob() -> None:
 
 def test_gitignore_ignores_the_playwright_artifact_directory() -> None:
     """
-    ``/test-results/`` is ignored -- the one path the blanket glob covered.
+    ``/test-results/``, pytest-playwright's artifact directory, is ignored.
 
-    ``git check-ignore -v`` was run against every candidate PNG path in the
-    repository. ``site/``, ``.planning/ui-reviews/`` and ``.playwright-mcp/``
-    each have their own entry and survive the glob's removal; pytest-playwright's
-    default artifact directory had nothing but ``*.png`` behind it. It holds
-    failure videos and trace archives as well as screenshots, so the directory
-    is the correct replacement rather than a narrower glob.
+    It holds failure videos and trace archives as well as screenshots, so it
+    is ignored by path rather than by a PNG glob.
     """
     lines = {line for _, line in _significant_lines(GITIGNORE)}
     name = GITIGNORE.relative_to(REPO_ROOT)
@@ -3402,7 +3304,7 @@ def test_gitignore_ignores_the_playwright_artifact_directory() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the container image itself (D-25, D-27, D-28, D-29, DLVR-07)
+# The container image itself
 # ---------------------------------------------------------------------------
 
 DOCKERFILE = REPO_ROOT / "Dockerfile"
@@ -3425,7 +3327,7 @@ BUILD_INPUTS = ("pyproject.toml", "uv.lock", "README.md", "LICENSE")
 
 def test_dockerfile_pins_every_base_image_by_digest() -> None:
     """
-    Every ``FROM`` reference carries both a tag and a ``sha256`` digest (D-27).
+    Every ``FROM`` reference carries both a tag and a ``sha256`` digest.
 
     The digest is what makes the build reproducible: a tag can be repointed at
     new content between two builds of the same source. The **tag** has to stay
@@ -3462,9 +3364,8 @@ def test_dockerfile_gets_uv_from_a_named_from_stage() -> None:
     directives **only**, and deliberately excludes builder-stage references
     written as a ``COPY`` with a ``--from`` pointing at a registry image. A
     digest written straight onto such a line is invisible to it and would
-    never be updated -- the pin would look maintained and quietly rot.
-    Promoting uv to ``FROM ... AS uv`` costs one line and makes the third
-    digest pin real.
+    never be updated -- the pin would look maintained and quietly rot. A
+    ``FROM ... AS uv`` stage puts the uv pin where Dependabot reads it.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3491,17 +3392,15 @@ def test_dockerfile_gets_uv_from_a_named_from_stage() -> None:
 
 def test_dockerfile_copies_only_the_build_inputs() -> None:
     """
-    The builder stage copies named paths, never the whole working tree (D-29).
+    The builder stage copies named paths, never the whole working tree.
 
     ``uv sync --locked`` reads exactly these: the project metadata, the lock it
     verifies every artifact against, the two files the metadata names, and the
-    package sources.
-
-    This is the second of the two independent build-context gates, the first
-    being the ``.dockerignore`` allow-list. Copying the entire context sweeps
-    whatever the daemon was sent into a layer -- which, before this phase,
-    included a real ``saneless.toml`` holding a live paperless-ngx token. Naming
-    the inputs means a mistake in the allow-list alone cannot leak anything.
+    package sources. This is the second build-context gate after the
+    ``.dockerignore`` allow-list: copying the whole context would sweep
+    whatever the daemon was sent, a live ``saneless.toml`` included, into a
+    layer, so naming the inputs means a mistake in the allow-list alone cannot
+    leak anything.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3527,7 +3426,7 @@ def test_dockerfile_copies_only_the_build_inputs() -> None:
 
 def test_dockerfile_runs_as_a_non_root_user() -> None:
     """
-    The image ends on a ``USER`` that is not root (D-25, DLVR-07).
+    The image ends on a ``USER`` that is not root.
 
     A root process in the container reaches much further into a bind-mounted
     host directory, and into the kernel, than UID 1000 does. The account is
@@ -3562,22 +3461,15 @@ def test_dockerfile_runs_as_a_non_root_user() -> None:
 
 def test_dockerfile_chowns_the_data_dir_before_declaring_the_volume() -> None:
     """
-    The data directory is created and chowned **before** ``VOLUME`` (D-28).
+    The data directory is created and chowned **before** ``VOLUME``.
 
-    Whether a build step that changes data inside a declared volume path
-    *after* the ``VOLUME`` instruction survives depends on **which builder
-    ran**: Docker's own reference says the legacy builder discards those
-    changes and BuildKit keeps them. Ordering the ``mkdir`` and ``chown``
-    before ``VOLUME`` is the one arrangement that is correct under both. Get
-    it wrong and, on the builder that discards, a fresh named volume comes up
-    owned by root, the non-root process cannot write the job database, and
-    preserved scans have nowhere to go.
-
-    Asserting the order statically rather than test-driving it is deliberate,
-    for the same reason: buildah -- which is what ``docker`` is on the
-    maintainer's host -- was measured keeping the change even with the wrong
-    order, so a green local build is no evidence at all. This test does not
-    depend on which builder ran.
+    Docker's reference says the legacy builder discards changes made inside a
+    declared volume path after ``VOLUME`` and BuildKit keeps them, so this
+    order is the one that is correct under both. On a builder that discards,
+    a fresh named volume comes up owned by root and the non-root process
+    cannot write the job database or keep preserved scans. The order is
+    asserted statically because a builder that keeps the change, buildah
+    among them, passes a local build with the wrong order.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3623,7 +3515,7 @@ def test_dockerfile_makes_the_data_dir_owner_only_before_declaring_the_volume() 
 
 def test_dockerfile_sets_a_workdir_in_the_runtime_stage() -> None:
     """
-    The runtime stage anchors relative writes inside the durable volume (D-28).
+    The runtime stage anchors relative writes inside the durable volume.
 
     With no ``WORKDIR`` the working directory is ``/``, so a relative write
     lands in the container's own writable layer and is destroyed on the next
@@ -3655,8 +3547,8 @@ LOCKED_SYNC = "uv sync --locked"
 # path on a copy line; ``uv sync`` is the command itself.
 RUNTIME_BUILD_TOOLS = ("gcc", "libc6-dev", "libsane-dev", "/uv", "uv sync")
 
-# Tokens that must appear nowhere in the file's instructions. The HTTP client
-# existed only for the healthcheck, and the data-dir variable overrode an
+# Tokens that must appear nowhere in the file's instructions. An HTTP client
+# would serve only the healthcheck, and the data-dir variable overrides an
 # operator's own ``[output] data_dir``.
 FORBIDDEN_DOCKERFILE_TOKENS = ("curl", "SANELESS_OUTPUT__DATA_DIR")
 
@@ -3865,19 +3757,15 @@ def test_dockerfile_runtime_stage_receives_a_finished_locked_venv() -> None:
     """
     The runtime image is a finished venv on a curated base, and nothing more.
 
-    Every dependency byte is hash-checked by ``uv sync --locked`` in the
-    builder stage, python-sane's build backend included, and compilation
-    happens only there. The runtime stage copies the finished ``/opt/venv``
-    and carries no compiler, headers, uv, pip or HTTP client that a
-    ``docker exec`` could turn into an installer. It enables exactly the
-    ``net`` and ``escl`` SANE backends, because the stock list probes about
-    eighty and the first device enumeration paid for every one of them. It
-    sets ``XDG_STATE_HOME`` rather than the data-dir variable, so a mounted
-    ``saneless.toml``'s ``[output] data_dir`` takes effect, and its
-    healthcheck is a Python probe with a start period.
-
-    This reads the file. That the built image holds these properties is
-    proven separately, by building and running it.
+    ``uv sync --locked`` hash-checks every dependency byte in the builder
+    stage, python-sane's build backend included, and compiles only there. The
+    runtime stage copies the finished ``/opt/venv`` and carries no compiler,
+    headers, uv, pip or HTTP client a ``docker exec`` could turn into an
+    installer. It enables only the ``net`` and ``escl`` SANE backends, since
+    the stock list makes the first enumeration probe about eighty. It sets
+    ``XDG_STATE_HOME`` rather than the data-dir variable, so a mounted
+    ``[output] data_dir`` takes effect, and its healthcheck is a Python probe
+    with a start period. The built image is checked separately, by running it.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3973,7 +3861,7 @@ def test_the_runtime_guard_reports_a_seeded_break(
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: one port everywhere, and the non-1000 operator (D-26, D-31, D-32)
+# One port everywhere, and the operator whose UID is not 1000
 # ---------------------------------------------------------------------------
 
 # A `-p` publish flag, with or without a bind address in front of it, and a
@@ -4120,14 +4008,12 @@ def _compose_service_image(lines: list[str], index: int) -> str:
 
 def test_the_example_config_does_not_ship_a_live_web_port() -> None:
     """
-    ``saneless.toml.example`` does not set ``web_port`` live (D-32).
+    ``saneless.toml.example`` does not set ``web_port`` live.
 
-    The example shipped ``web_port = 8081``, which is wrong for every Docker
-    reader: the image's ``EXPOSE`` and healthcheck are both 8080, so copying
-    the example into a mounted ``saneless.toml`` moved the server off the port
-    the healthcheck probes and the container went unhealthy with nothing on
-    screen to say why. The line joins the commented pair below it instead, so
-    it still documents the key without configuring anything.
+    The image's ``EXPOSE`` and healthcheck use one fixed port, so a live port
+    in the example, copied into a mounted ``saneless.toml``, moves the server
+    off the port the healthcheck probes, and the container goes unhealthy
+    with nothing on screen to say why. The key is documented in a comment.
     """
     name = TOML_EXAMPLE.relative_to(REPO_ROOT)
     offenders = [
@@ -4196,19 +4082,15 @@ def test_complete_example_loads_and_names_every_output_key(tmp_path: Path) -> No
 
 def test_every_documented_container_port_matches_the_model_default() -> None:
     """
-    Image, compose file and every doc page agree on one container port (D-31).
+    Image, compose file and every doc page agree on one container port.
 
-    The expectation is read off ``OutputConfig`` rather than written out here,
-    so changing the default cannot leave the image and the documentation
-    disagreeing without something going red. Only the *container* side of a
-    ``-p`` mapping is checked: remapping on the host is exactly what operators
-    are told to do when 8080 is taken.
-
-    A mapping counts only when the image it belongs to is this project's. The
-    compose how-to stands saneless next to paperless-ngx, whose own
-    ``"8000:8000"`` is correct and none of this contract's business, so each
-    mapping is attributed first -- to the enclosing compose service's image,
-    or to the shell command the flag appears in, continuations included.
+    The port is read from ``OutputConfig``, so changing the default cannot
+    leave the image and the docs disagreeing. Only the *container* side of a
+    ``-p`` mapping is checked, since remapping the host side is what operators
+    are told to do when the port is taken. A mapping counts only when it
+    belongs to this project's image -- found from the enclosing compose
+    service or the shell command, continuations included -- because
+    paperless-ngx's own ``"8000:8000"`` stands beside it in the compose how-to.
     """
     expected = str(OutputConfig.model_fields["web_port"].default)
     dockerfile_name = DOCKERFILE.relative_to(REPO_ROOT)
@@ -4263,7 +4145,7 @@ def test_every_documented_container_port_matches_the_model_default() -> None:
 
 def test_compose_carries_a_commented_user_override() -> None:
     """
-    The compose example ships the UID override commented out (D-26).
+    The compose example ships the UID override commented out.
 
     The image already runs as 1000:1000, which is what the operator's own
     ``./config`` directory is on a single-user Linux host, so the override is
@@ -4299,10 +4181,10 @@ def test_compose_carries_a_commented_user_override() -> None:
 
 def test_the_uid_is_documented_where_operators_will_look() -> None:
     """
-    Both Docker pages state the UID and give the ``chown`` command (D-26).
+    Both Docker pages state the UID and give the ``chown`` command.
 
     A bind mount does not inherit the image directory's ownership the way a
-    named volume does -- that was measured -- so an operator whose UID is not
+    named volume does, so an operator whose UID is not
     1000 has to fix the host directory themselves. This is handled with
     documentation rather than a runtime fix-up because any fix-up would have
     to start as root, which is the thing running as UID 1000 exists to stop.
@@ -4325,7 +4207,7 @@ def test_the_uid_is_documented_where_operators_will_look() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the deployment shapes and the one USB rule (D-47, D-48, DOCS-04)
+# The deployment shapes and the one USB rule
 # ---------------------------------------------------------------------------
 
 # The host device tree a container would have to be handed in order to reach a
@@ -4338,18 +4220,15 @@ CONTAINER_CAVEAT_WORDS = ("container", "saned")
 
 def test_no_doc_page_documents_usb_passthrough_into_a_container() -> None:
     """
-    No page or deployment file hands the host USB bus to a container (D-48).
+    No page or deployment file hands the host USB bus to a container.
 
-    PROJECT.md constrains this project to need no ``--privileged`` flag,
-    because USB device access is handled by the ``saned`` server rather than by
-    the saneless container. A container reaches a scanner over the network --
-    ``saned`` over SANE's own protocol, including a ``saned`` on its own host,
-    or an eSCL device directly -- and never over the USB bus.
-
-    Documenting a device mapping as an "advanced" option would add a fourth
-    deployment shape that contradicts that constraint, has never been tested
-    here, and hands the container raw device access it has no use for. It was
-    written once and deleted; this test is what stops it coming back.
+    saneless needs no ``--privileged`` flag, because USB device access belongs
+    to the ``saned`` server, not the saneless container. A container reaches a
+    scanner over the network -- ``saned`` over SANE's own protocol, including
+    one on its own host, or an eSCL device directly -- and never over the USB
+    bus. A device mapping offered as an "advanced" option would be an untested
+    fourth deployment shape that hands the container raw device access it has
+    no use for.
     """
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
@@ -4400,8 +4279,7 @@ def test_scanner_host_documentation_carries_the_container_caveat() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the setup chooser link and the no-auth note (D-47, D-50, DOCS-04,
-# DOCS-05)
+# The setup chooser link and the no-auth note
 # ---------------------------------------------------------------------------
 
 PREREQUISITES_HEADING = "## Prerequisites"
@@ -4409,9 +4287,8 @@ SETUP_CHOOSER_LINK_TARGET = "which-setup.md"
 
 MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\((?P<target>[^)\s]+)\)")
 
-# Either of the two places the trust posture is already written down. D-50
-# rejected a page of its own: a sentence that links to one of these is what
-# criterion 5 asks for, and a third partial copy is what it does not.
+# Either of the two places the trust posture is written out in full. An entry
+# page links to one of these rather than carrying a third, partial copy.
 TRUST_LINK_TARGETS = (
     DOCS_DIR / "how-to" / "deploy-docker-compose.md",
     DOCS_DIR / "reference" / "web-api.md",
@@ -4485,14 +4362,14 @@ def test_quick_start_prerequisites_link_to_the_setup_chooser() -> None:
     """
     The quick-start prerequisites send an unsure reader to the chooser first.
 
-    DOCS-04 puts the link here rather than further down on purpose. The three
+    The link sits here rather than further down because the three
     deployment shapes differ in whether a SANE daemon is needed and what the
     scanner host is set to, and a reader who guesses wrong does not find out
     until the device list comes back empty.
 
     The target's existence is read off the filesystem rather than hard-coded,
-    so renaming the page in a later phase surfaces here instead of becoming a
-    404 on the busiest page in the documentation.
+    so renaming the page fails here instead of becoming a 404 on the busiest
+    page in the documentation.
     """
     name = QUICK_START.relative_to(REPO_ROOT)
     section = _section_lines(QUICK_START, PREREQUISITES_HEADING)
@@ -4523,7 +4400,7 @@ def test_the_no_auth_note_appears_on_both_entry_surfaces() -> None:
     start and the Docker reference, rather than only on the API reference that
     a reader following either of them never opens.
 
-    D-50 rejected a page of its own for this. The assertion is therefore that
+    The posture has no page of its own, so the assertion is that
     each surface carries the sentence and a link that resolves to one of the
     two places the posture is already written out in full, not that it repeats
     the posture a third time.
@@ -4557,7 +4434,7 @@ def test_the_no_auth_note_appears_on_both_entry_surfaces() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the corrected examples (rows 30, 31) -- DOCS-01
+# Copyable examples: bind-mount paths and job ids
 # ---------------------------------------------------------------------------
 
 # The flag form of a bind mount, with the host side captured. The host side
@@ -4581,16 +4458,12 @@ def test_no_docker_run_example_uses_a_relative_host_path() -> None:
     """
     No ``-v``/``--volume`` flag in any example names a relative host path.
 
-    Docker Engine has historically rejected a host side that is not an absolute
-    path, so a block copied off one of these pages fails outright on a real
-    host rather than doing something subtly different (row 31). ``"$(pwd)/..."``
-    is the form that works, quoted so a directory whose name contains a space
-    is not re-split into two arguments.
-
-    Compose ``volumes:`` entries are a different syntax under different rules --
-    a path beginning with a dot is correct there, and is the mount Phase 27 D-09
-    requires -- so this looks only at the flag form and leaves YAML list items
-    alone.
+    Many Docker Engine releases reject a host side that is not an absolute
+    path, so a block copied off one of these pages can fail outright on a real
+    host. ``"$(pwd)/..."`` works everywhere, quoted so a directory whose name
+    contains a space is not split into two arguments. Compose ``volumes:``
+    entries follow other rules -- a path beginning with a dot is correct
+    there -- so only the flag form is checked.
     """
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
@@ -4610,10 +4483,9 @@ def test_the_job_json_example_shows_a_real_id_shape() -> None:
     The scripting guide's job JSON shows an id in the shape ids really have.
 
     ``saneless jobs --json`` echoes ``j.id`` straight out of the row, and a job
-    id is ``str(uuid.uuid4())`` -- see ``job.py``. The example used to show a
-    truncated eight-character string, so anything written against it (a script
-    that slices an id, a column sized to fit one, a fixture built to look like
-    one) was written against a shape the program never emits (row 30).
+    id is ``str(uuid.uuid4())`` -- see ``job.py``. A truncated example id
+    would have scripts, column widths and fixtures written against a shape
+    the program never emits.
     """
     text, name = _read(CLI_SCRIPTING)
     values = [match.group("value") for match in JSON_ID_FIELD.finditer(text)]
@@ -4626,10 +4498,10 @@ def test_the_job_json_example_shows_a_real_id_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the deploy guide links rather than copies (row 32, DOCS-06)
+# The deploy guide links rather than copies
 # ---------------------------------------------------------------------------
 
-# The one setting the guide's half-a-service used to declare.
+# A setting only a copied paperless-ngx service declares.
 PAPERLESS_SERVICE_MARKER = "PAPERLESS_" + "SECRET_KEY"
 
 # An image line whose value names the other project.
@@ -4647,16 +4519,11 @@ def test_the_deploy_guide_does_not_ship_a_partial_paperless_stack() -> None:
     """
     The compose guide points at the other project's own file, never copies it.
 
-    The example used to define half a service for it: one setting, no message
-    broker, no database. The stack it described could not come up, so a reader
-    who followed the guide ended with a container that restarts forever and
-    nothing saying why.
-
-    Completing it was the other option and was rejected (D-49). A copy of
-    someone else's stack is a claim this project would have to keep true
-    forever, against requirements that change without notice -- the bundled
-    files currently ship Valkey as the broker, which is not what the copy
-    here would have said.
+    Half a paperless-ngx service -- one setting, no broker, no database --
+    cannot come up, so a reader following it gets a container that restarts
+    forever. A complete copy would be a claim this project has to keep true
+    against requirements that change without notice, such as which broker the
+    bundled files ship, so the guide links to the other project instead.
     """
     text, name = _read(DEPLOY_HOWTO)
     assert PAPERLESS_SERVICE_MARKER not in text, (
@@ -4680,7 +4547,7 @@ def test_the_deploy_guide_does_not_ship_a_partial_paperless_stack() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: nothing from the planning tree is published (row 34, DOCS-03)
+# Nothing from the planning tree is published
 # ---------------------------------------------------------------------------
 
 # Names that belong to the planning tree rather than to a reader.
@@ -4693,13 +4560,8 @@ def test_no_planning_artifact_is_published_under_docs() -> None:
 
     MkDocs builds and publishes every Markdown file under ``docs/`` whether or
     not the nav lists it, so a page absent from the nav is still served and
-    still search-indexed -- it is only unreachable by clicking. That gap is how
-    a v1.0 planning document, whose claims stopped matching the code releases
-    ago, ended up on the public site with nobody aware it was there (row 34).
-
-    The document itself was not wrong to exist; it is a record of what v1.0
-    intended. It was in the wrong tree, and it now lives beside the other
-    planning artifacts.
+    search-indexed, only unreachable by clicking. A planning record there
+    would reach the public site with claims that need not match the code.
     """
     offenders = [
         str(page.relative_to(REPO_ROOT))
@@ -4713,7 +4575,7 @@ def test_no_planning_artifact_is_published_under_docs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: what the final audit itself found (rows 4 and 10, DOCS-01)
+# The empty-page rule, documented keys and history labels
 # ---------------------------------------------------------------------------
 
 # The heading whose body carries the threshold-tuning advice and its example.
@@ -4913,8 +4775,8 @@ def test_every_timeout_key_a_page_names_is_an_output_field() -> None:
     Every ``*_timeout_seconds`` key a page names is an ``OutputConfig`` field.
 
     A config or environment that sets an unknown key fails to load, so a page
-    naming one hands the reader a setting that cannot load. A line that says
-    the key was renamed is the one place an old name may appear.
+    naming one hands the reader a setting that cannot load. A line with the
+    word "renamed" in it is the one place an old name may appear.
     """
     fields = set(OutputConfig.model_fields)
     offenders = [
@@ -4939,7 +4801,7 @@ def test_first_web_ui_scan_names_real_history_labels() -> None:
     the table and "Done" in the status line.  Naming the status area's word in
     the description of the table sends a reader looking for a string the table
     never renders.  Derived from ``JobState`` so a relabelling cannot leave
-    this passing (row 4).
+    this passing.
     """
     text, name = _read(FIRST_WEB_UI_SCAN)
     match = HISTORY_STATUS_WORDS.search(text)
@@ -4966,7 +4828,7 @@ def test_first_web_ui_scan_names_real_history_labels() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hook interpreter pin (tooling hygiene, found during the Phase 31 rehearsal)
+# Hook interpreter pin
 # ---------------------------------------------------------------------------
 
 PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
@@ -4996,8 +4858,8 @@ def test_hook_interpreter_is_pinned_to_the_project_python() -> None:
 
     ``check-ast`` and ``debug-statements`` parse this project's source with
     their own interpreter. Unpinned, prek builds each hook environment with
-    whichever Python it happens to locate -- environments at 3.12.4, 3.13.9 and
-    3.14.2 all existed on one machine at once. Anything below ruff's target
+    whichever Python it happens to locate, and one machine can hold several.
+    Anything below ruff's target
     rejects syntax ruff itself produces: PEP 758's bracketless
     ``except ValueError, TypeError:`` is a SyntaxError before 3.14, and
     ``ruff format`` writes exactly that at ``target-version = "py314"``.
@@ -5024,8 +4886,8 @@ def test_hook_interpreter_is_pinned_to_the_project_python() -> None:
 # The suppression ban, enforced instead of merely written down
 # ---------------------------------------------------------------------------
 
-# CLAUDE.md and CONTRIBUTING.md both forbid silencing a checker rather than
-# fixing what it found, but prose cannot fail a build. The guard below turns
+# CONTRIBUTING.md forbids silencing a checker rather than fixing what it
+# found, but prose cannot fail a build. The guard below turns
 # the rule into something falsifiable: it reads every tracked Python file and
 # reports any line carrying one of the six comment forms that do the
 # silencing. Those are, in words: the bare linter-suppression comment; the
@@ -5067,12 +4929,12 @@ SUPPRESSION_MARKERS = (
 
 def _shipped_python_files() -> list[str]:
     """
-    Return every tracked ``.py`` file outside ``.planning/``.
+    Return every tracked ``.py`` file outside the planning directory.
 
     The suffix filter is not an optimisation. ``_shipped_files`` also returns
-    Markdown and YAML, and the ban is stated in prose in CLAUDE.md, in
-    CONTRIBUTING.md and in the CI workflow; scanning those would make the
-    guard fail on the very documents that define the rule.
+    Markdown and YAML, and the ban is stated in prose in the contributor
+    documents and the CI workflow; scanning those would make the guard fail
+    on the very documents that define the rule.
 
     Returns:
         Repo-relative names of the tracked Python files in scope.
@@ -5085,8 +4947,8 @@ def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
     """
     No tracked Python file silences a checker instead of fixing what it found.
 
-    Scope follows ``git ls-files``, so a Python file added in a later phase is
-    covered without anyone remembering to extend a list. This file is in scope
+    Scope follows ``git ls-files``, so a new Python file is covered without
+    anyone remembering to extend a list. This file is in scope
     of its own scan, which is why the markers it looks for are assembled at
     runtime rather than written out.
     """
@@ -5107,7 +4969,7 @@ def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
         )
     assert not offenders, (
         "a tracked Python file silences a checker with a suppression comment, "
-        "which CLAUDE.md and CONTRIBUTING.md both forbid. Fix what the checker "
+        "which CONTRIBUTING.md forbids. Fix what the checker "
         "reported, at source, or change the rule set deliberately in "
         "pyproject.toml where the whole project can see it. Remove the comment "
         "from each line below:\n" + "\n".join(offenders)
@@ -5120,8 +4982,8 @@ def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
 # ---------------------------------------------------------------------------
 
 _TC002_TARGET = "src/saneless/web/routes.py"
-# Generous, because the assertion is about the answer and not the latency. The
-# measured run is well under a second: it invokes the ruff executable in this
+# Generous, because the assertion is about the answer and not the latency. A
+# run takes well under a second: it invokes the ruff executable in this
 # environment directly, so there is no dependency resolution step in front of
 # it.
 _TC002_SECONDS = 120
@@ -5188,13 +5050,12 @@ def test_ruff_still_exempts_the_runtime_evaluated_route_annotations() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The declared floors against the versions uv.lock resolves (D-09, D-10, D-11)
+# The declared floors against the versions uv.lock resolves
 # ---------------------------------------------------------------------------
 
-# This is the one guard in this file that parses rather than matching plain
-# text, and the departure is deliberate. Everywhere else the contract is what
-# an operator copies, so a parser would assert something no reader ever sees.
-# ``uv.lock`` is the opposite: machine-generated TOML that nobody copies, and
+# This guard parses ``uv.lock`` rather than matching plain text. Where the
+# contract is what an operator copies, a parser would assert something no
+# reader ever sees. ``uv.lock`` is the opposite: machine-generated TOML that nobody copies, and
 # the failure that most needs catching here -- one declared name resolved into
 # two ``[[package]]`` entries split by an environment marker -- is invisible to
 # a line scanner, because both entries are well formed and neither is wrong on
@@ -5294,32 +5155,14 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
     """
     Every declared ``>=`` floor equals the version ``uv.lock`` resolves for it.
 
-    The container is no longer the surface at risk here -- its builder stage
-    runs ``uv sync --locked`` -- but the published wheel's metadata
-    carries these floors verbatim, so they are what a downstream installer
-    resolves against. A floor left below the locked
-    version therefore admits into a fresh install the very tree this project
-    upgraded away from, and nothing else in the repository would notice. The
-    rule is equality, not satisfaction, so the comparison is plain string
-    equality over the lock's ``version`` field and needs no PEP 440 parsing: a
-    post-release floor compares like any other string.
-
-    The check runs in both directions: every declared name is resolved by the
-    lock, and every floor equals what the lock resolved. One further
-    requirement makes the second half meaningful -- a declared name must have
-    exactly one ``[[package]]`` entry. A name absent from the lock fails, and a
-    name split across two entries by an environment marker fails with both
-    versions named, because which one a wheel install would land on is a
-    decision and not something a guard may guess.
-
-    Scope is ``[project].dependencies`` and every ``[dependency-groups]``
-    table. ``[tool.uv].constraint-dependencies`` is deliberately outside that scope:
-    it holds ceilings rather than floors, so there is no floor in it to compare
-    for equality, and the pattern above would reject its one entry as
-    uncomparable. That entry is covered instead by
-    ``test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it`` below. The
-    exclusion is stated here so no reader has to infer it from a regex that
-    happens not to match.
+    The image builds with ``uv sync --locked``, but the published wheel's
+    metadata carries these floors verbatim, so a floor below the locked
+    version admits an older tree into a fresh downstream install. Every
+    declared name has exactly one ``[[package]]`` entry whose version string
+    equals the floor; a name split across two entries by a marker fails with
+    both versions named. Scope is ``[project].dependencies`` and every
+    ``[dependency-groups]`` table; ``[tool.uv].constraint-dependencies`` holds
+    ceilings, not floors, and the anyio ceiling test below covers it.
     """
     locked = _locked_versions()
     offenders: list[str] = []
