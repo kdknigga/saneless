@@ -185,7 +185,7 @@ class TestRunPipeline:
         tmp_path: Path,
     ) -> None:
         """Paperless raises PaperlessError -> pipeline raises PaperlessError."""
-        # data_dir is pointed at tmp_path too: a failing delivery now preserves
+        # data_dir is pointed at tmp_path too: a failing delivery preserves
         # the assembled PDF into <data_dir>/failed/, and a test must not write
         # that into the shared default outside pytest's own temp directory.
         default_settings.output.data_dir = tmp_path / "state"
@@ -377,9 +377,9 @@ def _keep_everything(
     """
     Stand in for ``filter_blank_pages``, keeping every record it is given.
 
-    A ``return_value`` cannot be used for this any more: the records the
-    pipeline goes on to assemble have to be the ones its own sink produced, and
-    a list built in the test would point at files nobody wrote.
+    A ``return_value`` cannot do this: the records the pipeline goes on to
+    assemble have to be the ones its own sink produced, and a list built in the
+    test would point at files nobody wrote.
 
     Args:
         pages: Whatever the pipeline passed.
@@ -567,20 +567,15 @@ class TestInterleave:
 
 class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
     """
-    D-02 and D-04: document order is the record list's order, and nothing else.
+    Document order is the record list's order, and nothing else.
 
-    The invariant both tests attack is one sentence: **nothing ever sorts or
-    globs the spool directory to recover page order.**  Order is carried by the
-    record list, and ``PageRecord.sequence`` is the proof of what the device
-    fed.
-
-    They attack it from opposite ends.  The twelve-page test follows a whole
-    simplex job out the far side, reading the assembled PDF back and matching
-    each of its pages against one specific spooled file.  The interleave test
-    builds a duplex job whose filename order is deliberately *not* its document
-    order, and asserts that difference before asserting the order itself -- so
-    an implementation that ever reached for ``sorted()`` or ``glob()`` would
-    fail it rather than pass it by luck.
+    Nothing ever sorts or globs the spool directory to recover page order:
+    order is carried by the record list, and ``PageRecord.sequence`` is the
+    proof of what the device fed.  The twelve-page test reads a simplex job's
+    assembled PDF back, matching each page to one spooled file.  The
+    interleave test builds a duplex job whose filename order is not its
+    document order, so an implementation that reached for ``sorted()`` or
+    ``glob()`` fails it.
     """
 
     def test_twelve_page_order_survives_into_the_assembled_pdf(
@@ -592,18 +587,12 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         """
         A twelve-page scan is pages 1..12 of the PDF, each carrying its own page.
 
-        The equivalence being asserted, stated so this test cannot quietly
-        weaken into "there are twelve pages": for every position *i*, the raw
-        image stream pikepdf reads out of PDF page *i* is **byte-identical** to
-        the concatenated IDAT payload of the PNG that record *i* names.  That
-        is an equality between a PDF page and one specific spooled file.  The
-        twelve spooled files are asserted to be twelve *distinct* byte strings
-        first, so a PDF of twelve identical pages cannot satisfy it, and the
-        records are asserted to carry ``sequence`` 1..12, so the order being
-        matched is the order the device fed.
-
-        The real ``assemble_pdf`` runs: the stand-in only redirects the output
-        somewhere that outlives the job's workspace.
+        For every position *i*, the raw image stream of PDF page *i* is
+        byte-identical to the concatenated IDAT payload of the PNG record *i*
+        names.  The twelve spooled files are distinct and the records carry
+        ``sequence`` 1..12, so neither twelve identical pages nor a reordering
+        passes.  The real ``assemble_pdf`` runs; the stand-in only redirects
+        the output somewhere that outlives the job's workspace.
         """
         default_settings.output.tmp_dir = tmp_path / "scratch"
         pages = [distinct_page(index) for index in range(12)]
@@ -640,17 +629,11 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         A duplex job whose filename order is deliberately not its document order.
 
         Pass A spools ``a-0001`` to ``a-0003`` and pass B ``b-0001`` to
-        ``b-0003`` into one directory, so sorting that directory by name yields
-        all three fronts and then all three backs.  The document order is
-        front1, back3, front2, back2, front3, back1: a different order.
-
-        The difference is asserted **first**, on purpose.  Without that
-        assertion this test would still pass against an implementation that
-        rebuilt the page list from a sorted glob, which is exactly the mistake
-        D-02 exists to forbid.
-
-        Nothing on disk moves: the interleave reorders records only, and every
-        record's ``path`` is the same before and after.
+        ``b-0003`` into one directory, so a name sort yields all three fronts
+        and then all three backs, while the document order is front1, back3,
+        front2, back2, front3, back1.  That difference is asserted first, so a
+        page list rebuilt from a sorted glob fails.  Nothing on disk moves: the
+        interleave reorders records only, and every ``path`` is unchanged.
         """
         spool_dir, fronts, backs = _duplex_spool(tmp_path, 3, 3)
         paths_before = [record.path for record in [*fronts, *backs]]
@@ -819,11 +802,10 @@ class TestPipelineEmptyPageFilter:
         """
         A non-empty batch that detection empties is its own failure, kept as a PDF.
 
-        EXC-03: the blank message is reserved for detection really removing
-        every page, so it names what happened rather than an empty scan.  It
-        used to be a ``ScanError`` saying "All pages were blank" and keeping
-        nothing; it is now ``AllPagesBlankError``, not a scanner fault, and the
-        run guard keeps the unfiltered pages as one PDF in ``failed/``.
+        The blank message is reserved for detection really removing every
+        page, so it names what happened rather than an empty scan.  The run
+        raises ``AllPagesBlankError``, not a scanner fault, and the run guard
+        keeps the unfiltered pages as one PDF in ``failed/``.
         """
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
@@ -874,7 +856,7 @@ def _blank() -> Image.Image:
     """
     Return tinted, noisy paper with nothing on it.
 
-    The old mean/stddev rule kept this page, because tinted paper is darker
+    A mean/stddev rule would keep this page, because tinted paper is darker
     than its mean threshold; the ink-coverage rule removes it.
 
     Returns:
@@ -1009,8 +991,8 @@ class TestBlankPagesByInkCoverage:
         """
         A page carrying only a footer page number is uploaded, not dropped.
 
-        On bright paper the old mean/stddev rule removed this page, which is
-        how a real page of a document disappeared.
+        On bright paper a mean/stddev rule removes this page, losing a real
+        page of the document.
         """
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
@@ -1071,7 +1053,7 @@ class TestBlankPagesByInkCoverage:
 
 class TestFlipAnswerSlot:
     """
-    The one claim-once answer both flip coordinators compose (IN-02).
+    The one claim-once answer both flip coordinators compose.
 
     Every wait here is bounded, and none sleeps: a wait on an answered slot
     returns because its event is already set, and a wait on an unanswered one
@@ -1083,7 +1065,7 @@ class TestFlipAnswerSlot:
         assert FlipAnswerSlot().answer is None
 
     def test_the_first_offer_claims_and_a_later_one_is_dropped(self) -> None:
-        """D-16: the first offer is the answer, and a later offer changes nothing."""
+        """The first offer is the answer, and a later offer changes nothing."""
         slot = FlipAnswerSlot()
         assert slot.offer(FlipOutcome.CONTINUED) is True
         assert slot.answer is FlipOutcome.CONTINUED
@@ -1255,7 +1237,7 @@ class TestFlipCoordinatorContract:
 
         ``abort_cause`` is concrete on the ABC, so an ``ABORTED`` answer from a
         coordinator that never overrides it is always an operator's abort -- a
-        cancel -- and existing coordinators need no change (D-02).
+        cancel -- and existing coordinators need no change.
         """
         coordinator = _FixedFlipCoordinator(FlipOutcome.ABORTED)
 
@@ -1264,10 +1246,10 @@ class TestFlipCoordinatorContract:
 
     def test_abort_cause_adds_no_flip_outcome_of_its_own(self) -> None:
         """
-        The cause travels beside the outcome, never as a new member (D-09).
+        The cause travels beside the outcome, never as a new member.
 
         The fourth member is a server stop, which is a different ending, not a
-        broken prompt: this used to pin exactly three members.
+        broken prompt.
         """
         assert set(FlipOutcome) == {
             FlipOutcome.CONTINUED,
@@ -1279,13 +1261,13 @@ class TestFlipCoordinatorContract:
 
 class TestZeroPages:
     """
-    An empty batch is reported truthfully at the pipeline boundary (EXC-03, N-06).
+    An empty batch is reported truthfully at the pipeline boundary.
 
-    Before this check an empty batch was misreported as all-blank with
-    detection on, and leaked img2pdf's bare ``ValueError`` with it off or on an
-    empty duplex half. The SANE backend never returns an empty batch --
-    an empty feeder raises ``FeederEmptyError`` (Phase 24 D-03) -- so these
-    tests drive the pipeline's contract check with a stubbed backend.
+    It is reported as neither all-blank nor img2pdf's bare ``ValueError``,
+    with detection on or off and on either duplex half.  The SANE backend
+    never returns an empty batch -- an empty feeder raises
+    ``FeederEmptyError`` -- so these tests drive the pipeline's contract
+    check with a stubbed backend.
     """
 
     @pytest.mark.parametrize("detection", [True, False])
@@ -1300,7 +1282,7 @@ class TestZeroPages:
         An empty simplex batch raises "No pages were scanned", detection on or off.
 
         Assembly and upload are never reached, so img2pdf never sees an empty
-        list (N-06).
+        list.
         """
         default_settings.profiles["default"].enable_empty_page_detection = detection
 
@@ -1327,7 +1309,7 @@ class TestZeroPages:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """An empty manual-duplex pass A raises before the flip prompt (EXC-03)."""
+        """An empty manual-duplex pass A raises before the flip prompt."""
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1359,18 +1341,14 @@ class TestZeroPages:
         tmp_path: Path,
     ) -> None:
         """
-        An empty manual-duplex pass B raises before the count comparison (EXC-03).
+        An empty manual-duplex pass B raises before the count comparison.
 
         Without the check the counts differ and the mismatch recovery would try
         to assemble the empty back half.  The message names the pass and what
-        pass A scanned: "No pages were scanned" would be false once the fronts
-        were fed (IN-01).
-
-        Since plan 29-09 the fronts are preserved rather than discarded, so the
-        message carries a preservation clause after the sentence pinned here
-        and no half is *delivered* -- which is what "before any half is
-        assembled" was always guarding.  The preserved half itself is covered
-        by ``TestPassBAndFlipFailuresKeepTheFronts``.
+        pass A scanned, since "No pages were scanned" is false once the fronts
+        were fed.  The fronts are preserved, so a preservation clause follows
+        the sentence pinned here, and no half is delivered; the preserved half
+        is covered by ``TestPassBAndFlipFailuresKeepTheFronts``.
         """
         _duplex_settings(default_settings, tmp_path)
 
@@ -1405,11 +1383,10 @@ class TestZeroPages:
         default_settings: Settings,
     ) -> None:
         """
-        Detection removing every page of a non-empty batch is "blank" (EXC-03).
+        Detection removing every page of a non-empty batch is "blank".
 
         The run's own assembly never starts; the only PDF built is the
-        preservation's, of the unfiltered pages.  This used to expect a
-        ``ScanError`` reading exactly "All pages were blank".
+        preservation's, of the unfiltered pages.
         """
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_empty_image()])
@@ -1437,7 +1414,7 @@ class TestZeroPages:
         default_settings: Settings,
     ) -> None:
         """
-        ``FeederEmptyError`` propagates unchanged (Phase 24 D-03).
+        ``FeederEmptyError`` propagates unchanged.
 
         The zero-page check runs on a returned batch, so it can never replace
         the backend's more specific feeder message.
@@ -1551,7 +1528,7 @@ class TestManualDuplex:
 
         The mismatch path uploads twice. If either upload fell back, the run did
         not reach paperless-ngx and must not claim SUCCESS -- that is precisely
-        the lie ScanOutcome.FALLBACK exists to prevent (CTR-02).
+        the lie ScanOutcome.FALLBACK exists to prevent.
         """
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -1587,7 +1564,7 @@ class TestManualDuplex:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """A partially-delivered mismatch is still FALLBACK, not SUCCESS (CTR-02)."""
+        """A partially-delivered mismatch is still FALLBACK, not SUCCESS."""
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
         mock_paperless.upload_document.side_effect = [
@@ -1728,7 +1705,7 @@ class TestManualDuplex:
         default_settings: Settings,
     ) -> None:
         """
-        The flip wait is one bounded call to the coordinator (DPLX-04, DPLX-05).
+        The flip wait is one bounded call to the coordinator.
 
         ``AWAITING_FLIP`` is announced before the wait and ``SCANNING_REVERSE``
         only after it, and the timeout handed over is the configured one.
@@ -1769,12 +1746,12 @@ class TestManualDuplex:
         default_settings: Settings,
     ) -> None:
         """
-        An operator's ABORTED cancels the run before pass B (EXC-04, N-08).
+        An operator's ABORTED cancels the run before pass B.
 
         Web Abort, n, Ctrl-D and Ctrl-C all reach the pipeline as ``ABORTED``
         with no ``abort_cause``: someone chose to stop, so the run raises
         ``ScanCancelledError`` -- never a ``ScanError`` -- and the worker and
-        the CLI record a cancel rather than a scanner failure (D-01, D-02).
+        the CLI record a cancel rather than a scanner failure.
         """
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -1812,15 +1789,14 @@ class TestManualDuplex:
         """
         An ``ABORTED`` with an ``abort_cause`` fails the run, chained to the cause.
 
-        A broken terminal prompt is not anyone's choice to stop (D-02, WR-08),
-        so it raises ``ScanError`` -- exit 1 at the CLI, ERROR on the web --
-        naming what broke, with the original exception as ``__cause__``.
+        A broken terminal prompt is not anyone's choice to stop, so it raises
+        ``ScanError`` -- exit 1 at the CLI, ERROR on the web -- naming what
+        broke, with the original exception as ``__cause__``.
 
-        Because nobody chose to stop, plan 29-09 also keeps pass A's fronts,
-        so the failure text continues past the sentence pinned here.  The run
-        guard now re-raises the very ``ScanError`` this path built, so its
-        ``__cause__`` is the OSError the prompt raised, with no re-raise link
-        in between any more.
+        Because nobody chose to stop, pass A's fronts are kept, so the failure
+        text continues past the sentence pinned here.  The run guard re-raises
+        the very ``ScanError`` this path built, so its ``__cause__`` is the
+        OSError the prompt raised, with no link in between.
         """
         _duplex_settings(default_settings, tmp_path)
 
@@ -1860,7 +1836,7 @@ class TestManualDuplex:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """TIMED_OUT fails the run naming the flip wait and its timeout (DPLX-05)."""
+        """TIMED_OUT fails the run naming the flip wait and its timeout."""
         _duplex_settings(default_settings, tmp_path)
         default_settings.output.operator_wait_timeout_seconds = 17
 
@@ -2045,7 +2021,7 @@ class TestManualDuplex:
 
 class TestManualDuplexPassCounts:
     """
-    ``pass_count_callback`` carries each pass's page count out mid-run (A-4).
+    ``pass_count_callback`` carries each pass's page count out mid-run.
 
     ``status_callback`` is ``Callable[[PipelineEvent], None]`` and carries no
     payload, so ``SCANNING_REVERSE`` cannot tell an observer how many fronts
@@ -2083,7 +2059,7 @@ class TestManualDuplexPassCounts:
         )
 
     def test_pass_count_callback_defaults_to_none(self) -> None:
-        """A request built without one behaves exactly as it did before."""
+        """A request built without a pass-count observer has none."""
         request = PipelineRequest(profile_name="default", title="No Counts")
 
         assert request.pass_count_callback is None
