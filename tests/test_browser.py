@@ -7445,8 +7445,8 @@ def _simple_form_settings(tmp_dir: Path) -> Settings:
     """
     Build settings with the Tags block off and a profile that carries its own.
 
-    The default profile's ``default_tags`` is what makes D-29 observable at
-    all: with no tag picker on the page the submit carries no ``tags`` field,
+    The default profile's ``default_tags`` is what makes the profile's tags
+    observable at all: with no tag picker on the page the submit carries no ``tags`` field,
     so whatever lands on the job row came from the profile and from nowhere
     else.
     """
@@ -7489,7 +7489,7 @@ def simple_form_server(
 @pytest.mark.browser
 class TestSimplerFormInChromium:
     """
-    ``show_tags = false`` changes the form and never the scan (D-28, D-29).
+    ``show_tags = false`` changes the form and never the scan.
 
     Two halves, and the second is the one that could go wrong quietly. The
     first is an absence claim about a whole rendered page, which is why this
@@ -7505,13 +7505,12 @@ class TestSimplerFormInChromium:
         simple_form_server: _BrowserServer,
     ) -> None:
         """
-        No tag markup anywhere, and a scan still files under the profile's tags (P14).
+        No tag markup anywhere, and a scan still files under the profile's tags.
 
         Absent, never hidden: what is not in the markup cannot be re-shown from
         devtools, cannot be read out by a screen reader and cannot be tabbed
-        into, which is the whole of D-28's claim. The tags on the created job
-        are then the proof of D-29 -- the submit carried no ``tags`` field at
-        all, so the two ids on the row can only have come from the profile.
+        into. The submit carries no ``tags`` field at all, so the two ids on
+        the created job can only have come from the profile.
         """
         server = simple_form_server
         job_store: JobStore = server.app.state.job_store
@@ -7538,7 +7537,7 @@ class TestSimplerFormInChromium:
 
 
 # ---------------------------------------------------------------------------
-# The courtesy and the enforcement (D-15, APPL-07).
+# The courtesy and the enforcement.
 #
 # The disabled Scan button and the route guard are two different promises, and
 # only one of them is load-bearing. The first class below proves the button
@@ -7587,7 +7586,7 @@ def private_blocked_server(
 @pytest.mark.browser
 class TestBlockedButtonThroughTheStatusPoll:
     """
-    A run of real status responses does not give the blocked button back (C-10).
+    A run of real status responses does not give the blocked button back.
 
     ``test_the_blocked_button_survives_its_own_page_load_requests`` covers the
     requests the form issues on load. This covers the other stream of requests
@@ -7602,19 +7601,13 @@ class TestBlockedButtonThroughTheStatusPoll:
         self, page: Page, private_blocked_server: _BrowserServer
     ) -> None:
         """
-        Three poll responses later the button is still disabled (P16).
+        The button stays disabled through three polls and after the job ends.
 
-        And once the job retires, the flag is the only thing still holding it
-        shut, so the last swap is the tightest of the four readings.
-
-        The job is parked directly rather than scanned, for the reason plan
-        30-17's P4 gives: what the page needs is the two pieces of state a live
-        scan produces, and running one would make the assertion wait on a
-        worker thread it is not testing. Here it could not run one anyway --
-        the guard refuses every submit on this server.
-
-        The waits are completed responses, never a sleep: "several ticks" is a
-        count of round trips, and a stopwatch would be measuring the host.
+        Once the job ends, the blocked flag is the only thing still holding the
+        button shut, so the last swap is the tightest of the four readings. The
+        job is parked directly rather than scanned, because the guard refuses
+        every submit on this server. The waits are completed responses, never a
+        sleep: "several ticks" is a count of round trips.
         """
         server = private_blocked_server
         job_store: JobStore = server.app.state.job_store
@@ -7662,26 +7655,23 @@ class TestBlockedButtonThroughTheStatusPoll:
 @pytest.mark.browser
 class TestTheGuardBehindTheBlockedButton:
     """
-    The button is the courtesy; this is the proof the guard is the refusal (D-15).
+    The button is the courtesy; the route guard is the refusal.
 
-    ``tests/test_web_errors.py`` already refuses this submit against a client
-    that has no button at all, which is the stronger statement about the route.
-    What it cannot say is that the two halves of D-15 really are separable in a
-    browser: that the greyed-out button is a convenience anyone with devtools
-    can take away, and that taking it away buys nothing. That is what this
-    does, by removing the attribute and clicking.
+    The greyed-out button is a convenience anyone with devtools can take
+    away, and taking it away buys nothing: the attribute is removed, the
+    button clicked, and the server still refuses the scan.
     """
 
     def test_a_tampered_button_still_cannot_start_a_scan(
         self, page: Page, private_blocked_server: _BrowserServer
     ) -> None:
         """
-        ``disabled`` removed, clicked, refused, and recorded as Failed (P17).
+        ``disabled`` removed, clicked, refused, and recorded as Failed.
 
         Three separate claims, because a refusal that left any one of them
         unmet would be a different bug: the person is told why in the slot, no
         scan started, and the attempt is in Job History rather than silently
-        swallowed (D-05). The row's error is asserted through the job store
+        swallowed. The row's error is asserted through the job store
         because Job History renders a state label and not the sentence -- the
         sentence is what ``saneless jobs`` and the API surface.
         """
@@ -7704,7 +7694,7 @@ class TestTheGuardBehindTheBlockedButton:
             button.click()
         assert caught.value.status == _SERVICE_UNAVAILABLE, caught.value.status
 
-        # Told why, in the slot phase 26 reserved for request errors (D-02).
+        # Told why, in the slot reserved for request errors.
         expect(page.locator(_SLOT_MESSAGE)).to_have_text(_TOKEN_UNSET_SLOT_TEXT)
         # And nothing started: the status area was never the target of this
         # response, and it still says what this idle appliance says -- why no
@@ -8452,8 +8442,8 @@ class TestStatusPollLostContact:
     A job store that cannot be read never reaches the alert slot, in Chromium.
 
     The alert slot is for the operator's own failed actions.  A status poll
-    that failed into it re-wrote the page's one alert on every tick and left
-    an error standing above "Done" once the store healed.  These tests break
+    failing into it would re-write the page's one alert on every tick and
+    leave an error standing above "Done" once the store healed.  These tests break
     the store's job reads under a live, held scan and watch both elements.
     """
 
@@ -9029,8 +9019,8 @@ class TestStatusReflow:
     """
     Every busy status line wraps at 320 px, and its spinner obeys reduced motion.
 
-    A busy line used to carry ``aria-busy``, and Pico keeps any busy element on
-    one line, so a queued line naming a long title pushed the whole page wider
+    A busy line carries no ``aria-busy``: Pico keeps any busy element on one
+    line, so a queued line naming a long title would push the whole page wider
     than a phone.  Each row here stages one busy state on a private server and
     measures the document at 320 x 640.  Two rows stage the form instead: its
     lists loading, with Scan's hold line, and its lists unavailable.
@@ -9486,7 +9476,7 @@ class TestFormControls:
         The profile opens on 41, so 42 is a choice the operator made.  The
         options are marked before the press and the wait is for the marks to
         be gone, so the value is read from the swapped-in options.  The button
-        is found by its name, which it had before it had an id.
+        is found by its accessible name.
         """
         page.goto(defaults_server.url)
         _await_the_lists(page)
@@ -9517,8 +9507,9 @@ class TestFormControls:
         """
         Each button sits on its heading's line, right of the text, above the control.
 
-        Moving the buttons out of the legend and the label must not move them
-        on the screen, at a desktop width or at the narrowest phone.
+        The buttons sit outside the legend and the label in the markup, yet on
+        screen they keep that place, at a desktop width and at the narrowest
+        phone.
         """
         page.set_viewport_size({"width": width, "height": 800})
         page.goto(defaults_server.url)
