@@ -1781,10 +1781,10 @@ class TestPruneSingleStatement:
 
 
 class TestQueryMethods:
-    """fail_active_jobs() and list_pending(): the two STOR-05 query methods."""
+    """The query methods: restart failures, the queue, the latest run, the probe."""
 
     def test_fail_active_jobs_moves_every_active_job_to_error(self) -> None:
-        """fail_active_jobs fails every active job and reports how many (STOR-05)."""
+        """fail_active_jobs fails every active job and reports how many."""
         store = JobStore()
         try:
             seeded = _seed_one_per_state(store)
@@ -1811,7 +1811,7 @@ class TestQueryMethods:
             store.close()
 
     def test_fail_active_jobs_with_nothing_active_returns_zero(self) -> None:
-        """fail_active_jobs on a settled store changes nothing (STOR-05)."""
+        """fail_active_jobs on a settled store changes nothing."""
         store = JobStore()
         try:
             job = store.create_job(profile="default", title="Finished")
@@ -1882,7 +1882,7 @@ class TestQueryMethods:
             store.close()
 
     def test_fail_active_jobs_transitions_exactly_the_active_states(self) -> None:
-        """The states fail_active_jobs moves are exactly ACTIVE_STATES (STOR-05)."""
+        """The states fail_active_jobs moves are exactly ACTIVE_STATES."""
         store = JobStore()
         try:
             seeded = _seed_one_per_state(store)
@@ -1895,11 +1895,10 @@ class TestQueryMethods:
                 assert job is not None
                 if job.state != original:
                     transitioned.add(original)
-            # Computed from the real frozenset rather than spelled out.  This is
-            # what makes Phase 23's FALLBACK and Phase 25's SCANNING_REVERSE get
-            # picked up the moment they join ACTIVE_STATES, with no edit to
-            # fail_active_jobs -- and what fails loudly if the predicate is ever
-            # hand-written back into a fixed list.
+            # Computed from the real frozenset rather than spelled out, so a state
+            # that joins ACTIVE_STATES is picked up with no edit to
+            # fail_active_jobs, and a predicate hand-written as a fixed list
+            # fails loudly.
             assert transitioned == ACTIVE_STATES
             # The seeding covered the whole enum, so "exactly ACTIVE_STATES" is
             # a statement about every state and not only about the ones seeded.
@@ -2004,16 +2003,16 @@ class TestQueryMethods:
             store.close()
 
     def test_job_state_has_no_failed_member(self) -> None:
-        """FAILED in the STOR-05 prose means the existing JobState.ERROR (STOR-05)."""
-        # D-19, pinned as a test because a future reader taking the requirement
-        # prose literally could reasonably invent a JobState.FAILED.  The value
+        """JobState has no FAILED member: a failed job is JobState.ERROR."""
+        # "Failed" is the natural English word, so a JobState.FAILED is easy
+        # to invent.  The value
         # is persisted as SQLite TEXT and read back through the enum
         # constructor, so adding or renaming a member is a data migration.
         assert "FAILED" not in JobState.__members__
         assert JobState.ERROR.value == "ERROR"
 
     def test_list_pending_returns_only_pending_jobs_oldest_first(self) -> None:
-        """list_pending returns the still-queued jobs in creation order (STOR-05)."""
+        """list_pending returns the still-queued jobs in creation order."""
         store = JobStore()
         try:
             ids = _seed_queue(store)
@@ -2036,7 +2035,7 @@ class TestQueryMethods:
             store.close()
 
     def test_list_pending_on_an_empty_store_returns_an_empty_list(self) -> None:
-        """list_pending on a store with no jobs returns an empty list (STOR-05)."""
+        """list_pending on a store with no jobs returns an empty list."""
         store = JobStore()
         try:
             assert store.list_pending() == []
@@ -2044,7 +2043,7 @@ class TestQueryMethods:
             store.close()
 
     def test_list_pending_returns_jobs_in_the_pending_state(self) -> None:
-        """Every object list_pending returns is a PENDING Job (STOR-05)."""
+        """Every object list_pending returns is a PENDING Job."""
         store = JobStore()
         try:
             ids = _seed_queue(store)
@@ -2061,7 +2060,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_on_an_empty_store_is_none(self) -> None:
-        """latest_run_job on a store with no jobs returns None (D-06)."""
+        """latest_run_job on a store with no jobs returns None."""
         store = JobStore()
         try:
             assert store.latest_run_job() is None
@@ -2069,7 +2068,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_skips_a_newer_rejection(self) -> None:
-        """A rejection newer than a finished job does not replace it (D-06)."""
+        """A rejection newer than a finished job does not replace it."""
         store = JobStore()
         try:
             done_id, rejected_id = _create_in_order(store, 2)
@@ -2087,7 +2086,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_returns_a_real_failure(self) -> None:
-        """A newer non-rejected failure is a run job and is returned (D-06)."""
+        """A newer non-rejected failure is a run job and is returned."""
         store = JobStore()
         try:
             scanning_id, rejected_id, failed_id = _create_in_order(store, 3)
@@ -2108,7 +2107,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_returns_a_restart_failed_job(self) -> None:
-        """A job failed by restart recovery has no category and is returned (D-06)."""
+        """A job failed by restart recovery has no category and is returned."""
         store = JobStore()
         try:
             interrupted_id, rejected_id = _create_in_order(store, 2)
@@ -2133,7 +2132,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_with_only_rejections_is_none(self) -> None:
-        """A store holding only rejected rows has no run job (D-06)."""
+        """A store holding only rejected rows has no run job."""
         store = JobStore()
         try:
             for job_id in _create_in_order(store, 2):
@@ -2144,7 +2143,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_survives_a_reopen(self, tmp_path: Path) -> None:
-        """The REJECTED marker is durable across a close and reopen (D-06)."""
+        """The REJECTED marker is durable across a close and reopen."""
         db_path = str(tmp_path / "jobs.db")
         store = JobStore(db_path=db_path)
         try:
@@ -2164,7 +2163,7 @@ class TestQueryMethods:
             reopened.close()
 
     def test_latest_run_job_skips_excluded_ids(self) -> None:
-        """Excluded ids are passed over, however many newer rows they cover (IN-08)."""
+        """Excluded ids are passed over, however many newer rows they cover."""
         store = JobStore()
         try:
             older, middle, newest = _create_in_order(store, 3)
@@ -2185,7 +2184,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_exclusions_combine_with_the_rejection_skip(self) -> None:
-        """An owed rejection and a written one are both skipped (IN-08, D-06)."""
+        """An owed rejection and a written one are both skipped."""
         store = JobStore()
         try:
             done, owed, rejected = _create_in_order(store, 3)
@@ -2200,7 +2199,7 @@ class TestQueryMethods:
             store.close()
 
     def test_latest_run_job_ignores_excluded_ids_that_match_no_row(self) -> None:
-        """Excluding ids that match no row changes nothing (IN-08)."""
+        """Excluding ids that match no row changes nothing."""
         store = JobStore()
         try:
             only = _create_in_order(store, 1)[0]
@@ -2215,7 +2214,7 @@ class TestQueryMethods:
             store.close()
 
     def test_probe_on_a_healthy_store_changes_nothing(self) -> None:
-        """A probe returns None and leaves rows and user_version untouched (D-12)."""
+        """A probe returns None and leaves rows and user_version untouched."""
         store = JobStore()
         try:
             first_id, second_id = _create_in_order(store, 2)
@@ -2244,7 +2243,7 @@ class TestQueryMethods:
             store.close()
 
     def test_probe_after_close_raises(self) -> None:
-        """A probe touches the connection, so a closed store raises (D-12)."""
+        """A probe touches the connection, so a closed store raises."""
         store = JobStore()
         store.close()
 
@@ -2253,10 +2252,10 @@ class TestQueryMethods:
 
 
 class TestCreateRejectedJob:
-    """create_rejected_job(): a refused submit recorded in one statement (WR-01)."""
+    """create_rejected_job(): a refused submit recorded in one statement."""
 
     def test_create_rejected_job_writes_a_terminal_rejected_row(self) -> None:
-        """The row is already ERROR/REJECTED and reads back unchanged (D-05, D-06)."""
+        """The row is already ERROR/REJECTED and reads back unchanged."""
         store = JobStore()
         try:
             job = store.create_rejected_job(
@@ -2288,7 +2287,7 @@ class TestCreateRejectedJob:
             store.close()
 
     def test_create_rejected_job_runs_one_insert_and_no_update(self) -> None:
-        """One INSERT and no UPDATE, so no failure can strand a PENDING row (WR-01)."""
+        """One INSERT and no UPDATE, so no failure can strand a PENDING row."""
         store = JobStore()
         traced: list[str] = []
         try:
@@ -2300,7 +2299,7 @@ class TestCreateRejectedJob:
             verbs = [text.split()[0].upper() for text in statements]
             # Create-then-finish is two transactions; if the second one raises,
             # the first has already committed a PENDING row with no REJECTED
-            # marker, and nothing ever reconciles it (WR-01, D-06).
+            # marker, and nothing ever reconciles it.
             assert verbs.count("INSERT") == 1, (
                 f"create_rejected_job ran {verbs.count('INSERT')} INSERTs: "
                 f"{'; '.join(statements)}"
@@ -2319,7 +2318,7 @@ class TestCreateRejectedJob:
             store.close()
 
     def test_latest_run_job_skips_a_created_rejected_job(self) -> None:
-        """The status area skips the row while history still lists it (D-05, D-06)."""
+        """The status area skips the row while history still lists it."""
         store = JobStore()
         try:
             # Backdated, so the rejected row is strictly newer without sleeping.
@@ -2342,7 +2341,7 @@ class TestOwnerToken:
     """create_job's owner_token: round-trip, NULL-means-unowned, and the arg cap."""
 
     def test_create_job_records_the_owner_token_it_was_given(self) -> None:
-        """A job created with an owner token carries it and re-reads it (APPL-09)."""
+        """A job created with an owner token carries it and re-reads it."""
         store = JobStore()
         try:
             job = store.create_job(
@@ -2350,9 +2349,8 @@ class TestOwnerToken:
             )
 
             assert job.owner_token == OWNER_TOKEN
-            # Re-read rather than trusting the returned object: the point of
-            # the change is that the column now has a writer, not that the
-            # dataclass can hold the value (it already could -- job.py:501).
+            # Re-read rather than trusting the returned object: the column, not
+            # the dataclass, is what must hold the token.
             reread = store.get_job(job.id)
             assert reread is not None
             assert reread.owner_token == OWNER_TOKEN
@@ -2360,7 +2358,7 @@ class TestOwnerToken:
             store.close()
 
     def test_create_job_without_an_owner_token_reads_back_none(self) -> None:
-        """An unowned job stores NULL, which is what every older row holds (D-23)."""
+        """An unowned job stores NULL, which is what every older row holds."""
         store = JobStore()
         try:
             job = store.create_job(profile="default", title="Unowned Doc")
@@ -2373,17 +2371,17 @@ class TestOwnerToken:
             store.close()
 
     def test_create_job_parameter_tuple_ends_at_owner_token(self) -> None:
-        """create_job's parameters are pinned to five non-self names (APPL-09)."""
-        # A pin against two separate regressions: a sixth parameter, which
-        # would trip PLR0913 and tempt a suppression, and a silent restoration
-        # of `thumbnail` to the slot owner_token now occupies.
+        """create_job's parameters are pinned to five non-self names."""
+        # Two mistakes are caught here: a sixth parameter, which would trip
+        # PLR0913 and tempt a suppression, and `thumbnail` put back in the slot
+        # owner_token occupies.
         parameters = tuple(inspect.signature(JobStore.create_job).parameters)
 
         assert parameters == CREATE_JOB_PARAMETERS
         assert "thumbnail" not in parameters
 
     def test_create_rejected_job_still_records_a_null_owner_token(self) -> None:
-        """A refused submit is still unowned and still recorded nothing (D-05)."""
+        """A refused submit is unowned and records nothing."""
         store = JobStore()
         try:
             job = store.create_rejected_job(
@@ -2401,7 +2399,7 @@ class TestOwnerToken:
             store.close()
 
     def test_owner_token_reaches_no_other_text_column(self) -> None:
-        """The token lands in owner_token alone -- never in error or title (T-30-09)."""
+        """The token lands in owner_token alone -- never in error or title."""
         store = JobStore()
         try:
             job = store.create_job(
@@ -2427,7 +2425,7 @@ class TestOwnerToken:
             store.close()
 
     def test_two_jobs_keep_their_own_owner_tokens(self) -> None:
-        """Two owned jobs do not share or overwrite each other's token (D-23)."""
+        """Two owned jobs do not share or overwrite each other's token."""
         store = JobStore()
         try:
             first = store.create_job(
@@ -2447,7 +2445,7 @@ class TestOwnerToken:
             store.close()
 
     def test_owner_token_survives_a_close_and_reopen(self, tmp_path: Path) -> None:
-        """Both the written token and a NULL one are durable on disk (APPL-09)."""
+        """Both the written token and a NULL one are durable on disk."""
         db_path = str(tmp_path / "jobs.db")
         store = JobStore(db_path=db_path)
         try:
@@ -2467,17 +2465,17 @@ class TestOwnerToken:
             assert unowned is not None
             assert owned.owner_token == OWNER_TOKEN
             # A row written with no owner stays NULL across the reopen: NULL
-            # means unowned, and no migration backfills it (RESEARCH OQ 1).
+            # means unowned, and no migration backfills it.
             assert unowned.owner_token is None
         finally:
             reopened.close()
 
 
 class TestQueuePosition:
-    """queue_position(): the zero-based "N ahead of you" source (APPL-08)."""
+    """queue_position(): the zero-based "N ahead of you" source."""
 
     def test_queue_position_counts_the_jobs_ahead_of_each_pending_job(self) -> None:
-        """Three jobs queued in order report 0, 1 and 2 ahead (APPL-08)."""
+        """Three jobs queued in order report 0, 1 and 2 ahead."""
         store = JobStore()
         try:
             first, second, third = _create_in_order(store, 3)
@@ -2488,7 +2486,7 @@ class TestQueuePosition:
 
             # Zero-based: the job at the head of the queue has nothing ahead of
             # it, which the UI renders as "(next in line)" rather than the
-            # technically-true "(0 ahead of you)" (UI-SPEC S5).
+            # technically-true "(0 ahead of you)".
             assert positions == [0, 1, 2]
         finally:
             store.close()
@@ -2501,7 +2499,7 @@ class TestQueuePosition:
             store.update_state(running, JobState.SCANNING)
 
             assert store.queue_position(running) is None
-            # The job behind it moves up: the running job is no longer counted.
+            # The job behind it moves up: the running job is not counted.
             assert store.queue_position(waiting) == 0
         finally:
             store.close()
@@ -2534,7 +2532,7 @@ class TestQueuePosition:
             store.close()
 
     def test_queue_position_agrees_with_list_pending_ordering(self) -> None:
-        """Every pending job's position is its index in list_pending (APPL-08)."""
+        """Every pending job's position is its index in list_pending."""
         store = JobStore()
         try:
             created = _create_in_order(store, QUEUE_POSITION_ROWS)
@@ -2555,7 +2553,7 @@ class TestQueuePosition:
             store.close()
 
     def test_queue_position_on_an_empty_store_is_none(self) -> None:
-        """An empty queue answers None rather than raising (APPL-08)."""
+        """An empty queue answers None rather than raising."""
         store = JobStore()
         try:
             assert store.list_pending() == []
@@ -2622,7 +2620,7 @@ class TestPrivateDatabaseMode:
     def test_fresh_database_mode_is_owner_only_with_its_sidecars(
         self, tmp_path: Path
     ) -> None:
-        """The db, -wal and -shm files are 0600 under umask 022 (D-10)."""
+        """The db, -wal and -shm files are 0600 under umask 022."""
         db_path = tmp_path / "fresh.db"
         previous = os.umask(TEST_UMASK)
         try:
@@ -2641,7 +2639,7 @@ class TestPrivateDatabaseMode:
         assert modes == {path.name: PRIVATE_MODE for path in _sidecars(db_path)}
 
     def test_existing_database_mode_is_left_as_it_was(self, tmp_path: Path) -> None:
-        """A 0644 database from an earlier release is not re-moded (D-10)."""
+        """A 0644 database from an earlier release is not re-moded."""
         db_path = tmp_path / "legacy.db"
         sqlite3.connect(db_path).close()
         db_path.chmod(LEGACY_MODE)
@@ -2664,7 +2662,7 @@ class TestRejectedRowCap:
     """Refused rows keep their own small cap and never count against history."""
 
     def test_create_rejected_job_rejected_cap_keeps_the_newest(self) -> None:
-        """30 refused submits leave the newest 20 and touch no run row (D-12)."""
+        """30 refused submits leave the newest 20 and touch no run row."""
         store = JobStore()
         try:
             done = store.create_job(profile="default", title="Real scan")
@@ -2677,7 +2675,7 @@ class TestRejectedRowCap:
             assert _run_titles(store) == {"Real scan"}
             for job in store.list_recent(limit=VACUUM_ROWS):
                 if job.error_category is ErrorCategory.REJECTED:
-                    # D-14: the refused row stays unowned.
+                    # The refused row stays unowned.
                     assert job.owner_token is None
         finally:
             store.close()
@@ -2714,12 +2712,12 @@ class TestRejectedRowCap:
             store.close()
 
     def test_rejected_cap_is_smaller_than_the_visible_history(self) -> None:
-        """A flood can never fill the web history table on its own (D-12)."""
+        """A flood can never fill the web history table on its own."""
         assert REJECTED_HISTORY_ROWS == 20
         assert job_module.WEB_HISTORY_LIMIT > REJECTED_HISTORY_ROWS
 
     def test_finish_job_rejected_cap_trims_refused_rows(self) -> None:
-        """finish_job recording REJECTED trims to the newest 20 as well (D-12)."""
+        """finish_job recording REJECTED trims to the newest 20 as well."""
         store = JobStore()
         try:
             ids = _create_in_order(store, REJECTED_FINISH_FLOOD)
@@ -2740,7 +2738,7 @@ class TestPruneCountsRunRowsOnly:
     """history_max_rows counts runs; refused rows sit under their own cap."""
 
     def test_prune_ignores_refused_rows_for_the_row_cap(self) -> None:
-        """Five runs and twenty refused rows all survive max_rows=5 (D-12)."""
+        """Five runs and twenty refused rows all survive max_rows=5."""
         store = JobStore()
         try:
             ids = _create_in_order(store, SPLIT_RUN_CAP)
@@ -2760,7 +2758,7 @@ class TestPruneCountsRunRowsOnly:
             store.close()
 
     def test_prune_trims_run_rows_to_the_cap_null_category_included(self) -> None:
-        """Only the newest 5 runs survive, NULL category counted as a run (D-12)."""
+        """Only the newest 5 runs survive, NULL category counted as a run."""
         # finish_job(DONE) records no category, so most run rows here are NULL
         # in error_category.  A `!=` predicate would never match NULL and would
         # keep them all; `IS NOT` is what makes them count.
@@ -2800,14 +2798,14 @@ class TestIncrementalVacuum:
     """A new database shrinks after deletes; an old one converts once."""
 
     def test_fresh_database_auto_vacuum_is_incremental(self, tmp_path: Path) -> None:
-        """A database this release creates reports auto_vacuum = 2 (D-12)."""
+        """A database this release creates reports auto_vacuum = 2."""
         db_path = tmp_path / "fresh.db"
         JobStore(db_path=str(db_path)).close()
 
         assert _raw_scalar(db_path, "PRAGMA auto_vacuum") == AUTO_VACUUM_INCREMENTAL
 
     def test_enable_incremental_auto_vacuum_converts_once(self, tmp_path: Path) -> None:
-        """An auto_vacuum NONE database converts once, then is a no-op (D-12)."""
+        """An auto_vacuum NONE database converts once, then is a no-op."""
         db_path = tmp_path / "old.db"
         JobStore(db_path=str(db_path)).close()
         raw = sqlite3.connect(db_path)
@@ -2872,7 +2870,7 @@ class TestIncrementalVacuum:
         assert messages[1].startswith("Converted the job database")
 
     def test_prune_vacuum_leaves_no_free_pages(self, tmp_path: Path) -> None:
-        """Pruning 195 thumbnail-heavy rows leaves an empty freelist (D-12)."""
+        """Pruning 195 thumbnail-heavy rows leaves an empty freelist."""
         db_path = tmp_path / "bloated.db"
         store = JobStore(db_path=str(db_path))
         try:
@@ -2890,7 +2888,7 @@ class TestIncrementalVacuum:
     def test_rejected_cap_trim_vacuum_leaves_no_free_pages(
         self, tmp_path: Path
     ) -> None:
-        """Trimming large refused rows leaves an empty freelist too (D-12)."""
+        """Trimming large refused rows leaves an empty freelist too."""
         db_path = tmp_path / "flooded.db"
         store = JobStore(db_path=str(db_path))
         try:
@@ -3092,7 +3090,7 @@ class TestRemovedPositions:
             store.close()
 
     def test_a_bare_job_and_result_have_no_positions(self) -> None:
-        """The new field defaults to None, so existing constructions stay valid."""
+        """removed_positions defaults to None, so a construction may omit it."""
         assert Job(id="t", profile="default", title="T").removed_positions is None
         result = JobResult(
             outcome=None,
