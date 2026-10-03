@@ -60,6 +60,7 @@ from saneless.vocabulary import (
     TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
+    UNSET_CREDENTIAL_CLAUSE,
     ErrorCategory,
     FlipOutcome,
     JobState,
@@ -3148,15 +3149,18 @@ class TestScanBlocked:
 
         It names the problem and nothing else: not the token value, not the
         paperless-ngx URL, which may carry credentials, and no exception text
-        (ASVS V7).  Modules are read for their string constants and templates
-        and the stylesheet for their text without comments.
+        (ASVS V7).  The sentence is built from the shared unset-credential
+        clause, so the clause, matched without regard to case, is what may
+        appear in exactly one module's string constants and in no template or
+        stylesheet text.
         """
+        clause = UNSET_CREDENTIAL_CLAUSE.casefold()
         carrying = sorted(
             path
             for path in _SRC_DIR.rglob("*")
             if path.is_file()
             and path.suffix in {".py", ".html", ".css"}
-            and any(_BLOCKED_REASON in text for text in _source_strings(path))
+            and any(clause in text.casefold() for text in _source_strings(path))
         )
 
         assert len(carrying) == 1, carrying
