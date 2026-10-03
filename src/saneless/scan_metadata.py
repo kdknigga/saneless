@@ -45,9 +45,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# The budget of each fetch made to check ids before a scan.  Short, because it
-# is paid before any paper moves: a paperless-ngx that does not answer costs a
-# few seconds and the ids go unchecked, rather than the client's 30 s per list.
+# The budget of each fetch made to check ids before a scan.  Shorter than the
+# client's own timeout, because it is paid before any paper moves; when it
+# runs out the ids go unchecked.
 _VALIDATION_TIMEOUT_SECONDS: Final = 5.0
 
 type MetadataKind = Literal["tags", "correspondents"]
@@ -167,12 +167,11 @@ def fetch_metadata(
         )
         return None
     except Exception as exc:
-        # Anything else from the client -- a RecursionError from decoding a
-        # deeply nested hostile body is one -- still only means the ids cannot
-        # be checked, so it must not end the scan before the scanner is
-        # touched.  Logged by class name alone, the web tier's rule for client
-        # exceptions: third-party text can carry a URL, a header or the token.
-        # ScanInterrupted is a BaseException, so a signal still gets through.
+        # Anything else from the client, such as a RecursionError from a deeply
+        # nested hostile body, still only means the ids cannot be checked.
+        # Logged by class name alone: third-party text can carry a URL, a
+        # header or the token.  ScanInterrupted is a BaseException, so a
+        # signal still gets through.
         logger.warning(
             "Could not read %s from paperless-ngx to check this scan's ids; "
             "they are sent unchecked: %s",
