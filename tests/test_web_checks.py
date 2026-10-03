@@ -2753,7 +2753,9 @@ class TestStripStyles:
 # htmx trigger is only as good as its exact attribute spelling.
 _HISTORY_LOADER = 'hx-get="/api/jobs/history"'
 _STRIP_LOADER = 'hx-get="/api/checks"'
-_OOB_CHECKS = re.compile(r'<div id="checks-body" hx-swap-oob="true"')
+_OOB_CHECKS = re.compile(
+    r'<div(?=[^>]*\sid="checks-body")(?=[^>]*\shx-swap-oob="true")\s[^>]*>'
+)
 # The out-of-band Scan button, found by its attributes in any order.
 _OOB_SCAN_BTN = re.compile(
     r'<button(?=[^>]*\sid="scan-btn")(?=[^>]*\shx-swap-oob="true")\s[^>]*>'
@@ -3021,14 +3023,23 @@ class TestWhichResponsesCarryWhat:
         assert response.status_code == 200
         assert _OOB_CHECKS.search(response.text) is None
 
-    def test_an_error_response_carries_neither(self, client: TestClient) -> None:
-        """An error slot renders the sentence and nothing out-of-band."""
+    def test_an_htmx_error_response_never_carries_the_strip(
+        self, client: TestClient
+    ) -> None:
+        """
+        An htmx error response never carries the strip out of band.
+
+        The error lands in the message slot. It may hand focus back with an
+        out-of-band Scan button, but the strip is not its to re-render.
+        """
         response = client.post(
-            "/api/scan", data={"profile": "no-such-profile", "title": ""}
+            "/api/scan",
+            data={"profile": "no-such-profile", "title": ""},
+            headers={"HX-Request": "true"},
         )
-        assert response.status_code != 200
+        assert response.status_code == 422
+        assert response.headers["HX-Retarget"] == "#status-message"
         assert _OOB_CHECKS.search(response.text) is None
-        assert _OOB_SCAN_BTN.search(response.text) is None
 
     def test_a_refresh_does_not_re_render_the_scan_button(
         self, client: TestClient
