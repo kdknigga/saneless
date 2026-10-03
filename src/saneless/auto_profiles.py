@@ -49,37 +49,26 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# The slug for a name of which _slugify's character set keeps nothing -- a
-# whitespace-only or wholly punctuation source name. "source" is the domain's
-# own word, so it cannot be mistaken for a device's wording, and it leaves the
-# collision tie-break free to turn a second degenerate name into "source-2"
-# rather than dropping it.
+# The slug for a source name of which _slugify keeps nothing.  A second such
+# name becomes "source-2" through the collision tie-break rather than being
+# dropped.
 _EMPTY_SLUG_FALLBACK = "source"
 
 
-# Substrings of the SANE device-type strings that imply a scanning glass.
-# Matched as substrings, case-insensitively, against DeviceInfo.device_type --
-# backends spell these with varying decoration ("flatbed scanner",
-# "multi-function peripheral", hpaio's "all-in-one"). Read only by
-# _declares_platen, which documents why a feeder-only MFP matching here is the
-# accepted trade.
+# Matched as substrings, case-insensitively, against DeviceInfo.device_type:
+# backends decorate these ("flatbed scanner", hpaio's "all-in-one").
 _PLATEN_DEVICE_TYPES: Final = ("flatbed", "all-in-one", "multi-function")
 
-# The mode a generated profile asks for when the device reported no modes at
-# all -- the conventional SANE name, which is what every profile used before
-# modes were ranked.
+# The mode a generated profile asks for when the device reported none.
 _FALLBACK_MODE: Final = "Color"
 
-# Words that mark a scan mode as colour, and as gray, when found in a mode name.
-# Matched case-insensitively, as whole names first and then as substrings,
-# because backends decorate them ("24bit Color", "True Gray") and some use the
-# British spelling.
+# Matched as whole names first and then as substrings, because backends
+# decorate them ("24bit Color", "True Gray").
 _COLOUR_WORDS: Final = ("color", "colour")
 _GRAY_WORDS: Final = ("gray", "grey")
 
-# Words that mark a mode as a degraded rendering of its colour or gray family --
-# one or two bits per pixel, a dither, or an inverted image. A mode naming one
-# of these is chosen only when nothing cleaner in the same family exists.
+# A mode naming one of these is chosen only when nothing cleaner in the same
+# family exists.
 _DEGRADED_MODE_WORDS: Final = (
     "lineart",
     "halftone",
@@ -94,26 +83,10 @@ def _slugify(source: str) -> str:
     """
     Reduce a source name to a strict ``[a-z0-9-]`` slug.
 
-    The character set is the contract: the result holds only lowercase ASCII
-    letters, digits and hyphens, with no leading, trailing or doubled hyphen.
-    The rule, in order -- lowercase the name; replace every run of characters
-    outside ``[a-z0-9]`` with a single hyphen; strip leading and trailing
-    hyphens; fall back to ``_EMPTY_SLUG_FALLBACK`` when nothing survives.
-
-    Lowercasing happens here rather than in the caller so no caller can pass a
-    half-normalised string and get a slug that silently breaks the contract.
-
-    This is deliberately NOT the PDF filename sanitiser, and the two must not
-    be merged: they were separated because this one passed "/" and ".."
-    straight through. The strict character set fixes that weakness here; it
-    does not make this function safe to reuse for filesystem paths.
-
-    Args:
-        source: SANE source name, in whatever case the device reported it.
-
-    Returns:
-        A slug matching ``^[a-z0-9][a-z0-9-]*$``.
-
+    The character set is the contract: no leading, trailing or doubled
+    hyphen, and ``_EMPTY_SLUG_FALLBACK`` when nothing survives.  This is not
+    the PDF filename sanitiser and must not be merged with it or reused for
+    filesystem paths.
     """
     slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
     return slug or _EMPTY_SLUG_FALLBACK
@@ -123,19 +96,10 @@ def source_to_slug(source: str) -> str:
     """
     Convert a SANE source name to a profile slug.
 
-    Every source is named from the device's own wording. This function used to
-    map each SourceKind onto one of four hard-coded friendly names, which forced
-    a special case for "ADF Back". The reason is worth keeping: "which scan path
-    do I take?" and "what do I name this profile?" are different questions with
-    different equivalence classes. "ADF Front" and "ADF Back" are both feeders
-    for routing, so naming them from the kind collapsed two distinct sources
-    onto one profile and silently lost one. Naming from the source itself
-    removes the naming question's need for a rule at all, so no source can be
-    named after another source's kind.
-
-    Two *different* names can still normalise alike ("ADF-Front" and
-    "ADF Front"). That residue is resolved where profiles are assembled, with a
-    deterministic tie-break -- not here, so this function stays pure.
+    Named from the source itself, never from its ``SourceKind``: "ADF Front"
+    and "ADF Back" are both feeders, and naming by kind would collapse them
+    onto one profile.  Two different names can still normalise alike; that is
+    resolved where profiles are assembled, so this function stays pure.
 
     Args:
         source: SANE source name string (e.g., "Flatbed", "ADF Duplex").
@@ -151,34 +115,14 @@ def _snap_into_range(target: int, resolution_range: tuple[float, float, float]) 
     """
     Clamp a target into a reported range and snap it onto the range's step.
 
-    Clamping alone is not enough. A range says the device accepts values from
-    its minimum *in increments of its step* up to its maximum, so a value inside
-    the span but off the grid is still one the device never offered, and SANE
-    would silently substitute something else for it. The maximum itself need
-    not lie on the grid, so the ceiling used is the largest on-grid value not
-    above it -- clamping to the raw maximum could land off the grid.
-
-    Between two grid values the higher wins a tie, so an equidistant pick is
-    never below the target a profile asked for.
-
-    A step of zero is not a defect to guard against but a documented SANE
-    meaning -- the range is continuous and any value within it is acceptable --
-    so it clamps without snapping rather than dividing by zero.
-
-    Args:
-        target: The preferred resolution, in dpi.
-        resolution_range: The ``(min, max, step)`` the device reported.
-
-    Returns:
-        A whole-dpi resolution the device could actually accept. The device
-        reports its bounds as floats; the coercion to int happens here, at the
-        point of use, rather than when the constraint was read.
-
+    An off-grid value is one the device never offered, and SANE would
+    silently substitute another.  The maximum need not lie on the grid, so the
+    ceiling is the largest on-grid value not above it, and a tie goes to the
+    higher value.  A step of zero means a continuous range in SANE, so it
+    clamps without snapping.
     """
     low, high, step = resolution_range
     if step > 0:
-        # The grid starts at the minimum; its top is the largest grid value
-        # that does not exceed the maximum.
         top = low + math.floor((high - low) / step) * step
         clamped = min(max(float(target), low), top)
         below = low + math.floor((clamped - low) / step) * step
@@ -200,17 +144,11 @@ def pick_closest_resolution(
     """
     Pick the resolution closest to target from what the device actually offers.
 
-    A device constrains its resolution option with *either* a word list *or* a
-    ``(min, max, step)`` range, so the two arguments are alternatives rather
-    than two spellings of one fact. A word list is an exhaustive enumeration and
-    wins when present: ``min(..., key=absolute difference)`` is already exactly
-    right for it.
-
-    The range branch is not optional. This function used to return the target
-    unchanged whenever the list was empty -- which is precisely what a
-    range-reporting device produces -- so such a device was asked for 300 dpi
-    regardless of what it supported, and a device whose ceiling sat below 300
-    got a resolution it had never advertised.
+    A device constrains its resolution option with either a word list or a
+    ``(min, max, step)`` range, so the two arguments are alternatives; a word
+    list wins when present.  A range-reporting device sends an empty list, so
+    the range branch is what keeps it from being asked for a resolution it
+    never advertised.
 
     Args:
         resolutions: The exact resolutions the device offers, when it reported
@@ -255,11 +193,9 @@ def pick_preferred_mode(modes: list[str]) -> str:
     """
     Pick the scan mode a person would choose, ranked by what each mode means.
 
-    SANE backends do not agree on how to spell colour: brother4 offers
-    ``24bit Color``, some drivers say ``Colour``, and the SANE standard names
-    include ``Color Lineart``. A backend's first entry is usually its
-    black-and-white mode, so matching only the exact word ``Color`` and falling
-    back to the first entry handed colour scanners black-and-white profiles.
+    SANE backends do not agree on how to spell colour (brother4 offers
+    ``24bit Color``), and a backend's first entry is usually its
+    black-and-white mode, so the first entry is only the last resort.
 
     The tiers, each scanning the modes in the order the device reported them
     and matching case-insensitively:
@@ -296,12 +232,9 @@ def is_bare_default(settings: Settings) -> bool:
     equal to ``ProfileConfig()`` in every field.
 
     The whole profile is compared rather than a hand-picked subset, so a field
-    added later cannot be silently ignored -- as ``duplex`` was, which let a
-    hand-written manual-duplex default be replaced in memory by a generated
-    flatbed profile. Pydantic model equality compares field values,
-    not which fields were set, so a config that spells out default values
-    explicitly still counts as bare. ``auto_generated=True`` is covered by the
-    same equality, because the bare profile has ``auto_generated=False``.
+    added later cannot be silently ignored.  Pydantic equality compares field
+    values, not which fields were set, so a config that spells out the
+    defaults still counts as bare.
 
     Args:
         settings: Application settings to inspect.
@@ -321,23 +254,15 @@ def _claim_slug(source: str, claimed: dict[str, str]) -> str:
     """
     Resolve a source's slug against the slugs already claimed.
 
-    Slugging is not injective -- "ADF-Front" and "ADF Front" are different
-    source names that normalise to the same slug -- so the assignment needs a
-    tie-break. The first source to claim a slug keeps it bare; each later
-    collider gains a "-2", "-3", ... suffix. "Last wins" is rejected: it
-    silently drops a source the device reported, which is the very loss the
-    tie-break exists to prevent.
-
-    The walk follows ``capabilities.sources`` order, so the result is
-    deterministic given the device's own stable ordering of its sources.
+    "ADF-Front" and "ADF Front" normalise to the same slug.  The first source
+    to claim a slug, in the device's own source order, keeps it bare; each
+    later collider gains a "-2", "-3", ... suffix, so no reported source is
+    dropped.
 
     Args:
         source: The SANE source name claiming a slug.
         claimed: Slugs already taken, mapped to the source that took each.
             Mutated to record the returned slug.
-
-    Returns:
-        The slug this source may use.
 
     """
     slug = source_to_slug(source)
@@ -365,16 +290,10 @@ def device_type_of(devices: Sequence[DeviceInfo], device_id: str) -> str:
     """
     Find the type a discovered device declared, by its SANE name.
 
-    Both callers of ``generate_profiles`` already hold the enumeration result
-    and pick their ``device_id`` out of it, so the type is free -- no second
-    ``get_devices()`` RPC, which on the net backend is a real round trip.
-
-    A miss returns the empty string rather than raising. ``device_id`` can come
-    from ``scanner.device`` in the config, which the operator may have spelled
-    in a form the enumeration does not return verbatim, and a scanner whose
-    name does not match is still a scanner worth generating profiles for. The
-    empty string is exactly what ``_declares_platen`` reads as "no evidence",
-    so a miss degrades to judging the device on its source names alone.
+    Read from an enumeration the caller already holds, so there is no second
+    ``get_devices()`` round trip.  A miss returns the empty string rather
+    than raising: ``scanner.device`` may be spelled differently from the
+    enumeration, and ``_declares_platen`` reads ``""`` as "no evidence".
 
     Args:
         devices: The devices the backend enumerated.
@@ -391,36 +310,11 @@ def _declares_platen(device_type: str) -> bool:
     """
     Read the device's own declared type for evidence that it has a platen.
 
-    SANE hands back a type string beside every device name, and saneless has
-    always carried it verbatim as ``DeviceInfo.device_type``. Nothing used to
-    ask it anything. It is the device's own answer to the question
-    ``_auto_source_mode`` needs answered, and it is available without a second
-    round trip.
-
-    The tokens below are the platen-bearing halves of SANE's conventional
-    vocabulary. ``"sheetfed scanner"`` -- the one type that positively denies a
-    platen -- matches none of them, so a real sheet-fed document scanner is
-    untouched by this function. So is a device whose backend reports a type
-    saneless does not recognise, or no type at all: absence of evidence is
-    read as absence, never as denial, which is what keeps this a widening of
-    the platen test rather than a replacement for it.
-
-    ``"multi-function"`` and ``"all-in-one"`` are included knowingly. A few
-    MFPs really are feeder-only, and on one of those this returns True and an
-    ``Auto`` profile comes back single-page. That device still names its feeder
-    explicitly -- an MFP without a platen has an ADF and says so -- so the
-    operator has a feeder profile that works, and the residual failure is the
-    cheap, visible one this project already accepts (see ``classify_source``).
-    The failure it replaces is the expensive one: probing a platen for a
-    second sheet that cannot exist.
-
-    Args:
-        device_type: The type string SANE reported for the device, as carried
-            on ``DeviceInfo.device_type``. Empty when unknown.
-
-    Returns:
-        Whether the declared type is one that has a platen.
-
+    ``"sheetfed scanner"`` matches no token, and an unrecognised or empty type
+    is read as no evidence, never as denial.  A feeder-only MFP matches, so
+    its ``Auto`` profile scans one page: the cheap, visible failure, preferred
+    over probing a platen for a second sheet.
+    See docs/explanation/decisions/0001-unknown-sources-scan-one-page.md.
     """
     lower = device_type.strip().lower()
     return any(token in lower for token in _PLATEN_DEVICE_TYPES)
@@ -430,34 +324,12 @@ def _auto_source_mode(source: str, *, has_platen: bool) -> Literal["flatbed", "a
     """
     Decide how an ``Auto`` source should be routed on this device.
 
-    A source that is not ``Auto`` routes on its own name and never consults
-    this. An ``Auto`` source says nothing about what is loaded, so the only
-    evidence available is whether the device has a platen at all: one that does
-    not is a sheet-fed machine, where treating ``Auto`` as single-page returns
-    one page from a whole stack.
-
-    ``has_platen`` is that question, and it is deliberately no longer the same
-    question as "does the device report a source named Flatbed". It used to be,
-    and that proxy is false on the ``hpaio`` backend: an HP LaserJet 3030 has a
-    platen, is the only scan path on many such units once the feeder wears out,
-    and hpaio names its two sources ``Auto`` and ``ADF`` -- no ``Flatbed``
-    among them. Every generated profile for that device was handed
-    ``auto_source_mode = "adf"``, so ``scan_pages`` sent a platen scan down
-    ``_scan_adf_pages``, which probed ``multi_scan()`` for a second sheet the
-    glass could not supply; the device answered with a device I/O error and a
-    "Memory is low" panel message, and a clean one-page scan was reported as a
-    scanner fault.
-
-    Args:
-        source: The SANE source name the profile will carry.
-        has_platen: Whether the device is known to have a platen, from either
-            the sources it reports or the type it declares. Keyword-only,
-            because a positional boolean is not allowed by this project's lint
-            rules.
-
-    Returns:
-        The ``auto_source_mode`` the profile should carry.
-
+    An ``Auto`` source says nothing about what is loaded, so the only
+    evidence is whether the device has a platen: one without is sheet-fed,
+    where single-page routing returns one page from a stack.  ``has_platen``
+    must not be reduced to "reports a Flatbed source": hpaio names an HP
+    LaserJet 3030's sources ``Auto`` and ``ADF``, and probing its glass for a
+    second sheet fails with a device I/O error.
     """
     if classify_source(source) is SourceKind.AUTO and not has_platen:
         return "adf"
@@ -468,48 +340,20 @@ def _duplex(source: str) -> Literal["none", "hardware"]:
     """
     Decide the ``duplex`` value a generated profile should carry.
 
-    A source the classifier calls ``FEEDER_DUPLEX`` is one the device duplexes
-    itself, so its profile says ``"hardware"``; every other source says
-    ``"none"``. ``"manual"`` is deliberately outside this function's range:
-    manual duplex is not a device source at all, so auto-profiles has no
-    evidence for it and those profiles are always written by hand.
-
-    ``"hardware"`` is read by the scanner, which sets a separate ADF-mode
-    option to ``Duplex`` on a scanner that has one; on the others the source
-    name selects duplex. Here it is still derived only from a
-    ``FEEDER_DUPLEX`` source name. No hardware-duplex profile is generated
-    from an ADF-mode option, because the capabilities are read at the default
-    source and cannot prove the feeder duplexes: epson2 reports the option
-    inactive until its feeder is selected, and reports it on hardware that
-    cannot duplex at all. The double-sided feeder wording the scan page shows
-    comes from ``_profile_label`` and ``_profile_description`` below, which
-    classify the same source rather than reading this value. ``config.py``
-    states what the scanner does with it; it is repeated here because this is
-    where the value is produced, and a reader here will ask what consumes it.
-
-    The value is always passed explicitly, never left to the field default:
-    the config loader reads a source name containing both "manual" and
-    "duplex" as ``duplex = "manual"`` when no duplex is given. Such a name
-    classifies as ``FEEDER_DUPLEX`` here, so passing the value is what keeps
-    a generated profile from turning into a manual-duplex one.
-
-    Args:
-        source: The SANE source name the profile will carry.
-
-    Returns:
-        The ``duplex`` the profile should carry.
-
+    ``"hardware"`` for a ``FEEDER_DUPLEX`` source, else ``"none"``; manual
+    duplex is never generated.  An ADF-mode option is not evidence: epson2
+    reports it inactive until its feeder is selected, and on hardware that
+    cannot duplex.  The value is always passed explicitly, because the loader
+    reads a source naming "manual" and "duplex" as manual duplex otherwise.
     """
     if classify_source(source) is SourceKind.FEEDER_DUPLEX:
         return "hardware"
     return "none"
 
 
-# Whole lowercase words of a feeder source name that say which one side it
-# scans, mapped to that side. Wording only: this is never consulted for routing,
-# and ``classify_source`` remains the only rule that says what a source is.
-# Real backends spell these "ADF Front" and "ADF Back" (fujitsu, canon_dr,
-# kodak, epjitsu, avision, epsonds); none spells "Rear".
+# Wording only, never consulted for routing: ``classify_source`` remains the
+# only rule that says what a source is.  Real backends spell these "ADF Front"
+# and "ADF Back"; none spells "Rear".
 _FEEDER_SIDE_WORDS: Final[dict[str, Literal["front", "back"]]] = {
     "front": "front",
     "back": "back",
@@ -520,23 +364,9 @@ def _feeder_side(source: str) -> Literal["front", "back"] | None:
     """
     Name the one side a single-sided feeder source scans, for its wording only.
 
-    Reached only from the ``SourceKind.FEEDER`` arm of ``_profile_label`` and
-    ``_profile_description``, after ``classify_source`` has already decided the
-    source is a feeder, so it refines the words a feeder is described with and
-    never which path a scan takes. A name without a feeder word ("Card Front")
-    therefore never gets here.
-
-    A side counts only when it is a whole word of the name, so "Backlit" names
-    no side. A name that names both sides, or neither, gets None and keeps the
-    plain single-sided wording.
-
-    Args:
-        source: A SANE source name that classifies as ``SourceKind.FEEDER``.
-
-    Returns:
-        ``"front"`` or ``"back"`` -- a constant, never text from the name -- or
-        None when the name does not name exactly one side.
-
+    Reached only after ``classify_source`` has called the source a feeder, so
+    it never decides which path a scan takes.  A side counts only as a whole
+    word ("Backlit" names none); a name with both sides or neither gets None.
     """
     words = set(re.findall(r"[a-z]+", source.lower()))
     sides = {side for word, side in _FEEDER_SIDE_WORDS.items() if word in words}
@@ -549,31 +379,14 @@ def _profile_label(source: str) -> str:
     """
     Return the short human name a generated profile carries.
 
-    The text is derived from what the code already knows -- the ``SourceKind``
-    the one classification rule reports -- so there is no new probe of the
-    device and no new config key to fill in. The three feeder and glass forms
-    have fixed, agreed wording; ``Auto`` and an unrecognised name get their own
-    so that no profile is ever offered under a blank name. A single-sided
-    feeder whose name says which one side it scans reads as that side, which
-    ``_feeder_side`` decides inside the feeder arm only, after classification.
-
-    The label is the base text for the source alone. ``generate_profiles``
-    appends an ordinal when two sources of a set share it.
-
-    Every returned string is a developer-authored constant. The SANE source
-    name is never interpolated into it, so a vendor-chosen source string
-    cannot ride this path into the config file the scan page renders.
-
-    Args:
-        source: The SANE source name the profile will carry.
-
-    Returns:
-        A name short enough for a dropdown option, within
-        ``PROFILE_LABEL_MAX_LENGTH``.
+    Derived from the ``SourceKind``, so no profile is offered under a blank
+    name.  Every returned string is a developer-authored constant: the SANE
+    source name is never interpolated, so vendor text cannot ride this path
+    onto the scan page.  ``generate_profiles`` appends an ordinal when two
+    sources share a label.
 
     Raises:
-        AssertionError: If the classifier returns a value that is not a
-            SourceKind member.
+        AssertionError: The classifier returned a non-``SourceKind`` value.
 
     """
     kind = classify_source(source)
@@ -605,29 +418,13 @@ def _profile_description(
     """
     Return the one-sentence explanation a generated profile carries.
 
-    The sentence beneath the profile dropdown. Like ``_profile_label`` it is
-    derived from the ``SourceKind``, refined for a feeder by the side
-    ``_feeder_side`` reads: no new probe, no new config key, and the SANE
-    source name is never interpolated into the result, so every string here is
-    a developer-authored constant.
-
-    An ``Auto`` source is the exception to "the kind alone": what it does
-    depends on how it is routed, so its sentence follows ``auto_source_mode``.
-    Routed as a feeder on a platen-less device it takes every page loaded;
-    routed as a single page it takes one, from wherever the scanner chooses.
-
-    Args:
-        source: The SANE source name the profile will carry.
-        auto_source_mode: How the profile routes an ``Auto`` source, as
-            ``_auto_source_mode`` decided it. Read only for an ``Auto``
-            source. Keyword-only, so it cannot be confused with the source.
-
-    Returns:
-        One plain sentence, within ``PROFILE_DESCRIPTION_MAX_LENGTH``.
+    Like ``_profile_label``, every string is a developer-authored constant
+    derived from the ``SourceKind``; the SANE source name is never
+    interpolated.  An ``Auto`` source's sentence follows ``auto_source_mode``,
+    because what it does depends on how it is routed.
 
     Raises:
-        AssertionError: If the classifier returns a value that is not a
-            SourceKind member.
+        AssertionError: The classifier returned a non-``SourceKind`` value.
 
     """
     kind = classify_source(source)
@@ -664,11 +461,9 @@ def _profile_description(
     return description
 
 
-# The human text of the ``default`` generated for a device with no ``source``
-# option. There is no source to describe, so neither phrase names an input; the
-# description says why the operator sees no other profile to choose from. It
-# also says "one page": with no source to classify, the scan routes as the
-# model default's flatbed, a single page per scan, even on a sheet-fed device.
+# For a device with no ``source`` option.  It says "one page" because with no
+# source to classify, the scan routes as the model default's flatbed, even on a
+# sheet-fed device.
 _NO_SOURCE_LABEL: Final = "Standard scan"
 _NO_SOURCE_DESCRIPTION: Final = (
     "Scans one page from the scanner, which offers no choice of where the page "
@@ -686,39 +481,23 @@ def generate_profiles(
     Creates one profile per scanner source, plus a "default" profile. All
     generated profiles have auto_generated=True.
 
-    The "default" profile is always emitted, and that is not a preference:
-    ``Settings.validate_default_profile`` makes the key mandatory, so a
-    generated set without it is written to disk and then refused by saneless
-    on the next load, with ``auto-profiles`` reporting success and exiting 0
-    over an unusable installation. A flatbed backs it when the device has one;
-    on a sheet-fed scanner the device's own first reported source does, which
-    is the only honest candidate available. The default is then a copy of the
-    profile generated for that source, so the two compare equal as whole
-    models. A device that reports no source at all -- it has no SANE
-    ``source`` option -- gets a ``default`` that names no source: the backend
-    assigns none to such a device and routes by the model default's source, so
-    the profile scans from wherever the scanner feeds.
+    The "default" profile is always emitted, because
+    ``Settings.validate_default_profile`` refuses a config without it.  It is
+    a copy of the profile for the device's flatbed, else its first reported
+    source, so the two compare equal as whole models; a device with no SANE
+    ``source`` option gets a ``default`` that names no source.
 
     Labels are unique within the set: a source whose label another source
     already holds gets an ordinal, so "Feeder, single-sided" is followed by
-    "Feeder, single-sided 2".
-
-    Every question this function asks about a source name is answered by
-    ``classify_source``. It previously carried three rules of its own -- an
-    equality test for "auto" and two ``"flatbed" in s.lower()`` substring tests
-    -- which disagreed with the classifier at the edges: stray whitespace
-    defeated the equality test, and the substring test called "Flatbed Duplex" a
-    flatbed, making a duplex feeder back the default profile.
+    "Feeder, single-sided 2".  Every question about a source name is answered
+    by ``classify_source`` and by no rule of this function's own.
 
     Args:
         capabilities: Scanner device capabilities with sources,
             resolutions, and modes.
-        device_type: The type string SANE reported for the device, from
-            ``DeviceInfo.device_type``. Read only as extra evidence of a
-            platen, for the ``Auto`` routing decision ``_auto_source_mode``
-            makes. Defaults to empty, which reproduces the behaviour of every
-            caller that predates it: a device declaring no type is judged on
-            its source names alone.
+        device_type: The type string SANE reported for the device, read only
+            as extra evidence of a platen.  Empty means the device is judged
+            on its source names alone.
 
     Returns:
         Dictionary mapping profile slug names to ProfileConfig instances.
@@ -731,18 +510,12 @@ def generate_profiles(
         resolution_range=capabilities.resolution_range,
     )
     mode = pick_preferred_mode(capabilities.modes)
-    # Two independent witnesses to one fact, OR-ed rather than ranked: a named
-    # Flatbed source, or a declared device type that has a glass. Either alone
-    # is enough, because each covers the other's blind spot -- a backend can
-    # name a Flatbed source while declaring a type saneless does not know, and
-    # hpaio declares "all-in-one" while naming no Flatbed source at all. Only a
-    # device that offers neither witness is treated as sheet-fed.
+    # Either witness alone is enough: hpaio declares "all-in-one" while naming
+    # no Flatbed source, and a backend can name one while declaring an unknown
+    # type.
     has_platen = any(
         classify_source(s) is SourceKind.FLATBED for s in capabilities.sources
     ) or _declares_platen(device_type)
-    # A flatbed backs the default when the device has one; otherwise its first
-    # reported source does. The fallback is what keeps a sheet-fed scanner from
-    # producing a config that Settings refuses to load (see the docstring).
     # Decided before the loop so that the slug it occupies can be reserved.
     flatbed_sources = [
         s for s in capabilities.sources if classify_source(s) is SourceKind.FLATBED
@@ -751,26 +524,16 @@ def generate_profiles(
         iter(capabilities.sources), None
     )
 
-    # "default" is claimed up front because the default profile is assigned
-    # after the loop with a bare ``profiles["default"] = ...``: a source whose
-    # name slugs to "default" would otherwise claim the slug, be written, and
-    # then be silently overwritten by that assignment -- N sources in, N-1
-    # represented, which is the exact loss _claim_slug exists to prevent.
-    # Reserving it sends such a source to "default-2" and makes the collision
-    # WARNING name both.
+    # Reserved up front: a source that slugs to "default" would otherwise be
+    # silently overwritten by the assignment after the loop.  It goes to
+    # "default-2" instead.
     claimed: dict[str, str] = {}
     if default_source is not None:
         claimed["default"] = default_source
 
-    # How many profiles so far carry each base label. The first holder of a
-    # label keeps it and the n-th reads "<label> n", so no two options in the
-    # dropdown share a name -- brother4 reports two feeders that name no side,
-    # epson2 two sources the classifier does not recognise. The ordinal is an
-    # int appended to a constant, so no text from the source name gets in.
-    # The walk follows ``capabilities.sources`` order, like the slug tie-break,
-    # so the numbering follows the device's own ordering. Only the label
-    # takes the ordinal: the description stays the base sentence, which is
-    # true of every holder, and it is the dropdown text that must differ.
+    # The n-th holder of a base label reads "<label> n", so no two dropdown
+    # options share a name (brother4 reports two feeders that name no side).
+    # Only the label takes the ordinal; the description is true of every holder.
     holders: dict[str, int] = {}
     default_slug: str | None = None
     for source in capabilities.sources:
@@ -793,11 +556,8 @@ def generate_profiles(
         )
 
     if default_slug is None:
-        # No source to copy: the device offers no choice of input. ``source``
-        # is left unset on purpose. The backend assigns nothing to a device
-        # without the option and routes by the model default's classification,
-        # and a table that names no source says so, where "Flatbed" would claim
-        # a platen the scanner never reported.
+        # ``source`` is left unset on purpose: "Flatbed" would claim a platen
+        # the scanner never reported.
         profiles["default"] = ProfileConfig(
             resolution=resolution,
             mode=mode,
@@ -806,15 +566,9 @@ def generate_profiles(
             description=_NO_SOURCE_DESCRIPTION,
         )
     else:
-        # A copy of the profile it duplicates rather than a second build from
-        # the same inputs, so every field agrees by construction: an Auto
-        # source on a platen-less device keeps the stack routing of the profile
-        # it was copied from, the duplex strategy is the same, and the human
-        # text -- ordinal included, which the source name alone cannot
-        # reproduce -- reads the way that profile reads. A fresh default is
-        # therefore equal to its backing profile as a whole model, which is
-        # what lets the scan page recognise it as a twin. Deep, so that no
-        # mutable field is shared between the two entries.
+        # A copy, not a second build, so every field agrees by construction,
+        # ordinal included; the scan page relies on the two comparing equal.
+        # Deep, so that no mutable field is shared between the two entries.
         profiles["default"] = profiles[default_slug].model_copy(deep=True)
 
     return profiles
@@ -829,25 +583,10 @@ def _is_auto_generated(table: object) -> bool:
     """
     Report whether a parsed profile table carries a truthy auto_generated flag.
 
-    The parsed profiles section holds values typed ``object``, so the flag is
-    read behind an isinstance narrowing rather than an annotation the type
-    checkers cannot verify. Anything that is not a mapping -- a stray scalar
-    under ``[profiles]`` -- answers False and is therefore never pruned.
-
-    The flag is read with the same pydantic ``bool`` the loader uses
-    (``ProfileConfig.auto_generated``), not Python truthiness: the loader reads
-    ``auto_generated = "false"`` (or ``"no"``, ``"off"``, ``"0"``) as False, so
-    the writer must call that profile hand-written too, or it would refresh or
-    prune a profile the loader says the operator owns. A value the
-    loader would reject is not the tool's either.
-
-    Args:
-        table: A value from the parsed ``[profiles]`` section.
-
-    Returns:
-        True only for a mapping whose ``auto_generated`` value validates as
-        True.
-
+    Read with the loader's pydantic ``bool``, not Python truthiness: the
+    loader reads ``auto_generated = "false"`` as False, and the writer must
+    not refresh or prune a profile the loader says the operator owns.  A
+    non-mapping, or a value the loader would reject, answers False.
     """
     if not isinstance(table, Mapping):
         return False
@@ -858,33 +597,15 @@ def _is_auto_generated(table: object) -> bool:
 
 
 # Profile names the orphan prune must never remove, however they are flagged.
-#
-# ``default`` is required by ``Settings.validate_default_profile``, so pruning
-# it leaves behind a config saneless itself refuses to load. There is no way
-# back from that inside the tool: every command loads and validates settings
-# before it runs (only ``--help`` skips that), so not even ``auto-profiles``
-# could regenerate the key it just deleted, and the user has to hand-edit
-# TOML. A previous run stamps every profile it writes with
-# ``auto_generated = true``, ``default`` included, so without this guard a
-# single run against a scanner with no flatbed -- an ordinary sheet-fed
-# document scanner -- destroys a working installation.
+# Pruning ``default`` leaves a config saneless refuses to load, and every
+# command, ``auto-profiles`` included, validates settings before it runs.
 _UNPRUNABLE = frozenset({"default"})
 
 
-# The keys a generation writes, and so the keys the tool owns in a profile that
-# carries ``auto_generated = true``. ``--force`` overwrites exactly these on the
-# existing table and deletes any of them the fresh generation omits; every
-# other key -- default_tags, title, thresholds -- is the user's. A hand edit to
-# an owned key is overwritten while the flag is set: to keep it, remove
-# ``auto_generated`` and the profile is never touched again.
-#
-# ``label`` and ``description`` come first because this tuple is the file key
-# order for a newly written table: a human opening the config should read the
-# profile's human name before the SANE source string it was derived from.
-# They are ordinary owned keys -- ``--force`` overwrites them exactly as
-# it overwrites ``source``, ``mode`` and ``resolution``, with no special case
-# for free text. They are the first free-text keys the tool owns, so the how-to
-# spells that out in plain words next to the escape hatch.
+# The keys the tool owns in a profile flagged ``auto_generated = true``:
+# ``--force`` overwrites these and deletes any the fresh generation omits; every
+# other key is the user's.  The order is the key order of a newly written
+# table, so a human reads the profile's name before its SANE source.
 _OWNED_KEYS: Final = (
     "label",
     "description",
@@ -903,9 +624,8 @@ _NOT_GENERATED_REASON: Final = (
     "rename or delete it to regenerate"
 )
 
-# The same skip, for ``default``. It cannot be renamed or deleted like any other
-# profile -- saneless requires it -- so the generic advice is wrong for it; the
-# flag is the one way to hand it back to the tool.
+# ``default`` cannot be renamed or deleted, so the flag is the one way to hand
+# it back to the tool.
 _DEFAULT_NOT_GENERATED_REASON: Final = (
     "add auto_generated = true to its table to let auto-profiles --force refresh it"
 )
@@ -1038,35 +758,23 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
 
     """
     values: dict[str, str | int | bool] = {
-        # Deliberately unconditional, unlike auto_source_mode and duplex below,
-        # which are written only when they differ from the model default. That
-        # is what makes the prune rule -- an owned key a fresh generation does
-        # not write is deleted from the table -- unreachable for these two, so a
-        # free-text field a human reads can never be silently pruned by a
-        # refresh. Copied from the model rather than derived from the source:
-        # a label's ordinal depends on the whole source set, which the source
-        # name alone cannot reproduce, so re-deriving here would write two
-        # feeders of a pair under one name. A refresh still corrects a table
-        # whose stored text no longer matches its source, because the profiles
-        # passed in come from a fresh generation.
+        # Unconditional, so the prune of omitted owned keys never reaches
+        # free text.  Copied from the model, not re-derived from the source: a
+        # label's ordinal depends on the whole source set.
         "label": profile.label,
         "description": profile.description,
     }
-    # Only a source the profile was given. A no-source device's default
-    # carries none, so its table names none, and a --force refresh deletes a
-    # stale one, as it does any owned key the generation omits.
+    # A no-source device's default carries none, and a --force refresh deletes
+    # a stale one.
     if "source" in profile.model_fields_set:
         values["source"] = profile.source
     values["resolution"] = profile.resolution
     values["mode"] = profile.mode
     if profile.auto_source_mode != "flatbed":
         values["auto_source_mode"] = profile.auto_source_mode
-    # Written only when non-default, like auto_source_mode. In a generated set
-    # that means "hardware" on a FEEDER_DUPLEX source; see _duplex for what
-    # reads it. Omitting "none" cannot let the loader's legacy
-    # translation turn a profile manual on reload: a "none" source classified
-    # as something other than FEEDER_DUPLEX, so its name does not contain
-    # "duplex".
+    # Omitting "none" cannot let the loader's legacy translation turn a profile
+    # manual on reload: a "none" source is not FEEDER_DUPLEX, so its name does
+    # not contain "duplex".
     if profile.duplex != "none":
         values["duplex"] = profile.duplex
     values["auto_generated"] = True
@@ -1096,9 +804,8 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
     """
     if not config_path.exists():
         return tomlkit.document(), ""
-    # Bytes decoded as UTF-8 here. Path's text-mode reader uses the locale
-    # encoding and translates CRLF to LF, silently re-encoding the file and
-    # rewriting its line endings on the way back out.
+    # Path's text-mode reader uses the locale encoding and translates CRLF to
+    # LF, silently rewriting the file on the way back out.
     try:
         text = config_path.read_bytes().decode("utf-8")
     except UnicodeDecodeError:
@@ -1107,14 +814,10 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
     try:
         document = tomlkit.parse(text)
     except TOMLKitError as exc:
-        # Every tomlkit error, not only ParseError: a table redefined under a
-        # dotted header raises KeyAlreadyPresent, which is not one.
-        # tomlkit's str() is a fixed message plus, for a ParseError, the
-        # position. The document text it can quote is one unexpected
-        # character, or a duplicated key's name -- never a value, so the
-        # chain cannot carry the token. The
-        # position is rendered once, in saneless's own words, and only when
-        # tomlkit has one.
+        # Every tomlkit error: a table redefined under a dotted header raises
+        # KeyAlreadyPresent, which is not a ParseError.  The document text
+        # tomlkit can quote is one unexpected character or a duplicated key's
+        # name, never a value, so the chain cannot carry the token.
         reason = describe(exc)
         where = ""
         if isinstance(exc, ParseError):
@@ -1138,13 +841,6 @@ def _comparable(value: object) -> object:
     the CRLF, so a CRLF config holding one would never compare equal; the
     loader sees LF either way, so the meaning is the same. NaN is mapped to a
     sentinel because it is unequal to itself.
-
-    Args:
-        value: Data from ``tomllib.loads`` or ``TOMLDocument.unwrap``.
-
-    Returns:
-        The same data with those two differences removed.
-
     """
     if isinstance(value, str):
         return value.replace("\r\n", "\n")
@@ -1168,14 +864,6 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
     and then fail to load. The dumped text is therefore re-parsed and
     compared with the merged document's data.
 
-    Args:
-        config_path: The config file, for the error message.
-        doc: The merged document.
-        original_text: The text the document was parsed from.
-
-    Returns:
-        The text to write.
-
     Raises:
         ConfigError: The dumped text is not valid TOML, or it parses to data
             other than the merged document; nothing was written.
@@ -1184,21 +872,15 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
     new_text = tomlkit.dumps(doc)
     crlf_count = original_text.count("\r\n")
     if crlf_count and crlf_count == original_text.count("\n"):
-        # tomlkit keeps the CRLF of the lines it parsed but ends the lines it
-        # adds with a bare LF; normalise those so the file stays CRLF.
-        # Only when EVERY line ending in the original is CRLF: a file that
-        # mixes endings, or holds a bare LF inside a multi-line string, is
-        # left as tomlkit wrote it, so no LF the user wrote becomes CRLF and
-        # no string value changes.
+        # tomlkit ends the lines it adds with a bare LF.  Only an all-CRLF
+        # file is normalised, so no LF the user wrote, such as one inside a
+        # multi-line string, becomes CRLF.
         new_text = re.sub(r"(?<!\r)\n", "\r\n", new_text)
     try:
         reparsed: object = _comparable(tomllib.loads(new_text))
     except tomllib.TOMLDecodeError:
         reparsed = None
     if reparsed is None or reparsed != _comparable(doc.unwrap()):
-        # The guard: whatever shape the operator's file has, and whatever
-        # tomlkit makes of it, text that does not parse -- or that parses to
-        # something other than the merge -- never replaces a working config.
         msg = (
             f"Cannot update {config_path}: the merged profiles do not "
             "round-trip through TOML; refusing to rewrite it, so the file is "
@@ -1220,14 +902,6 @@ def _same_value(stored: object, generated: object) -> bool:
     Type and value are both compared, so ``300.0`` against ``300`` and ``1``
     against ``True`` are changes, though Python calls each pair equal: a
     refresh must replace such a value with the generation's own.
-
-    Args:
-        stored: The value from the parsed table, a tomlkit item or plain data.
-        generated: The value ``_generated_values`` would write.
-
-    Returns:
-        True only when the unwrapped value has the same type and is equal.
-
     """
     value = stored.unwrap() if isinstance(stored, Item) else stored
     return type(value) is type(generated) and value == generated
@@ -1274,13 +948,9 @@ def _merge_profile(
         return "skipped_not_generated"
     if not force:
         return "skipped_existing"
-    # Keys are set on the EXISTING table -- never a fresh table assigned over
-    # it, which would drop default_tags, title and the comments. An owned key
-    # this generation omits is deleted, so a stale ``duplex = "hardware"`` does
-    # not outlive the source that produced it.
+    # Keys are set on the existing table, never a fresh table assigned over
+    # it, which would drop default_tags, title and the comments.
     owned = cast("MutableMapping[str, object]", existing)
-    # Compared first, so a table that already reads as the generation is left
-    # as it is and not reported refreshed. A key on one side only is a change.
     if all(
         (key in owned) == (key in values)
         and (key not in values or _same_value(owned[key], values[key]))
@@ -1299,9 +969,9 @@ def _pin_device(doc: TOMLDocument, config_path: Path, device: str) -> str | None
     """
     Write ``device`` into the document's ``[scanner] device`` when it is unset.
 
-    Unset means absent or ``""``.  Any other value was put there by the
-    operator: ``[scanner] device`` carries no ``auto_generated`` marker, so it
-    is never the tool's to change, and ``force`` has no say over it.
+    Unset means absent or ``""``.  ``[scanner] device`` carries no
+    ``auto_generated`` marker, so a set value is never the tool's to change,
+    ``force`` included.
 
     Args:
         doc: The parsed config document, changed in place.
@@ -1329,8 +999,6 @@ def _pin_device(doc: TOMLDocument, config_path: Path, device: str) -> str | None
         doc.add("scanner", tomlkit.table())
     section = doc["scanner"]
     if not isinstance(section, MutableMapping):
-        # The same refusal as a scalar ``profiles``: a value this function
-        # cannot read as a table is not one it may replace with a table.
         msg = f"[scanner] in {config_path} is not a table; refusing to overwrite it"
         raise ConfigError(msg)
     scanner = cast("MutableMapping[str, object]", section)
@@ -1364,39 +1032,27 @@ def write_profiles_to_config(
       owned key already matches in type and value, when the table is left
       alone and counted as unchanged rather than refreshed.
 
-    Auto-generated profiles that the freshly generated set no longer names are
-    pruned first, so renaming does not strand the profiles it replaced. The
-    prune runs whether or not ``force`` is passed, and that is deliberate:
-    ``force`` governs refreshing profiles that are *present* in the generated
-    set, while an orphan is by definition absent from it, so ``force`` has
-    nothing to say about it.
-
-    ``default`` is never pruned either, whatever it is flagged with: it is not
-    an ordinary profile but a schema requirement (``_UNPRUNABLE``), and a
-    config missing it is one saneless refuses to load.
+    Auto-generated profiles the fresh set no longer names are pruned first,
+    whether or not ``force`` is passed: ``force`` governs profiles present in
+    the set, and an orphan is absent from it.  ``default`` is never pruned
+    (``_UNPRUNABLE``).
 
     ``device``, when given, is written into ``[scanner] device`` if the file
     leaves that key absent or empty, so later scans go to the scanner this run
-    used rather than to whichever one SANE happens to list first.  A set value
-    is never overwritten, ``force`` included: the key has no
-    ``auto_generated`` marker, so it is not tool-owned.
+    used.  A set value is never overwritten, ``force`` included.
 
-    The rewrite is durable: the file is read as UTF-8 bytes, CRLF line endings
-    are kept, the new text is re-parsed and must mean exactly the merged
-    document before anything is replaced, and ``replace_file_atomically`` swaps
-    it in through any symlink.
-    A merge that changes nothing does not rewrite the file.
+    The new text is re-parsed and must mean exactly the merged document
+    before ``replace_file_atomically`` swaps it in, CRLF line endings kept.  A
+    merge that changes nothing does not rewrite the file.
 
     Args:
         config_path: Path to the TOML config file.
         profiles: Dictionary of profile name to ProfileConfig.
         force: If True, refresh the owned keys of flagged profiles.
         device: The device id discovery chose, to pin when the file has none;
-            None to leave ``[scanner]`` untouched.  Only ``auto-profiles``
-            passes one, and only when no device was configured.  The worker's
-            startup generation passes none on purpose: a service start must
-            not silently pin whichever scanner answered first, so pinning is
-            left to the operator, by that command or by hand.
+            None to leave ``[scanner]`` untouched.  The worker's startup
+            generation passes none on purpose: a service start must not
+            silently pin whichever scanner answered first.
 
     Returns:
         What was added, refreshed, skipped, removed and pinned, with ``path``
@@ -1422,24 +1078,17 @@ def write_profiles_to_config(
     if "profiles" not in doc:
         doc.add("profiles", tomlkit.table(is_super_table=True))
 
-    # ``cast`` is a promise to the type checker, not a check. A config whose
-    # ``profiles`` key is a scalar -- ``profiles = "oops"`` -- reaches
-    # ``.items()`` on a tomlkit String and ends ``auto-profiles`` in a raw
-    # AttributeError traceback. So the container is checked here, as
-    # ``_is_auto_generated`` checks each entry, and a non-table is refused
-    # as a configuration error.
+    # ``cast`` is not a check: ``profiles = "oops"`` would reach ``.items()``
+    # on a tomlkit String and end in a raw AttributeError traceback.
     section = doc["profiles"]
     if not isinstance(section, Mapping):
         msg = f"[profiles] in {config_path} is not a table; refusing to overwrite it"
         raise ConfigError(msg)
     profiles_section = cast("dict[str, object]", section)
 
-    # Generation always emits ``default``, so "only default was generated" is
-    # the signal that the scanner reported no sources, and then nothing can be
-    # judged orphaned: the device said nothing about where pages come from,
-    # so a flagged profile is not absent, merely unasked about. A guard on an
-    # empty set would never fire, and the prune would delete every flagged
-    # profile together with the operator's own keys on it.
+    # Generation always emits ``default``, so "only default was generated"
+    # means the scanner reported no sources, and then nothing can be judged
+    # orphaned.  A guard on an empty set would never fire.
     orphans = (
         []
         if set(profiles) <= _UNPRUNABLE
@@ -1475,20 +1124,14 @@ def write_profiles_to_config(
     )
     new_text = _render_checked(config_path, doc, original_text) if changed else ""
     if not changed or new_text == original_text:
-        # Nothing changed, so nothing is replaced -- and a legacy single-file
-        # mount gets no EBUSY error for a run that had nothing to write. The
-        # text comparison backs up the outcome bookkeeping: identical bytes
-        # are never swapped in, so the file keeps its inode, and with it any
-        # ACL or ownership set on it by hand.
+        # Identical bytes are never swapped in, so a single-file mount gets no
+        # EBUSY and the file keeps its inode, ACL and ownership.
         target = config_path.resolve()
     else:
         target = replace_file_atomically(config_path, new_text)
         if config_path.is_symlink():
-            # The operator edits the link, the write lands on the target;
-            # naming both explains which file changed. Asked of the path
-            # itself: a regular file reached through a linked directory is
-            # the file written, and calling it a symlink would send the
-            # operator looking for a link that does not exist.
+            # Asked of the path itself: a regular file reached through a
+            # linked directory is not a symlink.
             logger.info("Wrote profiles to %s (symlink to %s)", config_path, target)
         if pinned is not None:
             # Logged once the file holds it; %r because the id is untrusted.
