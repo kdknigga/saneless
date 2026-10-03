@@ -1,17 +1,9 @@
 """
-CheckCache unit tests.
+The strip's cache keeps one aging entry and a floor under manual refreshes.
 
-``CheckCache`` takes its clock as a constructor parameter, as
-``MetadataCache`` does, so every assertion about the TTL here advances a float
-instead of waiting for real seconds to pass.
-
-Nothing in this file sleeps, and nothing in it ever may: a suite that waits on
-the wall clock to observe a timeout is both slow and flaky, and making that
-unnecessary is the whole reason the clock is injectable.  A grep for the
-sleeping call therefore finds no hit here, which is how the phase-wide "the
-count must not rise" gate stays checkable by grep.
-
-Covers requirements: APPL-02.
+``CheckCache`` takes its clock as a constructor parameter, so every TTL and
+interval assertion advances a float instead of waiting for real seconds to
+pass, and nothing in this file sleeps.
 """
 
 from __future__ import annotations
@@ -52,7 +44,7 @@ def _results(message: str = "All good.") -> tuple[CheckResult, ...]:
 
 
 def test_cold_cache_has_no_results() -> None:
-    """A cache nothing has stored into reports no results at all (D-06)."""
+    """A cache nothing has stored into reports no results at all."""
     cache = CheckCache(clock=_FakeClock())
     entry = cache.current()
     assert entry.results is None
@@ -67,7 +59,7 @@ def test_cold_cache_is_not_fresh() -> None:
 
 
 def test_stored_results_are_fresh_inside_the_ttl() -> None:
-    """Results stored at 100.0 are still fresh at 129.9 with a 30 s TTL (D-03)."""
+    """Results stored at 100.0 are still fresh at 129.9 with a 30 s TTL."""
     clock = _FakeClock(start=100.0)
     cache = CheckCache(clock=clock)
     stored = _results()
@@ -80,7 +72,7 @@ def test_stored_results_are_fresh_inside_the_ttl() -> None:
 
 
 def test_expired_entry_returns_the_same_results_marked_stale() -> None:
-    """After the TTL the previous results are still returned, flagged stale (D-08)."""
+    """After the TTL the previous results are still returned, flagged stale."""
     clock = _FakeClock(start=100.0)
     cache = CheckCache(clock=clock)
     stored = _results()
@@ -104,7 +96,7 @@ def test_expired_entry_reports_its_age() -> None:
 
 
 def test_stale_entry_is_never_discarded() -> None:
-    """Long past the TTL the last-known-good entry is still readable (Pitfall 6)."""
+    """Long past the TTL the last-known-good entry is still readable."""
     clock = _FakeClock(start=100.0)
     cache = CheckCache(clock=clock)
     stored = _results("Scanner is ready.")
@@ -131,7 +123,7 @@ def test_store_records_an_aware_wall_clock_stamp() -> None:
 
 
 def test_default_ttl_is_thirty_seconds() -> None:
-    """The default TTL is D-03's 30 seconds, not ``MetadataCache``'s 60."""
+    """The default TTL is 30 seconds, not ``MetadataCache``'s 60."""
     clock = _FakeClock(start=100.0)
     cache = CheckCache(clock=clock)
     cache.store(_results())
@@ -203,7 +195,7 @@ def test_concurrent_stores_leave_a_consistent_entry() -> None:
 
 
 class TestClaimManualRefresh:
-    """WR-05: a floor under the Refresh button's deliberate TTL bypass."""
+    """A floor sits under the Refresh button's deliberate TTL bypass."""
 
     def test_the_first_claim_on_a_cold_appliance_is_granted(self) -> None:
         """The first click after a boot must work, or the floor is a wall."""
@@ -215,7 +207,7 @@ class TestClaimManualRefresh:
         The grant is identified, so its holder can give back that grant and no other.
 
         The stamp is the clock reading the claim recorded, which is what
-        :meth:`release_manual_claim` compares against (R3-IN-03).
+        :meth:`release_manual_claim` compares against.
         """
         clock = _FakeClock(start=100.0)
         cache = CheckCache(clock=clock)
@@ -252,7 +244,7 @@ class TestClaimManualRefresh:
         assert cache.claim_manual_refresh() is not None
 
     def test_the_default_interval_is_two_seconds(self) -> None:
-        """2.0 s is below a human's click rate and above a loop's (WR-05)."""
+        """The default floor is 2.0 s, below a human's click rate, above a loop's."""
         clock = _FakeClock(start=100.0)
         cache = CheckCache(clock=clock)
         assert cache.claim_manual_refresh() is not None
@@ -328,9 +320,8 @@ class TestClaimManualRefresh:
 
         The clock double claims once from inside the first claim's own clock
         read, so the overlap is a fact of the call stack rather than of
-        scheduling luck -- the idiom plan 30-25 used for the probe lock.  It
-        also pins that the clock is read *outside* the lock: a claim that read
-        it inside would deadlock here rather than fail.
+        scheduling luck.  It also pins that the clock is read *outside* the
+        lock: a claim that read it inside would deadlock here rather than fail.
         """
         clock = _FakeClock(start=100.0)
         cache = CheckCache(clock=clock)
@@ -374,12 +365,10 @@ class TestClaimManualRefresh:
 
 class TestReleaseManualClaim:
     """
-    WR-03: a click whose probe collapsed must not spend the floor.
+    A click whose probe collapsed gives back its own claim, and only that.
 
-    R3-IN-03: and it gives back *its own* claim.  The release is a
-    compare-and-clear, so every case below that hands over a stamp which is no
-    longer the recorded one asserts that nothing moved -- the property that
-    used to be a paragraph of reasoning about one call site.
+    The release is a compare-and-clear, so every case below that hands over a
+    stamp other than the recorded one asserts that nothing moved.
     """
 
     def test_a_released_claim_is_granted_again_at_once(self) -> None:
@@ -389,8 +378,8 @@ class TestReleaseManualClaim:
         ``request_probe`` reporting a collapse means another checker owned the
         probe, so this call issued no Paperless request, no saned dial and no
         filesystem write.  Charging it the interval would refuse the very next
-        click for no traffic saved -- which is the second consequence WR-03
-        named, the button appearing to do nothing twice in a row.
+        click for no traffic saved, and the button would appear to do nothing
+        twice in a row.
         """
         clock = _FakeClock(start=100.0)
         cache = CheckCache(clock=clock)
@@ -410,8 +399,8 @@ class TestReleaseManualClaim:
         The clear is idempotent: a doubled release is not a doubled grant.
 
         The second release reports that it cleared nothing, because by then
-        the stamp it carries is no longer recorded -- the same answer a stale
-        stamp gets, reached by the shortest route.
+        the stamp it carries is not the recorded one, the same answer a stale
+        stamp gets.
         """
         clock = _FakeClock(start=100.0)
         cache = CheckCache(clock=clock)
@@ -424,7 +413,7 @@ class TestReleaseManualClaim:
 
     def test_a_release_then_a_grant_leaves_the_new_grants_floor_standing(self) -> None:
         """
-        T-30-29-01: the release gives a claim back, it does not disable the floor.
+        The release gives a claim back; it does not disable the floor.
 
         Grant, release, grant: the second grant stamps like any other, so a
         third call inside the interval is still refused and a scripted loop
@@ -453,20 +442,12 @@ class TestReleaseManualClaim:
 
     def test_a_stale_stamp_does_not_clear_another_callers_claim(self) -> None:
         """
-        R3-IN-03: a release arriving after somebody else's grant is a no-op.
+        A release arriving after somebody else's grant is a no-op.
 
-        The old code cleared unconditionally and defended that with an
-        argument about the one call site: the release follows its grant by
-        microseconds on the same thread, and a competing claimer inside that
-        window is refused without writing.  The argument was sound and it was
-        still an argument -- a second caller, a retry, or a handler that grew
-        a second release would have lowered the 2 s floor under an
-        unauthenticated LAN endpoint.  Here the first caller releases late,
-        after the second caller's grant, and the floor holds: the third claim
-        inside the interval is still refused.
-
-        Against an unconditional clear the release reports True and the third
-        claim is granted, so this case is the mutation detector the plan names.
+        An unconditional clear would let a retry, or a second release, lower
+        the 2 s floor under an unauthenticated LAN endpoint.  Here the first
+        caller releases late, after the second caller's grant, and the floor
+        holds: the release reports False and the third claim is refused.
         """
         clock = _FakeClock(start=100.0)
         cache = CheckCache(clock=clock)
@@ -482,7 +463,7 @@ class TestReleaseManualClaim:
 
     def test_a_thread_refused_inside_the_interval_loses_nothing(self) -> None:
         """
-        The window the old docstring described, exercised by two real threads.
+        A claim refused inside the interval, on another thread, writes nothing.
 
         A holds a grant; B claims inside the interval from a second thread and
         is refused.  :meth:`claim_manual_refresh` promises a refusal writes
@@ -518,8 +499,7 @@ class TestReleaseManualClaim:
         The releasing thread claims, gives its grant back, and then -- after a
         second thread has been granted a claim of its own -- releases the same
         old stamp again, the way a retried or duplicated request would.  The
-        second grant survives it and the floor is still shut, which is the
-        whole of R3-IN-03 stated as an observation rather than as reasoning.
+        second grant survives it and the floor is still shut.
         """
         clock = _FakeClock(start=100.0)
         cache = CheckCache(clock=clock)
