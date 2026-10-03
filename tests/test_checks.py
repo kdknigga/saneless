@@ -851,7 +851,7 @@ class TestNumericAddressShorthand:
         """
         assert _saned_hosts(setting) == ()
 
-    def test_a_mistyped_port_no_longer_invents_a_loopback_entry(self) -> None:
+    def test_a_mistyped_port_does_not_invent_a_loopback_entry(self) -> None:
         """
         ``host:0.0`` drops the invented segment rather than dialling it.
 
