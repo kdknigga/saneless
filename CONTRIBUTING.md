@@ -145,9 +145,11 @@ anchor that does not exist fails it. Never add `-q` to that command. Quiet mode 
 the warnings that strict mode counts, so a quiet strict build exits 0 over a dead
 anchor.
 
-Every command must exit 0. Fix what they report -- do not silence them. `# noqa`,
-`# type: ignore` and rule-disabling are not accepted, and both type checkers must be
-clean because they do not always report the same issues for the same code. The
+Every command must exit 0. Fix what they report -- do not silence them. `# noqa` and
+`# type: ignore` are not accepted. A lint rule is relaxed only by an entry under
+`[tool.ruff.lint.per-file-ignores]` in `pyproject.toml` that carries a one-line
+reason, and never by an inline marker. Both type checkers must be clean because they
+do not always report the same issues for the same code. The
 workflows skip nothing either: no hook is skipped with `SKIP=`, and no step carries
 `continue-on-error` or ends in `|| true`. A test in `tests/test_deployment_config.py`
 fails the build on any of them.
@@ -173,9 +175,15 @@ written any other way is left to review.
 Comments and docstrings in `src/`, `scripts/`, `tests/`, the workflows under `.github/`
 and `.dockerignore` state their reasons in words and never cite planning IDs (decision,
 finding or requirement numbers, phase or plan numbers, planning file names), because the
-planning records do not ship with the product. The `no-planning-citations` hook fails a
-commit, merge or push that adds one, and a test in `tests/test_deployment_config.py`
-fails CI. The hook skips one file, `tests/citation_samples.py`, which holds the pattern
+planning records do not ship with the product. For the same reason a comment cites a
+symbol, such as `paperless._without_userinfo`, and never a line number, a file that
+does not ship (the assistant-instructions file or the planning records) or an
+unnumbered reference to an earlier phase of work. The `no-planning-citations` hook
+fails a commit, merge or push that adds a planning ID, a file name followed by a colon
+and a line number, a reference to the assistant-instructions file or an unnumbered
+phase reference, in the shipped sources, the tests, the workflows, `.dockerignore` and
+the decision records under `docs/explanation/decisions/`, and a test in
+`tests/test_deployment_config.py` fails CI. The hook skips one file, `tests/citation_samples.py`, which holds the pattern
 and the sample identifiers the guard's own tests need; a test pins that it stays the
 only exclusion.
 
@@ -213,6 +221,75 @@ was stuck, at the cost of the rest of the run: later tests never run, session fi
 are not torn down, and child processes are left behind. The signal method fails only
 the stuck test, but it interrupts only the main thread and prints only its stack. Add
 the thread flag locally when you are chasing a hang.
+
+## Comments and docstrings
+
+Before writing a comment, ask what mistake it stops the next editor making. An
+invariant, a race or a measured quirk of a library stays next to the line it guards,
+in three sentences or fewer. How the code got here goes in the commit message, or, for
+a choice a later contributor could undo by mistake, in a decision record. A comment
+that restates the code is deleted. A docstring longer than its function is cut down,
+unless the function is a public contract. Numbers the code already holds, such as the
+size of an enum, the number of checks or an exit code, are not spelled out in prose:
+name the enum or the constant instead, so the sentence cannot drift from the code.
+Review enforces this rule; no hook measures it.
+
+Decision records live under `docs/explanation/decisions/` as `NNNN-slug.md`, numbered
+from `0001`. Each is short: Status, Context, Decision, Consequences and a one-line
+list of the alternatives rejected. They are written in the present tense, with dates
+only in Status, and each one is listed in `docs/explanation/decisions/README.md`. They
+ship in the repository but stay out of the site navigation. Code that depends on a
+decision keeps the invariant next to the line and ends that comment with the pointer:
+
+```text
+See docs/explanation/decisions/NNNN-slug.md.
+```
+
+A test in `tests/test_deployment_config.py` fails on a pointer to a record that does
+not exist and on a record the index does not list.
+
+Two conventions that the code used to argue for in its own comments:
+
+- The coordinator seams and the scanner backend are `abc.ABC` classes, not
+  `typing.Protocol`. A `Protocol` describes a shape this project does not own, such as
+  python-sane's device handle or pydantic's settings constructor; an `ABC` defines a
+  seam the project implements itself. Where a seam is called a "protocol" in lower
+  case, the word means contract, not `typing.Protocol`.
+- Code that moves to another module leaves no re-export behind. Every importer and
+  every `monkeypatch` target is updated to the new home, so a stale target fails
+  loudly instead of patching a name nothing reads.
+
+The lint notes below cover rules a contributor meets again and again. Each says what
+the project does about the rule, so the code does not have to explain itself at every
+site.
+
+- `S105` and `S106` (ruff's hard-coded-credential rules) read a string literal
+  assigned to a name, or passed to a keyword, containing "pass", "token", "secret" or
+  "password" as a credential. A scan pass or a message about a missing token is not
+  one. Give the literal a name the rule does not read, as `_REJECTED_WIRE_VALUE` in
+  `vocabulary.py` does, and pass that constant where a keyword such as `pass_label=`
+  takes the value.
+- `PLR0913` caps a function at five parameters, `self` excluded and keyword-only ones
+  included, and `PLR0912` caps its branches. Neither limit is raised. Over the
+  argument limit, values that travel together become one frozen dataclass; over the
+  branch limit, a helper takes the branches it owns. A parameter object is not
+  introduced only to satisfy the count: if the values do not belong together, split
+  the function instead.
+- `S101` bans `assert` in `src/`. Narrow an optional where the value is built, so the
+  callee receives a record whose field is never `None`, or raise an explicit error.
+- `S608` matches `select ... from` anywhere in the literal text of an interpolated
+  string. A query assembled from fragments keeps each verb and nested `SELECT` in a
+  named constant of its own, and every value is a bound parameter.
+- `S603` accepts a subprocess argv only when it is written out as a literal at the
+  call. Variable parts reach the child through its environment, not through the argv.
+- `PTH105` forbids `os.replace`. Rename with `Path.replace`, which is the same atomic,
+  overwriting `rename(2)`.
+- `B008` rejects a call in a default argument, including FastAPI's `Query(...)` and
+  `Form(...)`. Build the default once as a module-level constant and use that.
+- `B027` flags an empty, non-abstract method on an `ABC` as a probable unfinished
+  override. A deliberate no-op default gets a real body, such as a DEBUG log line.
+- `E501` is off. The formatter keeps code at 88 columns, and a user-facing sentence
+  that a test pins word for word stays one literal on one line, so a search finds it.
 
 ## Local pre-flight
 
