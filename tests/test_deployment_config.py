@@ -15,11 +15,14 @@ nobody copies, and ``packaging`` decides what a version or a range means.
 
 from __future__ import annotations
 
+import ast
+import io
 import logging
 import os
 import re
 import subprocess
 import sys
+import tokenize
 
 # One of the two parsing imports this module's plain-text rule allows. It
 # serves the floor-to-lock guard at the foot of the file, where the reason is
@@ -7290,28 +7293,182 @@ def test_the_anchor_validation_reader_reports_anything_but_warn(text: str) -> No
 # The repository-wide sweep for the legacy config file name
 # ---------------------------------------------------------------------------
 
-# The lines allowed to name the superseded config filename without also naming
-# the current one. Each entry is an exact ``(repo-relative path, stripped
-# line)`` pair, so widening the exception to a neighbouring line, or letting it
-# drift to another file, fails the guard rather than passing quietly. Every
-# entry carries the reason it is here.
+# The passages allowed to name the superseded config filename without also
+# naming the current one. Each entry is an exact ``(repo-relative path,
+# passage)`` pair, so widening the exception to a neighbouring passage, or
+# letting it drift to another file, fails the guard rather than passing
+# quietly. Every entry carries the reason it is here.
 #
-# The line texts are assembled from ``LEGACY_CONFIG_NAME`` for the reason given
+# The texts are assembled from ``LEGACY_CONFIG_NAME`` for the reason given
 # where that constant is defined: the guard below scans this file too, and a
 # literal here would make it report its own allowlist.
-_LEGACY_NAME_ALLOWED_LINES: frozenset[tuple[str, str]] = frozenset(
+_LEGACY_NAME_ALLOWED: frozenset[tuple[str, str]] = frozenset(
     {
         # The one place the superseded name is spelled in shipped source.
         # Detection needs the literal -- without it nothing could name a
         # leftover file -- and the constant exists precisely so that this is
-        # the only line which has to carry it. Detecting the old name is not
+        # the only string which has to carry it. Detecting the old name is not
         # supporting it: the file is stat-ed and never opened.
-        (
-            "src/saneless/config.py",
-            f'LEGACY_CONFIG_FILENAME: Final = "{LEGACY_CONFIG_NAME}"',
-        ),
+        ("src/saneless/config.py", LEGACY_CONFIG_NAME),
     }
 )
+
+# A Markdown table row, which is a passage of its own: the rows of one table
+# say unrelated things, so one row naming the current file excuses no other.
+_TABLE_ROW = re.compile(r"^\s*\|")
+
+# A rename or move pointed the wrong way: from the current name to the old.
+_RENAME_TO_LEGACY = re.compile(
+    r"\b(?:rename\w*|mv|move\w*)\b[^.]*?"
+    + re.escape(CONFIG_NAME)
+    + r"[^.]*?"
+    + re.escape(LEGACY_CONFIG_NAME),
+    re.IGNORECASE,
+)
+
+
+def _text_passages(text: str, first_line: int = 1) -> list[tuple[int, str]]:
+    """
+    Split prose into passages: paragraphs, with each table row on its own.
+
+    A paragraph is a run of non-blank lines, joined with single spaces, so
+    where a line breaks inside it never changes what it contains.
+
+    Args:
+        text: The prose.
+        first_line: The file line ``text`` starts on, for the report.
+
+    Returns:
+        ``(line, passage)`` for each passage, in order.
+
+    """
+    passages: list[tuple[int, str]] = []
+    current: list[str] = []
+    start = first_line
+    for number, line in enumerate(text.splitlines(), start=first_line):
+        if not line.strip() or _TABLE_ROW.match(line):
+            if current:
+                passages.append((start, " ".join(current)))
+                current = []
+            if line.strip():
+                passages.append((number, line.strip()))
+            continue
+        if not current:
+            start = number
+        current.append(line.strip())
+    if current:
+        passages.append((start, " ".join(current)))
+    return passages
+
+
+def _docstring_nodes(tree: ast.Module) -> list[tuple[ast.Constant, str]]:
+    """Return the module, class and function docstrings, with their text."""
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    found: list[tuple[ast.Constant, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, owners) or not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            found.append((first.value, first.value.value))
+    return found
+
+
+def _comment_passages(text: str) -> list[tuple[int, str]]:
+    """Return each block of comments on consecutive lines as passages."""
+    lines: list[str] = []
+    numbers: list[int] = []
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type == tokenize.COMMENT:
+            numbers.append(token.start[0])
+            lines.append(token.string.lstrip("#").strip())
+    passages: list[tuple[int, str]] = []
+    block: list[str] = []
+    start = previous = 0
+    for number, line in zip(numbers, lines, strict=True):
+        if block and number != previous + 1:
+            passages.extend(_text_passages("\n".join(block), start))
+            block = []
+        if not block:
+            start = number
+        block.append(line)
+        previous = number
+    passages.extend(_text_passages("\n".join(block), start))
+    return passages
+
+
+def _python_passages(text: str) -> list[tuple[int, str]]:
+    """
+    Split Python source into the passages the legacy-name guard judges.
+
+    Docstrings and comment blocks are prose, split into paragraphs. Every
+    other string is a passage of its own -- implicitly concatenated pieces
+    already joined by the parser, and an f-string's literal parts joined --
+    because a string that names a path is what the code would open.
+
+    Returns:
+        ``(line, passage)`` for each passage.
+
+    """
+    tree = ast.parse(text)
+    docstrings = _docstring_nodes(tree)
+    passages: list[tuple[int, str]] = []
+    for node, docstring in docstrings:
+        passages.extend(_text_passages(docstring, node.lineno))
+    skipped = {id(node) for node, _ in docstrings}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr):
+            skipped.update(id(part) for part in node.values)
+            literal = "".join(
+                part.value
+                for part in node.values
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
+            passages.append((node.lineno, literal))
+    passages.extend(
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in skipped
+    )
+    passages.extend(_comment_passages(text))
+    return passages
+
+
+def _passages(name: str, text: str) -> list[tuple[int, str]]:
+    """Return a shipped file's passages, read as Python or as prose."""
+    if name.endswith(".py"):
+        return _python_passages(text)
+    return _text_passages(text)
+
+
+def _legacy_name_offences(name: str, text: str) -> list[str]:
+    """
+    Return ``name:line: passage`` for each passage that names the old file wrongly.
+
+    A passage naming the legacy file must also name the current one, the way
+    every upgrade note is written, and must not tell the reader to rename the
+    current file to the old name. Passages are whole paragraphs, table rows
+    or strings, so the verdict never depends on where a line breaks.
+
+    Returns:
+        One entry per offending passage.
+
+    """
+    offences: list[str] = []
+    for line, passage in _passages(name, text):
+        if LEGACY_CONFIG_NAME not in passage:
+            continue
+        if (name, passage) in _LEGACY_NAME_ALLOWED:
+            continue
+        if CONFIG_NAME not in passage or _RENAME_TO_LEGACY.search(passage):
+            offences.append(f"{name}:{line}: {' '.join(passage.split())[:200]}")
+    return offences
 
 
 def test_no_shipped_file_names_the_legacy_config_file() -> None:
@@ -7320,9 +7477,9 @@ def test_no_shipped_file_names_the_legacy_config_file() -> None:
 
     A half-swept tree is worse than an unswept one: a reader who meets the
     legacy name on one page and the current name on another cannot tell which
-    is stale. A line naming both is a rename instruction, the way the upgrade
-    sections are written, and passes. Anything else is an offender unless it
-    appears verbatim in ``_LEGACY_NAME_ALLOWED_LINES``.
+    is stale. A paragraph, table row or string naming both is a rename note,
+    the way the upgrade sections are written, and passes. Anything else is an
+    offender unless it appears verbatim in ``_LEGACY_NAME_ALLOWED``.
     """
     offenders: list[str] = []
     for name in _shipped_files():
@@ -7336,49 +7493,101 @@ def test_no_shipped_file_names_the_legacy_config_file() -> None:
             continue
         except OSError:
             continue
-        offenders.extend(
-            f"{name}:{number}: {line.strip()}"
-            for number, line in enumerate(text.splitlines(), start=1)
-            if LEGACY_CONFIG_NAME in line
-            if CONFIG_NAME not in line
-            if (name, line.strip()) not in _LEGACY_NAME_ALLOWED_LINES
-        )
+        offenders.extend(_legacy_name_offences(name, text))
     assert not offenders, (
         f"a shipped file still names {LEGACY_CONFIG_NAME} as a saneless "
         f"config path. saneless reads {CONFIG_NAME} in every searched "
         "location and never reads the old name, so a page that still spells "
         "it sends its reader to create a file that is detected and ignored. "
-        "Either rename the path, or name both files on the line so it reads "
-        "as the rename it is:\n" + "\n".join(offenders)
+        "Either rename the path, or name both files in the same paragraph so "
+        "it reads as the rename it is:\n" + "\n".join(offenders)
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "offending"),
+    [
+        (
+            "seeded.md",
+            f"Put your settings in `{LEGACY_CONFIG_NAME}`.\n\n"
+            f"saneless reads `{CONFIG_NAME}`.\n",
+            True,
+        ),
+        (
+            "seeded.md",
+            f"| a | `{CONFIG_NAME}` |\n| b | `{LEGACY_CONFIG_NAME}` |\n",
+            True,
+        ),
+        (
+            "seeded.md",
+            f"Rename `{CONFIG_NAME}`\nto `{LEGACY_CONFIG_NAME}`.\n",
+            True,
+        ),
+        ("seeded.py", f'PATH = "{LEGACY_CONFIG_NAME}"\n', True),
+        ("seeded.py", f'PATH = f"/etc/{{d}}/{LEGACY_CONFIG_NAME}"\n', True),
+        (
+            "seeded.md",
+            f"An old `{LEGACY_CONFIG_NAME}`\nis ignored; rename it to\n"
+            f"`{CONFIG_NAME}`.\n",
+            False,
+        ),
+        (
+            "seeded.py",
+            f'"""\nSummary.\n\nAn unread ``{LEGACY_CONFIG_NAME}``\n'
+            f'beside a ``{CONFIG_NAME}``.\n"""\n',
+            False,
+        ),
+        (
+            "seeded.py",
+            f"# An old {LEGACY_CONFIG_NAME} is detected,\n"
+            f"# and {CONFIG_NAME} is read.\n",
+            False,
+        ),
+    ],
+    ids=[
+        "separate-paragraphs",
+        "separate-table-rows",
+        "rename-the-wrong-way",
+        "bare-literal",
+        "f-string",
+        "wrapped-paragraph",
+        "wrapped-docstring",
+        "wrapped-comment",
+    ],
+)
+def test_the_legacy_name_guard_judges_passages_not_lines(
+    name: str, text: str, *, offending: bool
+) -> None:
+    """The verdict follows the paragraph, row or string, wherever lines break."""
+    assert bool(_legacy_name_offences(name, text)) is offending
 
 
 def test_legacy_name_allowlist_entries_still_exist() -> None:
     """
-    Every allowlisted line is present, verbatim, in the file it names.
+    Every allowlisted passage is present, verbatim, in the file it names.
 
     Without this the allowlist rots into a silent pass: the guard above only
-    ever *subtracts*, so an entry whose line was reworded, moved or deleted
-    goes on excusing something that is not there, and the next line to match
-    its text inherits the exemption without anyone deciding to grant it.
+    ever *subtracts*, so an entry whose passage was reworded, moved or deleted
+    goes on excusing something that is not there, and the next passage to
+    match its text inherits the exemption without anyone deciding to grant it.
     """
     missing: list[str] = []
-    for name, expected in sorted(_LEGACY_NAME_ALLOWED_LINES):
+    for name, expected in sorted(_LEGACY_NAME_ALLOWED):
         try:
             text = (REPO_ROOT / name).read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            missing.append(f"{name}: is not UTF-8, so the line cannot be found")
+            missing.append(f"{name}: is not UTF-8, so the passage cannot be found")
             continue
         except OSError:
             missing.append(f"{name}: cannot be read")
             continue
-        if expected not in [line.strip() for line in text.splitlines()]:
+        if expected not in [passage for _, passage in _passages(name, text)]:
             missing.append(f"{name}: {expected}")
     assert not missing, (
-        "an entry in _LEGACY_NAME_ALLOWED_LINES no longer matches a line in "
-        "the file it exempts, so it excuses nothing while the next line to "
+        "an entry in _LEGACY_NAME_ALLOWED no longer matches a passage in "
+        "the file it exempts, so it excuses nothing while the next passage to "
         "match its text would be exempted by accident. Remove the entry, or "
-        "correct it to the line that is really there:\n" + "\n".join(missing)
+        "correct it to the passage that is really there:\n" + "\n".join(missing)
     )
 
 
