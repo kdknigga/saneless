@@ -243,7 +243,7 @@ Re-runs every check immediately, ignoring the cache, and returns the refreshed s
 
 The checks run on the server's background check thread, never on the request itself, and the request waits at most 2.5 seconds for them. Checks that finish inside that time come back in this response. Slower ones come back as the strip as it stands, which asks for itself again every 2 seconds until the results land, within the same bounds as the `GET /api/checks` self-poll. So the request answers within a few seconds whatever the scanner or paperless-ngx is doing.
 
-A failure inside the strip's own rendering comes back the way it does from [`GET /api/checks`](#get-apichecks): as the cold-start body at `200`, six named rows and the `Check again` button, with no poll attached. A failure in the re-run itself is an ordinary error response, shown in the status area, and the strip is left as it was.
+A failure inside the strip's own rendering comes back the way it does from [`GET /api/checks`](#get-apichecks): as the cold-start body at `200`, six named rows and the `Check again` button, with no poll attached. A failure in the re-run itself is logged and stores nothing, so the response is still `200` and carries the strip as it stood, with any previous results still on it.
 
 During a scan, the checks that would touch the scanner are skipped, and the Scanner row says it is not checked while a scan is running. When another check is holding the scanner briefly, such as the capability read saneless does at start-up, or a scan starts just as the refresh begins, the row says the scanner was busy instead. A skipped row stored during a scan can stay on the strip for up to one refresh interval after the scan finishes; pressing `Check again` replaces it.
 
