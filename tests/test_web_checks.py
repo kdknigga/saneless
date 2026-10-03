@@ -1288,6 +1288,44 @@ class TestTheStripSurvivesItsOwnFailure:
         for forbidden in (_CHECKS_BOOM_MARKER, "Traceback", "RuntimeError", ".py"):
             assert forbidden not in response.text, (forbidden, response.text)
 
+    @pytest.mark.parametrize(
+        ("owner", "target"),
+        [
+            ("refresher", "note_watcher"),
+            ("checks", "claim_manual_refresh"),
+            ("refresher", "request_probe"),
+        ],
+    )
+    def test_a_failure_before_the_refresh_render_is_a_failed_click(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        owner: str,
+        target: str,
+    ) -> None:
+        """
+        A click whose stamp, claim or probe request raises is an error, not a strip.
+
+        Only the render is guarded. A failure in the click's own action
+        reaches the message slot as a server error, so the strip on the page
+        stays as it was rather than being swapped for a cold one that hides
+        the failure.
+        """
+
+        def boom(*_args: object, **_kwargs: object) -> NoReturn:
+            raise RuntimeError(_CHECKS_BOOM_MARKER)
+
+        app = _app(client)
+        monkeypatch.setattr(getattr(app.state, owner), target, boom)
+        browser = TestClient(app, raise_server_exceptions=False)
+
+        response = browser.post("/api/checks/refresh", headers={"HX-Request": "true"})
+
+        assert response.status_code == 500
+        assert response.headers["HX-Retarget"] == "#status-message"
+        assert _CHECK_ROW.findall(response.text) == []
+        assert _CHECKS_BOOM_MARKER not in response.text
+
     @pytest.mark.parametrize("target", ["_checks_context", "note_watcher"])
     def test_a_failure_inside_the_render_is_a_cold_strip_at_200(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch, target: str
