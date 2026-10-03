@@ -2322,7 +2322,7 @@ def test_a_job_waiting_for_the_gate_reads_starting_scan(client: TestClient) -> N
     assert progress_label(JobState.SCANNING) not in area
 
 
-# --- The owner-gated flip prompt (APPL-09, D-24, D-26, D-27) ----------------
+# --- The owner-gated flip prompt -------------------------------------------
 
 # The cookie's wire name, spelled out rather than imported: a test that imported
 # the constant would still pass if the name changed under every browser that
@@ -2338,7 +2338,7 @@ _OWNING_BROWSER = "the-browser-that-submitted-this-stack"
 # the owner's rendering carries an `<img>` that every other browser's lacks.
 _THUMBNAIL = "c3RhbmQtaW4="
 
-# The exact confirmation D-27 locks: one question, one consequence, and no
+# The exact confirmation: one question, one consequence, and no
 # claim about the pages already scanned, which is a promise this contract
 # cannot verify.
 _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
@@ -2352,9 +2352,9 @@ _STATUS_OPEN = re.compile(r'<div id="status-area"[^>]*>', re.DOTALL)
 _SEEN_TOKEN = re.compile(r"seen=[0-9a-f]+")
 _THUMBNAIL_START = '<img src="data:image/jpeg;base64,'
 
-# Any control that would let a second browser seize an answered-for job.  D-26
-# says the absence of one IS the rendering, so it is asserted like any other
-# contract rather than left to a reviewer's memory.
+# Any control that would let a second browser seize an answered-for job.  The
+# absence of one IS the rendering, so it is asserted like any other contract
+# rather than left to memory.
 _SEIZE_CONTROL = re.compile(r"override|take[ -]over|force", re.IGNORECASE)
 
 
@@ -2438,7 +2438,7 @@ class TestOwnerGatedFlipPrompt:
     """
     Who sees the Continue and Abort buttons, and what everyone else sees.
 
-    APPL-09 and D-24: the token gates those two buttons.  The gate is
+    The token gates those two buttons.  The gate is
     server-side -- the buttons are not rendered for a non-owner, never hidden
     with CSS, which would be an ASVS V4 failure.  The same token also gates the
     job's preview, through the job view, while the poll and the Scan button
@@ -2448,7 +2448,7 @@ class TestOwnerGatedFlipPrompt:
     def test_owner_sees_the_flip_prompt_with_both_buttons(
         self, client: TestClient
     ) -> None:
-        """The browser that submitted the stack gets the prompt (APPL-09)."""
+        """The browser that submitted the stack gets the prompt."""
         _flip_job(client, _OWNING_BROWSER)
 
         markup = _as_browser(client, _OWNING_BROWSER)
@@ -2463,7 +2463,7 @@ class TestOwnerGatedFlipPrompt:
         self, client: TestClient
     ) -> None:
         """
-        A second viewer gets the waiting copy and zero controls (D-24).
+        A second viewer gets the waiting copy and zero controls.
 
         Zero controls, not hidden ones: the gate is decided on the server and
         the markup never carries a button the viewer is not allowed to press.
@@ -2521,11 +2521,11 @@ class TestOwnerGatedFlipPrompt:
         self, client: TestClient
     ) -> None:
         """
-        There are exactly two controls and no third one (D-26).
+        There are exactly two controls and no third one.
 
         A human who closed the tab is the same case as a human who walked
-        away, and the bounded Phase 25 flip timeout already resolves both.  The
-        absence of a third control is the decision, so it is asserted.
+        away, and the bounded flip timeout resolves both.  The absence of a
+        third control is the design, so it is asserted.
         """
         _flip_job(client, _OWNING_BROWSER)
 
@@ -2537,7 +2537,7 @@ class TestOwnerGatedFlipPrompt:
     def test_non_owner_flip_rendering_offers_nothing_to_seize_with_either(
         self, client: TestClient
     ) -> None:
-        """The waiting viewer is offered no control of any kind (D-26)."""
+        """The waiting viewer is offered no control of any kind."""
         _flip_job(client, _OWNING_BROWSER)
 
         markup = _as_browser(client, None)
@@ -2550,9 +2550,8 @@ class TestOwnerGatedFlipPrompt:
         """
         The locked copy ends without one, against the usual in-progress style.
 
-        The user wrote this string twice; D-24 treats it as locked copy and
-        this test records the style exception rather than letting a later
-        tidy-up "fix" it.
+        The string is locked copy, so this test records the style exception
+        rather than letting a tidy-up "fix" it.
         """
         _flip_job(client, _OWNING_BROWSER)
 
@@ -2565,7 +2564,7 @@ class TestOwnerGatedFlipPrompt:
     def test_flip_abort_button_carries_the_exact_confirmation(
         self, client: TestClient
     ) -> None:
-        """Abort asks first, in D-27's exact words (APPL-09)."""
+        """Abort asks first, in its exact words, and nothing else asks."""
         _flip_job(client, _OWNING_BROWSER)
 
         markup = _as_browser(client, _OWNING_BROWSER)
@@ -2579,11 +2578,11 @@ class TestOwnerGatedFlipPrompt:
 
     def test_flip_confirmation_is_on_the_button_not_the_scan_form(self) -> None:
         """
-        The scan form is untouched, so the C-10 inheritance fix still holds.
+        The confirmation is on the flip prompt's Abort button, never the scan form.
 
-        Putting the confirmation on the form would make every child request
-        confirm, and would need the form's inheritance list extended -- the
-        exact landmine Phase 26 spent a regression test on.
+        On the form it would make every child request confirm, and it would
+        need the form's ``hx-disinherit`` list extended, which would let the
+        selects and refresh buttons disable Scan again.
         """
         index = _template_tags("index.html")
         flip = _template_tags("partials", "flip.html")
@@ -2601,9 +2600,8 @@ class TestOwnerGatedFlipPrompt:
 # rendered through `local_time`, so the expected line is built the same way.
 _DEADLINE = datetime(2026, 9, 30, 19, 23, tzinfo=UTC)
 
-# The flip prompt's sentences that stay as they were, byte for byte, with the
-# template's own line breaks and indentation: the new lines are added around
-# them, and none of them is reworded.
+# The flip prompt's fixed sentences, byte for byte, with the template's own
+# line breaks and indentation.
 _FLIP_INSTRUCTIONS = (
     "<p>\n"
     "    Keep the pages in the same order, then flip the stack over the long edge\n"
@@ -2789,7 +2787,7 @@ class TestWaitingCopy:
     def test_flip_prompt_unchanged_copy_is_byte_identical(
         self, client: TestClient
     ) -> None:
-        """The instructions, captions and Abort confirmation are as they were."""
+        """The flip prompt keeps its exact instructions, captions and confirmation."""
         _flip_job(client, _OWNING_BROWSER)
 
         prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
@@ -2817,9 +2815,9 @@ def _status_area_of(markup: str) -> str:
     return markup[: button.start]
 
 
-# --- S8: the blocked Scan button and its reason line (APPL-07, D-14, D-15) ---
+# --- The blocked Scan button and its reason line ----------------------------
 
-# The reason line's copy, verbatim from UI-SPEC S8. Pinned here as a literal so
+# The reason line's copy, verbatim. Pinned here as a literal so
 # a change to the constant is caught by a test and not only by a reviewer; that
 # the constant lives in Python and not in a template is asserted below.
 _BLOCKED_REASON = (
@@ -2833,9 +2831,9 @@ _REASON_LINE = re.compile(
     re.DOTALL,
 )
 
-# The scan form's attributes, in order. `hx-disinherit` is the C-10 fix and
-# `hx-disabled-elt` is what it protects, so the list is asserted whole rather
-# than by membership.
+# The scan form's attributes, in order. `hx-disinherit` keeps the selects and
+# refresh buttons from inheriting `hx-disabled-elt`, which is what it protects,
+# so the list is asserted whole rather than by membership.
 #
 # `method` and `action` are not htmx attributes and nothing inherits them: they
 # make a submit with JavaScript off a POST, so the title never lands in a URL,
@@ -2938,12 +2936,12 @@ def _done_job_that_is_not_current(client: TestClient, title: str) -> str:
 
 class TestScanBlocked:
     """
-    The placeholder token disables the Scan button and says why (UI-SPEC S8).
+    The placeholder token disables the Scan button and says why.
 
     The button is the courtesy, never the enforcement: every test here is about
     what a viewer is shown, and the refusal that actually holds is proved
-    against the route in tests/test_web_errors.py. Exactly one condition blocks
-    the button in this phase -- a scanner that is unreachable or a
+    against the route in tests/test_web_errors.py. Only missing paperless-ngx
+    settings block the button -- a scanner that is unreachable or a
     paperless-ngx that is down does not, because the user is allowed to try and
     will get a plain-language error with a next step.
     """
@@ -2967,8 +2965,7 @@ class TestScanBlocked:
         """
         The flag is a second `disabled` source and touches nothing else.
 
-        Phase 26's table is re-asserted underneath it: the label and
-        `aria-busy` still come from the job, for every state.
+        The label and `aria-busy` still come from the job, for every state.
         """
         _job_in_state(blocked_client, state)
         match = _only_scan_button(blocked_client.get("/").text)
@@ -2984,7 +2981,7 @@ class TestScanBlocked:
     def test_an_unblocked_page_carries_no_describedby_and_no_reason(
         self, client: TestClient
     ) -> None:
-        """A configured appliance is exactly as it was before this plan."""
+        """A configured appliance's button names no blocked reason, and none renders."""
         page = client.get("/").text
         match = _only_scan_button(page)
 
@@ -2995,7 +2992,7 @@ class TestScanBlocked:
     def test_blocked_reason_line_renders_the_exact_copy(
         self, blocked_client: TestClient
     ) -> None:
-        """The reason is S8's sentence, once, as visible text."""
+        """The reason is the blocked sentence, once, as visible text."""
         page = blocked_client.get("/").text
         rendered = _REASON_LINE.findall(page)
 
@@ -3032,11 +3029,11 @@ class TestScanBlocked:
         self, blocked_client: TestClient
     ) -> None:
         """
-        No status response can hand back an enabled button (C-10, T-30-66).
+        No status response can hand back an enabled button.
 
-        This is the regression guard for the new flag specifically: the button
-        is re-rendered from server state every second, so a flag expressed
-        anywhere but the one partial would be dropped by exactly these polls.
+        The button is re-rendered from server state every second, so a blocked
+        flag expressed anywhere but the one partial would be dropped by exactly
+        these polls.
         """
         for _ in range(5):
             match = _only_scan_button(
@@ -3071,7 +3068,7 @@ class TestScanBlocked:
         self, blocked_client: TestClient
     ) -> None:
         """
-        Re-running the checks cannot change a verdict read from Settings (S8).
+        Re-running the checks cannot change a verdict read from Settings.
 
         So the refresh response carries neither the button nor the reason:
         re-rendering them there would be theatre, and it is why
@@ -3123,21 +3120,21 @@ class TestScanBlocked:
 
     def test_the_scan_form_element_gains_no_attribute(self) -> None:
         """
-        The form is byte-identical to before this plan (C-10, UI-SPEC S8).
+        The scan form carries exactly its own attributes, in order.
 
         The blocked state lives in the button partial and nowhere else, so the
-        inheritance fix and its comment are untouched.
+        form's ``hx-disinherit`` list never has to grow.
         """
         assert list(_scan_form_attributes().items()) == _SCAN_FORM_ATTRS
 
     def test_no_template_reaches_for_aria_disabled_or_a_tooltip(self) -> None:
         """
-        The reason is visible text, not a tooltip and not `aria-disabled` (S8).
+        The reason is visible text, not a tooltip and not `aria-disabled`.
 
         A `disabled` button is not focusable and cannot be reliably hovered, so
         a `title` is unreachable by keyboard and unreliable on touch. Switching
         to `aria-disabled="true"` to make it focusable is forbidden: it would
-        break Phase 26's `disabled` contract and `hx-disabled-elt`.
+        break the button's `disabled` contract and `hx-disabled-elt`.
         """
         offenders = [
             (path.name, tag)
@@ -3157,7 +3154,8 @@ class TestScanBlocked:
 
         It names the problem and nothing else: not the token value, not the
         paperless-ngx URL, which may carry credentials, and no exception text
-        (ASVS V7, T-30-65).
+        (ASVS V7).  Modules are read for their string constants and templates
+        and the stylesheet for their text without comments.
         """
         carrying = sorted(
             path
@@ -3189,20 +3187,14 @@ class TestScanButtonFollowsTheRenderedJob:
     """
     The button's job-derived state describes the job the page is reporting.
 
-    D-25 made the status area follow the job *this* browser submitted, and the
-    out-of-band Scan button is rendered from the same context. A browser whose
-    own job has finished therefore sees an enabled button while somebody else's
-    job is still running, where before this phase every viewer's button was
-    disabled whenever any job was active.
-
-    That is kept deliberately, and pinned here. Keying `disabled` on a
-    different job from the one the status area reports would let the button
-    read "Scanning..." directly above "Done: ...", which is the page
-    contradicting itself -- the untruthfulness this milestone exists to remove.
-    The appliance queues, which is the premise APPL-08's queue line rests on,
-    so a browser whose scan has finished is allowed to start another and will
-    be told where it lands. The guard against over-submission is unchanged: the
-    worker's QUEUE_FULL refusal and its REJECTED row.
+    The status area follows the job *this* browser submitted, and the
+    out-of-band Scan button is rendered from the same context, so a browser
+    whose own job has finished sees an enabled button while somebody else's
+    job is still running.  Keying `disabled` on another job would let the
+    button read "Scanning..." directly above "Done: ...", the page
+    contradicting itself.  The appliance queues, so that browser may start
+    another scan and is told where it lands; the worker's QUEUE_FULL refusal
+    and its REJECTED row guard against over-submission.
     """
 
     def test_a_finished_followed_job_leaves_the_button_enabled(
@@ -3263,10 +3255,9 @@ class TestScanButtonFollowsTheRenderedJob:
         assert match.attributes.get("aria-describedby") == "scan-blocked-reason"
 
 
-# Every help line on the scan form, keyed by the id the control points at
-# (UI-SPEC S6). Profile is deliberately not here: its help line is the live
-# description plan 30-15 built, and a second one would be a second line under
-# one control.
+# Every help line on the scan form, keyed by the id the control points at.
+# Profile is deliberately not here: its help line is the live profile
+# description, and a second one would be a second line under one control.
 _HELP_TEXT = {
     "title-help": "What this document should be called in paperless-ngx.",
     "tag-filter-help": "Type to narrow the list. Ticked tags stay ticked.",
@@ -3323,20 +3314,20 @@ _CORRESPONDENT_SELECT = re.compile(
 
 class TestFormHelpTextAndTagPicker:
     """
-    UI-SPEC S6: one plain-words line per control, and a filter that cannot scan.
+    One plain-words line per control, and a filter that cannot scan.
 
     Two of these assertions exist because of hazards the design removes rather
     than guards against. The filter input's HTML form owner is a separate empty
     form, so Enter in it filters instead of starting a scan and a scan can never
-    carry the filter text (A-6); and nothing at all is added to the scan form
-    element, so the C-10 inheritance fix stays byte-identical (Pitfall 8).
+    carry the filter text; and nothing at all is added to the scan form
+    element, so its ``hx-disinherit`` list stays as it is.
     """
 
     def test_every_control_has_one_help_line_wired_with_aria_describedby(
         self, client: TestClient
     ) -> None:
         """
-        Four sentences, four slots, four references -- one each (APPL-10).
+        Four sentences, four slots, four references -- one each.
 
         The correspondent's sentence reaches its slot with the lazy list load,
         out of band; until then the slot says the list is loading.
@@ -3363,7 +3354,7 @@ class TestFormHelpTextAndTagPicker:
 
         Asserted as the whole list rather than by membership, so a second help
         line under any one control fails here -- Profile's included, where the
-        description plan 30-15 built already is the line.
+        live profile description already is the line.
         """
         page = client.get("/").text
 
@@ -3393,7 +3384,7 @@ class TestFormHelpTextAndTagPicker:
     def test_the_tag_filter_input_carries_its_form_owner_and_htmx_wiring(
         self, client: TestClient
     ) -> None:
-        """The seven attributes S6 specifies, the form owner first (A-6, D-31)."""
+        """The filter input carries its seven attributes, the form owner first."""
         match = _TAG_FILTER_INPUT.search(client.get("/").text)
 
         assert match is not None, "tag filter input not rendered"
@@ -3565,11 +3556,11 @@ class TestFormHelpTextAndTagPicker:
 
     def test_the_tag_block_adds_no_attribute_to_the_scan_form(self) -> None:
         """
-        The form is byte-identical to before this plan (C-10, Pitfall 8).
+        The tag block leaves the scan form with exactly its own attributes.
 
         This is the decisive advantage of the form-owner attribute over
-        `hx-params="not q"` on the form, which would have needed the
-        `hx-disinherit` list extended.
+        `hx-params="not q"` on the form, which would need the `hx-disinherit`
+        list extended.
         """
         assert list(_scan_form_attributes().items()) == _SCAN_FORM_ATTRS
         assert [
@@ -3597,7 +3588,7 @@ class TestFormHelpTextAndTagPicker:
         assert re.search(rf"<h2>Scan</h2>\s*{re.escape(noscript)}", page), page
 
     def test_no_template_keeps_the_tag_multi_select(self) -> None:
-        """D-30: one control, one partial -- the multi-select is deleted."""
+        """No template renders a tag multi-select: the tag list is the one control."""
         offenders = [
             (path.name, tag)
             for path, tag, attributes in _all_template_tags()
@@ -3609,7 +3600,7 @@ class TestFormHelpTextAndTagPicker:
     def test_the_tag_and_correspondent_refresh_buttons_survive_the_rewrite(
         self, client: TestClient
     ) -> None:
-        """Both maintenance controls stay; only the tag one's target moves."""
+        """One refresh button per list; the tag one swaps the list, filter included."""
         page = client.get("/").text
 
         assert page.count('aria-label="Refresh tags"') == 1
@@ -3672,8 +3663,7 @@ def test_check_again_has_a_stable_id_and_a_timeout_above_its_wait(
     route waits a bounded time for the refresher's probe and then answers
     either way, so the request the browser makes must not give up first.
     The effective timeout is the button's own when it carries one and the
-    page-wide one otherwise, and the minutes-long override that a probe on
-    the request thread once needed is gone.
+    page-wide one otherwise, and the button carries no three-minute override.
     """
     page = client.get("/").text
     assert page.count('id="checks-refresh"') == 1
