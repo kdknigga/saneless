@@ -3,9 +3,9 @@ The documented container commands must be readable and safe to run.
 
 The image smoke run takes the ``docker run`` a reader is told to paste from
 README.md and from the Quick Start, rather than keeping its own copy, so a
-documented command that drifts until it no longer works turns CI red. That
-text is editable by anyone who can open a pull request, and CI hands it to a
-container engine, so the smoke script reads it with ``shlex`` (never a shell),
+documented command that stops working turns CI red. That text is editable by
+anyone who can open a pull request, and CI hands it to a container engine, so
+the smoke script reads it with ``shlex`` (never a shell),
 holds it to an allow-list of flags and mounts, and only then swaps in the
 values a test run needs: the image under test, a loopback port, a scratch
 config directory, a throwaway data volume and a unique container name.
