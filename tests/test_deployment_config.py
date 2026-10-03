@@ -79,6 +79,11 @@ from saneless.vocabulary import (
     rejection_message,
     rejection_status_code,
 )
+from tests.citation_samples import (
+    CITATION_SAMPLES,
+    NON_CITATIONS,
+    PLANNING_CITATION,
+)
 from tests.workflow_support import (
     CI_WORKFLOW,
     DOCS_WORKFLOW,
@@ -2437,7 +2442,9 @@ _OWNER_GIVEN = "kris"
 _OWNER_FAMILY = "knigga"
 FORBIDDEN_OWNER_SLUG = f"{_OWNER_GIVEN}-{_OWNER_FAMILY}"
 
-_EXCLUDED_PREFIX = ".planning/"
+# The planning records, compared as a whole first path segment so that the
+# name written here is not itself a citation.
+_EXCLUDED_DIRECTORY = ".planning"
 
 
 def _shipped_files() -> list[str]:
@@ -2471,7 +2478,7 @@ def _shipped_files() -> list[str]:
     return [
         name
         for name in result.stdout.split("\0")
-        if name and not name.startswith(_EXCLUDED_PREFIX)
+        if name and Path(name).parts[0] != _EXCLUDED_DIRECTORY
     ]
 
 
@@ -2504,34 +2511,24 @@ def test_no_shipped_file_references_the_old_owner() -> None:
     )
 
 
-# The planning directory is not part of the product. Someone reading src/
-# has no copy of it, and its identifiers mean nothing once its records move
-# on, so a comment in shipped source states its reason in words instead of
-# pointing there. This pattern matches the identifier shapes the planning
-# records use: decision, finding and requirement IDs, threat IDs, phase and
-# plan numbers, numbered research pitfalls and the planning file names. It
-# leaves ordinary text alone: UTF-8, ISO-8601, SHA-384, A4, "N-1" and a bare
-# PLAN (SQLite's EXPLAIN QUERY PLAN) do not match. The no-planning-citations
-# hook in .pre-commit-config.yaml carries the same pattern, and the test after
-# the guard keeps the two identical. The architecture, enumeration and
-# multi-page requirement IDs are covered too, because their prefixes appear in
-# no other identifier shape above.
-PLANNING_CITATION = re.compile(
-    r"\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
-    r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|MPG|OUTC|ROBU|"
-    r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\bT-[0-9]+-[0-9]+\b|"
-    r"\b[Pp]hase [0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
-    r"\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|"
-    r"SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|"
-    r"[Pp]er user decision|\.planning/"
-)
-# The directories whose files ship with the repository and are read by people
-# who have no copy of the planning records: the package itself, and the
-# release scripts the workflows run. The hook's ``files:`` pattern below says
-# the same thing in regex form, and a test keeps the two in step.
-_SOURCE_PREFIXES = ("src/", "scripts/")
-CITATION_HOOK_FILES = r"^(src|scripts)/"
-_SOURCE_SUFFIXES = frozenset({".py", ".html", ".css", ".js"})
+# The planning directory is not part of the product. Someone reading src/,
+# the tests or the workflows has no copy of it, and its identifiers mean
+# nothing once its records move on, so a comment or docstring states its
+# reason in words instead of pointing there. PLANNING_CITATION, imported from
+# tests/citation_samples.py, matches the identifier shapes the planning
+# records use and leaves ordinary text alone. That module is the one file the
+# guard and the hook both skip, because it has to spell the identifiers out.
+#
+# The directories and files the guard reads: the package itself, the release
+# scripts the workflows run, the tests, the workflows and .dockerignore. The
+# hook's ``files:`` pattern below says the same thing in regex form, and a
+# test keeps the two in step.
+_SOURCE_PREFIXES = ("src/", "scripts/", "tests/", ".github/")
+_SOURCE_FILES = frozenset({".dockerignore"})
+CITATION_HOOK_FILES = r"^(src|scripts|tests|\.github)/|^\.dockerignore$"
+CITATION_HOOK_EXCLUDE = r"^tests/citation_samples\.py$"
+_SOURCE_SUFFIXES = frozenset({".py", ".html", ".css", ".js", ".yml", ".yaml"})
+_CITATION_SAMPLES_FILE = "tests/citation_samples.py"
 # The vendored htmx and Pico files are upstream bytes pinned by an integrity
 # hash, so they are neither ours to comment nor ours to edit.
 _VENDOR_PREFIX = "src/saneless/web/static/vendor/"
@@ -2540,18 +2537,26 @@ PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
 
 def _shipped_source_files() -> list[str]:
     """
-    Return the tracked source and script files under src/ and scripts/.
+    Return the tracked files the citation guard reads.
 
     Returns:
-        Repo-relative path names, vendored assets excluded.
+        Repo-relative path names under src/, scripts/, tests/ and .github/
+        with a source or YAML suffix, plus .dockerignore; vendored assets and
+        the citation samples module excluded.
 
     """
     return [
         name
         for name in _shipped_files()
-        if name.startswith(_SOURCE_PREFIXES)
-        and Path(name).suffix in _SOURCE_SUFFIXES
+        if (
+            name in _SOURCE_FILES
+            or (
+                name.startswith(_SOURCE_PREFIXES)
+                and Path(name).suffix in _SOURCE_SUFFIXES
+            )
+        )
         and not name.startswith(_VENDOR_PREFIX)
+        and name != _CITATION_SAMPLES_FILE
     ]
 
 
@@ -2592,21 +2597,24 @@ def _citation_offenders(names: list[str], root: Path) -> list[str]:
     return offenders
 
 
-def test_no_src_file_cites_a_planning_artefact() -> None:
+def test_no_source_test_or_ci_file_cites_a_planning_artefact() -> None:
     """
-    No shipped source or script file points at the planning records.
+    No file under src/, scripts/, tests/ or the workflows points at the plans.
 
-    The planning directory does not ship, so a comment in src/ or scripts/
-    that says only "see decision so-and-so" tells a reader nothing; each
-    carries its own reason in plain words. The test picks files by suffix and
-    the no-planning-citations hook by the type ``identify`` detects, which
-    also takes in an extensionless Python script or a ``.mjs`` file; src/
-    holds neither, so the two check the same files.
+    The planning directory does not ship, so a comment or docstring that says
+    only "see decision so-and-so" tells a reader nothing; each carries its own
+    reason in plain words. The test picks files by suffix and the
+    no-planning-citations hook by the type ``identify`` detects, which also
+    takes in an extensionless Python script or a ``.mjs`` file; the tree holds
+    neither, so the two check the same files.
     """
-    offenders = _citation_offenders(_shipped_source_files(), REPO_ROOT)
+    names = _shipped_source_files()
+    assert {"tests/test_deployment_config.py", ".dockerignore"} <= set(names)
+    assert ".github/workflows/ci.yml" in names
+    offenders = _citation_offenders(names, REPO_ROOT)
     assert not offenders, (
-        "a file under src/ or scripts/ cites a planning artefact or could not "
-        "be read. "
+        "a file under src/, scripts/, tests/ or .github/, or .dockerignore, "
+        "cites a planning artefact or could not be read. "
         "Replace a reference with the reason it stood for, in words, or "
         "delete it where the sentence is complete without it:\n" + "\n".join(offenders)
     )
@@ -2627,17 +2635,16 @@ def test_the_citation_guard_reports_a_file_it_cannot_read(tmp_path: Path) -> Non
     assert "unreadable" in offenders[1]
 
 
-def test_the_citation_guard_catches_architecture_and_enumeration_ids() -> None:
-    """Architecture and enumeration requirement IDs are citations; UTF-8 is not."""
-    assert PLANNING_CITATION.search("ENUM-03")
-    assert PLANNING_CITATION.search("ARCH-03")
-    assert not PLANNING_CITATION.search("UTF-8")
+@pytest.mark.parametrize("sample", CITATION_SAMPLES)
+def test_the_citation_guard_catches_every_identifier_family(sample: str) -> None:
+    """Each planning identifier shape, multi-page IDs included, is a citation."""
+    assert PLANNING_CITATION.search(sample)
 
 
-def test_the_citation_guard_catches_multi_page_ids() -> None:
-    """Multi-page requirement IDs are citations, with or without a leading zero."""
-    assert PLANNING_CITATION.search("MPG-01")
-    assert PLANNING_CITATION.search("MPG-4")
+@pytest.mark.parametrize("text", NON_CITATIONS)
+def test_the_citation_guard_leaves_ordinary_text_alone(text: str) -> None:
+    """Encodings, standards, paper sizes and SQL keywords are not citations."""
+    assert not PLANNING_CITATION.search(text)
 
 
 def test_the_citation_hook_uses_the_guard_pattern() -> None:
@@ -2651,14 +2658,14 @@ def test_the_citation_hook_uses_the_guard_pattern() -> None:
     )
 
 
-def test_the_citation_hook_covers_src_and_scripts() -> None:
+def _citation_hook_lines() -> list[str]:
     """
-    The commit hook reads the same directories the guard above reads.
+    Return the significant lines of the no-planning-citations hook entry.
 
-    The pattern is only half of what the two share. A hook scoped to src/
-    alone would let a citation into a release script at commit, merge and
-    push, and only CI would say so. The regex and the prefix list are written
-    once each, and this test holds them to the same directories.
+    Returns:
+        The stripped, non-comment lines after ``- id: no-planning-citations``
+        up to the next list item.
+
     """
     lines = _significant_lines(PRE_COMMIT_CONFIG)
     starts = [
@@ -2675,14 +2682,54 @@ def test_the_citation_hook_covers_src_and_scripts() -> None:
         if line.startswith("- "):
             break
         window.append(line)
+    return window
+
+
+def test_the_citation_hook_covers_shipped_sources_tests_and_ci() -> None:
+    """
+    The commit hook reads the same files the guard above reads.
+
+    The pattern is only half of what the two share. A hook narrower than the
+    guard would let a citation into a test or a workflow at commit, merge and
+    push, and only CI would say so. The regex and the prefix list are written
+    once each, and this test holds them to the same files.
+    """
+    window = _citation_hook_lines()
     assert f"files: {CITATION_HOOK_FILES}" in window, (
         f"the no-planning-citations hook is not scoped to {CITATION_HOOK_FILES}, "
-        "so it checks a different set of directories from the guard test. "
+        "so it checks a different set of files from the guard test. "
         f"Its lines read: {window}"
     )
     files = re.compile(CITATION_HOOK_FILES)
     assert all(files.match(prefix) for prefix in _SOURCE_PREFIXES)
-    assert files.match("tests/test_deployment_config.py") is None
+    assert all(files.match(name) for name in _SOURCE_FILES)
+    for name in (
+        "tests/test_deployment_config.py",
+        ".github/workflows/ci.yml",
+        ".dockerignore",
+    ):
+        assert files.match(name), name
+    assert files.match("docs/index.md") is None
+    assert files.match("src.dockerignore") is None
+
+
+def test_the_citation_hook_excludes_only_the_samples_module() -> None:
+    """
+    The hook skips the citation samples module and nothing else.
+
+    A second exclusion, or a baseline, would let citations back in without
+    the guard test noticing, so the hook's one ``exclude:`` line is pinned and
+    the file it names must exist.
+    """
+    window = _citation_hook_lines()
+    excludes = [line for line in window if line.startswith("exclude:")]
+    assert excludes == [f"exclude: {CITATION_HOOK_EXCLUDE}"], (
+        "the no-planning-citations hook must exclude tests/citation_samples.py "
+        f"and nothing else. Its lines read: {window}"
+    )
+    assert not [line for line in window if "baseline" in line], window
+    assert re.fullmatch(CITATION_HOOK_EXCLUDE, _CITATION_SAMPLES_FILE)
+    assert (REPO_ROOT / _CITATION_SAMPLES_FILE).is_file()
 
 
 # Only the documentation deep links: the site root has no path after
