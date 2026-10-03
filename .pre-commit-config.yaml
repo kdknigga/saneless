@@ -234,13 +234,16 @@ repos:
   # without its number: line numbers drift, and the other two do not ship
   # either. That holds for the package under src/, the release scripts under
   # scripts/ that the workflows send a reader into, the tests, the workflows
-  # under .github/ and .dockerignore. pygrep fails the hook on any matching
-  # line in those files.
+  # under .github/, .dockerignore and the decision records under
+  # docs/explanation/decisions/, which ship and are written in the same voice
+  # as the comments that point at them. The rest of docs/ is not in scope.
+  # pygrep fails the hook on any matching line in those files.
   #
   # This block is separate from the local block above because it works the
   # other way round: those hooks run whole-tree checkers with no filenames,
   # while this one is handed the files and filters them by path and type, so it
-  # only ever reads Python, templates, CSS, JavaScript, YAML and .dockerignore.
+  # only ever reads Python, templates, CSS, JavaScript, YAML, Markdown and
+  # .dockerignore.
   # The top-level exclude keeps the vendored assets out. The one file this hook
   # excludes is tests/citation_samples.py: it holds the pattern and the sample
   # identifiers the guard's own tests need, which cannot be written anywhere
@@ -256,8 +259,8 @@ repos:
         name: no planning-artefact citations in shipped files, tests and CI
         language: pygrep
         entry: '\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|MPG|OUTC|ROBU|SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\bT-[0-9]+-[0-9]+\b|\b[Pp]hase[ -][0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|[Pp]er user decision|\.planning/|\.py:[0-9]+|CLAUDE\.md|\b([Tt]his|[Tt]hat|[Tt]hree|[Ee]arlier) phases?\b'
-        files: ^(src|scripts|tests|\.github)/|^\.dockerignore$
-        types_or: [python, html, css, javascript, yaml, dockerignore]
+        files: ^(src|scripts|tests|\.github)/|^\.dockerignore$|^docs/explanation/decisions/
+        types_or: [python, html, css, javascript, yaml, dockerignore, markdown]
         exclude: ^tests/citation_samples\.py$
         stages: [pre-commit, pre-merge-commit, pre-push]
 

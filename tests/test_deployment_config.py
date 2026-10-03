@@ -2535,14 +2535,19 @@ def test_no_shipped_file_references_the_old_owner() -> None:
 # guard and the hook both skip, because it has to spell the identifiers out.
 #
 # The directories and files the guard reads: the package itself, the release
-# scripts the workflows run, the tests, the workflows and .dockerignore. The
-# hook's ``files:`` pattern below says the same thing in regex form, and a
-# test keeps the two in step.
-_SOURCE_PREFIXES = ("src/", "scripts/", "tests/", ".github/")
+# scripts the workflows run, the tests, the workflows, .dockerignore and the
+# decision records. The decision records are in scope because they ship with
+# the documentation and are written in the same voice as the comments that
+# point at them; the rest of docs/ is not. The hook's ``files:`` pattern below
+# says the same thing in regex form, and a test keeps the two in step.
+_DECISIONS_PREFIX = "docs/explanation/decisions/"
+_SOURCE_PREFIXES = ("src/", "scripts/", "tests/", ".github/", _DECISIONS_PREFIX)
 _SOURCE_FILES = frozenset({".dockerignore"})
-CITATION_HOOK_FILES = r"^(src|scripts|tests|\.github)/|^\.dockerignore$"
+CITATION_HOOK_FILES = (
+    r"^(src|scripts|tests|\.github)/|^\.dockerignore$|^docs/explanation/decisions/"
+)
 CITATION_HOOK_EXCLUDE = r"^tests/citation_samples\.py$"
-_SOURCE_SUFFIXES = frozenset({".py", ".html", ".css", ".js", ".yml", ".yaml"})
+_SOURCE_SUFFIXES = frozenset({".py", ".html", ".css", ".js", ".yml", ".yaml", ".md"})
 _CITATION_SAMPLES_FILE = "tests/citation_samples.py"
 # The vendored htmx and Pico files are upstream bytes pinned by an integrity
 # hash, so they are neither ours to comment nor ours to edit.
@@ -2555,9 +2560,10 @@ def _shipped_source_files() -> list[str]:
     Return the tracked files the citation guard reads.
 
     Returns:
-        Repo-relative path names under src/, scripts/, tests/ and .github/
-        with a source or YAML suffix, plus .dockerignore; vendored assets and
-        the citation samples module excluded.
+        Repo-relative path names under src/, scripts/, tests/, .github/ and
+        the decision records with a source, YAML or Markdown suffix, plus
+        .dockerignore; vendored assets and the citation samples module
+        excluded.
 
     """
     return [
@@ -2746,6 +2752,154 @@ def test_the_citation_hook_excludes_only_the_samples_module() -> None:
     assert not [line for line in window if "baseline" in line], window
     assert re.fullmatch(CITATION_HOOK_EXCLUDE, _CITATION_SAMPLES_FILE)
     assert (REPO_ROOT / _CITATION_SAMPLES_FILE).is_file()
+
+
+# A comment that gives its reason at length points at a decision record by
+# path. The path is only useful if it names a record that ships, and a record
+# is only findable if the index links it.
+ADR_POINTER = re.compile(r"docs/explanation/decisions/[0-9]{4}-[a-z0-9-]+\.md")
+_ADR_FILE = re.compile(r"[0-9]{4}-[a-z0-9-]+\.md")
+_ADR_INDEX = "README.md"
+
+
+def _dangling_adr_pointers(names: list[str], root: Path) -> list[str]:
+    """
+    Return every decision-record path cited in ``names`` that does not exist.
+
+    A file that cannot be read is reported too, for the reason
+    ``_citation_offenders`` gives: unchecked is not clean.
+
+    Args:
+        names: Repo-relative file names to check.
+        root: The directory the names, and the cited paths, are relative to.
+
+    Returns:
+        One ``name:line: path`` entry per missing record, and one
+        ``name: reason`` entry per file that could not be read.
+
+    """
+    offenders: list[str] = []
+    for name in names:
+        # Two clauses rather than one tuple, for the reason given in the
+        # owner guard above.
+        try:
+            text = (root / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            offenders.append(f"{name}: not UTF-8, so it was not checked: {exc}")
+            continue
+        except OSError as exc:
+            offenders.append(f"{name}: unreadable, so it was not checked: {exc}")
+            continue
+        offenders.extend(
+            f"{name}:{number}: {pointer}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            for pointer in ADR_POINTER.findall(line)
+            if not (root / pointer).is_file()
+        )
+    return offenders
+
+
+def _unlisted_adrs(root: Path) -> list[str]:
+    """
+    Return every numbered decision record the decisions index does not link.
+
+    The index is read only when a numbered record exists, so a tree with no
+    records yet needs no index either.
+
+    Args:
+        root: The directory holding ``docs/``.
+
+    Returns:
+        The sorted file names of the records with no link from the index.
+
+    """
+    decisions = root / _DECISIONS_PREFIX
+    records = sorted(
+        path.name for path in decisions.glob("*.md") if _ADR_FILE.fullmatch(path.name)
+    )
+    if not records:
+        return []
+    index = (decisions / _ADR_INDEX).read_text(encoding="utf-8")
+    return [
+        record
+        for record in records
+        if not re.search(rf"\]\((\./)?{re.escape(record)}(#[^)]*)?\)", index)
+    ]
+
+
+def test_every_adr_pointer_names_an_existing_decision() -> None:
+    """
+    Every decision-record path a shipped file cites exists.
+
+    Test sources are left out: they build such paths by concatenation, so a
+    pointer written there is test data rather than a reference.
+    """
+    names = [name for name in _shipped_files() if not name.startswith("tests/")]
+    assert "src/saneless/cli.py" in names
+    offenders = _dangling_adr_pointers(names, REPO_ROOT)
+    assert not offenders, (
+        "a shipped file points at a decision record that does not exist, or "
+        "could not be read. Correct the path or write the record:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_every_decision_is_listed_in_the_index() -> None:
+    """Every numbered decision record is linked from the decisions index."""
+    unlisted = _unlisted_adrs(REPO_ROOT)
+    assert not unlisted, (
+        f"{_DECISIONS_PREFIX}{_ADR_INDEX} does not link these decision "
+        f"records, so a reader browsing the index cannot find them: {unlisted}"
+    )
+
+
+def test_the_adr_pointer_check_reports_a_missing_decision(tmp_path: Path) -> None:
+    """A cited decision record that does not exist is reported; a real one is not."""
+    decisions = tmp_path / _DECISIONS_PREFIX
+    decisions.mkdir(parents=True)
+    (decisions / "0001-real.md").write_text("# Real\n", encoding="utf-8")
+    source = tmp_path / "src"
+    source.mkdir()
+    # Built by concatenation so that this file never holds a literal pointer
+    # at a decision that does not exist.
+    missing = _DECISIONS_PREFIX + "0999-nope.md"
+    (source / "a.py").write_text(f"# See {missing}.\n", encoding="utf-8")
+    real = _DECISIONS_PREFIX + "0001-real.md"
+    (source / "b.py").write_text(f"# See {real}.\n", encoding="utf-8")
+
+    offenders = _dangling_adr_pointers(["src/a.py", "src/b.py"], tmp_path)
+
+    assert offenders == ["src/a.py" + ":1: " + missing]
+
+
+def test_the_adr_pointer_check_reports_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """A non-UTF-8 or missing file is reported, never skipped as clean."""
+    (tmp_path / "latin1.py").write_bytes(b"# caf\xe9\n")
+
+    offenders = _dangling_adr_pointers(["latin1.py", "gone.py"], tmp_path)
+
+    assert [entry.split(":", 1)[0] for entry in offenders] == [
+        "latin1.py",
+        "gone.py",
+    ]
+
+
+def test_the_adr_index_check_reports_an_unlisted_decision(tmp_path: Path) -> None:
+    """A decision record the index does not link is reported by file name."""
+    decisions = tmp_path / _DECISIONS_PREFIX
+    decisions.mkdir(parents=True)
+    (decisions / "0001-a.md").write_text("# A\n", encoding="utf-8")
+    (decisions / "0002-b.md").write_text("# B\n", encoding="utf-8")
+    (decisions / _ADR_INDEX).write_text(
+        "# Decisions\n\n- [A](0001-a.md)\n", encoding="utf-8"
+    )
+
+    assert _unlisted_adrs(tmp_path) == ["0002-b.md"]
+
+
+def test_the_adr_index_check_needs_no_index_without_records(tmp_path: Path) -> None:
+    """With no numbered decision record there is nothing to list."""
+    assert _unlisted_adrs(tmp_path) == []
 
 
 # Only the documentation deep links: the site root has no path after
