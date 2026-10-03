@@ -71,9 +71,9 @@ builds the documentation site:
 | `ci.yml` | `lint` | `uv run prek run --all-files --show-diff-on-failure` |
 | `ci.yml` | `lint` | `uv run prek run --stage pre-push --all-files --show-diff-on-failure` |
 | `ci.yml` | `lint` | `uv audit --preview-features audit-command` |
-| `ci.yml` | `test` | `uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"` |
-| `ci.yml` | `test` | `uv run env HOME="$(mktemp -d)" pytest -m sane_hardware` |
-| `ci.yml` | `browser` | `uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser` |
+| `ci.yml` | `test` | `uv run env HOME="$(mktemp -d)" pytest -o timeout_method=thread -m "not browser and not sane_hardware"` |
+| `ci.yml` | `test` | `uv run env HOME="$(mktemp -d)" pytest -o timeout_method=thread -m sane_hardware` |
+| `ci.yml` | `browser` | `uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -o timeout_method=thread -m browser` |
 | `ci.yml` | `docker` | builds the image as `saneless:ci`, then `uv run --no-project python scripts/smoke_image.py saneless:ci` |
 | `docs.yml` | `build` | `uv run --no-sync mkdocs build --strict` |
 
@@ -99,10 +99,10 @@ You can reproduce the gate, in the same order, with:
 uv run prek run --all-files --show-diff-on-failure
 uv run prek run --stage pre-push --all-files --show-diff-on-failure
 uv audit --preview-features audit-command
-uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"
-uv run env HOME="$(mktemp -d)" pytest -m sane_hardware
+uv run env HOME="$(mktemp -d)" pytest -o timeout_method=thread -m "not browser and not sane_hardware"
+uv run env HOME="$(mktemp -d)" pytest -o timeout_method=thread -m sane_hardware
 uv run playwright install chromium firefox   # once, to fetch the browsers
-uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser
+uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -o timeout_method=thread -m browser
 docker build -t saneless:ci .
 uv run --no-project python scripts/smoke_image.py saneless:ci
 uv run --no-sync mkdocs build --strict
@@ -182,8 +182,13 @@ runs it in that step; nothing deselects `slow` by default. Add `-m "not slow"` f
 quicker local run.
 
 A test that hangs is not allowed to hang the run: `pytest-timeout` is configured in
-`pyproject.toml` with `timeout = 60` and `timeout_method = "signal"`, so a stuck test
-fails on its own with a traceback while the rest of the suite keeps going.
+`pyproject.toml` with `timeout = 60` and `timeout_method = "signal"` for local runs, so
+a stuck test fails on its own with a traceback while the rest of the suite keeps going.
+CI passes `-o timeout_method=thread` to every pytest command, as the table and the
+block above show. The thread method also ends a test that a blocked non-daemon thread
+is holding open, which the signal method cannot, and it prints every thread's stack,
+so a hang in CI says where each thread was stuck. Add the same flag locally when you
+are chasing a hang.
 
 ## Local pre-flight
 

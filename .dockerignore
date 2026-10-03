@@ -1,4 +1,5 @@
-# Docker build context -- an ALLOW-LIST, not a deny-list (D-29, DLVR-06).
+# Docker build context -- an ALLOW-LIST, not a deny-list, so a new file in the
+# working tree stays out of the image until someone decides it belongs there.
 #
 # The `*` below must stay the first line. It excludes the entire working tree;
 # each `!` line under it re-includes exactly one path the image build reads.
@@ -18,8 +19,9 @@
 # project build fails outright when either file is missing from the context.
 #
 # `!src/` re-includes the directory and everything beneath it; `!src/**` is not
-# needed. Pinned by tests/test_deployment_config.py -- nothing else in CI would
-# notice this list being weakened (D-30).
+# needed. Pinned by tests/test_deployment_config.py, because nothing else in CI
+# would notice this list being weakened: the image still builds and runs with
+# extra files in its context.
 *
 !src/
 !pyproject.toml
