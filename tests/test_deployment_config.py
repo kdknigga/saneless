@@ -31,7 +31,7 @@ import tokenize
 # name. It also reads `pyproject.toml`'s `[project]` table for the packaging
 # and published-image guards.
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, get_args
 
 import pytest
@@ -7348,6 +7348,12 @@ _LEGACY_NAME_ALLOWED: frozenset[tuple[str, str]] = frozenset(
 # A Markdown table row, which is a passage of its own: the rows of one table
 # say unrelated things, so one row naming the current file excuses no other.
 _TABLE_ROW = re.compile(r"^\s*\|")
+# A Markdown list item, which starts a passage of its own for the same reason.
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
+# The files read as prose, whose paragraphs wrap wherever an editor broke the
+# line.  Every other file that is not Python is code or config, which does not
+# wrap sentences, so each of its lines is judged alone.
+_PROSE_SUFFIXES = frozenset({".md", ".rst", ".txt"})
 
 # A rename or move pointed the wrong way: from the current name to the old.
 _RENAME_TO_LEGACY = re.compile(
@@ -7361,10 +7367,14 @@ _RENAME_TO_LEGACY = re.compile(
 
 def _text_passages(text: str, first_line: int = 1) -> list[tuple[int, str]]:
     """
-    Split prose into passages: paragraphs, with each table row on its own.
+    Split prose into passages: paragraphs, with list items, rows and code apart.
 
     A paragraph is a run of non-blank lines, joined with single spaces, so
-    where a line breaks inside it never changes what it contains.
+    where a line breaks inside it never changes what it contains.  A list item
+    starts a passage, and the lines that follow it with no blank line between
+    join it, since that is how an item wraps.  A table row is a passage of its
+    own, and so is each line of a fenced block, delimiters included, because a
+    fenced block is code, not wrapped prose.
 
     Args:
         text: The prose.
@@ -7377,20 +7387,35 @@ def _text_passages(text: str, first_line: int = 1) -> list[tuple[int, str]]:
     passages: list[tuple[int, str]] = []
     current: list[str] = []
     start = first_line
+    fenced = False
     for number, line in enumerate(text.splitlines(), start=first_line):
-        if not line.strip() or _TABLE_ROW.match(line):
-            if current:
-                passages.append((start, " ".join(current)))
-                current = []
-            if line.strip():
-                passages.append((number, line.strip()))
+        stripped = line.strip()
+        alone = fenced or _FENCE_LINE.match(line) or _TABLE_ROW.match(line)
+        if current and (alone or not stripped or _LIST_ITEM.match(line)):
+            passages.append((start, " ".join(current)))
+            current = []
+        if _FENCE_LINE.match(line):
+            fenced = not fenced
+        if not stripped:
+            continue
+        if alone:
+            passages.append((number, stripped))
             continue
         if not current:
             start = number
-        current.append(line.strip())
+        current.append(stripped)
     if current:
         passages.append((start, " ".join(current)))
     return passages
+
+
+def _line_passages(text: str) -> list[tuple[int, str]]:
+    """Return each non-blank line of code or config as a passage of its own."""
+    return [
+        (number, line.strip())
+        for number, line in enumerate(text.splitlines(), start=1)
+        if line.strip()
+    ]
 
 
 def _docstring_nodes(tree: ast.Module) -> list[tuple[ast.Constant, str]]:
@@ -7473,10 +7498,12 @@ def _python_passages(text: str) -> list[tuple[int, str]]:
 
 
 def _passages(name: str, text: str) -> list[tuple[int, str]]:
-    """Return a shipped file's passages, read as Python or as prose."""
+    """Return a shipped file's passages, read as Python, as prose or by line."""
     if name.endswith(".py"):
         return _python_passages(text)
-    return _text_passages(text)
+    if PurePosixPath(name).suffix in _PROSE_SUFFIXES:
+        return _text_passages(text)
+    return _line_passages(text)
 
 
 def _legacy_name_offences(name: str, text: str) -> list[str]:
@@ -7485,8 +7512,9 @@ def _legacy_name_offences(name: str, text: str) -> list[str]:
 
     A passage naming the legacy file must also name the current one, the way
     every upgrade note is written, and must not tell the reader to rename the
-    current file to the old name. Passages are whole paragraphs, table rows
-    or strings, so the verdict never depends on where a line breaks.
+    current file to the old name. In prose a passage is a paragraph, list
+    item or table row, so the verdict never depends on where a line breaks;
+    in code and config it is a string or a line.
 
     Returns:
         One entry per offending passage.
@@ -7558,6 +7586,42 @@ def test_no_shipped_file_names_the_legacy_config_file() -> None:
         ("seeded.py", f'PATH = "{LEGACY_CONFIG_NAME}"\n', True),
         ("seeded.py", f'PATH = f"/etc/{{d}}/{LEGACY_CONFIG_NAME}"\n', True),
         (
+            "compose.yaml",
+            "services:\n  saneless:\n    volumes:\n"
+            f"      - ./{LEGACY_CONFIG_NAME}:/etc/saneless/{LEGACY_CONFIG_NAME}:ro\n"
+            f"    environment:\n      SANELESS_CONFIG: /etc/saneless/{CONFIG_NAME}\n",
+            True,
+        ),
+        (
+            "Dockerfile",
+            f"COPY {LEGACY_CONFIG_NAME} /etc/saneless/\n"
+            f"RUN test -f /etc/saneless/{CONFIG_NAME}\n",
+            True,
+        ),
+        (
+            "seeded.sh",
+            f"cp example.toml /etc/saneless/{LEGACY_CONFIG_NAME}\n"
+            f"echo 'see {CONFIG_NAME} docs'\n",
+            True,
+        ),
+        (
+            "seeded.html",
+            f"<code>/etc/saneless/{LEGACY_CONFIG_NAME}</code>\n<p>{CONFIG_NAME}</p>\n",
+            True,
+        ),
+        (
+            "seeded.md",
+            f"- /etc/saneless/{LEGACY_CONFIG_NAME} holds the system settings\n"
+            f"- ~/.config/saneless/{CONFIG_NAME} holds yours\n",
+            True,
+        ),
+        (
+            "seeded.md",
+            f"Set it up:\n```\n# /etc/saneless/{LEGACY_CONFIG_NAME}\n```\n"
+            f"Then edit {CONFIG_NAME}.\n",
+            True,
+        ),
+        (
             "seeded.md",
             f"An old `{LEGACY_CONFIG_NAME}`\nis ignored; rename it to\n"
             f"`{CONFIG_NAME}`.\n",
@@ -7575,6 +7639,17 @@ def test_no_shipped_file_names_the_legacy_config_file() -> None:
             f"# and {CONFIG_NAME} is read.\n",
             False,
         ),
+        (
+            "seeded.md",
+            f"- An old `{LEGACY_CONFIG_NAME}`\n  is ignored; rename it to\n"
+            f"  `{CONFIG_NAME}`.\n",
+            False,
+        ),
+        (
+            "compose.yaml",
+            f"# an old {LEGACY_CONFIG_NAME} is ignored; rename it to {CONFIG_NAME}\n",
+            False,
+        ),
     ],
     ids=[
         "separate-paragraphs",
@@ -7582,15 +7657,23 @@ def test_no_shipped_file_names_the_legacy_config_file() -> None:
         "rename-the-wrong-way",
         "bare-literal",
         "f-string",
+        "compose-volume",
+        "dockerfile-copy",
+        "shell-copy",
+        "html-template",
+        "markdown-list",
+        "fenced-in-a-paragraph",
         "wrapped-paragraph",
         "wrapped-docstring",
         "wrapped-comment",
+        "wrapped-list-item",
+        "config-line-naming-both",
     ],
 )
-def test_the_legacy_name_guard_judges_passages_not_lines(
+def test_the_legacy_name_guard_judges_prose_by_passage_and_code_by_line(
     name: str, text: str, *, offending: bool
 ) -> None:
-    """The verdict follows the paragraph, row or string, wherever lines break."""
+    """Prose is judged by paragraph, item or row; code by string or line."""
     assert bool(_legacy_name_offences(name, text)) is offending
 
 
