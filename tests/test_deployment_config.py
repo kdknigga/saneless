@@ -5386,23 +5386,16 @@ def test_the_build_backend_guard_reports_a_missing_group() -> None:
 
 def test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it() -> None:
     """
-    The ``anyio`` ceiling is still declared, and the locked anyio obeys it.
+    The ``anyio`` ceiling is declared, and the locked anyio obeys it.
 
-    anyio 4.15.0 turned ``anyio.abc.BlockingPortal`` into a deprecated alias,
-    and starlette's ``testclient`` module evaluates that name at module scope.
-    This project runs pytest under ``filterwarnings = ["error"]``, so the
-    deprecation is raised rather than printed and every module that imports
-    ``TestClient`` fails during collection -- seven of them here. Nothing in
-    this repository can fix that, because the deprecated name is starlette's
-    own and is reached before any saneless code runs. The ceiling should be
-    removed only once starlette stops using the alias.
-
-    anyio is a transitive this project never imports, so it is declared in
-    neither dependency list and the floor guard above cannot see it: a ceiling
-    is not a floor, and putting it in either list would export a workaround for
-    an upstream bug into the published wheel's metadata. This guard is what
-    covers it, and it fails if the declaration is deleted, if its bound is
-    loosened, or if the lock stops obeying it.
+    From anyio 4.15.0, ``anyio.abc.BlockingPortal`` is a deprecated alias that
+    starlette's ``testclient`` evaluates at module scope. Under
+    ``filterwarnings = ["error"]`` every module importing ``TestClient`` then
+    fails to collect, and no saneless code can prevent it. The ceiling lives
+    in ``[tool.uv].constraint-dependencies`` rather than a dependency list, so
+    the published wheel does not export the workaround, and the floor guard
+    above cannot see it. This guard fails if the declaration is deleted, its
+    bound loosened, or the lock stops obeying it.
     """
     pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
     uv_table = pyproject.get("tool", {}).get("uv", {})
@@ -5558,8 +5551,7 @@ def test_python_version_names_one_interpreter_the_project_supports() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 36: pinned artifacts and advisory coverage (PIN-02, PIN-05, SEC-01,
-# SEC-03)
+# Pinned artifacts and advisory coverage
 # ---------------------------------------------------------------------------
 
 DEPENDABOT_CONFIG = REPO_ROOT / ".github" / "dependabot.yml"
@@ -5588,17 +5580,13 @@ def _workflow_files(directory: Path = WORKFLOW_DIR) -> list[Path]:
     """
     Return every GitHub Actions workflow file, sorted by path.
 
-    This is the suite's first reader of ``.github/workflows``. Several guards
-    need the same input set, and sorting is what keeps their failure messages
-    in a stable order rather than whatever order the filesystem returns.
+    Several guards share this input set, and sorting keeps their failure
+    messages in a stable order rather than the filesystem's.
 
-    Both spellings are collected because GitHub loads both. Every workflow
-    here happens to be ``.yml`` today, so globbing one extension would pass
-    and keep passing -- right up until someone adds a ``.yaml`` file, which
-    would then carry an unpinned ``uses:`` or an ``--ignore`` flag past every
-    guard that reads this list. The guards are supply-chain gates, so their
-    input set has to be what GitHub runs, not what the repository happens to
-    contain.
+    Both spellings are collected because GitHub loads both. Globbing only
+    ``.yml`` would let a ``.yaml`` workflow carry an unpinned ``uses:`` or an
+    ``--ignore`` flag past every guard that reads this list, so the input set
+    is what GitHub runs, not one extension.
 
     Args:
         directory: The workflow directory to read, ``.github/workflows``
@@ -5662,7 +5650,7 @@ def _declared_uv_build_specifier() -> str:
 
 def test_every_repeated_image_tag_in_the_dockerfile_shares_one_digest() -> None:
     """
-    A tag on more than one ``FROM`` line carries the same digest at each (D-07).
+    A tag on more than one ``FROM`` line carries the same digest at each.
 
     ``python:3.14-slim`` is the base of both the builder and the runtime stage.
     The defect this catches is not a missing pin -- the shape guard further up
@@ -5850,20 +5838,16 @@ def test_every_uv_surface_sits_inside_the_required_version_range() -> None:
     """
     Every surface that pins uv lies inside ``pyproject.toml``'s declared range.
 
-    ``[tool.uv] required-version`` is the one place the uv version is
-    declared. setup-uv reads it on every runner when a step names no version
-    of its own, and local uv refuses to run outside it, so a ``version:`` or
-    ``version-file:`` input on a setup-uv step is a second source that
-    silently wins on that runner. Those inputs are refused outright.
+    ``[tool.uv] required-version`` is the one declaration of the uv version.
+    setup-uv reads it when a step names no version, and local uv refuses to
+    run outside it, so a ``version:`` or ``version-file:`` input on a setup-uv
+    step is a second source that silently wins; those inputs are refused.
 
-    Two surfaces cannot read the range and stay pinned: the Dockerfile's uv
-    tool stage and the ``uv_build`` build-backend requirement. The lock pins a
-    third, the ``uv`` the dev environment installs. Each is held inside the
-    range, and the build backend's ceiling must equal the range's, so the
-    backend cannot admit a uv series the rest of the toolchain refuses. Pins
-    are compared to the range rather than to each other: two surfaces that
-    each move to a newer patch release inside it are both correct, even when
-    their updates land in separate commits.
+    The Dockerfile's uv tool stage, the ``uv_build`` requirement and the
+    locked ``uv`` cannot read the range, so each is held inside it, and the
+    build backend's ceiling equals the range's. Pins are compared to the
+    range, not to each other, so two surfaces on different patch releases
+    inside it both pass.
     """
     pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
     declared_range = pyproject.get("tool", {}).get("uv", {}).get("required-version")
@@ -5951,15 +5935,13 @@ def test_the_setup_uv_scanner_sees_every_step_and_input_spelling(
 
 def test_the_dockerfile_comment_quotes_the_declared_build_specifier() -> None:
     """
-    The uv-stage comment quotes the specifier ``pyproject.toml`` declares (D-22).
+    The uv-stage comment quotes the specifier ``pyproject.toml`` declares.
 
     That comment explains why the uv tool image and the build backend are
-    pinned together, and it argues the case by quoting the specifier. Quoted
-    text goes stale silently: nothing about editing ``pyproject.toml`` touches
-    the Dockerfile, so the comment would go on explaining a real coupling in
-    terms of a range that no longer exists -- misstating a design decision
-    rather than merely reading untidily. The raw lines are needed here because
-    ``_significant_lines`` drops whole-line comments by design.
+    pinned together by quoting the specifier. Editing ``pyproject.toml``
+    never touches the Dockerfile, so a stale quote would explain a real
+    coupling in terms of a range nothing declares. The raw lines are read
+    because ``_significant_lines`` drops whole-line comments.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     quoted = [
@@ -5995,17 +5977,13 @@ MINIMUM_COOLDOWN_DAYS = 7
 
 def test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr() -> None:
     """
-    Every ``updates:`` entry carries a cooldown of at least a week (D-15).
+    Every ``updates:`` entry carries a cooldown of at least a week.
 
-    Measured against zizmor 1.30.1 on its default persona: the
-    ``dependabot-cooldown`` check is ecosystem-gated. A cooldown-less ``pip``
-    or ``github-actions`` entry is a finding, but a cooldown-less ``uv`` entry
-    produces none and the audit exits 0 -- so for the ecosystem carrying this
-    project's Python pins, the blocking CI step proves nothing. Without this
-    guard the settling period the file's own header demands would be policy
-    with nothing behind it, which is worse than an absent rule because it
-    reads like an enforced one. The window between one entry and the next is
-    what scopes the check, because ``_significant_lines`` has already stripped
+    zizmor's ``dependabot-cooldown`` check is ecosystem-gated: it reports a
+    cooldown-less ``pip`` or ``github-actions`` entry but not a ``uv`` one, the
+    ecosystem carrying this project's Python pins. This guard is what backs
+    the settling period the file's header demands. Each entry is the window
+    up to the next one, because ``_significant_lines`` has already stripped
     the indentation that would otherwise delimit it.
     """
     name = DEPENDABOT_CONFIG.relative_to(REPO_ROOT)
@@ -6113,22 +6091,15 @@ def test_the_suppression_flag_scan_reports_each_banned_spelling() -> None:
 
 def test_no_workflow_or_hook_file_silences_a_checker_with_a_flag() -> None:
     """
-    No workflow or hook step passes a flag or setting that drops a failure (D-05).
+    No workflow or hook step passes a flag or setting that drops a failure.
 
-    The advisory gate in ``ci.yml`` brought with it a suppression surface the
-    existing ban never reached: that guard scans tracked Python files, and
-    does so deliberately, because the prose stating the rule lives in Markdown
-    and YAML. An advisory waved through by a flag is the same defect as a
-    silenced type error -- the report stops, the vulnerable version stays in
-    the lock, and the build goes green over it. The match is on the bare flag
-    rather than on the audit step, because a line continuation would evade a
-    narrower rule and because the flag would be a suppression on any other
-    tool in these files too. Now that CI runs the hook file itself, a skipped
-    hook or a swallowed exit status is the same defect one level up, so those
-    spellings are banned alongside it. The scan runs over significant lines,
-    so the comment in ``ci.yml`` stating this ban is not read as the ban being
-    broken, and the audit flag is built at runtime for the reason the owner
-    guard gives further up.
+    The Python suppression ban scans only Python files, so workflows and the
+    hook file need their own. An advisory waved through by a flag is a
+    silenced error: the vulnerable version stays in the lock and the build
+    goes green. The match is on the bare flag, not the advisory step, so a line
+    continuation cannot evade it; a skipped hook or a swallowed exit status
+    is banned alongside it. Only significant lines are scanned, so the
+    ``ci.yml`` comment stating the ban is not read as breaking it.
     """
     scanned = 0
     offenders: list[str] = []
@@ -6172,26 +6143,17 @@ LOCAL_WORKFLOW_PREFIXES = ("$/", "./")
 
 def test_every_workflow_uses_reference_is_a_commented_lowercase_sha() -> None:
     """
-    Every ``uses:`` ref is a full lowercase SHA carrying its version (D-05).
+    Every ``uses:`` ref is a full lowercase SHA carrying its version.
 
-    A tag or branch ref is mutable: whoever controls the action can repoint it,
-    and different bytes then run with this workflow's permissions. The trailing
-    comment is the half a reviewer actually reads, and ``ci.yml:1`` and
-    ``release.yml:1`` already declare -- in identical words -- that comments
-    must carry the full version, while nothing until now parsed that claim.
-    The cross-file check catches the one-site-updated-one-missed case, which
-    has real duplication to work with: ``actions/checkout`` appears six times
-    and ``astral-sh/setup-uv`` five.
+    A tag or branch ref is mutable, so whoever controls the action can change
+    the bytes that run with this workflow's permissions. Both workflow headers
+    promise a trailing version comment, the half a reviewer reads. One action
+    at one version must carry one SHA at every site. A ``uses:`` line in
+    neither the exempt nor the pinned form is an offender, not a skip.
 
-    Classification is total on purpose. A ``uses:`` line matching neither the
-    exempt nor the pinned form is an offender rather than a silent skip, because
-    a guard that quietly passes over what it cannot parse is worse than none.
-
-    What this deliberately does not do: assert that a SHA is the commit its
-    comment names. That is a registry lookup, it would break the suite's
-    offline guarantee, and it would need a token for rate limits. Dependabot
-    rewrites a SHA and its comment together, so ongoing agreement is the bot's
-    job; the "wrong from day one" residual was closed once by hand under D-06.
+    Whether a SHA is the commit its comment names is not checked: that needs
+    a registry lookup, which the offline suite cannot make. Dependabot
+    rewrites a SHA and its comment together.
     """
     exempt: list[str] = []
     pinned: list[tuple[str, str, str, str]] = []
@@ -6304,9 +6266,10 @@ RELEASE_WORKFLOW = WORKFLOW_DIR / "release.yml"
 LATEST_WORD = re.compile(r"(?<![\w-])latest(?![\w-])")
 
 # The exact expressions that route a release by the gate's one output, which
-# it derives from the parsed version, not from the tag's text. Only the literal answer ``false`` selects the
-# real index, so an empty or missing gate output falls through to TestPyPI,
-# where an upload can be abandoned, never to PyPI, where it cannot be undone.
+# it derives from the parsed version, not from the tag's text. Only the
+# literal answer ``false`` selects the real index, so an empty or missing gate
+# output falls through to TestPyPI, where an upload can be abandoned, never to
+# PyPI, where it cannot be undone.
 # Pinned whole rather than by substring: swapping the two arms keeps every
 # substring and sends each release candidate to the real index.
 GATE_ENVIRONMENT = (
@@ -6319,8 +6282,8 @@ GATE_INDEX_URL = (
 # The gate's command, and the install it runs after.
 GATE_SCRIPT = "scripts/release_gate.py"
 GATE_INSTALL = "uv sync --locked --only-group release --no-install-project"
-# Ways a workflow has routed a release by reading the tag's text for a hyphen.
-# Each is a string test, which is exactly what the version gate replaced.
+# Ways to route a release by reading the tag's text for a hyphen. Each is a
+# string test on the tag, where routing belongs to the version gate's output.
 HYPHEN_ROUTING = ("contains(github.ref_name", "*-*")
 # An expression opener. The tag name is attacker-chosen text, so a ``run:``
 # script reads it from the environment rather than having it pasted in.
@@ -6443,9 +6406,9 @@ def test_release_publishes_only_after_ci_and_the_version_gate() -> None:
 
     A container registry tag can be deleted and pushed again; a package index
     upload cannot. So the image publish needs CI (which builds and smoke-tests
-    the image) and the gate, and the index upload needs all three. A release
-    candidate once uploaded to the index in parallel with an image build that
-    then failed, which is the half-publish this order rules out.
+    the image) and the gate, and the index upload needs all three. An index
+    upload running beside an image build that then fails is the half-publish
+    this order rules out.
     """
     docker_needs = _job_needs(_release_job("publish-docker"))
     pypi_needs = _job_needs(_release_job("publish-pypi"))
