@@ -2264,7 +2264,7 @@ class TestResolveDeviceChange:
     def test_device_change_first_detection_logs_info_only(
         self, default_settings: Settings, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The first detection has nothing to differ from: INFO, as before."""
+        """The first detection has nothing to differ from: one INFO."""
         default_settings.scanner.device = ""
         memory = DeviceMemory()
 
@@ -2401,7 +2401,7 @@ class TestNoScannerFound:
 
 class TestDuplexStrategy:
     """
-    ``profile.duplex`` alone chooses the scanning strategy (DPLX-01, DPLX-03).
+    ``profile.duplex`` alone chooses the scanning strategy.
 
     ``source`` is a pure SANE value: a source that merely reads like manual
     duplex must not start the two-pass flow, and a manual-duplex profile must
@@ -2620,23 +2620,16 @@ def _manual_duplex_over_the_fake(
 
 class TestManualDuplexOverTheSharedFake:
     """
-    A manual duplex run driven through a real SaneBackend (SCNR-07, M-32).
+    A manual duplex run driven through a real SaneBackend.
 
-    Every other pipeline test here hands ``run_pipeline`` a
-    ``MagicMock(spec=ScannerBackend)``, which can only ever return what the test
-    already told it to return.  A SANE-level defect on a duplex path -- a source
-    never assigned to the device, a feeder never rewound, a second pass handing
-    back the first pass's sheets -- cannot surface through a mock like that,
-    which is M-32's actual complaint.  This test drives the pipeline through the
-    real backend over the one shared fake, so such a defect can.
-
-    The two passes share one device handle.  ``scan_pages`` opens and closes the
-    device per pass and drains the feeder to its end, so the stack has to be
-    reloaded between them -- which is precisely the physical act manual duplex
-    asks the operator to perform.  The pipeline announces that moment with
-    ``AWAITING_FLIP`` *before* it asks the flip coordinator, so the status
-    callback is the honest place to do the reload: no second device, no thread,
-    and the reload happens exactly when the operator's would.
+    A ``MagicMock(spec=ScannerBackend)`` returns only what the test told it
+    to, so a SANE-level duplex defect -- a source never assigned, a feeder
+    never rewound, a second pass handing back the first pass's sheets --
+    cannot surface through it.  These tests drive the real backend over the
+    one shared fake.  ``scan_pages`` drains the feeder each pass, so the
+    status callback reloads the stack on ``AWAITING_FLIP``, which the
+    pipeline announces before it asks the flip coordinator: exactly when the
+    operator would reload it, with no second device and no thread.
     """
 
     def test_both_passes_run_through_the_backend_and_interleave(
@@ -2653,7 +2646,7 @@ class TestManualDuplexOverTheSharedFake:
         ``"Automatic Document Feeder"``, with no plain ``"ADF"`` and no
         manual-duplex pseudo-source, while the profile says ``source = "ADF"``
         as the how-to teaches. Only resolving the feeder from the device's own
-        list can make this pass (C-01, D-02).
+        list can make this pass.
         """
         profile = default_settings.profiles["default"]
         profile.source = "ADF"
@@ -2760,8 +2753,8 @@ class TestManualDuplexOverTheSharedFake:
         One sheet lost on pass A alone is enough to stop the interleave.
 
         Pass A reads two of three fronts; pass B reads two backs. The counts
-        agree, but a sheet went missing on one pass, so position no longer
-        proves which back belongs to which front.
+        agree, but a sheet went missing on one pass, so position does not
+        prove which back belongs to which front.
         """
         fronts = ["red", _UNREADABLE, "blue"]
         backs = ["yellow", "cyan"]
@@ -2787,10 +2780,10 @@ class TestManualDuplexOverTheSharedFake:
         """
         A flatbed-plus-Auto device fails loudly instead of snapshotting twice.
 
-        This is C-01's silent path: ``Auto`` on offer, ``auto_source_mode`` at
-        its ``"flatbed"`` default, and manual duplex used to take one platen
-        snapshot per pass and report a green Complete. Now no page is taken,
-        the operator is never asked to flip, and nothing is uploaded.
+        With ``Auto`` on offer and ``auto_source_mode`` at its ``"flatbed"``
+        default, manual duplex would otherwise take one platen snapshot per
+        pass and report a green Complete.  No page is taken, the operator is
+        never asked to flip, and nothing is uploaded.
         """
         profile = default_settings.profiles["default"]
         profile.source = "ADF"
@@ -2824,7 +2817,7 @@ class TestManualDuplexOverTheSharedFake:
 
 
 class TestExifStripped:
-    """No EXIF reaches the PDF, now that the page reaches it as a file."""
+    """No EXIF reaches the PDF from a spooled page."""
 
     def test_exif_stripped_before_pdf(
         self,
@@ -2833,15 +2826,13 @@ class TestExifStripped:
         tmp_path: Path,
     ) -> None:
         """
-        A page arriving with EXIF is spooled without it (Pitfall #5).
+        A page arriving with EXIF is spooled without it.
 
-        The pipeline no longer strips EXIF page by page, and restoring that
-        loop would have nothing to act on: what reaches ``assemble_pdf`` is a
-        record naming a PNG, and Pillow's PNG encoder emits an EXIF chunk only
-        for one handed to it through ``encoderinfo``, which the spool never
-        does.  The property the deleted loop protected is therefore still true,
-        and this asserts it where it is now decided -- on the spooled file the
-        PDF embeds, read while that file still exists.
+        What reaches ``assemble_pdf`` is a record naming a PNG, and Pillow's
+        PNG encoder emits an EXIF chunk only for one handed to it through
+        ``encoderinfo``, which the spool never does.  This asserts it where it
+        is decided -- on the spooled file the PDF embeds, read while that file
+        still exists.
         """
         img = _make_content_image()
         img.info["exif"] = b"fake-exif-data"
@@ -2908,7 +2899,7 @@ class TestEmptyPageDetectionToggle:
 
 
 class TestFlatbedStillWorks:
-    """Flatbed regression tests."""
+    """A flatbed scan still produces a PDF and its thumbnail."""
 
     def test_flatbed_single_page_with_thumbnail(
         self,
@@ -2999,14 +2990,14 @@ class TestDiskSpaceCheck:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        IN-07: a tmp_dir that cannot be used is a setup error, not a bug.
+        A tmp_dir that cannot be used is a setup error, not a bug.
 
         Each of the three start-up steps can raise a raw OSError -- a
-        permission refused, or tmp_dir removed since start-up.  Untranslated,
-        it classified UNKNOWN and the CLI called it a saneless bug (exit 5),
-        while ``validate_settings_dirs`` reports the same condition as a
-        ConfigError at start-up.  Nothing is scanned.  A full disk is the one
-        OSError that is not a setup error; the test after this one covers it.
+        permission refused, or tmp_dir removed since start-up.  It is reported
+        as a ConfigError, as ``validate_settings_dirs`` reports the same
+        condition at start-up, never as an UNKNOWN saneless bug.  Nothing is
+        scanned.  A full disk is the one OSError that is not a setup error;
+        the test after this one covers it.
         """
         tmp_dir = tmp_path / "work"
         default_settings.output.tmp_dir = tmp_dir
@@ -3309,11 +3300,11 @@ class TestPipelineEventEnum:
 
     @pytest.mark.parametrize("event", list(PipelineEvent))
     def test_job_state_projection_is_total(self, event: PipelineEvent) -> None:
-        """Every PipelineEvent projects to a JobState, with no None escape (DPLX-06)."""
+        """Every PipelineEvent projects to a JobState, with no None escape."""
         assert isinstance(event.job_state, JobState)
 
     def test_job_state_projection_mapping(self) -> None:
-        """Each state-changing event names the state the worker persists (CTR-01)."""
+        """Each state-changing event names the state the worker persists."""
         assert PipelineEvent.SCANNING.job_state is JobState.SCANNING
         assert PipelineEvent.AWAITING_FLIP.job_state is JobState.AWAITING_FLIP
         assert PipelineEvent.SCANNING_REVERSE.job_state is JobState.SCANNING_REVERSE
@@ -3329,16 +3320,16 @@ class TestPipelineEventEnum:
 
     def test_scanning_reverse_projects_to_its_own_job_state(self) -> None:
         """
-        Pass B persists SCANNING_REVERSE, so the job leaves AWAITING_FLIP (DPLX-06).
+        Pass B persists SCANNING_REVERSE, so the job leaves AWAITING_FLIP.
 
-        While this projected to None the job stayed AWAITING_FLIP for the whole
-        of pass B, leaving the flip prompt and its dead Abort on screen as pages fed.
+        Otherwise the job would stay AWAITING_FLIP for the whole of pass B,
+        leaving the flip prompt and its dead Abort on screen as pages fed.
         """
         assert PipelineEvent.SCANNING_REVERSE.job_state is JobState.SCANNING_REVERSE
 
 
 class TestScanResultContract:
-    """run_pipeline's typed ScanResult return (CTR-03)."""
+    """run_pipeline returns a typed ScanResult."""
 
     def test_success_outcome_and_page_counts(
         self,
@@ -3426,7 +3417,7 @@ class TestScanResultContract:
         )
 
         assert result.outcome is ScanOutcome.FALLBACK
-        # OUTC-02: the FALLBACK state says the document took the other route;
+        # The FALLBACK state says the document took the other route;
         # the warning says what that route did not do.  A state on its own
         # leaves the user to guess why their title and tags never appeared.
         assert result.warning is not None
@@ -3511,9 +3502,8 @@ class TestPreservation:
         """
         A Paperless FAILURE after a successful upload still preserves the PDF.
 
-        This is the case the whole phase is named after: a guard wrapped around
-        only the upload would let this raise unwind the temporary directory and
-        delete the finished scan.
+        A guard wrapped around only the upload would let this raise unwind
+        the temporary directory and delete the finished scan.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = _delivering_to_api()
@@ -3537,7 +3527,7 @@ class TestPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """D-10: a timeout is ambiguous, so the local copy is kept too."""
+        """A timeout is ambiguous, so the local copy is kept too."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = _delivering_to_api()
         paperless.poll_task.side_effect = PaperlessTimeoutError(
@@ -3556,7 +3546,7 @@ class TestPreservation:
 
         assert len(list(failed_dir.glob("*.pdf"))) == 1
         # The subclass survives the re-raise, so a caller that narrows to a
-        # timeout deliberately (D-11) still can.
+        # timeout deliberately still can.
         assert type(excinfo.value) is PaperlessTimeoutError
 
     def test_preserved_destination_is_named_in_the_raised_message(
@@ -3564,7 +3554,7 @@ class TestPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """OUTC-04: the user must be told where the scan went."""
+        """The user is told where the scan went."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
@@ -3591,9 +3581,8 @@ class TestPreservation:
         """
         The original exception itself escapes, with its traceback.
 
-        This used to assert the original was on ``__cause__`` of a rebuilt
-        copy.  The run guard now attaches a note and re-raises the very object
-        the client raised, so there is no copy and no chain.
+        The run guard attaches a note and re-raises the very object the
+        client raised, so there is no copy and no chain.
         """
         _isolate_dirs(default_settings, tmp_path)
         original = PaperlessError("Upload failed")
@@ -3644,11 +3633,9 @@ class TestPreservation:
         """
         A non-saneless exception in the delivery window keeps its own type.
 
-        This test used to pin the opposite: the delivery guard re-raised any
-        foreign exception as a ``PaperlessError``, so a bug in our own code
-        was filed as an upload failure (exit 3).  The run guard now keeps the
-        PDF, attaches a note and re-raises the same ``RuntimeError``, which
-        ``classify_error`` files as UNKNOWN.
+        The run guard keeps the PDF, attaches a note and re-raises the same
+        ``RuntimeError``, which ``classify_error`` files as UNKNOWN, so a bug
+        in our own code is never filed as an upload failure.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         original = RuntimeError("something odd")
@@ -3794,9 +3781,8 @@ class TestPreservation:
         Only the PDF is preserved: the spooled pages die with the workspace.
 
         The spool lives inside the job's workspace, and a delivery failure
-        keeps the assembled PDF and nothing else, so
-        ``failed/`` holds exactly one kind of file.  Plan 29-09 is what adds a
-        page directory beside it; until then this is the whole contract.
+        keeps the assembled PDF and nothing else, so ``failed/`` holds exactly
+        one kind of file.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
@@ -3846,8 +3832,8 @@ def _spooling_then_failing(
     """
     Build a ``scan_pages`` stand-in that spools some pages and then fails.
 
-    This is the mid-batch failure HARD-02 is about: a jam on sheet N+1 of a
-    stack whose first N sheets already went through the feeder.  The pages go
+    A mid-batch failure: a jam on sheet N+1 of a stack whose first N
+    sheets already went through the feeder.  The pages go
     into the pipeline's own sink, so the records the preservation path finds --
     and the files behind them -- are the ones production would have.
 
@@ -3892,14 +3878,14 @@ def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
 
 class TestPartialScanPreservation:
     """
-    HARD-02 / D-09: a mid-batch failure keeps the pages already fed.
+    A mid-batch failure keeps the pages already fed.
 
-    A jam on page 40 of a 50-sheet stack used to discard the 39 sheets the
-    operator had already put through the feeder.  The spool holds them, so the
+    A jam on page 40 of a 50-sheet stack does not discard the 39 sheets the
+    operator already put through the feeder.  The spool holds them, so the
     guard assembles them unfiltered into a ``(partial)`` PDF under ``failed/``
     and names the count and the path in the exception it re-raises -- without
     changing that exception's type, which is what keeps the job's error
-    category and the CLI's exit code correct (Phase 28 D-07).
+    category and the CLI's exit code correct.
     """
 
     def test_partial_scan_preserved_when_the_scanner_fails_mid_batch(
@@ -3953,7 +3939,7 @@ class TestPartialScanPreservation:
 
         ``type(...) is``, not ``isinstance``: a silent widening to
         ``SanelessError`` would satisfy an isinstance check while changing the
-        exit code the CLI chooses (Phase 28's table).
+        exit code the CLI chooses.
         """
         _isolate_dirs(default_settings, tmp_path)
         original = ScanError("Scanner error on page 3: Paper jam")
@@ -4013,7 +3999,7 @@ class TestPartialScanPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """N-02's rejected alternative: no incomplete document reaches paperless."""
+        """No incomplete document reaches paperless."""
         _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
 
@@ -4037,7 +4023,7 @@ class TestPartialScanPreservation:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        D-10: the operator chose to stop, so nothing is kept.
+        The operator chose to stop, so nothing is kept.
 
         ``ScanCancelledError`` is an ordinary ``Exception``, so a guard that
         caught only broadly would file a cancelled scan into a directory
