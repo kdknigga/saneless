@@ -829,85 +829,37 @@ class PaperlessClient:
     """
     Client for the paperless-ngx REST API.
 
-    Handles document uploads with metadata, task polling with
-    exponential backoff, and connection testing.  The construction and
-    upload path is a module boundary: whatever goes wrong there leaves as a
-    ``PaperlessError`` naming the configured base URL and the original text
-    with the token struck out, chained to its cause unless some link of that
-    cause's chain quotes the token (see ``_cause``) -- or, for a request that
-    could not be sent at all, with fixed text and no cause: a ``ConfigError``
-    when the configuration is at fault, else a ``PaperlessError``.  A URL or
-    token the constructor refuses is a ``PaperlessError`` with fixed text and
-    no cause.
+    Handles document uploads with metadata, task polling with exponential
+    backoff, and connection testing.  Whatever goes wrong while the client is
+    built or an upload runs leaves as a ``PaperlessError`` or ``ConfigError``
+    with the token struck out of any text it quotes and no chained cause that
+    quotes it (see ``_cause``).
 
-    ``_retry_decision`` sorts every httpx2 error by whether the upload can
-    have reached paperless-ngx, and upload failures fall into four groups:
-
-    * **Retried before send**, with waits that double from 1 s up to 5 s, for
-      the send budget (60 s unless ``timing`` says otherwise) in total: a
-      refused or timed-out connection, no
-      free connection in the pool, a proxy that refused the tunnel
-      (ProxyError), and a body write that stalled (WriteTimeout).  None of
-      them can have delivered the whole body.
-    * **After send**, never resent and never copied: a failure while reading
-      the answer -- ReadTimeout, ReadError, RemoteProtocolError (a proxy in
-      front of paperless-ngx closing the connection), CloseError and the
-      rest -- any 5xx, and a 200 whose body is not JSON or carries no task id.
-      paperless-ngx may already hold the document, so each is a
-      ``PaperlessUncertainSendError``.
-    * **Fail fast**, with no further attempt: a 4xx rejection, any other
-      non-2xx that is not a server error (a redirect, which names its target
-      so ``paperless.url`` can be corrected), and any other ``httpx2.HTTPError``.
-      A 406 is a server that does not accept API version 9 or 10, reported as
-      a ``PaperlessIncompatibleError``; it refuses before it reads the upload,
-      so nothing was stored.  A 406 to a request that asked for 10 is first
-      asked once more with 9, since the server that announced 10 may have
-      been rolled back.
-    * **Not sendable**, with no further attempt: a ``paperless.url`` that is
-      unset or has no usable scheme (``httpx2.UnsupportedProtocol``), and a
-      request the transport refused to put on the wire
-      (``httpx2.LocalProtocolError``, which is what h11 raises for a token
-      with edge whitespace or a control character).  Both are TransportErrors
-      that no retry can fix, and the second quotes the token in its text, so
-      the message is fixed and never chained.  It is a ``ConfigError`` when
-      the configured URL or token is at fault, and a ``PaperlessError``
-      naming only the exception's class when they pass the load rules and so
-      cannot be (see ``_unsendable_error``).
-
-    When a consume directory is configured it is the fallback only once the
-    before-send budget is spent: a scan must never be lost to an outage.
-    Nothing else is copied.  An after-send failure may already be a document,
-    so a copy could make it two; a 4xx, a 406, a redirect and a
-    misconfiguration are final, and a misconfiguration would otherwise send
-    every scan to the folder without its metadata.  The caller keeps the PDF
-    instead.
-
-    A request is resent only when it provably did not reach paperless-ngx, so
-    one scan cannot become two documents through a retry.
+    ``_retry_decision`` sorts every upload failure by whether the upload can
+    have reached paperless-ngx.  Only a failure before send is retried, for
+    the send budget, and only then may the consume directory take the PDF; an
+    upload that may have arrived is never resent or copied, and a refusal, a
+    406 or a misconfiguration is final.
+    See docs/explanation/decisions/0009-no-resend-after-send.md.
 
     Args:
-        url: Base URL of the paperless-ngx instance.
-        token: API authentication token.  It is sent only in the
-            ``Authorization`` header and never interpolated into a message;
-            the client keeps it only to strike it out of library text it
-            quotes.  It is the only credential sent: a ``url`` carrying a
-            user name or password is refused, never sent in its place.
+        url: Base URL of the paperless-ngx instance.  One carrying a user
+            name or password is refused.
+        token: API authentication token, sent only in the ``Authorization``
+            header; it is kept only to strike it out of quoted text.
         consume_dir: Optional fallback directory for an upload whose
             before-send budget ran out; None disables the fallback copy.
-        transport: The httpx2 transport requests go through, handed straight
-            to ``httpx2.Client(transport=...)``. None uses httpx2's default
-            network transport. This is the injection seam for tests (an
-            ``httpx2.MockTransport``) and for custom transports.
+        transport: The httpx2 transport requests go through; None uses
+            httpx2's default.  Tests pass an ``httpx2.MockTransport``.
         timing: The upload's send budget, the clock and sleep it runs on, and
             how its timeout is built; see ``PaperlessTiming``.
 
     Raises:
-        PaperlessError: If ``url`` is not a valid URL (``httpx2.InvalidURL``)
-            or carries a user name or password, or if ``token`` holds a
-            character an HTTP header cannot carry -- each with fixed text and
-            no chained cause, since the library's text can quote a password or
-            the token -- or if the TLS trust store named by ``SSL_CERT_FILE``
-            or ``SSL_CERT_DIR`` cannot be read.
+        PaperlessError: If ``url`` is not a valid URL or carries a user name
+            or password, or ``token`` holds a character an HTTP header cannot
+            carry (each with fixed text and no cause, since the library's text
+            can quote a secret), or the TLS trust store named by
+            ``SSL_CERT_FILE`` or ``SSL_CERT_DIR`` cannot be read.
 
     """
 
@@ -922,12 +874,9 @@ class PaperlessClient:
     ) -> None:
         """Initialize the paperless-ngx API client."""
         base_url = url.rstrip("/")
-        # The only form of the URL any message or log line may carry.  A user
-        # name or password is refused below, but an invalid URL is still
-        # shown, and it may hold one the parser could not read.
+        # The only form of the URL any message or log line may carry: an
+        # invalid URL is still shown, and may hold userinfo the parser missed.
         self._display_url = _without_userinfo(base_url)
-        # " at <url>" for a message, or nothing when no address is set: an
-        # unset paperless.url would otherwise read "Paperless at : ...".
         self._at_url = f" at {self._display_url}" if self._display_url else ""
         # Whether the transport could be refusing the configured values at
         # all.  A set token and URL that pass the load rules are ones h11
@@ -947,13 +896,10 @@ class PaperlessClient:
                     "paperless-ngx API token in paperless.token"
                 )
                 raise PaperlessError(msg) from None
-            # The highest API version the server has announced, or None until
-            # an answer names one.  Set before the client exists, because its
-            # hooks read it.
+            # Set before the client exists, because its hooks read it.
             self._server_max: int | None = None
-            # Accept is not a default header: it names the version, which can
-            # change once an answer announces a higher one, so the request
-            # hook sets it on each request and the defaults are never mutated.
+            # Accept names the version, which can change between requests, so
+            # the request hook sets it and the default headers never mutate.
             self._client = httpx2.Client(
                 base_url=base_url,
                 headers={"Authorization": f"Token {token}"},
@@ -965,10 +911,9 @@ class PaperlessClient:
                 },
             )
         except httpx2.InvalidURL:
-            # The parser's own text can quote part of a password: a "/" in
-            # one makes httpx2 read what comes before it as the port, and
-            # its complaint names that port.  Nothing of it is kept, not even
-            # as the chained cause.
+            # The parser's text can quote part of a password (a "/" in one
+            # makes httpx2 read what precedes it as the port), so nothing of
+            # it is kept, not even as the cause.
             msg = f"Paperless URL {self._display_url} is not valid"
             raise PaperlessError(msg) from None
         except UnicodeEncodeError:
@@ -980,15 +925,10 @@ class PaperlessClient:
             )
             raise PaperlessError(msg) from None
         except OSError as exc:
-            # The TLS trust anchors are read while the client is being built,
-            # so a SSL_CERT_FILE naming a path that does not exist arrives
-            # here as FileNotFoundError, and one naming a directory -- which
-            # is what a docker-compose bind mount leaves behind when the host
-            # file is absent -- arrives as IsADirectoryError.  Neither may
-            # leave this boundary as a raw traceback.  The offending path is
-            # not recoverable from the exception, whose filename attribute is
-            # None, so the message names the two variables that steer the
-            # trust store and can be corrected.
+            # The trust anchors are read here, so an SSL_CERT_FILE naming a
+            # missing path, or the directory a bind mount leaves when the host
+            # file is absent, arrives as an OSError.  Its filename is None, so
+            # the message names the two variables that steer the trust store.
             msg = (
                 f"Could not build the TLS trust store for Paperless{self._at_url}: "
                 f"{describe(exc)}; "
@@ -1015,14 +955,11 @@ class PaperlessClient:
         """
         Name the API version the next request will ask for.
 
-        It is 10 once a server has announced 10 or higher, and 9 otherwise:
-        before any answer, when no answer named a version, and when the
-        latest usable announcement was 9.  A server announcing more than 10
-        still allows 10, the highest this client knows; speaking a later
-        version is deferred until saneless is written against it.
+        The newest supported version once a server has announced it or a
+        higher one, and the oldest otherwise.
 
         Returns:
-            One of the supported versions, 9 or 10.
+            One of ``_SUPPORTED_API_VERSIONS``.
 
         """
         oldest, newest = _SUPPORTED_API_VERSIONS
@@ -1047,24 +984,11 @@ class PaperlessClient:
         """
         Remember the highest API version an answer announces.
 
-        The response event hook, which runs for every answer, including one
-        that later raises from ``raise_for_status``, and adds no request.
-        Only a value of one to three ASCII digits naming at least 9 is kept;
-        anything else, and an answer without the header, leaves what was
-        learned as it is.  The value is stored as an int and never quoted.
-        The web client is shared by several threads, and this is one
-        attribute write, so racing answers from one server can only write the
-        same value.
-
-        A 406 to a request that asked for 10 forgets what was learned, so the
-        next request asks for 9 again.  Without it a client that once saw 10
-        announced -- by a paperless-ngx since rolled back to 2.x, or by another
-        server at the same address -- would ask for 10 until the process
-        restarted, and every request would be refused.
-
-        Args:
-            response: The answer just received.
-
+        The response event hook.  Threads share the client, but this is one
+        attribute write, so racing answers from one server write the same
+        value.  A 406 to the newest version forgets what was learned, or a
+        client that saw it from a since rolled-back server would ask for it,
+        and be refused, until restart.
         """
         if _refused_newest_version(response):
             self._server_max = None
@@ -1101,14 +1025,11 @@ class PaperlessClient:
         """
         Upload a PDF document to paperless-ngx.
 
-        Builds multipart form data with title and optional metadata.
-        Tags are submitted as repeated form fields.  No document date is
-        sent: paperless-ngx dates the document itself.  A failure that proves
-        the request never reached paperless-ngx whole is retried, with waits
-        doubling from 1 s up to 5 s, until the send budget is spent; the
-        consume directory, when one is configured, then gets the PDF instead.
-        Every other failure ends the upload at once and copies nothing; see
-        the class docstring for how each is reported.
+        No document date is sent: paperless-ngx dates the document itself.  A
+        failure that proves the request never reached paperless-ngx whole is
+        retried until the send budget is spent, and the consume directory, if
+        any, then gets the PDF.  Every other failure ends the upload at once
+        and copies nothing.
 
         Args:
             pdf_path: Path to the PDF file to upload.
@@ -1123,36 +1044,20 @@ class PaperlessClient:
             to.
 
         Raises:
-            ConfigError: If the request cannot be sent from the configured
-                ``paperless.url`` and ``paperless.token``: the URL is unset or
-                has no usable scheme, or the transport refused a token or URL
-                outside the load rules.  The message is fixed text starting
-                ``Uploading to Paperless:`` and naming the setting, and the
-                error carries no cause, so no traceback can print the refused
-                header value.  Nothing is retried or copied.
+            ConfigError: If the configured ``paperless.url`` or
+                ``paperless.token`` cannot be sent: fixed text naming the
+                setting, with no cause, so no traceback prints the refused
+                header value.
             PaperlessUncertainSendError: If the upload may have reached
                 paperless-ngx without a usable answer: a failure while reading
-                the answer, a 5xx, or a 200 whose body is not JSON or is not a
-                non-empty string task id.  A read timeout names the time
-                allowed and the file size.  Nothing is resent or copied.
-            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
-                not accept API version 9 or 10.  Fixed text, no cause, nothing
-                retried or copied.
-            PaperlessError: If the server rejects the upload with a 4xx
-                (``Paperless rejected the upload (<status> <reason>): <line>``)
-                or answers with a redirect (``Paperless redirected the upload
-                (<status> <reason>) to <location>; check paperless.url``);
-                if the send budget is spent and no consume directory is
-                configured (``could not connect for <N>s``, or ``could not
-                deliver the upload for <N>s`` when the last failure came after
-                connecting); if the transport
-                refuses to send a request built from a sendable URL and token
-                (fixed text, no cause, nothing retried or copied); if any
-                other httpx2 error occurs; if the PDF cannot be read; or if
-                copying into the consume directory fails.  Any library or
-                server text it quotes has the token struck out, and it is
-                chained to its cause only when no link of the cause's chain
-                quotes the token.
+                the answer, a 5xx, or a 200 that carries no task id.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it
+                accepts none of the supported API versions.
+            PaperlessError: If the server rejects or redirects the upload; if
+                the send budget is spent with no consume directory; if the
+                transport refuses a request built from sendable settings; if
+                any other httpx2 error occurs; or if the PDF cannot be read or
+                copied into the consume directory.
 
         """
         data = self._form_fields(title, tags, correspondent)
@@ -1195,8 +1100,7 @@ class PaperlessClient:
                     case _RetryDecision.REFUSED if isinstance(
                         exc, httpx2.HTTPStatusError
                     ):
-                        # A 4xx rejection and a redirect (1xx and 3xx too:
-                        # raise_for_status refuses every non-2xx) would only be
+                        # A non-2xx that is neither a 5xx nor a 406 would be
                         # answered the same way again: no retry, no fallback.
                         msg = _not_accepted_message(exc.response, self._token)
                         raise PaperlessError(msg) from self._cause(exc)
@@ -1260,21 +1164,13 @@ class PaperlessClient:
             data: The multipart form fields.
             timeout: The request's timeout, scaled to the PDF's size.
 
-        Returns:
-            The task id: a non-empty string, returned as sent.
+        Any ``httpx2.HTTPError`` propagates for ``upload_document`` to sort.
+        A 406 to the newest API version is asked once more, with the oldest.
 
         Raises:
             PaperlessError: If the PDF cannot be opened.
-            PaperlessUncertainSendError: If a 200 body is not JSON, or is not
-                a non-empty string.  paperless-ngx answered 200, so the
-                document may be stored; the message names what came back.
-
-        Any ``httpx2.HTTPError`` from the request or from ``raise_for_status``
-        propagates: ``upload_document`` decides which of those to retry.
-
-        A 406 to a request that asked for API version 10 is asked once more:
-        the response hook has forgotten the 10, so the second request asks for
-        9 (see ``_refused_newest_version`` for why that cannot duplicate).
+            PaperlessUncertainSendError: If a 200 body is not a non-empty JSON
+                string; the document may be stored.
 
         """
         response = self._send_document(pdf_path, data, timeout)
@@ -1289,8 +1185,7 @@ class PaperlessClient:
                 f"not JSON: {self._answer_text(response)}{_MAY_HAVE_REACHED}"
             )
             raise PaperlessUncertainSendError(msg) from self._cause(exc)
-        # Only a non-empty string is a task id.  A number, a bool, an object
-        # or null would otherwise become a string and be polled as one.
+        # A number, a bool, an object or null would otherwise be polled as text.
         if not isinstance(task_id, str) or not task_id.strip():
             msg = (
                 f"Paperless{self._at_url} answered the upload with "
@@ -1309,21 +1204,12 @@ class PaperlessClient:
         """
         Send the upload request once and return the answer, whatever its status.
 
-        Args:
-            pdf_path: Path to the PDF file to upload.
-            data: The multipart form fields.
-            timeout: The request's timeout, scaled to the PDF's size.
-
-        Returns:
-            The answer, not yet checked.
-
         Raises:
             PaperlessError: If the PDF cannot be opened.
 
         """
-        # Only the open is guarded: an OSError here is the PDF itself, while
-        # the request below raises httpx2's own types, which upload_document
-        # sorts into retries.
+        # Only the open is guarded: the request raises httpx2's own types,
+        # which upload_document sorts into retries.
         try:
             pdf_file = pdf_path.open("rb")
         except OSError as exc:
@@ -1356,13 +1242,6 @@ class PaperlessClient:
 
         Every place the client interpolates an exception's text goes through
         here, and so through ``_strike``.
-
-        Args:
-            exc: The cause.
-
-        Returns:
-            The one-line reason, with the token replaced by ``***``.
-
         """
         return _one_line_reason(exc, self._token)
 
@@ -1370,22 +1249,9 @@ class PaperlessClient:
         """
         Return ``exc`` as a cause to chain to, or None when it would leak the token.
 
-        A ``PaperlessError`` whose message has the token struck out would
-        still print it if it were chained to library text quoting it: the
-        worker logs a failed job with ``logger.exception`` and the CLI logs a
-        failure with ``exc_info``, and both print every chained cause and
-        context.  So the cause is kept only when its whole formatted
-        traceback -- exactly what a log would print, every link of its own
-        chain included -- is unchanged by ``_strike``.  Otherwise the error
-        is raised ``from None``: its message already carries the struck
-        reason, and no traceback can put the token back.
-
-        Args:
-            exc: The cause the caller would chain to.
-
-        Returns:
-            ``exc`` when no link of its chain quotes the token, else None.
-
+        The worker and the CLI log failures with their tracebacks, which print
+        every chained cause.  So the cause is kept only when its whole
+        formatted traceback, every link included, is unchanged by ``_strike``.
         """
         rendered = "".join(traceback.format_exception(exc))
         return exc if _strike(rendered, self._token) == rendered else None
@@ -1396,24 +1262,10 @@ class PaperlessClient:
         """
         Build the error for a request that could not be sent at all.
 
-        The configuration is blamed only when it can be at fault: a URL with
-        no usable scheme, or a token or URL outside the load rules, which a
-        client built from loaded settings never has.  Any other refusal --
-        h11 finding a body longer than its declared length, say -- is not
-        something ``paperless.url`` or ``paperless.token`` can fix, so it is a
-        ``PaperlessError`` that names only the exception's class.  Either way
-        the text is fixed: h11's own text for a refused header value quotes
-        it, and for the Authorization header that is the token.
-
-        Args:
-            exc: The error, used only for its type.  Its text is never
-                included.
-            action: What saneless was doing, e.g. ``Uploading to Paperless``.
-
-        Returns:
-            ``<action>: <fixed problem>``, one line, as a ``ConfigError`` when
-            the configuration is at fault and a ``PaperlessError`` otherwise.
-
+        A ``ConfigError`` only when the configuration can be at fault (a URL
+        with no usable scheme, or a value outside the load rules), else a
+        ``PaperlessError`` naming the exception's class.  The text is fixed:
+        h11's text for a refused Authorization header quotes the token.
         """
         if isinstance(exc, httpx2.UnsupportedProtocol):
             return ConfigError(f"{action}: {_URL_UNUSABLE}")
@@ -1430,23 +1282,14 @@ class PaperlessClient:
         """
         End an upload whose before-send budget ran out.
 
-        Args:
-            pdf_path: The PDF that could not be sent.
-            exc: The last attempt's error.
-
-        Returns:
-            The consume-folder copy, when a consume directory is configured.
-
         Raises:
-            PaperlessError: Naming the budget and the last error when there is
-                no consume directory, or from the copy itself.
+            PaperlessError: When there is no consume directory, or from the
+                copy itself.
 
         """
         if self._consume_dir is not None:
             return self._fall_back_to_consume_dir(pdf_path, self._consume_dir)
-        # Named by the last failure: a refused or timed-out connection never
-        # connected, but a stalled body write did connect, and no free pooled
-        # connection is not a connect failure either.
+        # A stalled body write and an empty pool did connect.
         failed = (
             "could not connect"
             if isinstance(
@@ -1466,17 +1309,8 @@ class PaperlessClient:
         """
         Say why an upload may have reached paperless-ngx without an answer.
 
-        Args:
-            exc: The after-send error.
-            size_bytes: The PDF's size.
-            timeout: The timeout the request was sent with.
-
-        Returns:
-            One line naming the address and the struck reason, ending with the
-            warning that the document may already be there.  A read timeout
-            names the time allowed and the file size instead, since a larger
-            file is given longer.
-
+        A read timeout names the time allowed and the file size, since a
+        larger file is given longer.
         """
         reason = self._reason(exc)
         if isinstance(exc, httpx2.ReadTimeout) and timeout.read is not None:
@@ -1498,19 +1332,11 @@ class PaperlessClient:
 
         The directory is never created.  A missing one almost always means
         the paperless-ngx volume is not mounted, and a directory made in its
-        place is one nothing watches: the copy would sit there unseen.
-
-        Args:
-            pdf_path: The PDF that could not be uploaded.
-            dest_dir: The configured consume directory.
-
-        Returns:
-            A FolderDelivery naming the file the PDF was copied to.
+        place is one nothing watches.
 
         Raises:
-            PaperlessError: If the directory does not exist, is not a
-                directory, or cannot be examined -- each worded for its own
-                cause -- or, chained to the OSError, if the copy fails.
+            PaperlessError: If the directory is missing, is not a directory or
+                cannot be examined, or if the copy fails.
 
         """
         try:
@@ -1549,50 +1375,26 @@ class PaperlessClient:
         """
         Hand a whole PDF to the consume directory, never a partial one.
 
-        paperless-ngx watches the consume directory with inotify and acts on
-        what appears there, so writing the bytes directly to the final name
-        lets it pick up a half-written PDF.  Instead the bytes go to a hidden
-        staging file, are flushed and fsynced, and only then take their final
-        name in one ``rename(2)``.
+        paperless-ngx acts on whatever appears in the consume directory, so
+        the bytes go to a hidden staging file, are fsynced, and only then
+        take their final name in one rename.  The directory is not fsynced:
+        it is a handoff, not a system of record.
 
-        Three details are load-bearing:
-
-        * The staging file is a unique hidden ``.part`` file created
-          exclusively by ``mkstemp`` (``O_EXCL``, mode 0600), so
-          nothing planted at a predictable name -- a symlink, or a leftover
-          from a crash -- can be written through or collide with it.
-          paperless-ngx 2.x logs it as an unknown file extension and 3.x
-          skips it by extension; neither consumes it.
-        * The staging file lives **inside the consume directory**, not in
-          the caller's temporary directory.  ``rename(2)`` is atomic only
-          within one filesystem, and the consume directory is typically a
-          Docker volume or a network share -- a rename across that boundary
-          fails with EXDEV.
-        * The rename is ``Path.replace``, which delegates to ``os.replace``
-          and so is the atomic, unconditionally-overwriting one.
-          ``Path.rename`` is not a substitute: it refuses an existing
-          destination on Windows.  ``os.replace`` is not called directly
-          only because ruff's PTH105 forbids it and this project does not
-          permit per-line suppressions.
-
-        The file is fsynced but the directory is not: the consume directory
-        is a handoff, not a system of record, so paying for file durability
-        is worth it while a directory fsync is not.
-
-        Args:
-            pdf_path: The PDF to hand over.
-            dest_dir: The consume directory, which must already exist.
-            dest: The final path inside dest_dir.
+        * The staging ``.part`` file is made exclusively by ``mkstemp``, so
+          nothing planted at a predictable name can be written through;
+          paperless-ngx 2.x and 3.x both leave it alone.
+        * It lives inside the consume directory, because a rename across
+          filesystems (a Docker volume, a network share) fails with EXDEV.
+        * The rename is ``Path.replace``: ``Path.rename`` refuses an existing
+          destination on Windows.
 
         Raises:
-            OSError: Whatever the copy or the rename raised, re-raised after
-                the staging file is removed so a failed handoff leaves no
-                truncated remnant for a retry or the consumer to find.
+            OSError: Whatever the copy or the rename raised, after the staging
+                file is removed.
 
         """
-        # Created owner-only and exclusively, so under no umask can anyone
-        # else write to it, even for an instant: the consume folder is often
-        # shared with a group.
+        # Owner-only and exclusive under any umask: the consume folder is
+        # often shared with a group.
         descriptor, staged_name = tempfile.mkstemp(
             dir=dest_dir, prefix=f".{pdf_path.name}.", suffix=".part"
         )
@@ -1603,13 +1405,8 @@ class PaperlessClient:
                 pdf_path.open("rb") as source,
             ):
                 # 0644 so paperless-ngx can read the copy whatever UID it runs
-                # as; the consume folder's own mode decides who can reach it.
-                # A chmod is not subject to the umask, and it is applied
-                # before the first byte is written, so the document is never
-                # in a file with any other mode, and never under its final
-                # name with one. A filesystem without Unix modes refuses it,
-                # and that must not fail a handoff that would otherwise save
-                # the scan.
+                # as, set before the first byte is written.  A filesystem
+                # without Unix modes refuses it, which must not fail the handoff.
                 try:
                     os.fchmod(staged_file.fileno(), 0o644)
                 except OSError as exc:
@@ -1630,79 +1427,37 @@ class PaperlessClient:
         """
         Poll the task endpoint with exponential backoff until the task finishes.
 
-        Two wire shapes are tolerated. API v9 answers ``GET /api/tasks/``
-        with a bare list of tasks whose ``status`` is uppercase and whose
-        failure text is a flat ``result`` string.  API v10 paginates the
-        list into ``{"count", "next", "previous", "results"}``, spells the
-        status in lowercase, and moved the failure text into
-        ``result_data["error_message"]``.  The client asks for v10 once the
-        server has announced it and for v9 until then (see ``api_version``),
-        so either shape can arrive.  In both, only the entry whose
-        ``task_id`` equals ours is read; an answer holding only other tasks
-        means ours is not visible yet.
-
-        A 200 carrying no task of ours is not an error.  A task is not always
-        visible immediately after the upload that created it, so an empty
-        list (or an empty ``results``) means "ask again", and polling
-        continues until the deadline.
-
-        Nor does an answer that says "later" end the poll: a 5xx, which is
-        usually a reverse proxy in front of a restarting paperless-ngx, or a
-        429 rate limit.  Neither does a request-level error (a connection
-        refused, a reset, a read timeout, a proxy closing the connection, a
-        body that cannot be decoded).  Each is logged and remembered, and the
-        poll backs off and asks again within the same deadline.  The waits
-        double from 0.5 s up to 5 s, and the last is cut to what remains.
-        An answered poll clears what was remembered.
-
-        A 401, 403, 404 or 406, and any other non-200, ends the poll at once:
-        a revoked token or a moved endpoint should be reported as what it is
-        within a second, not as a timeout several minutes later.
-
-        paperless-ngx accepted the upload before the poll began, so it holds
-        the document.  Every failure from here on is therefore "received, not
-        confirmed", never a plain failed upload that would invite a second
-        scan of the same document.
+        A 200 without our task means it is not visible yet, and a 5xx, a 429
+        or a request error may clear: each is retried until the deadline.
+        Any other non-200 ends the poll at once, so a revoked token is
+        reported as what it is rather than as a timeout.  paperless-ngx
+        accepted the upload before the poll began, so every failure from
+        here on is "received, not confirmed", never a failed upload that
+        would invite a second scan.
 
         Args:
             task_id: Task UUID returned from upload.
-            timeout: Maximum seconds to wait, measured on the client's clock
-                (see ``PaperlessTiming``), which includes request time as
-                well as sleep time. There is no default: callers pass
-                ``output.paperless_task_timeout``, so the configured value is
-                the only source.
+            timeout: Maximum seconds to wait, request time included, measured
+                on the client's clock.  There is no default: callers pass
+                ``output.paperless_task_timeout``.
 
         Returns:
-            ``TaskFiled`` carrying the task when it reached SUCCESS, or
-            ``TaskDuplicate`` when it ended FAILURE because paperless-ngx
-            already holds the file: that is a document delivered, not lost,
-            so it is an answer rather than an error.  The duplicate names the
-            existing document when the answer does (see ``_duplicate_of``).
+            ``TaskFiled`` when the task reached SUCCESS, or ``TaskDuplicate``
+            when paperless-ngx refused it because it already holds the file:
+            a document delivered, so an answer rather than an error.
 
         Raises:
             PaperlessUnconfirmedError: If the task ends FAILURE for any other
-                reason, carrying the message paperless-ngx supplied, or
-                REVOKED, saying paperless-ngx cancelled it; if a poll is
-                answered 406, in the
-                incompatible-version wording; if a poll gets any other
-                non-200 but a 5xx or 429, carrying the status code, the
-                reason phrase and the body reduced to one bounded line by
-                ``_render_error_body``; or if a 200 body is not JSON,
-                chained to the ValueError.  The token is struck out of every
-                piece of server text in the message.
+                reason or REVOKED, or a poll gets a non-200 that is not
+                retried, or a 200 whose body is not JSON.  Server text in the
+                message has the token struck out.
             PaperlessTimeoutError: A ``PaperlessUnconfirmedError``, if the
-                deadline passes before the task reaches a terminal status.
-                The message names the task id so the task can be looked up in
-                paperless-ngx directly, and, when the last poll got a 5xx, a
-                429 or a request error rather than an answer, ends by naming
-                it.  A request error is chained, unless its chain quotes the
-                token, when there is no cause.
+                deadline passes first.  The message names the task id, and the
+                last retried error when there was one.
 
         """
         deadline = self._clock() + timeout
         delay = 0.5
-        # What went wrong with the latest poll, on one line with the token
-        # struck, and the request error to chain to when it was one.
         last_error: str | None = None
         last_cause: BaseException | None = None
 
@@ -1712,10 +1467,8 @@ class PaperlessClient:
                     "/api/tasks/",
                     params={"task_id": task_id},
                 )
-            # RequestError rather than TransportError: DecodingError (a corrupt
-            # compressed body) is a request-level failure that is not a
-            # transport one, and it must neither escape this boundary as a raw
-            # httpx2 type nor fail an upload Paperless already accepted.
+            # RequestError rather than TransportError, so a DecodingError (a
+            # corrupt compressed body) cannot fail an upload already accepted.
             except httpx2.RequestError as exc:
                 last_error = self._reason(exc)
                 last_cause = self._cause(exc)
@@ -1737,14 +1490,12 @@ class PaperlessClient:
                 elif answer is not None:
                     return answer
                 else:
-                    # Paperless answered, so an earlier blip is no longer the
-                    # story: a timeout after this names no stale error.
+                    # A timeout after an answer names no stale error.
                     last_error = None
                     last_cause = None
 
-            # Every path through the loop body reaches this check -- a
-            # transport error included -- so the poll cannot outlive its
-            # deadline.
+            # Every path through the loop reaches this check, so the poll
+            # cannot outlive its deadline.
             remaining = deadline - self._clock()
             if remaining <= 0:
                 shown = _loggable_task_id(task_id)
@@ -1755,9 +1506,7 @@ class PaperlessClient:
                 msg = f"{msg}; last error: {last_error}"
                 raise PaperlessTimeoutError(msg) from last_cause
 
-            # Clamped so the poll never sleeps past its own deadline -- that
-            # is what makes a sub-second timeout cost what it says it does
-            # rather than the 0.5s first backoff.
+            # Clamped, so a sub-second timeout costs what it says.
             self._sleep(min(delay, remaining))
             delay = min(delay * 2, _MAX_POLL_DELAY_SECONDS)
 
@@ -1793,8 +1542,7 @@ class PaperlessClient:
                 f"{_render_error_body(response, self._token)}"
             )
         if response.status_code == 406:
-            # The same fixed text as a refused upload; the 406 body only
-            # restates the refusal.
+            # The 406 body only restates the refusal.
             msg = f"Could not confirm Paperless task {shown}: "
             raise PaperlessUnconfirmedError(msg + self._incompatible_message())
         if response.status_code != 200:
@@ -1840,9 +1588,7 @@ class PaperlessClient:
                     duplicate.document_id,
                 )
                 return duplicate
-            # Bounded like an error body: a failure result can embed a whole
-            # OCR or consumer traceback, and this text becomes job.error and
-            # the CLI line.
+            # A failure result can embed a whole OCR or consumer traceback.
             failure = _bounded_line(full_failure) or _NO_FAILURE_MESSAGE
             msg = f"Paperless task {shown} ended {status}: {failure}"
             raise PaperlessUnconfirmedError(msg)
@@ -1854,44 +1600,16 @@ class PaperlessClient:
         """
         Probe paperless-ngx and report which ``ConnectionStatus`` occurred.
 
-        CONNECTED means a 2xx and nothing else.  A 404 says the API is not
-        where the configured URL points -- a different thing to fix than a
-        500, which says paperless-ngx itself is unwell, and both used to be
-        reported as CONNECTED.  A 406 is INCOMPATIBLE: paperless-ngx refused
-        the API version, so it is older than 2.16 or newer than this client
-        knows.  It is not tried again with another version.
-
-        A 3xx is REDIRECTED, as the upload path treats it: paperless.url
-        points at an address paperless-ngx does not answer on, and following
-        the redirect would only hide that.  Where it pointed is logged and
-        kept on the result for ``doctor``, sanitised, and ``https_upgrade``
-        says whether only the scheme changed.  A request the HTTP library
-        would not send is MISCONFIGURED when the configuration can be at
-        fault, by the rule ``_unsendable_error`` applies to an upload:
-        nothing reached the network, so "could not reach" would send the
-        operator to look for a fault that is not there.
-
-        The classification is an ordered chain of integer comparisons rather
-        than a ``match`` with ``assert_never``, for the same reason
-        ``vocabulary.classify_error`` is an ``isinstance`` chain: the input
-        is a range of integers, not a closed set of members, so exhaustive
-        matching does not apply and a trailing fallback is the correct total
-        answer.  ``assert_never`` governs the *message* lookup in
-        ``vocabulary.connection_status_message``, which does dispatch on a
-        closed set.
-
-        The bound is a per-request override rather than a constructor
-        argument, because callers want a shorter budget than an upload's.
-        The status strip, ``saneless doctor`` and ``GET /api/paperless/test``
-        all pass the short probe budget, so an unplugged host is discovered
-        in about two seconds instead of thirty.  The ``except
-        httpx2.TransportError`` arm below is the base class of
-        ``ConnectTimeout`` and ``ReadTimeout`` as well as ``ConnectError``, so
-        a budget that expires lands on UNREACHABLE.
+        CONNECTED means a 2xx and nothing else.  A 3xx is REDIRECTED and is
+        not followed, since following it would hide a wrong paperless.url; a
+        406 is INCOMPATIBLE and is not retried with another version.  A
+        request the HTTP library would not send is MISCONFIGURED when the
+        configuration can be at fault, since nothing reached the network.
 
         Args:
-            timeout: The per-request budget to send, or None to use the
-                client's own 30 s default.
+            timeout: The per-request budget, or None for the client-wide
+                default.  Callers pass a short one, so an unplugged host is
+                found in seconds.
 
         Returns:
             The outcome, with the redirect's target and kind when there was
@@ -1904,20 +1622,17 @@ class PaperlessClient:
                 params={"page_size": 1},
                 timeout=timeout if timeout is not None else httpx2.USE_CLIENT_DEFAULT,
             )
-        # Both refusals are TransportError subclasses, so they must be caught
-        # before it.  Neither reached the network, and neither exception's
-        # text is logged: h11's text for a refused header value quotes it,
-        # and for the Authorization header that is the token.
+        # Both refusals are TransportError subclasses, so they are caught
+        # first.  Neither's text is logged: h11 quotes a refused header value,
+        # which for the Authorization header is the token.
         except httpx2.UnsupportedProtocol:
             logger.warning("Paperless connection test: %s", _URL_UNUSABLE)
             return ConnectionProbe(ConnectionStatus.MISCONFIGURED)
         except httpx2.LocalProtocolError:
             return self._refused_probe()
         except httpx2.TransportError:
-            # The base class of ConnectError, ConnectTimeout and ReadTimeout.
-            # Catching only ConnectError let the timeout siblings escape to
-            # routes.py's blanket handler, which answers HTTP 500
-            # {"status": "error"} -- none of the outcomes.
+            # Also the base of ConnectTimeout and ReadTimeout, so an expired
+            # budget is UNREACHABLE too.
             logger.warning("Paperless is unreachable")
             return ConnectionProbe(ConnectionStatus.UNREACHABLE)
         return self._answer_probe(response)
@@ -1926,16 +1641,8 @@ class PaperlessClient:
         """
         Classify a connection test h11 refused to send, and log it.
 
-        The configuration is blamed only when it can be at fault, by the rule
-        ``_unsendable_error`` applies to an upload: settings that pass the
-        load rules are ones h11 sends, so a refusal of them has another cause
-        and is reported as UNREACHABLE.  The exception's text is never
-        logged, because h11's text for a refused header value quotes it.
-
-        Returns:
-            MISCONFIGURED when the configuration cannot be sent, otherwise
-            UNREACHABLE.
-
+        MISCONFIGURED only when the configuration can be at fault, by the
+        rule ``_unsendable_error`` applies; otherwise UNREACHABLE.
         """
         if not self._configuration_sendable:
             logger.warning("Paperless connection test: %s", _REQUEST_UNSENDABLE)
@@ -2009,19 +1716,9 @@ class PaperlessClient:
         """
         Report whether a redirect changed only ``http`` to ``https``.
 
-        The target may keep the request's path, or go to the root of the
-        configured address, which is where many proxies send every plain
-        HTTP request.  httpx2 drops a scheme's default port, so ``http`` on
-        80 and ``https`` on 443 compare as the same port.
-
-        Args:
-            sent: The URL the probe requested.
-            target: The resolved redirect target.
-
-        Returns:
-            True when the scheme went from http to https and the host, port
-            and path are otherwise the same.
-
+        The target may keep the request's path or go to the configured base
+        path, where many proxies send every plain HTTP request.  httpx2 drops
+        a scheme's default port, so 80 and 443 compare as the same port.
         """
         return (
             sent.scheme == "http"
@@ -2041,15 +1738,12 @@ class PaperlessClient:
         API, which serialises the outcome and nothing else.
 
         Args:
-            timeout: The per-request budget to send, or None to use the
-                client's own 30 s default.
+            timeout: The per-request budget, or None for the client-wide
+                default.
 
         Returns:
-            A ConnectionStatus member.  It is a StrEnum, and its values are
-            the public JSON contract documented in
-            ``docs/reference/web-api.md`` -- ``web/routes.py`` serialises the
-            return value straight into a response body, so the values may
-            not be renamed without breaking existing clients.
+            A ConnectionStatus member.  Its values are the public JSON
+            contract in ``docs/reference/web-api.md`` and may not be renamed.
 
         """
         return self.probe_connection(timeout=timeout).status
@@ -2061,28 +1755,19 @@ class PaperlessClient:
         Fetch all tags from paperless-ngx.
 
         Args:
-            timeout: The per-request budget, sent on every page request, or
-                None to use the client's own 30 s default.  A float bounds
-                every phase of the request alike; an ``httpx2.Timeout``
-                carries separate connect and read budgets, so a host that
-                does not answer at all is given up on sooner than a slow one.
-                A check made before a scan starts passes a short one, so a
-                paperless-ngx that is down is reported in seconds.
+            timeout: The budget for every page request, in seconds or as an
+                ``httpx2.Timeout``, or None for the client-wide default.
 
         Returns:
             List of tag dicts with at least 'id' and 'name' keys.
 
         Raises:
-            ConfigError: If the request cannot be sent from the configured
-                ``paperless.url`` and ``paperless.token``, with fixed text and
-                no cause.  A request refused for another reason is a
-                ``PaperlessError`` with fixed text and no cause.
-            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
-                not accept API version 9 or 10.  Fixed text, no cause.
-            PaperlessError: If any page request fails for any other
-                ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
-                naming the endpoint and base URL and chained to the cause
-                unless the cause's chain quotes the token.
+            ConfigError: If the configured ``paperless.url`` or
+                ``paperless.token`` cannot be sent; fixed text, no cause.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it
+                accepts none of the supported API versions.
+            PaperlessError: If any page request fails otherwise or a body has
+                the wrong shape.
 
         """
         return self._fetch_collection("/api/tags/", "tags", timeout=timeout)
@@ -2094,28 +1779,19 @@ class PaperlessClient:
         Fetch all correspondents from paperless-ngx.
 
         Args:
-            timeout: The per-request budget, sent on every page request, or
-                None to use the client's own 30 s default.  A float bounds
-                every phase of the request alike; an ``httpx2.Timeout``
-                carries separate connect and read budgets, so a host that
-                does not answer at all is given up on sooner than a slow one.
-                A check made before a scan starts passes a short one, so a
-                paperless-ngx that is down is reported in seconds.
+            timeout: The budget for every page request, in seconds or as an
+                ``httpx2.Timeout``, or None for the client-wide default.
 
         Returns:
             List of correspondent dicts with at least 'id' and 'name' keys.
 
         Raises:
-            ConfigError: If the request cannot be sent from the configured
-                ``paperless.url`` and ``paperless.token``, with fixed text and
-                no cause.  A request refused for another reason is a
-                ``PaperlessError`` with fixed text and no cause.
-            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
-                not accept API version 9 or 10.  Fixed text, no cause.
-            PaperlessError: If any page request fails for any other
-                ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
-                naming the endpoint and base URL and chained to the cause
-                unless the cause's chain quotes the token.
+            ConfigError: If the configured ``paperless.url`` or
+                ``paperless.token`` cannot be sent; fixed text, no cause.
+            PaperlessIncompatibleError: If paperless-ngx answers 406: it
+                accepts none of the supported API versions.
+            PaperlessError: If any page request fails otherwise or a body has
+                the wrong shape.
 
         """
         return self._fetch_collection(
@@ -2132,55 +1808,21 @@ class PaperlessClient:
         """
         Fetch every page of one metadata collection.
 
-        Pages are requested by number, ``?page=N``, on the configured base
-        URL until a page's ``next`` is null, a page comes back empty, or the
-        items collected reach the server's own ``count``.  The ``next`` link
-        itself is only read as "there is another page" and is never
-        requested: a server behind a misconfigured proxy builds it
-        from the wrong host or scheme, and following it would send the API
-        token there.  A redirect is not followed either; it fails the fetch.
-        Every paperless-ngx release this client supports paginates tags and
-        correspondents, so each page must be an object whose ``results`` is
-        a list of objects; a bare list is not a collection.
+        Pages are requested by number on the configured base URL.  The
+        ``next`` link is read only as "there is another page" and never
+        requested: behind a misconfigured proxy it names the wrong host, and
+        following it would send the token there.
 
-        The client does not take the server's word alone that it is making
-        progress.  A proxy that drops the query string, or a server that
-        ignores ``page``, answers page 1 to every request with a non-null
-        ``next``; a page identical to the one before it therefore fails the
-        fetch.  So does asking for more pages than ``count`` can need (one
-        more than ``count`` over the size of the first page), or, with no
-        usable ``count``, more than ``_METADATA_MAX_PAGES``.
-
-        This is a module boundary: no httpx2 type and no raw ValueError leaves
-        it.  A status error is rendered by ``_one_line_reason`` as status,
-        reason and body, so the message stays one line, any library or server
-        text has the token struck out by ``_reason``, and a cause is chained
-        only through ``_cause``.
-
-        Args:
-            path: The collection endpoint, e.g. ``/api/tags/``.
-            noun: What the collection holds, for the message.
-            timeout: The per-request budget for every page -- seconds, or
-                an ``httpx2.Timeout`` with separate connect and read
-                budgets -- or None for the client's default.
-
-        Returns:
-            The ``results`` of every page in order.
+        A proxy or server that ignores ``page`` answers page 1 every time
+        with a non-null ``next``, so a repeated page fails the fetch, as does
+        asking for more pages than ``count`` (or ``_METADATA_MAX_PAGES``)
+        allows.
 
         Raises:
-            ConfigError: ``Could not fetch <noun> from Paperless at <url>:
-                <fixed problem>``, with no cause, when the request cannot be
-                sent from the configured URL and token.  With no URL set the
-                `` at <url>`` is left out.  A request refused for any other
-                reason is a ``PaperlessError`` of the same shape.
-            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
-                not accept API version 9 or 10.  Fixed text, no cause.
-            PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
-                <reason>``, chained to the httpx2 error or the ValueError
-                unless its chain quotes the token, or
-                unchained when a body or its items have the wrong shape, the
-                server repeats a page, or it needs more pages than its
-                ``count`` allows.
+            ConfigError: If the configured URL or token cannot be sent.
+            PaperlessIncompatibleError: If paperless-ngx answers 406.
+            PaperlessError: If a request fails otherwise, a body has the
+                wrong shape, or the server does not make progress.
 
         """
         prefix = f"Could not fetch {noun} from Paperless{self._at_url}"
@@ -2231,32 +1873,14 @@ class PaperlessClient:
         """
         Request one metadata page and return its decoded JSON body.
 
-        A 406 to a request that asked for API version 10 is asked once more,
-        with 9, as ``_post_document`` does.
-
-        Args:
-            path: The collection endpoint, e.g. ``/api/tags/``.
-            page: The page number to ask for.
-            prefix: The message prefix naming the collection and base URL.
-            timeout: The request's budget -- seconds, or an
-                ``httpx2.Timeout`` with separate connect and read budgets --
-                or None for the client's default.
-
-        Returns:
-            The decoded body, whatever its shape.
+        A 406 to the newest API version is asked once more, as
+        ``_post_document`` does.
 
         Raises:
-            ConfigError: ``<prefix>: <fixed problem>``, with no cause, when
-                ``_retry_decision`` finds the request could not be sent and
-                ``_unsendable_error`` finds the configured URL or token at
-                fault; the library's text, which can quote the token, is left
-                out.  Otherwise the same fixed-text error is a
-                ``PaperlessError``.
-            PaperlessIncompatibleError: If paperless-ngx answers 406: it does
-                not accept API version 9 or 10.  Fixed text, no cause.
-            PaperlessError: ``<prefix>: <reason>``, with the token struck out
-                of the reason, chained to any other httpx2 error or the
-                ValueError unless that cause's chain quotes the token.
+            ConfigError: If the configured URL or token cannot be sent.
+            PaperlessIncompatibleError: If paperless-ngx answers 406.
+            PaperlessError: If the request fails otherwise or the body is not
+                JSON.
 
         """
 
@@ -2270,19 +1894,16 @@ class PaperlessClient:
         try:
             response = _get()
             if _refused_newest_version(response):
-                # Asked once more, now for 9: the response hook has forgotten
-                # the 10 a server that no longer allows it once announced.
+                # The response hook has forgotten the stale version.
                 response = _get()
             response.raise_for_status()
         except httpx2.HTTPError as exc:
             decision = _retry_decision(exc)
             if decision is _RetryDecision.MISCONFIGURED:
-                # from None for the reason upload_document gives: a chained
-                # h11 error would print the refused token in a traceback.
+                # A chained h11 error would print the refused token.
                 raise self._unsendable_error(exc, prefix) from None
             if decision is _RetryDecision.INCOMPATIBLE:
-                # The same fixed text as a refused upload; the 406 body only
-                # restates the refusal.
+                # The 406 body only restates the refusal.
                 raise PaperlessIncompatibleError(self._incompatible_message()) from None
             msg = f"{prefix}: {self._reason(exc)}"
             raise PaperlessError(msg) from self._cause(exc)
