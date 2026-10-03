@@ -50,7 +50,6 @@ from saneless.auto_profiles import (
 from saneless.checks import CheckKey, check_name
 from saneless.cli import cli
 from saneless.config import (
-    LogLevel,
     OutputConfig,
     ProfileConfig,
     WebConfig,
@@ -506,6 +505,17 @@ def test_says_matches_whole_words_across_a_line_break() -> None:
     assert not _says(scope, "`amber`")
 
 
+def _log_levels() -> tuple[object, ...]:
+    """
+    Return the levels ``log_level`` accepts, read from the field's annotation.
+
+    A ``type`` alias is unwrapped first: ``get_args`` gives nothing for the
+    alias itself, which would leave the documentation check with no level.
+    """
+    annotation = OutputConfig.model_fields["log_level"].annotation
+    return get_args(getattr(annotation, "__value__", annotation))
+
+
 def test_configuration_reference_documents_xdg_and_levels() -> None:
     """The configuration reference names the XDG bases, every level and ``~``."""
     text, name = _read(CONFIG_REFERENCE)
@@ -515,7 +525,9 @@ def test_configuration_reference_documents_xdg_and_levels() -> None:
     )
     output = _section(text, "## `[output]`", name)
     level_row = _table_row(output, "`log_level`")
-    for level in get_args(LogLevel):
+    levels = _log_levels()
+    assert levels, "log_level declares no Literal levels to check"
+    for level in levels:
         assert _says(level_row, f"`{level}`"), (
             f"{name}'s log_level row does not name the {level} level"
         )
