@@ -170,11 +170,14 @@ fails on the inline `Event().wait(...)` and `wait_for_timeout(...)` spellings of
 anywhere under `tests/` except `tests/conftest.py`, which holds the two helpers; a pause
 written any other way is left to review.
 
-Comments in `src/` state their reasons in words and never cite planning IDs (decision,
+Comments and docstrings in `src/`, `scripts/`, `tests/`, the workflows under `.github/`
+and `.dockerignore` state their reasons in words and never cite planning IDs (decision,
 finding or requirement numbers, phase or plan numbers, planning file names), because the
 planning records do not ship with the product. The `no-planning-citations` hook fails a
 commit, merge or push that adds one, and a test in `tests/test_deployment_config.py`
-fails CI.
+fails CI. The hook skips one file, `tests/citation_samples.py`, which holds the pattern
+and the sample identifiers the guard's own tests need; a test pins that it stays the
+only exclusion.
 
 The `test` job deselects the `browser` marker because the `browser` job runs those
 Playwright tests, with Chromium and Firefox installed (`uv run playwright install
