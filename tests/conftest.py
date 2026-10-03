@@ -708,7 +708,6 @@ def reset_sane_process_state() -> None:
     record.stuck = False
     record.done = None
     record.device = None
-    record.iterator = None
     record.device_id = ""
     record.page_label = ""
     record.settling = False

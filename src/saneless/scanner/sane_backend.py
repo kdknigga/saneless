@@ -355,12 +355,15 @@ _MM_PER_INCH = 25.4
 # How far the area a device reports may differ from the one requested before it
 # counts as having been clamped, in millimetres.
 #
-# This is a tolerance and NOT an equality test, on purpose.  SANE geometry
-# options are TYPE_FIXED -- a 16.16 fixed-point integer -- so a length that is
-# not a multiple of 1/65536 cannot be represented exactly and reads back
-# differing in the low bits although the device clamped nothing at all.
-# Letter's 215.9 mm is exactly such a length.  Comparing for equality would
-# send every letter-sized scan down the crop path for no reason.
+# This is a tolerance and NOT an equality test, on purpose.  A length the
+# device accepted unclamped can still read back different, for two reasons.
+# The larger is quantisation to the option's step: a device rounds the value to
+# the step it supports, and the SANE ``test`` backend reads 115.9 back as
+# 116.0.  The smaller is representation: SANE geometry options are TYPE_FIXED
+# -- a 16.16 fixed-point integer -- so a length that is not a multiple of
+# 1/65536, such as Letter's 215.9 mm, reads back differing in the low bits.
+# Comparing for equality would send such scans down the crop path for no
+# reason.
 #
 # One millimetre is the chosen value because the smallest thing being compared
 # is a paper size, where a millimetre is far below what anyone could notice,
@@ -1375,9 +1378,8 @@ class _Wedge:
     and which this project does not suppress, so this state lives in a
     container instead of in a name.
 
-    ``device`` and ``iterator`` are **strong** references, deliberately.
-    ``SaneDev_dealloc`` calls ``sane_close()`` and ``_SaneIterator.__del__``
-    calls ``device.cancel()``, so letting a wedged handle be garbage-collected
+    ``device`` is a **strong** reference, deliberately.  ``SaneDev_dealloc``
+    calls ``sane_close()``, so letting a wedged handle be garbage-collected
     would reintroduce exactly the close-while-reading this module now avoids.
 
     ``done`` identifies *which* acquisition is wedged.  A reader that wakes up
@@ -1411,7 +1413,6 @@ class _Wedge:
     stuck: bool = False
     done: threading.Event | None = None
     device: SaneDevice | None = None
-    iterator: object = None
     device_id: str = ""
     page_label: str = ""
     settling: bool = False
@@ -1645,7 +1646,7 @@ def _handles_open() -> int:
 
 # What a scan job is told when SANE cannot be restarted because a handle is
 # open.  It names no device and no host: the count does not know which device
-# the handle belongs to, and a net: id is a LAN address (ASVS V7).
+# the handle belongs to, and a net: id is a LAN address (ASVS 4.0.3 V7).
 _HANDLE_OPEN_REFUSAL: Final = (
     "Could not start a scan: a scanner handle from an earlier operation is "
     "still open, and SANE cannot be restarted safely while it is. Restart "
@@ -1811,7 +1812,7 @@ def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
     the later backend's listings dial it too.  The warning names the host list
     that was in effect at init, which is what SANE is using.  Only host names from the operator's
     own configuration or environment are named, which the existing INFO line
-    already logs; no credential is in scope here (ASVS V7).
+    already logs; no credential is in scope here (ASVS 4.0.3 V7).
 
     ``log_level`` is the level of the success lines.  A construction logs them
     at INFO; the per-job restart passes DEBUG and logs one line of its own, so
@@ -2017,17 +2018,10 @@ def _cancel_read(dev: SaneDevice, done: threading.Event) -> None:
 
 
 def _clear_wedge() -> None:
-    """
-    Forget the wedge record.  The caller holds ``_WEDGE_LOCK``.
-
-    Dropping the retained iterator here runs its finaliser's cancel, which is
-    harmless only because every caller has either closed the handle first or
-    never retained one.
-    """
+    """Forget the wedge record.  The caller holds ``_WEDGE_LOCK``."""
     _WEDGE.stuck = False
     _WEDGE.done = None
     _WEDGE.device = None
-    _WEDGE.iterator = None
     _WEDGE.device_id = ""
     _WEDGE.page_label = ""
     _WEDGE.settling = False
@@ -2163,30 +2157,6 @@ def _release_wedge(dev: SaneDevice, done: threading.Event, holder: str) -> None:
         _clear_wedge()
 
 
-def _retain_iterator(dev: SaneDevice, iterator: object) -> bool:
-    """
-    Keep a wedged device's iterator alive, reversing the old ``del``.
-
-    ``del iterator`` used to be the cleanup; on this path it is the hazard.
-    ``_SaneIterator.__del__`` calls ``device.cancel()``, so dropping the last
-    reference to a wedged device's iterator issues a SANE call on a handle a
-    read is still inside -- the thing this whole sequence exists to prevent.
-
-    Args:
-        dev: The handle the iterator drives.
-        iterator: The ``multi_scan()`` iterator.
-
-    Returns:
-        True if the iterator was retained because the device is wedged.
-
-    """
-    with _WEDGE_LOCK:
-        if _WEDGE.stuck and _WEDGE.device is dev:
-            _WEDGE.iterator = iterator
-            return True
-        return False
-
-
 def _name_wedged_device(dev: SaneDevice, device_id: str) -> bool:
     """
     Record which device is wedged, and report that it is.
@@ -2196,7 +2166,7 @@ def _name_wedged_device(dev: SaneDevice, device_id: str) -> bool:
     later call raises can name the device the operator has to deal with.
 
     Only the device id is recorded.  No host string and no credential from
-    ``SANE_NET_HOSTS`` is written anywhere on this path (ASVS V7).
+    ``SANE_NET_HOSTS`` is written anywhere on this path (ASVS 4.0.3 V7).
 
     Args:
         dev: The handle being released, or not.
@@ -2561,11 +2531,12 @@ def _acquire_pages(
     signal there is.  Every other exception is a real fault -- a jam, an open
     cover, a busy device, an I/O error -- and is reported as itself.
 
-    The zero-page ``FeederEmptyError`` at the end is therefore the **only**
-    path to "No paper detected in feeder", and it is the correct one: a feeder
-    that produced no pages at all genuinely has no paper in it.  Do not
-    re-introduce a first-page special case; inferring "the feeder is empty"
-    from "it failed on iteration zero" is what made a jam, an open cover and a
+    The zero-page ``FeederEmptyError`` at the end is how a feeder that produced
+    no page reports itself, which is true: it has no paper in it.
+    (``_snap_flatbed`` raises the same error when the device answers its
+    single acquisition with "Document feeder out of documents".)  Do not
+    re-introduce a first-page special case here; inferring "the feeder is
+    empty" from "it failed on iteration zero" made a jam, an open cover and a
     busy device all tell the operator to load paper.
 
     A page that fails its integrity checks is skipped and counted, not fatal:
@@ -2690,16 +2661,13 @@ def _acquire_pages(
             # -- and what is spooled is exactly what the PDF embeds.
             records.append(sink.add(framing.crop(page_image), dpi=framing.resolution))
     finally:
-        # Dropping the last reference runs ``_SaneIterator.__del__``, which
-        # calls ``device.cancel()``, so where the iterator goes depends on
-        # whether a cancel may still be sent.  When the device is wedged a
-        # read is still inside it: the wedge record takes the reference, and
-        # the reader thread drops it when it finally returns.  When a cancel
-        # was already issued -- the page timed out, or the wait was
-        # interrupted -- one more would be a second, unbounded request on this
-        # thread: the handle's record takes the reference and drops it after
-        # the close.  Only a scan that ended without a cancel drops it here.
-        if not _retain_iterator(dev, iterator) and not _park_iterator(dev, iterator):
+        # A cancel already issued means one more, from the iterator's
+        # finaliser, would be a second unbounded request on this thread, so the
+        # handle's record takes the iterator and drops it after the close.
+        # Otherwise the reference is dropped here, which is safe even for a
+        # wedged device: the reader thread's own callable keeps the iterator
+        # alive until its read returns.
+        if not _park_iterator(dev, iterator):
             del iterator
 
     if page_num == 0:
