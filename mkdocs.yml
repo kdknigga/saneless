@@ -44,6 +44,10 @@ validation:
   anchors: warn
   unrecognized_links: warn
 
+# The decision records ship in the repository but stay out of the site navigation.
+not_in_nav: |
+  /explanation/decisions/
+
 nav:
   - Home: index.md
   - Getting Started:
