@@ -1,29 +1,15 @@
 """
-Playwright browser tests for web UI rendering verification.
+Web UI behaviour in a real browser, against a live uvicorn server.
 
-These tests verify that PicoCSS styling, HTMX interactions, and UI
-components render correctly in a real browser. They use a session-scoped
-uvicorn server with a stub scanner for isolation from real hardware.
+A session-scoped server runs with a stub scanner. Every test runs behind an
+egress gate that fails it on any request not addressed to the test server and
+on any Content-Security-Policy violation, so the UI works offline and needs
+nothing the policy refuses. A stylesheet whose bytes do not match its
+``integrity`` pin is refused silently and reads like a palette fault in bulk;
+``test_pico_css_applied`` is the load canary that says so in plain words.
 
-PicoCSS and htmx are vendored under ``/static/vendor/`` and ``base.html`` loads
-them with an SRI ``integrity`` pin; ``tests/test_vendor_assets.py`` pins those
-bytes to the hashes. Every browser test here runs behind an egress gate (the
-overridden ``context`` fixture) that aborts and records any request not
-addressed to the test server and fails the test if anything was recorded, so
-the UI is proven to work with no internet, and the CI ``browser`` job runs this
-whole module offline. The same fixture records every Content-Security-Policy
-violation a page raises and fails the test if there was one, so the module is
-also the proof that no page needs anything the policy refuses.
-
-A stylesheet whose bytes no longer match its ``integrity`` is refused by the
-browser without announcing itself: the contrast checks then report unstyled
-black-on-white ratios and the amber checks report a colour mismatch, both of
-which read like a palette regression. If a run fails that way in bulk, read
-``test_pico_css_applied`` first -- it is the load canary, and it is the one that
-says so in plain words.
-
-Requires: pytest-playwright, and the chromium and firefox browsers
-(uv run playwright install chromium firefox); Firefox runs the reload test only.
+Requires pytest-playwright and the chromium and firefox browsers
+(``uv run playwright install chromium firefox``); Firefox runs the reload test only.
 """
 
 from __future__ import annotations
@@ -146,7 +132,7 @@ from saneless.web import cache as cache_module
 from saneless.web import routes as routes_module
 from saneless.web.app import TEMPLATE_DIR, create_app
 from saneless.worker import WorkerFlipCoordinator, WorkerPassCoordinator
-from tests.conftest import StubScannerBackend, poll_until, scan_batch
+from tests.conftest import StubScannerBackend, poll_until, scan_batch, wait_for_state
 
 # Every palette value these tests assert against, in one place. All of them are
 # valid only for Pico 2.1.1, the version vendored as
@@ -166,16 +152,16 @@ _AMBER = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
 """The app's fallback amber (#a16207 / #ca8a04, from app.css), as computed."""
 
 _ERROR_RED = {"light": "rgb(136, 57, 53)", "dark": "rgb(206, 126, 123)"}
-"""Pico's ``--pico-del-color`` behind ``.status-error``, per 26-UI-SPEC, as computed."""
+"""Pico's ``--pico-del-color`` behind ``.status-error``, as computed."""
 
 _MUTED = {"light": "rgb(100, 107, 121)", "dark": "rgb(123, 132, 149)"}
 """Pico's ``--pico-muted-color`` (#646b79 / #7b8495) behind ``.status-cancelled``."""
 
 _SUCCESS_GREEN = {"light": "rgb(29, 106, 84)", "dark": "rgb(98, 175, 154)"}
-"""Pico's ``--pico-ins-color`` behind ``.check-ok``, per 30-UI-SPEC, as computed."""
+"""Pico's ``--pico-ins-color`` behind ``.check-ok``, as computed."""
 
-# The status strip's three verdict colours, each pinned to the token 30-UI-SPEC
-# § Color says it reads. The amber is the existing _AMBER rather than a second
+# The status strip's three verdict colours, each pinned to the Pico token its
+# state reads. The amber is the existing _AMBER rather than a second
 # pair of literals: .check-warn and .status-fallback share one custom property
 # on purpose, so a drift in either must be reported by both.
 _CHECK_STATE_COLOURS = {
@@ -255,9 +241,9 @@ class _BrowserTestScanner(StubScannerBackend):
     opens it again (``gate.set()``) to let the job finish. The wait is bounded,
     so a gate left closed by a failing test ends the scan rather than the run.
 
-    Capabilities come from ``StubScannerBackend``, which reports the same
-    flatbed at 300 dpi in colour the local copy did. Only ``get_devices``
-    differs, because these tests want a device with a recognisable name.
+    Capabilities come from ``StubScannerBackend``, a flatbed at 300 dpi in
+    colour. Only ``get_devices`` differs, because these tests want a device
+    with a recognisable name.
     """
 
     def __init__(self) -> None:
@@ -305,11 +291,9 @@ class _BrowserServer(NamedTuple):
     """
     The live test server: its base URL and the app object behind it.
 
-    Yielding only the URL made the server a black box -- a test could look at
-    the idle page and nothing else, because there was no way to put a job into
-    a given state. Carrying the app alongside the URL is what lets a test drive
-    a job to FALLBACK and then look at it through a real browser; carrying the
-    scanner is what lets a test hold a real scan in SCANNING through its gate.
+    Carrying the app alongside the URL lets a test drive a job to FALLBACK and
+    then look at it through a real browser; carrying the scanner lets a test
+    hold a real scan in SCANNING through its gate.
     """
 
     url: str
@@ -424,11 +408,10 @@ def _serve(
     """
     Run a private app on loopback for the length of one test, then shut it down.
 
-    ``blocked_server`` and ``lan_server`` each hand-rolled this; the tests that
-    need a *cold* check cache or a scan held mid-flight need it several times
-    more, and none of them can use the session server -- its cache is warm
-    within a second of the first page load and its scanner is shared with every
-    other test in the module.
+    The tests that need a *cold* check cache, a scan held mid-flight or a
+    second address cannot use the session server -- its cache is warm within a
+    second of the first page load and its scanner is shared with every other
+    test in the module.
 
     The caller must add the yielded URL to ``egress_allowlist``: the gate knows
     only the session server, and a page served from here would otherwise be
@@ -495,17 +478,13 @@ def _is_allowed(url: str, allowlist: list[str]) -> bool:
     return any(url == base or url.startswith(base + "/") for base in allowlist)
 
 
-# Pitfall 9, stated in full because this factory exists only to design it out.
-#
-# The gate used to be a closure written inside the ``context`` fixture below,
-# which made it unreachable from anywhere else in the module. A test that needs
-# two browser sessions at once has to build its own contexts with
+# A test that needs two browser sessions at once builds its own contexts with
 # ``browser.new_context()`` -- the owner/non-owner proof of the flip prompt is
 # exactly that shape -- and a hand-made context carries none of the overridden
-# fixture's routing. It would therefore have had NO gate at all: its page could
-# reach the real internet in CI and nothing in the suite would have noticed,
-# because the only ``blocked`` list anybody asserted on belonged to a context
-# that test never used. The escape is silent, which is what makes it dangerous.
+# ``context`` fixture's routing. Without a gate built here its page could reach
+# the real internet in CI and nothing in the suite would notice, because the
+# only ``blocked`` list asserted on would belong to a context that test never
+# used. The escape is silent, which is what makes it dangerous.
 #
 # The rule this factory enforces is therefore twofold, and both halves matter:
 # every context created in this module must install a gate built here, and
@@ -614,12 +593,12 @@ def context(
     Route every request the page makes through a no-egress gate.
 
     This overrides pytest-playwright's ``context`` fixture, so every ``page`` in
-    this module -- the DARK-01/DARK-02 tests included -- is built from a context
-    that continues requests addressed to the test server and aborts and records
+    this module -- the dark-mode tests included -- is built from a context that
+    continues requests addressed to the test server and aborts and records
     everything else. The test then fails if anything was recorded. That proves
-    the UI needs no internet (ROBU-09) rather than assuming it from the network
-    the run happens to have, and it is what lets every browser test run offline
-    in the CI ``browser`` job (ROBU-11).
+    the UI needs no internet rather than assuming it from the network the run
+    happens to have, and it is what lets every browser test run offline in the
+    CI ``browser`` job.
 
     The gate itself comes from ``_make_gate`` rather than being written here, so
     a hand-made context can install the identical one; see that factory's note.
@@ -705,7 +684,6 @@ _JOB_FINISH_TIMEOUT = 30.0
 def scan_harness(
     browser_server: _BrowserServer,
     delivering_paperless: None,
-    wait_for_state: Callable[..., Job],
 ) -> Iterator[_ScanHarness]:
     """
     Let a test run real scans, then put the session-scoped server back to idle.
@@ -754,7 +732,7 @@ _EGRESS_PROBE_BUDGET = 5.0
 @pytest.mark.browser
 class TestTheEgressGateRefuses:
     """
-    The positive half of the no-egress proof (ROBU-09, ROBU-11).
+    The egress gate refuses, and records, a request outside the allowlist.
 
     Every other browser test asserts that nothing was blocked, which is a claim
     about the page. This one asserts that something *was* blocked, which is a
@@ -770,7 +748,7 @@ class TestTheEgressGateRefuses:
         egress_allowlist: list[str],
     ) -> None:
         """
-        A navigation aimed off the allowlist is recorded and never leaves (ROBU-09).
+        A navigation aimed off the allowlist is recorded and never leaves.
 
         The page is served by the test server first, so the probe is issued by
         a live document through the same gate every other browser test relies
@@ -823,7 +801,7 @@ _CSP_PROBE_BUDGET = 5.0
 @pytest.mark.browser
 class TestTheCspGate:
     """
-    The positive half of the Content-Security-Policy proof.
+    The policy listener records a violation, and htmx runs inside the policy.
 
     Every other browser test asserts that its pages raised no violation, which
     is a claim about the pages.  The first test here asserts that a violation
@@ -837,7 +815,6 @@ class TestTheCspGate:
         page: Page,
         browser_server_url: str,
         csp_violations: list[str],
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         An inline style set from script is refused and recorded, exactly once.
@@ -881,7 +858,7 @@ class TestTheCspGate:
 
 @pytest.mark.browser
 class TestBrowserRendering:
-    """PicoCSS and semantic HTML rendering tests."""
+    """The page loads styled by Pico, with every scan form control present."""
 
     def test_page_loads_with_title(self, page: Page, browser_server_url: str) -> None:
         """Main page loads and has the saneless title."""
@@ -898,12 +875,11 @@ class TestBrowserRendering:
         viewport = page.viewport_size
         assert viewport is not None
         # bounding_box() returns a box for any rendered element, styled or not,
-        # so its existence proves nothing. Neither does "x > 0": measured with
-        # the CDN blocked, <main> is full-bleed inside <body>'s default 8px
-        # margin -- x=8, width=1264 at a 1280px viewport -- so a bare x > 0
-        # passes unstyled as well. Pico's .container caps the width and centres
-        # what is left (x=40, width=1200), so it is the *cap* that tells the two
-        # states apart. Both numbers were measured against a blocked CDN.
+        # so its existence proves nothing. Neither does "x > 0": unstyled,
+        # <main> is full-bleed inside <body>'s default 8px margin -- x=8,
+        # width=1264 at a 1280px viewport -- so a bare x > 0 passes unstyled as
+        # well. Pico's .container caps the width and centres what is left
+        # (x=40, width=1200), so it is the *cap* that tells the two states apart.
         assert box["width"] <= viewport["width"] - 64, (
             f"PicoCSS did not load (main spans {box['width']}px of a "
             f"{viewport['width']}px viewport; Pico would cap it well below that)"
@@ -937,7 +913,7 @@ class TestBrowserRendering:
 
 @pytest.mark.browser
 class TestHTMXPolling:
-    """HTMX live status polling tests."""
+    """The page carries the polled status area and runs htmx."""
 
     def test_status_area_exists(self, page: Page, browser_server_url: str) -> None:
         """Status area element exists on the page."""
@@ -959,7 +935,7 @@ class TestHTMXPolling:
 @pytest.mark.browser
 class TestOfflinePage:
     """
-    The page structure phase 26 promises, read from the live DOM.
+    The page structure the offline UI depends on, read from the live DOM.
 
     Each of these is a property of what the browser actually loaded and built:
     which htmx ran and with which config, whether a deleted script is still
@@ -971,13 +947,13 @@ class TestOfflinePage:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        The vendored htmx 2.0.10 runs with all three response rules (B2, ROBU-09).
+        The vendored htmx 2.0.10 runs with all three response rules.
 
         htmx merges the meta config shallowly, so a config holding only the
         ``[45]..`` entry would replace the whole array and stop every 2xx swap;
         the count of three and the error entry's ``swap`` are both asserted. No
-        ``data-theme`` and no ``pico.colors`` stylesheet keep the 23.1 dark-mode
-        coupling intact.
+        ``data-theme`` and no ``pico.colors`` stylesheet keep the page following
+        the OS colour scheme.
         """
         page.goto(browser_server_url)
         assert page.evaluate("htmx.version") == "2.0.10"
@@ -999,11 +975,11 @@ class TestOfflinePage:
 
     def test_app_js_is_gone(self, page: Page, browser_server: _BrowserServer) -> None:
         """
-        The deleted app script is neither referenced nor served (B3, ROBU-04).
+        No ``app.js`` script is referenced, and none is served.
 
-        A stale ``<script>`` tag pointing at a 404 would still load nothing, and
-        a stale file still served would let a cached page run the old button
-        logic, so both halves are checked.
+        A ``<script>`` tag pointing at a 404 loads nothing yet is still wrong,
+        and a served file would let a cached page run stale button logic, so
+        both halves are checked.
         """
         page.goto(browser_server.url)
         assert page.locator("script[src*='app.js']").count() == 0
@@ -1018,7 +994,7 @@ class TestOfflinePage:
         scheme: Literal["light", "dark"],
     ) -> None:
         """
-        The request-error slot is one empty alert region taking no space (B4, D-03).
+        The request-error slot is one empty alert region taking no space.
 
         It must be present and empty in the initial HTML so a later insertion is
         announced, and it must not push the status area down while empty.
@@ -1044,7 +1020,7 @@ class TestOfflinePage:
 
     def test_title_input_caps_at_118(self, page: Page, browser_server_url: str) -> None:
         """
-        The title input stops at the server's 118-character cap (B14, ROBU-08).
+        The title input stops at the server's 118-character cap.
 
         118 is what paperless-ngx keeps whole even with " (fronts)" appended.
         The server's 422 stays authoritative; this is what keeps a browser user
@@ -1059,7 +1035,7 @@ class TestOfflinePage:
 
 @pytest.mark.browser
 class TestFlipPromptUI:
-    """Flip prompt rendering tests."""
+    """The flip prompt shows only for a waiting job, and Continue answers it."""
 
     def test_flip_prompt_not_visible_on_idle(
         self, page: Page, browser_server_url: str
@@ -1082,7 +1058,7 @@ class TestFlipPromptUI:
         self, page: Page, browser_server: _BrowserServer
     ) -> None:
         """
-        A real Continue click answers its own job and is acknowledged (CR-01).
+        A real Continue click answers its own job and is acknowledged.
 
         The string tests in ``test_web.py`` see the ``hx-vals`` attribute but not
         what htmx actually sends.  Here Chromium clicks the rendered button: if
@@ -1217,13 +1193,12 @@ def _refresh_both_lists(page: Page) -> None:
 @pytest.mark.browser
 class TestServerOwnedScanButton:
     """
-    The Scan button through a real scan, in Chromium (ROBU-04, ROBU-11).
+    The server alone owns the Scan button through a real scan, in Chromium.
 
-    C-10 shipped because its fix was proven by reading: the button's state had
-    two owners, the server's template and a client script, and they disagreed.
-    The script is gone and the server re-renders the button out of band with
-    every status response. These tests drive real scans through the live worker
-    and watch the button the user sees.
+    The server re-renders the button out of band with every status response
+    and no client script touches it, so the button has one owner. These tests
+    drive real scans through the live worker and watch the button the user
+    sees.
     """
 
     def _assert_released(self, page: Page) -> None:
@@ -1238,12 +1213,11 @@ class TestServerOwnedScanButton:
         self, page: Page, scan_harness: _ScanHarness
     ) -> None:
         """
-        Click Scan, reach DONE, and the button is usable again (B5, ROBU-11, C-10).
+        Click Scan, reach DONE, and the button is usable again.
 
-        This is roadmap success criterion 5 as a test: clicking Scan in a real
-        browser, waiting for the terminal status, and finding the button enabled
-        again -- with no app script on the page, and exactly one button, so the
-        release is the server's out-of-band render and not a duplicate.
+        The button is enabled again with no app script on the page and exactly
+        one button, so the release is the server's out-of-band render and not
+        a duplicate.
         """
         page.goto(scan_harness.server.url)
         assert page.locator("script[src*='app.js']").count() == 0
@@ -1257,7 +1231,7 @@ class TestServerOwnedScanButton:
         self, page: Page, scan_harness: _ScanHarness
     ) -> None:
         """
-        While a scan is in flight the button is disabled and busy (B6, ROBU-04).
+        While a scan is in flight the button is disabled and busy.
 
         The gate holds the job in SCANNING, so the out-of-band button every
         poll delivers has to say so; releasing the gate then has to give the
@@ -1355,20 +1329,17 @@ class TestServerOwnedScanButton:
         self,
         page: Page,
         scan_harness: _ScanHarness,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        A page opened mid-scan keeps Scan disabled after its lists refresh (B7).
+        A page opened mid-scan keeps Scan disabled after its lists refresh.
 
         The form carries ``hx-disabled-elt="#scan-btn"``. Without
         ``hx-disinherit`` the tags and correspondents refresh buttons inherit
         it, so each of their requests would take charge of the ``disabled``
-        attribute on a button the server already rendered disabled -- C-10
-        again, on every refresh during a scan (T-26-48).  What is asserted is
-        this project's behaviour and not htmx's: a button the server rendered
-        disabled is still disabled after both lists have refreshed.  The page
-        itself no longer asks for either list on load, so the two refresh
-        clicks are what exercise it.
+        attribute on a button the server rendered disabled and release it on
+        every refresh during a scan.  What is asserted is this project's
+        behaviour and not htmx's: a button the server rendered disabled is
+        still disabled after both lists have refreshed.
         """
         server = scan_harness.server
         server.scanner.gate.clear()
@@ -1388,7 +1359,7 @@ class TestServerOwnedScanButton:
             # Read once, without retrying. expect(...).to_be_disabled() polls for
             # up to 5 s, and the status poll re-renders the button disabled
             # every second, so a retrying check waits out the trap and passes
-            # with it sprung -- observed with hx-disinherit removed.
+            # with it sprung, as it does with hx-disinherit removed.
             assert page.locator("#scan-btn").is_disabled(), (
                 "a list refresh during an active scan re-enabled the Scan button"
             )
@@ -1524,8 +1495,7 @@ _PROBE_CONTEXT_CONTRAST = (
     } else if (context === "card") {
         // Any <article> is Pico's secondary surface, which is the one a line
         // placed inside a card sits on -- the status strip's card and the Scan
-        // card are the same colour, so the first one serves for both. (It used
-        // to be the Scan card; #checks-card now precedes it.)
+        // card are the same colour, so the first one serves for both.
         document.querySelector("article").appendChild(probe);
     } else {
         const row = document.createElement("tr");
@@ -1621,7 +1591,7 @@ def _contrast_ratio(foreground: str, background: str) -> float:
 
 class TestContrastHelper:
     """
-    The contrast helper, pinned to the numbers the UI-SPEC measured.
+    The contrast helper reproduces known WCAG ratios.
 
     The dark-mode contrast tests only mean something if the formula is right.
     A helper that returned a large number for everything would let every one of
@@ -1654,7 +1624,7 @@ class TestContrastHelper:
     def test_reference_ratios_match_the_ui_spec(
         self, foreground: str, background: str, expected: float
     ) -> None:
-        """Light amber, dark amber, and the dark-surface failure this phase fixes."""
+        """Amber on each Pico surface gives its known ratio, the 3.65:1 failure too."""
         assert _contrast_ratio(foreground, background) == pytest.approx(
             expected, abs=0.01
         )
@@ -1679,7 +1649,7 @@ class TestContrastHelper:
         stripe = "rgba(111, 120, 135, 0.0375)"
         flattened = _flatten([stripe, _PICO_SURFACE["light"]])
         assert _relative_luminance(flattened) > 0.9
-        # The same colour read as opaque, which is what the bug did.
+        # The same colour read as opaque, which is what ignoring alpha does.
         assert _relative_luminance(stripe) < 0.3
 
     def test_a_colour_the_parser_cannot_read_is_named(self) -> None:
@@ -1691,14 +1661,13 @@ class TestContrastHelper:
 @pytest.mark.browser
 class TestFallbackStatusRendering:
     """
-    The FALLBACK status render, proven in a browser rather than by grep.
+    The FALLBACK status renders amber, releases Scan and repaints history.
 
-    Three of this phase's claims are only checkable here: that the amber is a
-    different colour from the success green and the failure red once the
-    cascade has resolved (D-05), that the Scan button recovers after a fallback
-    swap (T-23-23), and that the history table refreshes (T-23-24). A template
-    assertion cannot see any of them -- the first is a cascade outcome, and the
-    other two depend on JavaScript and htmx actually running.
+    The amber differs from the success green and the failure red once the
+    cascade has resolved, the Scan button recovers after a fallback swap, and
+    the history table refreshes. A template assertion cannot see any of them --
+    the first is a cascade outcome, and the other two depend on JavaScript and
+    htmx actually running.
     """
 
     @pytest.fixture
@@ -1714,17 +1683,12 @@ class TestFallbackStatusRendering:
             owner_token=_as_owner(page, browser_server.url),
         )
         # finish_job is the public writer for the warning column, and the worker
-        # already reaches FALLBACK through it. This used to UPDATE the column
-        # through job_store._conn, on a comment saying no warning writer landed
-        # until plan 23-07 -- which it since has.
-        #
-        # The workaround was also unsafe by the store's own rules: every public
-        # writer is wrapped in @_locked because the web and worker threads share
-        # one connection opened with check_same_thread=False, and sqlite3
-        # connection context managers do not nest -- an inner `with conn:`
-        # commits the outer transaction. Opening one from the test thread while
-        # holding no lock could commit another thread's in-flight work. Benign
-        # only because no scan runs during a browser test.
+        # reaches FALLBACK through it. Writing the column through
+        # job_store._conn instead would break the store's own rules: every
+        # public writer is wrapped in @_locked because the web and worker
+        # threads share one connection opened with check_same_thread=False, and
+        # sqlite3 connection context managers do not nest -- an inner
+        # `with conn:` commits the outer transaction.
         job_store.finish_job(
             job.id,
             JobState.FALLBACK,
@@ -1741,13 +1705,11 @@ class TestFallbackStatusRendering:
             yield page
         finally:
             # The server and its store are both session-scoped, so the teardown
-            # has to undo both halves. Clearing the pointer alone did not:
+            # undoes both halves. Clearing the pointer alone is not enough:
             # index() and current_job_status() each fall back to
-            # list_recent(limit=1) when there is no current job, and the most
-            # recent job was the one this fixture had just created. The FALLBACK
-            # page therefore followed every later test onto what was supposed to
-            # be the idle page, and the jobs accumulated across the session.
-            # Deleting the row is what actually restores the idle state.
+            # list_recent(limit=1) when there is no current job, so a row left
+            # here would follow every later test onto what should be the idle
+            # page. Deleting the row is what restores the idle state.
             app.state.worker._current_job_id = None
             job_store.delete_job(job.id)
 
@@ -1782,9 +1744,9 @@ class TestFallbackStatusRendering:
         """
         Amber resolves to a colour that is neither the ins green nor the del red.
 
-        This is the mechanical proof of D-05's "visually distinct from both",
-        and it is run under both colour schemes because a token that is legible
-        in one and invisible in the other is not distinct at all.
+        The amber is visually distinct from both, under both colour schemes,
+        because a token that is legible in one and invisible in the other is not
+        distinct at all.
         """
         self._goto(fallback_page, browser_server.url, scheme)
         colours = fallback_page.evaluate(_PROBE_STATUS_COLOURS)
@@ -1805,10 +1767,10 @@ class TestFallbackStatusRendering:
         scheme: Literal["light", "dark"],
     ) -> None:
         """
-        A fallback swap releases a stale disabled Scan button (T-23-23, ROBU-04).
+        A fallback swap releases a stale disabled Scan button.
 
         A FALLBACK is a finished scan, so a button still disabled when it lands
-        would look like a locked-up application. What releases it now is the
+        would look like a locked-up application. What releases it is the
         server's out-of-band button in the status response, not JavaScript:
         the page carries no app script, so the only thing that can re-enable a
         button forced disabled here is the swapped-in server render.
@@ -1827,7 +1789,7 @@ class TestFallbackStatusRendering:
         self, fallback_page: Page, browser_server: _BrowserServer
     ) -> None:
         """
-        The hidden reload div in the FALLBACK branch actually fires (T-23-24).
+        The hidden reload div in the FALLBACK branch actually fires.
 
         The status partial is swapped in with a stale history table below it;
         the reload div carried in the new markup has to repaint that table
@@ -1849,7 +1811,7 @@ class TestFallbackStatusRendering:
 @pytest.mark.browser
 class TestWarnedDoneStatusRendering:
     """
-    An upload that lost a sheet, proven amber in a browser rather than by grep.
+    An upload that lost a sheet reads amber in a browser, in both schemes.
 
     The template tests prove the headline wears `status-fallback`; only a
     resolved cascade proves that class reads as the fallback amber, and not as
@@ -1932,7 +1894,7 @@ _POLL_OBSERVATION_MS = 2500
 @pytest.mark.browser
 class TestCancelledStatusRendering:
     """
-    The CANCELLED status render, proven in a browser (D-01, EXC-04).
+    The CANCELLED status renders muted, with no alert, and behaves as terminal.
 
     A cancel is a deliberate stop, not a failure, so it must never look like
     one: muted rather than red, and no alert. Whether the grey is really a
@@ -2025,7 +1987,7 @@ class TestCancelledStatusRendering:
         self, cancelled_page: Page, browser_server: _BrowserServer
     ) -> None:
         """
-        A CANCELLED current job leaves the page idle-ready (D-01: terminal).
+        A CANCELLED current job leaves the page idle-ready, as a terminal state.
 
         The Scan button is enabled with no busy marker, the status area carries
         no polling trigger, and -- the behaviour the attribute stands for -- no
@@ -2105,9 +2067,8 @@ class TestDarkModeEngagement:
         page.goto(url)
         # The idle page renders "Ready to scan." and no .status-* line, so there
         # is nothing status-shaped to wait for -- wait for the history table
-        # instead. This is true only because fallback_page deletes its job on
-        # teardown; while that row survived, every test in this class was in
-        # fact looking at a FALLBACK page.
+        # instead. This holds because every fixture that stages a job deletes it
+        # on teardown; a surviving row would put a finished job's page here.
         page.wait_for_selector("#history-body")
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])
@@ -2117,7 +2078,7 @@ class TestDarkModeEngagement:
         browser_server_url: str,
         scheme: Literal["light", "dark"],
     ) -> None:
-        """The root element paints Pico's surface for the OS scheme (T1)."""
+        """The root element paints Pico's surface for the OS scheme."""
         expected = {
             "light": (_PICO_SURFACE["light"], "light"),
             "dark": (_PICO_SURFACE["dark"], "dark"),
@@ -2139,8 +2100,8 @@ class TestDarkModeEngagement:
             "status-error",
             "status-fallback",
             "status-cancelled",
-            # Phase 30's counts line renders in the status area and in the
-            # history Title cell alike (UI-SPEC S3), so it belongs in exactly
+            # The counts line renders in the status area and in the
+            # history Title cell alike, so it belongs in exactly
             # the same three placements as the four status colours. It reads
             # --pico-muted-color, the property .status-cancelled reads, which
             # is why the value assertion below covers both from one constant:
@@ -2164,10 +2125,10 @@ class TestDarkModeEngagement:
         placement: Literal["status-area", "history-cell", "card"],
     ) -> None:
         """
-        Every status colour reaches WCAG AA where it is really shown (T2).
+        Every status colour reaches WCAG AA where it is really shown.
 
-        The card placement is the margin UI-SPEC records for a status line
-        inside an ``<article>``; the dark card is lighter than the dark page,
+        The card placement covers a status line inside an ``<article>``; the
+        dark card is lighter than the dark page,
         so it is the tighter of the two for the muted cancelled grey.
 
         The fallback amber, the cancelled grey and the counts line are also
@@ -2191,7 +2152,7 @@ class TestDarkModeEngagement:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        A forced dark theme gets Pico's dark muted grey under a light OS (D-01).
+        A forced dark theme gets Pico's dark muted grey under a light OS.
 
         ``.status-cancelled`` reads Pico's own token rather than an app-owned
         pair, so this is the proof that Pico's ``[data-theme="dark"]`` block
@@ -2212,7 +2173,7 @@ class TestDarkModeEngagement:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        A forced dark theme gets the dark amber even under a light OS (T3).
+        A forced dark theme gets the dark amber even under a light OS.
 
         The automatic-dark tests cannot reach the forced-dark rule, because the
         OS preference alone never sets data-theme. This sets it directly, the
@@ -2227,7 +2188,7 @@ class TestDarkModeEngagement:
 _QUEUE_FULL_TEXT = (
     "✗ The scan queue is full. Wait for a scan to finish, then try again."
 )
-"""The slot's exact text for a 429: the error partial's cross plus the S3 copy."""
+"""The slot's exact text for a 429: the error partial's cross plus its copy."""
 
 _DEGRADED_TEXT = (
     "✗ Job history cannot be saved right now, so the scan was not started. "
@@ -2242,11 +2203,11 @@ _SLOT_MESSAGE = "#status-message p.status-error"
 """
 The slot's message paragraph, named rather than taken as the slot's first p.
 
-Phase 30 put a collapsed "Technical details" disclosure beside the message
-(APPL-04, UI-SPEC S2), so the slot's own text is no longer only the message and
-its paragraphs are no longer only one.  Everything asserting what the user reads
--- the exact text, the red, the left edge, the wrapped line count -- names this
-paragraph, so a later change to the disclosure cannot be measured by mistake.
+A collapsed "Technical details" disclosure sits beside the message, so the
+slot holds more than the message and more than one paragraph.  Everything
+asserting what the user reads -- the exact text, the red, the left edge, the
+wrapped line count -- names this paragraph, so a change to the disclosure
+cannot be measured by mistake.
 """
 
 _FILL_ATTEMPTS = 15
@@ -2311,7 +2272,7 @@ _SUBMIT_UNKNOWN_PROFILE = """
 """
 
 # The status poll names the job this browser follows once it has one, and
-# the current-job path only until then (D-25), so a poll is recognised by the
+# the current-job path only until then, so a poll is recognised by the
 # shape of its URL rather than by one literal path.  The URL carries the token
 # of what the page shows as a query string, so the path may end there too.
 _POLL_URL = re.compile(r"/api/jobs/[^/?]+/status(\?|$)")
@@ -2338,14 +2299,14 @@ def _fill_queue_until_rejected(url: str) -> None:
 @pytest.mark.browser
 class TestRequestErrorSlot:
     """
-    Request errors are seen where 26-UI-SPEC S2 puts them (ROBU-02, D-02..D-06).
+    A request error shows in ``#status-message``, legible, aligned and lasting.
 
-    A 429 that is returned but never shown is the failure this class exists for:
+    A 429 that is returned but never shown is the failure this class guards:
     the TestClient tests prove the response, and only a browser proves that htmx
     retargets it into ``#status-message``, that the text is legible and aligned,
     that polling does not erase it, and that a successful scan does. The Scan
     button is disabled while a job is active, so the queue is filled over HTTP
-    after an idle page has loaded (B8).
+    after an idle page has loaded.
     """
 
     @pytest.fixture
@@ -2382,12 +2343,11 @@ class TestRequestErrorSlot:
         self, queue_full_page: Callable[..., Page]
     ) -> None:
         """
-        A 429 lands in the slot, as announced text, and in Job History (B8).
+        A 429 lands in the slot, as announced text, and in Job History.
 
-        Covers ROBU-02's visible message, D-02 (errors go to the slot, not the
-        status area), D-05 (the rejected attempt is recorded) and the UI-SPEC
-        accessibility contract: the slot itself is the alert, so the message
-        must not carry a second ``role="alert"``.  Focus returns to the Scan
+        The error goes to the slot, not the status area, and the rejected
+        attempt is recorded. The slot itself is the alert, so the message must
+        not carry a second ``role="alert"``.  Focus returns to the Scan
         button the refused press came from, enabled, and never moves into
         ``#status-message``: the slot speaks the error from where it is.
         """
@@ -2415,7 +2375,7 @@ class TestRequestErrorSlot:
         scheme: Literal["light", "dark"],
     ) -> None:
         """
-        The slot message is the error red at WCAG AA in both schemes (B9).
+        The slot message is the error red at WCAG AA in both schemes.
 
         The colour is asserted by value so a palette drift is named, and the
         ratio is measured against the layers the real paragraph sits on.
@@ -2433,7 +2393,7 @@ class TestRequestErrorSlot:
         self, queue_full_page: Callable[..., Page], width: int
     ) -> None:
         """
-        The slot's text starts at the same x as the status text (B12).
+        The slot's text starts at the same x as the status text.
 
         ``app.css`` insets the slot paragraph by the status area's border and
         padding; the check is on the glyphs, within 1 px, at desktop and phone
@@ -2452,13 +2412,13 @@ class TestRequestErrorSlot:
         self, queue_full_page: Callable[..., Page], width: int
     ) -> None:
         """
-        The disclosure starts at the same x as the message it belongs to (B12).
+        The disclosure starts at the same x as the message it belongs to.
 
         ``app.css`` insets the slot's children by the status area's own border
-        and padding so the slot and the status area share a left edge. Phase 30
-        made the message a sibling rather than an only child, so the inset has
-        to cover the disclosure too, or "Technical details" hangs a rem to the
-        left of the sentence it explains.
+        and padding so the slot and the status area share a left edge. The
+        message is a sibling of the disclosure, not an only child, so the inset
+        has to cover the disclosure too, or "Technical details" hangs a rem to
+        the left of the sentence it explains.
         """
         page = queue_full_page(width=width)
         message = page.evaluate(_READ_CONTENT_BOX_LEFT, _SLOT_MESSAGE)
@@ -2476,7 +2436,7 @@ class TestRequestErrorSlot:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        The longest slot message wraps at 375 px with no horizontal overflow (B13).
+        The longest slot message wraps at 375 px with no horizontal overflow.
 
         The route reads ``worker.health`` before any submit, so replacing the
         property makes the 503 deterministic. Setting the worker's degraded
@@ -2505,7 +2465,7 @@ class TestRequestErrorSlot:
         self, page: Page, scan_harness: _ScanHarness
     ) -> None:
         """
-        An error shown mid-scan outlives at least two status polls (B10, D-03).
+        An error shown mid-scan outlives at least two status polls.
 
         The poll re-renders ``#status-area`` every second while a job is active.
         If a poll response carried the slot clear that a successful scan
@@ -2543,7 +2503,7 @@ class TestRequestErrorSlot:
         self, page: Page, scan_harness: _ScanHarness
     ) -> None:
         """
-        A successful scan empties the slot back to zero height (B11, D-03).
+        A successful scan empties the slot back to zero height.
 
         The slot must also stay the same ``role="alert"`` element: the clear
         replaces its contents, not the element, so the next error is still
@@ -2596,8 +2556,8 @@ class _ScanHeaderRecorder:
     The browser's own view of a request cannot answer whether it sent
     ``Sec-Fetch-Site``: under the egress gate's ``context.route``, Playwright's
     ``Request.all_headers()`` omits the ``Sec-Fetch-*`` headers even when the
-    server receives them (measured: a routed 127.0.0.1 page reports none while
-    the server gets ``same-origin``). So the headers are read where the guard
+    server receives them (a routed 127.0.0.1 page reports none while the server
+    gets ``same-origin``). So the headers are read where the guard
     reads them, in front of the app. Every scope, lifespan included, is passed
     through unchanged.
     """
@@ -2639,7 +2599,7 @@ def lan_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Lan
     It is its own app with its own store under ``tmp_path``, so nothing it does
     touches the session server. Uvicorn binds all interfaces on a free port
     because the browser has to reach it by the LAN address, and it runs only for
-    this one test, with a stub scanner and a stubbed Paperless (T-26-56).
+    this one test, with a stub scanner and a stubbed Paperless.
     """
     address = _non_loopback_ipv4()
     if address is None:
@@ -2661,7 +2621,7 @@ def lan_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Lan
 @pytest.mark.browser
 class TestPlainHttpLanOrigin:
     """
-    The cross-site guard lets the app's own page scan from a LAN address (D-20).
+    The cross-site guard lets the app's own page scan from a LAN address.
 
     saneless's documented deployment is plain HTTP on a LAN address, and there a
     browser sends no ``Sec-Fetch-Site`` at all, so only the guard's Origin
@@ -2675,19 +2635,15 @@ class TestPlainHttpLanOrigin:
         lan_server: _LanServer,
     ) -> None:
         """
-        A same-origin Scan click from ``http://<lan-ip>`` is accepted (ROBU-10).
+        A same-origin Scan click from ``http://<lan-ip>`` is accepted.
 
-        Research assumption A6: the Fetch Metadata spec adds ``Sec-Fetch-*``
-        only for potentially trustworthy URLs, so Chromium omits it on a plain
-        HTTP LAN origin and the guard decides on ``Origin`` against ``Host``
-        (D-20 branch 2). ``localhost`` and ``127.0.0.1`` cannot prove this: they
-        are secure contexts, always get ``Sec-Fetch-Site``, and exercise branch
-        1 instead. The TestClient branch-2 tests in ``tests/test_cross_origin.py``
-        prove the rule; this proves the browser really takes that branch.
-
-        The headers are checked as the server received them, not through
-        Playwright's request object, which hides ``Sec-Fetch-*`` under routing
-        (see ``_ScanHeaderRecorder``).
+        The Fetch Metadata spec adds ``Sec-Fetch-*`` only for potentially
+        trustworthy URLs, so Chromium omits it on a plain HTTP LAN origin and
+        the guard decides on ``Origin`` against ``Host``. ``localhost`` and
+        ``127.0.0.1`` cannot prove this: they are secure contexts and always
+        get ``Sec-Fetch-Site``. The headers are read as the server received
+        them, because Playwright's request object hides ``Sec-Fetch-*`` under
+        routing.
         """
         lan_url = lan_server.url
         egress_allowlist.append(lan_url)
@@ -2705,7 +2661,7 @@ class TestPlainHttpLanOrigin:
         headers = lan_server.scan_headers[0]
         assert "sec-fetch-site" not in headers, (
             f"Chromium sent Sec-Fetch-Site={headers['sec-fetch-site']!r} to "
-            f"{lan_url}, so this test no longer exercises D-20 branch 2: the "
+            f"{lan_url}, so this test does not exercise the guard's Origin branch: the "
             "runner's address is being treated as potentially trustworthy"
         )
         assert headers.get("origin") == lan_url, headers
@@ -2713,7 +2669,7 @@ class TestPlainHttpLanOrigin:
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
 
 
-# The shipped stand-in `config.is_placeholder_token` refuses (D-14). A second
+# The shipped stand-in `config.is_placeholder_token` refuses. A second
 # live server runs with it so the blocked Scan button can be looked at in a
 # real browser rather than only in rendered markup.
 _SHIPPED_PLACEHOLDER = "changeme"
@@ -2730,8 +2686,7 @@ def _blocked_settings(tmp_dir: Path) -> Settings:
     Build the browser settings with the shipped placeholder token in place.
 
     One definition, because two servers run with it: the session-scoped one
-    below, and the private one plan 30-19 uses for the claims that write a job
-    row. A second copy of this ``model_copy`` would be a second place for the
+    below, and the private one serving the claims that write a job row. A second copy of this ``model_copy`` would be a second place for the
     placeholder to drift from ``is_placeholder_token``'s idea of one.
     """
     configured = _browser_test_settings(tmp_dir)
@@ -2754,7 +2709,7 @@ def blocked_server(
 
     The verdict is read from ``Settings`` once at process start, so there is no
     runtime setter to reach for: a second server is the only honest way to put
-    a real browser in front of the blocked page (UI-SPEC S8).
+    a real browser in front of the blocked page.
     """
     tmp_dir = tmp_path_factory.mktemp("browser-blocked")
     scanner = _BrowserTestScanner()
@@ -2769,11 +2724,11 @@ def blocked_server(
 @pytest.mark.browser
 class TestBlockedScanButtonInABrowser:
     """
-    The blocked Scan button and its reason line, in Chromium (APPL-07, D-15).
+    A placeholder token blocks the Scan button and shows why, in Chromium.
 
     Two of these claims cannot be made from rendered markup. Whether the
-    ``disabled`` attribute survives the page's own load requests is the C-10
-    inheritance trap, which only a browser running htmx can spring; and whether
+    ``disabled`` attribute survives the page's own requests is the
+    ``hx-disabled-elt`` inheritance trap, which only a browser running htmx can spring; and whether
     the reason line is actually legible is a question about computed colour on
     the layers it really sits on.
 
@@ -2842,15 +2797,14 @@ class TestBlockedScanButtonInABrowser:
         egress_allowlist: list[str],
     ) -> None:
         """
-        The requests inside the form do not re-enable it (C-10, T-30-66).
+        The requests inside the form do not re-enable the blocked button.
 
         An inherited ``hx-disabled-elt`` puts a child request in charge of the
         button's ``disabled`` attribute, which is why the form disinherits it.
         With no job active there is no one-second status poll to put the
         attribute back, so a blocked button that lost it here would stay
         clickable -- which is exactly why the flag lives in the one button
-        partial.  The two refresh buttons are the form's own requests now that
-        the page asks for neither list on load.
+        partial.  The two refresh buttons supply the form's own requests.
         """
         egress_allowlist.append(blocked_server.url)
         page.add_init_script(_RECORD_CONTROL_SWAPS)
@@ -2904,13 +2858,13 @@ class TestBlockedScanButtonInABrowser:
         assert page.locator(_BLOCKED_REASON_SELECTOR).count() == 0
         assert page.locator("#scan-btn").get_attribute("aria-describedby") is None
         # The other half of the same flag, asserted here so the blocked case
-        # below is a difference and not just a presence (plan 30-19, P16).
+        # below is a difference and not just a presence.
         expect(page.locator("#scan-btn")).to_be_enabled()
 
 
 _OWNER_COOKIE_NAME = "saneless_owner"
 
-# The owner cookie lives a year (D-06), so a browser keeps its ownership across
+# The owner cookie lives a year, so a browser keeps its ownership across
 # restarts. Playwright reports a cookie's expiry in Unix seconds, and a session
 # cookie -- one with neither Max-Age nor Expires -- as -1, so an expiry more
 # than 364 days out proves the year-long lifetime arrived. The one day short of
@@ -2936,12 +2890,12 @@ def _outlives_364_days(expires: float) -> bool:
 @pytest.mark.browser
 class TestOwnerCookieInABrowser:
     """
-    The owner cookie's behaviour in Chromium, measured rather than assumed.
+    The owner cookie an htmx submit sets persists in Chromium, out of scripts' reach.
 
-    RESEARCH carried assumption A6: that a browser processes ``Set-Cookie`` on
-    an htmx XHR response exactly as it does on a navigation. If that were
-    false the token would never persist and the whole gate would be decorative,
-    so it is asserted here instead of reasoned about (APPL-09, D-23).
+    The token persists only if a browser processes ``Set-Cookie`` on an htmx
+    XHR response exactly as it does on a navigation. Were that false the whole
+    ownership gate would be decorative, so it is asserted here instead of
+    reasoned about.
     """
 
     def test_scan_submit_sets_a_persistent_owner_cookie(
@@ -2968,7 +2922,7 @@ class TestOwnerCookieInABrowser:
         assert _outlives_364_days(cookie["expires"]), cookie["expires"]
         assert cookie["secure"] is False
         # HttpOnly proved from inside the page, not from the header: this is
-        # the claim that the token cannot reach a script (T-30-59), and there
+        # the claim that the token cannot reach a script, and there
         # is no script file that could read it in the first place.
         assert _OWNER_COOKIE_NAME not in page.evaluate("() => document.cookie")
 
@@ -2980,7 +2934,7 @@ class TestOwnerCookieInABrowser:
 
         A CSS-hidden control is still in the page and still reachable from the
         console, which would be an ASVS V4 failure. This asserts absence in a
-        real browser rather than absence from a string (D-24).
+        real browser rather than absence from a string.
         """
         app = browser_server.app
         job_store: JobStore = app.state.job_store
@@ -3016,7 +2970,7 @@ class TestOwnerCookieInABrowser:
 
 @pytest.mark.browser
 class TestProfileDescriptionSwap:
-    """The sentence under the select follows the selection, live (D-20, S4)."""
+    """The sentence under the select follows the selection, live."""
 
     def test_choosing_another_profile_swaps_the_description_in_place(
         self, page: Page, browser_server_url: str
@@ -3048,7 +3002,7 @@ class TestProfileDescriptionSwap:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        One help line under Profile, and it is the live one (APPL-10).
+        One help line under Profile, and it is the live one.
 
         The adjacent-sibling selector is Pico's own help-text rule, so this
         asserts the styling hook and the "no second help line" contract at
@@ -3202,22 +3156,12 @@ class TestMultiPageCheckbox:
 
         Firefox restores a form control's state on reload unless something
         stops it, and Chromium does not, so this is the one browser that can
-        tell.  Two things stop it on this page: the ``Cache-Control: no-store``
-        every page response carries, and ``autocomplete="off"`` on the
-        checkbox.  Either alone is enough, so the page as served cannot tell
-        whether the checkbox's own opt-out is there.  The second case therefore
-        strips ``no-store`` from the page response on its way to the browser,
-        leaving the attribute as the only thing between a reload and a restored
-        tick: that case fails when the attribute is removed.  The first case
-        keeps the page exactly as the server sends it.
-
-        The read after the reload is a single ``is_checked`` rather than a
-        retrying assertion: a retry could pass on a moment before a restore
-        instead of on the settled page.
-
-        The context is built by hand from a Firefox browser, so it installs the
-        egress gate and the policy recorder itself and is checked after it
-        closes, as the two-browser ownership test does.
+        tell.  The page's ``Cache-Control: no-store`` and the checkbox's
+        ``autocomplete="off"`` each stop it alone, so the second case strips
+        ``no-store`` on the way to the browser and leaves the attribute as the
+        only guard; the first keeps the page exactly as served.  The read after
+        the reload is a single ``is_checked``, so a retry cannot pass on a
+        moment before a restore.
         """
         blocked: list[str] = []
         seen: list[str] = []
@@ -3287,11 +3231,11 @@ class TestPageLoadAsksForNoList:
         self, page: Page, tmp_path: Path, egress_allowlist: list[str]
     ) -> None:
         """
-        Load the page, record every request, then refresh each list.
+        A load asks ``/api/metadata`` once and no per-list route; refreshes swap.
 
-        The refresh requests are recorded by the same listener, so the empty
-        record of per-list requests at load is not a listener that heard
-        nothing at all; nor is it, since the one lazy request is in it.
+        The lazy request and the refresh requests are recorded by the same
+        listener, so the empty record of per-list requests at load is not a
+        listener that heard nothing at all.
         """
         tags = list(_PAGE_LOAD_TAGS)
         correspondents = list(_PAGE_LOAD_CORRESPONDENTS)
@@ -3372,12 +3316,12 @@ def tagged_server(browser_server: _BrowserServer) -> Iterator[_BrowserServer]:
 @pytest.mark.browser
 class TestTagFilterInChromium:
     """
-    The tag picker's two designed-out hazards, proven in a real browser.
+    The tag picker keeps a filtered-out tick and never submits the filter text.
 
-    Neither is reachable from a server-side test. A-5 is about what the DOM
-    holds after an htmx swap, and A-6 is about which form a browser considers
-    an input to belong to -- the HTML form-owner association, which only a
-    browser implements.
+    Neither is reachable from a server-side test. The first is about what the
+    DOM holds after an htmx swap, and the second is about which form a browser
+    considers an input to belong to -- the HTML form-owner association, which
+    only a browser implements.
     """
 
     def _load_tags(self, page: Page, url: str) -> None:
@@ -3396,10 +3340,9 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        A tick the filter excludes stays in the DOM, above the list (A-5).
+        A tick the filter excludes stays in the DOM, above the list.
 
-        This is the hazard the research named. A swap that re-rendered only the
-        matches would take an already-chosen tag out of the document, and a tag
+        A swap that re-rendered only the matches would take an already-chosen tag out of the document, and a tag
         that is not in the document is not in the next submit either -- with
         nothing to warn the user, who would simply find it was not applied.
         """
@@ -3424,7 +3367,7 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        The filtered-out tick rides along and the filter text does not (A-5, A-6).
+        The filtered-out tick rides along and the filter text does not.
 
         The submit is intercepted rather than served, so this reads what the
         browser actually put on the wire without starting a real scan on the
@@ -3456,7 +3399,7 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        Enter performs implicit submission of the filter's own form (A-6).
+        Enter performs implicit submission of the filter's own form.
 
         Without the form attribute the input would belong to the scan form, and
         a household member typing a filter and pressing Enter would start a
@@ -3483,7 +3426,7 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        Every row is at least 44 px tall and spans the list (D-30, WCAG 2.5.5).
+        Every row is at least 44 px tall and spans the list (WCAG 2.5.5).
 
         Measured in the browser, because this is a cascade outcome and not a
         stylesheet fact: Pico shrinks a checkbox label to the width of its text
@@ -3507,7 +3450,7 @@ class TestTagFilterInChromium:
 # A profile's default tags and correspondent, in a real browser.
 #
 # The lists paperless-ngx is patched to answer.  Tag 99 is in neither, so the
-# profile that names it has a default paperless-ngx no longer has.
+# profile that names it has a default paperless-ngx does not have.
 # ---------------------------------------------------------------------------
 
 _DEFAULTS_TAGS: list[dict[str, object]] = [
@@ -3715,18 +3658,15 @@ class TestProfileDefaultsInTheBrowser:
         served: Literal["as-served", "without-no-store"],
     ) -> None:
         """
-        A reload shows the profile's defaults, not what was changed by hand.
+        A reload shows the profile's defaults, not the operator's hand edits.
 
         Firefox restores form state on reload unless something stops it, and
-        Chromium does not, so Firefox is the browser that can tell.  As in the
-        Multiple pages reload test, the second case strips ``no-store`` from
-        the page on its way to the browser, so ``autocomplete="off"`` on the
-        box and on the select is all that stands between the reload and an
-        untick the operator made, or a correspondent they picked, coming back
-        over the server's defaults.
-
-        The reads after the reload are single reads, not retrying assertions,
-        so they cannot pass on a moment before a restore.
+        Chromium does not, so Firefox is the browser that can tell.  The second
+        case strips ``no-store`` from the page, so ``autocomplete="off"`` on the
+        box and on the select is all that keeps an untick, or a picked
+        correspondent, from coming back over the server's defaults.  The reads
+        after the reload are single reads, so they cannot pass on a moment
+        before a restore.
         """
         url = defaults_server.url
         blocked: list[str] = []
@@ -4612,8 +4552,8 @@ class TestLazyListsInTheBrowser:
 
         The lazy request, asked for ``default``, is held while ``receipts``
         is chosen.  The change sends the load again for ``receipts`` and
-        abandons the first request, so the answer for a profile no longer
-        chosen never lands.  The lists, their markers and the Profile select
+        abandons the first request, so the answer for the abandoned profile
+        never lands.  The lists, their markers and the Profile select
         then agree on ``receipts``, and the scan files its own defaults.
         """
         held = _hold_the_list_load(page)
@@ -5062,16 +5002,14 @@ class TestProfileDefaultsPreselection:
 # ---------------------------------------------------------------------------
 # The status strip, in Chromium.
 #
-# Per CLAUDE.md nothing in this phase's browser contract is deferred to a
-# person. Every row of 30-UI-SPEC's Verification Contract that names a browser
-# is automated -- here and in the classes below -- and none of them is marked
-# for a human to look at. The one out-of-suite item is scanner reachability
-# against physical hardware, which cannot be stubbed and which 30-VALIDATION.md
-# already records as the hardware-only check it is.
+# Every browser-visible claim about the strip is automated, here and in the
+# classes below, and none is left for a person to look at. The one claim
+# outside the suite is scanner reachability against physical hardware, which
+# cannot be stubbed.
 # ---------------------------------------------------------------------------
 
 _PAUSED_PREFIX = "Paused during scan \N{EM DASH} "
-"""The freshness line's prefix while a scan holds the scanner (D-08, UI-SPEC S1)."""
+"""The freshness line's prefix while a scan holds the scanner."""
 
 _SCANNER_PAUSED_MESSAGE = "Not checked while a scan is running."
 """The Scanner row's message for the same situation."""
@@ -6537,10 +6475,10 @@ class TestHistoryTableOnAPhone:
 
 
 _FRONT_PAGES = 12
-"""How many sheets pass A produces, so the busy line has UI-SPEC P7's number."""
+"""How many sheets pass A produces, so the busy line has a known front count."""
 
 _FRONT_COUNT_PREFIX = f"Front: {_FRONT_PAGES} pages \N{MIDDLE DOT} "
-"""The opening UI-SPEC P7 pins, separator included."""
+"""The busy line's opening, separator included."""
 
 
 class _ManualDuplexScanner(_BrowserTestScanner):
@@ -6622,7 +6560,6 @@ class TestManualDuplexFrontCountInChromium:
         self,
         page: Page,
         duplex_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         At ``SCANNING_REVERSE`` the busy line opens ``Front: 12 pages ·`` (P7).
@@ -6812,7 +6749,7 @@ class TestProfileDescriptionInChromium:
 
 
 _TIME_CELL_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} (\S+)$")
-"""UI-SPEC P15's Time cell shape, with the zone token captured for reuse."""
+"""The history Time cell's shape, with the zone token captured for reuse."""
 
 
 @pytest.mark.browser
@@ -6886,7 +6823,7 @@ before the worker records when the wait began, and either form carries this.
 """
 
 _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
-"""The question ``hx-confirm`` puts in the native dialog (D-27, UI-SPEC S5)."""
+"""The question ``hx-confirm`` puts in the native dialog."""
 
 # D-26 forbids a third way out of the flip prompt: no override, no take-over,
 # no force-continue. The absence IS the rendering, so it is asserted rather
@@ -6924,7 +6861,6 @@ def flip_server(
 def _drive_to_flip_prompt(
     page: Page,
     server: _BrowserServer,
-    wait_for_state: Callable[..., Job],
     title: str,
 ) -> str:
     """
@@ -6937,7 +6873,6 @@ def _drive_to_flip_prompt(
     Args:
         page: The browser page that submits, and so becomes the owner.
         server: The private server to submit to.
-        wait_for_state: The conftest waiter, polling the job store.
         title: The title to submit, so both browsers can be asked to agree.
 
     Returns:
@@ -7008,7 +6943,6 @@ class TestTwoBrowsersOneStack:
         browser: Browser,
         flip_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Two cookie jars, one prompt, and nothing else differs (P9, D-24, D-26).
@@ -7039,9 +6973,7 @@ class TestTwoBrowsersOneStack:
             owner_page = owner_ctx.new_page()
             viewer_page = viewer_ctx.new_page()
 
-            job_id = _drive_to_flip_prompt(
-                owner_page, server, wait_for_state, _FLIP_JOB_TITLE
-            )
+            job_id = _drive_to_flip_prompt(owner_page, server, _FLIP_JOB_TITLE)
             try:
                 # Both pages are (re)loaded from the same server state, so the
                 # only thing that differs between the two requests is the
@@ -7130,7 +7062,6 @@ class TestTwoBrowsersOneStack:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The owner's buttons are named by the job line; the pictures are silent.
@@ -7142,7 +7073,7 @@ class TestTwoBrowsersOneStack:
         lost.
         """
         server = flip_server
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, _FLIP_JOB_TITLE)
+        job_id = _drive_to_flip_prompt(page, server, _FLIP_JOB_TITLE)
         try:
             page.reload()
             status = page.locator("#status-area")
@@ -7160,7 +7091,7 @@ class TestTwoBrowsersOneStack:
             assert "Long edge (correct)" in snapshot, snapshot
             assert "Short edge (incorrect)" in snapshot, snapshot
         finally:
-            _end_the_flip(server, job_id, wait_for_state)
+            _end_the_flip(server, job_id)
 
     def test_non_owner_sees_the_way_forward_and_deadline(
         self,
@@ -7168,7 +7099,6 @@ class TestTwoBrowsersOneStack:
         browser: Browser,
         flip_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A second browser is told where the flip can be answered, and until when.
@@ -7180,7 +7110,7 @@ class TestTwoBrowsersOneStack:
         """
         server = flip_server
         worker = server.app.state.worker
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, _FLIP_JOB_TITLE)
+        job_id = _drive_to_flip_prompt(page, server, _FLIP_JOB_TITLE)
         blocked: list[str] = []
         seen: list[str] = []
         violations: list[str] = []
@@ -7213,7 +7143,7 @@ class TestTwoBrowsersOneStack:
             expect(page.locator("#flip-continue")).to_be_visible()
         finally:
             viewer_ctx.close()
-            _end_the_flip(server, job_id, wait_for_state)
+            _end_the_flip(server, job_id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
@@ -7224,7 +7154,6 @@ class TestTwoBrowsersOneStack:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The confirm is really raised, and dismissing it aborts nothing (P10).
@@ -7258,7 +7187,7 @@ class TestTwoBrowsersOneStack:
         page.on("dialog", _on_dialog)
         page.on("request", _on_request)
 
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, "Abort Me")
+        job_id = _drive_to_flip_prompt(page, server, "Abort Me")
         abort_button = page.locator("#status-area button[hx-post='/api/flip/abort']")
         expect(abort_button).to_be_visible()
 
@@ -7327,22 +7256,19 @@ class TestFlipPromptSurvivesPolls:
         return posted
 
     @staticmethod
-    def _settled_prompt(
-        page: Page, server: _BrowserServer, wait_for_state: Callable[..., Job]
-    ) -> str:
+    def _settled_prompt(page: Page, server: _BrowserServer) -> str:
         """
         Park a real scan at the flip prompt and wait until the page shows it.
 
         Args:
             page: The page that submits, and so owns the job.
             server: The private flip server.
-            wait_for_state: The conftest waiter, polling the job store.
 
         Returns:
             The id of the job waiting at the flip prompt.
 
         """
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, "Held Flip")
+        job_id = _drive_to_flip_prompt(page, server, "Held Flip")
         expect(page.locator("#flip-continue")).to_be_visible(timeout=10_000)
         # One completed poll after the prompt appeared, so the area on the page
         # is the one the unchanged polls will leave in place.
@@ -7350,9 +7276,7 @@ class TestFlipPromptSurvivesPolls:
         return job_id
 
     @staticmethod
-    def _finish(
-        server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
-    ) -> None:
+    def _finish(server: _BrowserServer, job_id: str) -> None:
         """
         Bring the job to an end before the server shuts down.
 
@@ -7362,7 +7286,6 @@ class TestFlipPromptSurvivesPolls:
         Args:
             server: The private flip server.
             job_id: The job to end.
-            wait_for_state: The conftest waiter, polling the job store.
 
         """
         job_store: JobStore = server.app.state.job_store
@@ -7373,21 +7296,19 @@ class TestFlipPromptSurvivesPolls:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Continue and Abort carry the ids focus is restored by."""
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             expect(page.locator("#flip-continue")).to_have_text("Continue")
             expect(page.locator("#flip-abort")).to_have_text("Abort scan")
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
     def test_focused_continue_survives_two_polls_and_enter_sends_the_post(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A keyboard-focused Continue keeps focus through two polls, and Enter works.
@@ -7396,7 +7317,7 @@ class TestFlipPromptSurvivesPolls:
         the keyboard reached, not a replacement that happens to share its id.
         """
         posted = self._record_continues(page)
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             page.focus("#flip-continue")
             page.locator("#flip-continue").evaluate(
@@ -7414,13 +7335,12 @@ class TestFlipPromptSurvivesPolls:
             assert answered.value.status == 200
             assert len(posted) == 1, posted
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
     def test_space_held_across_a_poll_sends_one_continue(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A Space press that straddles a poll activates Continue exactly once.
@@ -7429,7 +7349,7 @@ class TestFlipPromptSurvivesPolls:
         the button that saw the keydown is still there when the key comes up.
         """
         posted = self._record_continues(page)
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             page.focus("#flip-continue")
             page.keyboard.down("Space")
@@ -7439,17 +7359,16 @@ class TestFlipPromptSurvivesPolls:
 
             assert len(posted) == 1, posted
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
     def test_pointer_held_across_a_poll_sends_one_continue(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A mouse press held across a poll clicks Continue exactly once."""
         posted = self._record_continues(page)
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             # hover() scrolls the button into view and puts the pointer on its
             # centre; the press itself is the raw mouse, so it can be held.
@@ -7461,7 +7380,7 @@ class TestFlipPromptSurvivesPolls:
 
             assert len(posted) == 1, posted
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
 
 _OWNED_TITLE = "Owned By One Browser"
@@ -7650,7 +7569,6 @@ class TestSimplerFormInChromium:
         self,
         page: Page,
         simple_form_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         No tag markup anywhere, and a scan still files under the profile's tags (P14).
@@ -8171,7 +8089,6 @@ def _await_status_poll(page: Page) -> int:
 def _start_multi_page_scan(
     page: Page,
     server: _BrowserServer,
-    wait_for_state: Callable[..., Job],
     title: str,
 ) -> str:
     """
@@ -8183,7 +8100,6 @@ def _start_multi_page_scan(
     Args:
         page: The browser page that submits, and so becomes the owner.
         server: The private server to submit to.
-        wait_for_state: The conftest waiter, polling the job store.
         title: The title to submit.
 
     Returns:
@@ -8206,9 +8122,7 @@ def _start_multi_page_scan(
     return job_id
 
 
-def _abort_the_document(
-    server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
-) -> None:
+def _abort_the_document(server: _BrowserServer, job_id: str) -> None:
     """
     End a multi-page job a test left running, by answering Abort to its prompt.
 
@@ -8219,7 +8133,6 @@ def _abort_the_document(
     Args:
         server: The private server the job runs on.
         job_id: The job to end.
-        wait_for_state: The conftest waiter, polling the job store.
 
     """
     job_store: JobStore = server.app.state.job_store
@@ -8310,7 +8223,6 @@ class TestMultiPagePromptInTheBrowser:
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Tick, Scan, Scan next page, Finish document, and the document is uploaded.
@@ -8321,7 +8233,7 @@ class TestMultiPagePromptInTheBrowser:
         """
         server = multi_page_scan_server
         job_store: JobStore = server.app.state.job_store
-        job_id = _start_multi_page_scan(page, server, wait_for_state, _MULTI_PAGE_TITLE)
+        job_id = _start_multi_page_scan(page, server, _MULTI_PAGE_TITLE)
         try:
             prompt = page.locator("#status-area .pages-prompt")
             scan_btn = page.locator("#scan-btn")
@@ -8364,13 +8276,12 @@ class TestMultiPagePromptInTheBrowser:
             expect(scan_btn).to_be_enabled()
             expect(scan_btn).to_have_text("Scan")
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_abort_asks_first_and_does_nothing_when_the_answer_is_no(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Abort raises the native confirmation naming the kept page; "no" keeps it.
@@ -8398,7 +8309,7 @@ class TestMultiPagePromptInTheBrowser:
 
         page.on("dialog", _on_dialog)
         page.on("request", _on_request)
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Abort Pages")
+        job_id = _start_multi_page_scan(page, server, "Abort Pages")
         try:
             _await_status_poll(page)
             page.click("#mp-abort")
@@ -8427,7 +8338,7 @@ class TestMultiPagePromptInTheBrowser:
                 job_store, job_id, JobState.CANCELLED, timeout=_JOB_FINISH_TIMEOUT
             )
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_finish_is_disabled_with_its_reason_while_no_page_is_kept(
         self, page: Page, multi_page_scan_server: _BrowserServer
@@ -8469,7 +8380,6 @@ class TestMultiPagePromptInTheBrowser:
         browser: Browser,
         multi_page_scan_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Only the browser that started the scan is asked; anyone else is told.
@@ -8481,7 +8391,7 @@ class TestMultiPagePromptInTheBrowser:
         itself and is checked after it closes.
         """
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Not Yours")
+        job_id = _start_multi_page_scan(page, server, "Not Yours")
         blocked: list[str] = []
         seen: list[str] = []
         violations: list[str] = []
@@ -8507,7 +8417,7 @@ class TestMultiPagePromptInTheBrowser:
             expect(page.locator("#status-area .pages-prompt")).to_be_visible()
         finally:
             viewer_ctx.close()
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
@@ -8518,7 +8428,6 @@ class TestMultiPagePromptInTheBrowser:
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Four buttons fit a 320 px screen by wrapping, each a full touch target.
@@ -8528,7 +8437,7 @@ class TestMultiPagePromptInTheBrowser:
         """
         server = multi_page_scan_server
         page.set_viewport_size({"width": 320, "height": 640})
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Phone Pages")
+        job_id = _start_multi_page_scan(page, server, "Phone Pages")
         try:
             _await_status_poll(page)
             layout = page.evaluate(_MEASURE_PROMPT)
@@ -8546,13 +8455,12 @@ class TestMultiPagePromptInTheBrowser:
             rows = {round(button["top"]) for button in buttons}
             assert len(rows) > 1, f"the buttons did not wrap: {buttons}"
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_keyboard_focus_on_a_button_survives_the_status_poll(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A keyboard user keeps their place while the status area is polled.
@@ -8566,7 +8474,7 @@ class TestMultiPagePromptInTheBrowser:
         once, not retried.
         """
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Pages")
+        job_id = _start_multi_page_scan(page, server, "Focus Pages")
         try:
             _await_status_poll(page)
             page.locator("#mp-finish").focus()
@@ -8584,7 +8492,7 @@ class TestMultiPagePromptInTheBrowser:
             )
             assert page.evaluate("() => document.activeElement.id") == "mp-next"
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
 
 # Counts every write into the alert slot: a child added or removed, or text
@@ -8619,7 +8527,6 @@ class TestStatusPollLostContact:
         self,
         page: Page,
         scan_harness: _ScanHarness,
-        wait_for_state: Callable[..., Job],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
@@ -9248,9 +9155,7 @@ def _accept_the_confirmation(page: Page) -> None:
     page.once("dialog", _on_dialog)
 
 
-def _end_the_flip(
-    server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
-) -> None:
+def _end_the_flip(server: _BrowserServer, job_id: str) -> None:
     """
     Bring a flip job a test started to an end before the server shuts down.
 
@@ -9260,7 +9165,6 @@ def _end_the_flip(
     Args:
         server: The private flip server.
         job_id: The job to end.
-        wait_for_state: The conftest waiter, polling the job store.
 
     """
     job_store: JobStore = server.app.state.job_store
@@ -9310,7 +9214,6 @@ class TestFocusMap:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The flip prompt arriving through the poll puts focus on Continue.
@@ -9319,38 +9222,32 @@ class TestFocusMap:
         the new prompt moves it on to the button the operator needs next, and
         the unchanged polls after it leave it there.
         """
-        job_id = _drive_to_flip_prompt(
-            page, flip_server, wait_for_state, "Focus Prompt"
-        )
+        job_id = _drive_to_flip_prompt(page, flip_server, "Focus Prompt")
         try:
             expect(page.locator("#flip-continue")).to_be_focused(timeout=10_000)
             _await_status_poll(page)
             expect(page.locator("#flip-continue")).to_be_focused()
         finally:
-            _end_the_flip(flip_server, job_id, wait_for_state)
+            _end_the_flip(flip_server, job_id)
 
     def test_focus_map_flip_continue(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Continue, pressed with Enter, moves focus to the status area."""
-        job_id = _drive_to_flip_prompt(
-            page, flip_server, wait_for_state, "Focus Continue"
-        )
+        job_id = _drive_to_flip_prompt(page, flip_server, "Focus Continue")
         try:
             expect(page.locator("#flip-continue")).to_be_focused(timeout=10_000)
             page.keyboard.press("Enter")
             expect(page.locator("#status-area")).to_be_focused()
         finally:
-            _end_the_flip(flip_server, job_id, wait_for_state)
+            _end_the_flip(flip_server, job_id)
 
     def test_focus_map_flip_abort(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A confirmed Abort ends with focus on the Scan button.
@@ -9358,7 +9255,7 @@ class TestFocusMap:
         The response focuses the status area while the scan winds down, and
         the first poll whose Scan button is enabled moves focus onto it.
         """
-        job_id = _drive_to_flip_prompt(page, flip_server, wait_for_state, "Focus Abort")
+        job_id = _drive_to_flip_prompt(page, flip_server, "Focus Abort")
         try:
             expect(page.locator("#flip-abort")).to_be_visible(timeout=10_000)
             _accept_the_confirmation(page)
@@ -9369,13 +9266,12 @@ class TestFocusMap:
             expect(scan).to_be_focused()
             expect(page.locator("#status-area .status-cancelled")).to_be_visible()
         finally:
-            _end_the_flip(flip_server, job_id, wait_for_state)
+            _end_the_flip(flip_server, job_id)
 
     def test_focus_map_multi_page_scan_next_then_next_question(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Scan next focuses the status area, then the next question's Scan next.
@@ -9384,7 +9280,7 @@ class TestFocusMap:
         seen before the next question arrives and takes it.
         """
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Next")
+        job_id = _start_multi_page_scan(page, server, "Focus Next")
         try:
             expect(page.locator("#mp-next")).to_be_focused(timeout=10_000)
             server.scanner.gate.clear()
@@ -9399,17 +9295,16 @@ class TestFocusMap:
             expect(page.locator("#mp-next")).to_be_focused()
         finally:
             server.scanner.gate.set()
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_focus_map_multi_page_finish(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Finish moves focus to the status area, and it stays through Done."""
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Finish")
+        job_id = _start_multi_page_scan(page, server, "Focus Finish")
         try:
             page.locator("#mp-finish").focus()
             page.keyboard.press("Enter")
@@ -9418,17 +9313,16 @@ class TestFocusMap:
             expect(area.locator(".status-done")).to_be_visible(timeout=15_000)
             expect(area).to_be_focused()
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_focus_map_multi_page_abort(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A confirmed Abort of the document ends with focus on the Scan button."""
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Drop")
+        job_id = _start_multi_page_scan(page, server, "Focus Drop")
         try:
             _accept_the_confirmation(page)
             page.locator("#mp-abort").focus()
@@ -9438,7 +9332,7 @@ class TestFocusMap:
             expect(scan).to_be_focused()
             expect(page.locator("#status-area .status-cancelled")).to_be_visible()
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_focus_map_non_owner_is_not_autofocused(
         self,
@@ -9446,7 +9340,6 @@ class TestFocusMap:
         browser: Browser,
         flip_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A prompt appearing for somebody else's scan moves no focus of mine.
@@ -9492,7 +9385,7 @@ class TestFocusMap:
             viewer_ctx.close()
             server.scanner.gate.set()
             if job_id:
-                _end_the_flip(server, job_id, wait_for_state)
+                _end_the_flip(server, job_id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
