@@ -1,10 +1,11 @@
 """
-The suite runs in a fake home and its own working directory.
+The suite runs sealed off from the developer's machine.
 
-A test that reaches the developer's real home can read their live config --
-Paperless URL and token included -- and write job state beside their real one.
-These tests check the isolation from inside an ordinary test, so a change to the
-autouse fixture that loosens it fails here rather than silently.
+Every test runs in a fake home, its own working directory and a private temp
+directory. A test that reached the real home could read the live config --
+Paperless URL and token included -- and write job state beside the real one.
+These tests check the isolation from inside an ordinary test, so a change to an
+autouse fixture that loosens it fails here, not silently.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ _XDG_BASES = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_H
 
 
 def test_home_is_neither_the_real_home_nor_in_the_repository() -> None:
-    """HOME is a throwaway directory, away from both real homes of the code."""
+    """HOME is a throwaway directory, neither the real home nor the checkout."""
     home = Path(os.environ["HOME"]).resolve()
     assert home != _REAL_HOME.resolve()
     assert not home.is_relative_to(_REPOSITORY)
