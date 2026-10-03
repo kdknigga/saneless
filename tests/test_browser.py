@@ -2557,8 +2557,8 @@ class _ScanHeaderRecorder:
     The browser's own view of a request cannot answer whether it sent
     ``Sec-Fetch-Site``: under the egress gate's ``context.route``, Playwright's
     ``Request.all_headers()`` omits the ``Sec-Fetch-*`` headers even when the
-    server receives them (measured: a routed 127.0.0.1 page reports none while
-    the server gets ``same-origin``). So the headers are read where the guard
+    server receives them (a routed 127.0.0.1 page reports none while the server
+    gets ``same-origin``). So the headers are read where the guard
     reads them, in front of the app. Every scope, lifespan included, is passed
     through unchanged.
     """
@@ -2600,7 +2600,7 @@ def lan_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Lan
     It is its own app with its own store under ``tmp_path``, so nothing it does
     touches the session server. Uvicorn binds all interfaces on a free port
     because the browser has to reach it by the LAN address, and it runs only for
-    this one test, with a stub scanner and a stubbed Paperless (T-26-56).
+    this one test, with a stub scanner and a stubbed Paperless.
     """
     address = _non_loopback_ipv4()
     if address is None:
@@ -2622,7 +2622,7 @@ def lan_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Lan
 @pytest.mark.browser
 class TestPlainHttpLanOrigin:
     """
-    The cross-site guard lets the app's own page scan from a LAN address (D-20).
+    The cross-site guard lets the app's own page scan from a LAN address.
 
     saneless's documented deployment is plain HTTP on a LAN address, and there a
     browser sends no ``Sec-Fetch-Site`` at all, so only the guard's Origin
@@ -2636,19 +2636,15 @@ class TestPlainHttpLanOrigin:
         lan_server: _LanServer,
     ) -> None:
         """
-        A same-origin Scan click from ``http://<lan-ip>`` is accepted (ROBU-10).
+        A same-origin Scan click from ``http://<lan-ip>`` is accepted.
 
-        Research assumption A6: the Fetch Metadata spec adds ``Sec-Fetch-*``
-        only for potentially trustworthy URLs, so Chromium omits it on a plain
-        HTTP LAN origin and the guard decides on ``Origin`` against ``Host``
-        (D-20 branch 2). ``localhost`` and ``127.0.0.1`` cannot prove this: they
-        are secure contexts, always get ``Sec-Fetch-Site``, and exercise branch
-        1 instead. The TestClient branch-2 tests in ``tests/test_cross_origin.py``
-        prove the rule; this proves the browser really takes that branch.
-
-        The headers are checked as the server received them, not through
-        Playwright's request object, which hides ``Sec-Fetch-*`` under routing
-        (see ``_ScanHeaderRecorder``).
+        The Fetch Metadata spec adds ``Sec-Fetch-*`` only for potentially
+        trustworthy URLs, so Chromium omits it on a plain HTTP LAN origin and
+        the guard decides on ``Origin`` against ``Host``. ``localhost`` and
+        ``127.0.0.1`` cannot prove this: they are secure contexts and always
+        get ``Sec-Fetch-Site``. The headers are read as the server received
+        them, because Playwright's request object hides ``Sec-Fetch-*`` under
+        routing.
         """
         lan_url = lan_server.url
         egress_allowlist.append(lan_url)
@@ -2674,7 +2670,7 @@ class TestPlainHttpLanOrigin:
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
 
 
-# The shipped stand-in `config.is_placeholder_token` refuses (D-14). A second
+# The shipped stand-in `config.is_placeholder_token` refuses. A second
 # live server runs with it so the blocked Scan button can be looked at in a
 # real browser rather than only in rendered markup.
 _SHIPPED_PLACEHOLDER = "changeme"
@@ -2691,8 +2687,7 @@ def _blocked_settings(tmp_dir: Path) -> Settings:
     Build the browser settings with the shipped placeholder token in place.
 
     One definition, because two servers run with it: the session-scoped one
-    below, and the private one plan 30-19 uses for the claims that write a job
-    row. A second copy of this ``model_copy`` would be a second place for the
+    below, and the private one serving the claims that write a job row. A second copy of this ``model_copy`` would be a second place for the
     placeholder to drift from ``is_placeholder_token``'s idea of one.
     """
     configured = _browser_test_settings(tmp_dir)
@@ -2715,7 +2710,7 @@ def blocked_server(
 
     The verdict is read from ``Settings`` once at process start, so there is no
     runtime setter to reach for: a second server is the only honest way to put
-    a real browser in front of the blocked page (UI-SPEC S8).
+    a real browser in front of the blocked page.
     """
     tmp_dir = tmp_path_factory.mktemp("browser-blocked")
     scanner = _BrowserTestScanner()
@@ -2730,11 +2725,11 @@ def blocked_server(
 @pytest.mark.browser
 class TestBlockedScanButtonInABrowser:
     """
-    The blocked Scan button and its reason line, in Chromium (APPL-07, D-15).
+    A placeholder token blocks the Scan button and shows why, in Chromium.
 
     Two of these claims cannot be made from rendered markup. Whether the
-    ``disabled`` attribute survives the page's own load requests is the C-10
-    inheritance trap, which only a browser running htmx can spring; and whether
+    ``disabled`` attribute survives the page's own requests is the
+    ``hx-disabled-elt`` inheritance trap, which only a browser running htmx can spring; and whether
     the reason line is actually legible is a question about computed colour on
     the layers it really sits on.
 
@@ -2803,15 +2798,14 @@ class TestBlockedScanButtonInABrowser:
         egress_allowlist: list[str],
     ) -> None:
         """
-        The requests inside the form do not re-enable it (C-10, T-30-66).
+        The requests inside the form do not re-enable the blocked button.
 
         An inherited ``hx-disabled-elt`` puts a child request in charge of the
         button's ``disabled`` attribute, which is why the form disinherits it.
         With no job active there is no one-second status poll to put the
         attribute back, so a blocked button that lost it here would stay
         clickable -- which is exactly why the flag lives in the one button
-        partial.  The two refresh buttons are the form's own requests now that
-        the page asks for neither list on load.
+        partial.  The two refresh buttons supply the form's own requests.
         """
         egress_allowlist.append(blocked_server.url)
         page.add_init_script(_RECORD_CONTROL_SWAPS)
@@ -2865,13 +2859,13 @@ class TestBlockedScanButtonInABrowser:
         assert page.locator(_BLOCKED_REASON_SELECTOR).count() == 0
         assert page.locator("#scan-btn").get_attribute("aria-describedby") is None
         # The other half of the same flag, asserted here so the blocked case
-        # below is a difference and not just a presence (plan 30-19, P16).
+        # below is a difference and not just a presence.
         expect(page.locator("#scan-btn")).to_be_enabled()
 
 
 _OWNER_COOKIE_NAME = "saneless_owner"
 
-# The owner cookie lives a year (D-06), so a browser keeps its ownership across
+# The owner cookie lives a year, so a browser keeps its ownership across
 # restarts. Playwright reports a cookie's expiry in Unix seconds, and a session
 # cookie -- one with neither Max-Age nor Expires -- as -1, so an expiry more
 # than 364 days out proves the year-long lifetime arrived. The one day short of
@@ -2897,12 +2891,12 @@ def _outlives_364_days(expires: float) -> bool:
 @pytest.mark.browser
 class TestOwnerCookieInABrowser:
     """
-    The owner cookie's behaviour in Chromium, measured rather than assumed.
+    The owner cookie an htmx submit sets persists in Chromium, out of scripts' reach.
 
-    RESEARCH carried assumption A6: that a browser processes ``Set-Cookie`` on
-    an htmx XHR response exactly as it does on a navigation. If that were
-    false the token would never persist and the whole gate would be decorative,
-    so it is asserted here instead of reasoned about (APPL-09, D-23).
+    The token persists only if a browser processes ``Set-Cookie`` on an htmx
+    XHR response exactly as it does on a navigation. Were that false the whole
+    ownership gate would be decorative, so it is asserted here instead of
+    reasoned about.
     """
 
     def test_scan_submit_sets_a_persistent_owner_cookie(
@@ -2929,7 +2923,7 @@ class TestOwnerCookieInABrowser:
         assert _outlives_364_days(cookie["expires"]), cookie["expires"]
         assert cookie["secure"] is False
         # HttpOnly proved from inside the page, not from the header: this is
-        # the claim that the token cannot reach a script (T-30-59), and there
+        # the claim that the token cannot reach a script, and there
         # is no script file that could read it in the first place.
         assert _OWNER_COOKIE_NAME not in page.evaluate("() => document.cookie")
 
@@ -2941,7 +2935,7 @@ class TestOwnerCookieInABrowser:
 
         A CSS-hidden control is still in the page and still reachable from the
         console, which would be an ASVS V4 failure. This asserts absence in a
-        real browser rather than absence from a string (D-24).
+        real browser rather than absence from a string.
         """
         app = browser_server.app
         job_store: JobStore = app.state.job_store
@@ -2977,7 +2971,7 @@ class TestOwnerCookieInABrowser:
 
 @pytest.mark.browser
 class TestProfileDescriptionSwap:
-    """The sentence under the select follows the selection, live (D-20, S4)."""
+    """The sentence under the select follows the selection, live."""
 
     def test_choosing_another_profile_swaps_the_description_in_place(
         self, page: Page, browser_server_url: str
@@ -3009,7 +3003,7 @@ class TestProfileDescriptionSwap:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        One help line under Profile, and it is the live one (APPL-10).
+        One help line under Profile, and it is the live one.
 
         The adjacent-sibling selector is Pico's own help-text rule, so this
         asserts the styling hook and the "no second help line" contract at
@@ -3163,22 +3157,12 @@ class TestMultiPageCheckbox:
 
         Firefox restores a form control's state on reload unless something
         stops it, and Chromium does not, so this is the one browser that can
-        tell.  Two things stop it on this page: the ``Cache-Control: no-store``
-        every page response carries, and ``autocomplete="off"`` on the
-        checkbox.  Either alone is enough, so the page as served cannot tell
-        whether the checkbox's own opt-out is there.  The second case therefore
-        strips ``no-store`` from the page response on its way to the browser,
-        leaving the attribute as the only thing between a reload and a restored
-        tick: that case fails when the attribute is removed.  The first case
-        keeps the page exactly as the server sends it.
-
-        The read after the reload is a single ``is_checked`` rather than a
-        retrying assertion: a retry could pass on a moment before a restore
-        instead of on the settled page.
-
-        The context is built by hand from a Firefox browser, so it installs the
-        egress gate and the policy recorder itself and is checked after it
-        closes, as the two-browser ownership test does.
+        tell.  The page's ``Cache-Control: no-store`` and the checkbox's
+        ``autocomplete="off"`` each stop it alone, so the second case strips
+        ``no-store`` on the way to the browser and leaves the attribute as the
+        only guard; the first keeps the page exactly as served.  The read after
+        the reload is a single ``is_checked``, so a retry cannot pass on a
+        moment before a restore.
         """
         blocked: list[str] = []
         seen: list[str] = []
@@ -3248,11 +3232,11 @@ class TestPageLoadAsksForNoList:
         self, page: Page, tmp_path: Path, egress_allowlist: list[str]
     ) -> None:
         """
-        Load the page, record every request, then refresh each list.
+        A load asks ``/api/metadata`` once and no per-list route; refreshes swap.
 
-        The refresh requests are recorded by the same listener, so the empty
-        record of per-list requests at load is not a listener that heard
-        nothing at all; nor is it, since the one lazy request is in it.
+        The lazy request and the refresh requests are recorded by the same
+        listener, so the empty record of per-list requests at load is not a
+        listener that heard nothing at all.
         """
         tags = list(_PAGE_LOAD_TAGS)
         correspondents = list(_PAGE_LOAD_CORRESPONDENTS)
@@ -3333,12 +3317,12 @@ def tagged_server(browser_server: _BrowserServer) -> Iterator[_BrowserServer]:
 @pytest.mark.browser
 class TestTagFilterInChromium:
     """
-    The tag picker's two designed-out hazards, proven in a real browser.
+    The tag picker keeps a filtered-out tick and never submits the filter text.
 
-    Neither is reachable from a server-side test. A-5 is about what the DOM
-    holds after an htmx swap, and A-6 is about which form a browser considers
-    an input to belong to -- the HTML form-owner association, which only a
-    browser implements.
+    Neither is reachable from a server-side test. The first is about what the
+    DOM holds after an htmx swap, and the second is about which form a browser
+    considers an input to belong to -- the HTML form-owner association, which
+    only a browser implements.
     """
 
     def _load_tags(self, page: Page, url: str) -> None:
@@ -3357,10 +3341,9 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        A tick the filter excludes stays in the DOM, above the list (A-5).
+        A tick the filter excludes stays in the DOM, above the list.
 
-        This is the hazard the research named. A swap that re-rendered only the
-        matches would take an already-chosen tag out of the document, and a tag
+        A swap that re-rendered only the matches would take an already-chosen tag out of the document, and a tag
         that is not in the document is not in the next submit either -- with
         nothing to warn the user, who would simply find it was not applied.
         """
@@ -3385,7 +3368,7 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        The filtered-out tick rides along and the filter text does not (A-5, A-6).
+        The filtered-out tick rides along and the filter text does not.
 
         The submit is intercepted rather than served, so this reads what the
         browser actually put on the wire without starting a real scan on the
@@ -3417,7 +3400,7 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        Enter performs implicit submission of the filter's own form (A-6).
+        Enter performs implicit submission of the filter's own form.
 
         Without the form attribute the input would belong to the scan form, and
         a household member typing a filter and pressing Enter would start a
@@ -3444,7 +3427,7 @@ class TestTagFilterInChromium:
         self, page: Page, tagged_server: _BrowserServer
     ) -> None:
         """
-        Every row is at least 44 px tall and spans the list (D-30, WCAG 2.5.5).
+        Every row is at least 44 px tall and spans the list (WCAG 2.5.5).
 
         Measured in the browser, because this is a cascade outcome and not a
         stylesheet fact: Pico shrinks a checkbox label to the width of its text
@@ -3468,7 +3451,7 @@ class TestTagFilterInChromium:
 # A profile's default tags and correspondent, in a real browser.
 #
 # The lists paperless-ngx is patched to answer.  Tag 99 is in neither, so the
-# profile that names it has a default paperless-ngx no longer has.
+# profile that names it has a default paperless-ngx does not have.
 # ---------------------------------------------------------------------------
 
 _DEFAULTS_TAGS: list[dict[str, object]] = [
@@ -3676,18 +3659,15 @@ class TestProfileDefaultsInTheBrowser:
         served: Literal["as-served", "without-no-store"],
     ) -> None:
         """
-        A reload shows the profile's defaults, not what was changed by hand.
+        A reload shows the profile's defaults, not the operator's hand edits.
 
         Firefox restores form state on reload unless something stops it, and
-        Chromium does not, so Firefox is the browser that can tell.  As in the
-        Multiple pages reload test, the second case strips ``no-store`` from
-        the page on its way to the browser, so ``autocomplete="off"`` on the
-        box and on the select is all that stands between the reload and an
-        untick the operator made, or a correspondent they picked, coming back
-        over the server's defaults.
-
-        The reads after the reload are single reads, not retrying assertions,
-        so they cannot pass on a moment before a restore.
+        Chromium does not, so Firefox is the browser that can tell.  The second
+        case strips ``no-store`` from the page, so ``autocomplete="off"`` on the
+        box and on the select is all that keeps an untick, or a picked
+        correspondent, from coming back over the server's defaults.  The reads
+        after the reload are single reads, so they cannot pass on a moment
+        before a restore.
         """
         url = defaults_server.url
         blocked: list[str] = []
@@ -4573,8 +4553,8 @@ class TestLazyListsInTheBrowser:
 
         The lazy request, asked for ``default``, is held while ``receipts``
         is chosen.  The change sends the load again for ``receipts`` and
-        abandons the first request, so the answer for a profile no longer
-        chosen never lands.  The lists, their markers and the Profile select
+        abandons the first request, so the answer for the abandoned profile
+        never lands.  The lists, their markers and the Profile select
         then agree on ``receipts``, and the scan files its own defaults.
         """
         held = _hold_the_list_load(page)
@@ -5023,12 +5003,10 @@ class TestProfileDefaultsPreselection:
 # ---------------------------------------------------------------------------
 # The status strip, in Chromium.
 #
-# Per CLAUDE.md nothing in this phase's browser contract is deferred to a
-# person. Every row of 30-UI-SPEC's Verification Contract that names a browser
-# is automated -- here and in the classes below -- and none of them is marked
-# for a human to look at. The one out-of-suite item is scanner reachability
-# against physical hardware, which cannot be stubbed and which 30-VALIDATION.md
-# already records as the hardware-only check it is.
+# Every browser-visible claim about the strip is automated, here and in the
+# classes below, and none is left for a person to look at. The one claim
+# outside the suite is scanner reachability against physical hardware, which
+# cannot be stubbed.
 # ---------------------------------------------------------------------------
 
 _PAUSED_PREFIX = "Paused during scan \N{EM DASH} "
