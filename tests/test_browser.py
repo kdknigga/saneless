@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 from http import HTTPStatus
 from itertools import pairwise
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -2235,19 +2235,75 @@ _POLL_URL = re.compile(r"/api/jobs/[^/?]+/status(\?|$)")
 # this is generous headroom for a loaded CI runner.
 _ONE_POLL_BUDGET_MS = 5_000
 
-# Counts the status polls htmx has finished swapping and settling, out-of-band
-# swaps included, so a check can wait for a poll's effect on the page rather
-# than for its response headers, which arrive before the swap.
+# Counts the status polls htmx swapped into the page and settled, one per
+# response, and the status polls answered 204, which swap nothing.  htmx fires
+# htmx:afterSettle once for every element a swap settles, and a poll's body
+# settles two, the status area and the out-of-band Scan button, so a swapped
+# poll is counted by its request rather than by its events.  The settle is
+# counted rather than the response, because a response arrives before htmx
+# swaps it.
 _RECORD_POLL_SETTLES = r"""
-window.__pollsSettled = 0;
-document.addEventListener("htmx:afterSettle", (event) => {
-    const xhr = event.detail.xhr;
-    const path = xhr ? new URL(xhr.responseURL).pathname : "";
-    if (/^\/api\/jobs\/[^/]+\/status$/.test(path)) {
-        window.__pollsSettled += 1;
-    }
-});
+(() => {
+    window.__pollsSettled = 0;
+    window.__pollsUnchanged = 0;
+    const settled = new WeakSet();
+    const isPoll = (xhr) => Boolean(xhr && xhr.responseURL)
+        && /^\/api\/jobs\/[^/]+\/status$/.test(new URL(xhr.responseURL).pathname);
+    document.addEventListener("htmx:afterSettle", (event) => {
+        const xhr = event.detail.xhr;
+        if (isPoll(xhr) && !settled.has(xhr)) {
+            settled.add(xhr);
+            window.__pollsSettled += 1;
+        }
+    });
+    document.addEventListener("htmx:afterRequest", (event) => {
+        const xhr = event.detail.xhr;
+        if (isPoll(xhr) && xhr.status === 204) {
+            window.__pollsUnchanged += 1;
+        }
+    });
+})();
 """
+
+
+def _hold_the_status_polls(page: Page) -> tuple[list[Route], Callable[[], None]]:
+    """
+    Hold every status poll the page sends, unanswered, until released.
+
+    Releasing sends each held poll on with an empty ``seen``, which no
+    rendering's token matches, so each is answered with a body whatever the
+    page was showing when it asked.  Polls sent after the release pass through
+    untouched.
+
+    Args:
+        page: The browser page, before it loads.
+
+    Returns:
+        The held polls, in order, filled as they are sent, and the release.
+
+    """
+    held: list[Route] = []
+    released = False
+
+    def _hold(route: Route) -> None:
+        if released:
+            route.continue_()
+        else:
+            held.append(route)
+
+    def _release() -> None:
+        nonlocal released
+        released = True
+        for route in held:
+            parts = urlsplit(route.request.url)
+            query = parse_qs(parts.query, keep_blank_values=True)
+            query["seen"] = [""]
+            route.continue_(
+                url=parts._replace(query=urlencode(query, doseq=True)).geturl()
+            )
+
+    page.route(_POLL_URL, _hold)
+    return held, _release
 
 
 def _fill_queue_until_rejected(url: str) -> None:
@@ -2437,15 +2493,20 @@ class TestRequestErrorSlot:
         self, page: Page, scan_harness: _ScanHarness
     ) -> None:
         """
-        An error shown mid-scan outlives at least two status polls.
+        An error shown mid-scan outlives a status poll's body and the 204s after it.
 
         The poll re-renders ``#status-area`` every second while a job is active.
         If a poll response carried the slot clear that a successful scan
         carries, the message would vanish within a second -- before a user
-        could read it. The submitted profile is also checked not to be echoed.
+        could read it.  Only a poll with a body can carry the clear, and once
+        the area shows the job, every later poll finds nothing changed and is
+        answered 204, so the polls are held until the error is shown and the
+        first is then answered with a body.  The submitted profile is also
+        checked not to be echoed.
         """
         server = scan_harness.server
         page.add_init_script(_RECORD_POLL_SETTLES)
+        held, release = _hold_the_status_polls(page)
         server.scanner.gate.clear()
         page.goto(server.url)
         page.locator("#scan-btn").click()
@@ -2456,14 +2517,24 @@ class TestRequestErrorSlot:
         slot = page.locator("#status-message")
         expect(slot).to_contain_text(_UNKNOWN_PROFILE_TEXT)
         assert "zz-nonexistent-profile" not in slot.inner_text()
-        # Wait until two more polls have been swapped into the page and
-        # settled, not merely answered: a poll's response arrives before htmx
-        # swaps it. A function, not a bare expression, because the page's
+
+        def _a_poll_is_held() -> bool:
+            # A synchronous Playwright client delivers the route to its handler
+            # only while it talks to the browser, so each check is a round trip.
+            page.evaluate("() => true")
+            return bool(held)
+
+        assert poll_until(_a_poll_is_held, _ONE_POLL_BUDGET_MS / 1000), (
+            "the page sent no status poll"
+        )
+        # Nothing has been swapped or answered 204 yet: every poll is held.
+        # Functions, not bare expressions, because the page's
         # Content-Security-Policy refuses eval.
-        before = page.evaluate("() => window.__pollsSettled")
+        counts = "() => [window.__pollsSettled, window.__pollsUnchanged]"
+        assert page.evaluate(counts) == [0, 0]
+        release()
         page.wait_for_function(
-            "(before) => window.__pollsSettled >= before + 2",
-            arg=before,
+            "() => window.__pollsSettled >= 1 && window.__pollsUnchanged >= 1",
             timeout=2 * _ONE_POLL_BUDGET_MS,
         )
         # Read once, without retrying: the claim is that the message is there
