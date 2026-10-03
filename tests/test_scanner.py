@@ -6284,8 +6284,8 @@ class TestPageBudget:
     """
     Each page's timeout scales with the page the device agreed to send.
 
-    A fixed two minutes cut off honest high-resolution colour scans on slow
-    links and blamed the network.  The budget is twice an estimate anchored on
+    A fixed limit would cut off honest high-resolution colour scans on slow
+    links and blame the network.  The budget is twice an estimate anchored on
     one minute for an A4 colour page at 600 dpi, scaled by how many bytes the
     negotiated page holds, and never below two minutes.  There is no setting:
     the device's own parameters decide it.
@@ -6394,7 +6394,7 @@ class TestPageBudget:
         assert budget < threading.TIMEOUT_MAX
 
     def test_the_floor_is_two_minutes_with_no_setting(self) -> None:
-        """The floor is the old fixed limit, and a default budget uses it."""
+        """The floor is two minutes, and a default budget uses it."""
         assert sane_backend_mod._PAGE_TIMEOUT_FLOOR_SECONDS == 120.0
         assert sane_backend_mod._PageBudget().timeout == 120.0
         assert sane_backend_mod._PageBudget().page is None
@@ -6514,10 +6514,8 @@ class TestSourceOptionPresence:
 
     ``_resolve_source`` records presence independently of whether the constraint
     can be read as a word list, and the assignment in ``_configure_device``
-    depends on that flag.  Collapsing the two -- reporting only the parsed
-    constraint -- would silently stop saneless setting the source on a device
-    whose constraint it cannot read, which is a behaviour change disguised as a
-    refactor.
+    depends on that flag, so saneless still sets the source on a device whose
+    constraint it cannot read.
     """
 
     def test_a_device_with_no_source_option_is_left_alone(self) -> None:
@@ -6555,7 +6553,7 @@ class TestSourceOptionPresence:
 
 class TestAutoSourceFallbackIsAudible:
     """
-    Only a flatbed request may still become 'Auto', and never silently.
+    Only a flatbed request may become 'Auto', and never silently.
 
     ``scan_pages`` classifies the *effective* source, so ``Auto`` is routed by
     ``auto_source_mode``, which defaults to "flatbed". A feeder request swapped
@@ -6961,7 +6959,7 @@ class TestScannerInterfaceShape:
         )
 
     def test_device_capabilities_refuses_positional_construction(self) -> None:
-        """Keyword-only construction makes the field order nobody's dependency."""
+        """Capabilities are built by keyword, so field order is nobody's dependency."""
         construct = cast("Callable[..., object]", DeviceCapabilities)
 
         with pytest.raises(TypeError):
@@ -6969,7 +6967,7 @@ class TestScannerInterfaceShape:
 
 
 class TestResolutionReadBack:
-    """The resolution the device actually chose is read back (D-11, M-16)."""
+    """The resolution the device actually chose is read back."""
 
     @staticmethod
     def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -7034,24 +7032,19 @@ class TestResolutionReadBack:
 
 class TestScanBatch:
     """
-    One object carries what the device actually did, out of the backend (D-12).
+    One batch object carries what the device actually did out of the backend.
 
-    ``scan_pages`` used to yield ``Image`` only, so two facts the backend had
-    already measured -- the resolution the device settled on, and how many fed
-    sheets it could not read -- had no way out of it.  A generator's return
-    value is discarded by ``list()``, which is what every pipeline call site
-    does, so carrying them out meant changing the ABC rather than smuggling
-    them past it.
+    The resolution the device settled on and how many fed sheets it could not
+    read travel on the ``ScanBatch`` that ``scan_pages`` returns, since a
+    generator's return value is discarded by ``list()``.
     """
 
     def test_the_batch_carries_exactly_five_fields(self) -> None:
         """
         Five fields, in order, and the per-page detail lives in ``pages``.
 
-        The object is still deliberately minimal.  The ordered per-page record
-        design landed as ``pages: tuple[PageRecord, ...]`` rather than as
-        extra fields here, so anything measured about one page belongs on that
-        record.  The last two fields are about the pass as a whole -- the
+        Anything measured about one page belongs on its ``PageRecord``.  The
+        last two fields are about the pass as a whole -- the
         source the device's Auto stood in for when it fed, and the cap the
         pass reached -- and so are not a second channel for a per-page fact.
         """
@@ -7064,7 +7057,7 @@ class TestScanBatch:
         ]
 
     def test_the_substitution_defaults_to_none(self) -> None:
-        """A batch built without the new facts reports neither."""
+        """A batch built without the substitution or cap facts reports neither."""
         batch = ScanBatch(pages=(), actual_resolution=300, pages_rejected=0)
 
         assert batch.substituted_source is None
@@ -7197,10 +7190,8 @@ class TestScanBatch:
         """
         Acquisition is eager, so the handle is released on return.
 
-        This is a consequence, not a goal: the generator held the device open
-        until it was drained or garbage-collected.  Close-while-reading and
-        cancel semantics are Phase 29's HARD-03/HARD-04 and are deliberately
-        not folded in here.
+        Nothing holds the device open until the result is drained or
+        garbage-collected.
         """
         dev = FakeSaneDev()
         backend = _backend_with(dev, monkeypatch)
@@ -7213,7 +7204,7 @@ class TestScanBatch:
 
 
 # ---------------------------------------------------------------------------
-# HARD-01: the peak-memory bound, and the one-page-per-sink-call rule
+# The peak-memory bound, and the one-page-per-sink-call rule
 # ---------------------------------------------------------------------------
 
 
@@ -7278,35 +7269,16 @@ def _feeder_of(pages: int, monkeypatch: pytest.MonkeyPatch) -> FakeSaneDev:
 
 class TestPeakPageMemory:
     """
-    HARD-01's bound, proven by counting live page images (D-08).
+    A scan holds at most two page images at once, however long the stack.
 
-    The instrument is a ``weakref`` per page the fake hands out, and the three
-    obvious alternatives were all measured and rejected:
-
-    - ``tracemalloc`` cannot see this memory at all.  A 26 MB Pillow image adds
-      **460 bytes** to the traced total, because the pixels are malloc'd in C
-      rather than through the Python allocator.
-    - RSS is far too noisy for CI, and answers about the whole process rather
-      than about the pages.
-    - A hash-based weak set cannot hold Pillow images: ``Image`` defines
-      ``__eq__`` without ``__hash__``, so building one raises ``TypeError``.
-
-    The honest high-water mark is **2**, not 1, and the reason is structural:
-    ``_acquire_pages``' loop variable still references page *k-1* while page
-    *k* is being read.  A ``del`` that made the number 1 would exist only to
-    satisfy a test, and it was declined (29-RESEARCH.md Finding 4).
-
-    Which is why the bound is asserted two ways.  ``<= 2`` alone would survive
-    a regression that grew the constant; equality between a 3-page run and a
-    12-page one is what actually proves independence from page count, and that
-    independence -- not the constant -- is the claim HARD-01 makes.
-
-    One trap, recorded because it silently inverts the measurement:
-    ``load_feeder()`` makes the device keep a strong reference to every page it
-    was loaded with, so the counter would report the *test's* retention rather
-    than the backend's, and reads 12 for a 12-page run.  These tests therefore
-    let the fake generate its pages, which are already distinguishable by page
-    index, and assert that distinctness rather than assuming it.
+    Pages are counted live with a ``weakref`` each: ``tracemalloc`` cannot see
+    Pillow's C-allocated pixels, and RSS is too noisy.  The bound is 2, not 1,
+    because ``_acquire_pages``' loop variable still references page *k-1*
+    while page *k* is read.  Equal peaks for a 3-page and a 12-page run prove
+    independence from page count, which ``<= 2`` alone would not.  The fake
+    generates its own distinct pages: ``load_feeder()`` keeps a strong
+    reference to every page it was given, so the counter would report the
+    test's retention instead of the backend's.
     """
 
     def test_live_page_images_stays_bounded(
@@ -7382,7 +7354,7 @@ class TestPeakPageMemory:
 
 
 # ---------------------------------------------------------------------------
-# SANE module boundary (EXC-01)
+# SANE module boundary
 # ---------------------------------------------------------------------------
 
 _LIBSANE_MISSING = (
@@ -7408,9 +7380,7 @@ class _AssignmentFailure(NamedTuple):
     A named record rather than four parametrize columns, for the reason
     ``_DuplexMismatch`` gives in ``pipeline.py``: the four facts belong
     together, and a four-column table makes every reader remember an order.
-    The immediate cause is ruff's ``PLR0913`` -- the test already takes
-    ``monkeypatch`` and now a sink as well, which is six with the columns
-    spread out and five with them bundled.
+    Bundled, they also keep the test within ruff's ``PLR0913`` argument limit.
 
     Attributes:
         option: The underscore-spelled option whose assignment is armed to
@@ -7429,19 +7399,18 @@ class _AssignmentFailure(NamedTuple):
 
 class TestSaneBoundary:
     """
-    Every python-sane failure leaves the backend as a saneless type (EXC-01).
+    Every python-sane failure leaves the backend as a saneless type.
 
     python-sane raises ``_sane.error``, ``RuntimeError`` and ``AttributeError``
-    with no shared base, and before Phase 28 all three escaped ``scan_pages``,
-    ``get_capabilities`` and ``get_devices`` raw, so the CLI printed a traceback
-    and the web layer classified the job as UNKNOWN (M-17).  Each call site now
-    re-raises as ``ScanError`` naming the device, and the option where there is
-    one, with the original message and ``__cause__`` kept (D-08).  A missing
-    python-sane is a setup problem, so ``require_sane()`` raises ``ConfigError``
-    with an install hint instead (D-05).
+    with no shared base.  Each call site in ``scan_pages``, ``get_capabilities``
+    and ``get_devices`` re-raises as ``ScanError`` naming the device, and the
+    option where there is one, with the original message and ``__cause__``
+    kept, so the CLI prints no traceback and the web layer does not classify
+    the job as UNKNOWN.  A missing python-sane is a setup problem, so
+    ``require_sane()`` raises ``ConfigError`` with an install hint instead.
     """
 
-    # -- require_sane (D-05) ------------------------------------------------
+    # -- require_sane -------------------------------------------------------
 
     def test_require_sane_missing_module_raises_config_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7771,7 +7740,7 @@ class TestSaneBoundary:
             assert "close failed" not in message
             assert record.exc_info is None
 
-    # -- option assignment and read-back (D-08) -----------------------------
+    # -- option assignment and read-back ------------------------------------
 
     @pytest.mark.parametrize(
         "case",
@@ -7939,7 +7908,7 @@ class TestSaneBoundary:
     def test_flatbed_out_of_documents_is_feeder_empty(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """The one end-of-feed message maps to FeederEmptyError (Phase 24 D-03)."""
+        """The one end-of-feed message maps to FeederEmptyError."""
         original = FakeSaneError(_OUT_OF_DOCUMENTS)
         dev = FakeSaneDev(start_error=original)
         backend = _backend_with(dev, monkeypatch)
