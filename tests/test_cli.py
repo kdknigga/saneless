@@ -2878,6 +2878,10 @@ class TestJobsCommand:
 
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
+        lines = result.output.splitlines()
+        assert len(lines) == 2
+        assert lines[0].split() == ["Timestamp", "Profile", "Title", "Status"]
+        assert set(lines[1]) == {"-"}
 
     def test_jobs_table_output(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -7975,7 +7979,7 @@ def _token_settings(
     tmp_path: Path,
     value: str,
     consume_dir: str = "",
-    url: str = "http://localhost:8000",
+    url: str = "http://paperless.invalid",
 ) -> Settings:
     """
     Build settings carrying ``value`` as the paperless-ngx token.
@@ -8385,6 +8389,9 @@ class TestJobsJsonContract:
 
         result = runner.invoke(cli, ["jobs", "--json"])
 
+        assert result.exit_code == 0, result.output
+        listed = json.loads(result.output)
+        assert [row["id"] for row in listed] == [recorded.id]
         assert local_time(recorded.created_at) not in result.output
 
 

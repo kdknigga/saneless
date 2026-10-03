@@ -311,14 +311,22 @@ class TestConfigureLogging:
             configure_logging(
                 log_file=log_file, max_bytes=1024, backup_count=1, verbose=True
             )
-            root = logging.getLogger()
-            stream_handlers = [
-                h
-                for h in root.handlers
-                if isinstance(h, logging.StreamHandler)
-                and not isinstance(h, logging.handlers.RotatingFileHandler)
-            ]
-            assert len(stream_handlers) >= 1
+            mirrors = _handlers_named("saneless.stderr")
+            assert len(mirrors) == 1
+            assert isinstance(mirrors[0], logging.StreamHandler)
+            assert mirrors[0].stream is sys.stderr
+            assert _stderr_stream_handlers() == mirrors
+        finally:
+            self._cleanup_handlers()
+
+    def test_non_verbose_adds_no_stderr_handler(self, tmp_path: Path) -> None:
+        """Without verbose, a file that attaches is the only saneless handler."""
+        log_file = tmp_path / "test.log"
+        try:
+            configure_logging(log_file=log_file, max_bytes=1024, backup_count=1)
+            assert _stderr_stream_handlers() == []
+            assert _handlers_named("saneless.stderr") == []
+            assert len(_handlers_named("saneless.file")) == 1
         finally:
             self._cleanup_handlers()
 
