@@ -15,7 +15,7 @@ import os
 import sqlite3
 import stat
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -43,6 +43,7 @@ from saneless.vocabulary import (
 from saneless.vocabulary import RESTART_REASON as SERVER_RESTART_REASON
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 HEAD_VERSION = 3
@@ -109,6 +110,13 @@ BARRIER_TIMEOUT = 30.0
 
 Inside the project's 60 s per-test timeout, so a worker that never arrives
 fails the test with a BrokenBarrierError instead of hanging the suite.
+"""
+
+STRESS_JOIN_SECONDS = 45.0
+"""Seconds every stress worker together has to finish before the test fails.
+
+Past the start barrier's timeout and inside the 60 s per-test timeout, so a
+deadlocked worker fails the test with its name instead of hanging the run.
 """
 
 STRESS_STATES = (
@@ -530,6 +538,50 @@ def _nested_transactions(store: ast.ClassDef) -> list[str]:
                     for onward in _self_method_calls(methods[callee].body)
                 )
     return sorted(offenders)
+
+
+def _run_stress_workers(
+    worker: Callable[
+        [JobStore, threading.Barrier, dict[str, JobState], threading.Lock], None
+    ],
+    store: JobStore,
+    seen: dict[str, JobState],
+) -> None:
+    """
+    Run ``worker`` on STRESS_WORKERS daemon threads and re-raise its failure.
+
+    The threads are daemons joined against one deadline, so a worker stuck
+    inside the store fails the test rather than keeping the run alive, and an
+    exception a worker raises is carried back and raised here.
+
+    Raises:
+        BaseException: The first exception a worker raised.
+
+    """
+    guard = threading.Lock()
+    barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
+    raised: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            worker(store, barrier, seen, guard)
+        except BaseException as exc:  # carried back to the test thread below
+            with guard:
+                raised.append(exc)
+
+    threads = [
+        threading.Thread(target=run, name=f"stress-{n}", daemon=True)
+        for n in range(STRESS_WORKERS)
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + STRESS_JOIN_SECONDS
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    hung = [thread.name for thread in threads if thread.is_alive()]
+    assert hung == [], f"stress workers still running: {hung}"
+    if raised:
+        raise raised[0]
 
 
 def _stress_worker(
@@ -1568,17 +1620,8 @@ class TestFinishJob:
         """Two threads interleave finish_job and update_state cleanly."""
         store = JobStore()
         seen: dict[str, JobState] = {}
-        guard = threading.Lock()
-        barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
         try:
-            with ThreadPoolExecutor(max_workers=STRESS_WORKERS) as pool:
-                futures = [
-                    pool.submit(_finish_stress_worker, store, barrier, seen, guard)
-                    for _ in range(STRESS_WORKERS)
-                ]
-                for future in futures:
-                    # Future.result() re-raises the worker's exception here.
-                    future.result()
+            _run_stress_workers(_finish_stress_worker, store, seen)
 
             assert len(seen) == STRESS_WORKERS * STRESS_ROUNDS
             for job_id, expected in seen.items():
@@ -1667,19 +1710,11 @@ class TestLockDiscipline:
         """Two threads run 200 rounds of mixed traffic uncorrupted."""
         store = JobStore()
         seen: dict[str, JobState] = {}
-        guard = threading.Lock()
-        barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
         try:
-            with ThreadPoolExecutor(max_workers=STRESS_WORKERS) as pool:
-                futures = [
-                    pool.submit(_stress_worker, store, barrier, seen, guard)
-                    for _ in range(STRESS_WORKERS)
-                ]
-                for future in futures:
-                    # Future.result() re-raises the worker's exception here.  A
-                    # raw threading.Thread swallows it into threading.excepthook
-                    # and this test would pass green on a broken store.
-                    future.result()
+            # A raw thread would swallow a worker's exception into
+            # threading.excepthook, and this test would pass green on a broken
+            # store, so the runner carries it back and re-raises it.
+            _run_stress_workers(_stress_worker, store, seen)
 
             # 1. Every insert committed exactly once -- none lost, none doubled.
             assert len(seen) == STRESS_WORKERS * STRESS_ROUNDS
