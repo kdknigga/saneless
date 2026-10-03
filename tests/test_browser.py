@@ -2234,6 +2234,20 @@ _POLL_URL = re.compile(r"/api/jobs/[^/?]+/status(\?|$)")
 # this is generous headroom for a loaded CI runner.
 _ONE_POLL_BUDGET_MS = 5_000
 
+# Counts the status polls htmx has finished swapping and settling, out-of-band
+# swaps included, so a check can wait for a poll's effect on the page rather
+# than for its response headers, which arrive before the swap.
+_RECORD_POLL_SETTLES = r"""
+window.__pollsSettled = 0;
+document.addEventListener("htmx:afterSettle", (event) => {
+    const xhr = event.detail.xhr;
+    const path = xhr ? new URL(xhr.responseURL).pathname : "";
+    if (/^\/api\/jobs\/[^/]+\/status$/.test(path)) {
+        window.__pollsSettled += 1;
+    }
+});
+"""
+
 
 def _fill_queue_until_rejected(url: str) -> None:
     """
@@ -2430,13 +2444,7 @@ class TestRequestErrorSlot:
         could read it. The submitted profile is also checked not to be echoed.
         """
         server = scan_harness.server
-        polls: list[str] = []
-
-        def _record_poll(response: Response) -> None:
-            if _POLL_URL.search(response.url):
-                polls.append(response.url)
-
-        page.on("response", _record_poll)
+        page.add_init_script(_RECORD_POLL_SETTLES)
         server.scanner.gate.clear()
         page.goto(server.url)
         page.locator("#scan-btn").click()
@@ -2447,17 +2455,16 @@ class TestRequestErrorSlot:
         slot = page.locator("#status-message")
         expect(slot).to_contain_text(_UNKNOWN_PROFILE_TEXT)
         assert "zz-nonexistent-profile" not in slot.inner_text()
-        polls_before = len(polls)
-        # Wait for the two polls themselves rather than for a fixed stretch the
-        # polls are expected to fall in; each one gets a bounded budget.
-        for _ in range(2):
-            page.wait_for_event(
-                "response",
-                predicate=lambda response: bool(_POLL_URL.search(response.url)),
-                timeout=_ONE_POLL_BUDGET_MS,
-            )
-        polls_during = len(polls) - polls_before
-        assert polls_during >= 2, f"only {polls_during} polls arrived"
+        # Wait until two more polls have been swapped into the page and
+        # settled, not merely answered: a poll's response arrives before htmx
+        # swaps it. A function, not a bare expression, because the page's
+        # Content-Security-Policy refuses eval.
+        before = page.evaluate("() => window.__pollsSettled")
+        page.wait_for_function(
+            "(before) => window.__pollsSettled >= before + 2",
+            arg=before,
+            timeout=2 * _ONE_POLL_BUDGET_MS,
+        )
         # Read once, without retrying: the claim is that the message is there
         # now, after the polls, not that it can be found again within a timeout.
         assert _UNKNOWN_PROFILE_TEXT in slot.inner_text(), "a poll erased the error"
