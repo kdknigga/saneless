@@ -88,7 +88,7 @@ import sys
 # name. It also reads `project.version` for the published-image guard.
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from fastapi.responses import JSONResponse
@@ -109,6 +109,7 @@ from saneless.auto_profiles import (
 from saneless.checks import CheckKey, check_name
 from saneless.cli import cli
 from saneless.config import (
+    LogLevel,
     OutputConfig,
     ProfileConfig,
     WebConfig,
@@ -573,9 +574,7 @@ def test_configuration_reference_documents_xdg_and_levels() -> None:
     )
     output = _section(text, "## `[output]`", name)
     level_row = _table_row(output, "`log_level`")
-    for level in logging.getLevelNamesMapping():
-        if level in {"NOTSET", "WARN", "FATAL"}:
-            continue
+    for level in get_args(LogLevel):
         assert _says(level_row, f"`{level}`"), (
             f"{name}'s log_level row does not name the {level} level"
         )
