@@ -11,14 +11,23 @@ autouse fixture that loosens it fails here, not silently.
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import httpx2
 import pytest
 
 from saneless.config import OutputConfig
+from saneless.paperless import PaperlessClient
+from saneless.web import app as web_app
+
+if TYPE_CHECKING:
+    from tests.conftest import SocketGuard
 
 # Captured at import, before any fixture runs, so it is the real home.
 _REAL_HOME = Path.home()
@@ -26,6 +35,9 @@ _TESTS = Path(__file__).resolve().parent
 _REPOSITORY = _TESTS.parent
 
 _XDG_BASES = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")
+
+# Test data: the shared temp directory no test module may name.
+_FIXED_TEMP_NAME = "saneless-test"
 
 
 def test_home_is_neither_the_real_home_nor_in_the_repository() -> None:
@@ -66,12 +78,17 @@ def test_playwright_browsers_path_is_pinned() -> None:
 
 
 def test_no_test_module_names_a_fixed_temp_path() -> None:
-    """No test builds its settings on one shared, process-wide temp directory."""
-    fixed = "saneless" + "-test"
+    """
+    No test builds its settings on one shared, process-wide temp directory.
+
+    This module names the forbidden directory once, in the constant it scans
+    for, and nowhere else.
+    """
     offenders = sorted(
         path.name
         for path in _TESTS.glob("*.py")
-        if fixed in path.read_text(encoding="utf-8")
+        if path.read_text(encoding="utf-8").count(_FIXED_TEMP_NAME)
+        > (1 if path == Path(__file__).resolve() else 0)
     )
     assert offenders == []
 
@@ -115,3 +132,169 @@ def test_hermetic_import_of_config_touches_no_temp_dir() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "None"
+
+
+def _pending_connections(listener: socket.socket) -> int:
+    """
+    Count the connections waiting in a listener's backlog, accepting each.
+
+    Returns:
+        How many connections were waiting.
+
+    """
+    listener.settimeout(0.0)
+    count = 0
+    while True:
+        try:
+            accepted, _ = listener.accept()
+        except BlockingIOError:
+            return count
+        accepted.close()
+        count += 1
+
+
+def _loopback_listener() -> socket.socket:
+    """
+    Bind and listen on an ephemeral loopback port.
+
+    Returns:
+        The listening socket; the caller closes it.
+
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    return listener
+
+
+def _probe_through_the_app_client(port: int) -> None:
+    """Probe a loopback Paperless through the client class the web app builds."""
+    client = web_app.PaperlessClient(url=f"http://127.0.0.1:{port}", token="t")
+    try:
+        client.test_connection(timeout=httpx2.Timeout(0.5))
+    finally:
+        client.close()
+
+
+def test_the_socket_guard_refuses_a_port_nobody_bound(
+    socket_guard: SocketGuard,
+) -> None:
+    """
+    A connect to 127.0.0.1:8000 is refused and recorded, from any thread.
+
+    A worker thread that swallows the refusal still leaves the record, which
+    is what fails the test that made it.
+    """
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection(("127.0.0.1", 8000), timeout=1)
+
+    errors: list[BaseException] = []
+
+    def connect_from_a_thread() -> None:
+        try:
+            socket.create_connection(("127.0.0.1", 8000), timeout=1)
+        except OSError as error:
+            errors.append(error)
+
+    helper = threading.Thread(target=connect_from_a_thread, name="guard-helper")
+    helper.daemon = True
+    helper.start()
+    helper.join(timeout=10)
+    assert not helper.is_alive()
+    assert [type(error) for error in errors] == [ConnectionRefusedError]
+
+    recorded = [(thread, address) for _, thread, address in socket_guard.violations]
+    assert recorded == [
+        ("MainThread", ("127.0.0.1", 8000)),
+        ("guard-helper", ("127.0.0.1", 8000)),
+    ]
+    socket_guard.clear()
+
+
+def test_the_socket_guard_allows_a_loopback_port_the_test_bound(
+    socket_guard: SocketGuard,
+) -> None:
+    """A loopback port this process bound accepts a connection."""
+    listener = _loopback_listener()
+    try:
+        port = listener.getsockname()[1]
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        assert _pending_connections(listener) == 1
+    finally:
+        listener.close()
+    assert socket_guard.violations == []
+
+
+def test_the_socket_guard_refuses_a_non_loopback_address(
+    socket_guard: SocketGuard,
+) -> None:
+    """A connect to a documentation address is refused before it is sent."""
+    with pytest.raises(ConnectionRefusedError, match="test socket guard"):
+        socket.create_connection(("192.0.2.1", 80), timeout=1)
+    assert [address for _, _, address in socket_guard.violations] == [("192.0.2.1", 80)]
+    socket_guard.clear()
+
+
+def test_paperless_requests_are_refused_by_default() -> None:
+    """The web app's Paperless client sends nothing, even to a live listener."""
+    assert web_app.PaperlessClient is not PaperlessClient
+    listener = _loopback_listener()
+    try:
+        _probe_through_the_app_client(listener.getsockname()[1])
+        assert _pending_connections(listener) == 0
+    finally:
+        listener.close()
+
+
+@pytest.mark.real_paperless_transport
+def test_the_marker_keeps_the_real_paperless_transport() -> None:
+    """Under the opt-out marker the web app's client really connects."""
+    assert web_app.PaperlessClient is PaperlessClient
+    listener = _loopback_listener()
+    try:
+        _probe_through_the_app_client(listener.getsockname()[1])
+        assert _pending_connections(listener) >= 1
+    finally:
+        listener.close()
+
+
+def test_a_poisoned_environment_changes_no_verdict(tmp_path: Path) -> None:
+    """
+    Config, TLS, SANE host and web tests pass under a poisoned environment.
+
+    The child run exports a CA bundle that holds no certificate, a SANE host
+    list, a Paperless URL in the lower-case spelling settings accept, and a
+    proxy, all aimed at a documentation address. The suite clears them before
+    any test runs, so not one verdict changes.
+    """
+    bundle = tmp_path / "bogus-ca.pem"
+    bundle.write_text("this is not a certificate\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$SANELESS_TEST_PYTHON" -m pytest -p no:cacheprovider -q'
+            " tests/test_config.py::TestConfigSources"
+            " tests/test_config.py::TestPaperlessTokenAndUrlAtLoad"
+            " tests/test_paperless.py::TestLoopbackClientSideProtocolErrors"
+            " tests/test_paperless.py::TestProbeConnection"
+            " tests/test_net_hosts.py"
+            " tests/test_checks.py::TestScannerCheck"
+            " tests/test_cli.py::TestServeCommand"
+            " tests/test_web.py::TestOwnerCookie",
+        ],
+        cwd=_REPOSITORY,
+        env={
+            **os.environ,
+            "SANELESS_TEST_PYTHON": sys.executable,
+            "SSL_CERT_FILE": str(bundle),
+            "SANE_NET_HOSTS": "192.0.2.1",
+            "saneless_paperless__url": "http://192.0.2.1:8000",
+            "HTTPS_PROXY": "http://192.0.2.1:3128",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
