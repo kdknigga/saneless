@@ -1505,7 +1505,7 @@ _REDACTED_MESSAGE = "Input should be a valid string (got <value omitted>)"
 
 class TestConfigErrorsNeverEchoValues:
     """
-    A config error never contains an input value (D-14, CFG-05).
+    A config error never contains an input value.
 
     pydantic error dicts carry ``input``, and ``str(ValidationError)`` embeds
     it; for ``tokne = "..."`` that is the Paperless token. The chain is
@@ -1558,8 +1558,8 @@ class TestConfigErrorsNeverEchoValues:
         """
         Invalid JSON for a whole section is a ConfigError, not a SettingsError.
 
-        pydantic-settings raises ``SettingsError`` before validation (Pitfall
-        2); the loader names the variable with fixed text, never the value.
+        pydantic-settings raises ``SettingsError`` before validation; the
+        loader names the variable with fixed text, never the value.
         """
         value = "notjson"
         monkeypatch.setenv("SANELESS_PAPERLESS", value)
@@ -1577,7 +1577,7 @@ class TestConfigErrorsNeverEchoValues:
         pydantic's ``msg`` carries no input today, so the load is the standing
         case and the direct render call is the guard: an upstream wording
         change that started interpolating the input must still not put the
-        Paperless token in a user-visible line (D-07, CFG-05).
+        Paperless token in a user-visible line.
         """
         secret = "tok-SECRET-4f1c9ba27e5d8031-DISTINCTIVE"
         err = _load_error(
@@ -1599,9 +1599,9 @@ class TestConfigErrorsNeverEchoValues:
         self, tmp_config_dir: Path
     ) -> None:
         """
-        Redacting inputs keeps the one-line-per-error shape (D-07, D-10).
+        Redacting inputs keeps the one-line-per-error shape.
 
-        The mistyped key now carries ``"url"``, a real ``PaperlessConfig``
+        The mistyped key carries ``"url"``, a real ``PaperlessConfig``
         field name, so the fixture exercises the case where redaction can
         reach this project's own vocabulary. The body must therefore be free
         of the redaction marker: none of these three errors involves an
@@ -1690,9 +1690,8 @@ log_level = "TRACE"
         """
         Every branch that carries pydantic's wording strikes the input out.
 
-        The narrowed redaction boundary must not weaken the guarantee: each
-        line that interpolates an upstream ``msg`` still loses the input's
-        text, whatever wording upstream arrives with (D-07, CFG-05).
+        Each line that interpolates an upstream ``msg`` loses the input's
+        text, whatever wording upstream arrives with.
         """
         hostile: ErrorDetails = {
             "type": error_type,
@@ -1709,7 +1708,7 @@ log_level = "TRACE"
         self, tmp_config_dir: Path
     ) -> None:
         """
-        Striking the input out must not shred pydantic's own words (CR-01).
+        Striking the input out does not shred pydantic's own words.
 
         ``web_port = "in"`` is a two-character typo, and ``in`` occurs inside
         ``integer`` and ``string`` in pydantic's message. An unanchored
@@ -1729,7 +1728,7 @@ log_level = "TRACE"
         self,
     ) -> None:
         """
-        A credential glued into upstream prose withholds it whole (CR-01).
+        A credential glued into upstream prose withholds the message whole.
 
         Word-anchored striking cannot reach a value upstream joined to its
         own words with no separator, and a value this long cannot be there by
@@ -1751,7 +1750,7 @@ log_level = "TRACE"
 
     def test_a_short_midword_value_is_left_alone(self, tmp_config_dir: Path) -> None:
         """
-        A short value buried in a word is coincidence, not an echo (CR-01).
+        A short value buried in a word is coincidence, not an echo.
 
         ``eger`` occurs only inside ``integer``. No reader recovers the input
         from that, so withholding the message would cost the explanation and
@@ -1782,8 +1781,9 @@ log_level = "TRACE"
 
         A word boundary needs a word character on one side of it, so a value
         whose first or last character is punctuation has no boundary to find
-        where it meets a space or a bracket. Such a value used to survive in
-        the message whole: exactly the short, symbol-heavy kind a password is.
+        where it meets a space or a bracket. Left unstruck, such a value would
+        stay in the message whole: exactly the short, symbol-heavy kind a
+        password is.
         """
         hostile: ErrorDetails = {
             "type": "string_type",
@@ -1798,12 +1798,12 @@ log_level = "TRACE"
 
     def test_a_nested_input_value_is_struck_from_the_message(self) -> None:
         """
-        A secret inside a non-string input is struck out too (WR-01).
+        A secret inside a non-string input is struck out too.
 
         ``SANELESS_PAPERLESS__TOKEN__X=<token>`` makes pydantic's ``input`` a
-        mapping, not a string. D-07 promises the line is incapable of carrying
-        the input "whatever upstream wording arrives", so a bare
-        ``isinstance(value, str)`` test leaves that promise unkept.
+        mapping, not a string. The line must not carry the input whatever
+        upstream wording arrives, so redacting only ``str`` inputs is not
+        enough.
         """
         hostile: ErrorDetails = {
             "type": "string_type",
@@ -1819,14 +1819,13 @@ log_level = "TRACE"
         self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        The SettingsError branch redacts too, whatever wording arrives (WR-02).
+        The SettingsError branch redacts too, whatever wording arrives.
 
         ``_env_contribution`` raises ``SettingsError`` when a complex-typed
         variable will not parse, and its text goes straight into the rendered
         body. pydantic-settings names only the field and source today, but
-        that wording is upstream-owned -- which is the exact dependency D-07
-        exists to remove. The raise is forced here so the guard tests this
-        module's behaviour rather than upstream's current phrasing.
+        that wording is upstream-owned, so the raise is forced here and the
+        guard tests this module's behaviour rather than upstream's phrasing.
         """
         malformed = f'{{"token": "{_HOSTILE_SECRET}"'
         monkeypatch.setenv("SANELESS_PAPERLESS", malformed)
@@ -1848,8 +1847,8 @@ log_level = "TRACE"
         """
         The environment-attributed branch strikes the input out too.
 
-        This is the fifth render branch: it names the variable that supplied
-        the value, so the value itself must still be gone (D-07, CFG-05).
+        This render branch names the variable that supplied the value, so
+        the value itself must be gone.
         """
         monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", _HOSTILE_SECRET)
         hostile: ErrorDetails = {
@@ -1872,18 +1871,14 @@ log_level = "TRACE"
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A lowercase ``saneless_*`` value is redacted too (PR #13 review).
+        A lowercase ``saneless_*`` value is redacted too.
 
         ``SettingsConfigDict`` leaves ``case_sensitive`` at its default, so
         pydantic-settings reads ``saneless_paperless__token`` exactly as it
-        reads the shouted spelling -- this test asserts that first, so it
-        fails if that default ever changes rather than quietly passing on a
-        premise that stopped being true.
-
-        The redaction filter used to collect only names beginning with the
-        uppercase prefix, so a token that pydantic *had* read arrived at
-        ``_redact_input`` as a value it was never told about and survived
-        into the rendered line.
+        reads the shouted spelling. The test asserts that premise first, so a
+        change to the default fails it rather than passing it vacuously. A
+        redaction filter that collected only uppercase names would leave a
+        token pydantic had read in the rendered line.
         """
         monkeypatch.delenv("SANELESS_PAPERLESS__TOKEN", raising=False)
         monkeypatch.setenv("saneless_paperless__token", _HOSTILE_SECRET)
@@ -1940,12 +1935,12 @@ class TestPaperlessTokenAndUrlAtLoad:
     """
     ``paperless.token`` and ``paperless.url`` are checked where they are loaded.
 
-    Both are typed by hand or pasted from a secret file, and both used to be
-    kept exactly as typed: a trailing newline from a secret file ended up in
-    every request's Authorization header, and ``paperless:8000`` failed only
-    when the first scan tried to upload. The load is the one place a bad value
-    can be refused before any request exists, so that is where it happens --
-    with a message that names the key and never the value.
+    Both are typed by hand or pasted from a secret file. Kept exactly as
+    typed, a trailing newline from a secret file would reach every request's
+    Authorization header, and ``paperless:8000`` would fail only when the
+    first scan tried to upload. The load is the one place a bad value can be
+    refused before any request exists, so that is where it happens -- with a
+    message that names the key and never the value.
     """
 
     @pytest.mark.parametrize(
@@ -2201,7 +2196,7 @@ def patched_search_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> _SearchDirs:
     """
-    Redirect all three config search candidates into tmp_path (Phase 37 CFG-01).
+    Redirect all three config search candidates into tmp_path.
 
     The real third candidate is ``/etc/saneless``, which no test may create,
     write or chmod; patching the search list keeps the whole search, including
@@ -2243,13 +2238,11 @@ _STALE_TOML = (
 
 class TestConfigDiscovery:
     """
-    What config discovery found is recorded once and derived once (Phase 37).
+    What config discovery found is recorded once and derived once.
 
-    An operator who mounted ``/etc/saneless/saneless.toml`` got no config at
-    all, because that directory was searched for the other spelling, and no
-    surface named the cause. Discovery now records every candidate it searched,
-    the file it loaded, and any old-name file left beside a candidate -- which
-    it stats and never opens.
+    Discovery records every candidate it searched, the file it loaded, and any
+    old-name file left beside a candidate -- which it stats and never opens --
+    so every surface can name why a mounted file did or did not load.
     """
 
     @staticmethod
@@ -2269,7 +2262,7 @@ class TestConfigDiscovery:
     def test_xdg_new_name_is_discovered(
         self, patched_search_paths: _SearchDirs
     ) -> None:
-        """A correctly named file under XDG loads (Phase 37 CFG-01)."""
+        """A correctly named file under XDG loads."""
         expected = patched_search_paths.xdg / config_mod.CONFIG_FILENAME
         expected.write_text(_MINIMAL_TOML)
         settings = load_settings()
@@ -2282,7 +2275,7 @@ class TestConfigDiscovery:
     def test_xdg_old_name_alone_is_not_loaded(
         self, patched_search_paths: _SearchDirs
     ) -> None:
-        """An old-name file under XDG is recorded as stale, not loaded (D-08)."""
+        """An old-name file under XDG is recorded as stale, not loaded."""
         stale = self._stale_in(patched_search_paths.xdg)
         stale.write_text(_MINIMAL_TOML)
         settings = load_settings()
@@ -2295,11 +2288,10 @@ class TestConfigDiscovery:
         self, patched_search_paths: _SearchDirs
     ) -> None:
         """
-        The 2026-09-22 failure, inverted (Phase 37 CFG-01).
+        The app-named file in the system config directory loads.
 
-        A container mounting the app-named file into the system config
-        directory got nothing, because that directory was searched for the
-        other spelling. It now loads.
+        A container mounts ``saneless.toml`` into ``/etc/saneless``, so that
+        directory is searched for the same spelling as the other two.
         """
         mounted = patched_search_paths.etc / config_mod.CONFIG_FILENAME
         mounted.write_text('[scanner]\nhost = "from-etc"\n\n[profiles.default]\n')
@@ -2315,7 +2307,7 @@ class TestConfigDiscovery:
         self, patched_search_paths: _SearchDirs
     ) -> None:
         """
-        Invalid TOML under the old name does not break the load (D-08).
+        Invalid TOML in a superseded-name file does not break the load.
 
         Proof that the file is stat-ed and not read: were it parsed, this would
         raise.
@@ -2336,7 +2328,7 @@ class TestConfigDiscovery:
         self, patched_search_paths: _SearchDirs
     ) -> None:
         """
-        A live token under the old name populates nothing (D-08, Phase 37 CFG-03).
+        A live token in a superseded-name file populates nothing.
 
         The dangerous shape of "detection": stat-ing a file and then quietly
         merging it. The settings must still be the unconfigured defaults, and
@@ -2355,7 +2347,7 @@ class TestConfigDiscovery:
 
     def test_discover_config_lists_found_loaded_and_stale(self, tmp_path: Path) -> None:
         """
-        ``found`` is every existing candidate and ``loaded`` is the first (D-05).
+        ``found`` is every existing candidate and ``loaded`` is the first.
 
         Driven with a plain tuple, so nothing here depends on the environment.
         """
@@ -2389,10 +2381,10 @@ class TestConfigDiscovery:
 
     def test_unreadable_stale_file_still_counts(self, tmp_path: Path) -> None:
         """
-        A stale file with no permissions is present, not absent (Phase 37 D-09).
+        A stale file with no permissions is present, not absent.
 
-        Present-but-unreadable is deliberately not a distinct state this phase:
-        a stat is all the detection needs.
+        Present-but-unreadable is not a distinct state: a stat is all the
+        detection needs.
         """
         stale = self._stale_in(tmp_path)
         stale.write_text(_MINIMAL_TOML)
@@ -2408,7 +2400,7 @@ class TestConfigDiscovery:
     def test_state_loaded_with_leftover(
         self, patched_search_paths: _SearchDirs
     ) -> None:
-        """A leftover beside a loaded file is its own state (D-10)."""
+        """A leftover beside a loaded file is its own state."""
         (patched_search_paths.cwd / config_mod.CONFIG_FILENAME).write_text(
             _MINIMAL_TOML
         )
@@ -2458,7 +2450,7 @@ class TestConfigDiscovery:
         )
 
     def test_state_not_found(self, patched_search_paths: _SearchDirs) -> None:
-        """Nothing anywhere is NOT_FOUND, which is a supported deployment (D-07)."""
+        """Nothing anywhere is NOT_FOUND, which is a supported deployment."""
         assert patched_search_paths.cwd.is_dir()
         settings = load_settings()
         assert (
@@ -2468,7 +2460,7 @@ class TestConfigDiscovery:
 
     def test_explicit_path_bypasses_stale_detection(self, tmp_path: Path) -> None:
         """
-        ``--config`` searches nothing, so it detects nothing (Phase 37, deferred).
+        ``--config`` searches nothing, so it detects nothing.
 
         Current behaviour, pinned so a later change to it is deliberate.
         """
@@ -2489,7 +2481,7 @@ class TestConfigDiscovery:
         )
 
     def test_directly_constructed_settings_are_not_found(self) -> None:
-        """``Settings()`` recorded no discovery, so it loaded no file (D-05)."""
+        """``Settings()`` records no discovery, so it reads as no file loaded."""
         settings = Settings()
         assert settings.config_discovery is None
         assert (
@@ -2498,7 +2490,7 @@ class TestConfigDiscovery:
         )
 
     def test_settings_with_only_a_path_are_loaded(self, tmp_path: Path) -> None:
-        """A recorded path without a discovery still reads as LOADED (D-05)."""
+        """A recorded path without a discovery reads as LOADED."""
         settings = Settings()
         settings._config_path = tmp_path / config_mod.CONFIG_FILENAME
         assert (
@@ -2510,7 +2502,7 @@ class TestConfigDiscovery:
         self, tmp_path: Path
     ) -> None:
         """
-        The three spellings come from search position (Phase 37 D-14).
+        The three spellings come from search position.
 
         The status strip carries no filesystem path, so the stale file is named
         by the spelling the documentation uses. Driving it with tmp_path
@@ -2540,7 +2532,7 @@ class TestConfigDiscovery:
     def test_documented_spelling_rejects_an_unsearched_path(
         self, tmp_path: Path
     ) -> None:
-        """A path beside no candidate has no documented spelling (D-14)."""
+        """A path beside no candidate has no documented spelling."""
         discovery = config_mod.discover_config(
             (tmp_path / "a" / config_mod.CONFIG_FILENAME,)
         )
@@ -2687,7 +2679,7 @@ def _env_line(err: ConfigError, variable: str) -> str:
 
 class TestEnvironmentAttribution:
     """
-    An error whose value came from a SANELESS_* variable names it (D-12).
+    An error whose value came from a SANELESS_* variable names it.
 
     pydantic's ``loc`` is identical for TOML and environment input, so without
     attribution an env typo would be reported against a file that does not
@@ -2784,11 +2776,11 @@ class TestEnvironmentAttribution:
         self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A JSON section variable is not blamed for the file's typo (WR-04).
+        A JSON section variable is not blamed for the file's typo.
 
         ``SANELESS_OUTPUT`` supplies ``web_port`` only; ``tmpdir`` is in the
-        file. The shorter-prefix fallback used to match ``SANELESS_OUTPUT``
-        even though the failing key was not in what the environment supplied.
+        file. A shorter-prefix match would blame ``SANELESS_OUTPUT`` even though
+        the failing key is not in what the environment supplied.
         """
         monkeypatch.setenv("SANELESS_OUTPUT", '{"web_port": 1234}')
         err = _load_error(
@@ -2828,7 +2820,7 @@ class TestEnvironmentAttribution:
         self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        ``SANELESS_PAPERLESS__URL__X`` is named for the ``url`` error (WR-04).
+        ``SANELESS_PAPERLESS__URL__X`` is named for the ``url`` error.
 
         The variable turns ``url`` into a mapping, so the error's ``loc`` stops
         at ``url``; no variable is spelled exactly ``SANELESS_PAPERLESS__URL``,
