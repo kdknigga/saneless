@@ -7391,10 +7391,10 @@ CHECK_LISTING_PAGES = (
     DOCS_DIR / "getting-started" / "first-web-ui-scan.md",
 )
 
-# A count of the checks in prose: "six checks", "six health checks", "six
-# named rows", across a line wrap and in any case.
+# A count of the checks in prose: "six checks", "6 health checks", "six
+# named rows", as a word or a numeral, across a line wrap and in any case.
 _CHECK_COUNT = re.compile(
-    rf"\b(?P<count>{'|'.join(_NUMBER_WORDS)})\s+"
+    rf"\b(?P<count>[0-9]+|{'|'.join(_NUMBER_WORDS)})\s+"
     r"(?:(?:named|health|status)\s+)?(?:checks|rows)\b",
     re.IGNORECASE,
 )
@@ -7438,25 +7438,31 @@ def _check_count_offences(text: str, name: str) -> list[str]:
         name: The page's name, for the report.
 
     Returns:
-        One entry per count whose number word is not ``len(CheckKey)`` spelled
-        out.
+        One entry per count, as a word or a numeral, whose value is not
+        ``len(CheckKey)``.
 
     """
-    expected = _spelled_check_count()
     prose = _without_fences(text)
     offences: list[str] = []
     for match in _CHECK_COUNT.finditer(prose):
-        if match["count"].lower() == expected:
+        raw = match["count"].lower()
+        value = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
+        if value == len(CheckKey):
             continue
         line = prose.count("\n", 0, match.start()) + 1
         offences.append(f"{name}:{line}: {' '.join(match[0].split())}")
     return offences
 
 
-def test_the_check_count_scan_reports_a_wrong_count() -> None:
+@pytest.mark.parametrize("numeral", [False, True], ids=["word", "numeral"])
+def test_the_check_count_scan_reports_a_wrong_count(*, numeral: bool) -> None:
     """A page counting one check too many is one offence, on its line."""
-    wrong = next(
-        word for word, value in _NUMBER_WORDS.items() if value == len(CheckKey) + 1
+    wrong = (
+        str(len(CheckKey) + 1)
+        if numeral
+        else next(
+            word for word, value in _NUMBER_WORDS.items() if value == len(CheckKey) + 1
+        )
     )
     page = f"# Doctor\n\nIt reports {wrong} health\nchecks.\n"
 
@@ -7470,6 +7476,7 @@ def test_the_check_count_scan_passes_the_right_count_and_other_rows() -> None:
     right = _spelled_check_count()
     page = (
         f"The strip has {right} named rows and {right.capitalize()} checks.\n"
+        f"Doctor prints {len(CheckKey)} health checks.\n"
         "Three in a row failing raises the alarm.\n"
         "```\nten checks\n```\n"
     )
