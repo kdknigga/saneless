@@ -35,7 +35,7 @@ import time
 from contextlib import contextmanager
 from html import unescape
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import httpx2
 import pytest
@@ -1325,6 +1325,39 @@ class TestTheStripSurvivesItsOwnFailure:
         monkeypatch.setattr(_app(client).state.refresher, "request_probe", boom)
         with pytest.raises(RuntimeError, match=_CHECKS_BOOM_MARKER):
             client.post("/api/checks/refresh")
+
+    def test_a_failing_re_run_leaves_the_strip_as_it_stood(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A re-run that raises answers the click at 200 with the strip as it stood.
+
+        The refresher thread logs the failure and stores nothing, so the
+        previous results stay in the cache and on the page, settled, and
+        nothing about the exception reaches the body.
+        """
+        state = _app(client).state
+        state.checks.store(_synthetic_results())
+        before = state.checks.current()
+        threads: list[str] = []
+
+        def boom(_context: CheckContext, **_kwargs: object) -> NoReturn:
+            threads.append(threading.current_thread().name)
+            raise RuntimeError(_CHECKS_BOOM_MARKER)
+
+        monkeypatch.setattr(refresher_module, "run_checks", boom)
+        response = client.post("/api/checks/refresh")
+
+        assert response.status_code == 200
+        assert threads == [_refresher(client).thread_name]
+        after = state.checks.current()
+        assert after.results == before.results
+        assert after.checked_at == before.checked_at
+        for key in CheckKey:
+            assert f"{key.value} row." in _row_named(response.text, check_name(key))
+        assert "hx-trigger" not in _body_attrs(response.text)
+        for forbidden in (_CHECKS_BOOM_MARKER, "Traceback", "RuntimeError", ".py"):
+            assert forbidden not in response.text, (forbidden, response.text)
 
     @pytest.mark.parametrize("target", ["_checks_context", "note_watcher"])
     def test_a_failure_inside_the_render_is_a_cold_strip_at_200(
