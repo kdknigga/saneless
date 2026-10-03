@@ -5666,7 +5666,7 @@ class TestUploadResultContract:
 
         transport = httpx2.MockTransport(handler)
         client = PaperlessClient(
-            "http://localhost:8000",
+            "http://paperless.invalid",
             "token",
             transport=transport,
         )
