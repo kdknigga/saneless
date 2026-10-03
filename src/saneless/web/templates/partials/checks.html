@@ -15,8 +15,11 @@
       minutes and a chain that ended first never collected it.  That is the
       in-tree idiom
       (the conditional poll attributes on partials/status.html's #status-area)
-      and it is deliberately NOT HTTP 286,
-      which would need a change to the tuned htmx-config meta in base.html.
+      and it is deliberately NOT HTTP 286.  A 286 would work with the
+      htmx-config meta in base.html as it stands -- its [23].. rule swaps the
+      response and htmx then cancels the poll -- but the swapped body already
+      ends the poll by carrying no trigger, so a 286 would be a second
+      mechanism for the same thing.
    2. The strip asks only while something in flight will change the answer, and
       never otherwise.  There are two such things, and the route (`_checks_context`)
       is where both are read.  A cold cache is the first: no results yet, so a

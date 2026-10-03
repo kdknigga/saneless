@@ -232,7 +232,7 @@
         {% include "partials/scan_button.html" %}
         {# Why the button above is greyed out, as visible text in the reading
            order directly after it.  Not a title tooltip, and not
-           the ARIA disabled-state attribute, which no template uses.  A
+           aria-disabled, which appears on no element.  A
            disabled button cannot be focused, so aria-describedby on it is
            never announced on focus and a tooltip is unreachable by keyboard
            and unreliable on touch; keeping the button focusable by swapping
