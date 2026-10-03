@@ -88,13 +88,6 @@ if TYPE_CHECKING:
 
     from saneless.scanner.base import DeviceCapabilities, DeviceSurvey
 
-# Every ExitCode member, written out rather than derived, so that adding a
-# member to the enum fails here as well as in the doc tests.  A red check maps
-# onto the existing 2, and this is the assertion that says so.
-# 9 and 10 belong to a scan: an upload that may already be in paperless-ngx,
-# and a full disk.  doctor exits with neither.
-_EXPECTED_EXIT_CODES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 129, 130, 141, 143}
-
 # Every call the CLI made to ``require_sane`` during one invocation.  That
 # ``doctor`` never calls it is an assertion about a call that must *not*
 # happen, and a silent no-op stand-in cannot tell no call from a call that did
@@ -762,14 +755,31 @@ class TestDoctorExitCodes:
         assert "The configured scanner is ready." in result.output
         assert "The configured scanner was not found." not in result.output
 
-    def test_no_new_exit_code_member_was_added(self) -> None:
+    def test_doctor_exits_config_on_any_fail_and_success_otherwise(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """
-        ``ExitCode`` holds exactly the documented codes; ``doctor`` has none of its own.
+        ``doctor`` exits ``CONFIG`` when any row failed and ``SUCCESS`` otherwise.
 
-        A red check exits with the existing 2, so the documented exit-code
-        tables cover every code ``doctor`` can return.
+        Every state on every check is tried, so a red check always maps onto
+        the existing configuration code and ``doctor`` has no code of its own.
         """
-        assert {int(code) for code in ExitCode} == _EXPECTED_EXIT_CODES
+        runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
+        tables = [
+            _all_ok(),
+            _one_skipped_scanner(),
+            *(
+                _all_ok_except(key, state, "Do this.")
+                for key in CheckKey
+                for state in CheckState
+            ),
+        ]
+        for rows in tables:
+            _stub_registry(monkeypatch, rows)
+            failed = any(row.state is CheckState.FAIL for row in rows)
+            expected = ExitCode.CONFIG if failed else ExitCode.SUCCESS
+            result = runner.invoke(cli, ["doctor"])
+            assert result.exit_code == expected, (rows, result.output)
 
 
 class TestDoctorOutput:

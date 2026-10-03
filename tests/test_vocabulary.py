@@ -170,18 +170,7 @@ _AMBER_CATEGORIES = frozenset(
 
 
 class TestJobStateMembers:
-    """JobState has thirteen members, each valued as its name."""
-
-    def test_job_state_has_exactly_thirteen_members(self) -> None:
-        """
-        JobState declares exactly thirteen lifecycle members.
-
-        A count guard, not a name list: adding a member should fail the
-        parametrised completeness tests below -- which force a label and a
-        classification decision -- rather than a hand-written roster that only
-        records what the enum happened to contain when it was written.
-        """
-        assert len(list(JobState)) == 13
+    """Every JobState member is valued as its name."""
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:

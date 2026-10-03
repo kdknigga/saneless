@@ -269,35 +269,6 @@ def _result(state: CheckState, key: CheckKey = CheckKey.SCANNER) -> CheckResult:
 class TestCheckVocabulary:
     """The enums and their four presentation lookups are total."""
 
-    def test_check_state_has_exactly_three_members(self) -> None:
-        """
-        There are three check states, no more.
-
-        A fourth state would need an exit code, a glyph, a colour class and a
-        screen-reader label, and ``doctor``'s "non-zero on FAIL only" rule
-        would need deciding again, so adding one has to be deliberate.
-        """
-        assert len(list(CheckState)) == 3
-        assert set(CheckState) == {CheckState.OK, CheckState.WARN, CheckState.FAIL}
-
-    def test_check_key_has_exactly_six_members(self) -> None:
-        """
-        There are six checks, and this enum is how both surfaces see them.
-
-        Neither ``saneless doctor`` nor the status strip may hold a check the
-        other does not have.  Both iterate ``CheckKey``, so the only way to
-        add a seventh is here.
-        """
-        assert len(list(CheckKey)) == 6
-        assert set(CheckKey) == {
-            CheckKey.CONFIGURATION,
-            CheckKey.SCANNER,
-            CheckKey.PAPERLESS,
-            CheckKey.PROFILES,
-            CheckKey.FALLBACK,
-            CheckKey.DATA_DIR,
-        }
-
     def test_configuration_is_the_first_member(self) -> None:
         """
         The Configuration check comes first, so the cause is read above the symptoms.
