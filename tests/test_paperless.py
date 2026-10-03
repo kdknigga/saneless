@@ -3151,7 +3151,7 @@ def _metadata_client(handler: _CountingHandler) -> PaperlessClient:
 
 
 class TestMetadataFetchTranslation:
-    """EXC-01 / D-11: get_tags and get_correspondents raise only PaperlessError."""
+    """get_tags and get_correspondents raise only PaperlessError."""
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     @pytest.mark.parametrize(("respond", "suffix", "cause_type"), _METADATA_FAILURES)
@@ -3167,8 +3167,8 @@ class TestMetadataFetchTranslation:
         Every failure names the endpoint and base URL and keeps the cause.
 
         A status error is rendered as status, reason and the one-line body
-        rather than httpx2's two-line text, so the message stays one line
-        (EXC-02); a non-JSON body ends with ``describe`` of the ValueError.
+        rather than httpx2's two-line text, so the message stays one line; a
+        non-JSON body ends with ``describe`` of the ValueError.
         """
         handler = _CountingHandler(respond)
         client = _metadata_client(handler)
@@ -4038,8 +4038,8 @@ class TestMetadataResponseShape:
         """
         ``results`` must be a list of objects.
 
-        ``null`` used to raise a TypeError out of the client, and a string or
-        an object was taken apart into its characters or keys.
+        A ``null`` must not raise a TypeError out of the client, nor a string
+        or an object be taken apart into its characters or keys.
         """
         handler = _PagedHandler(
             {
@@ -4371,7 +4371,7 @@ class TestMetadataPaginationTerminates:
 
 
 class TestConnectionTest:
-    """Connection test method tests."""
+    """``test_connection`` maps every answer to exactly one ConnectionStatus."""
 
     @pytest.mark.parametrize(("status_code", "expected"), _CONNECTION_STATUS_CASES)
     def test_status_code_classification(
@@ -4387,10 +4387,9 @@ class TestConnectionTest:
         """
         Every transport-level failure is UNREACHABLE, not an escaped exception.
 
-        ConnectTimeout and ReadTimeout used to propagate past the narrow
-        `except httpx2.ConnectError` and hit routes.py's blanket handler,
-        surfacing as HTTP 502 {"status": "error"} -- which is none of the
-        five outcomes OUTC-08 names.
+        ConnectTimeout and ReadTimeout are not ConnectErrors; one that escaped
+        would hit routes.py's blanket handler and surface as HTTP 502
+        {"status": "error"}, which is none of the documented outcomes.
         """
         assert (
             _connection_result_for_exception(exc_type) is ConnectionStatus.UNREACHABLE
@@ -4414,11 +4413,11 @@ class TestConnectionTest:
 
     def test_legacy_wire_strings_are_byte_identical(self) -> None:
         """
-        The three documented JSON strings still compare equal as plain str.
+        The three documented JSON strings compare equal as plain str.
 
-        These assertions are deliberately NOT enum-identity checks: they are
-        the only thing proving the StrEnum *value* is still what
-        web/routes.py serialises and docs/reference/web-api.md documents.
+        These assertions are deliberately NOT enum-identity checks: they prove
+        the StrEnum *value* is what web/routes.py serialises and
+        docs/reference/web-api.md documents.
         """
         assert _connection_result_for_status(200) == "connected"
         assert _connection_result_for_status(401) == "token_rejected"
@@ -4730,20 +4729,16 @@ class TestProbeConnection:
 
 class TestConnectionTimeout:
     """
-    The probe can be bounded per request without changing any caller (APPL-02).
+    The probe can be bounded per request without changing any caller.
 
-    ``PaperlessClient`` sets one flat 30 s on its ``httpx2.Client``, which is
-    thirty seconds of a household member staring at a spinner when the
-    paperless-ngx host is unplugged.  The status strip and ``saneless doctor``
-    need a two-second answer, while ``GET /api/paperless/test`` deliberately
-    keeps today's client default, so the bound is a per-request override and
-    not a new constructor argument.
+    ``PaperlessClient`` sets one flat 30 s on its ``httpx2.Client``.  The status
+    strip and ``saneless doctor`` need a two-second answer when the
+    paperless-ngx host is unplugged, while ``GET /api/paperless/test`` keeps the
+    client default, so the bound is a per-request override, not a constructor
+    argument.
 
-    Every assertion here reads ``request.extensions["timeout"]``, the dict
-    httpx2 hands the transport, rather than measuring wall-clock.  The suite
-    forbids ``sleep`` and a timing assertion against a real socket would be
-    flaky on a loaded machine; what actually needs proving is *which budget was
-    sent*, and that is a value, not a duration.
+    Every assertion reads ``request.extensions["timeout"]``, the dict httpx2
+    hands the transport: *which budget was sent* is a value, not a duration.
     """
 
     @staticmethod
@@ -4755,8 +4750,7 @@ class TestConnectionTimeout:
 
         Args:
             timeout: The bound to pass, or None to call with no argument at
-                all -- which is the case that proves the existing route is
-                untouched.
+                all, as ``GET /api/paperless/test`` does.
 
         Returns:
             The ``timeout`` extension dict httpx2 handed the mock transport.
@@ -4787,22 +4781,21 @@ class TestConnectionTimeout:
         self, status_code: int, expected: ConnectionStatus
     ) -> None:
         """
-        Calling with no bound classifies exactly as it does today.
+        Called with no bound, each status still maps to its one outcome.
 
         Args:
             status_code: The status the stub server answers with.
-            expected: The outcome that status has always produced.
+            expected: The outcome that status produces.
 
         """
         assert _connection_result_for_status(status_code) is expected
 
     def test_no_timeout_argument_uses_the_client_default(self) -> None:
         """
-        A bare call still carries the client's 30 s, so no caller changed.
+        A bare call carries the client's flat 30 s.
 
-        This is the assertion that proves ``GET /api/paperless/test`` keeps
-        today's behaviour: the route calls ``test_connection()`` with no
-        argument, and what it sends is the constructor's flat 30 s.
+        ``GET /api/paperless/test`` calls ``test_connection()`` with no
+        argument, so this is the budget the route's probe is sent with.
         """
         recorded = self._recorded_timeout(None)
         assert recorded["connect"] == 30.0
@@ -4818,9 +4811,9 @@ class TestConnectionTimeout:
         """
         A bounded connect that expires reports UNREACHABLE, not an exception.
 
-        ``ConnectTimeout`` subclasses ``TransportError``, so the existing arm
-        already covers it -- asserted here so bounding the probe rests on a
-        tested claim rather than on reading the class hierarchy.
+        ``ConnectTimeout`` subclasses ``TransportError``, so the transport-error
+        arm covers it; this pins that outcome rather than leaving it to a
+        reading of the class hierarchy.
         """
         result = _connection_result_for_exception(httpx2.ConnectTimeout)
         assert result is ConnectionStatus.UNREACHABLE
@@ -4837,12 +4830,12 @@ class TestConnectionTimeout:
 
 
 class TestConsumeDir:
-    """Consume directory fallback tests."""
+    """The consume-folder handoff delivers the whole PDF or nothing, and says why."""
 
     def test_consume_dir_works_when_exists(
         self, sample_pdf: Path, tmp_path: Path
     ) -> None:
-        """Fallback works when consume_dir already exists."""
+        """An existing consume directory receives the PDF under its own name."""
         consume_dir = tmp_path / "existing-consume"
         consume_dir.mkdir()
 
@@ -5065,7 +5058,7 @@ class TestConsumeDir:
     def test_staging_leaves_a_leftover_at_the_old_name_untouched(
         self, sample_pdf: Path, tmp_path: Path
     ) -> None:
-        """A crash leftover at the old fixed staging name cannot collide."""
+        """A leftover file at the predictable staging name is neither used nor lost."""
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
         leftover = consume_dir / f".{sample_pdf.name}.part"
@@ -5108,7 +5101,7 @@ class TestConsumeDir:
 
 
 class TestAuthHeader:
-    """Authentication header tests."""
+    """Every request carries the API token and pins the API version."""
 
     def test_auth_header(self) -> None:
         """Authorization header contains Token prefix and credential."""
@@ -5131,10 +5124,10 @@ class TestAuthHeader:
 
     def test_accept_header_pins_the_api_version(self) -> None:
         """
-        Every request pins the paperless-ngx API version (OUTC-11 / D-17).
+        Every request pins the paperless-ngx API version.
 
-        Without the header the server picks its own default -- today v10,
-        one day v11 -- and the client silently tracks it.
+        Without the header the server picks its own default, which moves
+        between releases, and the client would silently track it.
         """
         captured_headers: dict[str, str | None] = {}
 
@@ -5391,7 +5384,7 @@ class TestApiVersionNegotiation:
         A refused request still teaches the version its answer names.
 
         paperless-ngx names it on any authenticated answer, a 4xx included,
-        and the next request should not repeat the old version.
+        and the next request speaks the version it named.
         """
         calls = {"n": 0}
 
@@ -5878,8 +5871,7 @@ class TestTaskIdIsBoundedInLogs:
     """
     Paperless's task id is third-party text, so it is bounded and neutralised.
 
-    It is still sent back to paperless unchanged: only what saneless prints is
-    tamed.
+    It is sent back to paperless unchanged: only what saneless prints is tamed.
     """
 
     def test_task_id_in_the_upload_log_is_bounded(
