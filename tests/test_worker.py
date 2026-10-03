@@ -96,7 +96,7 @@ def _mock_scanner_reports_no_devices(mock_scanner: MagicMock) -> None:
     Answer the shared mock scanner's ``get_devices`` with a deliberate ``[]``.
 
     Every worker started over ``default_settings`` -- a bare default profile
-    set -- runs startup profile generation first (D-14).  Left to itself the
+    set -- runs startup profile generation first.  Left to itself the
     ``MagicMock`` hands back a truthy mock and generation fails somewhere inside
     ``generate_profiles``, so whether profiles were swapped under a test would
     hang on how that function treats a mock.  "No scanners found" is a real
@@ -114,7 +114,7 @@ def _get(store: JobStore, job_id: str) -> Job:
 
 
 class TestJobStateTransitions:
-    """Job state machine tests."""
+    """A job moves through its states and reads back as it was written."""
 
     def test_job_state_transitions(self) -> None:
         """Job starts as PENDING and transitions through all active states."""
@@ -157,7 +157,7 @@ class TestJobStateTransitions:
 
 
 class TestJobStore:
-    """JobStore persistence tests."""
+    """The job store creates, updates and persists job rows."""
 
     def test_job_store_create_and_get(self) -> None:
         """JobStore.create_job returns Job with UUID, get_job returns same."""
@@ -206,7 +206,7 @@ class TestJobStore:
 
 
 class TestJobStateAwaitingFlip:
-    """AWAITING_FLIP state tests."""
+    """A job can wait at the flip prompt in its own state."""
 
     def test_awaiting_flip_exists(self) -> None:
         """JobState.AWAITING_FLIP exists and equals 'AWAITING_FLIP'."""
@@ -215,7 +215,7 @@ class TestJobStateAwaitingFlip:
 
 
 class TestJobThumbnail:
-    """Job thumbnail field tests."""
+    """A job carries an optional thumbnail that the store persists."""
 
     def test_thumbnail_defaults_none(self) -> None:
         """Job.thumbnail field defaults to None."""
@@ -235,7 +235,7 @@ class TestJobThumbnail:
 
 
 class TestScanWorker:
-    """Worker thread tests."""
+    """The worker runs jobs on its own thread and records how each ends."""
 
     def test_worker_starts_and_stops(
         self,
@@ -261,7 +261,7 @@ class TestScanWorker:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Submit job to worker -> job reaches DONE state."""
+        """A job submitted to the worker reaches DONE."""
         store = JobStore()
         try:
             # Mock run_pipeline to succeed
@@ -276,7 +276,7 @@ class TestScanWorker:
             job = store.create_job("default", "Worker Test")
             worker.submit(job)
 
-            # stop() abandons unstarted work (D-07), so wait for the row itself.
+            # stop() abandons unstarted work, so wait for the row itself.
             wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
 
@@ -292,7 +292,7 @@ class TestScanWorker:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Pipeline raises exception -> job state is ERROR with message."""
+        """A pipeline that raises ends the job ERROR with the exception's message."""
         store = JobStore()
         try:
 
@@ -525,7 +525,7 @@ def test_every_pipeline_request_comes_from_the_one_builder() -> None:
 # timed-out job rather than as a SIGALRM traceback.
 _MOCK_FLIP_TIMEOUT = 5.0
 
-# The text a flip-prompt cancel carries into the job row (D-01): the real
+# The text a flip-prompt cancel carries into the job row: the real
 # pipeline's message for an operator's abort, so the stubs raise it verbatim.
 _CANCEL_MESSAGE = "Manual duplex scan cancelled at the flip prompt"
 
@@ -545,7 +545,7 @@ def _mock_manual_duplex_pipeline(
             request.status_callback(PipelineEvent.AWAITING_FLIP)
         outcome = coordinator.wait_for_flip(_MOCK_FLIP_TIMEOUT)
         if outcome is FlipOutcome.ABORTED:
-            # As the real pipeline does for an operator's abort (D-02, EXC-04).
+            # As the real pipeline does for an operator's abort.
             raise ScanCancelledError(_CANCEL_MESSAGE)
         if outcome is FlipOutcome.TIMED_OUT:
             msg = "Manual duplex flip wait timed out"
@@ -559,9 +559,9 @@ def _assert_cancelled_at_the_flip_prompt(
     """
     Assert ``finished`` ended as an operator's cancel at the flip prompt.
 
-    CANCELLED with no category and the flip-prompt message (D-01), logged once
-    at INFO without a traceback (N-08).  Call only after the worker has been
-    stopped, which joins its thread, so the ending's log record exists.
+    CANCELLED with no category and the flip-prompt message, logged once at
+    INFO without a traceback.  Call only after the worker has been stopped,
+    which joins its thread, so the ending's log record exists.
     """
     assert finished.state is JobState.CANCELLED
     assert finished.error_category is None
@@ -619,7 +619,7 @@ def _captured_flip_coordinator(
 
 
 class TestScanWorkerManualDuplex:
-    """Worker manual duplex coordination tests."""
+    """A manual duplex job's flip prompt is answered through the worker."""
 
     def test_worker_supplies_a_flip_coordinator_for_manual_duplex(
         self,
@@ -668,10 +668,10 @@ class TestScanWorkerManualDuplex:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        abort_flip(job.id) answers ABORTED, and the job ends CANCELLED (D-01).
+        abort_flip(job.id) answers ABORTED, and the job ends CANCELLED.
 
         The Abort button is the operator choosing to stop, so the job is a
-        cancel rather than a scanner failure (EXC-04, N-08).
+        cancel rather than a scanner failure.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         # worker_for builds over this same fixture instance.
@@ -843,7 +843,7 @@ class TestScanWorkerManualDuplex:
             )
             assert worker.current_job_id == job.id
 
-            # Continue counts only at the flip prompt (CR-01), so reach it first.
+            # Continue counts only at the flip prompt, so reach it first.
             wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
             worker.continue_flip(job.id)
             wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
@@ -861,7 +861,7 @@ class TestScanWorkerManualDuplex:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        CR-01: whoever reads AWAITING_FLIP from the store finds the prompt armed.
+        Whoever reads AWAITING_FLIP from the store finds the prompt armed.
 
         The status poll renders Continue and Abort from the persisted row, so
         the coordinator must already accept an answer by the time that row is
@@ -912,10 +912,10 @@ class TestScanWorkerManualDuplex:
 
 class TestWorkerFlipCoordinator:
     """
-    The web flip coordinator answers once, and its answer is final (D-16).
+    The web flip coordinator answers once, and its answer is final.
 
     It is also bound to one job and accepts an answer only once armed, which
-    the worker does when the job announces ``AWAITING_FLIP`` (CR-01).
+    the worker does when the job announces ``AWAITING_FLIP``.
 
     Every wait here is bounded by ``0``: an Event wait with a zero timeout
     returns in microseconds, so nothing in this class waits on a wall clock.
@@ -941,10 +941,10 @@ class TestWorkerFlipCoordinator:
 
     def test_a_later_abort_after_continue_is_dropped(self) -> None:
         """
-        D-16: once Continue has answered, a late Abort changes nothing.
+        Once Continue has answered, a late Abort changes nothing.
 
-        Pass B has genuinely started by then, and stopping it mid-pass is
-        Phase 29's HARD-02, so the honest answer is the first one.
+        Pass B has genuinely started by then, and an Abort does not stop a
+        pass midway, so the honest answer is the first one.
         """
         coordinator = WorkerFlipCoordinator("job-1")
         coordinator.arm()
@@ -954,7 +954,7 @@ class TestWorkerFlipCoordinator:
 
     def test_an_unarmed_signal_is_dropped(self) -> None:
         """
-        CR-01: a signal before the flip prompt exists claims nothing.
+        A signal before the flip prompt exists claims nothing.
 
         Both signals report that they were dropped and leave the answer slot
         empty, so a click meant for an earlier prompt cannot pre-answer this one.
@@ -967,7 +967,7 @@ class TestWorkerFlipCoordinator:
 
     def test_an_early_signal_is_dropped_not_queued(self) -> None:
         """
-        CR-01: an Abort sent during pass A is not held back for the prompt.
+        An Abort sent during pass A is not held back for the prompt.
 
         Once the prompt is armed, the operator's real Continue is the answer.
         """
@@ -978,7 +978,7 @@ class TestWorkerFlipCoordinator:
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
     def test_the_first_armed_answer_wins_and_later_ones_are_dropped(self) -> None:
-        """D-16 with CR-01: the first armed signal claims; every later one is False."""
+        """The first armed signal claims the answer; every later one is False."""
         coordinator = WorkerFlipCoordinator("job-1")
         coordinator.arm()
         assert coordinator.signal_abort() is True
@@ -996,13 +996,13 @@ class TestWorkerFlipCoordinator:
         assert coordinator.signal_continue() is True
 
     def test_an_unanswered_armed_wait_times_out(self) -> None:
-        """Nothing signalled within the bound resolves TIMED_OUT (DPLX-05)."""
+        """Nothing signalled within the bound resolves TIMED_OUT."""
         coordinator = WorkerFlipCoordinator("job-1")
         coordinator.arm()
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
 
     def test_an_unanswered_unarmed_wait_times_out(self) -> None:
-        """A wait on a never-armed coordinator still times out (DPLX-05)."""
+        """A wait on a never-armed coordinator still times out."""
         coordinator = WorkerFlipCoordinator("job-1")
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
 
@@ -1075,7 +1075,7 @@ class TestWorkerFlipCoordinator:
 
 
 class TestWorkerIntermediateStates:
-    """Worker emits ASSEMBLING and UPLOADING intermediate states (UI-02)."""
+    """The worker records ASSEMBLING and UPLOADING as the pipeline reaches them."""
 
     def test_worker_assembling_state(
         self,
@@ -1317,7 +1317,7 @@ class TestWorkerErrorCategories:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """AllPagesBlankError sets ErrorCategory.ALL_BLANK, never SCANNER (D-10)."""
+        """AllPagesBlankError sets ErrorCategory.ALL_BLANK, never SCANNER."""
 
         def failing(*_a: object, **_k: object) -> ScanResult:
             msg = "All pages were blank"
@@ -1417,8 +1417,8 @@ class _PassBGatedScanner(StubScannerBackend):
     contract changes, and a mock is not.
 
     ``get_devices`` comes from ``StubScannerBackend`` and answers ``[]``, which
-    is what keeps startup profile generation (D-14) from swapping the settings
-    under these tests.  Only ``get_capabilities`` is overridden, because these
+    is what keeps startup profile generation from swapping the settings under
+    these tests.  Only ``get_capabilities`` is overridden, because these
     tests need a feeder rather than the base's flatbed.
 
     Attributes:
@@ -1471,7 +1471,8 @@ def _manual_duplex_settings(settings: Settings) -> Settings:
     """
     Add a ``duplex = "manual"`` profile named ``duplex`` to ``settings``.
 
-    ``source`` is a real feeder name: it no longer selects the strategy.
+    ``source`` is a real feeder name; the ``duplex`` key alone selects the
+    strategy.
 
     Args:
         settings: The fixture settings to extend in place.
@@ -1507,7 +1508,7 @@ def isolated_duplex_settings(default_settings: Settings) -> Settings:
 
 class TestWorkerPassB:
     """
-    Pass B through the real pipeline, observed from outside the worker (DPLX-06).
+    Pass B through the real pipeline, observed from outside the worker.
 
     These run the real ``run_pipeline``: the flip wait, the pass-B event and the
     state the worker persists for it are exactly what is under test, so stubbing
@@ -1558,8 +1559,8 @@ class TestWorkerPassB:
         """
         An Abort at the prompt ends the job CANCELLED through the real pipeline.
 
-        EXC-04, N-08: the pipeline raises ``ScanCancelledError`` for the
-        operator's Abort, and the worker records a cancel, not an ERROR (D-01).
+        The pipeline raises ``ScanCancelledError`` for the operator's Abort,
+        and the worker records a cancel, not an ERROR.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
@@ -1589,10 +1590,10 @@ class TestWorkerPassB:
         default_settings: Settings,
     ) -> None:
         """
-        D-16: an Abort arriving once pass B has begun changes nothing.
+        An Abort arriving once pass B has begun changes nothing.
 
-        The coordinator's first answer is final.  Pass B has genuinely started,
-        stopping it mid-pass is Phase 29's HARD-02, and so the job completes.
+        The coordinator's first answer is final.  Pass B has genuinely started
+        and an Abort does not stop a pass midway, so the job completes.
         """
         scanner = _PassBGatedScanner()
         settings = _manual_duplex_settings(default_settings)
@@ -1633,7 +1634,7 @@ class _GatedScanner(StubScannerBackend):
     A concrete class rather than a ``MagicMock``, like ``_PassBGatedScanner``,
     and inheriting the same ``get_devices`` answer of ``[]`` from
     ``StubScannerBackend`` for the same reason: startup profile generation
-    (D-14) must leave these tests' settings alone.
+    must leave these tests' settings alone.
 
     Attributes:
         gates: Per held call number, set by the test to let that call return.
@@ -1728,7 +1729,7 @@ _JAM_MESSAGE = "Scanner error on test:device:001: Document feeder jammed"
 
 class TestFlipSignalsAreJobScoped:
     """
-    A flip answer belongs to one job, and counts only at that job's prompt (CR-01).
+    A flip answer belongs to one job, and counts only at that job's prompt.
 
     These run the real ``run_pipeline``: the flip wait is the subject.  Only
     the scanner and the paperless client are fakes.  "Not answered early" is
@@ -1744,8 +1745,8 @@ class TestFlipSignalsAreJobScoped:
         """
         A Continue or Abort sent while pass A runs is dropped, not queued.
 
-        This is the C-02 mirror of CR-01: a kept early Continue would start
-        pass B on a stack nobody had flipped.
+        A kept early Continue would start pass B on a stack nobody had
+        flipped.
         """
         scanner = _GatedScanner(frozenset({1}))
         settings = _manual_duplex_settings(default_settings)
@@ -1780,7 +1781,7 @@ class TestFlipSignalsAreJobScoped:
         default_settings: Settings,
     ) -> None:
         """
-        The verifier's scenario (CR-01, 25-VERIFICATION.md) ends with job 2 DONE.
+        A double-clicked Abort cannot answer the next job's flip: job 2 ends DONE.
 
         Two manual-duplex jobs are queued.  Abort is clicked twice at job 1's
         prompt: the first click aborts job 1, the second is dropped.  Clicks
@@ -1826,7 +1827,7 @@ class TestFlipSignalsAreJobScoped:
             worker.stop()
             store.close()
 
-        # Job 1's Abort is the operator's cancel (D-01, EXC-04).
+        # Job 1's Abort is the operator's cancel.
         assert first.state is JobState.CANCELLED
         assert first.error is not None
         assert "flip prompt" in first.error
@@ -1858,7 +1859,7 @@ class TestFlipSignalsAreJobScoped:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        IN-03: a dropped signal is logged as dropped, with the reason.
+        A dropped signal is logged as dropped, with the reason.
 
         Pass A and pass B are both held, so each signal meets a coordinator in
         a known state: unarmed, armed and open, and already answered.
@@ -2079,13 +2080,12 @@ class TestWorkerStopAndSubmit:
     """
     Stopping is a flag, bounded and reported; submitting never blocks.
 
-    C-09 found two ways a full queue hung the service: ``submit`` blocked a
-    request thread on ``put``, and ``stop`` blocked shutdown on putting its
-    ``None`` sentinel.  D-07 replaces the sentinel with a stop flag and a queue
-    shutdown, D-08 bounds the join at five seconds and reports whether the
-    thread stopped, and ROBU-02 makes ``submit`` report ``QUEUE_FULL`` or
-    ``DOWN`` instead of waiting.  ROBU-03: every wait below is on a state, a
-    staged gate, or a bounded clock -- none relies on ``stop`` draining work.
+    A full queue holds neither a request thread in ``submit`` nor shutdown
+    in ``stop``: stopping sets a flag and shuts the queue down, the join is
+    bounded at five seconds and reports whether the thread stopped, and
+    ``submit`` reports ``QUEUE_FULL`` or ``DOWN`` instead of waiting.  Every
+    wait below is on a state, a staged gate, or a bounded clock -- none
+    relies on ``stop`` draining work.
     """
 
     def test_an_idle_worker_stops_at_once(
@@ -2095,7 +2095,7 @@ class TestWorkerStopAndSubmit:
         default_settings: Settings,
     ) -> None:
         """
-        D-07: an idle worker's stop() wakes the loop, not the idle tick.
+        An idle worker's stop() wakes the loop, not the idle tick.
 
         The idle tick is left at its default, far above the bound asserted
         here, so only the queue shutdown can explain a prompt return.
@@ -2122,7 +2122,7 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """D-08: stop() reports True for a stopped thread, however it got there."""
+        """stop() reports True for a stopped thread, however it got there."""
         store = JobStore()
         never_started = ScanWorker(
             mock_scanner, mock_paperless, default_settings, store
@@ -2143,7 +2143,7 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """ROBU-02: a worker that cannot take work says so instead of queueing."""
+        """A worker that cannot take work says so instead of queueing."""
         store = JobStore()
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
@@ -2164,7 +2164,7 @@ class TestWorkerStopAndSubmit:
         default_settings: Settings,
     ) -> None:
         """
-        C-09 / ROBU-02: the submit that finds no room returns QUEUE_FULL at once.
+        The submit that finds no room returns QUEUE_FULL at once.
 
         Job 1 is held inside ``scan_pages``, so the queue is empty when the
         next ten arrive; they fill it, and the eleventh has nowhere to go.
@@ -2198,12 +2198,12 @@ class TestWorkerStopAndSubmit:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        C-09 / D-08: a full queue cannot hold stop(), and a stuck join says so.
+        A full queue cannot hold stop(), and a stuck join says so.
 
         Job 1 stays held past the (shortened) join, so the thread is still
         alive when stop() gives up: it must return False within its bound
         rather than block on the full queue.  Once the gate opens the thread
-        finishes job 1 and exits without starting the queued ones (D-07).
+        finishes job 1 and exits without starting the queued ones.
         """
         monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
         scanner = _GatedScanner(frozenset({1}))
@@ -2238,19 +2238,14 @@ class TestWorkerStopAndSubmit:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        D-07: a stop at the flip prompt is an interruption, not a cancel.
+        A stop at the flip prompt is an interruption, not a cancel.
 
-        stop() answers the open wait with ``INTERRUPTED``, so the thread exits
-        at once rather than after ``operator_wait_timeout_seconds``.  Nobody chose to
-        throw the scan away, so pass A's fronts are kept as a ``(fronts)`` PDF
-        in ``failed/``.  The row says the server stopped the scan and where
-        the fronts went, with no category, and it is not logged as a failure.
-
-        This used to pin ``error == RESTART_REASON`` exactly, when a stop
-        answered the wait with Abort and the fronts were deleted.  The error
-        still starts with the restart reason; it now goes on to name the file.
-        The owner sees that file relative to the data directory, and anyone
-        else sees only the fixed sentence saying something was kept.
+        The wait ends at once with ``INTERRUPTED``, pass A's fronts are kept
+        as a ``(fronts)`` PDF in ``failed/``, and the row's error starts with
+        the restart reason and names that file, with no category and no
+        failure logged.  The owner sees the file relative to the data
+        directory; anyone else sees only the fixed sentence saying something
+        was kept.  Nobody chose to throw the scan away, so nothing is lost.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
@@ -2462,15 +2457,14 @@ class TestWorkerStopAndSubmit:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        D-07, research Pitfall 5: stopping during pass A still ends the flip wait.
+        Stopping during pass A still ends the flip wait.
 
         stop() can find no coordinator to answer because the job is still in
         pass A.  The stop flag is set while pass A is held, then pass A is
         released: the job must announce AWAITING_FLIP and be interrupted
         immediately, well inside the state budget and nowhere near the flip
-        timeout.  Like any stop at the flip, it keeps the fronts, so
-        the error starts with the restart reason and names the kept file;
-        it used to pin the bare restart reason.
+        timeout.  Like any stop at the flip, it keeps the fronts, so the error
+        starts with the restart reason and names the kept file.
         """
         scanner = _GatedScanner(frozenset({1}))
         settings = isolated_duplex_settings
@@ -2522,7 +2516,7 @@ class TestWorkerStopAndSubmit:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        WR-06, D-15: stopping alone does not make a failure a restart.
+        Stopping alone does not make a failure a restart.
 
         The pipeline fails with a Paperless error just as shutdown begins.
         Shutdown did not cause it, so the row keeps the error's own text and
@@ -2559,13 +2553,13 @@ class TestWorkerStopAndSubmit:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        WR-02, EXC-05: shutdown claiming the flip does not relabel a real failure.
+        Shutdown claiming the flip does not relabel a real failure.
 
         stop() pre-answers the flip wait with ``INTERRUPTED`` while pass A is
         still scanning, before the pipeline ever reaches the prompt.  Pass A
-        then jams.  The job did not end at the flip,
-        so the row keeps the scanner's text and category, and the failure is
-        logged with its traceback rather than as a restart at INFO.
+        then jams.  The job did not end at the flip, so the row keeps the
+        scanner's text and category, and the failure is logged with its
+        traceback rather than as a restart at INFO.
 
         The jam keeps pass A's fronts, so this test writes a real PDF into
         ``failed/``; the per-test settings keep it inside ``tmp_path``.
@@ -2606,7 +2600,7 @@ class TestWorkerStopAndSubmit:
         exc_info = failures[0]
         assert exc_info is not None
         assert isinstance(exc_info[1], ScanError)
-        # The jam keeps pass A's fronts (D-10), and this pins where: inside
+        # The jam keeps pass A's fronts, and this pins where: inside
         # this test's own directory, not the suite's shared one.
         preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
         assert len(preserved) == 1
@@ -2619,11 +2613,11 @@ class TestWorkerStopAndSubmit:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        WR-06, D-15: an Abort the operator claimed keeps its own meaning.
+        An Abort the operator claimed keeps its own meaning.
 
         Shutdown has begun, but the operator's Abort claimed the flip answer
         first, so shutdown's own Abort is dropped and the row records the
-        operator's cancel (D-01, D-02) rather than a server restart.
+        operator's cancel rather than a server restart.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
