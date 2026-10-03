@@ -1,23 +1,15 @@
 """
 ``saneless scan --multi-page``: the refusals, the prompt, and how a wait ends.
 
-The command is driven two ways.  End to end, through ``CliRunner`` with the
-real pipeline, a scanner that feeds identifiable pages and an in-memory
-paperless-ngx, so a document's page order can be read back out of the upload.
-And unit by unit, calling ``ClickPassCoordinator.ask`` directly under
-``CliRunner().isolation`` for the parsing, the confirmation and the endings a
-whole run cannot reach on demand.
-
-The terminal policy is the manual-duplex prompt's, in two halves that look
-contradictory and are not.  ``CliRunner`` genuinely is not a terminal, so the
-non-terminal refusal runs with ``_stdin_is_interactive`` unpatched: it is
-telling the truth about its environment.  Every test that needs the prompt
-patches that one seam to ``True``.
-
-The question waits for stdin to become readable before it reads a line, and
-``CliRunner``'s stdin has no descriptor to wait on, so every test here starts
-with that wait reporting stdin readable at once (``tests.prompt_support``).
-A test about the clock, a broken read or Ctrl-C replaces it again.
+Whole runs go through ``CliRunner`` with the real pipeline, a scanner feeding
+identifiable pages and an in-memory paperless-ngx, so page order is read back
+from the upload; ``ClickPassCoordinator.ask`` is called directly for the parsing,
+the confirmation and the endings a run cannot reach on demand.  ``CliRunner`` is
+not a terminal, so the non-terminal refusal runs with ``_stdin_is_interactive``
+unpatched, and every test that needs the prompt patches that one seam to
+``True``.  Every test starts with the question's wait reporting stdin readable
+at once (``tests.prompt_support``), since ``CliRunner``'s stdin has no descriptor
+to wait on; a test about the clock, a broken read or Ctrl-C replaces it again.
 """
 
 from __future__ import annotations
@@ -95,7 +87,7 @@ _EVERY_NEXT_PASS_ANSWER = frozenset(
     {PassAnswer.NEXT, PassAnswer.RESCAN, PassAnswer.FINISH, PassAnswer.ABORT}
 )
 
-# The manual-duplex refusal off a terminal, as it read before --multi-page.
+# The manual-duplex refusal off a terminal, which never mentions --multi-page.
 _MANUAL_DUPLEX_NEEDS_TERMINAL = (
     f"Profile '{DUPLEX_PROFILE}' is manual duplex, which needs an interactive "
     "terminal: saneless must prompt you to flip the stack between the "
@@ -395,7 +387,7 @@ class TestMultiPageRefusals:
     def test_manual_duplex_without_the_flag_is_refused_as_before(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Without --multi-page, manual duplex off a terminal reads as it always did."""
+        """Without --multi-page, manual duplex off a terminal gets its own refusal."""
         run = _scan(tmp_path, monkeypatch, ["--profile", DUPLEX_PROFILE])
 
         assert run.result.exit_code == ExitCode.CONFIG, run.result.output
@@ -806,7 +798,7 @@ class TestClickPassCoordinatorEndings:
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        The manual-duplex prompt's hangup line reads exactly as it always has.
+        The manual-duplex prompt logs a hangup's end of input in its own words.
 
         A signal recorded without raising leaves the question unanswered, so
         it ends as an unanswered wait does, keeping the fronts.
@@ -950,7 +942,8 @@ class TestTypeAheadFlush:
         assert log == ["flush", "wait", "flush", "wait"]
 
 
-# The thread the multi-page question was once read on.  Nothing may start it.
+# The name a thread reading the multi-page question would carry.  Nothing may
+# start it.
 _MULTI_PAGE_PROMPT_THREAD = "saneless-multi-page-prompt"
 
 # The operator wait the confirmation tests run with, in seconds.

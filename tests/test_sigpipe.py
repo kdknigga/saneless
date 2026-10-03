@@ -1,22 +1,15 @@
 """
-Tests for SIGPIPE handling: a dead peer must never kill saneless.
+A dead peer never kills saneless with SIGPIPE.
 
-libsane puts SIGPIPE back to its default action, at the C level and behind
-Python's back, whenever a read ends with an error status -- the end of every
-feeder batch included.  From then on a write to a socket whose peer has gone
-would end the process with no traceback.  saneless blocks the signal at
-startup, so such a write raises ``BrokenPipeError`` instead.
-
-The libsane test runs the risky part in a child process started through
-``saneless.main()``: the pytest process itself must never be left with SIGPIPE
-re-armed, and only the real entry point shows that the startup path applies
-the mask.
-
-The listing test blocks SIGPIPE in its own thread first, because that is the
-state a launching thread in saneless is in, and then checks what the listing
-child started with.  A blocked mask is inherited across fork and exec, so a
-launched program would start with SIGPIPE blocked unless the launcher undoes
-it around the launch.
+libsane puts SIGPIPE back to its default action, behind Python's back, whenever
+a read ends with an error status, the end of every feeder batch included, and a
+write to a socket whose peer has gone would then end the process with no
+traceback.  saneless blocks the signal at startup, so such a write raises
+``BrokenPipeError``; the libsane test runs in a child started through
+``saneless.main()``, so the startup path is the real one and pytest is never left
+with SIGPIPE re-armed.  A blocked mask is inherited across fork and exec, so the
+listing test blocks SIGPIPE first, as a launching thread in saneless has it, and
+checks that the listing child starts with it unblocked.
 """
 
 from __future__ import annotations
