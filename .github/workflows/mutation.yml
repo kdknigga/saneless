@@ -1,0 +1,54 @@
+# SHAs resolved 2026-09-24 via gh api; comments must carry the full version.
+name: Mutation
+
+# Mutation testing asks whether the suite notices a change to the code: each
+# mutant is a small deliberate bug, and a mutant that no test fails on marks
+# a behaviour the suite does not pin down. The run takes far longer than the
+# gate can afford, so it is never a merge gate. It runs weekly and on demand,
+# and no push or pull request starts it.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+# A second run on the same ref waits for the first rather than cancelling it,
+# so a long scheduled run is never thrown away by a manual one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mutation:
+    name: mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install SANE development headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsane-dev
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - run: uv sync --locked
+      # The hand-written mutants under tests/mutants cover what mutmut cannot
+      # generate. mutmut skips every function that carries a decorator other
+      # than staticmethod or classmethod, so the job store's locked methods
+      # get no generated mutants at all; each hand-written mutant re-runs a
+      # named test against a mutated copy of the repository and expects it to
+      # fail. A surviving hand-written mutant fails this step and the job.
+      - name: Hand-written mutants
+        run: uv run env HOME="$(mktemp -d)" pytest --mutants -m mutant
+      # mutmut generates mutants over the modules `[tool.mutmut]` in
+      # pyproject.toml names. It exits 0 when some survive: survivors are
+      # findings to read, not a failure, and the next step lists them.
+      - name: Generated mutants
+        run: uv run env HOME="$(mktemp -d)" mutmut run
+      - name: Surviving mutants
+        run: uv run mutmut results

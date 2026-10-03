@@ -261,6 +261,34 @@ paths filters out every source file, so it can report success having checked not
 A directory left off the list is not checked either, which is why `scripts` is named
 alongside `src` and `tests`. Copy the commands as written, paths included.
 
+## Mutation testing
+
+Mutation testing checks the tests rather than the code: each mutant is a small
+deliberate bug, and a mutant that no test fails on marks a behaviour the suite does
+not pin down. One command runs both kinds of mutant:
+
+```bash
+uv run env HOME="$(mktemp -d)" pytest --mutants -m mutant && uv run mutmut run && uv run mutmut results
+```
+
+The first part runs the hand-written mutants in `tests/mutants/`. Each one copies the
+repository, applies a named edit to the copy and re-runs one test there, which must
+fail. They are deselected unless pytest is given `--mutants`, so a plain test run
+never pays for them, and a surviving one fails the command. `mutmut run` then
+generates mutants over the modules listed under `[tool.mutmut]` in `pyproject.toml`
+and exits 0 even when some survive. `mutmut results` lists the survivors, which are
+findings to read rather than a failure.
+
+mutmut has a blind spot: it never mutates a function that carries a decorator other
+than `staticmethod` or `classmethod`. The job store's locked methods are all
+decorated, so they get no generated mutants at all, and the hand-written mutants are
+there to cover them.
+
+The run takes far longer than the CI gate can afford, so it is not part of it.
+`.github/workflows/mutation.yml` runs the same three steps weekly and whenever it is
+started by hand from the Actions tab. No push or pull request starts it, and it never
+blocks a merge.
+
 ## `--no-verify` no longer skips the gate
 
 The hooks are installed as a convenience, not as the enforcement point. Committing
