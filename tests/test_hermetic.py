@@ -11,6 +11,7 @@ autouse fixture that loosens it fails here, not silently.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -38,6 +39,20 @@ _XDG_BASES = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_H
 
 # Test data: the shared temp directory no test module may name.
 _FIXED_TEMP_NAME = "saneless-test"
+
+# The poisoned environment's names, each aimed at a documentation address,
+# besides SSL_CERT_FILE, which names a bundle holding no certificate. Each
+# one changes a verdict when the suite fails to clear it: the proxy carries
+# every plain-http request the loopback clients make, and the session
+# snapshot below sees the rest.
+_POISONS = {
+    "SANE_NET_HOSTS": "192.0.2.1",
+    "saneless_paperless__url": "http://192.0.2.1:8000",
+    "HTTP_PROXY": "http://192.0.2.1:3128",
+}
+
+# The child run's summary line when every selected test ran and passed.
+_ALL_PASSED = re.compile(r"^(?P<passed>[0-9]+) passed in [0-9.]+s", re.MULTILINE)
 
 
 def test_home_is_neither_the_real_home_nor_in_the_repository() -> None:
@@ -299,14 +314,45 @@ def test_the_marker_keeps_the_real_paperless_transport() -> None:
         listener.close()
 
 
+@pytest.fixture(scope="session")
+def environment_before_any_test_body() -> frozenset[str]:
+    """
+    Record the environment's names as session-scoped fixtures see it.
+
+    A session fixture runs before any function-scoped fixture clears a
+    variable for one test, so it sees only what the session-wide clearing
+    left.
+
+    Returns:
+        The names present at the time.
+
+    """
+    return frozenset(os.environ)
+
+
+def test_session_fixtures_see_none_of_the_poisons(
+    environment_before_any_test_body: frozenset[str],
+) -> None:
+    """
+    No poisoned variable is visible to a session-scoped fixture.
+
+    The browser suite's server starts at session scope, before any per-test
+    fixture runs, so the session-wide clearing is all that keeps an exported
+    variable away from it.
+    """
+    poisons = {"SSL_CERT_FILE", *_POISONS}
+    assert not poisons & environment_before_any_test_body
+
+
 def test_a_poisoned_environment_changes_no_verdict(tmp_path: Path) -> None:
     """
-    Config, TLS, SANE host and web tests pass under a poisoned environment.
+    Config, TLS, SANE host, Paperless and web scan tests pass when poisoned.
 
     The child run exports a CA bundle that holds no certificate, a SANE host
     list, a Paperless URL in the lower-case spelling settings accept, and a
-    proxy, all aimed at a documentation address. The suite clears them before
-    any test runs, so not one verdict changes.
+    plain-http proxy, all aimed at a documentation address. The suite clears
+    them before any test runs, so every selected test runs and passes; a
+    skipped, failed or missing test fails this check.
     """
     bundle = tmp_path / "bogus-ca.pem"
     bundle.write_text("this is not a certificate\n", encoding="utf-8")
@@ -315,6 +361,7 @@ def test_a_poisoned_environment_changes_no_verdict(tmp_path: Path) -> None:
             "/bin/sh",
             "-c",
             'exec "$SANELESS_TEST_PYTHON" -m pytest -p no:cacheprovider -q'
+            " tests/test_hermetic.py::test_session_fixtures_see_none_of_the_poisons"
             " tests/test_config.py::TestConfigSources"
             " tests/test_config.py::TestPaperlessTokenAndUrlAtLoad"
             " tests/test_paperless.py::TestLoopbackClientSideProtocolErrors"
@@ -322,20 +369,21 @@ def test_a_poisoned_environment_changes_no_verdict(tmp_path: Path) -> None:
             " tests/test_net_hosts.py"
             " tests/test_checks.py::TestScannerCheck"
             " tests/test_cli.py::TestServeCommand"
-            " tests/test_web.py::TestOwnerCookie",
+            " tests/test_web.py::TestOwnerCookie"
+            " tests/test_golden_e2e.py::test_web_polls_once_and_stores_the_outcome",
         ],
         cwd=_REPOSITORY,
         env={
             **os.environ,
             "SANELESS_TEST_PYTHON": sys.executable,
             "SSL_CERT_FILE": str(bundle),
-            "SANE_NET_HOSTS": "192.0.2.1",
-            "saneless_paperless__url": "http://192.0.2.1:8000",
-            "HTTPS_PROXY": "http://192.0.2.1:3128",
+            **_POISONS,
         },
         capture_output=True,
         text=True,
         check=False,
         timeout=600,
     )
-    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+    shown = result.stdout[-4000:] + result.stderr[-2000:]
+    assert result.returncode == 0, shown
+    assert _ALL_PASSED.search(result.stdout), shown
