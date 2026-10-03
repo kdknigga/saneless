@@ -5652,7 +5652,8 @@ class TestScannerCheckAgainstAFakeSaned:
         A second host refusing the connection does not keep SANE out.
 
         Both entries use the default port, which is pointed at the fake.  The
-        fake listens on 127.0.0.1 only, so the same port on 127.0.0.2 refuses.
+        fake listens on 127.0.0.1 only, and the same port on 127.0.0.2 is held
+        bound but not listening, so the kernel refuses it.
 
         Args:
             tmp_path: The test's own directory.
@@ -5661,7 +5662,11 @@ class TestScannerCheckAgainstAFakeSaned:
 
         """
         caplog.set_level(logging.DEBUG)
-        with fake_saned(SanedBehaviour.HEALTHY) as fake:
+        with (
+            fake_saned(SanedBehaviour.HEALTHY) as fake,
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as refusing,
+        ):
+            refusing.bind(("127.0.0.2", fake.port))
             monkeypatch.setattr(checks, "SANED_PORT", fake.port)
             settings = _with_device(
                 _healthy_settings(tmp_path, host="127.0.0.1:127.0.0.2"), ""
