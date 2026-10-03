@@ -4269,8 +4269,8 @@ def _degrade(worker: ScanWorker, store: JobStore) -> list[Job]:
     """
     Drive a started worker whose every job raises a store error into DEGRADED.
 
-    ``_DEGRADING_JOBS`` jobs make that many loop-level failures in a row
-    (D-10).  Degraded is set before the guard's write for the last job, so a
+    ``_DEGRADING_JOBS`` jobs make that many loop-level failures in a row.
+    Degraded is set before the guard's write for the last job, so a
     caller that heals the store right away may see that one row written by
     the guard rather than by recovery -- with the same text either way.
 
@@ -4287,13 +4287,13 @@ class TestWorkerDegradedHealth:
     """
     The worker reports HEALTHY, DEGRADED or DOWN, and heals on its own.
 
-    D-10: three consecutive loop-level failures -- the loop's own job store
+    Three consecutive loop-level failures -- the loop's own job store
     writes raising -- make the worker DEGRADED while its thread stays alive.
-    D-11: a degraded worker rejects scans with ``SubmitResult.DEGRADED``, so
-    nobody feeds paper into a job that cannot be recorded.  D-12: each idle
-    tick while degraded probes the store; the first success clears DEGRADED
-    with no scan needed.  Research Pitfall 6: that recovery also ends rows the
-    guard could not end, using only the texts that already exist.
+    A degraded worker rejects scans with ``SubmitResult.DEGRADED``, so
+    nobody feeds paper into a job that cannot be recorded.  Each idle tick
+    while degraded probes the store; the first success clears DEGRADED with
+    no scan needed, and also ends rows the guard could not end, using only
+    the texts that already exist.
     """
 
     def test_health_is_down_unless_the_thread_runs_not_degraded(
@@ -4323,7 +4323,7 @@ class TestWorkerDegradedHealth:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-10, D-11: degraded after three store failures, alive, and rejecting."""
+        """Three store failures in a row make a live worker DEGRADED and rejecting."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
@@ -4354,7 +4354,7 @@ class TestWorkerDegradedHealth:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-10: two failures, a success, two failures -- still HEALTHY."""
+        """Two failures, a success, two failures -- the worker is still HEALTHY."""
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
@@ -4392,7 +4392,7 @@ class TestWorkerDegradedHealth:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-12: a failing probe keeps DEGRADED; the first success heals it."""
+        """A failing probe keeps DEGRADED; the first success heals it."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
@@ -4483,7 +4483,7 @@ class TestWorkerDegradedHealth:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        Research Pitfall 6: a row the guard could not end is ended on recovery.
+        A row the guard could not end is ended on recovery.
 
         Both the job's handling and the guard's ERROR write raise, so the rows
         stay PENDING through degraded.  The first successful probe writes the
@@ -4526,7 +4526,7 @@ class TestWorkerDegradedHealth:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        D-13, research Open Question 1: a failed startup recovery starts degraded.
+        A failed startup recovery starts the worker degraded.
 
         The first successful probe fails the row the crashed process left
         SCANNING with ``RESTART_REASON``, then reports HEALTHY.
@@ -4685,7 +4685,7 @@ class TestWorkerDegradedHealth:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-12: probing is the degraded worker's business only."""
+        """Only a degraded worker probes the store."""
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
         probes = _StoreFault(store.probe, frozenset())
@@ -4695,7 +4695,7 @@ class TestWorkerDegradedHealth:
         try:
             worker.start()
             # A window in which nothing may happen, measured in idle ticks the
-            # worker actually took rather than in wall time (IN-03).
+            # worker actually took rather than in wall time.
             ticked = poll_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
             health = worker.health
         finally:
@@ -4713,13 +4713,13 @@ _PROFILE_LOCK_ROUNDS = 200
 
 class TestWorkerProfileLock:
     """
-    Every read and update of the worker's profiles goes through one lock (D-19).
+    Every read and update of the worker's profiles goes through one lock.
 
-    Request threads (the index dropdown, ROBU-08's unknown-profile check) and
-    the worker's own lookup read the profiles while the worker may be replacing
-    them.  Once routes run on the threadpool (ROBU-05) that is real
-    concurrency, so reads are locked and updates rebind a new dict rather than
-    mutating the one a reader may hold.
+    Request threads (the index dropdown, the unknown-profile check) and the
+    worker's own lookup read the profiles while the worker may be replacing
+    them.  Routes run on the threadpool, so that is real concurrency: reads
+    are locked and updates rebind a new dict rather than mutating the one a
+    reader may hold.
     """
 
     def test_profile_lock_names_are_a_copy_in_insertion_order(
@@ -4728,7 +4728,7 @@ class TestWorkerProfileLock:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """D-19: profile_names() is a snapshot the caller cannot use to mutate."""
+        """profile_names() is a snapshot the caller cannot use to mutate."""
         default_settings.profiles["flatbed"] = ProfileConfig(source="Flatbed")
         store = JobStore()
         try:
@@ -4748,7 +4748,7 @@ class TestWorkerProfileLock:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """D-19: get_profile returns the configured profile, or None."""
+        """get_profile returns the configured profile, or None."""
         store = JobStore()
         try:
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -4767,7 +4767,7 @@ class TestWorkerProfileLock:
         default_settings: Settings,
     ) -> None:
         """
-        D-19: an update replaces the mapping; the old dict is left untouched.
+        An update replaces the mapping; the old dict is left untouched.
 
         A reader holding the old dict without the lock -- ``run_pipeline`` on
         the worker thread -- therefore keeps a consistent view.
@@ -4799,7 +4799,7 @@ class TestWorkerProfileLock:
         default_settings: Settings,
     ) -> None:
         """
-        IN-01, D-19: ``only_if`` runs under the lock and can refuse the swap.
+        ``only_if`` runs under the lock and can refuse the swap.
 
         Startup generation swaps through this helper with ``is_bare_default``,
         so the refusal below is the production re-check.
@@ -4892,7 +4892,7 @@ class TestWorkerProfileLock:
         default_settings: Settings,
     ) -> None:
         """
-        D-19 / ROBU-05: concurrent readers and a writer never collide.
+        Concurrent readers and a writer never collide.
 
         Four readers iterate the names and look each one up while a writer
         swaps between two profile sets.  No thread may raise, and every name
@@ -4954,7 +4954,7 @@ class TestWorkerProfileLock:
 
 
 class TestScanWorkerQueuing:
-    """Worker sequential queuing tests."""
+    """The worker processes queued jobs one after another."""
 
     def test_jobs_processed_sequentially(
         self,
@@ -4963,7 +4963,7 @@ class TestScanWorkerQueuing:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Two submitted jobs are both processed to DONE (SCAN-11)."""
+        """Two submitted jobs are both processed to DONE."""
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
             lambda *_args, **_kwargs: _success_result(),
@@ -4991,14 +4991,12 @@ class TestScanWorkerQueuing:
 
 class TestStartupProfileGeneration:
     """
-    Auto-profile generation is the worker thread's first act (D-14, M-04).
+    Auto-profile generation is the worker thread's first act.
 
-    It used to run inside the first job, write to a path re-derived from the
-    working directory rather than the file ``--config`` loaded, and mutate the
-    profiles from the worker thread with no lock.  Now it runs once per start
-    (D-15), persists only to ``settings.config_path`` (D-16), keeps the profiles
-    in memory when there is no loaded file (D-17) or it cannot be written
-    (D-18), and swaps them in under the profile lock (D-19).
+    It runs once per start, persists only to ``settings.config_path`` (the
+    file ``--config`` loaded, never a path re-derived from the working
+    directory), keeps the profiles in memory when there is no loaded file or
+    it cannot be written, and swaps them in under the profile lock.
     """
 
     @staticmethod
@@ -5033,7 +5031,7 @@ class TestStartupProfileGeneration:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """D-14 / D-16: generated profiles land in memory and in the loaded file."""
+        """Generated profiles land in memory and in the loaded file."""
         caps = self._mock_caps_scanner(mock_scanner)
         expected = generate_profiles(caps)
         config_file = tmp_path / "saneless.toml"
@@ -5065,7 +5063,7 @@ class TestStartupProfileGeneration:
         tmp_path: Path,
     ) -> None:
         """
-        WR-03: memory keeps the ``default`` a restart will load from the file.
+        Memory keeps the ``default`` a restart will load from the file.
 
         The file spells out a bare ``[profiles.default]``, so the write skips
         ``default``.  Memory must keep that loaded ``default`` rather than the
@@ -5158,7 +5156,7 @@ class TestStartupProfileGeneration:
         self, tmp_path: Path
     ) -> None:
         """
-        WR-03 / D-01: a name the write did not persist keeps its loaded profile.
+        A name the write did not persist keeps its loaded profile.
 
         The worker never forces, so a flagged file profile is skipped as
         existing and an unflagged one as not generated; in both cases memory
@@ -5191,7 +5189,7 @@ class TestStartupProfileGeneration:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-04: the startup INFO line uses the CLI's group vocabulary."""
+        """The startup INFO line uses the CLI's group vocabulary."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
@@ -5227,7 +5225,7 @@ class TestStartupProfileGeneration:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        D-17 / T-26-32: no loaded file means memory only, and no file anywhere.
+        No loaded file means memory only, and no file anywhere.
 
         The working directory and HOME both point into ``tmp_path``, so a write
         to any re-derived location -- ``./saneless.toml`` or the XDG path --
@@ -5270,7 +5268,7 @@ class TestStartupProfileGeneration:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-18: an OSError writing the loaded file keeps the profiles in memory."""
+        """An OSError writing the loaded file keeps the profiles in memory."""
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
         config_file.write_text("# read-only\n")
@@ -5314,7 +5312,7 @@ class TestStartupProfileGeneration:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-18: a ConfigError from the write is handled like an OSError."""
+        """A ConfigError from the write is handled like an OSError."""
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
         config_file.write_text("profiles = 1\n")
@@ -5348,11 +5346,11 @@ class TestStartupProfileGeneration:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        D-08: a single-file bind mount is a logged ConfigError, not a lost set.
+        A single-file bind mount is a logged ConfigError, not a lost set.
 
         The kernel refuses to rename over a bind-mount point with EBUSY; the
-        atomic write reports it as a ConfigError, and the worker's existing
-        branch keeps the generated profiles for this run (Phase 26 D-18).
+        atomic write reports it as a ConfigError, and the worker keeps the
+        generated profiles for this run.
         """
         caps = self._mock_caps_scanner(mock_scanner)
         expected = generate_profiles(caps)
@@ -5392,7 +5390,7 @@ class TestStartupProfileGeneration:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-05: a non-UTF-8 file is refused as a ConfigError and left alone."""
+        """A non-UTF-8 file is refused as a ConfigError and left alone."""
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
         contents = b"\xff\xfe not utf-8\n"
@@ -5425,7 +5423,7 @@ class TestStartupProfileGeneration:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-12: an unparseable file is refused as a ConfigError and left alone."""
+        """An unparseable file is refused as a ConfigError and left alone."""
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
         contents = b"[profiles\n"
@@ -5460,12 +5458,11 @@ class TestStartupProfileGeneration:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        WR-04, D-18: an exception outside OSError and ConfigError keeps them too.
+        An exception outside OSError and ConfigError keeps them too.
 
-        Neither a non-UTF-8 file (D-05) nor an unparseable one (D-12) reaches
-        this handler any more, so the write is patched to raise an unexpected
-        class. The generated profiles must still be used in memory, with a
-        WARNING that names the exception class.
+        Non-UTF-8 and unparseable files are ConfigErrors, so the write is
+        patched to raise an unexpected class.  The generated profiles are
+        still used in memory, with a WARNING that names the exception class.
         """
         exception_name = "TypeError"
 
@@ -5512,10 +5509,10 @@ class TestStartupProfileGeneration:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        D-15 / T-26-34: the WARNING names the real exception, not a guessed cause.
+        The WARNING names the real exception, not a guessed cause.
 
-        The old message called every failure an unreachable scanner, which sent
-        operators hunting network faults for what was often a parsing error.
+        Calling every failure an unreachable scanner would send operators
+        hunting network faults for what is often a parsing error.
         """
         mock_scanner.get_devices.side_effect = ScanError("boom")
 
@@ -5536,7 +5533,7 @@ class TestStartupProfileGeneration:
         assert warned
         assert alive
         assert names == ["default"]
-        # Broader than the retired wording: no guess about reachability at all.
+        # No guess about reachability at all.
         assert "unreachable" not in caplog.text
 
     def test_startup_generation_no_scanners_keeps_the_bare_default(
@@ -5546,7 +5543,7 @@ class TestStartupProfileGeneration:
         default_settings: Settings,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """D-15: no devices found keeps the bare default with a WARNING."""
+        """No devices found keeps the bare default with a WARNING."""
         mock_scanner.get_devices.return_value = []
 
         store = JobStore()
@@ -5607,7 +5604,7 @@ class TestStartupProfileGeneration:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-15: three jobs later the scanner has still been asked only once."""
+        """Three jobs later the scanner has still been asked only once."""
         self._mock_caps_scanner(mock_scanner)
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
@@ -5638,7 +5635,7 @@ class TestStartupProfileGeneration:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        D-14: a job submitted during generation waits, then sees the new profiles.
+        A job submitted during generation waits, then sees the new profiles.
 
         ``get_capabilities`` is held on an event.  While it is held the job
         stays PENDING and the pipeline has not run; once released, the job's
@@ -5702,14 +5699,12 @@ class TestStartupProfileGeneration:
 
 class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
     """
-    The worker's "no config file was loaded" line is a fifth description of one fact.
+    The worker's "no config file was loaded" line agrees with what the search found.
 
     The startup log, the Configuration row, ``doctor``'s table and the
-    one-shot warning all read ``config_file_state``.  This message was written
-    before any of them and says "create one of <three paths>" whatever the
-    search found -- so on the machine that started this phase it would have
-    told an operator to create a ``saneless.toml`` while a ``config.toml``
-    sat in the very directory it was naming, and never mentioned it.
+    one-shot warning all describe the same search.  When it found only a
+    stale file, this line names that file and the rename it needs --
+    ``config.toml`` to ``saneless.toml`` -- rather than only saying to create one.
 
     It is exercised through ``_persist_generated_profiles`` directly rather
     than through a started worker, because the branch is reached before
@@ -5747,7 +5742,7 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The reason nothing loaded is the file the message used to leave out."""
+        """A stale-only search names the ignored file and the name to rename it to."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         directory = tmp_path / "etc"
         directory.mkdir()
@@ -5773,7 +5768,7 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """With nothing stale there is nothing to rename, so the advice is unchanged."""
+        """With nothing stale, the message lists every path searched and no rename."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         candidates = tuple(
             tmp_path / name / CONFIG_FILENAME for name in ("cwd", "xdg", "etc")
@@ -5934,7 +5929,7 @@ class TestWorkerEnumDispatch:
 
             # The states applied are exactly the in-flight ones, in the order
             # the events were emitted.  SCANNING_REVERSE is persisted as its own
-            # busy state, so pass B takes the job out of AWAITING_FLIP (DPLX-06).
+            # busy state, so pass B takes the job out of AWAITING_FLIP.
             # DONE (terminal) contributes nothing.  SCANNING comes first, and
             # from here: the worker writes nothing before the pipeline, whose
             # first event is announced only once the scanner gate is held.
@@ -5952,11 +5947,11 @@ class TestWorkerEnumDispatch:
             ]
             assert states_seen.count(JobState.SCANNING) == 1
 
-            # DONE is still written by the worker, after run_pipeline returned
-            # -- but through finish_job now, not update_state.  update_state's
-            # SQL is an unconditional SET that never names the six result
-            # columns (D-04), so the terminal write cannot go through it
-            # without blanking the outcome and page counts it just recorded.
+            # DONE is written by the worker, after run_pipeline returned, through
+            # finish_job rather than update_state.  update_state's SQL is an
+            # unconditional SET that never names the six result columns, so
+            # the terminal write cannot go through it without blanking the
+            # outcome and page counts it just recorded.
             assert JobState.DONE not in states_seen
             assert finished_states == [JobState.DONE]
         finally:
@@ -5970,10 +5965,10 @@ class TestWorkerEnumDispatch:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        D-13: a completed job is not followed by a prune.
+        A completed job is not followed by a prune.
 
         Prune runs on the idle tick instead, so a prune failure can never fail
-        a job (ROBU-01).  The prune interval stays at its hourly default, and
+        a job.  The prune interval stays at its hourly default, and
         stop() joins the thread, so the job's ``finally`` has run before the
         spy is read.
         """
@@ -6038,8 +6033,8 @@ class TestWorkerFinish:
     """The worker consumes the pipeline's ScanResult instead of discarding it."""
 
     # Every assertion here reads the persisted row back through the store
-    # rather than inspecting mock call arguments.  The bug being fixed was a
-    # discarded return value, and only the row proves it was consumed.
+    # rather than inspecting mock call arguments: only the row proves the
+    # pipeline's return value was consumed rather than discarded.
 
     def test_finish_passes_the_job_id_into_the_pipeline_request(
         self,
@@ -6048,7 +6043,7 @@ class TestWorkerFinish:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The assembled PDF is named from this job's id (OUTC-05)."""
+        """The assembled PDF is named from this job's id."""
         store = JobStore()
         captured: list[PipelineRequest] = []
 
@@ -6083,7 +6078,7 @@ class TestWorkerFinish:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A SUCCESS outcome becomes DONE, with its counts (OUTC-01)."""
+        """A SUCCESS outcome becomes DONE, with its counts."""
         store = JobStore()
         try:
             monkeypatch.setattr(
@@ -6115,7 +6110,7 @@ class TestWorkerFinish:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A FALLBACK outcome becomes FALLBACK, never DONE (OUTC-02)."""
+        """A FALLBACK outcome becomes FALLBACK, never DONE."""
         store = JobStore()
         try:
             monkeypatch.setattr(
@@ -6215,7 +6210,7 @@ class TestWorkerFinish:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A mismatch warning survives alongside a SUCCESS outcome (OUTC-03)."""
+        """A mismatch warning survives alongside a SUCCESS outcome."""
         store = JobStore()
         try:
             monkeypatch.setattr(
@@ -6246,7 +6241,7 @@ class TestWorkerFinish:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A raising pipeline records ERROR and records no counts (OUTC-01)."""
+        """A raising pipeline records ERROR and records no counts."""
         store = JobStore()
 
         def failing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
@@ -6267,7 +6262,7 @@ class TestWorkerFinish:
             assert finished.error == "Paperless said no"
             assert finished.error_category is ErrorCategory.UPLOAD
             # NULL, not 0.  A job that failed before the scanner opened has
-            # not measured zero pages (Phase 22 D-08).
+            # not measured zero pages.
             assert finished.outcome is None
             assert finished.warning is None
             assert finished.pages_scanned is None
@@ -6284,11 +6279,11 @@ class TestWorkerFinish:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        A UI poller is released on FALLBACK as it is on DONE (OUTC-02).
+        A UI poller is released on FALLBACK as it is on DONE.
 
         The web UI learns a job has ended only by re-reading its row, and stops
-        polling once that row is no longer active.  So the row is what this
-        waits on -- there is no worker-side signal to wait for any more.
+        polling once that row is not active.  So the row is what this waits
+        on; the worker has no separate end-of-job signal.
         """
         store = JobStore()
         try:
@@ -6319,8 +6314,8 @@ class TestWorkerFinish:
         """
         The ``finally`` still clears the current job on FALLBACK, and prunes nothing.
 
-        STOR-05's history bound is kept by the idle-tick prune now (D-13), so
-        the terminal path of any outcome makes no prune call.
+        The job history bound is kept by the idle-tick prune, so the terminal
+        path of any outcome makes no prune call.
         """
         store = JobStore()
         prune_spy = _StoreFault(store.prune, frozenset())
@@ -6419,14 +6414,13 @@ class TestWorkerJobEndings:
     """
     A job ends by shutdown, by cancel, or by failure: three explicit branches.
 
-    D-01: a ``ScanCancelledError`` is recorded ``CANCELLED`` with its message
-    and no category.  N-08: a cancel is not a failure, so it is logged once at
-    INFO with no traceback.  EXC-05: every other failure is recorded ERROR with
-    its category and logged at ERROR with ``exc_info``, so the operator can
-    find the cause.  A server stop reaches the worker as
-    ``ScanInterrupted``, its own ending, and is recorded as a restart followed
-    by whatever the pipeline kept.  Phase 26 D-10: job endings never count
-    toward degraded health.
+    A ``ScanCancelledError`` is recorded ``CANCELLED`` with its message and
+    no category.  A cancel is not a failure, so it is logged once at INFO with
+    no traceback.  Every other failure is recorded ERROR with its category and
+    logged at ERROR with ``exc_info``, so the operator can find the cause.  A
+    server stop reaches the worker as ``ScanInterrupted``, its own ending, and
+    is recorded as a restart followed by whatever the pipeline kept.  Job
+    endings never count toward degraded health.
     """
 
     def test_a_cancel_is_recorded_cancelled_without_a_category(
@@ -6434,7 +6428,7 @@ class TestWorkerJobEndings:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-01: a ScanCancelledError ends the job CANCELLED, not ERROR."""
+        """A ScanCancelledError ends the job CANCELLED, not ERROR."""
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
             _raising_pipeline(ScanCancelledError(_CANCEL_MESSAGE)),
@@ -6452,7 +6446,7 @@ class TestWorkerJobEndings:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """N-08: a cancel logs one INFO line, no traceback and no ERROR."""
+        """A cancel logs one INFO line, no traceback and no ERROR."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
@@ -6474,7 +6468,7 @@ class TestWorkerJobEndings:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """EXC-05: a scanner failure is ERROR, SCANNER, logged with its traceback."""
+        """A scanner failure is ERROR, SCANNER, logged with its traceback."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         message = "Paper jam"
         error = ScanError(message)
@@ -6507,7 +6501,7 @@ class TestWorkerJobEndings:
         caplog: pytest.LogCaptureFixture,
         failure: tuple[type[Exception], ErrorCategory],
     ) -> None:
-        """EXC-05: classified or unknown, a failure carries its traceback."""
+        """Classified or unknown, a failure carries its traceback."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         error_type, category = failure
         message = f"{error_type.__name__} ended the job"
@@ -6537,10 +6531,6 @@ class TestWorkerJobEndings:
         preservation's sentence as a note.  It is not an ``Exception``, so the
         worker catches it by name: ERROR with the restart reason and the note,
         no category, one INFO line and no traceback, because nothing failed.
-
-        This replaces a test that pinned the old path, where the stop answered
-        the flip with Abort and the worker had to tell that Abort from the
-        operator's by a marker on the coordinator.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         note = "The 1 page(s) scanned before the error were preserved at /x.pdf"
@@ -6768,7 +6758,7 @@ class TestWorkerJobEndings:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Phase 26 D-10: cancels in a row are job endings, not loop failures."""
+        """Cancels in a row are job endings, not loop failures."""
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
             _raising_pipeline(ScanCancelledError(_CANCEL_MESSAGE)),
@@ -6809,7 +6799,7 @@ class _CountedPassScanner(StubScannerBackend):
 
     Concrete rather than a ``MagicMock``, like every other fake here, and
     inheriting ``get_devices() -> []`` from ``StubScannerBackend`` so startup
-    profile generation (D-14) leaves these tests' settings alone.
+    profile generation leaves these tests' settings alone.
 
     Attributes:
         release_pass_b: Set by the test to let pass B return.
@@ -6915,13 +6905,13 @@ def _run_duplex_job(worker: ScanWorker, store: JobStore, title: str) -> Job:
 
 class TestFrontPages:
     """
-    ``ScanWorker.front_pages`` carries pass A's count out of a running job (D-33).
+    ``ScanWorker.front_pages`` carries pass A's count out of a running job.
 
     The status area renders from the job row, and the row has no column for
-    this: CONTEXT forbids a schema migration, and the number is wanted only
-    while one specific job is in ``SCANNING_REVERSE``.  So it lives on the
-    worker beside ``current_job_id``, is written by the pipeline's pass-count
-    callback, and is cleared however the job ends.
+    this: the number is wanted only while one specific job is in
+    ``SCANNING_REVERSE``, which does not justify a schema migration.  So it
+    lives on the worker beside ``current_job_id``, is written by the
+    pipeline's pass-count callback, and is cleared however the job ends.
     """
 
     def test_a_fresh_worker_reports_front_pages_as_none(
@@ -6972,7 +6962,7 @@ class TestFrontPages:
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
     ) -> None:
-        """D-33: SCANNING_REVERSE is exactly when the strip wants the number."""
+        """SCANNING_REVERSE is exactly when the strip wants the number."""
         scanner = _CountedPassScanner(fronts=4, backs=4)
         store = JobStore()
         worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
@@ -7145,7 +7135,7 @@ class _GatedProfileScanner(StubScannerBackend):
     """
     A scanner whose startup ``get_devices`` waits for the test to release it.
 
-    Startup profile generation is the worker thread's first act (D-14) and it
+    Startup profile generation is the worker thread's first act and it
     enters SANE twice, so it is the second place the gate has to be held.
     Holding enumeration open turns that into a state the test can observe.
 
@@ -7178,7 +7168,7 @@ class _GatedProfileScanner(StubScannerBackend):
 
 class TestScannerGate:
     """
-    ``ScanWorker.scanner_gate`` is real mutual exclusion on SANE (D-08).
+    ``ScanWorker.scanner_gate`` is real mutual exclusion on SANE.
 
     Nothing in ``scanner/sane_backend.py`` excludes two concurrent SANE calls:
     ``_refuse_if_wedged`` fires on a *stuck* read rather than a running one,
@@ -7186,7 +7176,7 @@ class TestScannerGate:
     ``current_job_id is None`` test has a genuine race -- read ``None``, enter
     ``get_devices()``, and the worker starts a job a microsecond later -- and
     on the ``net`` backend losing that race is a second RPC on the control
-    wire a scan is using, not merely a slow probe (Pitfall 2).
+    wire a scan is using, not merely a slow probe.
     """
 
     def test_scanner_gate_is_free_on_an_idle_worker(
@@ -7307,12 +7297,12 @@ class TestScannerGate:
         default_settings: Settings,
     ) -> None:
         """
-        D-14's first act enters SANE twice, so it is gated too.
+        Startup generation enters SANE twice, so it is gated too.
 
         ``_read_generated_profiles`` calls ``get_devices`` and then
         ``get_capabilities``; on the ``net`` backend the first is an RPC and
         the second opens the device.  A refresher probe landing in that window
-        would be exactly the concurrency Pitfall 2 describes.
+        would be a second RPC on the control wire the read is using.
         """
         scanner = _GatedProfileScanner()
         store = JobStore()
@@ -7857,15 +7847,14 @@ class TestScanningWaitsForTheGate:
 
 class TestProfileStorage:
     """
-    ``ScanWorker.profile_storage`` records what the startup persist did (A-2).
+    ``ScanWorker.profile_storage`` records what the startup persist did.
 
     ``_persist_generated_profiles`` returns ``None`` for two genuinely
     different situations -- no config file was loaded at all, and one was
-    loaded and could not be written -- and used to keep no record of which.
-    D-22's Profiles row has to tell a household member which happened, and a
-    fresh ``os.access()`` probe at check time cannot: Phase 27 D-09's
-    motivating failure is EBUSY on a single-file bind mount, where the
-    directory is writable and only the rename fails.
+    loaded and could not be written.  The Profiles row has to tell a
+    household member which happened, and a fresh ``os.access()`` probe at
+    check time cannot: on a single-file bind mount the directory is writable
+    and only the rename fails, with EBUSY.
     """
 
     @staticmethod
@@ -7944,7 +7933,7 @@ class TestProfileStorage:
         mock_scanner: MagicMock,
         worker_for: Callable[[JobStore], ScanWorker],
     ) -> None:
-        """D-17: nothing to write to is not the same as cannot write."""
+        """Nothing to write to is not the same as cannot write."""
         self._caps_scanner(mock_scanner)
         store = JobStore()
         worker = worker_for(store)
@@ -7970,7 +7959,7 @@ class TestProfileStorage:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-18: a loaded file that will not take the write is the amber case."""
+        """A loaded file that will not take the write is the amber case."""
         self._caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
         config_file.write_text("# read-only\n")
@@ -8012,7 +8001,7 @@ class TestProfileStorage:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        WR-04's catch-all branch records the same outcome as the OSError one.
+        The catch-all branch records the same outcome as the OSError one.
 
         Two branches, one truth: whatever went wrong, a file was loaded and the
         profiles did not reach it.
@@ -8077,13 +8066,13 @@ class TestProfileStorage:
         tmp_path: Path,
     ) -> None:
         """
-        CR-01: the production shape reported a permanent falsehood.
+        Profiles loaded from a file that skip generation are reported persisted.
 
         An operator with a real config file holding profiles that are not the
-        bare default never reaches a branch that records the storage outcome --
-        ``_generate_startup_profiles`` returns at ``if not bare``. The seed said
-        no config file was in use, for the life of the process, on the one
-        deployment shape the compose file ships.
+        bare default never reaches the write -- ``_generate_startup_profiles``
+        returns at ``if not bare`` -- yet the profiles are on disk.  This is the
+        deployment shape the compose file ships, so a "no config file" answer
+        here would be wrong for the life of the process.
         """
         self._caps_scanner(mock_scanner)
         self._second_profile(default_settings)
@@ -8137,7 +8126,7 @@ class TestProfileStorage:
         tmp_path: Path,
     ) -> None:
         """
-        D-15: a SANE failure leaves the loaded profiles exactly where they were.
+        A SANE failure leaves the loaded profiles exactly where they were.
 
         The autouse fixture answers ``get_devices`` with ``[]``, so
         ``_read_generated_profiles`` returns ``None`` and generation gives up.
@@ -8191,11 +8180,11 @@ class TestProfileStorage:
         tmp_path: Path,
     ) -> None:
         """
-        D-02 is about the words, so assert the rendered row, not just the enum.
+        The rendered Profiles row is green for profiles held in a config file.
 
-        The amber row CR-01 produced told a household member to create a
-        configuration file they already had. Asserting the enum alone would not
-        have caught that the sentence was false.
+        The row's words are what a household member reads; an amber row here
+        would tell them to create a configuration file they already have, which
+        the enum alone cannot show.
         """
         self._caps_scanner(mock_scanner)
         self._second_profile(default_settings)
@@ -8366,9 +8355,9 @@ class TestProgressWriteFailures:
     A failed progress write to the job store never changes how a scan ends.
 
     The thumbnail and the active-state writes only tell observers how far a
-    scan has got.  A locked or failing job database during one of them used to
-    abort the run, file the store's error as a scanner fault and, outside the
-    pipeline's guard windows, delete the spooled pages.  Each test here runs
+    scan has got, so a locked or failing job database during one of them must
+    not abort the run, file the store's error as a scanner fault or delete the
+    spooled pages.  Each test here runs
     the real pipeline over a manual-duplex job, so the spool, the flip wait and
     the assembly are all real; only the scanner and Paperless are fakes.
     """
