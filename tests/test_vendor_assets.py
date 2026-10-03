@@ -21,6 +21,10 @@ import re
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, override
 
+import jinja2
+import pytest
+from jinja2 import nodes
+
 from saneless.web.app import STATIC_DIR, TEMPLATE_DIR
 from tests.template_support import template_markup, template_start_tags
 
@@ -131,6 +135,20 @@ class _TextCollector(HTMLParser):
         self.chunks.append(data)
 
 
+def _jinja_strings(source: str) -> list[str]:
+    """
+    Return every string constant written inside a template's Jinja syntax.
+
+    ``template_markup`` drops Jinja expressions and statements, string
+    literals included, so a URL held in ``{% set %}`` or ``{{ '...' }}`` is
+    only visible here.
+    """
+    tree = jinja2.Environment(autoescape=True).parse(source)
+    return [
+        node.value for node in tree.find_all(nodes.Const) if isinstance(node.value, str)
+    ]
+
+
 def _rendered_text(path: Path) -> str:
     """Return the text a template's markup renders, without Jinja or comments."""
     collector = _TextCollector()
@@ -207,6 +225,21 @@ def test_templates_reference_no_external_url() -> None:
                 )
         text = _rendered_text(template)
         assert not _EXTERNAL_URL.search(text), f"{template} renders an external URL"
+        for value in _jinja_strings(template.read_text(encoding="utf-8")):
+            assert not _EXTERNAL_URL.search(value), f"{template}: {value!r}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '{% set cdn = "https://unpkg.com/htmx.org" %}<script src="{{ cdn }}">',
+        "<link href=\"{{ 'https://fonts.example/x.css' }}\">",
+    ],
+    ids=["set-statement", "expression"],
+)
+def test_the_jinja_string_reader_sees_a_url_in_jinja_syntax(source: str) -> None:
+    """A URL written inside Jinja syntax is one of the strings the check reads."""
+    assert any(_EXTERNAL_URL.search(value) for value in _jinja_strings(source))
 
 
 def test_licence_notices_present() -> None:
