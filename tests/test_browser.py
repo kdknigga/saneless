@@ -132,7 +132,14 @@ from saneless.web import cache as cache_module
 from saneless.web import routes as routes_module
 from saneless.web.app import TEMPLATE_DIR, create_app
 from saneless.worker import WorkerFlipCoordinator, WorkerPassCoordinator
-from tests.conftest import StubScannerBackend, poll_until, scan_batch, wait_for_state
+from tests.conftest import (
+    StubScannerBackend,
+    poll_until,
+    refusing_paperless_client,
+    scan_batch,
+    wait_for_state,
+)
+from tests.fake_clock import FakeClock
 
 # Every palette value these tests assert against, in one place. All of them are
 # valid only for Pico 2.1.1, the version vendored as
@@ -313,13 +320,14 @@ def _browser_test_settings(tmp_dir: Path) -> Settings:
     Build the settings every browser test server runs with, rooted at ``tmp_dir``.
 
     Two profiles are configured so the worker never generates profiles at
-    startup, and Paperless points at a closed local port so an unstubbed upload
-    fails fast instead of reaching the network.
+    startup, and Paperless names a host that cannot resolve. The servers build
+    their client over the refusing test transport as well, so an unstubbed
+    upload fails at once and nothing reaches the network.
     """
     return Settings(
         scanner=ScannerConfig(device="test:browser:001"),
         paperless=PaperlessConfig(
-            url="http://localhost:9999",
+            url="http://paperless.invalid",
             token="fake-token",
         ),
         output=OutputConfig(
@@ -440,6 +448,25 @@ def _serve(
         _stop_uvicorn(running)
 
 
+def _create_offline_app(settings: Settings, scanner: _BrowserTestScanner) -> FastAPI:
+    """
+    Build a session server's app over the refusing Paperless transport.
+
+    A session-scoped server is built before any test's own fixtures run, so
+    the suite-wide refusing client never reaches it; it is patched in here,
+    for as long as ``create_app`` takes to build the client.
+
+    Returns:
+        The app, holding a Paperless client that never opens a socket.
+
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "saneless.web.app.PaperlessClient", refusing_paperless_client(FakeClock())
+        )
+        return create_app(settings, scanner)
+
+
 @pytest.fixture(scope="session")
 def browser_server(
     tmp_path_factory: pytest.TempPathFactory,
@@ -447,7 +474,7 @@ def browser_server(
     """Start a real uvicorn server for browser tests."""
     tmp_dir = tmp_path_factory.mktemp("browser")
     scanner = _BrowserTestScanner()
-    app = create_app(_browser_test_settings(tmp_dir), scanner)
+    app = _create_offline_app(_browser_test_settings(tmp_dir), scanner)
     running = _start_uvicorn(app, host="127.0.0.1")
     yield _BrowserServer(
         url=f"http://127.0.0.1:{running.port}", app=app, scanner=scanner
@@ -637,9 +664,9 @@ def delivering_paperless(
     Make the live app's Paperless client deliver every upload at once.
 
     The worker holds the same client instance as ``app.state.paperless``, so
-    patching its methods affects real scans. Without this the upload goes to
-    ``localhost:9999``, spends about 3 s in retry backoff and ends ERROR, which is
-    neither the outcome under test nor fast enough to wait for. ``poll_task``
+    patching its methods affects real scans. Without this the refusing test
+    transport fails the upload and the job ends ERROR, which is not the outcome
+    under test. ``poll_task``
     returns a filed task, as a real one does when paperless-ngx files the
     document. ``monkeypatch`` restores both methods at teardown.
     """
@@ -2713,7 +2740,7 @@ def blocked_server(
     """
     tmp_dir = tmp_path_factory.mktemp("browser-blocked")
     scanner = _BrowserTestScanner()
-    app = create_app(_blocked_settings(tmp_dir), scanner)
+    app = _create_offline_app(_blocked_settings(tmp_dir), scanner)
     running = _start_uvicorn(app, host="127.0.0.1")
     yield _BrowserServer(
         url=f"http://127.0.0.1:{running.port}", app=app, scanner=scanner
@@ -4208,6 +4235,7 @@ class TestLazyListsInTheBrowser:
     says so, and fills in by itself once paperless-ngx answers.
     """
 
+    @pytest.mark.real_paperless_transport
     def test_index_renders_under_a_second_with_paperless_black_holed(
         self,
         page: Page,
@@ -4231,6 +4259,7 @@ class TestLazyListsInTheBrowser:
 
         assert 0 < loaded < _PAGE_RENDER_LIMIT_MS, loaded
 
+    @pytest.mark.real_paperless_transport
     def test_lists_loading_holds_scan_then_releases_it(
         self,
         page: Page,
@@ -4419,6 +4448,7 @@ class TestLazyListsInTheBrowser:
         expect(select).to_have_value("")
         expect(page.locator("#status-message")).to_be_empty()
 
+    @pytest.mark.real_paperless_transport
     def test_every_retry_asks_paperless_ngx_again(
         self,
         page: Page,

@@ -113,7 +113,7 @@ def settings(tmp_path: Path) -> Settings:
     """Build settings whose job store is a file under tmp_path."""
     return Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
+        paperless=PaperlessConfig(url="http://paperless.invalid", token="test-token"),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         profiles={"default": ProfileConfig()},
     )
@@ -1853,7 +1853,7 @@ def _private_settings(tmp_path: Path) -> Settings:
     """Build settings whose scratch and data directories do not exist yet."""
     return Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
+        paperless=PaperlessConfig(url="http://paperless.invalid", token="test-token"),
         output=OutputConfig(
             tmp_dir=str(tmp_path / "scratch"), data_dir=str(tmp_path / "state")
         ),
@@ -1892,7 +1892,7 @@ def test_create_app_validates_before_it_creates_anything(tmp_path: Path) -> None
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(
-            url="http://localhost:8000",
+            url="http://paperless.invalid",
             token="test-token",
             consume_dir=not_a_directory,
         ),

@@ -7806,7 +7806,19 @@ class TestRaiseSiteAdvice:
     from where the error is raised, through the group guard, to stderr.
     """
 
-    @pytest.mark.parametrize("site", list(_RAISE_SITES))
+    @pytest.mark.parametrize(
+        "site",
+        [
+            pytest.param(
+                site,
+                # The trust store is built by the real HTTP transport only.
+                marks=[pytest.mark.real_paperless_transport]
+                if site == "unreadable trust store"
+                else [],
+            )
+            for site in _RAISE_SITES
+        ],
+    )
     def test_each_raise_site_prints_its_own_next_step(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, site: str
     ) -> None:

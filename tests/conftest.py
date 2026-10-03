@@ -646,7 +646,7 @@ def build_settings(tmp_path: Path, **overrides: object) -> Settings:
     auth = "test-token"
     sections: dict[str, Any] = {
         "scanner": ScannerConfig(device="test:device:001"),
-        "paperless": PaperlessConfig(url="http://localhost:8000", token=auth),
+        "paperless": PaperlessConfig(url="http://paperless.invalid", token=auth),
         "output": OutputConfig(
             tmp_dir=tmp_path / "tmp",
             data_dir=tmp_path / "data",
@@ -691,31 +691,25 @@ def _refuse_every_request(request: httpx2.Request) -> httpx2.Response:
     raise httpx2.ConnectError(msg, request=request)
 
 
-@pytest.fixture
-def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+def refusing_paperless_client(clock: FakeClock) -> Callable[..., PaperlessClient]:
     """
-    Give the web app a Paperless client that never leaves the process.
+    Return a builder for Paperless clients whose every request is refused.
 
-    The web settings name ``http://localhost:8000``, so without this a test
-    that submits a scan would have its worker really connect there: refused on
-    most machines, then backed off for a real one and two seconds -- and on a
-    developer machine running Paperless, delivered with the test token.
+    The builder takes the arguments ``create_app`` passes to
+    ``PaperlessClient`` and returns a real client with only its transport
+    replaced: every request fails with the ``ConnectError`` a refused
+    connection raises, and no socket is opened. Its retry and before-send
+    waits run on ``clock``, so they are recorded instead of slept.
 
-    ``create_app`` still builds a real ``PaperlessClient``; only its transport
-    is replaced, by one that fails every request with the same ``ConnectError``
-    a refused connection raises. The upload's before-send budget runs on a
-    ``FakeClock``, so its waits are recorded instead of slept and the budget
-    is spent at once. Tests that replace ``app.state.paperless`` methods are
-    unaffected.
+    Import it as ``from tests.conftest import refusing_paperless_client``.
 
     Args:
-        monkeypatch: Undoes the patch after the test.
+        clock: The fake clock the clients wait on.
 
     Returns:
-        The backoff delays the client asked for, in order.
+        A drop-in replacement for the ``PaperlessClient`` class.
 
     """
-    clock = FakeClock()
 
     def build_client(
         *, url: str, token: str, consume_dir: Path | None = None
@@ -735,7 +729,41 @@ def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
             timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
         )
 
-    monkeypatch.setattr("saneless.web.app.PaperlessClient", build_client)
+    return build_client
+
+
+@pytest.fixture(autouse=True)
+def offline_paperless(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> list[float]:
+    """
+    Give the web app a Paperless client that never leaves the process.
+
+    Every test gets it: a test that submits a scan would otherwise have its
+    worker connect to the configured Paperless and, on a developer machine
+    running one, deliver with the test token. The client is the one
+    ``refusing_paperless_client`` builds, so its waits run on a ``FakeClock``
+    and the upload's before-send budget is spent at once. Tests that replace
+    ``app.state.paperless`` methods are unaffected.
+
+    A test that needs the real HTTP transport -- to exercise TLS set-up, say
+    -- is marked ``real_paperless_transport`` and is left alone.
+
+    Args:
+        monkeypatch: Undoes the patch after the test.
+        request: The test's request, to read its markers.
+
+    Returns:
+        The backoff delays the client asked for, in order; empty for a test
+        that keeps the real transport.
+
+    """
+    clock = FakeClock()
+    if request.node.get_closest_marker("real_paperless_transport") is not None:
+        return clock.waits
+    monkeypatch.setattr(
+        "saneless.web.app.PaperlessClient", refusing_paperless_client(clock)
+    )
     return clock.waits
 
 
