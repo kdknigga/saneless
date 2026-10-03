@@ -4222,7 +4222,7 @@ class TestLegacyManualDuplexSource:
 
 
 class TestLegacyManualDuplexTranslation:
-    """A legacy source = "Manual Duplex" loads as duplex = "manual" (DPLX-02)."""
+    """A legacy source = "Manual Duplex" loads as duplex = "manual"."""
 
     def test_manual_duplex_source_translates(self) -> None:
         """The legacy marker sets duplex and leaves source verbatim."""
@@ -4239,7 +4239,7 @@ class TestLegacyManualDuplexTranslation:
         assert ProfileConfig(source="ADF Duplex").duplex == "none"
 
     def test_explicit_duplex_is_never_overwritten(self) -> None:
-        """An explicitly written duplex beats the legacy inference (Pitfall 3)."""
+        """An explicitly written duplex beats the legacy inference."""
         profile = ProfileConfig(source="Manual Duplex", duplex="none")
         assert profile.duplex == "none"
 
@@ -4270,10 +4270,10 @@ source = "Manual Duplex"
 
 class TestLegacyDuplexWarning:
     """
-    A legacy manual-duplex source is warned about once, by name (D-04, D-18).
+    A legacy manual-duplex source is warned about once, by name.
 
     The warning is emitted by ``warn_on_legacy_duplex_sources``, which the CLI
-    calls after logging is configured (WR-05), not by loading settings -- a
+    calls after logging is configured, not by loading settings -- a
     record logged inside ``load_settings`` would never reach ``log_file``.
     """
 
@@ -4331,7 +4331,7 @@ source = "Manual Duplex"
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        A legacy-looking source with an explicit non-manual duplex is warned (IN-04).
+        A legacy-looking source with an explicit non-manual duplex is warned.
 
         Explicit configuration still wins -- the profile is not read as manual
         duplex -- but the source goes to the scanner verbatim, so the operator
@@ -4492,10 +4492,10 @@ class TestValidateSettingsDirs:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
     ) -> None:
         """
-        A deep missing directory is checked against its nearest ancestor (M-20).
+        A deep missing directory is checked against its nearest ancestor.
 
-        Only the immediate parent used to be checked, and only when it existed,
-        so ``<unwritable>/a/b/c`` passed at startup and failed mid-scan.
+        Checking only an existing immediate parent would let
+        ``<unwritable>/a/b/c`` pass at startup and fail mid-scan.
         """
         ancestor = tmp_path / "readonly"
         ancestor.mkdir()
@@ -4608,9 +4608,9 @@ class TestDirectorySettingsMustBeDirectories:
     """
     A directory setting that names a file is refused at start-up.
 
-    ``os.access`` says a regular file is writable, so a ``data_dir`` that was
-    a file -- or that sat under one -- passed the start-up check and failed
-    mid-scan, when a failed scan needed preserving.
+    ``os.access`` says a regular file is writable, so without this a
+    ``data_dir`` that is a file -- or sits under one -- would pass the
+    start-up check and fail mid-scan, when a failed scan needs preserving.
     """
 
     @staticmethod
@@ -4677,12 +4677,11 @@ class TestDirectorySettingsMustBeDirectories:
 
 class TestPathExpansion:
     """
-    A leading ``~`` is expanded in every path setting (CFG-03, M-20).
+    A leading ``~`` is expanded in every path setting.
 
-    ``~/scans`` in a config file used to be taken literally, creating a
-    directory named ``~`` in the working directory. By decision (Claude's
-    Discretion), only ``~`` is expanded: ``$VAR`` stays literal (T-27-26), and
-    an empty ``consume_dir`` is None because empty means disabled.
+    Taken literally, ``~/scans`` would create a directory named ``~`` in the
+    working directory. Only ``~`` is expanded: ``$VAR`` stays literal, and an
+    empty ``consume_dir`` is None because empty means disabled.
     """
 
     @pytest.fixture
@@ -4735,7 +4734,7 @@ class TestPathExpansion:
 
     @pytest.mark.usefixtures("home")
     def test_expanduser_does_not_expand_variables(self) -> None:
-        """``$HOME`` in a path setting is kept literally (T-27-26)."""
+        """``$HOME`` in a path setting is kept literally."""
         assert OutputConfig(data_dir="$HOME/x").data_dir == Path("$HOME/x")
 
     @pytest.mark.usefixtures("home")
@@ -4743,11 +4742,12 @@ class TestPathExpansion:
         self, tmp_path: Path
     ) -> None:
         """
-        ``~nosuchuser`` names the section and key, never the value (WR-03).
+        ``~nosuchuser`` names the section and key, never the value.
 
         ``Path.expanduser`` raises RuntimeError, which pydantic does not turn
-        into a validation error, so it used to escape the D-10 renderer as a
-        bare "Could not determine home directory." naming no file or key.
+        into a validation error; unconverted, it would escape the error
+        renderer as a bare "Could not determine home directory." naming no
+        file or key.
         """
         err = _load_error(
             tmp_path / "x.toml",
@@ -4802,8 +4802,7 @@ class TestPathTypedSettings:
         """
         The default ``tmp_dir`` follows the temp directory at construction.
 
-        It used to be computed once, at import, from whatever temp directory
-        the process saw then.
+        It is not fixed at import, so a temp directory chosen later is honoured.
         """
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         assert OutputConfig().tmp_dir == tmp_path / f"saneless-{os.getuid()}"
@@ -4931,9 +4930,9 @@ class TestRelativePaths:
     """
     A relative path setting is pinned absolute at load, next to its config file.
 
-    A relative ``data_dir`` used to be taken relative to whatever directory a
-    command ran in, so ``saneless jobs`` from another directory opened -- and
-    created -- an empty database there. File and environment values follow
+    Taken relative to whatever directory a command ran in, a relative
+    ``data_dir`` would make ``saneless jobs`` from another directory open --
+    and create -- an empty database there. File and environment values follow
     the same rule: the directory of the loaded file, or the working directory
     when no file was loaded.
     """
@@ -5154,13 +5153,13 @@ def _documented_token_stand_ins() -> list[tuple[str, str]]:
 
 class TestPlaceholderToken:
     """
-    ``is_placeholder_token`` is an exact-match predicate, not a heuristic (D-14).
+    ``is_placeholder_token`` is an exact-match predicate, not a heuristic.
 
     ``doctor``, the status strip, the scan route and ``saneless scan`` must all
     agree on whether the appliance can upload, so there is one predicate. The
     set is a small fixed literal set deliberately: refusing a legitimate token
     from a future paperless-ngx version is worse than missing an exotic
-    placeholder (APPL-07).
+    placeholder.
     """
 
     @pytest.mark.parametrize("blank", ["", " ", "   ", "\t\n", "\t \n "])
@@ -5253,7 +5252,7 @@ class TestPlaceholderToken:
 
     def test_predicate_is_annotated_to_take_a_plain_string(self) -> None:
         """
-        The predicate takes an already-unwrapped ``str`` (CFG-05, ASVS V7).
+        The predicate takes an already-unwrapped ``str``, never the secret.
 
         Asserted on the annotation rather than by calling it with a
         ``SecretStr``, because a call that type-checkers reject would need a
@@ -5284,12 +5283,12 @@ class TestPlaceholderToken:
 
 class TestProfileLabelAndDescription:
     """
-    ``label`` and ``description`` are persisted, tool-owned profile keys (D-18).
+    ``label`` and ``description`` are persisted, tool-owned profile keys.
 
     ``saneless auto-profiles`` writes them and ``--force`` overwrites them in
     place; the operator's escape hatch is removing ``auto_generated``. Both
-    default to ``""`` so a config written before this phase still loads under
-    ``extra="forbid"`` (APPL-05).
+    default to ``""`` so a profile without them still loads under
+    ``extra="forbid"``.
     """
 
     def test_both_round_trip_from_toml(self, tmp_config_dir: Path) -> None:
@@ -5310,9 +5309,8 @@ class TestProfileLabelAndDescription:
         """
         A profile table with neither key loads under ``extra="forbid"``.
 
-        Defaulting to ``""`` is what keeps an existing deployment loading; the
-        dropdown renders ``label or name`` (Amendment A-3) so such a profile is
-        never a blank option.
+        Defaulting to ``""`` keeps such a config loading; the dropdown renders
+        ``label or name``, so such a profile is never a blank option.
         """
         config_file = tmp_config_dir / "unlabelled.toml"
         config_file.write_text(
@@ -5335,7 +5333,7 @@ class TestProfileLabelAndDescription:
         assert ProfileConfig(label=label).label == label
 
     def test_description_over_max_length_is_rejected(self) -> None:
-        """An over-long description fails validation (T-30-08, ROBU-08)."""
+        """An over-long description fails validation; it is rendered into HTML."""
         with pytest.raises(ValidationError, match="description"):
             ProfileConfig(description="x" * (PROFILE_DESCRIPTION_MAX_LENGTH + 1))
 
@@ -5369,17 +5367,17 @@ class TestProfileLabelAndDescription:
 
 class TestWebConfig:
     """
-    The ``[web]`` section decides the scan form's shape (D-28, D-29, APPL-10).
+    The ``[web]`` section decides the scan form's shape.
 
     One appliance, one configured form shape -- not a per-browser toggle. Both
-    keys default on, so an existing deployment's form is unchanged, and hiding
-    a control changes the form and never the scan.
+    keys default on, so a config without the section shows every control, and
+    hiding a control changes the form and never the scan.
     """
 
     def test_web_config_absent_table_gets_the_defaults(
         self, tmp_config_dir: Path
     ) -> None:
-        """A config file that predates the section loads with both defaults."""
+        """A config file with no ``[web]`` table loads with both defaults."""
         config_file = tmp_config_dir / "no_web.toml"
         config_file.write_text('[scanner]\nhost = "192.168.1.50"\n')
         settings = load_settings(config_path=str(config_file))
@@ -5407,10 +5405,10 @@ class TestWebConfig:
         self, tmp_config_dir: Path
     ) -> None:
         """
-        A mistyped ``[web]`` key is a loud error, not a silent default (T-30-07).
+        A mistyped ``[web]`` key is a loud error, not a silent default.
 
-        The new section must be visible to the same unknown-key machinery that
-        renders ``[paperless] unknown key 'tokne'``.
+        The section is visible to the same unknown-key machinery that renders
+        ``[paperless] unknown key 'tokne'``.
         """
         err = _load_error(
             tmp_config_dir / "web_typo.toml",
@@ -5556,14 +5554,14 @@ def _toml_string(value: str) -> str:
 
 class TestEverySectionRendersUnknownKeys:
     """
-    Every plain section renders the D-11 unknown-key line, not a bare message.
+    Every plain section renders the unknown-key line, not a bare message.
 
     The error renderer looks a section's model up in a hand-maintained mapping,
     while every other reader derives the section list from ``Settings``' own
     fields. A section added to one and not the other loads fine and then falls
-    back to pydantic's bare "Extra inputs are not permitted" -- exactly the
-    silence CFG-01 exists to remove. Asserted over the sections themselves so a
-    future section cannot be added without being wired up (CFG-01, M-18).
+    back to pydantic's bare "Extra inputs are not permitted", naming no valid
+    key. Asserted over the sections themselves so a future section cannot be
+    added without being wired up.
     """
 
     @pytest.mark.parametrize(
@@ -5590,12 +5588,10 @@ class TestProfileStorageForLoaded:
     """
     ``profile_storage_for_loaded`` is the one rule for "nothing was written".
 
-    CR-01 was this rule written twice -- spelled out in ``saneless doctor`` and
-    left out by omission in ``ScanWorker`` -- with only one copy correct, so the
-    web status strip printed a permanent amber Profiles row contradicting what
-    ``doctor`` printed for the very same appliance. D-02 promises both surfaces
-    report the same checks in the same words, so there may be exactly one
-    derivation and both must call it.
+    ``saneless doctor`` and the web status strip report the same checks in the
+    same words, so there is exactly one derivation and both call it. Two
+    copies can drift apart, and then the strip shows an amber Profiles row that
+    contradicts what ``doctor`` prints for the very same appliance.
     """
 
     def test_a_loaded_config_file_means_persisted(self, tmp_path: Path) -> None:
@@ -5623,9 +5619,9 @@ class TestProfileStorageForLoaded:
 
         ``IN_MEMORY_UNWRITABLE`` is what the *worker* records when its one
         startup persist attempt was refused. A caller that attempted no write
-        has no such outcome and must not invent one by probing: Phase 27 D-09's
-        motivating failure is EBUSY on a single-file bind mount, where the
-        directory is writable and only the rename fails.
+        has no such outcome and must not invent one by probing: on a
+        single-file bind mount the directory is writable and only the rename
+        fails, with EBUSY.
 
         Args:
             tmp_path: pytest's per-test directory.
