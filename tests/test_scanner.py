@@ -1,4 +1,4 @@
-"""Tests for scanner abstraction layer (ABC + SaneBackend)."""
+"""The scanner abstraction and its SANE backend drive a device safely."""
 
 from __future__ import annotations
 
@@ -127,8 +127,8 @@ def _make_content_image(
     Create a test image with mixed content, comfortably above _MIN_PAGE_BYTES.
 
     Uses drawing operations to give the image non-trivial pixel variance, so a
-    test can tell a real page apart from a uniformly blank one.  The backend no
-    longer judges content, so variance is no longer required to survive a scan.
+    test can tell a real page apart from a uniformly blank one.  The backend
+    does not judge content, so a page survives a scan with or without it.
     """
     img = Image.new("RGB", (width, height), color)
     draw = ImageDraw.Draw(img)
@@ -167,13 +167,11 @@ def _assert_no_exif_on_disk(record: PageRecord) -> None:
         assert dict(spooled.getexif()) == {}
 
 
-# D-17 completed: MockSaneDev, MockSaneModule and _FakeSaneDevice used to live
-# here.  All three modelled a python-sane that does not exist -- most sharply
-# the geometry-less one, which RAISED on an unknown option name where the real
-# library stores it silently -- and each disagreement let a shipped defect earn
-# a green test (M-32).  There is now exactly one definition of what python-sane
-# does, in tests/fake_sane.py, and both this module and test_pipeline.py are
-# written against it.
+# There is exactly one definition of what python-sane does, in
+# tests/fake_sane.py, and both this module and test_pipeline.py are written
+# against it.  A second double would be free to disagree with the library --
+# raising on an unknown option name, say, where python-sane stores it
+# silently -- and every disagreement could keep a defect green.
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +180,7 @@ def _assert_no_exif_on_disk(record: PageRecord) -> None:
 
 
 class TestDeviceInfo:
-    """DeviceInfo dataclass tests."""
+    """DeviceInfo keeps what a device reports, safe to display."""
 
     def test_device_info_fields(self) -> None:
         """DeviceInfo stores name, vendor, model, and device_type."""
@@ -221,7 +219,7 @@ class TestDeviceInfo:
 
 
 class TestScanSettings:
-    """ScanSettings dataclass tests."""
+    """ScanSettings stores what it is given, flatbed being the Auto default."""
 
     def test_scan_settings_fields(self) -> None:
         """ScanSettings stores source, resolution, and mode."""
@@ -247,7 +245,7 @@ class TestScanSettings:
 
 
 # ---------------------------------------------------------------------------
-# Source classification tests (CTR-04)
+# Source classification tests
 # ---------------------------------------------------------------------------
 
 
@@ -262,14 +260,14 @@ class TestClassifySource:
             # and umax feeders.  Their lowercase form STARTS WITH "auto", so the
             # AUTO rule must be an exact equality test and must never be a
             # substring test -- a substring test classifies these as AUTO, sends
-            # them down the single-page branch, and restores the C-06 defect.
+            # them down the single-page branch, and a stack scans as one page.
             ("Automatic Document Feeder", SourceKind.FEEDER),
             ("Automatic Document Feeder(left aligned)", SourceKind.FEEDER),
             ("Automatic Document Feeder(centrally aligned)", SourceKind.FEEDER),
             ("Document Feeder", SourceKind.FEEDER),
             ("ADF", SourceKind.FEEDER),
             # "ADF Back" is a feeder for ROUTING purposes even though it must
-            # not share a profile slug with "ADF Front" (N-09).
+            # not share a profile slug with "ADF Front".
             ("ADF Front", SourceKind.FEEDER),
             ("ADF Back", SourceKind.FEEDER),
             ("ADF Duplex", SourceKind.FEEDER_DUPLEX),
@@ -281,10 +279,9 @@ class TestClassifySource:
             # requiring a feeder token AND "duplex" would mis-route real
             # Fujitsu hardware.
             ("Card Duplex", SourceKind.FEEDER_DUPLEX),
-            # Ambiguity B -- "Manual Duplex" is this project's own pseudo-source
-            # (docs/how-to/set-up-adf-duplex.md).  Its exposure is narrow and
-            # Phase 25 deletes the source-overloading entirely, so no special
-            # case is built for it here.
+            # Ambiguity B -- "Manual Duplex" contains "duplex" and no feeder
+            # token, so it classifies FEEDER_DUPLEX like "Card Duplex".  No
+            # special case is built for it here.
             ("Manual Duplex", SourceKind.FEEDER_DUPLEX),
             ("Auto", SourceKind.AUTO),
             ("auto", SourceKind.AUTO),
@@ -297,16 +294,16 @@ class TestClassifySource:
         ],
     )
     def test_classify_source(self, source: str, expected: SourceKind) -> None:
-        """Harvested real-world SANE source names classify correctly (CTR-04)."""
+        """Harvested real-world SANE source names classify correctly."""
         assert classify_source(source) is expected
 
     def test_uses_feeder_true_for_feeder_kinds(self) -> None:
-        """FEEDER and FEEDER_DUPLEX feed a stack of sheets (CTR-04)."""
+        """FEEDER and FEEDER_DUPLEX feed a stack of sheets."""
         assert SourceKind.FEEDER.uses_feeder
         assert SourceKind.FEEDER_DUPLEX.uses_feeder
 
     def test_uses_feeder_false_for_single_page_kinds(self) -> None:
-        """FLATBED, AUTO, and UNKNOWN take the single-page path (CTR-04)."""
+        """FLATBED, AUTO, and UNKNOWN take the single-page path."""
         assert not SourceKind.FLATBED.uses_feeder
         assert not SourceKind.AUTO.uses_feeder
         assert not SourceKind.UNKNOWN.uses_feeder
@@ -318,7 +315,7 @@ class TestClassifySource:
 
 
 class TestScannerBackendABC:
-    """Scanner backend ABC tests."""
+    """ScannerBackend is abstract."""
 
     def test_scanner_backend_is_abstract(self) -> None:
         """ScannerBackend cannot be instantiated directly."""
@@ -342,18 +339,16 @@ _TEST_DEVICE = "test:device:001"
 # The call sequence a three-sheet feeder produces, start to finish.
 #
 # The real ADF iterator calls start() then snap() ONCE PER SHEET, so "snap was
-# never called" does not distinguish the feeder path from the flatbed one --
-# that was an artefact of the deleted double, whose multi_scan() handed back
-# iter(list) and touched neither method. What actually distinguishes the feeder
-# is this repeated per-page probe, ending in one final start() that reports the
-# feeder empty. A flatbed scan is exactly ["start", "snap"], so comparing the
-# whole sequence tells the two paths apart without asserting a falsehood about
-# the library.
+# never called" does not distinguish the feeder path from the flatbed one.
+# What distinguishes the feeder is this repeated per-page probe, ending in one
+# final start() that reports the feeder empty. A flatbed scan is exactly
+# ["start", "snap"], so comparing the whole sequence tells the two paths apart
+# without asserting a falsehood about the library.
 _THREE_SHEET_FEEDER_CALLS = ["start", "snap"] * 3 + ["start"]
 
 # The free-space reserve the sinks in this module keep beyond the page being
 # written.  Zero, deliberately: these tests are about what the backend does
-# with a page, not about D-07's shortfall arithmetic, and any positive reserve
+# with a page, not about the spool's shortfall arithmetic, and any positive reserve
 # would make every scanner test fail on a CI runner whose disk happened to be
 # nearly full.  ``tests/test_spool.py`` owns the shortfall path and exercises
 # it with a reserve chosen to fire.
@@ -396,6 +391,11 @@ def _page_sink_for(tmp_path: Path, label: str = _SPOOL_LABEL_A) -> SpooledPageSi
 # inside pytest-timeout's sixty.
 _READER_THREAD_PREFIX = "sane-read-"
 _READER_JOIN_SECONDS = 5.0
+
+# The bound an interrupt delivered mid-read must land inside.  The read's page
+# budget is thirty seconds, far above it, so a wait that held the interrupt
+# back until the page timed out would miss the bound by seconds.
+_INTERRUPT_BOUND_SECONDS = 5.0
 
 
 def _join_sane_reader_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
@@ -462,8 +462,8 @@ def page_sink(tmp_path: Path) -> SpooledPageSink:
     """
     Return the sink this test's ``scan_pages`` call spools into.
 
-    ``scan_pages`` takes a sink as its third argument now, and it is the
-    pipeline that owns one in production, so every test here supplies its own.
+    ``scan_pages`` takes a sink as its third argument, and it is the pipeline
+    that owns one in production, so every test here supplies its own.
 
     Returns:
         A sink writing into ``tmp_path``, labelled as a first pass.
@@ -530,7 +530,7 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
     """
     The suite-wide reset really re-arms the init guard, in both its branches.
 
-    The guard is process state (D-17), so a module that builds a
+    The guard is process state, so a module that builds a
     ``SaneBackend`` over a fake and leaves ``_INIT.done`` set silently
     suppresses ``sane.init()`` for every later test in the same process -- and
     the later test that then makes real SANE calls fails with an empty device
@@ -562,8 +562,8 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
         A leaked wedge does not strand the guard, and no sane_exit() is risked.
 
         ``shutdown()`` deliberately refuses while a read is recorded as
-        outstanding, because ``sane_exit()`` closes every open handle (D-13,
-        D-18).  Left at that, a test that wedged the backend would set
+        outstanding, because ``sane_exit()`` closes every open handle.  Left
+        at that, a test that wedged the backend would set
         ``_INIT.done`` for the rest of the process.  The reset finishes the job
         by hand instead -- and ``exit_call_count`` staying 0 is the assertion
         that it did *not* reach for the unsafe call on the way.
@@ -586,7 +586,7 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
 
 
 class TestSaneBackendInit:
-    """SaneBackend initialization tests."""
+    """Constructing a SaneBackend initialises SANE and sets its host list."""
 
     def test_sane_backend_init_calls_sane_init(
         self, fake_sane_module: FakeSaneModule
@@ -732,7 +732,7 @@ def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 class TestSaneInitGuard:
     """
-    SANE is initialised once per process, behind a guard (HARD-05, D-17).
+    SANE is initialised once per process, behind a guard.
 
     ``sane_init`` is a process-global call: the second one is at best wasted
     and at worst -- on a ``net`` backend, whose host list is read only at the
@@ -777,7 +777,7 @@ class TestSaneInitGuard:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Repeating the configured host is the normal case, not a warning."""
+        """Repeating the configured host logs no warning."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
         SaneBackend(host="scanner-a.local")
         caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
@@ -918,7 +918,7 @@ class TestSaneInitGuard:
                 failures.append(exc)
 
         threads = [
-            threading.Thread(target=build, name=f"init-race-{i}")
+            threading.Thread(target=build, name=f"init-race-{i}", daemon=True)
             for i in range(thread_count)
         ]
         for thread in threads:
@@ -926,6 +926,7 @@ class TestSaneInitGuard:
         for thread in threads:
             thread.join(10)
 
+        assert not any(thread.is_alive() for thread in threads)
         assert failures == []
         assert fake_sane_module.init_call_count == 1
 
@@ -993,7 +994,7 @@ def _assert_shutdown_failure_logged(caplog: pytest.LogCaptureFixture) -> None:
 
 class TestSaneShutdown:
     """
-    SANE is shut down at an entry point, once, and never over an error (D-18).
+    SANE is shut down at an entry point, once, and never over an error.
 
     ``shutdown()`` is the other half of the init guard: the entry point that
     owns the process calls it when the process is ending, and nothing else
@@ -1004,7 +1005,7 @@ class TestSaneShutdown:
     def test_shutdown_calls_sane_exit_once_however_often_it_is_called(
         self, fake_sane_module: FakeSaneModule
     ) -> None:
-        """Repeated shutdowns are the normal case for several backends."""
+        """Repeated shutdowns, one per backend, call sane_exit once."""
         SaneBackend()
         sane_backend_mod.shutdown()
         sane_backend_mod.shutdown()
@@ -1013,7 +1014,7 @@ class TestSaneShutdown:
     def test_shutdown_calls_nothing_when_sane_was_never_initialised(
         self, fake_sane_module: FakeSaneModule
     ) -> None:
-        """With no init there is nothing to undo, and sane_exit is undefined."""
+        """Without an init, shutdown calls nothing: sane_exit would be undefined."""
         sane_backend_mod.shutdown()
         assert fake_sane_module.exit_call_count == 0
 
@@ -1041,7 +1042,7 @@ class TestSaneShutdown:
     def test_shutdown_re_arms_the_guard_even_when_sane_exit_failed(
         self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A failed exit must not leave the process unable to initialise again."""
+        """A failed exit still re-arms the guard, so SANE can initialise again."""
         SaneBackend()
         working_exit = fake_sane_module.exit
 
@@ -1078,7 +1079,7 @@ class TestSaneShutdown:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A raise from a close callback would replace the operator's error."""
+        """Closing never raises, so it cannot replace the operator's error."""
         backend = SaneBackend()
         monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
         with caplog.at_level(logging.WARNING, logger=sane_backend_mod.__name__):
@@ -1104,10 +1105,7 @@ class TestSaneShutdown:
         Python offers no way to ask which callbacks are registered, so the
         absence is asserted where it is decided: no module here imports the
         registry, and none of them calls anything that registers.  The check
-        is structural rather than textual on purpose -- the backend's own
-        docstrings explain at length why ``concurrent.futures``' interpreter-
-        exit join made a pooled reader unsurvivable, and prose recording a
-        rejected design is not the design.
+        is structural, because the backend's docstrings discuss exit hooks.
         """
         tree = ast.parse(inspect.getsource(module))
         imported = {
@@ -1131,7 +1129,7 @@ class TestSaneShutdown:
 
 
 class TestSaneBackendGetDevices:
-    """SaneBackend device enumeration tests."""
+    """SaneBackend lists devices as DeviceInfo records."""
 
     def test_sane_backend_get_devices(self, sane_backend: SaneBackend) -> None:
         """get_devices returns DeviceInfo objects from sane.get_devices()."""
@@ -1646,7 +1644,7 @@ class TestTheBaseListAndOpen:
 
 
 class TestSaneBackendScanPages:
-    """SaneBackend scan page acquisition tests."""
+    """scan_pages opens the device, spools, then cancels and closes it."""
 
     def test_sane_backend_scan_pages_opens_and_closes_device(
         self,
@@ -1683,8 +1681,8 @@ class TestSaneBackendScanPages:
         # The fault is armed on the device rather than by swapping out its snap
         # method: start() is where a flatbed scan first touches the hardware,
         # and the fake raises from there with the library's own error type.
-        # Since EXC-01 the library's error leaves the backend as a ScanError
-        # naming the device, with the original kept as its cause.
+        # The library's error leaves the backend as a ScanError naming the
+        # device, with the original kept as its cause.
         original = FakeSaneError("scan failed")
         dev = FakeSaneDev(start_error=original)
         backend = _backend_with(dev, monkeypatch)
@@ -1704,7 +1702,7 @@ class TestSaneBackendScanPages:
         fake_sane_module: FakeSaneModule,
         page_sink: SpooledPageSink,
     ) -> None:
-        """Verify snap() is called without progress argument (Pitfall #2)."""
+        """snap() is called with no progress callback."""
         mock_dev = fake_sane_module.device
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
@@ -1728,7 +1726,7 @@ class TestSaneBackendScanPages:
 
 
 class TestSaneBackendGetCapabilities:
-    """SaneBackend capability query tests."""
+    """get_capabilities reports what the device offers, as it gave it."""
 
     def test_sane_backend_get_capabilities(self, sane_backend: SaneBackend) -> None:
         """get_capabilities reports the sources, modes and resolution support."""
@@ -1740,7 +1738,7 @@ class TestSaneBackendGetCapabilities:
         assert "Color" in caps.modes
         assert "Gray" in caps.modes
         # The shared fake constrains resolution with a range, which is what the
-        # real SANE ``test`` backend does and what the deleted double did not.
+        # real SANE ``test`` backend does.
         # The word list stays empty because the device reported no word list --
         # the two are different facts and neither is derived from the other.
         assert caps.resolution_range == (1.0, 1200.0, 1.0)
@@ -1798,7 +1796,7 @@ class TestSaneBackendGetCapabilities:
 
 
 class TestSaneBackendADFScan:
-    """ADF simplex scan tests."""
+    """A feeder scan goes through multi_scan, a flatbed scan through snap."""
 
     def test_adf_scan_yields_all_pages(
         self,
@@ -1811,7 +1809,7 @@ class TestSaneBackendADFScan:
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = sane_backend.scan_pages("test:device:001", settings, page_sink).pages
         assert len(pages) == 3
-        # Order is the records' own, never the directory's (D-02).
+        # Order is the records' own, never the directory's.
         assert [page.sequence for page in pages] == [1, 2, 3]
         assert all(page.path.exists() for page in pages)
 
@@ -1835,7 +1833,7 @@ class TestSaneBackendADFScan:
         fake_sane_module: FakeSaneModule,
         page_sink: SpooledPageSink,
     ) -> None:
-        """Flatbed scan still uses snap(), not multi_scan()."""
+        """Flatbed scan uses snap(), not multi_scan()."""
         mock_dev = fake_sane_module.device
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
@@ -1846,7 +1844,7 @@ class TestSaneBackendADFScan:
 
 
 class TestSaneBackendAutomaticDocumentFeeder:
-    """Routing for feeder names that contain no "adf" token (C-06 / D-11)."""
+    """A feeder whose name contains no "adf" token routes to the feeder."""
 
     def test_automatic_document_feeder_yields_all_pages(
         self,
@@ -1855,16 +1853,12 @@ class TestSaneBackendAutomaticDocumentFeeder:
         page_sink: SpooledPageSink,
     ) -> None:
         """
-        Automatic Document Feeder uses multi_scan and returns every page (CTR-04).
+        Automatic Document Feeder uses multi_scan and spools every page.
 
         The SANE ``test`` backend names its feeder "Automatic Document Feeder",
-        with no "adf" token anywhere in the string. The deleted string-sniffing
-        rule in ``sane_backend`` returned False for it, so the flatbed
-        ``start()``/``snap()`` branch ran and a ten-page stack produced exactly
-        one page. This asserts that ``multi_scan()`` is used instead -- that all
-        3 fake pages are spooled rather than 1, and that ``snap()`` is never
-        called. This is the C-06 fix and the phase's one authorised behaviour
-        change (D-11); it could not have passed before Phase 21.
+        with no "adf" token anywhere in the string.  Sent down the flatbed
+        ``start()``/``snap()`` branch, a ten-page stack would produce one page;
+        here all three fake pages are spooled and ``snap()`` is never called.
         """
         mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "Automatic Document Feeder"])
@@ -1880,7 +1874,7 @@ class TestSaneBackendAutomaticDocumentFeeder:
 
 
 class TestSaneBackendDuplex:
-    """ADF Duplex scan tests."""
+    """A duplex feeder scan goes through multi_scan in the hardware's order."""
 
     def test_duplex_scan_yields_pages(
         self,
@@ -1911,15 +1905,12 @@ class TestSaneBackendDuplex:
 
 
 class TestSaneBackendEmptyFeeder:
-    """Empty ADF feeder detection tests."""
+    """A feeder that yields no page raises FeederEmptyError."""
 
-    # ``test_empty_feeder_out_of_documents_error`` was deleted here by D-03.
-    # It drove ``multi_scan()`` itself into raising and asserted the result was
-    # FeederEmptyError, but the real method is a one-line
-    # ``return _SaneIterator(self)`` that cannot raise, so it pinned the
-    # behaviour of provably unreachable code.  A fault arriving from the
-    # iterator is now covered honestly by TestAdfPageErrorsAreTruthful, and the
-    # zero-page path it nominally tested is covered below.
+    # ``multi_scan()`` itself is a one-line ``return _SaneIterator(self)`` that
+    # cannot raise, so nothing here makes it raise.  A fault arriving from the
+    # iterator is covered by TestAdfPageErrorsAreTruthful, and the zero-page
+    # path below.
 
     def test_empty_feeder_stop_iteration(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
@@ -1935,10 +1926,9 @@ class TestSaneBackendEmptyFeeder:
             backend.scan_pages("test:device:001", settings, page_sink)
 
 
-# The four first-page faults measured against the real SANE ``test`` backend
-# with ``read_return_value`` set to the matching status (RESEARCH Finding 3).
-# Every one of them reached the operator as "No paper detected in feeder"
-# before D-03.
+# The four first-page faults the real SANE ``test`` backend raises with
+# ``read_return_value`` set to the matching status.  None of them is an empty
+# feeder, and none may reach the operator as "No paper detected in feeder".
 _MEASURED_SANE_FAULTS = [
     "Error during device I/O",
     "Document feeder jammed",
@@ -1986,15 +1976,12 @@ def _backend_with(dev: FakeSaneDev, monkeypatch: pytest.MonkeyPatch) -> SaneBack
 
 class TestAdfPageErrorsAreTruthful:
     """
-    A real SANE fault is reported as itself, never as an empty feeder (D-03).
+    A real SANE fault is reported as itself, never as an empty feeder.
 
-    ``sane_backend`` used to convert *every* exception raised while acquiring
-    page 0 into ``FeederEmptyError("No paper detected in feeder")``, so a jam,
-    an open cover, a busy device and an I/O error all told the operator to
-    load paper (M-11).  The genuine empty-feeder signal never reached that
-    branch anyway: python-sane converts exactly one message to
-    ``StopIteration``, and a zero-page feeder is the only honest source of
-    "No paper detected in feeder".
+    A jam, an open cover, a busy device and an I/O error on page 0 each tell
+    the operator what happened rather than to load paper.  python-sane
+    converts exactly one message to ``StopIteration``, and a zero-page feeder
+    is the only honest source of "No paper detected in feeder".
     """
 
     @pytest.mark.parametrize("message", _MEASURED_SANE_FAULTS)
@@ -2071,16 +2058,13 @@ class TestAdfPageCap:
 
     python-sane's ``_SaneIterator.__next__`` stops only on one exact message,
     so on hardware that is not a feeder ``start()``/``snap()`` keep succeeding
-    and the loop never terminates -- reproduced live with a Flatbed source
-    that yielded page after page and would not stop.  The per-page timeout is
-    no help: a scan that succeeds satisfies it every single iteration.
+    and the loop never terminates; the per-page timeout cannot stop a scan
+    that succeeds every iteration.
 
-    A source named as a feeder is cut off at the per-pass cap.  A source that
-    is not one -- ``Auto`` sent through the feeder, asked for or stood in for
-    a flatbed -- may be a platen rescanned forever, so it is cut off much
-    sooner.  Either way the pass is not a failure: the pages already scanned
-    are kept, and the batch names the sheet that was fed but not kept, so the
-    operator knows where to resume.
+    A named feeder is cut off at the per-pass cap, and ``Auto`` sent through
+    the feeder much sooner, since it may be a platen rescanned forever.  The
+    pass is not a failure: the pages already scanned are kept, and the batch
+    names the sheet fed but not kept, so the operator knows where to resume.
     """
 
     @staticmethod
@@ -2266,7 +2250,7 @@ class TestAdfPageCap:
 
 
 class TestSaneBackendPageValidation:
-    """Inline page validation tests."""
+    """A page that is not a readable image is skipped; a readable one survives."""
 
     def test_zero_dimension_page_skipped(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
@@ -2303,11 +2287,10 @@ class TestSaneBackendPageValidation:
         A uniformly white page reaches the caller instead of being discarded.
 
         python-sane expands 1-bit lineart to 0 and 255 bytes, so a clean blank
-        page is uniformly 255 -- which is precisely what the deleted
-        scanner-level check keyed on.  Whether such a page is dropped is still
-        decided, but not here: it belongs to the pipeline's blank-page filter,
-        under the profile's ``enable_empty_page_detection`` toggle, where the
-        user can see it and turn it off (M-14, D-05).
+        page is uniformly 255.  Whether such a page is dropped is decided by the
+        pipeline's blank-page filter, under the profile's
+        ``enable_empty_page_detection`` toggle, where the user can see it and
+        turn it off.
         """
         mock_dev = fake_sane_module.device
         white_img = Image.new("RGB", (200, 300), (255, 255, 255))
@@ -2330,10 +2313,10 @@ class TestSaneBackendPageValidation:
         """
         A uniformly black page reaches the caller instead of being discarded.
 
-        This is the defect the real SANE ``test`` backend exposed end to end:
-        its default picture is solid black, so every page of a ten-sheet stack
-        was destroyed by the backend before the pipeline ever saw it.  Judging
-        content is not the scanner layer's job (M-14, D-05).
+        The real SANE ``test`` backend's default picture is solid black, so a
+        backend that judged content would destroy every page of a ten-sheet
+        stack before the pipeline saw it.  Judging content is not the scanner
+        layer's job.
         """
         mock_dev = fake_sane_module.device
         black_img = Image.new("RGB", (200, 300), (0, 0, 0))
@@ -2344,8 +2327,7 @@ class TestSaneBackendPageValidation:
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings, page_sink).pages
         assert len(pages) == 2
-        # Paper measuring 0 is solid black, which is precisely the page the
-        # deleted content policy keyed on.
+        # Paper measuring 0 is solid black.
         assert pages[0].paper_white == 0
 
     def test_normal_content_page_passes(
@@ -2400,15 +2382,11 @@ class TestSaneBackendPageValidation:
 
 class TestFlatbedIntegrityChecks:
     """
-    The single-sheet path runs the same two checks as the feeder (WR-03).
+    The single-sheet path runs the same two checks as the feeder.
 
-    The feeder validated every page and counted rejections; the flatbed path
-    did neither.  The reason given -- that the caller sees any failure as an
-    exception -- describes the case these checks are not for: an unreadable
-    image returned *successfully*, which flowed into ``_maybe_crop`` and then
-    into ``assemble_pdf``, where ``img.save()`` on a 0x0 image was the first
-    thing to notice.  The identical page arriving from a feeder was skipped,
-    counted and reported.
+    The checks are for an unreadable image returned *successfully*: unchecked,
+    it would flow into ``_maybe_crop`` and then into ``assemble_pdf``, where
+    ``img.save()`` on a 0x0 image would be the first thing to notice.
 
     A failure is fatal here rather than counted, because a flatbed exposes one
     sheet at a time and there is no next page to carry on to.
@@ -2443,7 +2421,7 @@ class TestFlatbedIntegrityChecks:
     def test_a_readable_sheet_still_reports_no_rejections(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
-        """The check must not start counting good flatbed pages as rejects."""
+        """A good flatbed page is not counted as a reject."""
         mock_dev = fake_sane_module.device
         mock_dev.load_feeder([_make_content_image()])
 
@@ -2459,15 +2437,10 @@ class TestIntegrityFailuresAreSkippedAndCounted:
     """
     One unreadable page costs one page; a wholly unreadable batch raises.
 
-    Raising on the first integrity failure was rejected in D-06: it would make
-    "every returned page is readable" true by construction, but it fails a
-    fifty-sheet job over one bad sheet, and partial-result recovery belongs to
-    Phase 29's HARD-02.
-
-    A batch in which *every* page was rejected must not return an empty list
-    either.  The pipeline would hand that straight to ``assemble_pdf([])`` and
-    record a job that produced nothing as a success, which is M-14's third
-    consequence and the reason it prescribes a raise.
+    Raising on the first integrity failure would fail a fifty-sheet job over
+    one bad sheet.  A batch in which *every* page was rejected does not return
+    an empty list either: the pipeline would hand that straight to
+    ``assemble_pdf([])`` and record a job that produced nothing as a success.
     """
 
     def test_a_mid_stack_integrity_failure_costs_exactly_one_page(
@@ -2549,7 +2522,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
 
 
 class TestAutoSourceRouting:
-    """Auto source conditional routing via auto_source_mode."""
+    """The Auto source routes by auto_source_mode; a named source ignores it."""
 
     def test_auto_source_adf_routes_to_adf_path(
         self,
@@ -2617,7 +2590,7 @@ class TestAutoSourceRouting:
 
 
 class TestAutoSourceRecognition:
-    """The Auto source is recognised by the classifier, not by == (Q8)."""
+    """The Auto source is recognised by the classifier, not by ==."""
 
     @pytest.mark.parametrize("reported", ["Auto", "auto", "  AUTO  "])
     def test_auto_is_recognised_whatever_its_spelling(
@@ -2630,9 +2603,8 @@ class TestAutoSourceRecognition:
         """
         A device spelling its Auto source differently still honours the routing.
 
-        ``effective_source == "Auto"`` was case- and whitespace-sensitive, so a
-        device reporting lowercase ``auto`` classified as AUTO, took the
-        single-page path and skipped the override entirely -- silently ignoring
+        A case- or whitespace-sensitive ``== "Auto"`` would send a device reporting
+        lowercase ``auto`` down the single-page path, silently ignoring
         ``auto_source_mode = "adf"`` and returning one page from a whole stack.
         """
         mock_dev = fake_sane_module.device
@@ -2696,12 +2668,10 @@ class TestAutoSourceRecognition:
         page_sink: SpooledPageSink,
     ) -> None:
         """
-        D-01, asserted so that reversing it flips a test rather than passing quietly.
+        An unrecognised source takes the single-page path and skips the override.
 
-        UNKNOWN keeps today's single-page routing.  C-06's safer default --
-        treat anything that is not the flatbed entry as multi-page -- was
-        DECLINED, not deferred.  ``auto_source_mode`` is set to ``"adf"`` here
-        precisely to show an unrecognised name does not reach the Auto
+        UNKNOWN is not treated as multi-page.  ``auto_source_mode`` is set to
+        ``"adf"`` here to show an unrecognised name does not reach the Auto
         override either.
         """
         mock_dev = fake_sane_module.device
@@ -2729,18 +2699,15 @@ def _options_reporting(sources: list[str]) -> list[tuple]:
 
 class TestResolveSourceForManualDuplex:
     """
-    Manual duplex resolves a real feeder from the device's own list (D-02, C-01).
+    Manual duplex resolves a real feeder from the device's own list.
 
-    ``"Manual Duplex"`` used to reach ``_resolve_source`` verbatim, where it
-    either raised or -- on a device offering ``Auto`` -- was silently swapped for
-    ``Auto``.  With ``auto_source_mode`` defaulting to ``"flatbed"``, that swap
-    took one platen snapshot per pass and reported a green Complete.  These
-    tests pin the feeder branch, and above all that the ``Auto`` substitution is
-    unreachable from it.
+    ``Auto`` is never substituted for a missing feeder: with
+    ``auto_source_mode`` defaulting to ``"flatbed"`` it would take one platen
+    snapshot per pass and report a green Complete.
 
     No expected feeder name here is a plain ``"ADF"``: real consumer feeders
-    report ``"Automatic Document Feeder"``, and a hardcoded ``"ADF"`` (the code
-    review's suggestion, declined by D-02) would fail on exactly that hardware.
+    report ``"Automatic Document Feeder"``, and a hardcoded ``"ADF"`` would
+    fail on exactly that hardware.
     """
 
     def test_selects_the_first_source_that_feeds(self) -> None:
@@ -2753,7 +2720,7 @@ class TestResolveSourceForManualDuplex:
         assert choice.has_option is True
 
     def test_a_single_sided_feeder_the_operator_named_is_honoured(self) -> None:
-        """An operator who picked one of two feeders gets that one (T-25-28)."""
+        """An operator who picked one of two feeders gets that one."""
         raw = _options_reporting(["Flatbed", "ADF Front", "Automatic Document Feeder"])
 
         choice = sane_backend_mod._resolve_source(
@@ -2766,7 +2733,7 @@ class TestResolveSourceForManualDuplex:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        A named ``"ADF Duplex"`` gives way to the single-sided feeder (WR-02).
+        A named ``"ADF Duplex"`` gives way to the single-sided feeder.
 
         A both-sides source returns 2N pages per pass, the two passes' counts
         agree, and interleaving them scrambles 4N pages into a green DONE. The
@@ -2795,7 +2762,7 @@ class TestResolveSourceForManualDuplex:
     def test_a_single_sided_feeder_wins_over_an_earlier_both_sides_one(
         self,
     ) -> None:
-        """The first *single-sided* feeder is chosen, not the first feeder (WR-02)."""
+        """The first *single-sided* feeder is chosen, not the first feeder."""
         raw = _options_reporting(["Flatbed", "ADF Duplex", "Automatic Document Feeder"])
 
         choice = sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
@@ -2804,7 +2771,7 @@ class TestResolveSourceForManualDuplex:
 
     def test_a_device_whose_only_feeder_scans_both_sides_is_refused(self) -> None:
         """
-        Only a both-sides feeder means refusal before any page (WR-02).
+        Only a both-sides feeder means refusal before any page.
 
         Using it with a WARNING would still end in a scrambled document beside
         a green DONE on an unattended appliance, so the operator is pointed at
@@ -2838,10 +2805,10 @@ class TestResolveSourceForManualDuplex:
 
     def test_auto_is_never_substituted_for_manual_duplex(self) -> None:
         """
-        C-01's mechanism, closed: ``Auto`` on offer still ends in a refusal.
+        ``Auto`` on offer still ends in a refusal, never a substitution.
 
-        Substituting ``Auto`` here is how a flatbed-only device used to take two
-        platen snapshots and report success.
+        Substituted, ``Auto`` would take two platen snapshots on a flatbed-only
+        device and report success.
         """
         raw = _options_reporting(["Flatbed", "Auto"])
 
@@ -2852,7 +2819,7 @@ class TestResolveSourceForManualDuplex:
 
     def test_no_source_option_trusts_a_configured_feeder_name(self) -> None:
         """
-        A sheet-fed device with no ``source`` option feeds without being told (WR-03).
+        A sheet-fed device with no ``source`` option feeds without being told.
 
         The simplex path already trusts the classifier on the configured name
         for such a device, so manual duplex does the same and nothing is
@@ -2865,7 +2832,7 @@ class TestResolveSourceForManualDuplex:
         assert (choice.effective, choice.has_option) == ("ADF", False)
 
     def test_no_source_option_accepts_the_legacy_manual_duplex_name(self) -> None:
-        """The pre-phase ``source = "Manual Duplex"`` profile runs again (WR-03)."""
+        """A ``source = "Manual Duplex"`` profile runs on a device with no source option."""
         raw = build_option_table(omit=("source",))
 
         choice = sane_backend_mod._resolve_source(
@@ -2875,7 +2842,7 @@ class TestResolveSourceForManualDuplex:
         assert (choice.effective, choice.has_option) == ("Manual Duplex", False)
 
     def test_no_source_option_refuses_a_non_feeder_name(self) -> None:
-        """A configured flatbed on a device with no source option is refused (WR-03)."""
+        """A configured flatbed on a device with no source option is refused."""
         raw = build_option_table(omit=("source",))
 
         with pytest.raises(ScanError, match="exposes no source option") as excinfo:
@@ -2928,7 +2895,7 @@ class TestResolveSourceForManualDuplex:
 
     def test_without_the_flag_a_missing_feeder_is_refused_not_auto(self) -> None:
         """
-        The simplex path no longer swaps ``Auto`` in for a feeder it lacks.
+        The simplex path refuses a missing feeder rather than swap ``Auto`` in.
 
         ``Auto`` routed by the default ``auto_source_mode`` takes one platen
         snapshot, so a stack would come back as one page reported as success.
@@ -2962,7 +2929,7 @@ class TestResolveSourceForManualDuplex:
         assert choice.substituted_from is None
 
     def test_scan_settings_does_not_resolve_a_feeder_by_default(self) -> None:
-        """Every existing simplex construction keeps today's behaviour."""
+        """ScanSettings resolves no feeder unless it is asked to."""
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
         assert settings.duplex == "none"
@@ -2989,7 +2956,7 @@ class TestResolveSourceForManualDuplex:
     def test_scan_pages_feeds_a_device_with_no_source_option(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """Manual duplex on a no-source-option device feeds the stack (WR-03)."""
+        """Manual duplex on a no-source-option device feeds the stack."""
         dev = FakeSaneDev(options=build_option_table(omit=("source",)))
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(
@@ -3027,7 +2994,7 @@ class TestResolveSourceForManualDuplex:
 
 
 class TestSaneBackendPerPageTimeout:
-    """Per-page timeout tests."""
+    """A page that takes too long raises ScanError; pages in time are spooled."""
 
     def test_page_timeout_raises_scan_error(
         self,
@@ -3088,11 +3055,11 @@ class TestSaneBackendPerPageTimeout:
 
 class TestSaneBackendCancelSequence:
     """
-    HARD-03 and HARD-04: cancel, wait, then close only if the read returned.
+    A timed-out read is cancelled and waited for, and closed only once it returns.
 
     Every test here arms the shared fake's Event-gated read, so nothing waits
     out a sleep: the block is ended by setting an ``Event``, and the only
-    bounded waits are the backend's own timeout and grace (TEST-02, D-16).
+    bounded waits are the backend's own timeout and grace.
 
     The ordering these tests assert is not a refinement.  ``sane_close`` runs
     holding the GIL while ``sane_read`` has released it, so a close racing a
@@ -3106,8 +3073,8 @@ class TestSaneBackendCancelSequence:
         """
         Release any blocked read and clear the wedge after each test here.
 
-        The record is module state by design -- D-13 needs the *next*
-        ``scan_pages`` on a fresh backend object to refuse -- so a test that
+        The record is module state by design -- the *next* ``scan_pages`` on
+        a fresh backend object has to refuse -- so a test that
         wedges it deliberately has to un-wedge it, or the refusal leaks into
         every test that runs afterwards.
 
@@ -3253,7 +3220,7 @@ class TestSaneBackendCancelSequence:
         wrong.  Measured on real libsane, a cancelled ``snap()`` returns a
         truncated image rather than raising, and that image clears
         ``_validate_page_image``: spooling it would put one more page in the
-        PDF than the error message claims (Pitfall 1, D-12).
+        PDF than the error message claims.
         """
         fake_device.block_read(ReadBlockMode.PARTIAL)
 
@@ -3280,20 +3247,17 @@ class TestSaneBackendCancelSequence:
         second_pass_sink: SpooledPageSink,
     ) -> None:
         """
-        D-13: every public entry point refuses, touching nothing.
+        Every public entry point of a wedged backend refuses, touching nothing.
 
         "No SANE call" is asserted as the device's own call log being
         byte-for-byte what it was, because the refusal has to happen before
-        ``sane.open()``.  Refusing after opening would be the very operation
-        the SANE standard forbids while a read is outstanding.
+        ``sane.open()``: opening is the very operation the SANE standard forbids
+        while a read is outstanding.
 
-        ``get_devices`` is included because it was the one entry point the
-        refusal missed, and the scan path reaches it: ``_resolve_device`` calls
-        it whenever ``scanner.device`` is empty -- the documented
-        auto-detection default -- and does so *before* ``scan_pages``, so the
-        refusal that would have stopped the job came too late.  On the ``net``
+        ``get_devices`` refuses too.  ``_resolve_device`` calls it before
+        ``scan_pages`` whenever ``scanner.device`` is empty, and on the ``net``
         backend ``sane_get_devices`` is an RPC on the same control wire the
-        stuck read is on (WR-04).
+        stuck read is on.
         """
         self._wedge(sane_backend, fake_device, page_sink)
         calls_before = list(fake_device.calls)
@@ -3351,7 +3315,7 @@ class TestSaneBackendCancelSequence:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        A wedged backend is not shut down, and the refusal is logged (D-18).
+        A wedged backend is not shut down, and the refusal is logged.
 
         ``sane_exit`` closes every open handle and runs holding the GIL, so it
         is the close-while-reading hazard applied to every handle at once.  An
@@ -3401,14 +3365,14 @@ class TestSaneBackendCancelSequence:
         page_sink: SpooledPageSink,
     ) -> None:
         """
-        HARD-04: one flatbed sheet is bounded exactly as one fed sheet is.
+        One flatbed sheet is bounded exactly as one fed sheet is.
 
-        The defaults are asserted alongside the behaviour because D-14's claim
-        is not merely "the flatbed times out" but "with the same constant, and
-        no new config key".  A second timeout that happened to be equal today
-        would satisfy the first half and quietly drift apart later.  The grace
-        is pinned for the same reason, and because it is the parameter that
-        makes the unresponsive-cancel path testable at all (WR-10).
+        The defaults are asserted alongside the behaviour because the claim is
+        not merely "the flatbed times out" but "with the same constant, and no
+        new config key".  A second timeout that happened to be equal would
+        satisfy the first half and quietly drift apart later.  The grace is
+        pinned for the same reason, and because it is the parameter that makes
+        the unresponsive-cancel path testable at all.
         """
         budget = (
             inspect.signature(sane_backend_mod._snap_flatbed)
@@ -3444,13 +3408,12 @@ class TestSaneBackendCancelSequence:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        The platen equivalent of ``test_did_not_respond_to_cancel`` (WR-10).
+        A platen scanner that never answers the cancel is reported, not closed.
 
-        D-14's claim is "one sheet is one sheet, whichever way it was
-        presented", and until the grace became injectable here there was no
-        flatbed version of this proof that did not wait out the module's real
-        ten seconds -- so the half of the claim that matters most, what happens
-        when the scanner ignores the cancel, was asserted only for the feeder.
+        The flatbed counterpart of ``test_did_not_respond_to_cancel``: one sheet
+        is one sheet, whichever way it was presented, including when the scanner
+        ignores the cancel.  The grace is injected through the page budget, so
+        the test does not wait out the module's real ten seconds.
         """
         fake_device.block_read(ReadBlockMode.NEVER)
         began = time.monotonic()
@@ -3490,7 +3453,7 @@ class TestSaneBackendCancelSequence:
         page_sink: SpooledPageSink,
     ) -> None:
         """
-        HARD-04's other half: the shared validation, fatal on the platen.
+        The shared page validation is fatal on the platen.
 
         A fed sheet that fails the same two checks is skipped and counted,
         because there is a next sheet to carry on to.  A flatbed exposes one
@@ -3522,30 +3485,17 @@ class TestSaneBackendCancelSequence:
         expected: type[BaseException],
     ) -> None:
         """
-        D-15: Ctrl-C during a read takes the same device-safe path, then re-raises.
+        Ctrl-C or SIGTERM during a read cancels and settles the device, then re-raises.
 
-        Parametrised over a SIGTERM that raises ``ScanInterrupted`` as well: a
-        signal that interrupts a one-shot command must leave the device
-        cancelled and settled exactly as Ctrl-C does, and the exception must
-        come back out unchanged so the command can keep the pages already
-        scanned.
+        The exception comes back out unchanged, so the CLI keeps its exit 130 and
+        a one-shot command keeps the pages already scanned.  The interrupt lands
+        well inside the thirty-second page budget: a wait that held it back until
+        the page timed out would prove the timeout path instead.
 
-        This closes the "safe device cancel on Ctrl-C mid-read" Phase 28
-        deferred to this phase.  Nothing about the operator-facing behaviour
-        moves: the ``KeyboardInterrupt`` is re-raised rather than swallowed or
-        translated into a ``ScanError``, so the CLI's exit 130 and its one-line
-        message are exactly what they were (Phase 28 D-07).  What changes is
-        the state the device is left in on the way out.
-
-        The interrupt is delivered deterministically, without a sleep and
-        without polling.  ``read_started`` is set by the reader thread from
-        inside the blocked read, so by the time the signal is sent the
-        waiting thread is provably past ``reader.start()`` and inside the
-        block that handles the interrupt.  The signal goes to the main thread
-        with ``pthread_kill``, which is where that wait runs: sent to the
-        interrupter's own thread with ``raise_signal``, it would only take
-        effect once the wait ended on its own, after the page timeout, and
-        the test would prove the timeout path instead of the interrupt.
+        ``read_started`` is set from inside the blocked read, so the signal is
+        sent only once the waiting thread is in the block that handles it.  It
+        goes to the main thread with ``pthread_kill``, which is where that wait
+        runs; ``raise_signal`` would deliver it to the interrupter's own thread.
         """
         fake_device.block_read(ReadBlockMode.PARTIAL)
         main_thread = threading.main_thread().ident
@@ -3565,15 +3515,19 @@ class TestSaneBackendCancelSequence:
         )
 
         with handling, sane_backend._open_device(_TEST_DEVICE) as dev:
+            began = time.monotonic()
             interrupter.start()
             with pytest.raises(expected):
                 sane_backend._scan_adf_pages(
                     dev,
                     page_sink,
                     _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=5.0),
+                    sane_backend_mod._PageBudget(timeout=30.0),
                 )
+            elapsed = time.monotonic() - began
             interrupter.join(_READER_JOIN_SECONDS)
+
+            assert elapsed < _INTERRUPT_BOUND_SECONDS
 
             assert fake_device.cancel_calls == 1
             assert fake_device.close_while_blocked is False
@@ -3592,11 +3546,10 @@ class TestSaneBackendCancelSequence:
         """
         After a feeder page times out, the only cancel is the one the timeout sent.
 
-        Three things used to send one each: the timeout's own canceller, the
-        feeder iterator's finaliser when it was dropped, and the device
-        context's routine cancel before close.  On the ``net`` backend each is
-        a request to a host that may have stopped answering, and the last two
-        ran on the worker thread with no bound.  Counted after the context has
+        Neither the feeder iterator's finaliser nor the device context's routine
+        cancel before close sends another.  On the ``net`` backend each cancel is
+        a request to a host that may have stopped answering, and those two would
+        run on the worker thread with no bound.  Counted after the context has
         exited and after a collection, so an iterator released late by a
         reference cycle would still be counted if it cancelled an open handle.
         """
@@ -3666,27 +3619,17 @@ class TestSaneBackendCancelSequence:
         interruption: BaseException,
     ) -> None:
         """
-        WR-05: Ctrl-C landing before the thread exists must not cancel or wedge.
+        Ctrl-C landing before the reader thread exists neither cancels nor wedges.
 
-        Parametrised over a signal's ``ScanInterrupted`` too, because the
-        handler that settles the device on Ctrl-C settles it for a signal
-        interruption as well, and must keep the same "no reader, nothing to
-        settle" guard for it.
+        Parametrised over a signal's ``ScanInterrupted`` too, which takes the same
+        settle path.  With no reader, a cancel would hit a handle holding no read
+        and the grace would be waited out on an event nothing sets; the wedge then
+        recorded could never clear, because only a reader's ``finally`` releases
+        it, and every later scan would refuse.
 
-        ``reader.start()`` sits inside the guarded block so that an interrupt
-        arriving once the thread exists cannot abandon it uncancelled.  The
-        other end of that window is the expensive one: with no reader, the D-12
-        tail fired ``dev.cancel()`` on a handle holding no read, waited out the
-        whole grace on an event nothing would ever set, and then recorded a
-        wedge that could never be cleared -- ``_release_wedge`` runs only from a
-        reader's ``finally``, and there is no reader.  Every later scan would
-        have refused and ``shutdown()`` would have skipped ``sane.exit()`` for
-        the rest of the process.
-
-        Only the *reader* thread is interrupted, so the cancel thread would
-        start normally if the handler reached for it; ``cancel_calls`` is
-        therefore a real assertion and not one the stub satisfies by accident.
-        The elapsed bound is what pins "did not wait out the grace".
+        Only the *reader* thread is interrupted, so the cancel thread would start
+        normally if the handler reached for it; ``cancel_calls`` is therefore a
+        real assertion.  The elapsed bound pins "did not wait out the grace".
         """
         reader_prefix = sane_backend_mod._READER_THREAD_PREFIX
 
@@ -3919,19 +3862,15 @@ class TestSaneBackendCancelSequence:
         """
         Ctrl-C pressed twice leaves the stuck read recorded, not closed under.
 
-        The first interrupt lands while the page is being read and starts the
-        cancel; the second lands while the worker waits out the grace for a
-        read that ignores the cancel.  The wedge was written before the cancel
-        fired, so the second interrupt cannot skip it: the device context
-        leaves the handle alone, the next scan is refused, and the handle is
-        closed by the reader when the late read returns.
+        The first interrupt lands during the read and starts the cancel; the
+        second lands while the worker waits out the grace for a read that ignores
+        the cancel.  The wedge is written before the cancel fires, so the second
+        interrupt cannot skip it: the device context leaves the handle alone, the
+        next scan is refused, and the reader closes the handle when it returns.
 
-        Both signals go to the main thread with ``pthread_kill``, which is
-        where the wait they interrupt is running.  ``raise_signal`` would
-        deliver them to the interrupter thread instead, and the main thread
-        would notice only when its wait ended on its own.  Each signal waits
-        on the fake's event for the moment it is meant to hit, so there is no
-        sleep.
+        Both signals go to the main thread with ``pthread_kill``, where the wait
+        they interrupt runs.  Each waits on the fake's event for the moment it is
+        meant to hit, so there is no sleep.
         """
         fake_device.block_read(ReadBlockMode.NEVER)
         main_thread = threading.main_thread().ident
@@ -3984,6 +3923,34 @@ class TestSaneBackendCancelSequence:
         assert _wedged() is False
 
 
+class TestBeginSettle:
+    """Recording a wedge before a cancel leaves a read that has returned alone."""
+
+    def test_an_already_finished_read_is_not_marked_wedged(
+        self, sane_backend: SaneBackend
+    ) -> None:
+        """
+        A read whose done event is already set is not recorded as wedged.
+
+        The reader can return in the instant between the page timeout and the
+        settle.  Recorded then, the wedge would refuse every later scan over a
+        handle nothing is blocked in.
+        """
+        done = threading.Event()
+        done.set()
+
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            try:
+                settling = sane_backend_mod._begin_settle(dev, done, "Page 1")
+                stuck = _wedged()
+            finally:
+                with sane_backend_mod._WEDGE_LOCK:
+                    sane_backend_mod._clear_wedge()
+
+        assert settling is False
+        assert stuck is False
+
+
 class TestReinitialise:
     """
     The per-job SANE restart, and the two states in which it must not run.
@@ -3991,8 +3958,8 @@ class TestReinitialise:
     After a saned restart, an open in this process keeps failing with an I/O
     error until SANE is restarted, so each scan job starts by restarting it.
     ``sane_exit`` closes every open handle with a close request that waits for
-    a reply, and on a host that has silently vanished that wait was measured
-    to last longer than 40 seconds.  So the restart is refused, with no SANE
+    a reply, and on a host that has silently vanished that wait can last
+    longer than 40 seconds.  So the restart is refused, with no SANE
     call at all, while a read is stuck or any handle is open.  "No SANE call"
     is asserted on the fake's own counters, because a refusal that came after
     ``sane_exit`` would already be too late.

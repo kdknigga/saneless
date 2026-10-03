@@ -3,7 +3,7 @@ Integration tests that drive the real SANE ``test`` backend.
 
 Every other scanner test in this suite talks to a double.  This module talks
 to libsane, so that a fake which has drifted from the library cannot keep a
-defect green on its own (M-32).  It is gated behind the ``sane_hardware``
+defect green on its own.  It is gated behind the ``sane_hardware``
 marker and deselected by the default command.
 
 No extra apt package is needed to run these: ``libsane-dev`` depends on
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 # The free-space reserve these sinks keep beyond the page being written.  Zero
 # for the same reason the in-process scanner tests use zero: these tests are
-# about libsane, not about D-07's shortfall arithmetic, and a positive reserve
+# about libsane, not about the spool's shortfall arithmetic, and a positive reserve
 # would fail them on a CI runner with a nearly full disk.
 _NO_FREE_SPACE_RESERVE = 0
 
@@ -58,6 +58,13 @@ _SLOW_READ_OPTIONS: tuple[tuple[str, object], ...] = (
     ("resolution", 1200),
 )
 
+# The same options under the names the device lists them by.  python-sane
+# stores an unknown attribute without complaint, so a libsane whose test
+# backend lacks them is only detectable by asking the device.
+_READ_DELAY_OPTION_NAMES = frozenset(
+    {"read-delay", "read-delay-duration", "read-limit", "read-limit-size"}
+)
+
 # How long the cancel test lets the read run before bounding it.  Long enough
 # that the read is provably under way and short enough to keep the test brisk;
 # the measured read was still blocked after three seconds with these options.
@@ -72,8 +79,8 @@ _SANE_PORT = 6566
 # libsane from hanging the suite.
 _SUBPROCESS_TIMEOUT_SECONDS = 60
 
-# Raw python-sane listing twice in one process: the call sequence
-# SaneBackend.get_devices() made in-process before listing moved to a child.
+# Raw python-sane listing twice in one process: the in-process call sequence
+# that SaneBackend.get_devices() avoids by listing in a child.
 _RAW_LISTS_TWICE = (
     "import sane; sane.init(); "
     "print(len(sane.get_devices()), flush=True); "
@@ -172,30 +179,26 @@ def _sane_config_dir(sane_test_backend_config: None) -> None:
 
 @pytest.mark.sane_hardware
 class TestRealSaneTestBackend:
-    """SCNR-08: enumerate, interrogate and scan the real ``test`` device."""
+    """The real ``test`` device enumerates, reports its capabilities and scans."""
 
     def test_enumeration_lists_the_test_device(self) -> None:
         """
         The configured backend appears by name.
 
-        The assertion is positive on purpose.  In CI there is no real
-        scanner, so an empty device list and a missing test backend look
-        identical -- a "list is not empty" assertion would pass for the wrong
-        reason with a half-broken fixture, and would also pass on a developer
-        machine that had leaked its own scanner into the list.
+        The assertion is positive: with no real scanner in CI, an empty list and
+        a missing test backend look identical, and "list is not empty" would pass
+        with a half-broken fixture or a developer's own scanner leaked in.
 
-        The guard check comes first, and it is not defensive padding.  The
-        process-global init guard (D-17) makes ``SaneBackend()`` a no-op when
-        some earlier test in the same process left it set over a fake ``sane``
-        module, and the only symptom is this empty list -- a diagnosis nobody
-        would reach from ``assert 'test:0' in []``.  Naming the real cause here
-        is what turns that into a one-line answer.
+        The guard check comes first because the process-global init guard makes
+        ``SaneBackend()`` a no-op when an earlier test left it set over a fake
+        ``sane`` module, and the only symptom is this empty list.  Naming that
+        cause turns the failure into a one-line answer.
         """
         assert sane_backend_mod._INIT.done is False, (
             "SANE was already marked initialised before this test constructed a "
             "backend, so sane.init() was skipped and the device list is empty "
             "for a reason that has nothing to do with libsane: an earlier test "
-            "leaked the process-global init guard (D-17)"
+            "leaked the process-global init guard"
         )
         names = [device.name for device in SaneBackend().get_devices()]
         assert "test:0" in names
@@ -207,13 +210,11 @@ class TestRealSaneTestBackend:
 
     def test_capabilities_report_the_resolution_range_the_device_gave(self) -> None:
         """
-        SCNR-06 proven against real libsane rather than against a double.
+        The device's resolution range is reported as the range it gave.
 
-        ``test:0`` constrains resolution with the measured range
-        ``(1.0, 1200.0, 1.0)``.  ``get_capabilities`` read only the word-list
-        shape, so that answer was discarded and this line would have read
-        ``[] == (1.0, 1200.0, 1.0)`` -- this is the assertion plan 24-01
-        deliberately deferred, and the one that would have caught N-01.
+        ``test:0`` constrains resolution with the range ``(1.0, 1200.0, 1.0)``,
+        and real libsane, not a double, is what shows ``get_capabilities`` reads
+        a range as well as a word list.
 
         The word list stays empty on purpose.  The device gave a range and no
         list, the two are different facts, and neither is synthesised from the
@@ -229,19 +230,11 @@ class TestRealSaneTestBackend:
         """
         Ten sheets in the feeder yield ten pages.
 
-        This assertion could not have passed before plan 24-04, and that is
-        what makes it worth having.  The ``test`` backend's default picture is
-        solid black, and the scanner backend used to discard any page whose
-        statistics read as pure black -- so all ten sheets were destroyed
-        inside ``scan_pages``, this line read ``assert 0 == 10``, and ten skip
-        warnings named the pages one by one.
-
-        What it proves now is that the feeder is drained end to end against
-        real libsane: the long ADF source name routes to the multi-page path,
-        ten sheets are taken off it, are spooled one at a time, and nothing is
-        thrown away on the way out.  The count assertion is unchanged from the
-        day it was written; only the behaviour underneath it moved (D-05, and
-        now D-01).
+        The ``test`` backend's default picture is solid black, so a backend that
+        discarded black pages would destroy all ten here.  The feeder is drained
+        end to end against real libsane: the long ADF source name routes to the
+        multi-page path, ten sheets are taken off it and spooled one at a time,
+        and nothing is thrown away on the way out.
 
         Args:
             tmp_path: Where the ten pages are spooled.
@@ -255,7 +248,7 @@ class TestRealSaneTestBackend:
         )
         assert len(pages) == 10
         # Order is the records' own and the files really exist -- against real
-        # libsane, not against a double (D-02).
+        # libsane, not against a double.
         assert [record.sequence for record in pages] == list(range(1, 11))
         assert all(record.path.exists() for record in pages)
 
@@ -305,19 +298,11 @@ class TestRealSaneTestBackend:
         """
         All ten pages come back, and every one of them is uniformly black.
 
-        SCNR-03 proven against real hardware instead of against a double.  The
-        ``test`` backend hands back solid black -- exactly the page the deleted
-        content policy keyed on -- so this
-        is the strongest evidence available that the scanner layer no longer
-        judges a page by what is printed on it.  Whether a blank page is worth
-        keeping is decided one layer up, under the profile's
-        ``enable_empty_page_detection`` toggle, where the user can see it.
-
-        Asserted twice over, because the two say different things.  The record's
-        measurement is what the pipeline's blank-page filter will actually
-        judge, made once at spool time; the read-back through ``images_of``
-        proves the spooled PNG -- the file the PDF embeds -- really holds those
-        pixels.
+        The ``test`` backend hands back solid black, so this shows the scanner
+        layer does not judge a page by what is printed on it; whether a blank
+        page is kept is a profile setting one layer up.  The record's measurement
+        is what the pipeline's blank-page filter judges, and the read-back
+        through ``images_of`` proves the spooled PNG really holds those pixels.
 
         Args:
             tmp_path: Where the ten pages are spooled.
@@ -366,7 +351,7 @@ class TestRealSaneDepth:
             None, while the device is at depth 16.
 
         """
-        assert SaneBackend() is not None  # the constructor runs sane.init()
+        SaneBackend()  # the constructor runs sane.init()
         sane = sane_backend_mod._ensure_sane()
         handle = sane.open("test:0")
         try:
@@ -429,7 +414,7 @@ class TestRealSaneDepth:
 @pytest.mark.sane_hardware
 class TestRealSaneCancelSequence:
     """
-    HARD-03's D-12 sequence, proven once against libsane instead of a double.
+    The timeout's cancel sequence holds against libsane, not only against a double.
 
     Everywhere else the cancel path is driven through an Event-gated fake, and
     a fake is exactly what cannot answer the question this class asks: whether
@@ -450,17 +435,16 @@ class TestRealSaneCancelSequence:
         ignoring the cancel.  ``close()`` afterwards is the last link -- it is
         the call the frontend may make only once the read has returned.
         """
-        backend = SaneBackend()
-        assert backend is not None  # the constructor is what ran sane.init()
+        SaneBackend()  # the constructor runs sane.init()
         device = sane_backend_mod._ensure_sane().open("test:0")
         try:
-            try:
-                device.source = "Automatic Document Feeder"
-                device.mode = "Gray"
-                for name, value in _SLOW_READ_OPTIONS:
-                    setattr(device, name, value)
-            except AttributeError:
+            offered = {option[1] for option in device.get_options()}
+            if not offered >= _READ_DELAY_OPTION_NAMES:
                 pytest.skip("this libsane test backend has no read-delay options")
+            device.source = "Automatic Document Feeder"
+            device.mode = "Gray"
+            for name, value in _SLOW_READ_OPTIONS:
+                setattr(device, name, value)
 
             def start_and_snap() -> Image.Image:
                 device.start()
@@ -490,19 +474,16 @@ class TestRealSaneCancelSequence:
 @pytest.mark.sane_hardware
 class TestLostControlConnection:
     """
-    ENUM-04: a saned that drops the control connection crashes raw libsane only.
+    A saned that drops the control connection crashes raw libsane only.
 
     libsane's net backend keeps one control connection per host open between
     listings.  Once the saned at the other end restarts, the next listing
-    sends its request on the dead connection, ignores the failed status and
-    reads a reply that was never filled in, and the process dies.  The fake
+    reads a reply that was never filled in, and the process dies; the fake
     saned here lists once and closes, which is exactly that.
 
-    All three tests run their client in a subprocess.  The control crashes by
-    design, and the fix path runs there too, so that a regression back to
-    listing in-process fails that one test rather than killing the whole
-    ``sane_hardware`` run.  They listen on port 6566, the only port libsane
-    dials; if something already listens there, they fail naming the port.
+    All three tests run their client in a subprocess, so a crash fails one
+    test rather than the whole ``sane_hardware`` run.  They listen on port
+    6566, the only port libsane dials, and fail naming it if it is taken.
     """
 
     def test_raw_libsane_dies_when_the_control_connection_drops(
