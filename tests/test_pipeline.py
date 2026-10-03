@@ -4221,12 +4221,10 @@ def _preserved_page_counts(failed_dir: Path) -> dict[str, int]:
 
 class TestPassBAndFlipFailuresKeepTheFronts:
     """
-    D-10: every way pass A's fronts can be lost now keeps them.
+    Every failure after pass A that nobody chose keeps pass A's fronts.
 
-    The gap this closes was written into ``_scan_manual_duplex`` itself -- "The
-    fronts are still lost here; keeping them needs Phase 29's spooling" -- and
-    the halves are named exactly as the duplex-mismatch recovery already names
-    them, so an operator finds the same two artefacts either way.
+    The halves are named exactly as the duplex-mismatch recovery names them,
+    so an operator finds the same two artefacts either way.
     """
 
     def test_pass_b_preserves_fronts_when_the_scanner_fails(
@@ -4305,8 +4303,8 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         """
         A pass B that fed nothing still keeps the fronts.
 
-        The existing message is unchanged; the preservation sentence follows it
-        as a note, exactly as it follows a delivery failure's.
+        The empty-pass-B message comes first; the preservation sentence follows
+        it as a note, exactly as it follows a delivery failure's.
         """
         failed_dir = _duplex_settings(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
@@ -4339,7 +4337,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Nobody chose to stop, so the fronts are kept (D-10, Phase 28 D-02)."""
+        """A flip wait that times out keeps the fronts: nobody chose to stop."""
         failed_dir = _duplex_settings(default_settings, tmp_path)
         default_settings.output.operator_wait_timeout_seconds = 17
         scanner = MagicMock(spec=ScannerBackend)
@@ -4444,7 +4442,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         tmp_path: Path,
     ) -> None:
         """
-        D-10 applies to each manual-duplex pass, not only to pass B.
+        A failure in pass A keeps the fronts fed so far, as one in pass B does.
 
         Nobody is asked to flip, so only one half exists and it is named as
         the fronts it is.
@@ -4520,14 +4518,12 @@ def _preserve_one_scan(settings: Settings, job_id: str) -> PaperlessError:
 
 class TestFailedDirWarningFiresOncePerGuard:
     """
-    One guard preserving two PDFs warns once, not once per file (WR-09).
+    One guard preserving two PDFs warns once, not once per file.
 
     A failed duplex-mismatch delivery keeps both halves in one preservation,
-    because they are one document between them (D-08).  Running the
-    threshold check inside the per-file loop therefore emitted the
-    same "N preserved scans have accumulated" WARNING twice, with different
-    counts -- log noise on the one path already flagged as an anomaly, and a
-    contradiction of the helper's own "one WARNING" docstring.
+    because they are one document between them.  A threshold check per moved
+    file would log the "N preserved scans have accumulated" WARNING twice,
+    with different counts, on the one path already flagged as an anomaly.
     """
 
     def _two_scans(self, tmp_path: Path) -> list[Path]:
@@ -4540,8 +4536,9 @@ class TestFailedDirWarningFiresOncePerGuard:
     def _preserve_both(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> Path:
         """Fail one delivery holding two PDFs, and return the failed dir."""
         failed_dir = tmp_path / "failed"
-        # One short of the threshold, so the per-file call crossed it on the
-        # first move and again on the second -- two warnings for one failure.
+        # One short of the threshold, so a check per moved file would cross it
+        # on the first move and again on the second -- two warnings for one
+        # failure.
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
         pdfs = self._two_scans(tmp_path)
         artefacts = preservation_module.RunArtefacts(
@@ -4590,7 +4587,7 @@ class TestFailedDirWarningFiresOncePerGuard:
 
 
 class TestFailedDirWarning:
-    """Warn -- never prune -- when preserved scans accumulate (T-23-29)."""
+    """Accumulating preserved scans are warned about and never pruned."""
 
     def test_failed_dir_warns_when_the_threshold_is_reached(
         self,
@@ -4688,7 +4685,7 @@ class TestFailedDirWarning:
 
         The growth check runs inside the preservation guard's own exception
         handler, so a raise there would swap the delivery failure -- the
-        message OUTC-04 requires the job to carry -- for a bookkeeping error.
+        message the job must carry -- for a bookkeeping error.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         real_glob = Path.glob
@@ -4745,14 +4742,12 @@ def _preserved_page_dirs(failed_dir: Path) -> list[Path]:
 
 class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
     """
-    WR-03: D-10's page-file fallback now covers the *partial* assembly too.
+    The page-file fallback covers the assembly of a partial scan.
 
-    It was wired only around ``run_pipeline``'s main ``assemble_pdf``. The
-    realistic trigger is the same fault twice over: D-07's per-page check
+    The realistic trigger is one fault twice over: the per-page space check
     refuses a sheet because the disk is full, the partial-scan guard fires,
-    ``assemble_pdf`` then also cannot write, and every page the guard exists to
-    keep went out with the workspace at exactly the moment the operator most
-    needed them.
+    and ``assemble_pdf`` cannot write either.  Without the fallback every page
+    the guard exists to keep would go out with the workspace.
     """
 
     def test_an_unassemblable_partial_still_keeps_the_page_files(
@@ -4844,7 +4839,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
         tmp_path: Path,
     ) -> None:
         """
-        D-10 is unchanged: the operator chose to stop, so nothing is filed.
+        A cancel files nothing, fallback or not: the operator chose to stop.
 
         The fallback lives inside the broad handler, below the cancel
         re-raise, and this is the assertion that keeps it there.
@@ -4870,14 +4865,13 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
 
 class TestPreservationNamesWhatItDidKeep:
     """
-    WR-02: a preservation that got half-way must not report a total loss.
+    A preservation that got half-way names what it kept, not a total loss.
 
     The preservation moves artefacts one at a time, so a failure part-way
-    through leaves some of them sitting in ``failed/``.  Saying the scan
-    "could NOT be preserved" then would be told nothing was saved when some of
-    it was -- the more expensive half: an operator who believes it rescans and
-    never looks in a directory saneless never prunes.  The report names what
-    did land, and "could NOT" is kept for the case where nothing did.
+    through leaves some of them sitting in ``failed/``.  An operator told the
+    scan "could NOT be preserved" rescans and never looks in a directory
+    saneless never prunes.  The report names what did land, and "could NOT"
+    is kept for the case where nothing did.
     """
 
     def test_a_half_preserved_partial_scan_names_the_half_it_kept(
@@ -4927,7 +4921,7 @@ class TestPreservationNamesWhatItDidKeep:
         assert len(kept) == 1
         assert "fronts" in kept[0].name
         message = failure_text(excinfo.value)
-        # Both failures are still reported, which is the existing contract.
+        # Both failures are reported.
         assert "Paper jam" in message
         assert "qpdf refused the backs" in message
         # The file that is really sitting there is named, and nothing claims
@@ -4998,10 +4992,10 @@ class TestPreservationNamesWhatItDidKeep:
         tmp_path: Path,
     ) -> None:
         """
-        The total-loss sentence is unchanged, because it was true.
+        A preservation that kept nothing says the scan could NOT be preserved.
 
-        Only the half-way case was misreporting; widening the new wording over
-        both would make every preservation failure read as a partial one.
+        Using the half-way wording here as well would make every preservation
+        failure read as a partial one.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         failed_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -5152,12 +5146,11 @@ class TestPreservationNamesWhatItDidKeep:
 
 class TestAssemblyFailureKeepsThePageFiles:
     """
-    D-10: no PDF could be built, so the pages themselves are what is kept.
+    When no PDF can be built, the page files themselves are kept.
 
-    Phase 28 deferred this case. The spool holds real files, so an assembly
-    failure moves them into ``failed/<job-keyed-name>/`` -- a second *kind* of
-    artefact in a directory that until now held only PDFs, which is why the
-    growth check has to learn about it too.
+    An assembly failure moves the spooled files into
+    ``failed/<job-keyed-name>/``, a second kind of artefact beside the
+    preserved PDFs, which the growth check counts too.
     """
 
     def test_a_pdf_error_moves_the_page_files_into_a_job_keyed_directory(
@@ -5446,11 +5439,11 @@ def _preserved_pages_dir(failed_dir: Path, name: str, page_bytes: int) -> Path:
 
 class TestFailedDirCountsPreservedPageDirectories:
     """
-    D-10: ``failed/`` holds two kinds of artefact now, and both are counted.
+    The growth check counts both kinds of artefact in ``failed/``.
 
-    A growth check that only globbed ``*.pdf`` would under-report a directory
-    filling up with preserved page directories -- silently, which is the one
-    thing T-29-36's warning exists to prevent.
+    A check that only globbed ``*.pdf`` would silently under-report a
+    directory filling up with preserved page directories, which is the one
+    thing the warning exists to prevent.
     """
 
     def test_failed_dir_counts_directories_towards_the_threshold(
@@ -5505,9 +5498,9 @@ class TestFailedDirCountsPreservedPageDirectories:
         """
         A directory removed underneath the walk ends the check silently.
 
-        The walk lives inside the existing ``try``, so it returns through the
-        same ``except OSError`` that has always kept a bookkeeping failure from
-        displacing the delivery failure already in flight.
+        The walk runs inside the check's ``try``, so it returns through the
+        ``except OSError`` that keeps a bookkeeping failure from displacing the
+        delivery failure already in flight.
         """
         failed_dir = tmp_path / "failed"
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD)
@@ -5579,14 +5572,14 @@ def _both_halves_delivered() -> MagicMock:
 
 
 class TestDuplexMismatchDelivery:
-    """D-08: the duplex-mismatch path gets the same honesty as the simplex one."""
+    """The duplex-mismatch path confirms, preserves and reports like the simplex one."""
 
     def test_duplex_mismatch_polls_both_halves(
         self,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Leaving either task unpolled is C-03 surviving in a corner."""
+        """Both halves' tasks are polled, so neither is reported filed unconfirmed."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -5750,18 +5743,14 @@ class TestDuplexMismatchDelivery:
         tmp_path: Path,
     ) -> None:
         """
-        A PdfError on the fronts half keeps both passes' page files (CR-01).
+        A PdfError on the fronts half keeps both passes' page files.
 
-        This arm returns early from ``run_pipeline``, so neither guard that
-        function opens is in scope: the partial-scan guard has closed and the
-        page-file guard sits on the branch this path never reaches.  Until the
-        assembly here got a guard of its own, a full disk or a page file
-        Pillow could no longer read unwound the workspace and deleted every
-        sheet of *both* passes -- on the one path whose whole reason to exist
-        is handing an anomaly to a person.
-
-        The assertion is on the file names and not merely on a count, because
-        keeping only the half that assembled would satisfy a count.
+        This arm returns early from ``run_pipeline``, outside the guards that
+        function opens, so its assembly needs a guard of its own: without it
+        a full disk or an unreadable page file would delete every sheet of
+        both passes, on the one path that exists to hand an anomaly to a
+        person.  The assertion is on the file names, because keeping only the
+        half that assembled would satisfy a count.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF"
@@ -5808,7 +5797,7 @@ class TestDuplexMismatchDelivery:
         tmp_path: Path,
     ) -> None:
         """
-        The guard spans both assembly calls, not just the first (CR-01).
+        The guard spans both assembly calls, not just the first.
 
         A guard wrapped around the fronts alone would leave the backs
         unprotected and still pass the sibling test above, so the failure is
@@ -5855,7 +5844,7 @@ class TestDuplexMismatchDelivery:
         """
         The stages do not overlap: an upload failure keeps the PDFs only.
 
-        D-08 keeps both halves when either upload fails, and the page files
+        Both halves are kept when either upload fails, and the page files
         are kept only when the assembly is what failed.  Keeping both would
         file the same two passes twice -- once as the partial PDFs and again as
         the page files they were built from -- and leave the operator two
@@ -5949,7 +5938,7 @@ class TestDuplexMismatchDelivery:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """OUTC-03: the worker needs an outcome, a warning and three counts."""
+        """A mismatch result carries the outcome, a warning and all three counts."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
