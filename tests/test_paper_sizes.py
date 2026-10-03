@@ -1,4 +1,4 @@
-"""Tests for paper size dimension lookup, crop utility, and config integration."""
+"""Paper sizes have fixed dimensions, crop images to fit, and validate in config."""
 
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ from saneless.scanner.base import ScanSettings
 
 
 class TestPaperSizeLiteral:
-    """PaperSize Literal type tests."""
+    """The set of paper-size names."""
 
     def test_paper_size_literal_includes_all_sizes(self) -> None:
-        """PaperSize Literal includes full, a3, a4, a5, letter, legal."""
+        """The paper sizes are exactly full, a3, a4, a5, letter and legal."""
         args = get_args(PaperSize)
         assert set(args) == {"full", "a3", "a4", "a5", "letter", "legal"}
 
@@ -46,44 +46,44 @@ class TestPaperSizeHasOneDefinition:
 
 
 class TestPaperSizesMM:
-    """PAPER_SIZES_MM constant tests."""
+    """Each paper size's width and height in millimetres."""
 
     def test_a4_dimensions(self) -> None:
-        """PAPER_SIZES_MM['a4'] is (210.0, 297.0)."""
+        """A4 is 210 by 297 mm."""
         assert PAPER_SIZES_MM["a4"] == (210.0, 297.0)
 
     def test_letter_dimensions(self) -> None:
-        """PAPER_SIZES_MM['letter'] is (215.9, 279.4)."""
+        """Letter is 215.9 by 279.4 mm."""
         assert PAPER_SIZES_MM["letter"] == (215.9, 279.4)
 
     def test_legal_dimensions(self) -> None:
-        """PAPER_SIZES_MM['legal'] is (215.9, 355.6)."""
+        """Legal is 215.9 by 355.6 mm."""
         assert PAPER_SIZES_MM["legal"] == (215.9, 355.6)
 
     def test_a3_dimensions(self) -> None:
-        """PAPER_SIZES_MM['a3'] is (297.0, 420.0)."""
+        """A3 is 297 by 420 mm."""
         assert PAPER_SIZES_MM["a3"] == (297.0, 420.0)
 
     def test_a5_dimensions(self) -> None:
-        """PAPER_SIZES_MM['a5'] is (148.0, 210.0)."""
+        """A5 is 148 by 210 mm."""
         assert PAPER_SIZES_MM["a5"] == (148.0, 210.0)
 
     def test_full_not_in_paper_sizes(self) -> None:
-        """'full' is NOT in PAPER_SIZES_MM (it means no constraint)."""
+        """'full' has no dimensions, because it means the whole bed."""
         assert "full" not in PAPER_SIZES_MM
 
 
 class TestCropToPaperSize:
-    """crop_to_paper_size function tests."""
+    """Cropping a scanned image to the chosen paper size."""
 
     def test_full_returns_unchanged(self) -> None:
-        """crop_to_paper_size returns image unchanged when paper_size is 'full'."""
+        """'full' returns the very image it was given."""
         img = Image.new("RGB", (3000, 4000), "red")
         result = crop_to_paper_size(img, "full", 300)
         assert result is img
 
     def test_unknown_size_returns_unchanged(self) -> None:
-        """crop_to_paper_size returns image unchanged when paper_size not in PAPER_SIZES_MM."""
+        """A size with no dimensions returns the very image it was given."""
         img = Image.new("RGB", (3000, 4000), "red")
         # Past the type, as an unvalidated caller would: the guard is for them.
         unknown = cast("PaperSize", "unknown_size")
@@ -91,50 +91,50 @@ class TestCropToPaperSize:
         assert result is img
 
     def test_a4_at_300dpi_crops_correctly(self) -> None:
-        """crop_to_paper_size with 'a4' at 300 DPI crops to (2480, 3508) pixels."""
-        # A4 at 300 DPI: 210 * 300 / 25.4 = 2480.31, rounds to 2480
-        # A4 at 300 DPI: 297 * 300 / 25.4 = 3507.87, rounds to 3508
+        """A4 at 300 DPI crops to 2480 by 3508 pixels."""
+        # 210 * 300 / 25.4 = 2480.31, rounds to 2480
+        # 297 * 300 / 25.4 = 3507.87, rounds to 3508
         img = Image.new("RGB", (5000, 6000), "red")
         result = crop_to_paper_size(img, "a4", 300)
         assert result.size == (2480, 3508)
 
     def test_clamps_to_image_dimensions(self) -> None:
-        """crop_to_paper_size clamps to image dimensions when crop exceeds image size."""
-        # Small image: crop would be larger than image
+        """An image smaller than the paper size is left at its own size."""
+        # The A4 crop is far larger than this image.
         img = Image.new("RGB", (100, 100), "red")
         result = crop_to_paper_size(img, "a4", 300)
         assert result.size == (100, 100)
 
 
 class TestProfileConfigPaperSize:
-    """ProfileConfig paper_size field tests."""
+    """A profile's paper_size accepts only known sizes."""
 
     def test_a4_validates(self) -> None:
-        """ProfileConfig(paper_size='a4') validates successfully."""
+        """A profile with paper_size 'a4' validates."""
         p = ProfileConfig(paper_size="a4")
         assert p.paper_size == "a4"
 
     def test_full_validates(self) -> None:
-        """ProfileConfig(paper_size='full') validates successfully."""
+        """A profile with paper_size 'full' validates."""
         p = ProfileConfig(paper_size="full")
         assert p.paper_size == "full"
 
     def test_invalid_raises_validation_error(self) -> None:
-        """ProfileConfig(paper_size='invalid') raises ValidationError."""
+        """An unknown paper_size is refused with a ValidationError."""
         with pytest.raises(ValidationError):
             ProfileConfig.model_validate({"paper_size": "invalid"})
 
 
 class TestScanSettingsPaperSize:
-    """ScanSettings paper_size field tests."""
+    """The paper size a scan's settings carry."""
 
     def test_default_is_full(self) -> None:
-        """ScanSettings defaults paper_size to 'full'."""
+        """Scan settings default to the full bed."""
         s = ScanSettings(source="Flatbed", resolution=300, mode="color")
         assert s.paper_size == "full"
 
     def test_accepts_paper_size(self) -> None:
-        """ScanSettings accepts paper_size parameter."""
+        """Scan settings keep the paper size they are given."""
         s = ScanSettings(
             source="Flatbed", resolution=300, mode="color", paper_size="a4"
         )

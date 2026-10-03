@@ -1,12 +1,12 @@
 """
-Tests for the wording of a multi-page scan's prompts, on the web and in a terminal.
+A multi-page scan's prompts read word for word, on the web and in a terminal.
 
 Every sentence the operator reads between the passes of a multi-page document
 comes from the vocabulary module: the web prompt's headline, buttons and notes,
 the abort confirmation, the Multiple pages checkbox's label and help line, and
-the ``--multi-page`` option's help, refusals and single-letter prompts.  These
-tests pin each of those strings verbatim, so the web page and the terminal
-cannot drift apart and no template or command has to compose prose of its own.
+the ``--multi-page`` option's help, refusals and single-letter prompts.  Each
+is pinned verbatim, so the web page and the terminal cannot drift apart and no
+template or command composes prose of its own.
 """
 
 from __future__ import annotations
@@ -425,7 +425,7 @@ class TestRetryPrompt:
         )
 
     def test_error_override_replaces_the_raw_text(self) -> None:
-        """The web passes scrubbed text, which is what the detail line shows."""
+        """The detail line shows the scrubbed text it is given, not the raw error."""
         copy = pass_prompt_copy(
             _prompt(PassWait.RETRY, pages_kept=4, error="/home/op/raw"),
             error="scrubbed",
@@ -456,7 +456,7 @@ class TestFormAndOptionWording:
     """The checkbox on the scan form and the ``--multi-page`` option."""
 
     def test_checkbox_wording(self) -> None:
-        """The label, its help line and its manual-duplex reason."""
+        """The checkbox's label, help line and manual-duplex reason read verbatim."""
         assert MULTI_PAGE_LABEL == "Multiple pages"
         assert MULTI_PAGE_HELP == (
             "Asks after each scan whether there is another page, and puts every "

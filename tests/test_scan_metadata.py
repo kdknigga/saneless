@@ -1,8 +1,8 @@
 """
-Tests for the scan metadata policy and the stale-id check.
+An untouched metadata control takes the profile default, and stale ids are dropped.
 
-The policy says what an untouched metadata control means; the check drops an
-id paperless-ngx no longer has, and only when a successful fetch shows it.
+An id is dropped only when a successful fetch shows paperless-ngx lacks it; a
+failed or unusable fetch leaves every id for the upload to judge.
 """
 
 from __future__ import annotations
