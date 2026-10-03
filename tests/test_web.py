@@ -1,8 +1,8 @@
 """
-Web endpoint tests for the saneless FastAPI application.
+The web app's routes render, accept and refuse what an operator's browser sends.
 
-Covers requirements: UI-01 through UI-08, PROF-03, PLSS-04,
-HLTH-01, HLTH-02, LOG-03.
+Every app here talks to a Paperless client that never leaves the process, and
+every page, partial and JSON answer is asserted as the browser receives it.
 """
 
 from __future__ import annotations
@@ -570,7 +570,7 @@ def test_architecture_owner_token_bullet_states_what_it_grants() -> None:
 
 def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
     """
-    Every route handler is a plain ``def`` (ROBU-05, M-01).
+    Every route handler is a plain ``def``.
 
     Each handler calls blocking code, and FastAPI only moves ``def`` handlers
     onto its threadpool; an ``async def`` one would block the event loop.  The
@@ -591,7 +591,7 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
 
 
 def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
-    """/health answers promptly while another request is blocked in I/O (ROBU-05)."""
+    """/health answers promptly while another request is blocked in I/O."""
     gate = threading.Event()
     entered = threading.Event()
     app = _app(client)
@@ -659,7 +659,7 @@ def test_health_reports_degraded_worker(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A degraded worker makes /health a 503 naming the store (ROBU-05, D-10).
+    A degraded worker makes /health a 503 naming the store.
 
     The property is patched rather than the degraded Event set, so the worker
     thread's idle recovery probe cannot clear it mid-request.
@@ -673,7 +673,7 @@ def test_health_reports_degraded_worker(
 
 
 def test_health_reports_down_worker(client: TestClient) -> None:
-    """A stopped worker makes /health a 503 naming the thread (ROBU-05, D-10)."""
+    """A stopped worker makes /health a 503 naming the thread."""
     assert _app(client).state.worker.stop()
     response = client.get("/health")
     assert response.status_code == 503
@@ -681,14 +681,14 @@ def test_health_reports_down_worker(client: TestClient) -> None:
 
 
 def test_profile_dropdown(client: TestClient, web_settings: Settings) -> None:
-    """Profile names from settings appear in dropdown (PROF-03)."""
+    """Profile names from settings appear in dropdown."""
     response = client.get("/")
     for profile_name in web_settings.profiles:
         assert profile_name in response.text
 
 
 def test_scan_form_submit(client: TestClient) -> None:
-    """POST /api/scan creates job and returns status partial (PLSS-04, UI-07)."""
+    """POST /api/scan creates job and returns status partial."""
     response = client.post(
         "/api/scan", data={"profile": "default", "title": "Test Scan"}
     )
@@ -701,13 +701,13 @@ def titled_client(
     tmp_path: Path, web_scanner: StubScannerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[TestClient]:
     """
-    TestClient whose ``default`` profile has ``title = "Receipt"`` (D-16).
+    TestClient whose ``default`` profile has ``title = "Receipt"``.
 
     The worker's ``submit`` is stubbed to accept without running a pipeline,
     so the created job row is what the route resolved and nothing else.
 
-    The token is configured because ``POST /api/scan`` now refuses outright
-    when it is a placeholder (APPL-07, D-15), and an unset one here would stop
+    The token is configured because ``POST /api/scan`` refuses outright
+    when it is a placeholder, and an unset one here would stop
     these title tests at the guard instead of reaching the resolution they are
     about.  That refusal has its own tests in tests/test_web_errors.py.
     """
@@ -732,7 +732,7 @@ def titled_client(
 def test_scan_blank_title_uses_profile_title(
     titled_client: TestClient, typed: str
 ) -> None:
-    """A blank typed title is replaced by the profile's title (D-16, M-24)."""
+    """A blank typed title is replaced by the profile's title."""
     response = titled_client.post(
         "/api/scan", data={"profile": "default", "title": typed}
     )
@@ -742,7 +742,7 @@ def test_scan_blank_title_uses_profile_title(
 
 
 def test_scan_typed_title_beats_profile_title(titled_client: TestClient) -> None:
-    """A typed title is used as given over the profile's title (D-16)."""
+    """A typed title is used as given over the profile's title."""
     response = titled_client.post(
         "/api/scan", data={"profile": "default", "title": "Typed"}
     )
@@ -752,7 +752,7 @@ def test_scan_typed_title_beats_profile_title(titled_client: TestClient) -> None
 
 
 def test_scan_title_unknown_profile_still_rejected(titled_client: TestClient) -> None:
-    """Resolving the title never masks an unknown profile (D-16, T-27-04)."""
+    """Resolving the title never masks an unknown profile."""
     job_store: JobStore = _app(titled_client).state.job_store
     before = job_store.list_recent(limit=50)
     response = titled_client.post(
@@ -767,7 +767,7 @@ def test_scan_title_unknown_profile_still_rejected(titled_client: TestClient) ->
 
 
 def test_status_polling(client: TestClient) -> None:
-    """GET /api/jobs/current/status returns status partial (UI-02)."""
+    """GET /api/jobs/current/status returns status partial."""
     response = client.get("/api/jobs/current/status")
     assert response.status_code == 200
     assert 'id="status-area"' in response.text
@@ -834,7 +834,7 @@ def test_status_polling_active_job(client: TestClient) -> None:
 
 
 def test_flip_prompt(client: TestClient) -> None:
-    """AWAITING_FLIP state shows flip prompt with PRD wording (UI-03)."""
+    """AWAITING_FLIP state shows the flip prompt's wording and both buttons."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Flip Test")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
@@ -847,7 +847,7 @@ def test_flip_prompt(client: TestClient) -> None:
     assert 'hx-post="/api/flip/abort"' in response.text
 
     # Both buttons name the job they were rendered for, so an answer can only
-    # ever land on that job (CR-01).
+    # ever land on that job.
     buttons = re.findall(
         r"<button[^>]*hx-post=\"/api/flip/(continue|abort)\"[^>]*>", response.text
     )
@@ -863,7 +863,7 @@ def test_flip_prompt(client: TestClient) -> None:
 
 
 def test_thumbnail_display(client: TestClient) -> None:
-    """The owner's job with a thumbnail shows the base64 img tag (UI-04)."""
+    """The owner's job with a thumbnail shows the base64 img tag."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(
         profile="default", title="Thumb Test", owner_token=_as_owner(client)
@@ -877,7 +877,7 @@ def test_thumbnail_display(client: TestClient) -> None:
 
 
 def test_job_history(client: TestClient) -> None:
-    """GET /api/jobs/history returns the owner's jobs by title (UI-05)."""
+    """GET /api/jobs/history returns the owner's jobs by title."""
     job_store: JobStore = _app(client).state.job_store
     titles = ["Job Alpha", "Job Beta", "Job Gamma"]
     owner = _as_owner(client)
@@ -891,7 +891,7 @@ def test_job_history(client: TestClient) -> None:
 
 
 def test_error_display(client: TestClient) -> None:
-    """Error state shows the owner its error message in status area (LOG-03)."""
+    """Error state shows the owner its error message in status area."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(
         profile="default", title="Error Test", owner_token=_as_owner(client)
@@ -926,7 +926,7 @@ def test_cache_invalidate(client: TestClient) -> None:
 
 
 def test_cache_invalidate_rejects_an_unknown_resource(client: TestClient) -> None:
-    """Only tags and correspondents can be invalidated; nothing else is (N-20, D-19)."""
+    """Only tags and correspondents can be invalidated; nothing else is."""
     cache = _app(client).state.cache
     cache.set("tags", [{"id": 1, "name": "receipt"}])
 
@@ -950,7 +950,7 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A rejection during a run never becomes the status area's job (D-06, T8).
+    A rejection during a run never becomes the status area's job.
 
     The rejected row is newer than the running job, so once that job ends the
     status area must still report it -- not the queue-full rejection.
@@ -985,14 +985,14 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     page = client.get("/").text
     assert "Done: Running Job" in _status_area(page)
     assert QUEUE_FULL_JOB_ERROR not in _status_area(page)
-    # History still lists the rejected attempt (D-05).  A submit refused after
+    # History still lists the rejected attempt.  A submit refused after
     # its row was written keeps the token it was written with, so the browser
     # that sent it still sees its title.
     assert "Refused Scan" in page
 
 
 def test_rejected_rows_alone_leave_the_status_area_ready(client: TestClient) -> None:
-    """With only rejected rows and no current job, nothing has run (D-06)."""
+    """With only rejected rows and no current job, nothing has run."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Never Ran")
     job_store.finish_job(
@@ -1010,7 +1010,7 @@ def test_rejected_rows_alone_leave_the_status_area_ready(client: TestClient) -> 
 
 
 def test_index_lists_the_worker_profiles(client: TestClient) -> None:
-    """The profile dropdown reads the worker's locked profile set (D-19)."""
+    """The profile dropdown reads the worker's locked profile set."""
     _app(client).state.worker._set_profiles(
         {"default": ProfileConfig(), "zz-new-profile": ProfileConfig()}
     )
@@ -1024,7 +1024,7 @@ def test_index_lists_the_worker_profiles(client: TestClient) -> None:
 
 def test_flip_continue(client: TestClient) -> None:
     """
-    A Continue arriving after the job ended reports that job (UI-03, M-02).
+    A Continue arriving after the job ended reports that job.
 
     The worker clears its current job id in ``_process_job``'s ``finally``, so
     a click landing as the job ends finds no current job.  The route must fall
@@ -1047,7 +1047,7 @@ def test_flip_continue(client: TestClient) -> None:
 
 def test_flip_abort(client: TestClient) -> None:
     """
-    An Abort arriving after the job ended reports that job (UI-03, M-02).
+    An Abort arriving after the job ended reports that job.
 
     Otherwise an abort that aborted nothing reports nothing either: the partial
     would say "Ready to scan." while the job that timed out sits in history.
@@ -1110,7 +1110,7 @@ def test_claimed_abort_acknowledges_instead_of_the_prompt(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
     """
-    A claimed Abort renders "Aborting scan..." without the buttons (CR-01).
+    A claimed Abort renders "Aborting scan..." without the buttons.
 
     The worker has not persisted ERROR yet, so the row still reads
     AWAITING_FLIP.  Re-rendering the prompt there would look as though the
@@ -1130,7 +1130,7 @@ def test_claimed_abort_acknowledges_instead_of_the_prompt(
 def test_claimed_continue_acknowledges_instead_of_the_prompt(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """A claimed Continue renders the flip-confirmed copy without buttons (CR-01)."""
+    """A claimed Continue renders the flip-confirmed copy without buttons."""
     job_id, coordinator = waiting_flip
 
     response = client.post("/api/flip/continue", data={"job_id": job_id})
@@ -1146,7 +1146,7 @@ def test_double_clicked_abort_still_acknowledges(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
     """
-    A repeat click on an answered job renders the same acknowledgment (CR-01).
+    A repeat click on an answered job renders the same acknowledgment.
 
     The second Abort is dropped by the coordinator, so the route has no claim
     of its own; the acknowledgment must come from the answer the worker holds.
@@ -1165,7 +1165,7 @@ def test_double_clicked_abort_still_acknowledges(
 def test_continue_after_abort_reports_the_abort(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """A late Continue on an aborted job acknowledges the Abort that won (D-16)."""
+    """A late Continue on an aborted job acknowledges the Abort that won."""
     job_id, coordinator = waiting_flip
 
     client.post("/api/flip/abort", data={"job_id": job_id})
@@ -1180,7 +1180,7 @@ def test_foreign_job_id_leaves_the_prompt_open(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
     """
-    An Abort naming another job does not acknowledge the waiting job (T-25-49).
+    An Abort naming another job does not acknowledge the waiting job.
 
     The route's claim is only authoritative for the job it names; the rendered
     job is still unanswered, so its prompt and both buttons stay.
@@ -1199,7 +1199,7 @@ def test_foreign_job_id_leaves_the_prompt_open(
 def test_poll_acknowledges_an_answer_the_store_has_not_recorded_yet(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """The status poll keeps the buttons away once the job is answered (CR-01)."""
+    """The status poll keeps the buttons away once the job is answered."""
     job_id, _ = waiting_flip
     client.post("/api/flip/continue", data={"job_id": job_id})
 
@@ -1215,7 +1215,7 @@ def test_poll_acknowledges_an_answer_the_store_has_not_recorded_yet(
 def test_poll_renders_the_prompt_for_an_unanswered_flip(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """An armed, unanswered flip wait still renders the full prompt (UI-03)."""
+    """An armed, unanswered flip wait still renders the full prompt."""
     _ = waiting_flip
 
     response = client.get("/api/jobs/current/status")
@@ -1230,7 +1230,7 @@ def test_poll_renders_the_prompt_for_an_unanswered_flip(
 def test_index_acknowledges_an_answered_flip(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """A page reload after the answer shows the acknowledgment too (CR-01, D-17)."""
+    """A page reload after the answer shows the acknowledgment too."""
     job_id, _ = waiting_flip
     client.post("/api/flip/abort", data={"job_id": job_id})
 
@@ -1245,7 +1245,7 @@ def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
     """
     A flip answer that names no job is rejected before reaching the worker.
 
-    The job id is what scopes the answer to one job (CR-01), so a request
+    The job id is what scopes the answer to one job, so a request
     without it cannot be interpreted and is refused with 422.
     """
     response = client.post(route)
@@ -1254,7 +1254,7 @@ def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
 
 
 def test_paperless_test_connected(client: TestClient) -> None:
-    """GET /api/paperless/test returns connected status (PLSS-03)."""
+    """GET /api/paperless/test returns connected status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "connected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1262,7 +1262,7 @@ def test_paperless_test_connected(client: TestClient) -> None:
 
 
 def test_paperless_test_token_rejected(client: TestClient) -> None:
-    """GET /api/paperless/test returns token_rejected status (PLSS-03)."""
+    """GET /api/paperless/test returns token_rejected status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "token_rejected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1270,7 +1270,7 @@ def test_paperless_test_token_rejected(client: TestClient) -> None:
 
 
 def test_paperless_test_unreachable(client: TestClient) -> None:
-    """GET /api/paperless/test returns unreachable status (PLSS-03)."""
+    """GET /api/paperless/test returns unreachable status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "unreachable"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1278,7 +1278,7 @@ def test_paperless_test_unreachable(client: TestClient) -> None:
 
 
 def test_paperless_test_error(client: TestClient) -> None:
-    """GET /api/paperless/test returns error on exception (PLSS-03)."""
+    """GET /api/paperless/test returns error on exception."""
 
     def raise_exc(*, timeout: httpx2.Timeout | None = None) -> None:
         _ = timeout
@@ -1295,7 +1295,7 @@ def test_paperless_test_error(client: TestClient) -> None:
 
 
 def test_history_humanized_labels(client: TestClient) -> None:
-    """Job history shows human-readable state labels instead of raw enum values (P12-01)."""
+    """Job history shows human-readable state labels instead of raw enum values."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Label Test")
     job_store.update_state(job.id, JobState.DONE)
@@ -1306,7 +1306,7 @@ def test_history_humanized_labels(client: TestClient) -> None:
 
 
 def test_status_no_inline_scripts(client: TestClient) -> None:
-    """Status partial contains no inline script tags for DONE or ERROR states (P12-04)."""
+    """Status partial contains no inline script tags for DONE or ERROR states."""
     job_store: JobStore = _app(client).state.job_store
 
     # DONE state
@@ -1325,13 +1325,13 @@ def test_status_no_inline_scripts(client: TestClient) -> None:
 
 
 def test_scan_form_no_hx_on(client: TestClient) -> None:
-    """Scan form does not use hx-on:: inline event attributes (P12-04)."""
+    """Scan form does not use hx-on:: inline event attributes."""
     response = client.get("/")
     assert "hx-on::before-request" not in response.text
 
 
 def test_refresh_buttons_accessible(client: TestClient) -> None:
-    """Refresh buttons have aria-label attributes and sr-only text (P12-02)."""
+    """Refresh buttons have aria-label attributes and sr-only text."""
     response = client.get("/")
     assert 'aria-label="Refresh tags"' in response.text
     assert 'aria-label="Refresh correspondents"' in response.text
@@ -1339,13 +1339,13 @@ def test_refresh_buttons_accessible(client: TestClient) -> None:
 
 
 def test_scan_form_has_heading(client: TestClient) -> None:
-    """Scan form article has an h2 heading for accessibility (P12-02)."""
+    """Scan form article has an h2 heading for accessibility."""
     response = client.get("/")
     assert "<h2>Scan</h2>" in response.text
 
 
 def test_flip_abort_label(client: TestClient) -> None:
-    """Flip prompt cancel button reads Abort scan (P12-05)."""
+    """Flip prompt cancel button reads Abort scan."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Flip Abort Test")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
@@ -1357,14 +1357,14 @@ def test_flip_abort_label(client: TestClient) -> None:
 
 
 def test_correspondent_placeholder(client: TestClient) -> None:
-    """Correspondent dropdown placeholder reads No correspondent (P12-05)."""
+    """Correspondent dropdown placeholder reads No correspondent."""
     response = client.get("/")
     assert "No correspondent" in response.text
     assert "-- None --" not in response.text
 
 
 def test_css_spacing_normalized() -> None:
-    """CSS uses PicoCSS grid-aligned spacing with no !important overrides (P12-05)."""
+    """CSS uses PicoCSS grid-aligned spacing with no !important overrides."""
     declarations = [
         (prop, value)
         for _selector, rule in _css_rules(_web_asset("static", "app.css"))
@@ -1376,7 +1376,7 @@ def test_css_spacing_normalized() -> None:
 
 
 def test_paperless_test_500_sanitizes_exception(client: TestClient) -> None:
-    """500 response returns exception class name, not raw message with secrets (RH-04)."""
+    """500 response returns exception class name, not raw message with secrets."""
     sensitive_msg = "http://192.168.1.100:8000 token=abc123"
     _app(client).state.paperless.test_connection = _raise_factory(
         ConnectionError, sensitive_msg
@@ -1462,13 +1462,11 @@ class TestAppComposition:
     """
     What ``create_app`` must have assembled before a single request arrives.
 
-    The phase's rendering and its background refresh both depend on wiring that
-    no route can compensate for: a template cannot invent a filter, and a route
-    cannot probe on its own without undoing D-04.  Every assertion here is made
-    on an app that has **not** been entered, because construction is exactly the
-    moment that must stay free of threads and probes.
-
-    Covers requirements: APPL-02, APPL-03, APPL-04, APPL-12.
+    The rendering and the background refresh both depend on wiring that no
+    route can compensate for: a template cannot invent a filter, and a route
+    must not start a probe of its own.  Every assertion here is made on an app
+    that has **not** been entered, because construction is exactly the moment
+    that must stay free of threads and probes.
     """
 
     @pytest.fixture
@@ -1486,7 +1484,7 @@ class TestAppComposition:
     def test_registers_the_filters_the_templates_reach_for(
         self, unstarted_app: FastAPI
     ) -> None:
-        """Every name this phase's templates reach for is registered (APPL-03)."""
+        """Every filter name the templates reach for is registered."""
         filters = unstarted_app.state.templates.env.filters
         expected = {
             "check_row_class",
@@ -1508,7 +1506,7 @@ class TestAppComposition:
 
         A lambda wrapper here would pass a "renders the same string" test today
         and drift from ``saneless doctor`` the first time either side is
-        edited.  ``is`` is what makes APPL-12's "one shared place" checkable.
+        edited.  ``is`` is what makes "one shared place" checkable.
         """
         filters = unstarted_app.state.templates.env.filters
         assert filters["check_row_class"] is check_row_class
@@ -1522,14 +1520,14 @@ class TestAppComposition:
 
     def test_the_state_lookups_are_not_filters(self, unstarted_app: FastAPI) -> None:
         """
-        R4-IN-03: a filter no template may correctly use is not registered.
+        A filter no template may correctly use is not registered.
 
         ``check_state_class`` and its two siblings draw a marker from the
-        state alone, which is what rendered a skipped row as a green tick
-        (R3-WR-03).  The strip reaches for the ``check_row_*`` filters, and
-        leaving the state lookups in the template namespace handed the next
-        row's author two plausible names of which only one is right.  The
-        Python functions stay; it is the filter names that are gone.
+        state alone, so a skipped row drawn from one renders as a green tick.
+        The strip reaches for the ``check_row_*`` filters, and a state lookup
+        in the template namespace would hand the next row's author two
+        plausible names of which only one is right.  The Python functions
+        exist; they are simply not filters.
         """
         filters = unstarted_app.state.templates.env.filters
         state_lookups = {"check_state_class", "check_state_glyph", "check_state_label"}
@@ -1545,7 +1543,7 @@ class TestAppComposition:
     def test_the_cache_is_cold_before_the_app_is_entered(
         self, unstarted_app: FastAPI
     ) -> None:
-        """Construction issues no probe, so the first render says Checking (D-06)."""
+        """Construction issues no probe, so the first render says Checking."""
         cached = unstarted_app.state.checks.current()
         assert cached.results is None
         assert cached.checked_at is None
@@ -1554,7 +1552,7 @@ class TestAppComposition:
         self, unstarted_app: FastAPI, web_settings: Settings
     ) -> None:
         """
-        The five earlier injections hold, and the label filters are the right ones.
+        The app state carries its five parts, and the label filters are the right ones.
 
         ``state_label`` is deliberately absent: it reads the state alone, so it
         would call a warned upload "Complete".  Every label goes through
@@ -1583,7 +1581,7 @@ class TestAppComposition:
         assert unstarted_app.state.refresher._thread.is_alive() is False
 
 
-# --- The owner cookie (APPL-09, D-23, D-24) ---------------------------------
+# --- The owner cookie --------------------------------------------------------
 
 # The cookie's name, spelled out here rather than imported from the route
 # module: a test that imported the constant would still pass if the wire name
@@ -1607,7 +1605,7 @@ def _owner_set_cookie(response: httpx2.Response) -> str | None:
     Return the raw ``Set-Cookie`` header carrying the owner token, if any.
 
     The raw header is parsed instead of the client's cookie jar because the jar
-    normalises away exactly what D-06 pins: the ``Max-Age`` value and an absent
+    normalises away exactly what these tests pin: the ``Max-Age`` value and an absent
     ``Secure`` are both invisible once httpx2 has turned the header into a jar
     entry, so a jar assertion could not tell a year-long cookie from a session
     one.
@@ -1676,7 +1674,7 @@ def _other_browser(client: TestClient) -> TestClient:
     Return a second client over the same running app, with its own cookie jar.
 
     Two clients rather than one client with its jar emptied: the jar is the
-    thing under test, and two jars are what D-23's "one token per browser"
+    thing under test, and two jars are what "one token per browser"
     actually means.  The app is already started by the first client's fixture,
     so this one is used without entering its lifespan.
 
@@ -1731,15 +1729,14 @@ class TestOwnerCookie:
     """
     The owner token's mint, its reuse, and the gate it puts on a flip answer.
 
-    Covers APPL-09 and decisions D-23 (one token per browser), D-24 (the token
-    gates the two flip buttons) and D-06 (the cookie lives a year, so ownership
-    survives a browser restart).
+    There is one token per browser, it gates the two flip buttons, and the
+    cookie lives a year, so ownership survives a browser restart.
     """
 
     def test_owner_cookie_is_httponly_lax_and_lives_a_year(
         self, accepting_client: TestClient
     ) -> None:
-        """The first submit mints D-06's exact attribute set, and nothing else."""
+        """The first submit mints the cookie's exact attribute set, and nothing else."""
         response = accepting_client.post(
             "/api/scan", data={"profile": "duplex", "title": "First Scan"}
         )
@@ -1776,7 +1773,7 @@ class TestOwnerCookie:
         """
         A second submit re-sets the same token with the year-long lifetime.
 
-        The mint rule still holds -- one value per browser (D-23) -- but every
+        The mint rule still holds -- one value per browser -- but every
         accepted submit sends it back, so the lifetime is renewed each time.
         """
         first = accepting_client.post(
@@ -1797,11 +1794,10 @@ class TestOwnerCookie:
         self, accepting_client: TestClient
     ) -> None:
         """
-        A token the browser already holds comes back unchanged, now with Max-Age.
+        A session cookie the browser already holds comes back with Max-Age.
 
-        A browser upgraded from a release that set a session cookie presents
-        that token on its next submit; it keeps its ownership and the cookie
-        becomes persistent.
+        A browser holding a token without a lifetime presents it on its next
+        submit; it keeps its ownership and the cookie becomes persistent.
         """
         held = "a-token-set-by-an-older-release"
         accepting_client.cookies.set(_OWNER_COOKIE, held)
@@ -1819,7 +1815,7 @@ class TestOwnerCookie:
     def test_owner_cookie_reuse_records_the_same_value_on_a_second_job(
         self, accepting_client: TestClient
     ) -> None:
-        """Two tabs on one device do not disown each other (D-23)."""
+        """Two tabs on one device do not disown each other."""
         accepting_client.post("/api/scan", data={"profile": "duplex", "title": "One"})
         accepting_client.post("/api/scan", data={"profile": "duplex", "title": "Two"})
 
@@ -1874,7 +1870,7 @@ class TestOwnerCookie:
         accepting_client: TestClient,
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
-        """The browser that submitted the job answers Continue (APPL-09)."""
+        """The browser that submitted the job answers Continue."""
         job_id, coordinator = owned_flip
 
         response = accepting_client.post("/api/flip/continue", data={"job_id": job_id})
@@ -1887,7 +1883,7 @@ class TestOwnerCookie:
         accepting_client: TestClient,
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
-        """The browser that submitted the job answers Abort (APPL-09)."""
+        """The browser that submitted the job answers Abort."""
         job_id, coordinator = owned_flip
 
         response = accepting_client.post("/api/flip/abort", data={"job_id": job_id})
@@ -1901,7 +1897,7 @@ class TestOwnerCookie:
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
         """
-        A second browser's Continue is dropped, not errored (D-16, D-24).
+        A second browser's Continue is dropped, not errored.
 
         The household member who did not load the paper must not be able to
         start pass B, and must not be shown a failure for trying either: the
@@ -1922,7 +1918,7 @@ class TestOwnerCookie:
         accepting_client: TestClient,
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
-        """A second browser's Abort is dropped the same way (D-16, D-24)."""
+        """A second browser's Abort is dropped the same way."""
         job_id, coordinator = owned_flip
 
         response = _other_browser(accepting_client).post(
@@ -1937,11 +1933,11 @@ class TestOwnerCookie:
         self, client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
     ) -> None:
         """
-        A NULL owner token means unowned, so anyone may answer (UI-SPEC S5).
+        A NULL owner token means unowned, so anyone may answer.
 
-        This is the manual-duplex job that was already in flight when the
-        appliance was upgraded.  A strict rule would make it un-continuable and
-        force it to time out.
+        A manual-duplex job whose row carries no token has no owner to check
+        against.  A strict rule would make it un-continuable and force it to
+        time out.
         """
         job_id, coordinator = waiting_flip
         job_store: JobStore = _app(client).state.job_store
@@ -1960,7 +1956,7 @@ class TestOwnerCookie:
         owned_flip: tuple[str, WorkerFlipCoordinator],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The token appears in no rendered markup and no log record (T-30-59)."""
+        """The token appears in no rendered markup and no log record."""
         job_id, _ = owned_flip
         minted = accepting_client.cookies[_OWNER_COOKIE]
 
@@ -2152,14 +2148,14 @@ class TestPostSubmitRender:
         assert 'id="checks-body"' in body
 
 
-# --- The followed job and the queue line (APPL-08, D-25) ---------------------
+# --- The followed job and the queue line ------------------------------------
 
 
 def _displayed(markup: str) -> str:
     """
     Return the markup with its HTML entities resolved, as a reader sees it.
 
-    Jinja autoescapes the whole busy line, and APPL-08's copy quotes the title
+    Jinja autoescapes the whole busy line, and the queue copy quotes the title
     with apostrophes, so the sentence is spelled with entities in the markup
     and only reads back as written once they are resolved.  Copy assertions use
     this; escaping assertions deliberately do not, because unescaping first
@@ -2235,10 +2231,10 @@ def _polls(markup: str, job_id: str) -> bool:
 
 class TestFollowedJob:
     """
-    The status area follows the job this browser submitted (D-25).
+    The status area follows the job this browser submitted.
 
     A submitter who sees another household member's scan reported back at them
-    learns nothing about their own, which is the whole of APPL-08's complaint.
+    learns nothing about their own.
     """
 
     def test_followed_job_status_reports_that_job_not_the_running_one(
@@ -2266,7 +2262,7 @@ class TestFollowedJob:
         A pruned job degrades to today's inference, not to a 404.
 
         A 404 would also confirm to a caller which ids exist, which is a fact
-        the appliance has no reason to hand out (T-30-61).
+        the appliance has no reason to hand out.
         """
         _running_job(client, "Still Running")
 
@@ -2377,8 +2373,8 @@ class TestFollowedJob:
         """
         A reload while someone else's scan runs follows this browser's queued job.
 
-        The page used to poll the current-job URL, so a queued submitter who
-        reloaded was shown the running job instead of their own.
+        Polling the current-job URL instead would show a queued submitter who
+        reloads the running job rather than their own.
         """
         owner = _as_owner(client)
         _running_job(client, "Someone Elses Scan", owner_token="another-browser")
@@ -2604,17 +2600,17 @@ class TestStatusPollAnswersWhenChanged:
 
 class TestQueueLine:
     """
-    What a queued submitter is told while they wait (APPL-08, UI-SPEC S5).
+    What a queued submitter is told while they wait.
 
-    Every case renders through the existing busy branch; no new state branch is
-    added, which is what keeps the flip controls disappearing the moment a job
+    Every case renders through the busy branch, with no state branch of its
+    own, which is what keeps the flip controls disappearing the moment a job
     leaves AWAITING_FLIP.
     """
 
     def test_queue_line_names_the_running_job_and_the_count(
         self, client: TestClient
     ) -> None:
-        """One job ahead reads as APPL-08 writes it, to the running job's owner."""
+        """One job ahead reads as the queue copy writes it, to the running job's owner."""
         _running_job(client, "Tax return", owner_token=_as_owner(client))
         _queued_job(client, "Ahead Of Me")
         mine = _queued_job(client, "Mine")
@@ -2666,8 +2662,7 @@ class TestQueueLine:
         """
         ``(0 ahead of you)`` is never rendered.
 
-        It is technically true and reads like a bug, which is the one thing
-        this milestone is spending itself on removing.
+        It is technically true and reads like a bug.
         """
         _running_job(client, "Tax return")
         mine = _queued_job(client, "Mine")
@@ -2688,7 +2683,7 @@ class TestQueueLine:
         assert "Waiting for" not in _displayed(response.text)
 
     def test_queue_line_escapes_the_running_title(self, client: TestClient) -> None:
-        """The title is user data and is autoescaped, never injected (T-30-62)."""
+        """The title is user data and is autoescaped, never injected."""
         _running_job(client, "<script>alert(1)</script>", owner_token=_as_owner(client))
         mine = _queued_job(client, "Mine")
 
@@ -2700,7 +2695,7 @@ class TestQueueLine:
     def test_queue_line_shows_the_front_count_on_pass_b(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Pass B leads with the pages already counted on pass A (APPL-03, D-33)."""
+        """Pass B leads with the pages already counted on pass A."""
         monkeypatch.setattr(ScanWorker, "front_pages", property(lambda _self: 12))
         job_id = _running_job(client, "Duplex Stack")
         job_store: JobStore = _app(client).state.job_store
@@ -2743,7 +2738,7 @@ def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) 
 
 
 class TestProfileDescriptionRoute:
-    """GET /api/profiles/description -- the sentence under the select (APPL-05)."""
+    """GET /api/profiles/description -- the sentence under the select."""
 
     def test_a_known_profile_returns_its_description_text_alone(
         self, client: TestClient
@@ -2800,7 +2795,7 @@ class TestProfileDescriptionRoute:
     def test_a_description_containing_markup_is_escaped_not_rendered(
         self, client: TestClient
     ) -> None:
-        """Config free text is autoescaped and never marked safe (T-30-70)."""
+        """Config free text is autoescaped and never marked safe."""
         _configure_profiles(
             client,
             {
@@ -2815,7 +2810,7 @@ class TestProfileDescriptionRoute:
         assert "&lt;script&gt;" in response.text
 
     def test_the_description_route_is_a_plain_def(self, client: TestClient) -> None:
-        """Every handler runs on the threadpool, this one included (ROBU-05)."""
+        """Every handler runs on the threadpool, this one included."""
         routes = [
             route
             for route in leaf_routes(_app(client))
@@ -2827,7 +2822,7 @@ class TestProfileDescriptionRoute:
 
 
 class TestProfileOrdering:
-    """The option list the select renders, and the D-21 feeder-first rule."""
+    """The option list the select renders, feeder profiles first."""
 
     def test_options_carry_the_name_label_and_description_of_each_profile(
         self, client: TestClient
@@ -2859,7 +2854,7 @@ class TestProfileOrdering:
     def test_a_blank_label_falls_back_to_the_profile_name(
         self, client: TestClient
     ) -> None:
-        """A config written before this phase never shows a blank option (A-3)."""
+        """A profile with no label shows its name, never a blank option."""
         _configure_profiles(
             client,
             {
@@ -2875,7 +2870,7 @@ class TestProfileOrdering:
     def test_feeder_profiles_lead_the_ordering_when_no_flatbed_source_exists(
         self, client: TestClient
     ) -> None:
-        """No flatbed source is the literal definition of sheet-fed (D-21)."""
+        """No flatbed source is the literal definition of sheet-fed."""
         _configure_profiles(
             client,
             {
