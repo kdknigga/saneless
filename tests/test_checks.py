@@ -23,6 +23,7 @@ No test here sleeps.
 
 from __future__ import annotations
 
+import ast
 import errno
 import logging
 import os
@@ -94,7 +95,7 @@ from saneless.vocabulary import (
     connection_status_message,
     render_check_step,
 )
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, poll_until
 from tests.fake_sane import FakeSaneDev, FakeSaneHandle, FakeSaneModule
 from tests.fake_saned import EXIT_REQUEST, INIT_REQUEST, SanedBehaviour, fake_saned
 
@@ -2084,29 +2085,119 @@ class TestSanedProbeBound:
         assert _probe() is checks._SanedOutcome.HEALTHY
 
 
+_SURFACE_PACKAGES: Final = ("saneless.web", "saneless.cli")
+
+
+def _imported_modules(source: str, package: str) -> set[str]:
+    """
+    Name every module an ``import`` statement anywhere in ``source`` reaches.
+
+    Each ``import`` and ``from ... import`` node is read, at any depth, so an
+    import inside a function or a ``TYPE_CHECKING`` block counts as much as
+    one at the top.  Relative imports are resolved against ``package``, and a
+    ``from X import name`` also yields ``X.name``, because ``name`` may be a
+    submodule.
+
+    Args:
+        source: The module's source text.
+        package: The package the module lives in, for relative imports.
+
+    Returns:
+        The absolute dotted names reached.
+
+    """
+    modules: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            parts = package.split(".")
+            base_parts = parts[: len(parts) - node.level + 1] if node.level else []
+            if node.module:
+                base_parts = [*base_parts, node.module]
+            base = ".".join(base_parts)
+            modules.add(base)
+            modules.update(f"{base}.{alias.name}" for alias in node.names)
+    return modules
+
+
+def _surface_imports(source: str) -> list[str]:
+    """
+    List the modules under either surface package that ``source`` imports.
+
+    Args:
+        source: Source text of a module in the ``saneless`` package.
+
+    Returns:
+        The offending module names, sorted.
+
+    """
+    return sorted(
+        module
+        for module in _imported_modules(source, "saneless")
+        if any(
+            module == surface or module.startswith(f"{surface}.")
+            for surface in _SURFACE_PACKAGES
+        )
+    )
+
+
 class TestImportHygiene:
     """``checks.py`` is read by both surfaces, so it may depend on neither."""
 
     def test_checks_imports_neither_web_nor_cli(self) -> None:
         """
-        No import of ``saneless.web`` or ``saneless.cli`` appears in the source.
+        No import statement in ``checks.py`` reaches ``saneless.web`` or ``saneless.cli``.
 
-        D-02 makes this module the shared registry.  An import of either
+        This module is the shared registry.  An import of either
         surface would make it that surface's module, and the other one would
         either import a web app to print a terminal table or import Click to
         render a page.  Every dependency is injected instead.
         """
         source = Path(checks.__file__).read_text(encoding="utf-8")
-        forbidden = (
-            "from saneless.web",
-            "import saneless.web",
-            "from saneless.cli",
-            "import saneless.cli",
-            "from .web",
-            "from .cli",
-        )
-        offenders = [line for line in source.splitlines() if line.startswith(forbidden)]
-        assert offenders == []
+        assert _surface_imports(source) == []
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            pytest.param(
+                "def late() -> None:\n    from saneless.web import routes\n",
+                ["saneless.web", "saneless.web.routes"],
+                id="indented",
+            ),
+            pytest.param(
+                "from . import cli as terminal\n",
+                ["saneless.cli"],
+                id="relative-aliased",
+            ),
+            pytest.param(
+                "import saneless.web.app\n",
+                ["saneless.web.app"],
+                id="plain-import",
+            ),
+            pytest.param(
+                '"""Neither saneless.web nor saneless.cli is imported."""\n'
+                "from saneless import vocabulary\n",
+                [],
+                id="prose-only",
+            ),
+        ],
+    )
+    def test_the_import_reader_finds_imports_and_ignores_prose(
+        self, source: str, expected: list[str]
+    ) -> None:
+        """
+        The reader catches indented, relative and aliased imports, not prose.
+
+        A check that matched lines of text would miss an import inside a
+        function and flag a docstring naming a surface; this one does neither.
+
+        Args:
+            source: Module text to read.
+            expected: The surface modules it must report.
+
+        """
+        assert _surface_imports(source) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -8183,7 +8274,6 @@ class TestIsolatedListingWiring:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        poll_until: Callable[..., bool],
         stand_in_listing_child: Callable[[str], Path],
         isolated_context: Callable[
             [str], tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]
@@ -8199,7 +8289,6 @@ class TestIsolatedListingWiring:
         Args:
             tmp_path: The test's own directory.
             monkeypatch: Sets the deadline and the PID-file variable.
-            poll_until: Waits, without sleeping, for the child to start.
             stand_in_listing_child: Points the real launcher at a stand-in.
             isolated_context: Builds a context around a real backend.
 
@@ -8365,7 +8454,7 @@ class TestConfigurationRow:
             "then restart saneless."
         )
 
-    def test_the_2026_09_22_scenario_reads_the_cause_in_the_first_row(
+    def test_a_legacy_name_under_etc_is_named_above_the_paperless_row(
         self, tmp_path: Path
     ) -> None:
         """
