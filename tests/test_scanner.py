@@ -397,6 +397,11 @@ def _page_sink_for(tmp_path: Path, label: str = _SPOOL_LABEL_A) -> SpooledPageSi
 _READER_THREAD_PREFIX = "sane-read-"
 _READER_JOIN_SECONDS = 5.0
 
+# The bound an interrupt delivered mid-read must land inside.  The read's page
+# budget is thirty seconds, far above it, so a wait that held the interrupt
+# back until the page timed out would miss the bound by seconds.
+_INTERRUPT_BOUND_SECONDS = 5.0
+
 
 def _join_sane_reader_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
     """
@@ -918,7 +923,7 @@ class TestSaneInitGuard:
                 failures.append(exc)
 
         threads = [
-            threading.Thread(target=build, name=f"init-race-{i}")
+            threading.Thread(target=build, name=f"init-race-{i}", daemon=True)
             for i in range(thread_count)
         ]
         for thread in threads:
@@ -926,6 +931,7 @@ class TestSaneInitGuard:
         for thread in threads:
             thread.join(10)
 
+        assert not any(thread.is_alive() for thread in threads)
         assert failures == []
         assert fake_sane_module.init_call_count == 1
 
@@ -3565,15 +3571,19 @@ class TestSaneBackendCancelSequence:
         )
 
         with handling, sane_backend._open_device(_TEST_DEVICE) as dev:
+            began = time.monotonic()
             interrupter.start()
             with pytest.raises(expected):
                 sane_backend._scan_adf_pages(
                     dev,
                     page_sink,
                     _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=5.0),
+                    sane_backend_mod._PageBudget(timeout=30.0),
                 )
+            elapsed = time.monotonic() - began
             interrupter.join(_READER_JOIN_SECONDS)
+
+            assert elapsed < _INTERRUPT_BOUND_SECONDS
 
             assert fake_device.cancel_calls == 1
             assert fake_device.close_while_blocked is False
@@ -3982,6 +3992,34 @@ class TestSaneBackendCancelSequence:
         assert fake_device.close_calls == 1
         assert fake_device.close_while_blocked is False
         assert _wedged() is False
+
+
+class TestBeginSettle:
+    """Recording a wedge before a cancel leaves a read that has returned alone."""
+
+    def test_an_already_finished_read_is_not_marked_wedged(
+        self, sane_backend: SaneBackend
+    ) -> None:
+        """
+        A read whose done event is already set is not recorded as wedged.
+
+        The reader can return in the instant between the page timeout and the
+        settle.  Recorded then, the wedge would refuse every later scan over a
+        handle nothing is blocked in.
+        """
+        done = threading.Event()
+        done.set()
+
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            try:
+                settling = sane_backend_mod._begin_settle(dev, done, "Page 1")
+                stuck = _wedged()
+            finally:
+                with sane_backend_mod._WEDGE_LOCK:
+                    sane_backend_mod._clear_wedge()
+
+        assert settling is False
+        assert stuck is False
 
 
 class TestReinitialise:

@@ -58,6 +58,13 @@ _SLOW_READ_OPTIONS: tuple[tuple[str, object], ...] = (
     ("resolution", 1200),
 )
 
+# The same options under the names the device lists them by.  python-sane
+# stores an unknown attribute without complaint, so a libsane whose test
+# backend lacks them is only detectable by asking the device.
+_READ_DELAY_OPTION_NAMES = frozenset(
+    {"read-delay", "read-delay-duration", "read-limit", "read-limit-size"}
+)
+
 # How long the cancel test lets the read run before bounding it.  Long enough
 # that the read is provably under way and short enough to keep the test brisk;
 # the measured read was still blocked after three seconds with these options.
@@ -195,7 +202,7 @@ class TestRealSaneTestBackend:
             "SANE was already marked initialised before this test constructed a "
             "backend, so sane.init() was skipped and the device list is empty "
             "for a reason that has nothing to do with libsane: an earlier test "
-            "leaked the process-global init guard (D-17)"
+            "leaked the process-global init guard"
         )
         names = [device.name for device in SaneBackend().get_devices()]
         assert "test:0" in names
@@ -366,7 +373,7 @@ class TestRealSaneDepth:
             None, while the device is at depth 16.
 
         """
-        assert SaneBackend() is not None  # the constructor runs sane.init()
+        SaneBackend()  # the constructor runs sane.init()
         sane = sane_backend_mod._ensure_sane()
         handle = sane.open("test:0")
         try:
@@ -450,17 +457,16 @@ class TestRealSaneCancelSequence:
         ignoring the cancel.  ``close()`` afterwards is the last link -- it is
         the call the frontend may make only once the read has returned.
         """
-        backend = SaneBackend()
-        assert backend is not None  # the constructor is what ran sane.init()
+        SaneBackend()  # the constructor runs sane.init()
         device = sane_backend_mod._ensure_sane().open("test:0")
         try:
-            try:
-                device.source = "Automatic Document Feeder"
-                device.mode = "Gray"
-                for name, value in _SLOW_READ_OPTIONS:
-                    setattr(device, name, value)
-            except AttributeError:
+            offered = {option[1] for option in device.get_options()}
+            if not offered >= _READ_DELAY_OPTION_NAMES:
                 pytest.skip("this libsane test backend has no read-delay options")
+            device.source = "Automatic Document Feeder"
+            device.mode = "Gray"
+            for name, value in _SLOW_READ_OPTIONS:
+                setattr(device, name, value)
 
             def start_and_snap() -> Image.Image:
                 device.start()
