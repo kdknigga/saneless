@@ -8,7 +8,7 @@
 
    It is rendered by its own handler and not through render_error, whose answer
    to a request that is not htmx's is JSON: a browser would show that as text.
-   The rule render_error keeps still holds here.  ASVS V7 forbids request input
+   The rule render_error keeps still holds here.  ASVS 4.0.3 V7.4 forbids request input
    from reaching an error surface, so every word on this page comes from the
    vocabulary through the handler and nothing the request sent is echoed, the
    title least of all.  The handler also sets the security headers and
