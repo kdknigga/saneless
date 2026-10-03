@@ -31,7 +31,6 @@ from saneless.config import (
     LEGACY_CONFIG_FILENAME,
     ProfileConfig,
     Settings,
-    config_search_paths,
     discover_config,
 )
 from saneless.exceptions import (
@@ -5257,7 +5256,7 @@ class TestStartupProfileGeneration:
         assert len(records) == 1
         message = records[0].getMessage()
         assert "--config" in message
-        for path in config_search_paths():
+        for path in worker_module.config_search_paths():
             assert str(path) in message
 
     def test_startup_generation_keeps_profiles_when_the_file_is_unwritable(

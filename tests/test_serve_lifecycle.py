@@ -35,6 +35,8 @@ from tests.conftest import poll_until
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from tests.conftest import SocketGuard
+
 # The repository root: the child imports ``tests.golden_support`` from here.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -201,12 +203,14 @@ class _Spawner:
 
     Attributes:
         tmp_path: The test's scratch directory.
+        guard: The socket guard, told the port each child serves on.
         runs: Every child started, for the teardown.
         pidfile: Where a listing stand-in writes its PID.
 
     """
 
     tmp_path: Path
+    guard: SocketGuard
     runs: list[_Served] = field(default_factory=list)
     pidfile: Path | None = None
 
@@ -265,6 +269,8 @@ class _Spawner:
         served = _Served(proc=proc)
         self.runs.append(served)
         served.url = _read_url(served, time.monotonic() + _START_BOUND_SECONDS)
+        # The child bound the port, so this process must be told about it.
+        self.guard.allow_port(int(served.url.rpartition(":")[2]))
         return served
 
     def listing_pid(self) -> int | None:
@@ -302,7 +308,7 @@ class _Spawner:
 
 
 @pytest.fixture
-def spawner(tmp_path: Path) -> Generator[_Spawner]:
+def spawner(tmp_path: Path, socket_guard: SocketGuard) -> Generator[_Spawner]:
     """
     Start ``saneless serve`` children, and kill whatever is left at the end.
 
@@ -310,7 +316,7 @@ def spawner(tmp_path: Path) -> Generator[_Spawner]:
         The spawner.
 
     """
-    spawn = _Spawner(tmp_path=tmp_path)
+    spawn = _Spawner(tmp_path=tmp_path, guard=socket_guard)
     try:
         yield spawn
     finally:

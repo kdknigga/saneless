@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import errno
 import functools
 import html
+import ipaddress
 import json
 import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import weakref
 from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,7 +27,10 @@ import httpx2
 import pytest
 from PIL import Image, ImageDraw
 
+from saneless import cli as cli_mod
+from saneless import config as config_mod
 from saneless import logging_config
+from saneless import worker as worker_mod
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -91,6 +98,307 @@ _NO_REAL_LIBSANE = (
     "with a FakeSaneModule, or request real_listing_launcher with a stand-in "
     "child"
 )
+
+
+# The search for config files, captured before any test replaces it, so a test
+# about the real candidates can still call it.
+real_config_search_paths = config_mod.config_search_paths
+
+# Ports where a real service usually listens on a developer's machine: a local
+# Paperless, and saned. A connect there is refused unless this process holds
+# the listener at that very address at that moment, so no real service can be
+# behind it.
+_GUARD_REFUSED_PORTS = frozenset({8000, 6566})
+
+_INET_FAMILIES = (socket.AF_INET, socket.AF_INET6)
+
+# The owner recorded for a refusal made outside any test.
+_OUTSIDE_A_TEST = "<session>"
+
+# Environment variables cleared for the whole session, in both cases, besides
+# every SANE_* and SANELESS_* variable.
+_AMBIENT_VARIABLES = (
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+)
+
+
+def _is_loopback(host: object) -> bool:
+    """
+    Tell whether a connect address names this machine.
+
+    Args:
+        host: The host part of the address, as the caller passed it.
+
+    Returns:
+        Whether it is ``localhost`` or a loopback IP literal.
+
+    """
+    if not isinstance(host, str):
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.partition("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_bound_to(sock: socket.socket, address: tuple[object, object]) -> bool:
+    """
+    Tell whether a socket is still open and bound to ``address``.
+
+    Returns:
+        False for a socket closed since it was bound, even mid-check.
+
+    """
+    try:
+        return sock.getsockname()[:2] == address
+    except OSError:
+        return False
+
+
+class _SocketGuardState:
+    """
+    What the socket guard knows, shared by every thread in the process.
+
+    Attributes:
+        bound: Every port an internet socket in this process was bound to.
+        held: The sockets this process bound to one of the refused ports.
+        allowed: Ports a test declared for a server in a child process.
+        refusals: ``(owner, thread name, address)`` for each refused connect,
+            where owner is the node id of the test running at the time.
+        owner: The node id of the test running now, or ``<session>``.
+
+    """
+
+    def __init__(self) -> None:
+        """Start knowing no ports and holding no refusals."""
+        self.lock = threading.Lock()
+        self.bound: set[int] = set()
+        self.held: weakref.WeakSet[socket.socket] = weakref.WeakSet()
+        self.allowed: set[int] = set()
+        self.refusals: list[tuple[str, str, tuple[object, ...]]] = []
+        self.owner = _OUTSIDE_A_TEST
+
+    def permits(self, host: object, port: object) -> bool:
+        """
+        Tell whether a connect to ``host:port`` may go ahead.
+
+        Returns:
+            Whether the host is loopback and the port is one this process
+            bound or a test allowed; for a refused port, only while this
+            process still holds a socket bound to exactly that address.
+
+        """
+        if not _is_loopback(host):
+            return False
+        if port in _GUARD_REFUSED_PORTS:
+            with self.lock:
+                held = list(self.held)
+            return any(_is_bound_to(sock, (host, port)) for sock in held)
+        with self.lock:
+            return port in self.bound or port in self.allowed
+
+    def audit(self, event: str, args: tuple[Any, ...]) -> None:
+        """
+        Refuse and record a ``socket.connect`` the guard does not permit.
+
+        Args:
+            event: The audit event's name.
+            args: The event's arguments: the socket and the address.
+
+        Raises:
+            ConnectionRefusedError: For an internet connect not permitted.
+
+        """
+        if event != "socket.connect":
+            return
+        sock, address = args
+        if sock.family not in _INET_FAMILIES or not isinstance(address, tuple):
+            return
+        if sock.type == socket.SOCK_DGRAM:
+            # Connecting a datagram socket only picks the route; nothing is sent.
+            return
+        if self.permits(address[0], address[1]):
+            return
+        with self.lock:
+            self.refusals.append((self.owner, threading.current_thread().name, address))
+        raise ConnectionRefusedError(
+            errno.ECONNREFUSED, "refused by the test socket guard"
+        )
+
+    def take(self, owner: str) -> list[tuple[str, str, tuple[object, ...]]]:
+        """
+        Remove and return the refusals recorded for ``owner``.
+
+        Returns:
+            Those refusals, oldest first.
+
+        """
+        with self.lock:
+            taken = [entry for entry in self.refusals if entry[0] == owner]
+            self.refusals[:] = [e for e in self.refusals if e[0] != owner]
+        return taken
+
+
+_SOCKET_GUARD: dict[str, _SocketGuardState] = {}
+
+
+def _install_socket_guard() -> _SocketGuardState:
+    """
+    Install the process-wide socket guard once, and return its state.
+
+    One audit hook refuses every internet ``connect`` except to a loopback
+    port this process bound, or one a test allowed. Ports 8000 and 6566 are
+    refused unless this process holds the listener at that very address
+    right then, so a local Paperless or saned is never reached. It sees
+    connects from every thread, httpx and asyncio included, and records each
+    refusal, so a worker thread that swallows the error still fails the test.
+    Bound ports are learnt by wrapping ``socket.socket.bind``: the bind audit
+    event fires before the bind, with port 0 for an ephemeral port.
+
+    Audit hooks cannot be removed, so a second call returns the first
+    installation rather than stacking another hook and another wrapper. It
+    starts no thread.
+
+    C code raises no audit event, so libsane's own sockets -- its ``net``
+    backend dialling saned -- are invisible to it; only Python's connects
+    are guarded. Datagram sockets are let through: connecting one sends
+    nothing, and the suite uses it only to ask which local address routes out.
+
+    Returns:
+        The guard's shared state.
+
+    """
+    installed = _SOCKET_GUARD.get("state")
+    if installed is not None:
+        return installed
+    state = _SocketGuardState()
+    real_bind = socket.socket.bind
+
+    def recording_bind(
+        sock: socket.socket, address: tuple[object, ...] | str | bytes, /
+    ) -> None:
+        real_bind(sock, address)
+        if sock.family in _INET_FAMILIES:
+            port = sock.getsockname()[1]
+            with state.lock:
+                state.bound.add(port)
+                if port in _GUARD_REFUSED_PORTS:
+                    state.held.add(sock)
+
+    # Never undone: the wrapper lasts as long as the hook it feeds.
+    pytest.MonkeyPatch().setattr(socket.socket, "bind", recording_bind)
+    sys.addaudithook(state.audit)
+    _SOCKET_GUARD["state"] = state
+    return state
+
+
+_GUARD_STATE = _install_socket_guard()
+
+
+class SocketGuard:
+    """
+    One test's handle on the socket guard.
+
+    Request it as the ``socket_guard`` fixture.
+    """
+
+    def __init__(self, state: _SocketGuardState, owner: str) -> None:
+        """Bind the handle to the guard's state and the test's node id."""
+        self._state = state
+        self._owner = owner
+        self._allowed: set[int] = set()
+
+    @property
+    def violations(self) -> list[tuple[str, str, tuple[object, ...]]]:
+        """The test's refused connects so far, as ``(owner, thread, address)``."""
+        with self._state.lock:
+            return [e for e in self._state.refusals if e[0] == self._owner]
+
+    def clear(self) -> None:
+        """Forget the test's refusals, once it has asserted on them."""
+        self._state.take(self._owner)
+
+    def allow_port(self, port: int) -> None:
+        """
+        Let the test connect to a loopback port a child process bound.
+
+        Args:
+            port: The port, allowed until the test ends.
+
+        """
+        if port in _GUARD_REFUSED_PORTS:
+            msg = f"port {port} is never allowed"
+            raise ValueError(msg)
+        with self._state.lock:
+            self._state.allowed.add(port)
+        self._allowed.add(port)
+
+    def release(self) -> None:
+        """Withdraw every port this handle allowed."""
+        with self._state.lock:
+            self._state.allowed -= self._allowed
+        self._allowed.clear()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Charge connects made from now on to the test about to be set up."""
+    _GUARD_STATE.owner = item.nodeid
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    """Fail the run for any refused connect no test was failed for."""
+    with _GUARD_STATE.lock:
+        left = list(_GUARD_STATE.refusals)
+    if not left:
+        return
+    lines = "\n".join(
+        f"  {owner} [{thread}] {address}" for owner, thread, address in left
+    )
+    sys.stderr.write(f"\nthe test socket guard refused these connects:\n{lines}\n")
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+@pytest.fixture(autouse=True)
+def _socket_guard_verdict(request: pytest.FixtureRequest) -> Iterator[None]:
+    """
+    Fail a test that made a connect the socket guard refused.
+
+    The refusal is raised in the connecting thread too, but a worker thread
+    may swallow it, so the record is what decides.
+
+    Yields:
+        Nothing; the check runs at teardown.
+
+    """
+    yield
+    refused = _GUARD_STATE.take(request.node.nodeid)
+    if refused:
+        shown = ", ".join(f"{address} from {thread}" for _, thread, address in refused)
+        pytest.fail(f"the test socket guard refused: {shown}")
+
+
+@pytest.fixture
+def socket_guard(request: pytest.FixtureRequest) -> Iterator[SocketGuard]:
+    """
+    Give the test a handle on the socket guard.
+
+    Yields:
+        The handle; ports it allowed are withdrawn after the test.
+
+    """
+    guard = SocketGuard(_GUARD_STATE, request.node.nodeid)
+    try:
+        yield guard
+    finally:
+        guard.release()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -242,28 +550,33 @@ def _suite_leaves_cwd_config_alone() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _no_ambient_sane_net_hosts_for_the_session() -> Iterator[None]:
+def _no_ambient_environment_for_the_session() -> Iterator[None]:
     """
-    Keep the developer's own ``SANE_NET_HOSTS`` away from the whole suite.
+    Keep the developer's environment away from the whole suite.
 
-    The Scanner check probes the hosts SANE will dial, and a non-empty
-    exported ``SANE_NET_HOSTS`` wins over ``scanner.host``.  With the
-    variable exported in a developer's shell or a CI image, every check that
-    runs the real registry would dial the machines it names -- real network
-    traffic -- and its verdict would depend on whether they answered.
+    Removed before any other session fixture runs: every ``SANE_*`` and every
+    ``SANELESS_*`` variable in any case, the CA bundle variables, and the
+    proxy variables in both cases. Each one changes a verdict when exported:
+    a bogus ``SSL_CERT_FILE`` breaks every client built with TLS, a
+    lower-case ``saneless_paperless__url`` is still a setting, and a
+    non-empty ``SANE_NET_HOSTS`` makes the Scanner check dial the machines it
+    names. ``sane_test_backend_config`` sets ``SANE_CONFIG_DIR`` afterwards.
 
-    Session-scoped as well as per test, because the per-test fixture cannot
+    Session-scoped as well as per test, because a per-test fixture cannot
     reach a session-scoped server: the browser suite's server starts before
-    any function-scoped fixture runs, and its check refresher reads the
-    environment on every tick, including the first one at start-up.  The
-    variable is restored when the session ends.
+    any function-scoped fixture runs. Everything is restored when the session
+    ends.
 
     Yields:
-        Nothing; the variable is restored after the last test.
+        Nothing; the variables are restored after the last test.
 
     """
+    ambient = {name.upper() for name in _AMBIENT_VARIABLES}
     with pytest.MonkeyPatch.context() as session_patch:
-        session_patch.delenv("SANE_NET_HOSTS", raising=False)
+        for key in list(os.environ):
+            upper = key.upper()
+            if upper in ambient or upper.startswith(("SANE_", "SANELESS_")):
+                session_patch.delenv(key, raising=False)
         yield
 
 
@@ -275,14 +588,16 @@ def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
     The session fixture above clears the developer's value once; this one
     also keeps a value an earlier test left behind -- set directly, or
     written by the scanner backend during SANE initialisation -- out of the
-    next test's body.  A test that wants the variable set says so with
-    ``monkeypatch.setenv`` in its own body.
+    next test's body.  It sets the variable before deleting it, so the undo
+    removes a value the test's own code creates.  A test that wants the
+    variable set says so with ``monkeypatch.setenv`` in its own body.
 
     Args:
         monkeypatch: pytest's environment patcher.
 
     """
-    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+    monkeypatch.setenv("SANE_NET_HOSTS", "unset")
+    monkeypatch.delenv("SANE_NET_HOSTS")
 
 
 @pytest.fixture(scope="session")
@@ -593,6 +908,11 @@ def hermetic_env(
 
     A test about the unset-XDG fallback deletes the variable itself.
 
+    The system config file, ``/etc/saneless/saneless.toml``, is replaced in
+    the config search by a path in an empty directory, in every module that
+    imports the search by name. ``SANELESS_*`` variables are removed in any
+    case, because settings read them in any case.
+
     The temp directory is faked too, by pinning ``tempfile.tempdir``: the
     default ``output.tmp_dir`` is computed from ``tempfile.gettempdir()`` when
     a ``Settings`` is built, so without this any test that builds default
@@ -607,7 +927,7 @@ def hermetic_env(
 
     """
     for key in list(os.environ):
-        if key.startswith("SANELESS_"):
+        if key.upper().startswith("SANELESS_"):
             monkeypatch.delenv(key, raising=False)
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
@@ -617,6 +937,16 @@ def hermetic_env(
     monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", _BROWSERS)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path_factory.mktemp("tmp")))
+    system_config = tmp_path_factory.mktemp("etc-saneless") / "saneless.toml"
+
+    def search_paths_without_the_system_file() -> tuple[Path, ...]:
+        working, user, _ = real_config_search_paths()
+        return working, user, system_config
+
+    for module in (config_mod, cli_mod, worker_mod):
+        monkeypatch.setattr(
+            module, "config_search_paths", search_paths_without_the_system_file
+        )
 
 
 def build_settings(tmp_path: Path, **overrides: object) -> Settings:

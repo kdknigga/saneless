@@ -59,6 +59,7 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.vocabulary import TITLE_MAX_LENGTH, ProfileStorage, local_time
+from tests.conftest import real_config_search_paths
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -349,7 +350,7 @@ class TestLoadedConfigPath:
 
     def test_config_search_paths_order(self) -> None:
         """The search list is cwd, then the XDG config home, then /etc."""
-        assert config_mod.config_search_paths() == (
+        assert real_config_search_paths() == (
             Path("./saneless.toml"),
             config_mod.xdg_config_home() / "saneless" / "saneless.toml",
             Path("/etc/saneless/saneless.toml"),
@@ -2652,7 +2653,7 @@ class TestConfigDiscovery:
     ) -> None:
         """The working directory, then XDG, then ``/etc/saneless``."""
         monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
-        assert config_mod.config_search_paths() == (
+        assert real_config_search_paths() == (
             Path(config_mod.CONFIG_FILENAME),
             tmp_path / "xdg" / "saneless" / config_mod.CONFIG_FILENAME,
             Path("/etc/saneless") / config_mod.CONFIG_FILENAME,

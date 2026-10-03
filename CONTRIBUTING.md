@@ -119,6 +119,22 @@ shell, before `env` changes it, so it is your real home, where `playwright insta
 put them. If you set `PLAYWRIGHT_BROWSERS_PATH` or `XDG_CACHE_HOME` for the
 install, use that directory instead.
 
+The suite keeps off the network and out of your environment too. Paperless
+requests are refused by default: every test URL names `paperless.invalid`, and the
+app's Paperless client is built over a transport that fails every request without
+opening a socket. A test that needs the real HTTP transport says so with
+`@pytest.mark.real_paperless_transport`. A socket guard watches every connect the
+test process makes, from any thread, and fails the test that connected anywhere but
+a loopback port the process itself bound. Ports 8000 and 6566, where a local
+Paperless or saned usually listens, are refused unless the process holds the
+listener at that address. A server started in a child process binds its port where
+the guard cannot see it, so its test declares the port with
+`socket_guard.allow_port(port)`. libsane's own sockets are opened in C and are
+invisible to the guard. Before the first test runs, ambient `SANELESS_*` (in any
+case), `SANE_*`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and proxy variables are cleared,
+and the system config file `/etc/saneless/saneless.toml` is replaced by an empty
+location, so nothing exported in your shell changes a verdict.
+
 The `docker` job builds the image from the `Dockerfile` and never pushes it, then
 starts containers from it and runs the smoke checks in `scripts/smoke_image.py`
 against them. The script drives the local `docker` CLI, and Podman's `docker` shim
