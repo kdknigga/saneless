@@ -214,17 +214,40 @@ def listening_port() -> Iterator[int]:
         yield server.getsockname()[1]
 
 
+# Sockets ``_closed_port`` keeps bound until the test that asked ends.
+_REFUSING_SOCKETS: list[socket.socket] = []
+
+
+@pytest.fixture(autouse=True)
+def _release_refusing_ports() -> Iterator[None]:
+    """
+    Close the sockets ``_closed_port`` bound once the test ends.
+
+    Yields:
+        Nothing; the sockets close at teardown.
+
+    """
+    yield
+    while _REFUSING_SOCKETS:
+        _REFUSING_SOCKETS.pop().close()
+
+
 def _closed_port() -> int:
     """
-    Return a loopback port that was bound and then released.
+    Return a loopback port that is bound but not listening, for this test.
+
+    The kernel refuses a connect to a bound socket that never listened, so
+    the refusal is real, and no other process can take the port while the
+    test runs.
 
     Returns:
         A port number nothing is listening on, so a connect is refused.
 
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port: int = probe.getsockname()[1]
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _REFUSING_SOCKETS.append(probe)
+    probe.bind(("127.0.0.1", 0))
+    port: int = probe.getsockname()[1]
     return port
 
 

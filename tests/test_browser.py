@@ -5151,8 +5151,8 @@ def refused_scanner_strip_server(
     """
     Serve a private app whose scanner host refuses the connection.
 
-    The host is a loopback port that was bound and released, so the server's
-    own pre-probe is refused at once.  A refused host is still enumerated, the
+    The host is a loopback port held bound but never listening, so the
+    server's own pre-probe is refused at once by the kernel.  A refused host is still enumerated, the
     browser test scanner is listed beside it, and the Scanner row is the amber
     ready-but-refused row, one of the longest messages the strip carries.
     Nothing leaves the machine: the dial is the server's, to 127.0.0.1, and
@@ -5164,13 +5164,13 @@ def refused_scanner_strip_server(
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         closed_port: int = probe.getsockname()[1]
-    base = _browser_test_settings(tmp_path)
-    scanner = base.scanner.model_copy(update={"host": f"127.0.0.1:{closed_port}"})
-    settings = base.model_copy(update={"scanner": scanner})
-    with _serve(settings, _BrowserTestScanner()) as server:
-        _pause_background_ticks(server, monkeypatch)
-        egress_allowlist.append(server.url)
-        yield server
+        base = _browser_test_settings(tmp_path)
+        scanner = base.scanner.model_copy(update={"host": f"127.0.0.1:{closed_port}"})
+        settings = base.model_copy(update={"scanner": scanner})
+        with _serve(settings, _BrowserTestScanner()) as server:
+            _pause_background_ticks(server, monkeypatch)
+            egress_allowlist.append(server.url)
+            yield server
 
 
 def _probe_now(server: _BrowserServer) -> None:

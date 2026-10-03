@@ -105,9 +105,9 @@ _NO_REAL_LIBSANE = (
 real_config_search_paths = config_mod.config_search_paths
 
 # Ports where a real service usually listens on a developer's machine: a local
-# Paperless, and saned. A connect there is refused unless this process holds
-# the listener at that very address at that moment, so no real service can be
-# behind it.
+# Paperless, and saned. A test may never allow them for a child process's
+# server; a connect there goes ahead only while this process holds a stream
+# socket bound to that very address, as for every other loopback port.
 _GUARD_REFUSED_PORTS = frozenset({8000, 6566})
 
 _INET_FAMILIES = (socket.AF_INET, socket.AF_INET6)
@@ -167,8 +167,8 @@ class _SocketGuardState:
     What the socket guard knows, shared by every thread in the process.
 
     Attributes:
-        bound: Every port an internet socket in this process was bound to.
-        held: The sockets this process bound to one of the refused ports.
+        held: Every internet stream socket this process bound, held weakly;
+            a socket closed since, or collected, permits nothing.
         allowed: Ports a test declared for a server in a child process.
         refusals: ``(owner, thread name, address)`` for each refused connect,
             where owner is the node id of the test running at the time.
@@ -179,7 +179,6 @@ class _SocketGuardState:
     def __init__(self) -> None:
         """Start knowing no ports and holding no refusals."""
         self.lock = threading.Lock()
-        self.bound: set[int] = set()
         self.held: weakref.WeakSet[socket.socket] = weakref.WeakSet()
         self.allowed: set[int] = set()
         self.refusals: list[tuple[str, str, tuple[object, ...]]] = []
@@ -190,19 +189,17 @@ class _SocketGuardState:
         Tell whether a connect to ``host:port`` may go ahead.
 
         Returns:
-            Whether the host is loopback and the port is one this process
-            bound or a test allowed; for a refused port, only while this
-            process still holds a socket bound to exactly that address.
+            Whether the host is loopback and either this process holds a
+            stream socket bound to exactly that address right now, or a test
+            allowed the port for a child process's server.
 
         """
         if not _is_loopback(host):
             return False
-        if port in _GUARD_REFUSED_PORTS:
-            with self.lock:
-                held = list(self.held)
-            return any(_is_bound_to(sock, (host, port)) for sock in held)
         with self.lock:
-            return port in self.bound or port in self.allowed
+            held = list(self.held)
+            allowed = port in self.allowed
+        return allowed or any(_is_bound_to(sock, (host, port)) for sock in held)
 
     def audit(self, event: str, args: tuple[Any, ...]) -> None:
         """
@@ -254,13 +251,17 @@ def _install_socket_guard() -> _SocketGuardState:
     Install the process-wide socket guard once, and return its state.
 
     One audit hook refuses every internet ``connect`` except to a loopback
-    port this process bound, or one a test allowed. Ports 8000 and 6566 are
-    refused unless this process holds the listener at that very address
-    right then, so a local Paperless or saned is never reached. It sees
-    connects from every thread, httpx and asyncio included, and records each
-    refusal, so a worker thread that swallows the error still fails the test.
-    Bound ports are learnt by wrapping ``socket.socket.bind``: the bind audit
-    event fires before the bind, with port 0 for an ephemeral port.
+    address where this process holds a bound stream socket at that moment,
+    or to a port a test allowed for a child process. Ports 8000 and 6566 can
+    never be allowed, so a local Paperless or saned is never reached. A
+    datagram socket on the same port proves nothing, because TCP and UDP
+    ports are separate, and a port an earlier test bound and released may
+    since belong to a real service, so neither permits a connect. The guard
+    sees connects from every thread, httpx and asyncio included, and records
+    each refusal, so a worker thread that swallows the error still fails the
+    test. Bound sockets are learnt by wrapping ``socket.socket.bind``: the
+    bind audit event fires before the bind, with port 0 for an ephemeral
+    port.
 
     Audit hooks cannot be removed, so a second call returns the first
     installation rather than stacking another hook and another wrapper. It
@@ -285,12 +286,9 @@ def _install_socket_guard() -> _SocketGuardState:
         sock: socket.socket, address: tuple[object, ...] | str | bytes, /
     ) -> None:
         real_bind(sock, address)
-        if sock.family in _INET_FAMILIES:
-            port = sock.getsockname()[1]
+        if sock.family in _INET_FAMILIES and sock.type == socket.SOCK_STREAM:
             with state.lock:
-                state.bound.add(port)
-                if port in _GUARD_REFUSED_PORTS:
-                    state.held.add(sock)
+                state.held.add(sock)
 
     # Never undone: the wrapper lasts as long as the hook it feeds.
     pytest.MonkeyPatch().setattr(socket.socket, "bind", recording_bind)

@@ -50,6 +50,8 @@ from scripts.smoke_image import (
 if TYPE_CHECKING:
     import subprocess
 
+    from tests.conftest import SocketGuard
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 README = REPO_ROOT / "README.md"
 QUICK_START = REPO_ROOT / "docs" / "getting-started" / "quick-start.md"
@@ -530,10 +532,18 @@ def test_the_fake_paperless_refuses_another_token_but_records_it() -> None:
         assert fake.hits == [FakeHit("GET", "/api/correspondents/", "Token other")]
 
 
-def test_the_fake_paperless_stops_listening_on_exit() -> None:
-    """Once the context exits, nothing accepts connections on its port."""
+def test_the_fake_paperless_stops_listening_on_exit(
+    socket_guard: SocketGuard,
+) -> None:
+    """
+    Once the context exits, nothing accepts connections on its port.
+
+    The port is allowed through the socket guard, so the refusal comes from
+    the kernel and not from the guard.
+    """
     with fake_paperless("127.0.0.1", "127.0.0.1", "t") as fake:
         port = int(fake.url.rpartition(":")[2])
+    socket_guard.allow_port(port)
     with (
         pytest.raises(ConnectionRefusedError),
         socket.create_connection(("127.0.0.1", port), 2),

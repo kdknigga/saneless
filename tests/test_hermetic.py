@@ -236,6 +236,46 @@ def test_the_socket_guard_refuses_a_non_loopback_address(
     socket_guard.clear()
 
 
+def test_a_datagram_socket_on_8000_does_not_open_8000_to_tcp(
+    socket_guard: SocketGuard,
+) -> None:
+    """
+    A UDP socket bound to 127.0.0.1:8000 lets no TCP connect through.
+
+    TCP and UDP ports are separate, so a real Paperless can listen on TCP
+    8000 while this process holds UDP 8000.
+    """
+    datagram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        datagram.bind(("127.0.0.1", 8000))
+        with pytest.raises(ConnectionRefusedError, match="test socket guard"):
+            socket.create_connection(("127.0.0.1", 8000), timeout=1)
+    finally:
+        datagram.close()
+    assert [address for _, _, address in socket_guard.violations] == [
+        ("127.0.0.1", 8000)
+    ]
+    socket_guard.clear()
+
+
+def test_a_released_loopback_port_is_refused(socket_guard: SocketGuard) -> None:
+    """
+    A loopback port this process bound and then closed is refused.
+
+    Once released, the port may belong to a real service, so having bound it
+    earlier in the session permits nothing.
+    """
+    listener = _loopback_listener()
+    port = listener.getsockname()[1]
+    listener.close()
+    with pytest.raises(ConnectionRefusedError, match="test socket guard"):
+        socket.create_connection(("127.0.0.1", port), timeout=1)
+    assert [address for _, _, address in socket_guard.violations] == [
+        ("127.0.0.1", port)
+    ]
+    socket_guard.clear()
+
+
 def test_paperless_requests_are_refused_by_default() -> None:
     """The web app's Paperless client sends nothing, even to a live listener."""
     assert web_app.PaperlessClient is not PaperlessClient
