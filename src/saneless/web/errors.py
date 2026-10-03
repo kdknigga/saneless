@@ -89,9 +89,9 @@ RETRY_AFTER_SECONDS: Final = 30
 # ``partials/checks.html`` gives its swap target, and a test asserts the two
 # agree.
 #
-# Four elements in this application poll: the status strip, which this
-# exemption covers, and three whose routes never raise into this handler --
-# the status area, whose poll routes catch their own failures and render a
+# Of the elements in this application that poll, only the status strip needs
+# this exemption; the routes of every other polling element never raise into
+# this handler -- the status area, whose poll routes catch their own failures and render a
 # backing-off fallback; the lazy list load; and a list's retry (see
 # ``get_metadata`` and ``probe_metadata``).  An armed htmx poll is ended by
 # exactly two things: the element leaving the DOM
@@ -100,14 +100,14 @@ RETRY_AFTER_SECONDS: Final = 30
 # never re-reads ``hx-trigger``.  Retargeting the strip's own failure into
 # ``#status-message`` therefore left ``#checks-body`` on the page with its
 # ``every 2s`` trigger intact, polling for the life of the tab and overwriting
-# the scan-progress line every two seconds.  Exempting this one id is what lets
+# the error slot, ``#status-message``, every two seconds.  Exempting this one id is what lets
 # the failure be swapped by the polling element's own ``hx-target="this"
 # hx-swap="outerHTML"``, which detaches it and ends the chain.
 #
 # The id alone does not identify the poll.  ``Check again`` in the same partial
 # is ``hx-post="/api/checks/refresh" hx-target="#checks-body"``, so its click
 # arrives carrying the same header, and exempting it too meant a failing click
-# wrote the error body over the strip -- six rows and the only button that
+# wrote the error body over the strip -- every row and the only button that
 # could bring them back, gone for the life of the tab.  So the
 # exemption also requires a GET (``_is_the_strip_fetching_itself``): the
 # strip's poll and its terminal-state reload are both ``GET /api/checks``, the
@@ -150,7 +150,7 @@ class TechnicalDetails:
     This is the slot's whole permitted vocabulary in one place.  Each field is
     either a value saneless made or a value its caller has already made safe;
     exception text, other request input and the log path have no field here
-    (ASVS V7).
+    (ASVS 4.0.3 V7.4.1).
     """
 
     job_id: str | None = None
@@ -291,7 +291,7 @@ def render_error(
     which name to add to ``[web] allowed_hosts``.  That Host arrives already
     neutralised and bounded, and the template escapes it.  Otherwise
     exception text, request input and the log path must never reach the slot
-    (ASVS V7), and a uniform affordance that sometimes lied about having
+    (ASVS 4.0.3 V7.4.1), and a uniform affordance that sometimes lied about having
     detail would be worse than one that says what it has.
 
     Every response built here carries ``SECURITY_HEADERS`` and ``NO_STORE``:
@@ -314,7 +314,7 @@ def render_error(
     ``HX-Retarget`` to the response's target *before* it decides what to swap,
     so the header did not merely redirect the error -- it also spared
     ``#checks-body``, which kept its ``every 2s`` trigger and kept polling,
-    overwriting the scan-progress line in ``#status-message`` twice a minute.
+    overwriting the error slot, ``#status-message``, every two seconds.
     And ``base.html``'s ``{"code":"[45]..","swap":true,"error":true}`` rule is
     what makes an error body swap at all, so it is load-bearing here: without
     it the exempt response would be discarded and the poll would survive.
@@ -467,7 +467,7 @@ async def _browser_navigation_refused(request: Request, exc: Exception) -> Respo
     answers anything but an htmx request with JSON, and a browser showing a
     navigation's answer would show the JSON as text.  Everything else
     ``render_error`` guarantees still holds.  Every word comes from the
-    vocabulary and none from the request (ASVS V7), and the response carries
+    vocabulary and none from the request (ASVS 4.0.3 V7.4.1), and the response carries
     ``SECURITY_HEADERS`` and ``NO_STORE`` itself.  It is a 400, because the
     request is one this route does not serve, and nothing was started or
     recorded.

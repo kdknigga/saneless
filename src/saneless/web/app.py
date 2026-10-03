@@ -211,8 +211,8 @@ def _build_check_machinery(
 
     """
     # No ttl is passed: unlike the Paperless metadata cache there is no config
-    # key for this one, so the answer is the class default.  One default, read
-    # at call time, is what a test or a future setting overrides.
+    # key for this one, so the answer is the class default, bound when
+    # CheckCache is defined.  A test that wants another ttl passes its own.
     checks_cache = CheckCache()
 
     def build_check_context() -> CheckContext:
@@ -233,9 +233,8 @@ def _build_check_machinery(
     refresher = CheckRefresher(
         cache=checks_cache,
         context_factory=build_check_context,
-        # Late-bound on purpose: the gate is fetched at probe time, so the
-        # refresher follows a worker that is rebuilt rather than holding a lock
-        # nothing else uses any more.
+        # The worker creates its scanner gate once, so this returns the same
+        # lock on every call; it is a callable only to match scan_active.
         scanner_gate=lambda: worker.scanner_gate,
         # The same fact _checks_context renders as scan_active, read from the
         # same place, so the strip's words and its colour cannot disagree.
