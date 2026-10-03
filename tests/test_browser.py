@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
     from saneless.job import Job, JobStore
     from saneless.scanner.base import PageSink, ScanSettings
+    from tests.conftest import SocketGuard
 
 import httpx2
 import pytest
@@ -3851,7 +3852,7 @@ _HELD_LOAD_BUDGET = 10.0
 
 
 @pytest.fixture
-def black_holed_paperless() -> Iterator[socket.socket]:
+def black_holed_paperless(socket_guard: SocketGuard) -> Iterator[socket.socket]:
     """
     Listen on a loopback port and never accept, so paperless-ngx never answers.
 
@@ -3860,6 +3861,8 @@ def black_holed_paperless() -> Iterator[socket.socket]:
     comes: a paperless-ngx that is up but hung, the worst case for a page
     that asks it anything.  Server-side only, so the browser's egress gate
     is unaffected.  Closed at teardown, if the test did not close it first.
+    The port stays allowed through the socket guard after the hole closes,
+    so a fetch made then is refused by the kernel, as it would be in use.
 
     Yields:
         The listening socket.
@@ -3868,6 +3871,7 @@ def black_holed_paperless() -> Iterator[socket.socket]:
     hole = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     hole.bind(("127.0.0.1", 0))
     hole.listen()
+    socket_guard.allow_port(hole.getsockname()[1])
     try:
         yield hole
     finally:

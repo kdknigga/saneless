@@ -273,6 +273,45 @@ def test_a_datagram_socket_on_8000_does_not_open_8000_to_tcp(
     socket_guard.clear()
 
 
+def test_a_listening_wildcard_socket_opens_its_port_on_loopback(
+    socket_guard: SocketGuard,
+) -> None:
+    """
+    A listener on 0.0.0.0 accepts a connect to 127.0.0.1 on its port.
+
+    No other socket can bind a specific address under a listening wildcard
+    one, so this process is what answers.
+    """
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("0.0.0.0", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+        assert _pending_connections(listener) == 1
+    finally:
+        listener.close()
+    assert socket_guard.violations == []
+
+
+def test_a_wildcard_socket_that_does_not_listen_opens_nothing(
+    socket_guard: SocketGuard,
+) -> None:
+    """A socket bound to 0.0.0.0 but not listening lets no loopback connect by."""
+    bound = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        bound.bind(("0.0.0.0", 0))
+        port = bound.getsockname()[1]
+        with pytest.raises(ConnectionRefusedError, match="test socket guard"):
+            socket.create_connection(("127.0.0.1", port), timeout=1)
+    finally:
+        bound.close()
+    assert [address for _, _, address in socket_guard.violations] == [
+        ("127.0.0.1", port)
+    ]
+    socket_guard.clear()
+
+
 def test_a_released_loopback_port_is_refused(socket_guard: SocketGuard) -> None:
     """
     A loopback port this process bound and then closed is refused.

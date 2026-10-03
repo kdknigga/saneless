@@ -148,17 +148,41 @@ def _is_loopback(host: object) -> bool:
         return False
 
 
+# The wildcard address of each internet family.
+_WILDCARD = {socket.AF_INET: "0.0.0.0", socket.AF_INET6: "::"}
+
+
 def _is_bound_to(sock: socket.socket, address: tuple[object, object]) -> bool:
     """
-    Tell whether a socket is still open and bound to ``address``.
+    Tell whether a socket still holds ``address``.
+
+    It does when it is bound to exactly that address, or when it listens on
+    its family's wildcard address at that port: the kernel lets no other
+    socket bind a specific address under a listening wildcard one, so no
+    other process can be behind it.
 
     Returns:
         False for a socket closed since it was bound, even mid-check.
 
     """
+    host, port = address
     try:
-        return sock.getsockname()[:2] == address
+        bound_host, bound_port = sock.getsockname()[:2]
+        if bound_port != port:
+            return False
+        if bound_host == host:
+            return True
+        family = ipaddress.ip_address(str(host).partition("%")[0]).version
+        return (
+            bound_host == _WILDCARD[sock.family]
+            and family == (4 if sock.family == socket.AF_INET else 6)
+            and sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+        )
+    # Two clauses rather than one tuple: ruff format rewrites a tuple into
+    # PEP 758's bracketless form, which the debug-statements hook cannot parse.
     except OSError:
+        return False
+    except ValueError:
         return False
 
 
@@ -190,8 +214,8 @@ class _SocketGuardState:
 
         Returns:
             Whether the host is loopback and either this process holds a
-            stream socket bound to exactly that address right now, or a test
-            allowed the port for a child process's server.
+            stream socket bound to that address right now (exactly, or as a
+            listening wildcard of its family), or a test allowed the port.
 
         """
         if not _is_loopback(host):
@@ -325,7 +349,10 @@ class SocketGuard:
 
     def allow_port(self, port: int) -> None:
         """
-        Let the test connect to a loopback port a child process bound.
+        Let the test connect to a loopback port this process does not hold.
+
+        For a server in a child process, or a port the test closed on purpose
+        so that the kernel, not the guard, refuses the connect.
 
         Args:
             port: The port, allowed until the test ends.
