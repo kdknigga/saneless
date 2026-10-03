@@ -2746,7 +2746,7 @@ def _count_idle_ticks(
     Count the idle ticks an unstarted worker completes once it runs.
 
     A test that sleeps and then asserts nothing happened also passes when the
-    thread never reached its first idle tick on a slow runner (IN-03).
+    thread never reached its first idle tick on a slow runner.
     Counting completed ticks proves the window was real.
 
     Returns:
@@ -2807,12 +2807,10 @@ class TestWorkerGuard:
     """
     No exception from the pipeline, the job store or prune ends the worker.
 
-    C-09 found the loop unguarded: a raise from ``update_state``, from the
-    failure-path ``finish_job`` or from the per-job ``prune`` ended the thread
-    silently, and every later scan sat PENDING until restart.  ROBU-01 guards
-    the loop; D-10 keeps a pipeline failure a job failure and makes a failure
-    of the loop's own store writes a loop failure; D-13 moves prune out of the
-    job path onto an hourly idle tick.  Each test proves the worker survived by
+    A pipeline failure is a job failure, a failure of the loop's own store
+    writes is a loop failure, and prune runs on an hourly idle tick outside
+    the job path.  None of them ends the thread, so no later scan sits
+    PENDING until a restart.  Each test proves the worker survived by
     finishing a later job, not by reading ``is_alive`` alone.
     """
 
@@ -2894,7 +2892,7 @@ class TestWorkerGuard:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        ROBU-01, D-10: the failure-path ``finish_job`` raising is a loop failure.
+        The failure-path ``finish_job`` raising is a loop failure.
 
         The pipeline fails job 1; recording that failure raises once.  The guard
         logs it and its own best-effort write lands the ERROR, and job 2 runs.
@@ -2945,7 +2943,7 @@ class TestWorkerGuard:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """ROBU-01, D-13: a raising prune is a WARNING with its traceback; jobs finish."""
+        """A raising prune is a WARNING with its traceback; jobs finish."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
@@ -3021,7 +3019,7 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-10: three pipeline failures in a row are three ERROR jobs, and no more."""
+        """Three pipeline failures in a row are three ERROR jobs, and no more."""
 
         def failing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
             msg = "Scanner jammed"
@@ -3056,7 +3054,7 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-13: an idle worker prunes with the configured limits once due."""
+        """An idle worker prunes with the configured limits once due."""
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
         store = JobStore()
@@ -3082,7 +3080,7 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-13: the idle prune is hourly, not every tick."""
+        """The idle prune is hourly, not every tick."""
         assert worker_module._PRUNE_INTERVAL_SECONDS >= 3600.0
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
@@ -3093,7 +3091,7 @@ class TestWorkerGuard:
         try:
             worker.start()
             # A window in which nothing may happen, measured in idle ticks the
-            # worker actually took rather than in wall time (IN-03).
+            # worker actually took rather than in wall time.
             ticked = poll_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
         finally:
             worker.stop()
@@ -3153,7 +3151,7 @@ class TestWorkerGuard:
         failed_writes: int,
     ) -> None:
         """
-        WR-02: a document Paperless accepted is never recorded as an ERROR.
+        A document Paperless accepted is never recorded as an ERROR.
 
         The terminal DONE write fails after the upload.  With one failure the
         guard's own retry lands it; with two the guard's retry fails too and
@@ -3193,7 +3191,7 @@ class TestWorkerGuard:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        WR-02: the owed ERROR keeps the pipeline's own text and category.
+        The owed ERROR keeps the pipeline's own text and category.
 
         The failure-path write raising must not replace the scanner's error
         with the job store's ``disk I/O error``.
@@ -3227,7 +3225,7 @@ class TestWorkerGuard:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        ROBU-01, CR-01, D-12: a row the guard could not end still ends on its own.
+        A row the guard could not end still ends on its own.
 
         The job's handling and the guard's ERROR write both fail once with a
         store error.  That is one loop-level failure, well below degraded, so
@@ -3280,13 +3278,13 @@ class TestWorkerGuard:
         stranded: int,
     ) -> None:
         """
-        CR-01, D-10, D-12: owed writes are retried on every idle tick, not probed.
+        Owed writes are retried on every idle tick, not probed.
 
         ``stranded`` loop-level failures stay below ``_DEGRADED_AFTER``, and the
         guard's ERROR write for each fails too.  Failed retries are not
         loop-level failures, and the streak limit is raised so the observation
-        window before healing cannot reach it (WR-10 is pinned by
-        ``TestOwedWriteStreak``), so the worker stays HEALTHY and never probes;
+        window before healing cannot reach it (``TestOwedWriteStreak`` pins
+        the limit), so the worker stays HEALTHY and never probes;
         once the store accepts writes, every stranded row reaches ERROR with the
         guard's own text.
         """
@@ -3358,12 +3356,12 @@ class TestOwedRejections:
     """
     A refused submit whose REJECTED write failed is written by the worker.
 
-    WR-01: the route creates the row before ``submit()`` (D-05), so a refusal
-    needs a second write, and when that write fails the row would stay PENDING
-    with no REJECTED marker (D-06).  The route owes it to the worker instead,
-    and the worker's idle flush -- shared with the guard's owed failures --
-    writes it on its next tick (D-12).  A failed retry is never a loop-level
-    failure (D-10), while a streak of them degrades the worker (WR-10).
+    The route creates the row before ``submit()``, so a refusal needs a
+    second write, and when that write fails the row would stay PENDING with
+    no REJECTED marker.  The route owes it to the worker instead, and the
+    worker's idle flush -- shared with the guard's owed failures -- writes
+    it on its next tick.  A failed retry is never a loop-level failure,
+    while a streak of them degrades the worker.
     """
 
     def test_an_owed_rejection_is_written_on_the_next_idle_tick(
@@ -3371,7 +3369,7 @@ class TestOwedRejections:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A healthy worker records an owed rejection without probing (D-12)."""
+        """A healthy worker records an owed rejection without probing."""
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
         probes = _StoreFault(store.probe, frozenset())
@@ -3402,8 +3400,8 @@ class TestOwedRejections:
         """
         A request-side debt the store refuses is retried, never a loop failure.
 
-        It is never counted as a loop-level failure (D-10).  The streak limit is
-        raised so the three-failure window cannot degrade it.
+        The streak limit is raised so the three-failure window cannot degrade
+        the worker by that route either.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
@@ -3511,7 +3509,7 @@ class TestOwedRejections:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        IN-07: the flush drops an owed entry only if it is unchanged.
+        The flush drops an owed entry only if it is unchanged.
 
         The first write for an id is held inside ``finish_job`` while the id is
         owed again with different text.  The flush must keep the newer entry
@@ -3584,10 +3582,10 @@ class TestOwedRejections:
         """
         Only owed REJECTED writes are listed, and only until they are written.
 
-        IN-08, D-06: the status area skips these ids so a refused attempt is
-        never shown as the live job.  A failure the loop guard could not write
-        belongs to a job that ran, so it is left out and D-17 still reports
-        it.  The streak limit is raised so the failing window cannot degrade.
+        The status area skips these ids so a refused attempt is never shown
+        as the live job.  A failure the loop guard could not write belongs
+        to a job that ran, so it is left out and that job is still shown.
+        The streak limit is raised so the failing window cannot degrade.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
@@ -3629,7 +3627,7 @@ class TestOwedRejections:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        IN-06: a rejection still owed at shutdown is written before the thread exits.
+        A rejection still owed at shutdown is written before the thread exits.
 
         No idle tick can run in the test's window, so only the exit flush can
         write it.  Unwritten, the row would come back after a restart as a
@@ -3661,7 +3659,7 @@ class TestOwedRejections:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """IN-06: a store that refuses the exit flush cannot hold the stop."""
+        """A store that refuses the exit flush cannot hold the stop."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
         store = JobStore()
@@ -3692,12 +3690,11 @@ class TestOwedWriteStreak:
     """
     A streak of failed owed-write retries degrades the worker.
 
-    WR-10: the idle flush retried owed job-row writes on every tick but only
-    logged a failed retry, so a job store that never healed left the stuck row
-    live and ``/health`` at 200 until an hourly prune failed.  A failed retry
-    is still not a loop-level failure (D-10), but ``_OWED_RETRY_DEGRADED_AFTER``
-    failed idle ticks in a row degrade the worker, and the probe-and-flush
-    recovery path clears it again (D-12).
+    A failed retry is not a loop-level failure, but
+    ``_OWED_RETRY_DEGRADED_AFTER`` failed idle ticks in a row degrade the
+    worker, and the probe-and-flush recovery path clears it again.  Without
+    the streak, a job store that never heals would leave the stuck row live
+    and ``/health`` at 200 until an hourly prune failed.
     """
 
     @pytest.mark.parametrize("debt", ["guard", "rejection"])
@@ -3709,7 +3706,7 @@ class TestOwedWriteStreak:
         debt: str,
     ) -> None:
         """
-        WR-10, D-10: an owed write the store never accepts reaches DEGRADED.
+        An owed write the store never accepts reaches DEGRADED.
 
         The debt is either the guard's (a store error escaping a job, whose
         ERROR write failed too, one loop-level failure) or a request-side rejection
@@ -3777,7 +3774,7 @@ class TestOwedWriteStreak:
         debt: str,
     ) -> None:
         """
-        WR-10, D-12, IN-07: a streak-degraded worker heals through probe and flush.
+        A streak-degraded worker heals through probe and flush.
 
         The debt is the guard's ERROR write or a request-side REJECTED write.
         Once the store accepts writes again, the probe succeeds and the owed
@@ -3852,7 +3849,7 @@ class TestOwedWriteStreak:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        IN-09, D-10: a cleanly recorded job breaks the streak as it breaks the run.
+        A cleanly recorded job breaks the streak as it breaks the run.
 
         Idle ticks come only between jobs, so without this a streak could span
         a job that proved the store accepts writes, and one more failed tick
@@ -4001,7 +3998,7 @@ class TestOwedWriteStreak:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        WR-10, D-10: a fault that heals inside the streak never degrades.
+        A fault that heals inside the streak never degrades.
 
         For each of two jobs the guard's ERROR write fails, then one tick fewer
         than the streak limit of retries fail, then the next retry lands.  A
@@ -4010,7 +4007,7 @@ class TestOwedWriteStreak:
         first failed retry at WARNING exactly once.
         """
         # Read from the production streak limit, never mirrored, so the streaks
-        # below stay exactly one tick short of it if the limit changes (IN-11).
+        # below stay exactly one tick short of it if the limit changes.
         threshold = worker_module._OWED_RETRY_DEGRADED_AFTER
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
@@ -4063,8 +4060,8 @@ class TestOwedWriteStreak:
 
         A store error escapes the job, one loop-level failure, and the
         guard's ERROR write fails too, so the ERROR is owed.  The next idle
-        tick writes it: the store just accepted a write, so the failure
-        before it is no longer part of a run.
+        tick writes it: the store just accepted a write, so the run of
+        failures before it is over.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
@@ -4231,7 +4228,7 @@ class TestOwedWritesAfterAJob:
         assert owed_at_scan == [frozenset({refused.id})] * 2
 
 
-# Loop-level failures in a row that make a worker degraded (D-10).
+# Loop-level failures in a row that make a worker degraded.
 _DEGRADING_JOBS = 3
 
 
