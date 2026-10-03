@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import functools
 import html
-import importlib
 import json
 import logging
 import os
@@ -15,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -1394,9 +1394,7 @@ def _flatten_routes(routes: Sequence[BaseRoute]) -> list[BaseRoute]:
         The leaves, with every wrapper expanded in place.
 
     """
-    included: type[_IncludedRouter] = importlib.import_module(
-        "fastapi.routing"
-    )._IncludedRouter
+    included: type[_IncludedRouter] = import_module("fastapi.routing")._IncludedRouter
     found: list[BaseRoute] = []
     for route in routes:
         if isinstance(route, included):
