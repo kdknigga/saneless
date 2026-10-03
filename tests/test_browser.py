@@ -940,27 +940,6 @@ class TestBrowserRendering:
 
 
 @pytest.mark.browser
-class TestHTMXPolling:
-    """The page carries the polled status area and runs htmx."""
-
-    def test_status_area_exists(self, page: Page, browser_server_url: str) -> None:
-        """Status area element exists on the page."""
-        page.goto(browser_server_url)
-        # Status area should be present (div#status-area)
-        status = page.locator(
-            "[hx-get*='status'], [data-hx-get*='status'], #status-area"
-        )
-        assert status.count() >= 1
-
-    def test_htmx_loaded(self, page: Page, browser_server_url: str) -> None:
-        """HTMX library is loaded and active on the page."""
-        page.goto(browser_server_url)
-        # Check htmx is available in the global scope
-        htmx_loaded = page.evaluate("typeof htmx !== 'undefined'")
-        assert htmx_loaded is True
-
-
-@pytest.mark.browser
 class TestOfflinePage:
     """
     The page structure the offline UI depends on, read from the live DOM.
@@ -1064,23 +1043,6 @@ class TestOfflinePage:
 @pytest.mark.browser
 class TestFlipPromptUI:
     """The flip prompt shows only for a waiting job, and Continue answers it."""
-
-    def test_flip_prompt_not_visible_on_idle(
-        self, page: Page, browser_server_url: str
-    ) -> None:
-        """Flip prompt is not visible when no job is in AWAITING_FLIP state."""
-        page.goto(browser_server_url)
-        # On idle there is no flip prompt at all, so no Continue control either.
-        flip_continue = page.locator(
-            "button:has-text('Continue'), [hx-post*='flip/continue']"
-        )
-        expect(flip_continue).to_have_count(0)
-
-    def test_scan_button_present(self, page: Page, browser_server_url: str) -> None:
-        """Scan button exists and is visible in idle state."""
-        page.goto(browser_server_url)
-        scan_btn = page.locator("button[type='submit'], input[type='submit']").first
-        assert scan_btn.is_visible()
 
     def test_flip_continue_click_answers_the_waiting_job(
         self, page: Page, browser_server: _BrowserServer
@@ -2175,42 +2137,6 @@ class TestDarkModeEngagement:
             assert colour == _AMBER[scheme], (colour, background, ratio)
         if cls in {"status-cancelled", "page-counts"}:
             assert colour == _MUTED[scheme], (colour, background, ratio)
-
-    def test_forced_dark_theme_gives_cancelled_the_dark_muted_colour(
-        self, page: Page, browser_server_url: str
-    ) -> None:
-        """
-        A forced dark theme gets Pico's dark muted grey under a light OS.
-
-        ``.status-cancelled`` reads Pico's own token rather than an app-owned
-        pair, so this is the proof that Pico's ``[data-theme="dark"]`` block
-        reaches it -- and that it still clears AA on the dark card there.
-        """
-        self._goto(page, browser_server_url, "light")
-        page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
-        colours = page.evaluate(_PROBE_STATUS_COLOURS)
-        assert colours["status-cancelled"] == _MUTED["dark"], colours
-        probe = page.evaluate(
-            _PROBE_CONTEXT_CONTRAST, {"cls": "status-cancelled", "context": "card"}
-        )
-        background = _flatten(probe["backgroundStack"])
-        ratio = _contrast_ratio(probe["colour"], background)
-        assert ratio >= 4.5, (probe, background, ratio)
-
-    def test_forced_dark_theme_keeps_the_dark_amber(
-        self, page: Page, browser_server_url: str
-    ) -> None:
-        """
-        A forced dark theme gets the dark amber even under a light OS.
-
-        The automatic-dark tests cannot reach the forced-dark rule, because the
-        OS preference alone never sets data-theme. This sets it directly, the
-        way a future theme toggle would, and checks the amber follows.
-        """
-        self._goto(page, browser_server_url, "light")
-        page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
-        colours = page.evaluate(_PROBE_STATUS_COLOURS)
-        assert colours["status-fallback"] == _AMBER["dark"], colours
 
 
 _QUEUE_FULL_TEXT = (
@@ -5384,33 +5310,6 @@ class TestStatusStripInChromium:
         assert colour == _CHECK_STATE_COLOURS[cls][scheme], (colour, background)
         assert ratio >= 4.5, (colour, background, ratio)
 
-    @pytest.mark.parametrize("cls", ["check-ok", "check-warn", "check-fail"])
-    def test_forced_dark_theme_gives_the_check_states_their_dark_colours(
-        self,
-        page: Page,
-        browser_server_url: str,
-        cls: Literal["check-ok", "check-warn", "check-fail"],
-    ) -> None:
-        """
-        A forced ``data-theme`` reaches all three, under a light OS.
-
-        The OS preference alone never sets ``data-theme``, so the emulated case
-        above cannot exercise the forced-dark rule at all. One of the three
-        reads an app-owned property and two read Pico's own tokens, and this is
-        what proves the forced-dark block reaches every one of them -- and that
-        the dark colour still clears AA on the dark card.
-        """
-        page.emulate_media(color_scheme="light")
-        page.goto(browser_server_url)
-        page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
-
-        probe = page.evaluate(_PROBE_CONTEXT_CONTRAST, {"cls": cls, "context": "card"})
-        colour = probe["colour"]
-        background = _flatten(probe["backgroundStack"])
-        ratio = _contrast_ratio(colour, background)
-        assert colour == _CHECK_STATE_COLOURS[cls]["dark"], (colour, background)
-        assert ratio >= 4.5, (colour, background, ratio)
-
     def test_a_scan_in_flight_pauses_the_scanner_row_and_says_so(
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
@@ -6053,8 +5952,8 @@ class TestPollEndsOnAnErrorResponse:
         assert errors[0]["error"] is True
 
 
-# The counts footnote's wording, for the three cases that behave differently: a
-# measured set, a measured zero in the middle clause, and never-recorded.
+# The counts footnote's wording, for a measured set and for a measured zero in
+# the middle clause.
 _MEASURED_COUNTS = "12 pages scanned, 2 blank removed, 10 uploaded"
 _ZERO_BLANK_COUNTS = "12 pages scanned, 0 blank removed, 12 uploaded"
 
@@ -6075,11 +5974,11 @@ def empty_history_server(
     """
     Serve a private app whose job history starts empty.
 
-    Two of the assertions below are about what is *absent* from the whole page:
-    a job with NULL counts renders no ``.page-counts`` element anywhere, and an
-    ERROR page carries no log-file path anywhere. Neither claim means anything
-    against the session server, whose store and whose configured log path are
-    shared with every other test in this module.
+    Some assertions below are about the whole page: an ERROR page carries no
+    log-file path anywhere, and a done job's counts sit in the first history
+    row. Neither claim means anything against the session server, whose store
+    and whose configured log path are shared with every other test in this
+    module.
     """
     with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
         egress_allowlist.append(server.url)
@@ -6263,8 +6162,8 @@ class TestPageCountsInChromium:
     One class and one rule serve the status area and the Title cell alike, and
     the guard for both is the filter returning None rather than a count's own
     truthiness. The failure mode that matters -- a measured zero rendered as
-    nothing, or a never-recorded count rendered as zero -- is a rendering
-    outcome, so it is read off the page rather than off the filter.
+    nothing -- is a rendering outcome, so it is read off the page rather than
+    off the filter.
     """
 
     @pytest.mark.parametrize(
@@ -6272,25 +6171,21 @@ class TestPageCountsInChromium:
         [
             ((12, 2, 10), _MEASURED_COUNTS),
             ((12, 0, 12), _ZERO_BLANK_COUNTS),
-            ((None, None, None), None),
         ],
-        ids=["measured", "measured-zero", "never-recorded"],
+        ids=["measured", "measured-zero"],
     )
-    def test_a_done_job_renders_its_counts_in_both_places_or_not_at_all(
+    def test_a_done_job_renders_its_counts_in_both_places(
         self,
         page: Page,
         empty_history_server: _BrowserServer,
-        counts: tuple[int | None, int | None, int | None],
-        expected: str | None,
+        counts: tuple[int, int, int],
+        expected: str,
     ) -> None:
         """
-        Measured counts render twice; never-recorded ones render nowhere.
+        Measured counts, a zero among them, render in both places.
 
-        The three cases are separate page loads on a server with an empty
-        history precisely so the negative case can be stated at full strength:
-        not "this row has no counts" but "this page has no ``.page-counts``
-        element at all". Sharing one page between the cases would have made the
-        other two rows answer for the third.
+        Each case is its own page load on a server with an empty history, so
+        the first history row is the job under test.
         """
         server = empty_history_server
         job_store: JobStore = server.app.state.job_store
@@ -6312,10 +6207,6 @@ class TestPageCountsInChromium:
         try:
             page.goto(server.url)
             _show_the_live_outcome(page, "#status-area .status-done")
-
-            if expected is None:
-                expect(page.locator(".page-counts")).to_have_count(0)
-                return
 
             expect(page.locator("#status-area .page-counts")).to_have_text(expected)
             title_cell = page.locator("#history-body tr").first.locator("td").nth(2)

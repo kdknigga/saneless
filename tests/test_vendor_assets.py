@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, override
 
@@ -68,6 +69,50 @@ def _tags(path: Path) -> list[tuple[str, dict[str, str | None]]]:
     collector.feed(path.read_text(encoding="utf-8"))
     collector.close()
     return collector.tags
+
+
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_DARK_SCHEME_MEDIA = "@media only screen and (prefers-color-scheme: dark)"
+
+
+def _stylesheet_rules(
+    css: str,
+) -> list[tuple[str | None, str, dict[str, str]]]:
+    """
+    Return every style rule of a stylesheet with the at-rule that encloses it.
+
+    Comments are removed first, so a comment may name any selector or property.
+    Each entry is the enclosing at-rule's prelude (``None`` at the top level),
+    the rule's selector and its declarations, all with whitespace collapsed.
+    """
+    rules: list[tuple[str | None, str, dict[str, str]]] = []
+    enclosing: list[str] = []
+    text = _CSS_COMMENT.sub("", css)
+    start = 0
+    for index, char in enumerate(text):
+        if index < start:
+            continue
+        if char == "{":
+            prelude = " ".join(text[start:index].split())
+            if prelude.startswith("@"):
+                enclosing.append(prelude)
+                start = index + 1
+            else:
+                body_end = text.index("}", index)
+                declarations: dict[str, str] = {}
+                for declaration in text[index + 1 : body_end].split(";"):
+                    if declaration.strip():
+                        prop, _, value = declaration.partition(":")
+                        declarations[prop.strip()] = " ".join(value.split())
+                rules.append(
+                    (enclosing[-1] if enclosing else None, prelude, declarations)
+                )
+                start = body_end + 1
+        elif char == "}":
+            if enclosing:
+                enclosing.pop()
+            start = index + 1
+    return rules
 
 
 def sri_sha384(data: bytes) -> str:
@@ -164,11 +209,29 @@ def test_html_tag_has_no_data_theme() -> None:
 
 def test_app_css_status_fallback_block_intact() -> None:
     """app.css keeps the --saneless-status-fallback light/dark block (23.1)."""
-    css = APP_CSS.read_text(encoding="utf-8")
-    assert "--saneless-status-fallback" in css
-    assert "@media only screen and (prefers-color-scheme: dark)" in css
-    assert '[data-theme="dark"]' in css
-    assert "--pico-color-" not in css
+    rules = _stylesheet_rules(APP_CSS.read_text(encoding="utf-8"))
+    light = [
+        declarations
+        for at_rule, selector, declarations in rules
+        if at_rule is None and selector == ":root"
+    ]
+    dark = [
+        declarations
+        for at_rule, selector, declarations in rules
+        if at_rule == _DARK_SCHEME_MEDIA and selector == ":root"
+    ]
+    assert len(light) == 1, light
+    assert len(dark) == 1, dark
+    assert light[0].get("--saneless-status-fallback")
+    assert dark[0].get("--saneless-status-fallback")
+    assert (
+        dark[0]["--saneless-status-fallback"]
+        != (light[0]["--saneless-status-fallback"])
+    )
+    for at_rule, selector, declarations in rules:
+        assert "data-theme" not in selector, f"{selector} ({at_rule})"
+        assert not any(prop.startswith("--pico-color-") for prop in declarations)
+        assert not any("--pico-color-" in value for value in declarations.values())
 
 
 def test_base_html_has_no_crossorigin() -> None:

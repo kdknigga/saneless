@@ -97,10 +97,9 @@
 }
 
 /* Cancelled: a deliberate stop by the operator, so neutral and muted, never
-   the error red. Pico's muted token already swaps per scheme -- light,
-   automatic dark and forced dark -- so it is used directly, with no app-owned
-   pair and no fallback: a Pico token that swaps on its own is never
-   redeclared. */
+   the error red. Pico's muted token already swaps between the light and dark
+   schemes, so it is used directly, with no app-owned pair and no fallback: a
+   Pico token that swaps on its own is never redeclared. */
 .status-cancelled {
     color: var(--pico-muted-color);
 }
@@ -108,27 +107,16 @@
 /* Consume-directory fallback: a degraded success, so amber -- deliberately
    neither the ins green nor the del red. PicoCSS has no amber among its
    semantic tokens, so the app owns this one and gives it a light and a dark
-   value; the darker amber is unreadable on a dark surface. The dark selectors
-   mirror PicoCSS v2's own: automatic dark applies only when <html> carries no
-   data-theme attribute, and forced dark uses data-theme="dark". */
+   value; the darker amber is unreadable on a dark surface. The dark value
+   follows the OS colour-scheme preference, as Pico's own dark palette does. */
 :root {
     --saneless-status-fallback: #a16207;
 }
 
 @media only screen and (prefers-color-scheme: dark) {
-    :root:not([data-theme]) {
-        /* Paired with the [data-theme="dark"] block below -- same value, and
-           it has to be written out twice. Change one, change the other. */
+    :root {
         --saneless-status-fallback: #ca8a04;
     }
-}
-
-[data-theme="dark"] {
-    /* Same value as the prefers-color-scheme block above. The duplication is
-       structural, not careless: plain CSS cannot merge two selectors onto one
-       declaration, and grouping them would make the forced-dark rule inherit
-       the media query. Change one, change the other. */
-    --saneless-status-fallback: #ca8a04;
 }
 
 .status-fallback {
