@@ -1498,23 +1498,6 @@ def wait_for_state(
     raise RuntimeError(msg)
 
 
-@pytest.fixture(name="wait_for_state")
-def _wait_for_state_fixture() -> Callable[..., Job]:
-    """
-    Hand the wait_for_state helper to a test module.
-
-    ``tests/`` is a package, so pytest's default prepend mode imports it as
-    ``tests.*`` and ``from conftest import wait_for_state`` raises
-    ``ModuleNotFoundError``.  A test module takes the helper either from this
-    fixture or as ``from tests.conftest import wait_for_state``.
-
-    Returns:
-        The wait_for_state function itself, uncalled.
-
-    """
-    return wait_for_state
-
-
 def poll_until(
     predicate: Callable[[], bool], budget: float, interval: float = _POLL_INTERVAL
 ) -> bool:
@@ -1545,22 +1528,6 @@ def poll_until(
             return True
         tick.wait(interval)
     return predicate()
-
-
-@pytest.fixture(name="poll_until")
-def _poll_until_fixture() -> Callable[..., bool]:
-    """
-    Hand the poll_until helper to a test module.
-
-    A fixture for the same reason as ``wait_for_state``: ``tests/`` is a
-    package, so pytest's default prepend mode imports it as ``tests.*``, and a
-    test module takes the helper from this fixture or from ``tests.conftest``.
-
-    Returns:
-        The poll_until function itself, uncalled.
-
-    """
-    return poll_until
 
 
 def quiet_window(seconds: float) -> None:

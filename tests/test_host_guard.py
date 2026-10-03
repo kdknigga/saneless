@@ -46,9 +46,6 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
     from starlette.types import Message, Receive, Scope, Send
 
-# Every app built in this module talks to a Paperless client whose requests
-# fail inside the process: nothing reaches localhost:8000.
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 EVIL_HOST = "evil.example"
 LAN_HOST = "192.168.1.5:8080"

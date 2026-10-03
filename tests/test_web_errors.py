@@ -70,10 +70,6 @@ if TYPE_CHECKING:
 
     from saneless.job import Job, JobStore
 
-# Every app built in this module, fixture or helper, talks to a Paperless client
-# whose requests fail inside the process: nothing reaches localhost:8000.
-pytestmark = pytest.mark.usefixtures("offline_paperless")
-
 
 HTMX_HEADERS = {"HX-Request": "true"}
 

@@ -39,9 +39,6 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
 
-# Every app built in this module talks to a Paperless client whose requests
-# fail inside the process: nothing reaches localhost:8000.
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 # Written out here rather than imported, so a change to the policy in the
 # source has to be made twice and cannot pass unnoticed.

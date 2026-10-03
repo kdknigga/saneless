@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
     from saneless.config import Settings
 
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 _TTL_SECONDS = 60
 # What the offline client's fetch failure starts with; the rest names the URL

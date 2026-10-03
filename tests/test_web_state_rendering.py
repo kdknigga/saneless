@@ -857,7 +857,6 @@ def test_the_status_area_sits_in_one_persistent_status_region(
     )
 
 
-@pytest.mark.usefixtures("offline_paperless")
 @pytest.mark.parametrize("route", _STATUS_ROUTES)
 def test_no_status_response_contains_the_live_region(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, route: str
@@ -1408,10 +1407,6 @@ def test_poll_scan_button_follows_the_state_table(
     assert match.text.strip() == expected
 
 
-# Offline, so the job the submit starts fails its upload at once instead of
-# retrying a real localhost connection past the worker's stop join, which
-# would leave the app's job store open at teardown.
-@pytest.mark.usefixtures("offline_paperless")
 def test_scan_success_carries_button_status_and_message_clear(
     client: TestClient,
 ) -> None:
@@ -2288,7 +2283,6 @@ _GATE_WAIT_BUDGET = 5.0
 _GATE_WAIT_WINDOW = 0.3
 
 
-@pytest.mark.usefixtures("offline_paperless")
 def test_a_job_waiting_for_the_gate_reads_starting_scan(client: TestClient) -> None:
     """
     A scan queued behind a running check still says "Starting scan...".
@@ -4531,7 +4525,6 @@ class TestPageTitle:
             "Uploaded with a warning — saneless"
         ]
 
-    @pytest.mark.usefixtures("offline_paperless")
     @pytest.mark.parametrize("route", _STATUS_ROUTES)
     def test_every_status_response_carries_one_title(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch, route: str

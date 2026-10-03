@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 
     from saneless.config import Settings
 
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 # How long a thread test waits for something that should happen at once.  Far
 # below pytest-timeout's 60 s, so a failing test reports what it was waiting for.

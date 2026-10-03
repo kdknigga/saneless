@@ -196,8 +196,9 @@ def test_the_socket_guard_refuses_a_port_nobody_bound(
         except OSError as error:
             errors.append(error)
 
-    helper = threading.Thread(target=connect_from_a_thread, name="guard-helper")
-    helper.daemon = True
+    helper = threading.Thread(
+        target=connect_from_a_thread, name="guard-helper", daemon=True
+    )
     helper.start()
     helper.join(timeout=10)
     assert not helper.is_alive()

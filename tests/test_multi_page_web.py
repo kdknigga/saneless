@@ -73,9 +73,6 @@ if TYPE_CHECKING:
     from saneless.config import Settings
     from saneless.job import Job, JobStore
 
-# Every app built here talks to a Paperless client whose requests fail inside
-# the process: nothing reaches the network.
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 # The flatbed is the default profile, which every configuration must have and
 # the page opens on.

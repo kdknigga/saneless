@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
     from saneless.config import Settings
 
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 _HOSTILE_NAME = "<img src=x onerror=alert(1)>"
 _ESCAPED_NAME = "&lt;img src=x onerror=alert(1)&gt;"

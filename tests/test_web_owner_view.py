@@ -54,9 +54,6 @@ if TYPE_CHECKING:
     from saneless.config import Settings
     from saneless.job import Job, JobStore
 
-# Every app built here talks to a Paperless client whose requests fail inside
-# the process, so the distinctive address below is never contacted.
-pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 OWNER_TOKEN = "tok-owner"
 OTHER_TOKEN = "tok-other"

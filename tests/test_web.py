@@ -95,10 +95,6 @@ from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, leaf_routes, load_the_lists
 from tests.template_support import template_start_tags
 
-# Every app built in this module, fixture or helper, talks to a Paperless client
-# whose requests fail inside the process: nothing reaches localhost:8000.
-pytestmark = pytest.mark.usefixtures("offline_paperless")
-
 
 def _app(client: TestClient) -> FastAPI:
     """Extract the FastAPI app from a TestClient, helping the type checker."""
@@ -4162,7 +4158,6 @@ def _simple_form_app(
     return app
 
 
-@pytest.mark.usefixtures("offline_paperless")
 class TestSimpleForm:
     """
     The owner can shrink the form without changing the scan.
@@ -4354,7 +4349,6 @@ def _newest_job(client: TestClient) -> Job:
     return rows[0]
 
 
-@pytest.mark.usefixtures("offline_paperless")
 class TestProfileDefaultsFollowTheFormShape:
     """
     A shown control is answered by the submit; a hidden one takes the default.
@@ -5249,7 +5243,6 @@ def _marker(html: str, name: str) -> str:
     return found[0]
 
 
-@pytest.mark.usefixtures("offline_paperless")
 class TestMetadataFollowsTheSubmittedProfile:
     """
     The metadata a scan files belongs to the profile it names.
@@ -5439,7 +5432,6 @@ def _marker_values(markup: str) -> dict[str, str]:
     return values
 
 
-@pytest.mark.usefixtures("offline_paperless")
 class TestScanReleasedDuringTheListLoad:
     """
     A Scan pressed before the lists land files the profile's defaults.
