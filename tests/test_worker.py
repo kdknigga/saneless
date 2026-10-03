@@ -5702,9 +5702,9 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
     The worker's "no config file was loaded" line agrees with what the search found.
 
     The startup log, the Configuration row, ``doctor``'s table and the
-    one-shot warning all describe the same search.  This line names a stale
-    ``config.toml`` it found rather than only telling the operator to create
-    a ``saneless.toml`` beside it.
+    one-shot warning all describe the same search.  When it found only a
+    stale file, this line names that file and the rename it needs --
+    ``config.toml`` to ``saneless.toml`` -- rather than only saying to create one.
 
     It is exercised through ``_persist_generated_profiles`` directly rather
     than through a started worker, because the branch is reached before
