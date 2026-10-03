@@ -2856,9 +2856,8 @@ class TestEnvironmentJson:
     A variable holding invalid JSON is named, and the file is still checked.
 
     pydantic-settings refuses such a variable before any field is validated,
-    with a message naming the field but not the variable. The loader used to
-    turn that into one anonymous line and stop, so a CSV ``default_tags``
-    variable hid every error in the file beside it.
+    with a message naming the field but not the variable. Without this, a CSV
+    ``default_tags`` variable would hide every error in the file beside it.
     """
 
     def test_bad_json_variable_is_named_beside_every_file_error(
@@ -2971,10 +2970,10 @@ class TestEnvironmentJson:
 
 class TestUnknownEnvironmentVariables:
     """
-    A SANELESS_* variable naming no section is rejected at load (D-13).
+    A SANELESS_* variable naming no section is rejected at load.
 
     pydantic-settings silently ignores such names, so a mistyped
-    ``SANELESS_PAPERLES__TOKEN`` left the token unset without a word.
+    ``SANELESS_PAPERLES__TOKEN`` would leave the token unset without a word.
     """
 
     @pytest.mark.usefixtures("no_discovered_config")
@@ -3004,10 +3003,10 @@ class TestUnknownEnvironmentVariables:
         self, no_discovered_config: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        SANELESS_CONFIG_PATH is rejected outright (D-13, D-16, T-26-05).
+        SANELESS_CONFIG_PATH is rejected outright, not silently ignored.
 
-        It could never forge the loaded path, which is a private attribute;
-        it is now also refused, rather than silently ignored.
+        It cannot forge the loaded path, which is a private attribute, but an
+        operator who sets it must hear that it does nothing.
         """
         evil = no_discovered_config / "evil.toml"
         evil.write_text("[profiles.default]\n")
@@ -3070,14 +3069,14 @@ class TestUnknownEnvironmentVariables:
     def test_unknown_env_does_not_affect_direct_construction(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The scan lives in the loader, not a validator (Pitfall 9, S-10)."""
+        """The unknown-variable scan lives in the loader, not a validator."""
         monkeypatch.setenv("SANELESS_BOGUS", "1")
         assert Settings().config_path is None
 
 
 class TestConfigSources:
     """
-    The loaded file and the env-sourced key names are reported (CFG-11, U-01).
+    The loaded file and the env-sourced key names are reported.
 
     Names only, never values: the token is commonly supplied by environment.
     """
@@ -3282,12 +3281,11 @@ class TestConfigSources:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        With nothing found, the one INFO line says where it looked (D-11, CFG-02).
+        With nothing found, the one INFO line says where it looked.
 
-        The 2026-09-22 log said only "no config file" and the operator had to
-        guess which three paths that meant. The relative first candidate is
-        printed absolute, because a relative path in a log is worth nothing
-        without the working directory.
+        "No config file" alone leaves the operator guessing which paths were
+        searched. The relative first candidate is printed absolute, because a
+        relative path in a log is worth nothing without the working directory.
         """
         secret = "tok-SECRET-51ab"
         monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", secret)
@@ -3312,7 +3310,7 @@ class TestConfigSources:
         patched_search_paths: _SearchDirs,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A successful load names one file and no others (D-11)."""
+        """A successful load names one file and no others."""
         loaded = patched_search_paths.xdg / config_mod.CONFIG_FILENAME
         loaded.write_text(_MINIMAL_TOML)
         settings = load_settings()
@@ -3332,9 +3330,10 @@ class TestConfigSources:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        Every old-name file is named with the rename to perform (Phase 37 CFG-03).
+        Every legacy-name file gets one warning naming the rename to perform.
 
-        This is the line that would have ended the 2026-09-22 evening.
+        Without it, an operator whose settings sit in a legacy-name file sees
+        defaults load and no hint why.
         """
         stale = [
             directory / config_mod.LEGACY_CONFIG_FILENAME
@@ -3360,12 +3359,12 @@ class TestConfigSources:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        A leftover may hold the only copy of the token (Phase 37 D-17).
+        A legacy-name leftover beside the loaded file is told: move, then delete.
 
         In the documented container layout the generated profiles are written
-        to a different directory than the mounted config, so the old-name file
-        left behind after an upgrade can be the only place the URL and token
-        survive. The next step must never be a bare "delete it".
+        to a different directory than the mounted config, so a legacy-name
+        file can be the only place the URL and token survive. The next step
+        is never a bare "delete it".
         """
         loaded = patched_search_paths.cwd / config_mod.CONFIG_FILENAME
         loaded.write_text(_MINIMAL_TOML)
@@ -3390,7 +3389,7 @@ class TestConfigSources:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Paths and key names reach the log; values never do (T-37-02)."""
+        """Paths and key names reach the log; values never do."""
         secret = "tok-SECRET-51ab"
         monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", secret)
         stale = patched_search_paths.etc / config_mod.LEGACY_CONFIG_FILENAME
@@ -3408,10 +3407,11 @@ class TestConfigSources:
 
 class TestExplicitConfigPath:
     """
-    An explicit ``--config`` path must be a regular file (CFG-02, M-19).
+    An explicit ``--config`` path must be a regular file.
 
-    A missing path used to load defaults silently, and Docker creates a
-    directory where a single-file bind mount's source is missing.
+    A missing path never falls back to defaults, and a directory is refused,
+    because Docker creates a directory where a single-file bind mount's
+    source is missing.
     """
 
     def test_missing_config_names_the_path(self) -> None:
@@ -3422,7 +3422,7 @@ class TestExplicitConfigPath:
     def test_missing_config_expands_tilde(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The error names the ``~``-expanded path (CFG-02, CFG-03)."""
+        """The error names the ``~``-expanded path."""
         home = tmp_path / "home"
         monkeypatch.setenv("HOME", str(home))
         with pytest.raises(ConfigError) as exc_info:
@@ -3432,7 +3432,7 @@ class TestExplicitConfigPath:
     def test_empty_config_path_is_rejected_not_discovered(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An empty explicit path is a ConfigError, not a discovery run (WR-05)."""
+        """An empty explicit path is a ConfigError, not a discovery run."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         (tmp_path / "saneless.toml").write_text("[profiles.default]\n")
@@ -3465,8 +3465,7 @@ def config_local_zone(
     """
     Give one test control of the process's local zone, then restore it.
 
-    Plan 30-01's ``local_zone`` technique: ``local_time`` renders whatever zone
-    the C library reports, so pinning ``TZ`` and calling ``time.tzset()`` is
+    ``local_time`` renders whatever zone the C library reports, so pinning ``TZ`` and calling ``time.tzset()`` is
     the only way to assert an exact string on a host in an unknown zone. The
     trailing ``tzset`` is what makes the C library notice the removal.
 
@@ -3485,11 +3484,10 @@ def config_local_zone(
 
 class TestResolveJobTitle:
     """
-    One title rule for every front end (D-16, M-24).
+    One title rule for every front end.
 
     A typed title wins when it is non-blank after stripping; otherwise the
-    profile's ``title``; otherwise ``Scan <local YYYY-MM-DD HH:MM ZZZ>``
-    (APPL-12). The documented ``title`` key used to do nothing.
+    profile's ``title``; otherwise ``Scan <local YYYY-MM-DD HH:MM ZZZ>``.
     """
 
     _NOW = datetime(2026, 9, 15, 13, 5, tzinfo=UTC)
@@ -3534,14 +3532,14 @@ class TestResolveJobTitle:
     def test_title_timestamp_names_utc_on_a_utc_server(
         self, config_local_zone: Callable[[str], None]
     ) -> None:
-        """A UTC server still gets the zone named on the title (D-35)."""
+        """A UTC server still gets the zone named on the title."""
         config_local_zone("UTC")
         assert resolve_job_title("", None, now=self._NOW) == "Scan 2026-09-15 13:05 UTC"
 
     def test_title_timestamp_ignores_the_zone_now_carries(
         self, config_local_zone: Callable[[str], None]
     ) -> None:
-        """A non-UTC aware ``now`` still renders in the server's zone (APPL-12)."""
+        """A non-UTC aware ``now`` still renders in the server's zone."""
         config_local_zone("America/Chicago")
         plus_two = datetime(2026, 9, 15, 15, 5, tzinfo=timezone(timedelta(hours=2)))
         assert resolve_job_title("", None, now=plus_two) == "Scan 2026-09-15 08:05 CDT"
@@ -3553,7 +3551,7 @@ class TestResolveJobTitle:
         The title, the ``jobs`` table and the web history cannot disagree.
 
         Asserted against ``local_time`` itself rather than a second copy of the
-        format string, which is the whole point of D-35.
+        format string, so the three can only ever share one format.
         """
         config_local_zone("America/Chicago")
         assert resolve_job_title("", None, now=self._NOW) == (
@@ -3561,7 +3559,7 @@ class TestResolveJobTitle:
         )
 
     def test_title_typed_is_returned_unstripped(self) -> None:
-        """A non-blank typed title is returned as given, matching today."""
+        """A non-blank typed title is returned as given, not stripped."""
         typed = " Invoice "
         assert resolve_job_title(typed, None, now=self._NOW) == typed
 
@@ -3656,8 +3654,8 @@ class TestOperatorWaitTimeoutSeconds:
     every manual-duplex job right after pass A; a value above
     ``threading.TIMEOUT_MAX`` makes ``Event.wait`` raise ``OverflowError`` at
     the same point.  Both are rejected at load, where the CLI reports a
-    configuration error.  The key was renamed from ``flip_timeout_seconds``
-    with no alias, so the old key is refused like any other unknown key.
+    configuration error.  ``flip_timeout_seconds`` is not an alias, so that
+    superseded spelling is refused like any other unknown key.
     """
 
     def test_operator_wait_timeout_seconds_default(self) -> None:
@@ -3711,7 +3709,7 @@ operator_wait_timeout_seconds = 90
     def test_old_flip_timeout_key_is_rejected_with_a_hint(
         self, tmp_config_dir: Path
     ) -> None:
-        """The pre-rename key fails to load and points at the new name."""
+        """``flip_timeout_seconds`` fails to load and points at the current name."""
         err = _load_error(
             tmp_config_dir / "old_flip_timeout.toml",
             "[output]\nflip_timeout_seconds = 30\n\n[profiles.default]\n",
@@ -3737,7 +3735,7 @@ operator_wait_timeout_seconds = 90
     def test_old_flip_timeout_variable_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The pre-rename environment variable fails at startup with a hint."""
+        """The ``FLIP_TIMEOUT_SECONDS`` variable fails at startup with a hint."""
         monkeypatch.setenv("SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS", "42")
         with pytest.raises(ConfigError) as exc_info:
             load_settings()
@@ -3752,7 +3750,7 @@ class TestWebPort:
 
     The resolver truncates a service number to 16 bits, so an out-of-range
     value would otherwise bind a different port without any error: 70000
-    became 4464 and 65536 became an OS-chosen port.
+    would bind 4464 and 65536 an OS-chosen port.
     """
 
     @pytest.mark.parametrize("value", [-1, 65_536, 70_000])
@@ -4099,8 +4097,9 @@ class TestBoolIsNotANumber:
     """
     A TOML boolean is refused by every numeric setting.
 
-    pydantic's lax mode reads ``true`` as 1, so ``web_port = true`` used to
-    bind port 1 and ``resolution = true`` scanned at 1 dpi.  The refusal is a
+    pydantic's lax mode reads ``true`` as 1, so without the refusal
+    ``web_port = true`` would bind port 1 and ``resolution = true`` would
+    scan at 1 dpi.  The refusal is a
     fixed sentence that carries no value, and the plain strings the
     ``SANELESS_*`` variables supply still load.
     """
@@ -4166,7 +4165,7 @@ class TestBoolIsNotANumber:
 
 
 class TestDuplexField:
-    """ProfileConfig duplex field validation (DPLX-01)."""
+    """ProfileConfig's duplex field takes none, hardware or manual."""
 
     def test_duplex_default_none(self) -> None:
         """ProfileConfig defaults duplex to 'none'."""
@@ -4194,11 +4193,10 @@ class TestDuplexField:
 
 class TestLegacyManualDuplexSource:
     """
-    Tests for the legacy manual-duplex source predicate.
+    The legacy manual-duplex source predicate and its edge cases.
 
-    Relocated from tests/test_pipeline.py: the substring rule no longer
-    chooses a scanning strategy, but it still recognises the deprecated
-    ``source = "Manual Duplex"`` form (DPLX-02) and keeps its edge cases.
+    The substring rule chooses no scanning strategy; it only recognises the
+    deprecated ``source = "Manual Duplex"`` form.
     """
 
     def test_adf_manual_duplex(self) -> None:
