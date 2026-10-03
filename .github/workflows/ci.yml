@@ -124,11 +124,13 @@ jobs:
       # cache and managed Python before `env` runs, under the real one.
       #
       # Every pytest step here switches pytest-timeout to its thread method,
-      # overriding the ini option on the command line. The thread method ends
-      # a hung test even when a non-daemon thread is blocking it, and prints
-      # every thread's stack, so a hang in CI shows where each thread was
-      # stuck. The signal method that pyproject.toml sets for local runs can
-      # do neither.
+      # overriding the ini option on the command line. On a timeout the
+      # thread method prints every thread's stack and then terminates the
+      # whole pytest process, so a hang in CI shows where each thread was
+      # stuck, at the cost of the rest of the run: later tests never run and
+      # session teardown never happens. The signal method that pyproject.toml
+      # sets for local runs fails only the stuck test and keeps going, but it
+      # interrupts only the main thread and prints only its stack.
       - name: Test with an empty HOME
         run: uv run env HOME="$(mktemp -d)" pytest -o timeout_method=thread -m "not browser and not sane_hardware"
       # Drives the real SANE `test` backend. It ships with the SANE runtime

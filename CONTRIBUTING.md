@@ -206,11 +206,13 @@ quicker local run.
 A test that hangs is not allowed to hang the run: `pytest-timeout` is configured in
 `pyproject.toml` with `timeout = 60` and `timeout_method = "signal"` for local runs, so
 a stuck test fails on its own with a traceback while the rest of the suite keeps going.
-CI passes `-o timeout_method=thread` to every pytest command, as the table and the
-block above show. The thread method also ends a test that a blocked non-daemon thread
-is holding open, which the signal method cannot, and it prints every thread's stack,
-so a hang in CI says where each thread was stuck. Add the same flag locally when you
-are chasing a hang.
+CI passes `-o timeout_method=thread` to every pytest command in `ci.yml`, as the table
+and the block above show. On a timeout the thread method prints every thread's stack
+and then terminates the whole pytest process, so a hang in CI says where each thread
+was stuck, at the cost of the rest of the run: later tests never run, session fixtures
+are not torn down, and child processes are left behind. The signal method fails only
+the stuck test, but it interrupts only the main thread and prints only its stack. Add
+the thread flag locally when you are chasing a hang.
 
 ## Local pre-flight
 
