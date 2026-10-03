@@ -3650,7 +3650,7 @@ def test_check_again_has_a_stable_id_and_a_timeout_above_its_wait(
     client: TestClient,
 ) -> None:
     """
-    Check again keeps focus across its own swap and outlasts the route's wait.
+    The Check again button keeps focus across its swap and outlasts the route's wait.
 
     htmx restores focus by id after an outerHTML swap, so the id is what keeps
     a keyboard user on the button once ``#checks-body`` is replaced.  The
@@ -3714,7 +3714,7 @@ def test_stylesheet_has_no_dead_fallbacks_or_deprecated_clip(
     behind them can never apply and only misleads a reader about what renders.
     ``clip`` is deprecated in favour of ``clip-path``.  The fixed table layout
     and ``word-break: break-word`` are what split history words across lines
-    on a phone, so neither may come back.
+    on a phone, so neither may appear.
     """
     response = client.get("/static/app.css")
     assert response.status_code == 200

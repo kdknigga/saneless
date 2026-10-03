@@ -1274,7 +1274,7 @@ def test_paperless_test_unreachable(client: TestClient) -> None:
 
 
 def test_paperless_test_error(client: TestClient) -> None:
-    """GET /api/paperless/test returns error on exception."""
+    """A raising connection test is a 500 naming the exception type, not its text."""
 
     def raise_exc(*, timeout: httpx2.Timeout | None = None) -> None:
         _ = timeout

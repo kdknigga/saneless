@@ -7661,7 +7661,7 @@ class TestRunChecksUnderTheScannerGate:
 
     def test_skip_scanner_never_touches_the_gate(self, tmp_path: Path) -> None:
         """
-        A caller that already knows a scan is running has no reason to probe.
+        With skip_scanner set, the scanner row is skipped and the gate untaken.
 
         Args:
             tmp_path: The test's own directory.

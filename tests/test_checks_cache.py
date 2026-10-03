@@ -430,7 +430,7 @@ class TestReleaseManualClaim:
         assert cache.claim_manual_refresh() is not None
 
     def test_a_release_stores_nothing(self) -> None:
-        """Giving the floor back is not a record of results, as a claim is not."""
+        """Releasing a refresh claim leaves no results and no checked time behind."""
         cache = CheckCache(clock=_FakeClock())
         stamp = cache.claim_manual_refresh()
         assert stamp is not None

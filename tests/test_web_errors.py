@@ -1993,7 +1993,7 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend, tmp_path: Path
     ) -> None:
         """
-        The refusal is unconditional, not contingent on the upload route.
+        A placeholder token refuses the scan even with a consume directory set.
 
         A configured consume directory is the one thing that could look like a
         reason to let the scan run anyway.  It buys no exception: the

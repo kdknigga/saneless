@@ -2333,7 +2333,7 @@ class TestSaneBackendPageValidation:
     def test_normal_content_page_passes(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
-        """Image with mixed content passes all validation checks."""
+        """A page with mixed content passes validation and is kept."""
         mock_dev = fake_sane_module.device
         content_img = _make_content_image()
         mock_dev.load_feeder([content_img])
@@ -2645,7 +2645,7 @@ class TestAutoSourceRecognition:
         fake_sane_module: FakeSaneModule,
         page_sink: SpooledPageSink,
     ) -> None:
-        """It is a feeder by classification, so auto_source_mode is irrelevant."""
+        """A long feeder name scans as a feeder whatever auto_source_mode says."""
         mock_dev = fake_sane_module.device
         mock_dev.report_sources(["Flatbed", "ADF", "Automatic Document Feeder"])
         settings = ScanSettings(

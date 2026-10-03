@@ -2223,7 +2223,7 @@ class TestCliFlags:
         assert "verbose-probe-5c1d" in result.stderr
 
     def test_config_flag(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """--config /path/to/config -> load_settings called with that path."""
+        """``--config`` hands its path to load_settings unchanged."""
         captured: dict[str, object] = {}
 
         def capture_load(config_path: str | None = None) -> Settings:
@@ -5591,7 +5591,7 @@ class TestAutoProfilesTarget:
         tmp_path: Path,
         patched_search_paths: _SearchFiles,
     ) -> None:
-        """With no system directory there was nothing to pass over, so no aside."""
+        """With no system directory, the write error names no skipped directory."""
         files = patched_search_paths
         self._refuse_etc_and_xdg(monkeypatch, files)
         files.etc.parent.rmdir()
@@ -7036,7 +7036,7 @@ class TestEntryPointsCloseTheBackend:
     def test_scan_closes_the_backend_when_the_pipeline_fails(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The close happens before the guard prints the error and exits 1."""
+        """A failing pipeline still closes the backend once, and the scan exits 1."""
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
 

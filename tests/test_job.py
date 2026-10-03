@@ -2380,7 +2380,7 @@ class TestOwnerToken:
         assert "thumbnail" not in parameters
 
     def test_create_rejected_job_still_records_a_null_owner_token(self) -> None:
-        """A refused submit is unowned and records nothing."""
+        """A refused submit is stored with no owner token and no page counts."""
         store = JobStore()
         try:
             job = store.create_rejected_job(
