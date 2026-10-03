@@ -70,7 +70,7 @@ from .vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Mapping
 
     from .auto_profiles import ProfileWriteResult
     from .config import ProfileConfig, Settings
@@ -149,8 +149,9 @@ class _OwedWrite:
     The owed value is the whole ``finish_job`` call, not just an error text:
     a success-path write that failed after Paperless accepted the document
     must be replayed as DONE or FALLBACK with its result, never turned into an
-    ERROR that invites a duplicate scan.  Frozen, so the flush's
-    delete-if-unchanged check compares values.
+    ERROR that invites a duplicate scan.  Value equality comes from the
+    dataclass, and freezing it means the owed value cannot change between the
+    flush's snapshot and its delete-if-unchanged compare.
 
     Attributes:
         state: The terminal state to record.
@@ -732,7 +733,10 @@ class ScanWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         # Set once by stop(); read by the loop, submit() and the flip callback.
         self._stopping = threading.Event()
-        # Guards every read and every rebind of self._settings.profiles.
+        # Every rebind of self._settings.profiles happens under this lock;
+        # readers that skip it rely on the mapping being replaced wholesale,
+        # never mutated.
+        # See docs/explanation/decisions/0004-profiles-replaced-wholesale.md.
         self._profiles_lock = threading.Lock()
         self._flip_coordinator: WorkerFlipCoordinator | None = None
         # The running multi-page job's coordinator, read by request threads
@@ -1439,8 +1443,6 @@ class ScanWorker:
     def _set_profiles(
         self,
         profiles: Mapping[str, ProfileConfig],
-        *,
-        only_if: Callable[[Settings], bool] | None = None,
     ) -> bool:
         """
         Replace the configured profiles with a new dict, under the lock.
@@ -1450,8 +1452,7 @@ class ScanWorker:
         example -- keeps a consistent view of it, and no locked reader can
         observe a dict part-way through an update.
 
-        This is the one place the profiles are rebound: startup generation
-        swaps through it too, with its bare-default re-check as ``only_if``.
+        This is the one place the profiles are rebound.
 
         A set without ``default`` is refused.  Every scan that names no profile
         resolves ``default``, so swapping such a set in would leave the
@@ -1461,12 +1462,10 @@ class ScanWorker:
 
         Args:
             profiles: The complete new set of profiles.
-            only_if: A check on the current settings, run under the same lock
-                as the swap; when it returns ``False`` nothing is replaced.
 
         Returns:
             Whether the profiles were replaced: ``False`` when the new set has
-            no ``default`` profile or ``only_if`` refused the swap.
+            no ``default`` profile.
 
         """
         replacement = dict(profiles)
@@ -1477,8 +1476,6 @@ class ScanWorker:
             )
             return False
         with self._profiles_lock:
-            if only_if is not None and not only_if(self._settings):
-                return False
             self._settings.profiles = replacement
         return True
 
@@ -1501,9 +1498,6 @@ class ScanWorker:
         are used in memory too (WARNING).  Nothing is ever written to a path
         worked out afresh here.
 
-        The swap happens under the profile lock, after re-checking that the set
-        is still the bare default.
-
         Memory matches what the file will load after a restart.  When the file
         already defines ``default``, the write keeps it, so the loaded
         ``default`` is kept in memory too rather than the generated one.
@@ -1525,12 +1519,7 @@ class ScanWorker:
             self._profile_storage = profile_storage_for_loaded(self._settings)
             return
         result = self._persist_generated_profiles(profiles)
-        # Re-checked under the lock: only the exact bare default is ever
-        # replaced, so a set customised meanwhile is left alone.
-        self._set_profiles(
-            _profiles_after_persist(loaded, profiles, result),
-            only_if=is_bare_default,
-        )
+        self._set_profiles(_profiles_after_persist(loaded, profiles, result))
 
     def _read_generated_profiles(self) -> dict[str, ProfileConfig] | None:
         """
