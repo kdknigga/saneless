@@ -3,12 +3,8 @@ Job workspaces: scratch directories named after their job and locked while alive
 
 A scan's pages live in a scratch directory under ``output.tmp_dir`` until the
 PDF is assembled. When the process dies hard -- SIGKILL, the OOM killer, a
-power cut -- that directory is all that is left of the scan. An anonymous
-``tempfile.TemporaryDirectory`` leaves nothing to recover it by: its name says
-nothing about the job, and nothing tells a crashed scan's directory apart from
-a live one belonging to another process sharing the same ``tmp_dir``.
-
-:class:`JobWorkspace` replaces it with two properties recovery needs:
+power cut -- that directory is all that is left of the scan.
+:class:`JobWorkspace` gives it the two properties recovery needs:
 
 * **A name.** The directory is ``job-<first 8 characters of the job id>-<random>``
   and holds a small metadata file with the job id, title and profile, so a
@@ -21,10 +17,10 @@ a live one belonging to another process sharing the same ``tmp_dir``.
   renamed to its ``job-*`` name, so a sweeper can never see a live workspace
   that is not yet locked.
 
-There is deliberately **no** ``atexit`` or ``weakref`` finalizer.
-``TemporaryDirectory`` registers one, and at interpreter exit it can delete a
-workspace a daemon thread is still preserving pages from. Without one, a
-process that exits early leaves an orphan for the next sweep instead.
+There is deliberately **no** ``atexit`` or ``weakref`` finalizer: at
+interpreter exit one can delete a workspace a daemon thread is still
+preserving pages from. A process that exits early leaves an orphan for the
+next sweep instead.
 
 :func:`find_orphans` is the discovery half: it returns the ``job-*``
 directories whose lock is free, each still holding that lock so two sweepers
@@ -143,14 +139,12 @@ def _job_id_from_name(name: str) -> str:
     """
     Recover as much of the job id as a workspace's name carries.
 
-    The random suffix never contains ``-``, so everything between the prefix
-    and the last ``-`` is the job segment.
-
     Args:
         name: A directory name starting with ``job-``.
 
     Returns:
-        The job segment, or ``""`` for the ``nojob`` placeholder.
+        The job segment (the random suffix holds no ``-``), or ``""`` for the
+        ``nojob`` placeholder.
 
     """
     segment = name.removeprefix(WORKSPACE_PREFIX).rpartition("-")[0]
@@ -160,10 +154,6 @@ def _job_id_from_name(name: str) -> str:
 def _write_metadata(directory: Path, metadata: dict[str, str]) -> None:
     """
     Write the metadata file into ``directory`` atomically, mode 0600.
-
-    ``mkstemp`` creates the temp file 0600 with ``O_EXCL``; it is fsynced
-    before the rename, and removed on any failure, ``KeyboardInterrupt``
-    included.
 
     Args:
         directory: The (staging) workspace directory.
@@ -181,7 +171,6 @@ def _write_metadata(directory: Path, metadata: dict[str, str]) -> None:
             handle.write(json.dumps(metadata).encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        # Path.replace rather than the os function: ruff PTH105.
         tmp.replace(target)
         replaced = True
     finally:
@@ -213,13 +202,11 @@ def _remove_or_retire(path: Path, what: str) -> None:
     """
     Remove a workspace nothing in which still needs keeping, or hide it.
 
-    The run that owned it is over: its document was delivered, its pages were
-    kept in ``failed/``, or it was cancelled.  If the removal fails, what is
-    left must not look like a killed scan, or the next sweep would file the
-    delivered document's pages in ``failed/`` as an interrupted scan.  So,
-    while the caller still holds its lock, it is renamed out of the ``job-``
-    names every sweep looks at; failing that, its lock file is removed, and
-    a sweep skips a workspace with no lock file.
+    If the removal fails, what is left must not look like a killed scan, or
+    the next sweep would file a delivered document's pages in ``failed/``.
+    So, while the caller still holds its lock, it is renamed out of the
+    ``job-`` names; failing that, its lock file is removed, and a sweep skips
+    a workspace with no lock file.
 
     Args:
         path: The workspace directory.
@@ -311,10 +298,8 @@ class JobWorkspace:
 
         If ``flock`` is not supported (for example ENOLCK on some network
         filesystems) the workspace is used unlocked, with a WARNING, and is
-        published as ``unlocked-*`` rather than ``job-*``. No sweep looks at
-        that name, so a sweeper whose own lock attempt does succeed can never
-        take the live scan inside; the cost is that such a workspace is never
-        recovered.
+        published as ``unlocked-*``, a name no sweep looks at; such a
+        workspace is never recovered.
 
         Returns:
             The workspace directory.
@@ -413,14 +398,11 @@ class JobWorkspace:
     @staticmethod
     def _lock(fd: int, staging: Path) -> bool:
         """
-        Take the workspace's exclusive lock, or warn that it cannot be had.
+        Take the workspace's exclusive lock; warn and return False without one.
 
         Args:
             fd: The open lock file.
             staging: The staging directory, for the warning.
-
-        Returns:
-            Whether the lock is held.
 
         Raises:
             BlockingIOError: If someone already holds the brand-new lock.
@@ -626,17 +608,13 @@ def _still_in_place(fd: int, path: Path) -> bool:
     """
     Say whether the lock just taken is still the lock of a workspace at ``path``.
 
-    The lock file is opened before it is locked.  If its owner -- or another
-    sweeper -- finishes removing the workspace in between, and then lets go of
-    the lock, the lock taken here is on a file that no longer exists, and
-    proves nothing about anything still in ``tmp_dir``.
-
     Args:
         fd: The candidate's open, now locked, lock file.
         path: The candidate directory.
 
     Returns:
-        True if the file is still linked, as ``path``'s lock file.
+        True if the file is still linked, as ``path``'s lock file; one removed
+        between the open and the lock proves nothing.
 
     """
     try:
@@ -772,8 +750,7 @@ class RecoveredWorkspace:
 
 
 # The spool file names of each acquisition pass, as the pipeline's sink writes
-# them. Named for the side of the sheet rather than the pass, because ruff's
-# S105 reads any variable whose name contains "pass" as a hardcoded password.
+# them.
 _FRONT_PAGES: Final = "a-*.png"
 _BACK_PAGES: Final = "b-*.png"
 
@@ -781,10 +758,6 @@ _BACK_PAGES: Final = "b-*.png"
 def _read_page(path: Path, sequence: int) -> PageRecord:
     """
     Rebuild the record of one spooled page from the file alone.
-
-    The file is checked with ``verify()`` first, then reopened to read its
-    size, mode and the dpi in its pHYs chunk, and measured the way the spool
-    measures a page it writes.
 
     Args:
         path: The spooled PNG.
@@ -821,20 +794,15 @@ def _read_page(path: Path, sequence: int) -> PageRecord:
 
 def _page_files(spool: Path, pattern: str) -> list[Path]:
     """
-    List one pass's spooled pages, in name order.
-
-    Name order is the pass's acquisition order, because the sink numbers each
-    page as it arrives. This is the one place order comes from names: a sweep
-    has no records, and it never orders across the two passes. A ``.part``
-    file is an interrupted write and never matches; a symbolic link is not a
-    page the sink wrote and is left out.
+    List one pass's spooled pages in name order, which is acquisition order.
 
     Args:
         spool: The workspace's spool directory.
         pattern: The pass's file-name pattern.
 
     Returns:
-        The page files, possibly none.
+        The page files, possibly none; a symbolic link is not a page the sink
+        wrote and is left out.
 
     """
     return sorted(
@@ -989,8 +957,8 @@ def sweep_orphans(
     to the next, leaving that workspace for a later sweep.
     ``KeyboardInterrupt`` passes straight through.
 
-    Scratch directories from releases before job-named workspaces (``tmp*``
-    names) are never touched: nothing can prove their owner dead.
+    Other scratch directories, such as ``tmp*`` names, are never touched:
+    nothing can prove their owner dead.
 
     Args:
         tmp_dir: The scratch directory workspaces are created in. A missing
@@ -1007,9 +975,8 @@ def sweep_orphans(
         return []
     orphans = find_orphans(tmp_dir)
     if orphans:
-        # Said up front, because every page is decoded and a PDF assembled
-        # and copied before this returns -- and at serve startup, before the
-        # web server answers anything, so a long silence has an explanation.
+        # Said up front: at serve startup every page is decoded and a PDF
+        # assembled before the web server answers anything.
         pages = sum(
             len(_page_files(orphan.spool, pattern))
             for orphan in orphans
@@ -1039,8 +1006,7 @@ def sweep_orphans(
             finally:
                 orphan.close()
     finally:
-        # Interrupted part way: release every lock still held. Closing twice
-        # is safe.
+        # Interrupted part way: release every lock still held.
         for orphan in orphans:
             orphan.close()
     return recovered

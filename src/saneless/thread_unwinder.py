@@ -1,27 +1,18 @@
 """
 Load the C library's thread unwinder once, at startup, on a throwaway thread.
 
-glibc does not load the unwinder (``libgcc_s``) that ending a thread needs
-until the first time some thread ends through ``pthread_exit`` or is
-cancelled.  That first time it ``dlopen``s the library, holding the dynamic
-loader's lock and allocating memory as it goes.
-
-Some SANE backends read the scanner on a thread of their own and stop it with
-an *asynchronous* ``pthread_cancel``, which can kill a thread at any
-instruction.  When the reader is the first thread in the process to end, a
-cancel landing in that ``dlopen`` kills it with the loader's lock held.  Nothing
-ever releases the lock, so the process hangs the next time anything loads a
-library, or in its exit handlers.  Measured with libsane's ``test`` backend,
-that was about one failed read in twenty.
+glibc ``dlopen``s the unwinder (``libgcc_s``) the first time a thread ends
+through ``pthread_exit`` or is cancelled, holding the dynamic loader's lock.
+Some SANE backends stop their reader thread with an *asynchronous*
+``pthread_cancel``; if that reader is the first thread to end, the cancel can
+kill it inside the ``dlopen`` with the lock held, and the process hangs the
+next time anything loads a library, or at exit.
 
 Ending one thread of our own before any backend runs makes glibc load and keep
-the unwinder there and then, so no backend thread ever has to.  The thread is
-created and ended through the C library directly, because a Python thread
-returns from its start routine instead of calling ``pthread_exit`` and would
-load nothing.
-
-It is a no-op anywhere but glibc on Linux: other C libraries load no unwinder
-at thread exit, and saneless drives SANE only on Linux.
+the unwinder there and then.  The thread is made through the C library
+directly, because a Python thread returns from its start routine instead of
+calling ``pthread_exit`` and would load nothing.  Other C libraries load no
+unwinder at thread exit, so this is a no-op anywhere but glibc on Linux.
 """
 
 from __future__ import annotations
@@ -58,10 +49,9 @@ def load_thread_unwinder() -> None:
     End one native thread through ``pthread_exit``, so glibc loads its unwinder.
 
     Called from the main thread at startup, before SANE is initialised.
-    Safe to call more than once: every call after the first loads nothing.
-    A failure is logged at debug level and otherwise ignored, because the
-    process works without it -- it only leaves the hazard described in the
-    module docstring in place.
+    Safe to call more than once. A failure is logged at debug level and
+    otherwise ignored: the process works without it, with the hang left
+    possible.
     """
     if not _is_glibc():
         return

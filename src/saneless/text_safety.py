@@ -94,14 +94,13 @@ def neutralise_controls(text: str) -> str:
     Replace every control character and display hazard with its visible escape.
 
     Each becomes what ``repr`` shows for it without the quotes, so ESC becomes
-    ``\x1b``, a tab ``\t`` and a right-to-left override ``\u202e``. That is
-    the convention ``config._escape_name`` uses for configuration names. Every
-    other character, quotes and backslashes included, is kept as it is, so
-    ordinary text reads unchanged.
+    ``\x1b``, a tab ``\t`` and a right-to-left override ``\u202e``, as
+    ``config._escape_name`` does for configuration names. Every other
+    character, quotes and backslashes included, is kept as it is.
 
-    ``has_control_characters``, which decides which titles are refused, still
-    counts only control characters: a display hazard is escaped here and
-    never refused.
+    A display hazard is escaped here but never refused:
+    ``has_control_characters``, which decides which titles are refused, counts
+    only control characters.
 
     Args:
         text: Text from outside saneless, such as a device model or a title.

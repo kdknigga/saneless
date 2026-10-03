@@ -31,11 +31,9 @@ __all__ = ["configure_logging"]
 _FORMAT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
 
 # The HTTP stack's loggers, held at INFO or above whatever the log level says.
-# httpcore2's DEBUG trace writes headers; httpx2 is its client front end and
-# hpack its HTTP/2 header codec (not installed today, and a name costs nothing
-# when absent). python_multipart is the multipart parser's real logger name, and
-# multipart the shim package that re-exports it. Children such as
-# httpcore2.http11 inherit the level from their parent.
+# httpcore2's DEBUG trace writes headers; hpack is listed though it may be
+# absent. python_multipart is the multipart parser's real logger name, and
+# multipart the shim package that re-exports it.
 _LIBRARY_LOGGERS: Final = (
     "httpx2",
     "httpcore2",
@@ -50,9 +48,8 @@ class _TracebackFreeFormatter(logging.Formatter):
     A formatter that renders a record's message but never its traceback.
 
     Used for the stderr fallback when the log file cannot be opened and ``-v``
-    was not given: stderr is then the user's terminal, and no user sees a
-    traceback without asking for one. The record itself
-    keeps its ``exc_info``, so any other handler still renders it in full.
+    was not given: stderr is then the user's terminal. The record itself keeps
+    its ``exc_info``, so any other handler still renders it in full.
     """
 
     def format(self, record: logging.LogRecord) -> str:
@@ -84,9 +81,6 @@ def _owner_only_opener(path: str, flags: int) -> int:
     """
     Open ``path`` as ``open`` would, creating a missing file 0600.
 
-    The mode applies only when ``O_CREAT`` really creates the file, so a log
-    an earlier release left with a wider mode is appended to unchanged.
-
     Args:
         path: The file to open.
         flags: The ``os.open`` flags ``open`` computed from its mode.
@@ -103,10 +97,9 @@ class _PrivateRotatingFileHandler(RotatingFileHandler):
     A rotating file handler whose every new log file is owner-only.
 
     ``RotatingFileHandler`` opens a new base file on construction and again
-    after each rollover, both through ``_open`` and both with the umask's
-    mode, 0644 under the usual 022. Overriding ``_open`` covers both. A
-    rotated file is renamed, not copied, so it keeps the mode it was created
-    with.
+    after each rollover, both through ``_open`` with the umask's mode, so
+    overriding ``_open`` covers both. A rotated file is renamed, not copied,
+    so it keeps its mode.
     """
 
     def _open(self) -> TextIOWrapper:
@@ -163,35 +156,24 @@ def configure_logging(
     Configure application logging for a one-shot command or for a service.
 
     Calling it again replaces what an earlier call set up instead of adding
-    to it: every handler it installs is named with a ``saneless.`` prefix,
-    and each call first removes and closes the root handlers carrying that
-    prefix. Handlers it did not install are left alone, so a second call never
-    prints a record twice and never silences someone else's handler.
+    to it: each call first removes and closes the root handlers named with a
+    ``saneless.`` prefix, which every handler it installs carries. Handlers it
+    did not install are left alone.
 
     Given a ``log_file`` -- the one-shot CLI shape -- this creates parent
     directories for it if they don't exist, the innermost one 0700, then
     attaches a RotatingFileHandler to the root logger. Each log file it
     creates, the first one and every one a rotation starts, is 0600; an
-    existing directory or file keeps its mode. If the directory cannot be created
-    or the file cannot be opened, one stderr handler is attached instead and a
-    warning names the log file; this function does not raise for an unwritable
-    log, so the caller keeps running. Without ``verbose`` that fallback handler
-    renders each record's message but never its traceback, because stderr is
-    the user's terminal and a traceback there is only shown on request. With
-    ``verbose`` it renders the traceback too, and it is the only stderr
-    handler, so each record is printed once.
+    existing directory or file keeps its mode. If the directory cannot be
+    created or the file cannot be opened, one stderr handler is attached
+    instead, a warning names the log file, and nothing is raised. Without
+    ``verbose`` that fallback handler renders each record's message but never
+    its traceback.
 
     Given ``None`` -- the service shape ``saneless serve`` asks for -- a single
-    stderr handler is attached and nothing is written to disk: no file, no
-    directory, no rotation, and tracebacks always rendered. ``max_bytes`` and
-    ``backup_count`` are then unused, because they describe a rotation that
-    does not happen.
-
-    ``None`` rather than a separate ``stream=True`` flag is deliberate twice
-    over: a service genuinely has no log file, so the two modes cannot be
-    asked for contradictorily; and ruff's ``PLR0913`` ceiling is five
-    parameters, which this signature already sits on, and the project forbids
-    both a suppression and raising the limit.
+    stderr handler is attached, tracebacks always rendered, and nothing is
+    written to disk. A service genuinely has no log file, so ``None`` rather
+    than a separate flag means the two modes cannot be asked for at once.
 
     Args:
         log_file: Path to the log file, or None to stream to stderr instead.
@@ -200,9 +182,8 @@ def configure_logging(
         max_bytes: Maximum log file size before rotation. It has no default:
             the configuration's ``log_max_bytes`` is the one source of the
             value. Unused when ``log_file`` is None.
-        backup_count: Number of rotated log files to keep. It has no default
-            for the same reason, with ``log_backup_count`` as the source.
-            Unused when ``log_file`` is None.
+        backup_count: Number of rotated log files to keep, from
+            ``log_backup_count``. Unused when ``log_file`` is None.
         verbose: If True, log saneless's own loggers at DEBUG; with a
             ``log_file`` this also puts records, tracebacks included, on
             stderr.
@@ -224,15 +205,10 @@ def configure_logging(
     root_logger.setLevel(level)
 
     if log_file is None:
-        # The reader who knows the fallback branch below will expect
-        # _TracebackFreeFormatter here too. It is deliberately the plain
-        # formatter instead. The fallback's traceback-free rule is justified by
-        # "stderr is the user's terminal now" -- that is false for a service:
-        # the stream *is* the log, and docker logs or journald is nobody's
-        # terminal. There is also no file here to carry the traceback instead.
-        # Swap in _TracebackFreeFormatter and every unexpected worker exception
-        # leaves one message line in `docker logs` and nothing else, recoverable
-        # only by restarting the service with -v.
+        # Deliberately not _TracebackFreeFormatter: for a service the stream
+        # *is* the log, not a terminal, and no file carries the traceback
+        # instead. Stripping it would leave each unexpected worker exception
+        # as one message line in `docker logs`.
         stream_handler = logging.StreamHandler(sys.stderr)
         stream_handler.set_name("saneless.stream")
         stream_handler.setFormatter(formatter)
@@ -253,10 +229,9 @@ def configure_logging(
             root_logger.addHandler(file_handler)
             attached = True
         except OSError:
-            # The one stderr handler on this path. stderr is the user's
-            # terminal now, so it renders a traceback only when -v asked for
-            # one. It is attached before the warning below, which would
-            # otherwise reach no handler at all.
+            # stderr is the user's terminal now, so it renders a traceback
+            # only when -v asked for one. It is attached before the warning
+            # below, which would otherwise reach no handler at all.
             stderr_handler = logging.StreamHandler(sys.stderr)
             stderr_handler.set_name("saneless.stderr")
             stderr_handler.setFormatter(
@@ -281,16 +256,11 @@ def configure_logging(
     # earlier call's DEBUG.
     logging.getLogger("saneless").setLevel(logging.DEBUG if verbose else logging.NOTSET)
 
-    # The root level alone does not keep library DEBUG output out: a configured
-    # log_level of DEBUG is the root's level, and a library logger without one
-    # of its own inherits it. That output is not saneless's to audit --
-    # httpcore2 logs full response headers today, nothing stops it logging
-    # request headers tomorrow, and the Paperless Authorization header must not
-    # reach a log. So each HTTP library logger gets its own level, the
-    # configured one but never below INFO. Not a flat INFO: a logger's own
-    # level, not the root's, gates emission, so INFO under a WARNING root would
-    # switch httpx2's per-request line on. Setting it on every call keeps
-    # repeated calls idempotent, as above.
+    # A library logger inherits a DEBUG root, and httpcore2's DEBUG trace logs
+    # headers, which may carry the Paperless Authorization header. So each
+    # gets its own level, the configured one but never below INFO. Not a flat
+    # INFO: a logger's own level gates emission, so INFO under a WARNING root
+    # would switch httpx2's per-request line on.
     library_level = max(level, logging.INFO)
     for name in _LIBRARY_LOGGERS:
         logging.getLogger(name).setLevel(library_level)

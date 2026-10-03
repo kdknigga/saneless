@@ -32,16 +32,10 @@ def crop_to_paper_size(
     """
     Crop an image to the given paper size at the specified DPI.
 
-    Returns the image unchanged when *paper_size* is ``"full"`` or not
-    recognised.  Otherwise crops to the paper's size in pixels, each rounded
-    to the nearest whole pixel and clamped to the actual image size.
-
     The crop is **top-left aligned**, which assumes the sheet's top-left corner
-    is the image's.  That is right for a sheet placed in the corner of a
-    flatbed, and the scanner backend applies it only there, or inside a
-    feeder window the device has already centred on the paper.  A feeder that
-    guides the sheet into the middle of a wider window would lose the right
-    edge of every page to it.
+    is the image's: true on a flatbed, or in a feeder window the device has
+    already centred on the paper.  A feeder that guides the sheet into the
+    middle of a wider window would lose the right edge of every page to it.
 
     Args:
         image: Source PIL image to crop.
