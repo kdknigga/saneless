@@ -5,7 +5,7 @@ A hand-typed device table drifts the moment the column sizing changes, and a
 hand-typed ``auto-profiles`` run drifts the moment profile naming does. These
 tests hold only the inputs as literals -- the device each page documents and
 the capabilities it reports -- and render every sample through the real
-command, so a doc block that no longer matches the program fails here.
+command, so a doc block that differs from the program's output fails here.
 
 They also hold First CLI Scan to the order a reader can succeed with:
 profiles are generated after the config file exists, so they land in the file

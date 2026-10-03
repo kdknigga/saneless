@@ -535,7 +535,7 @@ def test_every_whole_service_example_mounts_the_data_volume() -> None:
 
 
 def test_the_attestation_caveat_fits_the_declared_version() -> None:
-    """The unattested-images caveat names the right tag, and only before 0.2.0."""
+    """The unattested-images caveat names the right tag, and only in a pre-release."""
     declared = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
         "version"
     ]
