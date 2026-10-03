@@ -91,6 +91,37 @@ _NO_REAL_LIBSANE = (
 )
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Add ``--mutants``, which runs the hand-written mutant checks."""
+    parser.addoption(
+        "--mutants",
+        action="store_true",
+        default=False,
+        help=(
+            "run the tests marked mutant, which re-run named tests against "
+            "mutated copies of the repository"
+        ),
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """
+    Deselect every ``mutant`` test unless ``--mutants`` was given.
+
+    Deselecting rather than skipping keeps them out of the summary, and an
+    ``-m`` expression on the command line cannot bring them back by accident.
+    """
+    if config.getoption("--mutants"):
+        return
+    kept = [item for item in items if item.get_closest_marker("mutant") is None]
+    if len(kept) != len(items):
+        dropped = [item for item in items if item.get_closest_marker("mutant")]
+        config.hook.pytest_deselected(items=dropped)
+        items[:] = kept
+
+
 @pytest.fixture
 def tmp_config_dir(tmp_path: Path) -> Path:
     """Create a temporary directory for config files."""

@@ -512,6 +512,7 @@ def _pipeline_request_builders() -> list[tuple[str, str]]:
     return sites
 
 
+@pytest.mark.source_structure
 def test_every_pipeline_request_comes_from_the_one_builder() -> None:
     """
     The worker and the CLI build their requests one way.
@@ -7665,6 +7666,7 @@ class TestPerJobReinitialise:
         assert "Restart saneless" in finished.error
         assert freed
 
+    @pytest.mark.source_structure
     def test_reinitialise_is_called_only_from_the_scan_job(self) -> None:
         """
         SANE is restarted in the job's gated block and nowhere outside the job.

@@ -28,6 +28,7 @@ __pycache__/
 # Generated site and browser-test artifacts
 /site/
 /test-results/
+/mutants/
 /.playwright-mcp/
 
 # Editors and operating systems

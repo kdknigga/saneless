@@ -57,6 +57,7 @@ IGNORED_PATHS = (
     ".coverage",
     "site/index.html",
     "test-results/x",
+    "mutants/x",
     ".serena/x",
     ".claude/worktrees/x/y",
 )

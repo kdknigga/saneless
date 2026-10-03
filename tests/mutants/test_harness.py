@@ -9,6 +9,7 @@ stay out of an ordinary run until they are asked for.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -126,7 +127,7 @@ def test_mutant_tests_are_collected_with_the_option() -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert _SELF_TEST in result.stdout
-    assert "deselected" not in result.stdout
+    assert re.search(r"\d+ deselected", result.stdout) is None
 
 
 @pytest.mark.mutant

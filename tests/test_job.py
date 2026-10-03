@@ -1258,6 +1258,7 @@ class TestResultColumns:
         ]
         assert len(definitions) == 1
 
+    @pytest.mark.source_structure
     def test_single_mapping_constructs_a_job_in_one_place(self) -> None:
         """job.py builds a Job only inside the module-level row mapper (STOR-04)."""
         tree = ast.parse(_job_source())
@@ -1269,6 +1270,7 @@ class TestResultColumns:
         assert _count_job_constructions(tree) == 1
         assert _count_job_constructions(job_from_row) == 1
 
+    @pytest.mark.source_structure
     def test_the_store_maps_rows_through_the_shared_mapper(self) -> None:
         """The store's own row conversion delegates rather than copying (STOR-04)."""
         row_to_job = next(
@@ -1522,6 +1524,7 @@ class TestFinishJob:
 class TestLockDiscipline:
     """Lock coverage, the no-public-self-call rule, and the concurrency claim."""
 
+    @pytest.mark.source_structure
     def test_locked_coverage_spans_every_public_method(self) -> None:
         """Every public JobStore method carries the lock marker (STOR-01)."""
         # Blind spot, recorded deliberately: inspect.isfunction does not see a

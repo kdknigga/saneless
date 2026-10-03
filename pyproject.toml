@@ -228,12 +228,12 @@ exclude = [".planning/**/*.md"]
 [tool.pyrefly]
 # "src" must come first. Pyrefly infers a single import root from the project
 # layout ("src"), which leaves `tests` unresolvable -- `tests/test_scanner.py`
-# imports the shared fake as `tests.fake_sane`, the only form that works under
-# pytest 9's importlib mode. Adding "." alone is not the fix: it lets
-# `src/saneless` resolve as both `saneless.*` and `src.saneless.*`, and the two
-# identities are not assignable to each other (measured: 14 bad-argument-type
-# errors). Listing "src" first pins each source file to one module name and
-# leaves "." to resolve `tests` only.
+# imports the shared fake as `tests.fake_sane`: `tests/` is a package, so
+# pytest's default prepend mode imports it as `tests.*`. Adding "." alone is
+# not the fix: it lets `src/saneless` resolve as both `saneless.*` and
+# `src.saneless.*`, and the two identities are not assignable to each other
+# (measured: 14 bad-argument-type errors). Listing "src" first pins each
+# source file to one module name and leaves "." to resolve `tests` only.
 search-path = ["src", "."]
 
 # A deprecated API reported as a warning scrolls past unread: pyrefly hides
@@ -250,6 +250,9 @@ markers = [
     "browser: Playwright browser tests (requires chromium)",
     "sane_hardware: tests that drive the real SANE test backend (requires libsane-dev)",
     "slow: tests that take tens of seconds; deselect with -m 'not slow' for a quick local run",
+    "mutant: re-runs a named test against a mutated copy of the repository; selected only with --mutants",
+    "source_structure: reads a module's own source text; mutmut deselects it because its mutated copy is not the real source",
+    "real_paperless_transport: keeps the real Paperless HTTP transport instead of the refusing default",
 ]
 addopts = ["-ra"]
 strict_markers = true
@@ -267,6 +270,38 @@ timeout_method = "signal"
 # asked to capture. "legacy" is the family that carries them.
 junit_family = "legacy"
 
+# Generated mutants for the delivery path: the pipeline, the worker, the
+# Paperless client and the job store.  mutmut never mutates a function that
+# carries a decorator other than staticmethod or classmethod, so the store's
+# locked public methods get no generated mutants at all; the hand-written
+# mutants under tests/mutants cover them instead.  mutmut runs the tests
+# against a rewritten copy of each module, so a test that reads a module's own
+# source sees the rewrite rather than the real code and fails the clean run;
+# those tests carry the source_structure marker and are deselected here.  Each
+# mutant runs in a forkserver child, which is safe with the threads the worker
+# tests start.
+[tool.mutmut]
+source_paths = ["src"]
+only_mutate = [
+    "src/saneless/pipeline.py",
+    "src/saneless/worker.py",
+    "src/saneless/paperless.py",
+    "src/saneless/job.py",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/test_pipeline.py",
+    "tests/test_multi_page_pipeline.py",
+    "tests/test_worker.py",
+    "tests/test_multi_page_worker.py",
+    "tests/test_paperless.py",
+    "tests/test_job.py",
+    "tests/test_golden_e2e.py",
+    "tests/test_outcomes_e2e.py",
+    "-m",
+    "not browser and not sane_hardware and not source_structure",
+]
+process_isolation = "forkserver"
+
 [dependency-groups]
 dev = [
     "playwright>=1.63.0",
@@ -281,6 +316,7 @@ dev = [
     "pytest-timeout>=2.4.0",
     "zizmor>=1.30.1",
     "pytest-cov>=7.1.0",
+    "mutmut>=3.8.0",
 ]
 # The release workflow installs only this group, hash-checked from the lock,
 # to run the version gate before anything is published.
