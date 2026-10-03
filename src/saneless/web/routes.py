@@ -3035,11 +3035,10 @@ def start_scan(
     # -- and it sits ahead of ``create_job`` so a scan that could never upload
     # leaves exactly one row: the REJECTED one, which Job History shows so the
     # attempt is visible rather than silently swallowed.
-    # The degraded-worker rejection is deliberately not reused here, and this
-    # comment names it in prose rather than as the symbol so a grep for that
-    # member still counts only the places that raise it: "the scan service was
-    # unavailable" is untrue when the service is fine and nobody set the token,
-    # and it would send a household member looking for a broken server.  The
+    # ``RequestRejection.WORKER_DEGRADED`` is deliberately not reused here: "the
+    # scan service was unavailable" is untrue when the service is fine and
+    # nobody set the token, and it would send a household member looking for a
+    # broken server.  The
     # status is 503, matching the two existing refuse-to-start rejections, so
     # htmx response handling and the history reload behave identically; a 4xx
     # would imply the request was at fault, which it was not.
