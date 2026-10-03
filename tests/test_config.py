@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import errno
 import logging
 import os
@@ -14,7 +15,16 @@ import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, Final, NamedTuple, TypedDict, Unpack
+from typing import (
+    IO,
+    TYPE_CHECKING,
+    Any,
+    Final,
+    NamedTuple,
+    NoReturn,
+    TypedDict,
+    Unpack,
+)
 
 import pytest
 from click.testing import CliRunner
@@ -53,6 +63,7 @@ from saneless.vocabulary import TITLE_MAX_LENGTH, ProfileStorage, local_time
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
+    from pydantic import BaseModel
     from pydantic_core import ErrorDetails
 
 
@@ -1059,6 +1070,48 @@ def _error_lines(err: ConfigError) -> list[str]:
     return str(err).split("\n")
 
 
+def _upstream_message(model: type[BaseModel], field: str, value: object) -> str:
+    """
+    Return pydantic's own message for ``value`` in ``model``'s ``field``.
+
+    The loader's line is ``[section] key: <message>``. Taking the message
+    from pydantic itself keeps the tests on the part saneless writes, so a
+    pydantic release that rewords its messages changes no expectation.
+
+    Args:
+        model: The model that owns the field.
+        field: The field's key, as the TOML spells it.
+        value: The invalid value.
+
+    Returns:
+        The ``msg`` of the one error pydantic reports at ``field``.
+
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        model.model_validate({field: value})
+    [message] = [
+        error["msg"] for error in exc_info.value.errors() if error["loc"] == (field,)
+    ]
+    return message
+
+
+def _field_line(section: str, field: str, model: type[BaseModel], value: object) -> str:
+    """
+    Return the error line the loader renders for ``value`` in ``[section] field``.
+
+    Args:
+        section: The TOML table, without brackets.
+        field: The key inside it.
+        model: The model that owns the key.
+        value: The invalid value.
+
+    Returns:
+        The indented body line, ``  [section] field: <message>``.
+
+    """
+    return f"  [{section}] {field}: {_upstream_message(model, field, value)}"
+
+
 class TestUnknownKeyRendering:
     """
     Every validation error is rendered by its full ``loc`` (D-10, D-11, CFG-01).
@@ -1180,14 +1233,8 @@ log_level = "TRACE"
         assert any(
             line.startswith("  [paperless] unknown key 'tokne'") for line in body
         )
-        assert any(
-            line.startswith("  [output] web_port: Input should be a valid integer")
-            for line in body
-        )
-        assert any(
-            line.startswith("  [output] log_level: Input should be 'DEBUG', ")
-            for line in body
-        )
+        assert _field_line("output", "web_port", OutputConfig, "abc") in body
+        assert _field_line("output", "log_level", OutputConfig, "TRACE") in body
 
     def test_renders_every_error_with_list_index(self, tmp_config_dir: Path) -> None:
         """An integer ``loc`` element is rendered as a list index (D-10)."""
@@ -1581,14 +1628,8 @@ log_level = "TRACE"
         assert any(
             line.startswith("  [paperless] unknown key 'tokne'") for line in body
         )
-        assert any(
-            line.startswith("  [output] web_port: Input should be a valid integer")
-            for line in body
-        )
-        assert any(
-            line.startswith("  [output] log_level: Input should be 'DEBUG', ")
-            for line in body
-        )
+        assert _field_line("output", "web_port", OutputConfig, "abc") in body
+        assert _field_line("output", "log_level", OutputConfig, "TRACE") in body
         assert [line for line in body if "<value omitted>" in line] == []
         assert (
             "  [paperless] unknown key 'tokne' (did you mean 'token'?); "
@@ -1684,10 +1725,7 @@ log_level = "TRACE"
         )
         [line] = [ln for ln in _error_lines(err) if "web_port" in ln]
         assert "<value omitted>" not in line
-        assert line.strip() == (
-            "[output] web_port: Input should be a valid integer, "
-            "unable to parse string as an integer"
-        )
+        assert line == _field_line("output", "web_port", OutputConfig, "in")
 
     def test_a_value_that_cannot_be_struck_cleanly_withholds_the_message(
         self,
@@ -1728,10 +1766,7 @@ log_level = "TRACE"
         )
         [line] = [ln for ln in _error_lines(err) if "web_port" in ln]
         assert "<value omitted>" not in line
-        assert line.strip() == (
-            "[output] web_port: Input should be a valid integer, "
-            "unable to parse string as an integer"
-        )
+        assert line == _field_line("output", "web_port", OutputConfig, "eger")
 
     @pytest.mark.parametrize(
         "value",
@@ -2056,10 +2091,9 @@ class TestPaperlessTokenAndUrlAtLoad:
             tmp_config_dir / "host_less_url.toml",
             f'[paperless]\nurl = "{url}"\n',
         )
-        assert _only_body_line(err) == (
-            "  [paperless] url: Value error, must be an http or https address "
-            "that names a host"
-        )
+        line = _only_body_line(err)
+        assert line.startswith("  [paperless] url: ")
+        assert line.endswith(" must be an http or https address that names a host")
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_a_malformed_url_from_the_environment_is_refused(
@@ -2851,7 +2885,7 @@ class TestEnvironmentJson:
         )
         assert _error_lines(err) == [
             f"Configuration error in {config_file}:",
-            "  [output] web_port: Input should be less than or equal to 65535",
+            _field_line("output", "web_port", OutputConfig, 70000),
             "  [paperless] unknown key 'tokne' (did you mean 'token'?); "
             "valid keys: url, token, consume_dir",
             _json_line(variable),
@@ -2867,7 +2901,7 @@ class TestEnvironmentJson:
         err = _load_error(config_file, "[output]\nweb_port = 70000\n")
         assert _error_lines(err) == [
             f"Configuration error in {config_file}:",
-            "  [output] web_port: Input should be less than or equal to 65535",
+            _field_line("output", "web_port", OutputConfig, 70000),
             _json_line("SANELESS_PROFILES__DEFAULT__DEFAULT_TAGS"),
             _json_line("SANELESS_WEB__ALLOWED_HOSTS"),
         ]
@@ -3802,10 +3836,7 @@ class TestHistoryRetentionDays:
         lines = _output_bound_line(
             tmp_config_dir, "history_retention_days", 0, "retention_zero"
         )
-        assert (
-            "  [output] history_retention_days: "
-            "Input should be greater than or equal to 1"
-        ) in lines
+        assert _field_line("output", "history_retention_days", OutputConfig, 0) in lines
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_history_retention_days_from_environment(
@@ -3840,9 +3871,7 @@ class TestHistoryMaxRows:
         lines = _output_bound_line(
             tmp_config_dir, "history_max_rows", 0, "max_rows_zero"
         )
-        assert (
-            "  [output] history_max_rows: Input should be greater than or equal to 1"
-        ) in lines
+        assert _field_line("output", "history_max_rows", OutputConfig, 0) in lines
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_history_max_rows_from_environment(
@@ -3880,10 +3909,7 @@ class TestPaperlessTaskTimeout:
         lines = _output_bound_line(
             tmp_config_dir, "paperless_task_timeout", 0, "task_timeout_zero"
         )
-        assert (
-            "  [output] paperless_task_timeout: "
-            "Input should be greater than or equal to 1"
-        ) in lines
+        assert _field_line("output", "paperless_task_timeout", OutputConfig, 0) in lines
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_paperless_task_timeout_from_environment(
@@ -3916,9 +3942,7 @@ class TestLogMaxBytesBound:
     def test_log_max_bytes_zero_in_toml_rejected(self, tmp_config_dir: Path) -> None:
         """A TOML ``log_max_bytes = 0`` fails at load, naming the key."""
         lines = _output_bound_line(tmp_config_dir, "log_max_bytes", 0, "max_bytes")
-        assert (
-            "  [output] log_max_bytes: Input should be greater than or equal to 1"
-        ) in lines
+        assert _field_line("output", "log_max_bytes", OutputConfig, 0) in lines
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_log_max_bytes_from_environment(
@@ -3953,9 +3977,7 @@ class TestLogBackupCount:
         lines = _output_bound_line(
             tmp_config_dir, "log_backup_count", 0, "backup_count_zero"
         )
-        assert (
-            "  [output] log_backup_count: Input should be greater than or equal to 1"
-        ) in lines
+        assert _field_line("output", "log_backup_count", OutputConfig, 0) in lines
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_log_backup_count_from_environment(
@@ -3991,9 +4013,7 @@ class TestMinFreeSpaceMb:
         lines = _output_bound_line(
             tmp_config_dir, "min_free_space_mb", -1, "free_space_negative"
         )
-        assert (
-            "  [output] min_free_space_mb: Input should be greater than or equal to 0"
-        ) in lines
+        assert _field_line("output", "min_free_space_mb", OutputConfig, -1) in lines
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_min_free_space_mb_from_environment(
@@ -4031,9 +4051,9 @@ class TestPaperlessCacheTtlBound:
             tmp_config_dir, "paperless_cache_ttl_seconds", -1, "cache_ttl_negative"
         )
         assert (
-            "  [output] paperless_cache_ttl_seconds: "
-            "Input should be greater than or equal to 0"
-        ) in lines
+            _field_line("output", "paperless_cache_ttl_seconds", OutputConfig, -1)
+            in lines
+        )
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_paperless_cache_ttl_from_environment(
@@ -4070,9 +4090,8 @@ class TestResolutionBound:
             tmp_config_dir / "resolution_zero.toml",
             "[profiles.default]\nresolution = 0\n",
         )
-        assert (
-            "  [profiles.default] resolution: "
-            "Input should be greater than or equal to 1"
+        assert _field_line(
+            "profiles.default", "resolution", ProfileConfig, 0
         ) in _error_lines(err)
 
     @pytest.mark.usefixtures("no_discovered_config")
@@ -5259,12 +5278,20 @@ class TestPlaceholderToken:
         """
         The predicate adds no secret-unwrapping call to ``config.py``.
 
-        Only ``cli.py scan`` and ``web/app.py create_app`` unwrap the token
-        (T-30-05, N-15); ``config.py`` itself never does, and naming the method
-        in a comment is not a call site -- the call form is what is asserted.
+        Only ``cli.py scan`` and ``web/app.py create_app`` unwrap the token;
+        ``config.py`` itself never does. The parsed module's calls are counted,
+        so a comment or docstring naming the method neither trips nor
+        satisfies the check.
         """
-        source = Path(config_mod.__file__).read_text()
-        assert ".get_secret_value(" not in source
+        tree = ast.parse(Path(config_mod.__file__).read_text(encoding="utf-8"))
+        unwraps = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get_secret_value"
+        ]
+        assert unwraps == [], f"config.py unwraps a secret at lines {unwraps}"
 
 
 class TestProfileLabelAndDescription:
@@ -5643,13 +5670,25 @@ class TestProfileStorageForLoaded:
         assert profile_storage_for_loaded(settings) is ProfileStorage.PERSISTED
 
     def test_it_is_pure_and_touches_no_filesystem(self, tmp_path: Path) -> None:
-        """Called twice with the same settings it gives the same answer twice."""
+        """
+        It answers from the settings alone, without asking the filesystem.
+
+        Every existence or metadata question about a path goes through a stat
+        call, so with both stat entry points refusing, any probe fails the test.
+        """
         missing = tmp_path / "gone.toml"
         settings = Settings()
         settings._config_path = missing
 
-        first = profile_storage_for_loaded(settings)
-        second = profile_storage_for_loaded(settings)
+        def refuse(*_args: object, **_kwargs: object) -> NoReturn:
+            message = "filesystem touched"
+            raise AssertionError(message)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "stat", refuse)
+            patch.setattr(os, "stat", refuse)
+            first = profile_storage_for_loaded(settings)
+            second = profile_storage_for_loaded(settings)
 
         assert first is second
         assert list(tmp_path.iterdir()) == []

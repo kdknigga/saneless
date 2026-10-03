@@ -1126,7 +1126,7 @@ class TestProfileLabels:
             ("Card Back", "Scanner source"),
         ],
     )
-    def test_label_uses_the_three_d19_forms_verbatim(
+    def test_label_uses_the_fixed_feeder_duplex_and_glass_wording(
         self, source: str, expected: str
     ) -> None:
         """
@@ -2642,28 +2642,60 @@ class TestScanProfileHowToDocumentsOwnership:
             / "docs"
             / "how-to"
             / "configure-scan-profiles.md"
-        ).read_text()
+        ).read_text(encoding="utf-8")
 
-    @pytest.mark.parametrize("key", ["label", "description"])
-    def test_guide_documents_both_new_keys(self, key: str) -> None:
-        """Each key appears as a field the guide describes."""
-        assert f"`{key}`" in self._guide()
+    @classmethod
+    def _section(cls, heading: str) -> str:
+        """
+        Return the guide's ``## heading`` section, up to the next ``##`` heading.
+
+        Args:
+            heading: The section's title, without the hashes.
+
+        Returns:
+            The section's text, its own heading line excluded.
+
+        """
+        match = re.search(
+            rf"^## {re.escape(heading)}\n(?P<body>.*?)(?=^## |\Z)",
+            cls._guide(),
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, f"the guide has no '## {heading}' section"
+        return match.group("body")
+
+    def test_field_reference_lists_every_profile_key(self) -> None:
+        """The field reference table has one row per profile key, and no others."""
+        rows = re.findall(
+            r"^\| `(?P<key>[a-z_]+)` \|",
+            self._section("Profile field reference"),
+            re.MULTILINE,
+        )
+        keys = {
+            field.alias or name for name, field in ProfileConfig.model_fields.items()
+        }
+        assert sorted(rows) == sorted(keys)
 
     def test_guide_names_the_force_command_and_the_escape_hatch(self) -> None:
-        """The overwrite rule and the way out are both stated."""
-        guide = self._guide()
-        assert "auto-profiles --force" in guide
-        assert "auto_generated" in guide
+        """The auto-generated section states the overwrite rule and the way out."""
+        section = self._section("Auto-generated profiles")
+        assert re.search(r"\bsaneless auto-profiles --force\b", section)
+        assert re.search(r"\bdelete the `auto_generated` line\b", section)
 
     def test_owned_key_list_in_the_guide_names_every_owned_key(self) -> None:
         """
-        The verbatim owned-key list does not drift from ``_OWNED_KEYS``.
+        The guide's list of keys ``--force`` rewrites is exactly ``_OWNED_KEYS``.
 
         The list is prose, so nothing but a test keeps it honest.
         """
-        guide = self._guide()
-        for key in auto_profiles._OWNED_KEYS:
-            assert f"`{key}`" in guide, key
+        match = re.search(
+            r"only the generated keys \((?P<keys>[^)]*)\)",
+            self._section("Auto-generated profiles"),
+        )
+        assert match is not None, "the guide no longer lists the generated keys"
+        listed = re.findall(r"`([^`]+)`", match.group("keys"))
+        assert len(listed) == len(set(listed)), listed
+        assert set(listed) == set(auto_profiles._OWNED_KEYS)
 
 
 class TestOwnershipReadsTheFlagLikeTheLoader:
@@ -2881,8 +2913,7 @@ class TestDurableConfigWrite:
         message = str(caught.value)
         assert message.startswith(f"Cannot update {config_file}:")
         assert "line 1, column 4" in message
-        assert "Unexpected character" in message
-        # The position is given once, not again in tomlkit's own suffix (IN-03).
+        # The position is given once, not again in tomlkit's own suffix.
         assert " col 4" not in message
         assert isinstance(caught.value.__cause__, ParseError)
         assert config_file.read_bytes() == original
