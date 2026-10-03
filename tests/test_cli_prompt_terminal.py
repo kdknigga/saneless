@@ -1,38 +1,15 @@
 """
 The CLI's prompts on a real terminal: every ending exits promptly, with its code.
 
-``saneless scan`` asks the operator two kinds of question: with a
-manual-duplex profile, whether the stack has been flipped between its two
-passes; with ``--multi-page``, what to do after each pass.  On a real
-terminal each way of leaving either question has to end the process within
-two seconds, with the documented exit code.
-
-At the flip question:
-
-- Ctrl-C is the operator's cancel: 130.
-- No answer before ``operator_wait_timeout_seconds``: 1, the fronts kept in
-  ``failed/``.
-- End of input (Ctrl-D): a cancel, 130.
-- A hangup: an interruption, 129, whichever of the hangup and the end of input
-  a closing terminal delivers first.
-- An answer: the scan goes on to the backs.
-
-At a multi-page question the same, except that a timeout uploads the pages
-kept, with a warning (7), or keeps them in ``failed/`` when every page was
-blank (8).
-
-Only a real terminal shows the fault these guard against: a process that has
-printed its outcome and then waits at interpreter exit for someone to press
-Enter.  With stdout piped it hides, so every test here runs the real
-``saneless`` entry point in a child process whose stdin, stdout and stderr are
-all one pseudo-terminal, and reads that terminal from this side.
-
-The child is started in its own session, so the terminal is not its
-controlling terminal: typing the Ctrl-C byte would generate nothing, and
-Ctrl-C is delivered as the SIGINT the line discipline would have sent.  End of
-input (the Ctrl-D byte) does go through the line discipline.  Every wait is a ``select`` on
-the terminal with a deadline, and a child that outlives its bound is killed and
-the test failed, so a hang cannot take the suite down with it.
+At the flip question and at a multi-page question, Ctrl-C and end of input exit
+130, a hangup exits 129 whichever of it and end of input comes first, and an
+answer goes on.  No answer exits 1 at the flip question, the fronts kept in
+``failed/``; at a multi-page question it exits 7, the kept pages uploaded with a
+warning, or 8 when every page looked blank.  Each ending is over within two
+seconds: the fault guarded against is a process that prints its outcome and then
+waits at exit for Enter, which only a real terminal shows.  So each test runs the
+real entry point in its own session on one pseudo-terminal, delivers Ctrl-C as
+SIGINT, and kills a child that outlives its bound, so a hang fails one test.
 """
 
 from __future__ import annotations
@@ -378,8 +355,8 @@ def _exit_code_within(run: _PtyRun, seconds: float) -> int:
     Wait at most ``seconds`` for the child to exit, reading what it writes.
 
     A child still running at the bound is killed, with its whole session, and
-    the test fails naming the hang, so a regression costs the bound rather
-    than the suite.
+    the test fails naming the hang, so a hang costs the bound rather than
+    the suite.
 
     Args:
         run: The child.
