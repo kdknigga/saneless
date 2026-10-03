@@ -1109,8 +1109,10 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
     except TOMLKitError as exc:
         # Every tomlkit error, not only ParseError: a table redefined under a
         # dotted header raises KeyAlreadyPresent, which is not one.
-        # tomlkit's str() is its message plus, for a ParseError, the position --
-        # never document text, so the chain cannot carry the token. The
+        # tomlkit's str() is a fixed message plus, for a ParseError, the
+        # position. The document text it can quote is one unexpected
+        # character, or a duplicated key's name -- never a value, so the
+        # chain cannot carry the token. The
         # position is rendered once, in saneless's own words, and only when
         # tomlkit has one.
         reason = describe(exc)
@@ -1403,8 +1405,10 @@ def write_profiles_to_config(
     Raises:
         ConfigError: ``[profiles]`` or ``[scanner]`` in the file is not a
             table, the file is not valid UTF-8, the merged text does not
-            round-trip through TOML, or the file is bind-mounted as a single
-            file (EBUSY) and cannot be replaced.
+            round-trip through TOML, or the file cannot be replaced because it
+            is bind-mounted as a single file (EBUSY) or sits on a read-only
+            mount, or for any other refusal ``replace_file_atomically``
+            documents.
         OSError: Any other failure to read or replace the file, including
             ``PermissionError`` for a file this process may not write.
 
@@ -1420,10 +1424,10 @@ def write_profiles_to_config(
 
     # ``cast`` is a promise to the type checker, not a check. A config whose
     # ``profiles`` key is a scalar -- ``profiles = "oops"`` -- reaches
-    # ``.items()`` on a tomlkit String, and the user gets a raw AttributeError
-    # traceback out of ``auto-profiles`` instead of a configuration error.
-    # ``_is_auto_generated`` already guards exactly this risk one level down,
-    # for each entry; the container itself was not given the same treatment.
+    # ``.items()`` on a tomlkit String and ends ``auto-profiles`` in a raw
+    # AttributeError traceback. So the container is checked here, as
+    # ``_is_auto_generated`` checks each entry, and a non-table is refused
+    # as a configuration error.
     section = doc["profiles"]
     if not isinstance(section, Mapping):
         msg = f"[profiles] in {config_path} is not a table; refusing to overwrite it"

@@ -194,7 +194,8 @@ LEGACY_CONFIG_FILENAME: Final = "config.toml"
 # Positionally aligned with ``config_search_paths()``: index i is how the
 # documentation spells the directory of candidate i. The status strip is
 # visible to anyone on the LAN and carries no filesystem path, so it names a
-# file by its documented spelling; the log and ``doctor`` print absolute paths.
+# file by its documented spelling; the log and ``doctor`` print real paths,
+# absolute unless the working directory has been removed.
 _SEARCH_DIR_SPELLINGS: Final = ("./", "$XDG_CONFIG_HOME/saneless/", "/etc/saneless/")
 
 
@@ -597,8 +598,8 @@ def _is_legacy_manual_duplex_source(source: str) -> bool:
     This exists ONLY to detect a legacy profile at config load so it can be
     translated to ``duplex = "manual"``, and so ``warn_on_legacy_duplex_sources``
     can warn about it once logging is configured. It is never consulted to
-    choose a scanning strategy: ``pipeline._is_manual_duplex`` is deleted in
-    favour of ``ProfileConfig.duplex``, and ``source`` is a pure SANE value.
+    choose a scanning strategy: that comes from ``ProfileConfig.duplex``, and
+    ``source`` is a pure SANE value.
 
     Args:
         source: The profile's configured source string.
@@ -670,10 +671,10 @@ def is_placeholder_token(value: str) -> bool:
     an exotic placeholder, so membership is exact and never a substring match:
     ``changeme7f3a91`` is a real token.
 
-    ASVS V7: this function neither logs nor returns the value it is given -- it
-    returns only a ``bool``. It takes an already-unwrapped ``str``, so it adds
-    no secret-unwrapping call site to this module, and
-    callers must not log or render the value either.
+    ASVS 4.0.3 V7.1.1 (no credentials in logs): this function neither logs
+    nor returns the value it is given -- it returns only a ``bool``. It takes
+    an already-unwrapped ``str``, so it adds no secret-unwrapping call site to
+    this module, and callers must not log or render the value either.
 
     Args:
         value: The token as configured, already unwrapped from its SecretStr.
@@ -705,9 +706,9 @@ class PaperlessConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     url: str = ""
-    # Masked in repr, tracebacks and model_dump. Unwrapped with
-    # get_secret_value only where PaperlessClient is built: cli.py scan and
-    # web/app.py create_app.
+    # Masked in repr, tracebacks and model_dump. Code that needs the value
+    # calls get_secret_value() where it uses it; settings never hold the
+    # unwrapped string, and nothing may log or render it.
     token: SecretStr = SecretStr("")
     # None means the fallback copy is disabled.
     consume_dir: Path | None = None
@@ -1297,8 +1298,8 @@ class Settings(BaseSettings):
     paperless: PaperlessConfig = Field(default_factory=PaperlessConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     # default_factory for the same reason the three above use one: a plain
-    # ``WebConfig()`` default would be built once at import, and every section
-    # on Settings uses a factory so none of them can freeze import-time state.
+    # ``WebConfig()`` default would be built once at import. ``profiles``
+    # keeps a plain default, which pydantic deep-copies for each instance.
     web: WebConfig = Field(default_factory=WebConfig)
     profiles: dict[str, ProfileConfig] = {"default": ProfileConfig()}
 
@@ -1354,7 +1355,7 @@ class Settings(BaseSettings):
         Configure settings sources with optional TOML file support.
 
         The _toml_file init kwarg is extracted and used to create a
-        _ByteExactTomlSource if the file exists. The private _skip_env init
+        _ByteExactTomlSource whenever it is passed. The private _skip_env init
         kwarg drops the environment source, so the loader can still validate
         the file when a SANELESS_* variable will not parse. pydantic-settings
         calls this by keyword, so the two unused sources keep their names.
