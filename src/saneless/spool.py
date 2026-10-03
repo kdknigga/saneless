@@ -376,8 +376,9 @@ class SpooledPageSink(PageSink):
         Refuse the page if it plus the assembly reserve would not fit.
 
         The page's decoded size is computed from its dimensions and band
-        count, which is an upper bound on the PNG because the PNG is
-        compressed.
+        count.  It estimates the PNG rather than bounding it: compression
+        usually shrinks a page, but an incompressible one can come out larger
+        (a measured 26,121,019-byte PNG from 26,099,520 raw bytes).
 
         Args:
             image: The page about to be written, already in the mode it will

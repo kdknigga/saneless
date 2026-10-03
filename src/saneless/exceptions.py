@@ -184,8 +184,10 @@ class PdfError(SanelessError):
     """
     The scanned pages could not be assembled into a PDF.
 
-    A sibling of ``ScanError`` rather than a subclass, so a full disk or an
-    image the PDF writer rejects is never recorded as a scanner failure.
+    A sibling of ``ScanError`` rather than a subclass, so an image the PDF
+    writer rejects is never recorded as a scanner failure.  A full disk during
+    assembly is a ``DiskSpaceError`` instead, which is not a ``ScanError``
+    either.
     """
 
 

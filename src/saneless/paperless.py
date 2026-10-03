@@ -367,8 +367,9 @@ def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
     Say whether a failed task was paperless-ngx refusing a duplicate document.
 
     The shapes differ by version: API v9 says ``Not consuming: It is a
-    duplicate of document #N``, paperless-ngx 2.x says ``... It is a Duplicate
-    of <title> (#id).``, and API v10 carries only ``result_data`` =
+    duplicate of document #N``, paperless-ngx 2.0 to 2.20.15 says ``... It is
+    a duplicate of <title> (#id).`` (matched ignoring case, so a capitalised
+    ``Duplicate`` counts too), and API v10 carries only ``result_data`` =
     ``{"duplicate_of": N, "duplicate_in_trash": bool}`` with no message at all.
 
     A duplicate refusal is not a failure: paperless-ngx already holds the
@@ -2145,7 +2146,7 @@ class PaperlessClient:
         self, *, timeout: httpx2.Timeout | None = None
     ) -> ConnectionProbe:
         """
-        Probe paperless-ngx and report which of eight outcomes occurred.
+        Probe paperless-ngx and report which ``ConnectionStatus`` occurred.
 
         CONNECTED means a 2xx and nothing else.  A 404 says the API is not
         where the configured URL points -- a different thing to fix than a

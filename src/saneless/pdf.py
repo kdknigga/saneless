@@ -88,10 +88,10 @@ def sanitise_title_for_filename(title: str) -> str:
     form body or a ``saneless scan --title`` argument and its result is joined
     onto ``consume_dir`` and ``<data_dir>/failed/``.
 
-    ``auto_profiles._slugify`` is **not** reused for this, and must not be: it
-    is two ``str.replace`` calls that pass ``/``, ``..`` and every control
-    character straight through.  Its input is a trusted SANE source name, not
-    operator input, so it is correct for its own job and unsafe for this one.
+    ``auto_profiles._slugify`` is **not** reused for this, and must not be.  It
+    is a strict ``[^a-z0-9]+`` substitution too, but it has no length cap and
+    turns an empty result into a placeholder name: right for a profile name
+    built from a network device's untrusted strings, wrong for this one.
 
     The 60-character cap keeps the whole composed name (see
     :func:`build_pdf_filename`, whose other segments are fixed width or
@@ -252,10 +252,10 @@ def assemble_pdf(
     sentence true end to end, and ``outputstream=`` on its own does not.
 
     The accepted cost is the GIL. ``pikepdf.Job.run()`` holds it for roughly
-    12 ms per page, so a 500-page job stalls its thread for about 6 s during
-    assembly. That thread is the worker's, already blocked for the whole scan,
-    so the visible effect is one briefly frozen status poll -- and the
-    alternative is gigabytes of resident memory.
+    12 ms per page, so a 500-page job stalls every Python thread in the
+    process for about 6 s during assembly: web requests and the health
+    endpoint wait, not only the job's own thread. The alternative is gigabytes
+    of resident memory.
 
     **The document describes itself.** Its ``/Info`` dictionary carries
     ``/Title`` (the ``title`` given, which is also the title the document is

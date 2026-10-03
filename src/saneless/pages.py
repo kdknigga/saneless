@@ -231,8 +231,10 @@ def allow_large_scans() -> None:
     A 600 dpi A4 colour page is about 34.8M pixels and a 1200 dpi one about
     139M, over Pillow's default limit of about 89.5M.  Pages arrive from
     python-sane through ``Image.frombuffer``, which does not check the limit,
-    but img2pdf re-opens every spooled page with ``Image.open``, which does,
-    so without this a high-dpi scan would fail at PDF assembly.
+    but img2pdf re-opens every spooled page with ``Image.open``, which does.
+    Pillow warns above its limit and refuses a page above twice it, about
+    179M pixels.  Raised to 200M, the 1200 dpi page opens without a
+    ``DecompressionBombWarning``, and only a page over 400M pixels is refused.
 
     The limit is process-wide, so it is set here, once, by the entry point
     at start-up, rather than as a side effect of importing a module.
@@ -255,8 +257,11 @@ def filter_blank_pages(
     removed page is simply not referenced by the result, and nothing here
     unlinks it or copies it anywhere.  It goes when the job's workspace does.
     The surviving records keep their relative order, and their ``sequence``
-    values keep the gaps the removals left -- those numbers name the sheet
-    the device fed within its pass.
+    values keep the gaps the removals left.  A sequence is the page's place
+    among the pages spooled in its pass, so it matches the fed sheet only on
+    a one-sided pass with no rejected sheet before it: a rejected sheet is
+    not counted, a two-sided device spools two pages a sheet, and manual
+    duplex's pass B runs from the last sheet back.
 
     What was removed is reported by **position** instead: the page's 1-based
     place in ``pages``, which is the scanned document in order -- for manual
