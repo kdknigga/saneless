@@ -34,7 +34,7 @@ from pathlib import Path
 
 from packaging.version import Version
 
-from saneless.config import config_search_paths
+from tests.conftest import real_config_search_paths
 from tests.workflow_support import (
     WORKFLOW_DIR,
     job_block,
@@ -332,8 +332,13 @@ def _attestation_caveat_offences(section: str, declared: str) -> list[str]:
 
 
 def _config_target() -> str:
-    """Return the system config directory, the last place the loader searches."""
-    return config_search_paths()[-1].parent.as_posix()
+    """
+    Return the system config directory, the last place the loader searches.
+
+    Read through the search captured before any fixture replaces it: the
+    autouse environment fixture points the live one at a temp directory.
+    """
+    return real_config_search_paths()[-1].parent.as_posix()
 
 
 def _data_target() -> str:
@@ -528,8 +533,23 @@ def test_every_compose_example_declares_the_volumes_it_mounts() -> None:
 
 
 def test_every_whole_service_example_mounts_the_data_volume() -> None:
-    """Each docker.md example mounting the config mounts the data volume too."""
+    """
+    Each docker.md example mounting the config mounts the data volume too.
+
+    At least one example must mount the config, or the check has nothing to
+    hold to the rule and passes on nothing.
+    """
     page = DOCKER_REFERENCE.read_text(encoding="utf-8")
+    target = _config_target()
+    mounting = [
+        start
+        for start, block in _compose_blocks(page)
+        if any(
+            mount is not None and mount.group("target").rstrip("/") == target
+            for mount in map(_MOUNT.match, block)
+        )
+    ]
+    assert mounting, f"no docker.md compose example mounts {target}"
     offences = _data_volume_offences(page)
     assert not offences, "\n".join(offences)
 
