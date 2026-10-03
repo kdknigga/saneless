@@ -107,6 +107,9 @@ The one place the live column list is spelled.  Every ``SELECT`` and every
 this tuple, so a column cannot be added to one statement and forgotten in
 another -- which is exactly how the ``thumbnail`` column came to exist in
 ``CREATE TABLE`` while no statement that needed it ever learned about it.
+
+The statements below interpolate identifiers only from this tuple; every value
+they carry is a bound ``?`` parameter.
 """
 
 _COLUMN_LIST = ", ".join(_COLUMNS)
@@ -133,10 +136,8 @@ partition.  ``ACTIVE_STATES`` and ``TERMINAL_STATES`` partition ``JobState``, so
 what this tuple excludes is exactly the completed jobs.
 
 ``sorted()`` because ``ACTIVE_STATES`` is a ``frozenset``: its iteration order
-varies per process with ``PYTHONHASHSEED``.  The *result* is correct either way,
-but an unsorted bind makes a failing test's parameter dump irreproducible across
-runs and makes the assembled SQL text vary between processes, which defeats
-``sqlite3``'s statement cache.
+varies per process with ``PYTHONHASHSEED``.  The *result* is correct either way;
+sorting makes a failing test's parameter dump reproducible across runs.
 """
 
 _ACTIVE_MARKS = ", ".join("?" for _ in _ACTIVE_STATE_VALUES)
@@ -148,43 +149,7 @@ cannot fall out of step.  Only the *length* of the tuple reaches the SQL text;
 every value is a bound parameter.
 """
 
-_SELECT_JOBS = "SELECT"
-"""The ``SELECT`` verb, held under a name rather than written into a statement.
-
-Interpolating a column list is unavoidable -- SQL cannot parameterise an
-identifier -- and here it is safe: the only interpolated values are
-``_COLUMN_LIST`` and ``_PLACEHOLDERS``, both derived at import from the
-module-level ``_COLUMNS`` tuple literal, which no caller-supplied value can
-reach.  Every runtime value is a bound ``?`` parameter.  Holding the verb
-under a name is also what lets the statements below be built once at import
-instead of rebuilt on every call.
-"""
-
-_INSERT_JOBS = "INSERT INTO jobs"
-"""The ``INSERT`` verb and its target table, held under a name.
-
-The safety argument is ``_SELECT_JOBS``'s: the only interpolated values are
-``_COLUMN_LIST`` and ``_PLACEHOLDERS``, both module-level derivations that no
-caller can influence.
-"""
-
-_UPDATE_JOBS = "UPDATE jobs"
-"""The ``UPDATE`` verb and its target table, held under a name.
-
-Declared here so every statement in this module is assembled the same way, and
-consumed by ``_FAIL_ACTIVE``, ``_FAIL_UPLOADING`` and ``_FAIL_RECOVERED`` below.
-Its safety argument is ``_SELECT_JOBS``'s.
-"""
-
-_DELETE_JOBS = "DELETE FROM jobs"
-"""The ``DELETE`` verb and its target table, held under a name.
-
-Declared for the same reason as ``_UPDATE_JOBS``, and consumed by
-``_DELETE_BY_ID`` and ``_PRUNE`` below.  Its safety argument is
-``_SELECT_JOBS``'s.
-"""
-
-_SELECT_ALL = f"{_SELECT_JOBS} {_COLUMN_LIST} FROM jobs"
+_SELECT_ALL = f"SELECT {_COLUMN_LIST} FROM jobs"
 """Read every column of every job, in ``_COLUMNS`` order."""
 
 _SELECT_BY_ID = f"{_SELECT_ALL} WHERE id = ?"
@@ -212,8 +177,7 @@ _LIST_PENDING = f"{_SELECT_ALL} WHERE state = ? ORDER BY created_at ASC"
 Ascending, the opposite of ``_SELECT_RECENT``: history reads newest-first, a
 queue reads oldest-first.  One bound parameter, the state value, which is
 ``JobState.PENDING.value`` at the only call site -- the literal string is never
-written into the statement text.  Its safety argument is ``_SELECT_JOBS``'s: the
-only interpolated value is the module-level ``_SELECT_ALL``.
+written into the statement text.
 
 Like ``_PRUNE``'s, the ``ORDER BY`` is lexicographic over ``created_at``'s
 ISO-8601 strings and is correct only because every writer stamps UTC.
@@ -231,35 +195,24 @@ Neither is ever written into the statement text.
 is NULL and would drop the row, while ``NULL IS NOT 'X'`` is true.  Every job
 that has not failed, and every job ``fail_active_jobs`` failed on restart before
 its upload, has no category, so ``!=`` would silently hide exactly the jobs this
-query exists to return.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated value
-is the module-level ``_SELECT_ALL``, and the category is bound.
+query exists to return.
 
 Like ``_SELECT_RECENT``'s, the ``ORDER BY`` is lexicographic over
 ``created_at``'s ISO-8601 strings and is correct only because every writer
 stamps UTC.
 """
 
-_COUNT_JOBS = f"{_SELECT_JOBS} COUNT(*) FROM jobs"
-"""Count every job -- the read half of ``JobStore.probe``.
+_COUNT_JOBS = "SELECT COUNT(*) FROM jobs"
+"""Count every job -- the read half of ``JobStore.probe``.  No parameters."""
 
-No parameters.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated
-value is that module-level literal.
-"""
-
-_INSERT = f"{_INSERT_JOBS} ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS})"
+_INSERT = f"INSERT INTO jobs ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS})"
 """Write one job, naming every column so physical column order never matters."""
 
-_FAIL_ACTIVE = (
-    f"{_UPDATE_JOBS} SET state = ?, error = ? WHERE state IN ({_ACTIVE_MARKS})"
-)
+_FAIL_ACTIVE = f"UPDATE jobs SET state = ?, error = ? WHERE state IN ({_ACTIVE_MARKS})"
 """Move every still-in-flight job to a failed state with a given error text.
 
 Bound parameters, in this order: the target state value, the error text, then one
-per entry of ``_ACTIVE_STATE_VALUES``.  Its safety argument is
-``_SELECT_JOBS``'s, extended one step: the only interpolated values are the
-module-level ``_UPDATE_JOBS`` literal and a run of ``?`` characters whose LENGTH
-comes from a module-level tuple.  Every runtime value -- the target state, the
-caller-supplied reason, each active-state value -- is a bound parameter.
+per entry of ``_ACTIVE_STATE_VALUES``.
 
 ``json_each(?)`` would make the statement fully static and was verified to work
 here, but JSON1 was a compile-time option before SQLite 3.38, so it would add a
@@ -267,27 +220,24 @@ soft dependency on an extension this module otherwise does not need.
 """
 
 _FAIL_UPLOADING = (
-    f"{_UPDATE_JOBS} SET state = ?, error = ?, error_category = ? WHERE state = ?"
+    "UPDATE jobs SET state = ?, error = ?, error_category = ? WHERE state = ?"
 )
 """Move every job still uploading to a failed state, with a text and a category.
 
 Run before ``_FAIL_ACTIVE``, because an uploading job may already be in
 paperless-ngx and so gets a text and a category of its own.  Bound parameters,
 in this order: the target state value, the error text, the category value, then
-``JobState.UPLOADING.value``.  Its safety argument is ``_FAIL_ACTIVE``'s, and
-simpler: the only interpolated value is the module-level ``_UPDATE_JOBS``
-literal.  Every runtime value is a bound parameter.
+``JobState.UPLOADING.value``.
 """
 
-_SELECT_STATE_BY_ID = f"{_SELECT_JOBS} state FROM jobs WHERE id = ?"
+_SELECT_STATE_BY_ID = "SELECT state FROM jobs WHERE id = ?"
 """Read one job's state by its primary key, for ``fail_recovered_jobs``.
 
-One bound parameter, the job id.  Its safety argument is ``_SELECT_JOBS``'s:
-the only interpolated value is that module-level literal.
+One bound parameter, the job id.
 """
 
 _FAIL_RECOVERED = (
-    f"{_UPDATE_JOBS} SET state = ?, error = ?, error_category = ? "
+    "UPDATE jobs SET state = ?, error = ?, error_category = ? "
     "WHERE id = ? AND state = ?"
 )
 """Move one named job to a failed state with its own text and category.
@@ -295,23 +245,16 @@ _FAIL_RECOVERED = (
 The sibling of ``_FAIL_UPLOADING`` for one named row.  Bound parameters, in
 this order: the target state value, the error text, the category value (or
 NULL), the job id, then the state the row was read in.  Matching that state
-means the write lands only on the row the text was composed for.  Its safety
-argument is ``_FAIL_UPLOADING``'s: the only interpolated value is the
-module-level ``_UPDATE_JOBS`` literal.  The id and the text -- which quotes a
-title read back from a workspace on disk -- are bound, never written into the
-statement.
+means the write lands only on the row the text was composed for.  The id and
+the text -- which quotes a title read back from a workspace on disk -- are
+bound, never written into the statement.
 """
 
-_DELETE_BY_ID = f"{_DELETE_JOBS} WHERE id = ?"
-"""Delete a single job by its primary key.
-
-One bound parameter, the job id.  Its safety argument is ``_SELECT_JOBS``'s: the
-only interpolated value is the module-level ``_DELETE_JOBS`` literal.
-"""
+_DELETE_BY_ID = "DELETE FROM jobs WHERE id = ?"
+"""Delete a single job by its primary key.  One bound parameter, the job id."""
 
 _NEWEST_RUN_IDS = (
-    f"{_SELECT_JOBS} id FROM jobs WHERE error_category IS NOT ? "
-    "ORDER BY created_at DESC LIMIT ?"
+    "SELECT id FROM jobs WHERE error_category IS NOT ? ORDER BY created_at DESC LIMIT ?"
 )
 """The ids of the newest jobs that were not refused at submit, up to a limit.
 
@@ -320,23 +263,17 @@ _NEWEST_RUN_IDS = (
 ``!=`` for the reason ``_SELECT_LATEST_RUN`` gives: ``NULL != 'X'`` is NULL, so
 ``!=`` would leave out every job with no category -- nearly every run -- and
 those jobs would then never count toward the cap.
-
-Held apart from ``_PRUNE`` for the same reason ``_SELECT_JOBS`` holds the verb:
-``S608`` matches ``select ... from`` anywhere in an interpolated string's
-literal text, not only at its start, so a nested ``SELECT`` written inline would
-trip it -- and a lint suppression is not available to silence it.  Behind a
-name, both halves are ordinary constants and the rule has nothing to flag.
 """
 
 _NEWEST_REJECTED_IDS = (
-    f"{_SELECT_JOBS} id FROM jobs WHERE error_category = ? ORDER BY rowid DESC LIMIT ?"
+    "SELECT id FROM jobs WHERE error_category = ? ORDER BY rowid DESC LIMIT ?"
 )
 """The ids of the most recently written refused submits, up to a limit.
 
 The subquery ``_PRUNE`` and ``_TRIM_REJECTED`` share.  Two bound parameters, in
 this order: ``ErrorCategory.REJECTED.value`` and ``REJECTED_HISTORY_ROWS``.
 Plain ``=`` is right here, because it is meant to leave out every NULL
-category.  Named apart for the ``S608`` reason ``_NEWEST_RUN_IDS`` gives.
+category.
 
 Ordered by ``rowid``, which is insertion order, and not by ``created_at``.
 ``_TRIM_REJECTED`` runs in the transaction that wrote a refused row, and the
@@ -346,21 +283,19 @@ kept, and an order by time would delete the row just written.
 """
 
 _TRIM_REJECTED = (
-    f"{_DELETE_JOBS} WHERE error_category = ? AND id NOT IN ({_NEWEST_REJECTED_IDS})"
+    f"DELETE FROM jobs WHERE error_category = ? AND id NOT IN ({_NEWEST_REJECTED_IDS})"
 )
 """Delete every refused submit outside the newest ``REJECTED_HISTORY_ROWS``.
 
 Three bound parameters, in this order: ``ErrorCategory.REJECTED.value``, then
 ``ErrorCategory.REJECTED.value`` and ``REJECTED_HISTORY_ROWS`` for the
-subquery.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated
-values are the module-level ``_DELETE_JOBS`` literal and the module-level
-subquery, and every runtime value is bound.  It runs in the same transaction
+subquery.  It runs in the same transaction
 as the write that recorded a refusal, so once that write commits the table
 never holds more refused rows than the cap.
 """
 
 _PRUNE = (
-    f"{_DELETE_JOBS} WHERE created_at < ? "
+    "DELETE FROM jobs WHERE created_at < ? "
     f"OR (error_category IS NOT ? AND id NOT IN ({_NEWEST_RUN_IDS})) "
     f"OR (error_category = ? AND id NOT IN ({_NEWEST_REJECTED_IDS}))"
 )
@@ -376,9 +311,6 @@ the NULL-safety reason ``_NEWEST_RUN_IDS`` gives.
 Seven bound parameters, in this order: the ISO-8601 cutoff; for the run half,
 ``ErrorCategory.REJECTED.value`` twice and the run-row cap; for the refused
 half, ``ErrorCategory.REJECTED.value`` twice and ``REJECTED_HISTORY_ROWS``.
-Its safety argument is ``_SELECT_JOBS``'s -- the only interpolated values are
-the module-level ``_DELETE_JOBS`` literal and the two module-level subqueries,
-and every runtime value is a bound ``?``.
 
 **Every comparison is lexicographic over strings.**  ``created_at`` is written
 as ``datetime.now(tz=UTC).isoformat()``, so every value ends ``+00:00``, and the

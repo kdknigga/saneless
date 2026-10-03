@@ -217,6 +217,8 @@ exclude = [".planning/**/*.md"]
 ]
 "src/saneless/__init__.py" = ["PLC0415"]
 "src/saneless/config.py" = ["S104"]
+# identifiers come from the module's column tuple; every value is a bound parameter
+"src/saneless/job.py" = ["S608"]
 
 # Deliberately empty: its presence is the setting.  ty skips any
 # pyproject.toml without a `[tool.ty]` table and keeps searching parent
