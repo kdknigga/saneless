@@ -106,6 +106,35 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def pytest_configure() -> None:
+    """
+    Block SIGPIPE for the whole run, the way ``saneless.main()`` runs.
+
+    It also loads the C library's thread unwinder, the next thing
+    ``saneless.main()`` does, for the reason given at the call below.
+
+    The suite drives libsane in this very process, as the shipped program
+    does, and libsane puts SIGPIPE back to its default action after a read
+    that ends with an error status.  ``saneless.main()`` blocks the signal
+    before anything else, but pytest never calls it, so without this a later
+    test's write to a closed socket would kill the whole run.
+
+    A hook rather than a session fixture, so it runs before any test starts:
+    the mask belongs to a thread and is copied to the threads it starts, and
+    pytest-timeout's thread method starts a timer thread for each test before
+    that test's fixtures are set up.  The check below makes a late call fail
+    loudly instead of leaving some threads unprotected.
+    """
+    assert threading.current_thread() is threading.main_thread()
+    assert threading.active_count() == 1, threading.enumerate()
+    block_sigpipe()
+    # And the unwinder is loaded up front, as ``saneless.main()`` loads it
+    # next: otherwise the first libsane reader thread to end loads it, and a
+    # cancel landing in that load leaves the loader's lock held, which hangs
+    # the run in its exit handlers after the last test has passed.
+    load_thread_unwinder()
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
@@ -189,35 +218,6 @@ def _config_file_stamp(path: Path) -> tuple[int, int] | None:
     except FileNotFoundError:
         return None
     return status.st_mtime_ns, status.st_size
-
-
-@pytest.fixture(autouse=True, scope="session")
-def _sigpipe_blocked_like_saneless() -> None:
-    """
-    Run the suite with SIGPIPE blocked, the way ``saneless.main()`` runs.
-
-    It also loads the C library's thread unwinder, the next thing
-    ``saneless.main()`` does, for the reason given at the call below.
-
-    The suite drives libsane in this very process, as the shipped program
-    does, and libsane puts SIGPIPE back to its default action after a read
-    that ends with an error status.  ``saneless.main()`` blocks the signal
-    before anything else, but pytest never calls it, so without this a later
-    test's write to a closed socket would kill the whole run.
-
-    Defined first among the session fixtures, so it runs before any test or
-    fixture starts a thread: the mask belongs to a thread and is copied to
-    the threads it starts.  The check below makes a late call fail loudly
-    instead of leaving some threads unprotected.
-    """
-    assert threading.current_thread() is threading.main_thread()
-    assert threading.active_count() == 1, threading.enumerate()
-    block_sigpipe()
-    # And the unwinder is loaded up front, as ``saneless.main()`` loads it
-    # next: otherwise the first libsane reader thread to end loads it, and a
-    # cancel landing in that load leaves the loader's lock held, which hangs
-    # the run in its exit handlers after the last test has passed.
-    load_thread_unwinder()
 
 
 @pytest.fixture(autouse=True, scope="session")
