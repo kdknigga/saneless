@@ -119,6 +119,7 @@ from .vocabulary import (
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
     UNKNOWN_PROFILE_NEXT_STEP,
+    UNSET_CREDENTIAL_CLAUSE,
     WARNED_UPLOAD_LABEL,
     CheckSurface,
     ConfigFileState,
@@ -266,17 +267,10 @@ _FLIP_PROMPT = (
     "Flip the stack over and load it back into the feeder. Scan the back sides?"
 )
 
-# Why `scan` refuses when nobody configured paperless-ngx. A developer
-# constant: it names the problem and never the value, the URL or the config
-# path. Lower-cased and without a full stop because it is the tail of the CLI's
-# `<what saneless was doing>: <problem>` error line, unlike checks.py's
-# sentence for the same fact, which stands alone in a table row.
-#
-# The name carries no password-ish word on purpose: ruff's S105 reads the
-# *name* of the target, not the value, so `_TOKEN_...` here would be flagged as
-# a hardcoded credential. This is vocabulary.py's `_REJECTED_WIRE_VALUE` idiom
-# rather than a suppression.
-_UNSET_CREDENTIAL_PROBLEM = "the paperless-ngx API token has not been set"
+# Why `scan` refuses when nobody configured paperless-ngx: the tail of the CLI's
+# `<what saneless was doing>: <problem>` error line, which names the problem and
+# never the value, the URL or the config path.
+_UNSET_CREDENTIAL_PROBLEM = UNSET_CREDENTIAL_CLAUSE
 # The same refusal for an empty paperless.url, which names the setting.
 _UNSET_ADDRESS_PROBLEM = "the paperless-ngx address in paperless.url has not been set"
 

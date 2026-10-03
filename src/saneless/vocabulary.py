@@ -91,6 +91,7 @@ __all__ = [
     "UNCONFIRMED_FILING_LABEL",
     "UNCONFIRMED_SEND_LABEL",
     "UNKNOWN_PROFILE_NEXT_STEP",
+    "UNSET_CREDENTIAL_CLAUSE",
     "URL_UNSET_JOB_ERROR",
     "WAITING_STATES",
     "WARNED_UPLOAD_LABEL",
@@ -178,6 +179,7 @@ __all__ = [
     "scan_button_label",
     "scan_hold_reason",
     "scan_page_description",
+    "sentence_case",
     "sixteen_bit_error",
     "source_not_offered_error",
     "stale_default_correspondent_label",
@@ -394,7 +396,7 @@ class ConfigFileState(StrEnum):
     that file, and a fresh stat cannot reproduce it -- a file created, renamed
     or deleted since startup would make a re-probe describe a program that is
     not running.  Mixing a recorded "loaded" with a freshly probed "stale"
-    would also produce combinations none of these five members describe.
+    would also produce combinations no ``ConfigFileState`` member describes.
     Every surface that reports configuration -- the startup log, the status
     strip, ``saneless doctor`` and the one-shot commands -- reads the one
     recording, so they cannot disagree about the same appliance.
@@ -530,7 +532,7 @@ class FlipOutcome(StrEnum):
     """
     How a manual-duplex flip wait resolved.
 
-    The four members are exhaustive over the ways that wait can end: the
+    The members are exhaustive over the ways that wait can end: the
     operator turned the stack and said so, the operator gave up, the clock
     ran out first, or saneless is stopping.  The last is not the operator's
     decision, so unlike giving up it keeps the pages already scanned: the
@@ -573,10 +575,10 @@ class PassAnswer(StrEnum):
     """
     How a multi-page wait resolved.
 
-    The eight members are exhaustive over the ways any of the three
-    multi-page questions can end.  Six are the operator's answers: scan
-    another pass, scan the last pass again, finish the document, abort it,
-    and -- for pages that look blank -- skip or keep them.  ``TIMED_OUT`` is
+    The members are exhaustive over the ways any of the multi-page questions
+    can end.  Most are the operator's answers: scan another pass, scan the
+    last pass again, finish the document, abort it, and -- for pages that
+    look blank -- skip or keep them.  ``TIMED_OUT`` is
     the clock running out first.  ``INTERRUPTED`` is saneless stopping; as
     with ``FlipOutcome.INTERRUPTED`` it is not the operator's decision, so it
     keeps the pages already scanned rather than discarding them.  Which of the
@@ -584,7 +586,7 @@ class PassAnswer(StrEnum):
     ``PassPrompt.offered``, not by this enum.
 
     This is a sibling of ``FlipOutcome`` and deliberately not a widening of
-    it.  The flip wait's four outcomes, and what each of them means, must not
+    it.  The flip wait's outcomes, and what each of them means, must not
     change because a second kind of wait exists: every ``match`` over
     ``FlipOutcome`` would otherwise gain arms that can never be reached there.
 
@@ -665,11 +667,11 @@ class ConnectionStatus(StrEnum):
     The values are lowercase snake_case and so break this module's otherwise
     uniform value-equals-name convention.  That is deliberate, not an
     oversight: ``web.routes.paperless_test`` serialises the value straight into
-    the JSON body of ``GET /api/paperless/test`` and
-    ``docs/reference/web-api.md:54-56`` documents the exact spelling of
-    ``connected``, ``token_rejected`` and ``unreachable``.  Those three strings
-    are a public wire contract and have to stay byte-identical; renaming them to
-    match the member names would silently break every existing client.
+    the JSON body of ``GET /api/paperless/test``, and the endpoint's section of
+    ``docs/reference/web-api.md`` documents the exact spelling of every value.
+    The documented values are a public wire contract and have to stay
+    byte-identical; renaming them to match the member names would silently
+    break every existing client.
 
     Only the *message* lookup below is a ``match`` with ``assert_never``.
     Deciding which member an HTTP response maps to is an ordered chain of
@@ -847,6 +849,34 @@ TITLE_MAX_LENGTH: Final = PAPERLESS_TITLE_LIMIT - max(
 # 1..MAX_PAPERLESS_ID cannot name anything and is refused where it enters.
 MAX_PAPERLESS_ID: Final = 2_147_483_647
 
+
+def sentence_case(text: str) -> str:
+    """
+    Return *text* with only its first character upper-cased.
+
+    ``str.capitalize`` would also lower-case the rest, turning "API" into
+    "api", so a clause written to sit mid-sentence is opened this way instead.
+
+    Args:
+        text: The clause to open a sentence with.
+
+    Returns:
+        The clause with its first character upper-cased and the rest as given.
+
+    """
+    return text[:1].upper() + text[1:]
+
+
+# The one wording of an unset paperless-ngx API token.  Every surface that
+# names the problem -- the job row, the greyed-out Scan button, the web
+# rejection, the paperless check and the CLI's refusal -- derives its copy from
+# this clause, so they cannot drift apart.  It is lower-case and has no full
+# stop because the CLI and the job row use it as the tail of a line; the others
+# open a sentence with it through ``sentence_case``.  The name avoids the word
+# "token" because ruff's S105 reads a string assigned to such a name as a
+# hardcoded credential, and this is copy about a token nobody set.
+UNSET_CREDENTIAL_CLAUSE: Final = "the paperless-ngx API token has not been set"
+
 # Job-row error texts.  A submit refused because the queue was full, the
 # worker was down or degraded, or the paperless-ngx API token or address was
 # never set still writes a job row, so history shows the attempt; these are that row's
@@ -854,29 +884,21 @@ MAX_PAPERLESS_ID: Final = 2_147_483_647
 QUEUE_FULL_JOB_ERROR: Final = "Not started: the scan queue was full"
 WORKER_DOWN_JOB_ERROR: Final = "Not started: the scan service was not running"
 WORKER_DEGRADED_JOB_ERROR: Final = "Not started: the scan service was unavailable"
-# The literal is named first, and the exported constant aliases it, for the
-# same reason ``_REJECTED_WIRE_VALUE`` is: ruff's S105 reads any string literal
-# assigned to a name containing "token" as a hardcoded credential.  This is
-# job-row copy *about* a token nobody set, not a token, and the exported name
-# is fixed, so the literal gets a name S105 does not flag.
-_UNSET_CREDENTIAL_JOB_ERROR = (
-    "Not started: the paperless-ngx API token has not been set"
-)
-TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
+TOKEN_UNSET_JOB_ERROR: Final = f"Not started: {UNSET_CREDENTIAL_CLAUSE}"
 URL_UNSET_JOB_ERROR: Final = "Not started: the paperless-ngx address has not been set"
 
 # Why the Scan button is greyed out, rendered as a line beneath it.  It
 # deliberately does not repeat the fix: the status strip's Paperless row, a few
 # centimetres above on the same page, already carries "Put a real API token in
-# the saneless config file, then restart saneless." as its next step.  Three
-# surfaces name the same problem in the same words; only one owns the remedy.
+# the saneless config file, then restart saneless." as its next step.  Every
+# surface names the problem in the same words; only one owns the remedy.
 #
 # Like every other string here it is a developer constant: it names the problem
 # and nothing else -- never the token value and never the paperless-ngx URL,
-# which says where paperless-ngx runs (ASVS V7).  The em dash is the
+# which says where paperless-ngx runs (ASVS 4.0.3 V7.4).  The em dash is the
 # same one ``web/routes.py``'s paused-checks prefix already uses.
 SCAN_BLOCKED_REASON: Final = (
-    "The paperless-ngx API token has not been set — see System status above."
+    f"{sentence_case(UNSET_CREDENTIAL_CLAUSE)} — see System status above."
 )
 # The same line when the token is set but ``paperless.url`` is empty.
 SCAN_BLOCKED_URL_REASON: Final = (
@@ -1804,16 +1826,15 @@ def busy_line(
        known, so the count leads the progress prose.
     3. The job is scanning a later pass of a multi-page document that already
        holds at least one page, so the kept count leads the progress prose.
-       With no page kept yet the first pass reads exactly as before.
-    4. Otherwise the progress prose alone, exactly as before.
+       With no page kept yet, the first pass falls through to the next rule.
+    4. Otherwise the progress prose alone.
 
     ``(0 ahead of you)`` is never produced.  It is technically true and reads
     like a bug, so the last job in the queue is told it is ``next in line``.
 
-    The trailing phrase in branch 2 is ``progress_label(SCANNING_REVERSE)`` --
-    master-pinned copy with its own tests -- and not the history table's
-    ``state_label``, which is a different owner with a different string.  The
-    choice is deliberate.
+    The trailing phrase in branch 2 is ``progress_label(SCANNING_REVERSE)``,
+    which has its own tests, and not the history table's ``state_label``, which
+    is a different owner with a different string.
 
     ``queue_title`` is the only user data any string here carries.  It is
     returned as plain text, escaped by Jinja's autoescape at render time, and
@@ -1967,11 +1988,11 @@ def local_time(value: datetime) -> str:
     back from the isoformat string), so a naive value reaching here is a bug in
     the caller, not a case to guess at.
 
-    ``astimezone()`` is called with no argument, so the zone is the process's
-    own whatever zone the value carries.  That makes ``TZ`` load-bearing: a
-    container reports UTC unless it is set, which does name a zone and helps
-    nobody.  No ``zoneinfo`` import and no new config key is
-    involved -- the operator's ``TZ`` is the single source.
+    ``astimezone()`` with no argument converts to the process's local zone, so
+    ``TZ`` decides it, regardless of the zone the value arrived in.  That makes
+    ``TZ`` load-bearing: a container reports UTC unless it is set, which does
+    name a zone and helps nobody.  No ``zoneinfo`` import and no new config key
+    is involved -- the operator's ``TZ`` is the single source.
 
     ``%Z`` renders as the empty string when the platform reports no zone
     abbreviation, which leaves the separator before it dangling at the end of
@@ -3765,7 +3786,7 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
 
     Every string is a developer-authored constant.  None of them interpolates
     exception text, request input, a URL, a token or a filesystem path, so
-    nothing internal can reach a screen through this path (ASVS V7).  None
+    nothing internal can reach a screen through this path (ASVS 4.0.3 V7.4).  None
     carries a number either, except the paperless-ngx release and API
     versions saneless supports, which are facts about saneless rather than
     about the job.
@@ -4077,25 +4098,25 @@ def _reload_page_message(
     """
     Return the message for a rejection whose remedy is "reload the page".
 
-    These four are one group, not four unrelated arms: each names a different
-    thing the browser got wrong and all four end in the same sentence, because
+    These are one group, not unrelated arms: each names a different thing the
+    browser got wrong and every one ends in the same sentence, because
     reloading is the only thing a reader can usefully do about any of them.
-    Grouping them keeps ``rejection_message`` readable as the twelfth member
-    joins it.
+    Grouping them keeps ``rejection_message`` readable as ``RequestRejection``
+    grows.
 
-    The parameter is typed as the four members this arm can pass, so the
+    The parameter is typed as the members this arm can pass, so the
     ``assert_never`` below still fails the type gate if the group ever grows,
     and ``rejection_message``'s own ``assert_never`` still fails it if
     ``RequestRejection`` grows.
 
     Args:
-        rejection: One of the four reload-remedy rejections.
+        rejection: One of the reload-remedy rejections.
 
     Returns:
         The approved sentence for that rejection.
 
     Raises:
-        AssertionError: If the value is outside the four-member group.
+        AssertionError: If the value is outside the reload-remedy group.
 
     """
     match rejection:
@@ -4126,30 +4147,30 @@ def _config_file_message(
     """
     Return the message for a rejection whose remedy is an edit to the config file.
 
-    These three are one group: each names the one setting to change and ends
+    These are one group: each names the one setting to change and ends
     in the same instruction, because saneless reads its config file only at
     start-up.  Each names the setting and never a value -- not the token, not
     the paperless-ngx URL (which says where paperless-ngx runs), and not the
     refused Host, which is shown beside the sentence, neutralised and bounded
-    (ASVS V7).
+    (ASVS 4.0.3 V7.4).
 
-    The parameter is typed as the three members this arm can pass, so the
+    The parameter is typed as the members this arm can pass, so the
     ``assert_never`` below still fails the type gate if the group ever grows.
 
     Args:
-        rejection: One of the three config-file rejections.
+        rejection: One of the config-file rejections.
 
     Returns:
         The approved sentence for that rejection.
 
     Raises:
-        AssertionError: If the value is outside the three-member group.
+        AssertionError: If the value is outside the config-file group.
 
     """
     match rejection:
         case RequestRejection.TOKEN_UNSET:
             message = (
-                "The paperless-ngx API token has not been set, so the scan was "
+                f"{sentence_case(UNSET_CREDENTIAL_CLAUSE)}, so the scan was "
                 "not started. Put a real API token in the saneless config "
                 "file, then restart saneless."
             )

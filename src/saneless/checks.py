@@ -77,10 +77,12 @@ from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
     RETRY_PLACEHOLDER,
     RETRY_SENTENCE_PLACEHOLDER,
+    UNSET_CREDENTIAL_CLAUSE,
     ConfigFileState,
     ConnectionStatus,
     ProfileStorage,
     connection_status_message,
+    sentence_case,
 )
 
 if TYPE_CHECKING:
@@ -3343,7 +3345,7 @@ def _check_paperless(context: CheckContext) -> CheckResult:
         return CheckResult(
             key=CheckKey.PAPERLESS,
             state=CheckState.FAIL,
-            message="The paperless-ngx API token has not been set.",
+            message=f"{sentence_case(UNSET_CREDENTIAL_CLAUSE)}.",
             next_step=(
                 "Put a real API token in the saneless config file, "
                 "then restart saneless."
