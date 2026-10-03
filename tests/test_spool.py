@@ -1,4 +1,4 @@
-"""Tests for the page-record contract and the page spool (HARD-01, M-08)."""
+"""The page-record contract and the spool that writes each page to disk."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ def _inked_page(size: tuple[int, int] = (200, 300)) -> Image.Image:
 
 
 class TestPageRecordContract:
-    """The frozen record of facts a spooled page yields (D-02)."""
+    """The frozen record of facts a spooled page yields."""
 
     def test_fields_are_exactly_the_contract(self) -> None:
         """PageRecord carries the seven agreed fields, in the agreed order."""
@@ -64,7 +64,7 @@ class TestPageRecordContract:
         ]
 
     def test_carries_no_verdict_field(self) -> None:
-        """No is_blank/is_empty flag: verdicts belong to the pipeline (D-02)."""
+        """No is_blank/is_empty flag: verdicts belong to the pipeline."""
         names = {field.name for field in dataclasses.fields(PageRecord)}
         assert "is_blank" not in names
         assert "is_empty" not in names
@@ -88,7 +88,7 @@ class TestPageRecordContract:
             setattr(record, attribute, 2)
 
     def test_sequence_is_one_based(self) -> None:
-        """The first page's sequence is 1, not 0 (D-02)."""
+        """The first page's sequence is 1, not 0."""
         record = PageRecord(
             sequence=1,
             path=Path("a-0001.png"),
@@ -102,7 +102,7 @@ class TestPageRecordContract:
 
 
 class TestPageSinkContract:
-    """The seam the backend hands each acquired page to (D-01)."""
+    """The seam the backend hands each acquired page to."""
 
     def test_is_abstract(self) -> None:
         """PageSink cannot be instantiated: it declares a contract only."""
@@ -141,7 +141,7 @@ class TestPageSinkContract:
 
 
 class TestSpooledPageSinkNaming:
-    """Sequence assignment and pass-distinguishable file names (D-02)."""
+    """Sequence assignment and pass-distinguishable file names."""
 
     def test_first_page_is_sequence_one(self, tmp_path: Path) -> None:
         """The first add() assigns sequence 1 and writes a-0001.png."""
@@ -228,7 +228,7 @@ class TestSpooledPageSinkMeasurement:
         assert record.ink_coverage > 0.0
 
     def test_the_record_carries_no_greyscale_statistics(self, tmp_path: Path) -> None:
-        """The mean and stddev the old rule judged are gone from the record."""
+        """The record carries no mean or stddev greyscale statistics."""
         sink = SpooledPageSink(tmp_path, "a", 10)
         record = sink.add(_inked_page(), dpi=300)
         assert not hasattr(record, "mean")
@@ -260,7 +260,7 @@ class TestSpooledPageSinkMeasurement:
 
 
 class TestSpooledPageSinkThumbnail:
-    """The first page's thumbnail fires at spool time, once (D-05)."""
+    """The first page's thumbnail fires at spool time, once."""
 
     def test_fires_once_on_the_first_page_only(self, tmp_path: Path) -> None:
         """Three pages produce exactly one thumbnail, from page 1."""
@@ -293,19 +293,13 @@ class TestSpooledPageSinkThumbnail:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        A failed thumbnail is logged, and the page and the pass carry on (WR-01).
+        A failed thumbnail is logged, and the page and the pass carry on.
 
         The web worker's callback writes to the job store, which raises
         ``sqlite3.Error`` on a locked or closed database; the page it was
         describing is a sheet that really was fed.  The thumbnail is something
         to look at, not part of the scan, so its failure is logged at WARNING
-        with the traceback and ``add`` returns the page's record as usual.
-
-        This test used to pin the opposite: the callback went unguarded, and
-        the only protection was that the record was appended before it fired.
-        The callback is now best-effort, and the record still comes first.
-        The assertion on the file, not only on the record, is the part that
-        matters: what is being pinned is that the two agree.
+        with the traceback, and the record and the file on disk still agree.
         """
         thumbnails: list[str] = []
 
@@ -337,7 +331,7 @@ class TestSpooledPageSinkThumbnail:
 
 
 class TestSpooledPageSinkFailures:
-    """No raw OSError escapes, and a shortfall names the page (D-07)."""
+    """No raw OSError escapes, and a shortfall names the page."""
 
     def test_disk_shortfall_raises_disk_space_error_naming_the_page(
         self, tmp_path: Path
@@ -381,18 +375,10 @@ class TestSpooledPageSinkFailures:
         """
         A spool directory that has gone is a disk fault, not a scanner one.
 
-        ``add``'s docstring promises "no raw OSError escapes this method"
-        (D-07), and ``_write`` honoured it while ``_check_room_for`` did not:
         ``shutil.disk_usage`` on a directory whose mount went away raises
-        ``FileNotFoundError``.  Untranslated it escaped past
-        ``_acquire_pages``' ``except ScanError`` ladder into its generic
-        handler, where it came back as "Scanner error on page N" -- blaming
-        the scanner for a disk fault -- and on the flatbed path it escaped
-        untranslated altogether (WR-11).
-
-        The directory is removed after the sink is built, so the failure is
-        the one production sees: a spool that existed when the scan started
-        and did not when the page arrived.
+        ``FileNotFoundError``; ``add`` turns it into a chained ``ScanError``
+        naming the page.  The directory is removed after the sink is built: a
+        spool that existed when the scan started and not when the page arrived.
         """
         spool = tmp_path / "spool"
         spool.mkdir()
