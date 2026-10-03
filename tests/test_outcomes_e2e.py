@@ -103,7 +103,7 @@ from saneless.vocabulary import (
     timeout_finish_warning,
 )
 from saneless.worker import ScanOptions, ScanWorker
-from tests.conftest import poll_until, spooling_in_turn
+from tests.conftest import poll_until, spooling_in_turn, wait_for_state
 from tests.fake_clock import FakeClock
 from tests.golden_support import (
     DistinctPageScanner,
@@ -975,7 +975,6 @@ class TestFiveOutcomesEndToEnd:
         self,
         case: _Case,
         tmp_path: Path,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Drive one scan end to end and assert the row it left behind."""
         settings = _build_settings(tmp_path, case)
@@ -1044,7 +1043,6 @@ class TestAPartialScanSurvivesTheWorker:
     def test_partial_scan_preserved_is_recorded_on_the_job_row(
         self,
         tmp_path: Path,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Three sheets fed, a jam on the fourth, through the real worker."""
         case = next(case for case in _CASES if case.label == "success")
@@ -1099,7 +1097,6 @@ class TestFlipTimeoutReleasesTheWorker:
     def test_the_next_job_runs_after_a_flip_timeout(
         self,
         tmp_path: Path,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         After a timed-out flip, a second submitted job still reaches terminal.
@@ -1173,7 +1170,6 @@ _MISCONFIGURED = _Case(
 def _scan_once(
     settings: Settings,
     paperless: PaperlessClient,
-    wait_for_state: Callable[..., Job],
 ) -> Job:
     """
     Run one simplex scan through the real worker and return its finished row.
@@ -1181,7 +1177,6 @@ def _scan_once(
     Args:
         settings: The settings the worker runs under.
         paperless: The client the worker uploads with.
-        wait_for_state: The suite's wait helper, from its fixture.
 
     Returns:
         The job row, re-read once it reached a terminal state.
@@ -1218,7 +1213,6 @@ class TestClientSideMisconfigurationEndToEnd:
         self,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A token with a trailing space ends ERROR/CONFIG, token nowhere."""
         # Letters outside [0-9a-f], so no random job id in the DEBUG log can
@@ -1238,7 +1232,6 @@ class TestClientSideMisconfigurationEndToEnd:
                     consume_dir=settings.paperless.consume_dir,
                     timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
                 ),
-                wait_for_state,
             )
         assert server.hits == []
         assert clock.waits == []
@@ -1260,7 +1253,6 @@ class TestClientSideMisconfigurationEndToEnd:
         self,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """``paperless.url = ""`` is not a consume-folder setup: ERROR/CONFIG."""
         settings = _build_settings(tmp_path, _MISCONFIGURED, paperless_url="")
@@ -1275,7 +1267,6 @@ class TestClientSideMisconfigurationEndToEnd:
                     consume_dir=settings.paperless.consume_dir,
                     timing=PaperlessTiming(clock=clock.now, sleep=clock.sleep),
                 ),
-                wait_for_state,
             )
         assert clock.waits == []
         assert finished.error_category is ErrorCategory.CONFIG
@@ -1445,7 +1436,7 @@ class TestMultiPageTimeoutFinishes:
     """
 
     def test_a_timed_out_question_uploads_the_pages_and_frees_the_worker(
-        self, tmp_path: Path, wait_for_state: Callable[..., Job]
+        self, tmp_path: Path
     ) -> None:
         """Two passes, "Scan next" once, then silence: a warned upload of both."""
         settings = multi_page_settings(tmp_path, timeout=_MULTI_PAGE_TIMEOUT)
@@ -1599,7 +1590,7 @@ class TestMultiPageNothingKept:
     """A wait that times out with no page kept has nothing to finish."""
 
     def test_multi_page_blank_timeout_at_zero_kept_is_all_blank(
-        self, tmp_path: Path, wait_for_state: Callable[..., Job]
+        self, tmp_path: Path
     ) -> None:
         """
         The only page looks blank and nobody answers: the all-blank failure.

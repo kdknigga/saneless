@@ -597,7 +597,7 @@ class TestScanWorkerMultiPage:
     """The worker carries the multi-page choice in and each prompt out."""
 
     def test_the_default_options_are_a_single_pass(self) -> None:
-        """Submitting without options is the single-pass scan it always was."""
+        """Submitting without options is a single-pass scan."""
         assert ScanOptions() == DEFAULT_SCAN_OPTIONS
         assert DEFAULT_SCAN_OPTIONS.multi_page is False
 
@@ -744,7 +744,9 @@ class TestScanWorkerMultiPage:
         worker.submit(job, ScanOptions(multi_page=True))
         assert poll_until(lambda: len(fake.requests) == 1, _BUDGET)
         stopped: list[bool] = []
-        stopper = threading.Thread(target=lambda: stopped.append(worker.stop()))
+        stopper = threading.Thread(
+            target=lambda: stopped.append(worker.stop()), daemon=True
+        )
         stopper.start()
         try:
             assert poll_until(worker._stopping.is_set, _BUDGET)
@@ -752,6 +754,7 @@ class TestScanWorkerMultiPage:
             go.set()
         stopper.join(_OPEN_PROMPT_TIMEOUT * 2)
 
+        assert not stopper.is_alive(), "the stop never returned"
         assert stopped == [True]
         assert fake.answers == [PassAnswer.INTERRUPTED]
         assert fake.ask_seconds[0] < _OPEN_PROMPT_TIMEOUT / 2

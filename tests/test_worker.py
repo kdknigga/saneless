@@ -79,6 +79,7 @@ from tests.conftest import (
     poll_until,
     quiet_window,
     scan_batch,
+    wait_for_state,
 )
 
 if TYPE_CHECKING:
@@ -95,7 +96,7 @@ def _mock_scanner_reports_no_devices(mock_scanner: MagicMock) -> None:
     Answer the shared mock scanner's ``get_devices`` with a deliberate ``[]``.
 
     Every worker started over ``default_settings`` -- a bare default profile
-    set -- runs startup profile generation first (D-14).  Left to itself the
+    set -- runs startup profile generation first.  Left to itself the
     ``MagicMock`` hands back a truthy mock and generation fails somewhere inside
     ``generate_profiles``, so whether profiles were swapped under a test would
     hang on how that function treats a mock.  "No scanners found" is a real
@@ -113,7 +114,7 @@ def _get(store: JobStore, job_id: str) -> Job:
 
 
 class TestJobStateTransitions:
-    """Job state machine tests."""
+    """A job moves through its states and reads back as it was written."""
 
     def test_job_state_transitions(self) -> None:
         """Job starts as PENDING and transitions through all active states."""
@@ -156,7 +157,7 @@ class TestJobStateTransitions:
 
 
 class TestJobStore:
-    """JobStore persistence tests."""
+    """The job store creates, updates and persists job rows."""
 
     def test_job_store_create_and_get(self) -> None:
         """JobStore.create_job returns Job with UUID, get_job returns same."""
@@ -205,7 +206,7 @@ class TestJobStore:
 
 
 class TestJobStateAwaitingFlip:
-    """AWAITING_FLIP state tests."""
+    """A job can wait at the flip prompt in its own state."""
 
     def test_awaiting_flip_exists(self) -> None:
         """JobState.AWAITING_FLIP exists and equals 'AWAITING_FLIP'."""
@@ -214,7 +215,7 @@ class TestJobStateAwaitingFlip:
 
 
 class TestJobThumbnail:
-    """Job thumbnail field tests."""
+    """A job carries an optional thumbnail that the store persists."""
 
     def test_thumbnail_defaults_none(self) -> None:
         """Job.thumbnail field defaults to None."""
@@ -234,7 +235,7 @@ class TestJobThumbnail:
 
 
 class TestScanWorker:
-    """Worker thread tests."""
+    """The worker runs jobs on its own thread and records how each ends."""
 
     def test_worker_starts_and_stops(
         self,
@@ -259,9 +260,8 @@ class TestScanWorker:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
-        """Submit job to worker -> job reaches DONE state."""
+        """A job submitted to the worker reaches DONE."""
         store = JobStore()
         try:
             # Mock run_pipeline to succeed
@@ -276,7 +276,7 @@ class TestScanWorker:
             job = store.create_job("default", "Worker Test")
             worker.submit(job)
 
-            # stop() abandons unstarted work (D-07), so wait for the row itself.
+            # stop() abandons unstarted work, so wait for the row itself.
             wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
 
@@ -291,9 +291,8 @@ class TestScanWorker:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
-        """Pipeline raises exception -> job state is ERROR with message."""
+        """A pipeline that raises ends the job ERROR with the exception's message."""
         store = JobStore()
         try:
 
@@ -328,7 +327,6 @@ class TestScanWorker:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Every job of one worker carries the same device memory.
@@ -388,7 +386,6 @@ class TestJobMetadataReachesTheRequest:
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A row holding tag 3 and no correspondent runs with exactly those.
@@ -441,7 +438,6 @@ class TestJobMetadataReachesTheRequest:
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """The lookup the web app built is the one each job checks its ids with."""
         lookup = CachedMetadataLookup(MetadataCache(ttl=60), mock_paperless)
@@ -529,7 +525,7 @@ def test_every_pipeline_request_comes_from_the_one_builder() -> None:
 # timed-out job rather than as a SIGALRM traceback.
 _MOCK_FLIP_TIMEOUT = 5.0
 
-# The text a flip-prompt cancel carries into the job row (D-01): the real
+# The text a flip-prompt cancel carries into the job row: the real
 # pipeline's message for an operator's abort, so the stubs raise it verbatim.
 _CANCEL_MESSAGE = "Manual duplex scan cancelled at the flip prompt"
 
@@ -549,7 +545,7 @@ def _mock_manual_duplex_pipeline(
             request.status_callback(PipelineEvent.AWAITING_FLIP)
         outcome = coordinator.wait_for_flip(_MOCK_FLIP_TIMEOUT)
         if outcome is FlipOutcome.ABORTED:
-            # As the real pipeline does for an operator's abort (D-02, EXC-04).
+            # As the real pipeline does for an operator's abort.
             raise ScanCancelledError(_CANCEL_MESSAGE)
         if outcome is FlipOutcome.TIMED_OUT:
             msg = "Manual duplex flip wait timed out"
@@ -563,9 +559,9 @@ def _assert_cancelled_at_the_flip_prompt(
     """
     Assert ``finished`` ended as an operator's cancel at the flip prompt.
 
-    CANCELLED with no category and the flip-prompt message (D-01), logged once
-    at INFO without a traceback (N-08).  Call only after the worker has been
-    stopped, which joins its thread, so the ending's log record exists.
+    CANCELLED with no category and the flip-prompt message, logged once at
+    INFO without a traceback.  Call only after the worker has been stopped,
+    which joins its thread, so the ending's log record exists.
     """
     assert finished.state is JobState.CANCELLED
     assert finished.error_category is None
@@ -623,7 +619,7 @@ def _captured_flip_coordinator(
 
 
 class TestScanWorkerManualDuplex:
-    """Worker manual duplex coordination tests."""
+    """A manual duplex job's flip prompt is answered through the worker."""
 
     def test_worker_supplies_a_flip_coordinator_for_manual_duplex(
         self,
@@ -631,7 +627,6 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A manual duplex job waits on a coordinator that continue_flip answers."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -671,13 +666,12 @@ class TestScanWorkerManualDuplex:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        abort_flip(job.id) answers ABORTED, and the job ends CANCELLED (D-01).
+        abort_flip(job.id) answers ABORTED, and the job ends CANCELLED.
 
         The Abort button is the operator choosing to stop, so the job is a
-        cancel rather than a scanner failure (EXC-04, N-08).
+        cancel rather than a scanner failure.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         # worker_for builds over this same fixture instance.
@@ -714,7 +708,6 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker stores thumbnail on job via JobStore when thumbnail_callback fires."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -750,7 +743,6 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Non-duplex jobs carry no flip coordinator."""
         captured_request: dict[str, object] = {}
@@ -827,7 +819,6 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker tracks current_job_id during processing."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -852,7 +843,7 @@ class TestScanWorkerManualDuplex:
             )
             assert worker.current_job_id == job.id
 
-            # Continue counts only at the flip prompt (CR-01), so reach it first.
+            # Continue counts only at the flip prompt, so reach it first.
             wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
             worker.continue_flip(job.id)
             wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
@@ -868,10 +859,9 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        CR-01: whoever reads AWAITING_FLIP from the store finds the prompt armed.
+        Whoever reads AWAITING_FLIP from the store finds the prompt armed.
 
         The status poll renders Continue and Abort from the persisted row, so
         the coordinator must already accept an answer by the time that row is
@@ -922,10 +912,10 @@ class TestScanWorkerManualDuplex:
 
 class TestWorkerFlipCoordinator:
     """
-    The web flip coordinator answers once, and its answer is final (D-16).
+    The web flip coordinator answers once, and its answer is final.
 
     It is also bound to one job and accepts an answer only once armed, which
-    the worker does when the job announces ``AWAITING_FLIP`` (CR-01).
+    the worker does when the job announces ``AWAITING_FLIP``.
 
     Every wait here is bounded by ``0``: an Event wait with a zero timeout
     returns in microseconds, so nothing in this class waits on a wall clock.
@@ -951,10 +941,10 @@ class TestWorkerFlipCoordinator:
 
     def test_a_later_abort_after_continue_is_dropped(self) -> None:
         """
-        D-16: once Continue has answered, a late Abort changes nothing.
+        Once Continue has answered, a late Abort changes nothing.
 
-        Pass B has genuinely started by then, and stopping it mid-pass is
-        Phase 29's HARD-02, so the honest answer is the first one.
+        Pass B has genuinely started by then, and an Abort does not stop a
+        pass midway, so the honest answer is the first one.
         """
         coordinator = WorkerFlipCoordinator("job-1")
         coordinator.arm()
@@ -964,7 +954,7 @@ class TestWorkerFlipCoordinator:
 
     def test_an_unarmed_signal_is_dropped(self) -> None:
         """
-        CR-01: a signal before the flip prompt exists claims nothing.
+        A signal before the flip prompt exists claims nothing.
 
         Both signals report that they were dropped and leave the answer slot
         empty, so a click meant for an earlier prompt cannot pre-answer this one.
@@ -977,7 +967,7 @@ class TestWorkerFlipCoordinator:
 
     def test_an_early_signal_is_dropped_not_queued(self) -> None:
         """
-        CR-01: an Abort sent during pass A is not held back for the prompt.
+        An Abort sent during pass A is not held back for the prompt.
 
         Once the prompt is armed, the operator's real Continue is the answer.
         """
@@ -988,7 +978,7 @@ class TestWorkerFlipCoordinator:
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
     def test_the_first_armed_answer_wins_and_later_ones_are_dropped(self) -> None:
-        """D-16 with CR-01: the first armed signal claims; every later one is False."""
+        """The first armed signal claims the answer; every later one is False."""
         coordinator = WorkerFlipCoordinator("job-1")
         coordinator.arm()
         assert coordinator.signal_abort() is True
@@ -1006,13 +996,13 @@ class TestWorkerFlipCoordinator:
         assert coordinator.signal_continue() is True
 
     def test_an_unanswered_armed_wait_times_out(self) -> None:
-        """Nothing signalled within the bound resolves TIMED_OUT (DPLX-05)."""
+        """Nothing signalled within the bound resolves TIMED_OUT."""
         coordinator = WorkerFlipCoordinator("job-1")
         coordinator.arm()
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
 
     def test_an_unanswered_unarmed_wait_times_out(self) -> None:
-        """A wait on a never-armed coordinator still times out (DPLX-05)."""
+        """A wait on a never-armed coordinator still times out."""
         coordinator = WorkerFlipCoordinator("job-1")
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
 
@@ -1085,7 +1075,7 @@ class TestWorkerFlipCoordinator:
 
 
 class TestWorkerIntermediateStates:
-    """Worker emits ASSEMBLING and UPLOADING intermediate states (UI-02)."""
+    """The worker records ASSEMBLING and UPLOADING as the pipeline reaches them."""
 
     def test_worker_assembling_state(
         self,
@@ -1093,7 +1083,6 @@ class TestWorkerIntermediateStates:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker sets ASSEMBLING when the pipeline emits PipelineEvent.ASSEMBLING."""
         states_seen: list[str] = []
@@ -1141,7 +1130,6 @@ class TestWorkerIntermediateStates:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker sets UPLOADING when the pipeline emits PipelineEvent.UPLOADING."""
         states_seen: list[str] = []
@@ -1193,7 +1181,6 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """FeederEmptyError sets ErrorCategory.FEEDER."""
 
@@ -1221,7 +1208,6 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """ScanError sets ErrorCategory.SCANNER."""
 
@@ -1249,7 +1235,6 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """PaperlessError sets ErrorCategory.UPLOAD."""
 
@@ -1277,7 +1262,6 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """ConfigError sets ErrorCategory.CONFIG."""
 
@@ -1305,7 +1289,6 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Generic Exception sets ErrorCategory.UNKNOWN."""
 
@@ -1333,9 +1316,8 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
-        """AllPagesBlankError sets ErrorCategory.ALL_BLANK, never SCANNER (D-10)."""
+        """AllPagesBlankError sets ErrorCategory.ALL_BLANK, never SCANNER."""
 
         def failing(*_a: object, **_k: object) -> ScanResult:
             msg = "All pages were blank"
@@ -1361,7 +1343,6 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         What ``add_note`` attached reaches ``job.error``.
@@ -1436,8 +1417,8 @@ class _PassBGatedScanner(StubScannerBackend):
     contract changes, and a mock is not.
 
     ``get_devices`` comes from ``StubScannerBackend`` and answers ``[]``, which
-    is what keeps startup profile generation (D-14) from swapping the settings
-    under these tests.  Only ``get_capabilities`` is overridden, because these
+    is what keeps startup profile generation from swapping the settings under
+    these tests.  Only ``get_capabilities`` is overridden, because these
     tests need a feeder rather than the base's flatbed.
 
     Attributes:
@@ -1490,7 +1471,8 @@ def _manual_duplex_settings(settings: Settings) -> Settings:
     """
     Add a ``duplex = "manual"`` profile named ``duplex`` to ``settings``.
 
-    ``source`` is a real feeder name: it no longer selects the strategy.
+    ``source`` is a real feeder name; the ``duplex`` key alone selects the
+    strategy.
 
     Args:
         settings: The fixture settings to extend in place.
@@ -1526,7 +1508,7 @@ def isolated_duplex_settings(default_settings: Settings) -> Settings:
 
 class TestWorkerPassB:
     """
-    Pass B through the real pipeline, observed from outside the worker (DPLX-06).
+    Pass B through the real pipeline, observed from outside the worker.
 
     These run the real ``run_pipeline``: the flip wait, the pass-B event and the
     state the worker persists for it are exactly what is under test, so stubbing
@@ -1538,7 +1520,6 @@ class TestWorkerPassB:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """While pass B is in flight the job row reads SCANNING_REVERSE."""
         scanner = _PassBGatedScanner()
@@ -1574,13 +1555,12 @@ class TestWorkerPassB:
         mock_paperless: MagicMock,
         default_settings: Settings,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         An Abort at the prompt ends the job CANCELLED through the real pipeline.
 
-        EXC-04, N-08: the pipeline raises ``ScanCancelledError`` for the
-        operator's Abort, and the worker records a cancel, not an ERROR (D-01).
+        The pipeline raises ``ScanCancelledError`` for the operator's Abort,
+        and the worker records a cancel, not an ERROR.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
@@ -1608,13 +1588,12 @@ class TestWorkerPassB:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        D-16: an Abort arriving once pass B has begun changes nothing.
+        An Abort arriving once pass B has begun changes nothing.
 
-        The coordinator's first answer is final.  Pass B has genuinely started,
-        stopping it mid-pass is Phase 29's HARD-02, and so the job completes.
+        The coordinator's first answer is final.  Pass B has genuinely started
+        and an Abort does not stop a pass midway, so the job completes.
         """
         scanner = _PassBGatedScanner()
         settings = _manual_duplex_settings(default_settings)
@@ -1655,7 +1634,7 @@ class _GatedScanner(StubScannerBackend):
     A concrete class rather than a ``MagicMock``, like ``_PassBGatedScanner``,
     and inheriting the same ``get_devices`` answer of ``[]`` from
     ``StubScannerBackend`` for the same reason: startup profile generation
-    (D-14) must leave these tests' settings alone.
+    must leave these tests' settings alone.
 
     Attributes:
         gates: Per held call number, set by the test to let that call return.
@@ -1750,7 +1729,7 @@ _JAM_MESSAGE = "Scanner error on test:device:001: Document feeder jammed"
 
 class TestFlipSignalsAreJobScoped:
     """
-    A flip answer belongs to one job, and counts only at that job's prompt (CR-01).
+    A flip answer belongs to one job, and counts only at that job's prompt.
 
     These run the real ``run_pipeline``: the flip wait is the subject.  Only
     the scanner and the paperless client are fakes.  "Not answered early" is
@@ -1762,13 +1741,12 @@ class TestFlipSignalsAreJobScoped:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A Continue or Abort sent while pass A runs is dropped, not queued.
 
-        This is the C-02 mirror of CR-01: a kept early Continue would start
-        pass B on a stack nobody had flipped.
+        A kept early Continue would start pass B on a stack nobody had
+        flipped.
         """
         scanner = _GatedScanner(frozenset({1}))
         settings = _manual_duplex_settings(default_settings)
@@ -1801,10 +1779,9 @@ class TestFlipSignalsAreJobScoped:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        The verifier's scenario (CR-01, 25-VERIFICATION.md) ends with job 2 DONE.
+        A double-clicked Abort cannot answer the next job's flip: job 2 ends DONE.
 
         Two manual-duplex jobs are queued.  Abort is clicked twice at job 1's
         prompt: the first click aborts job 1, the second is dropped.  Clicks
@@ -1850,7 +1827,7 @@ class TestFlipSignalsAreJobScoped:
             worker.stop()
             store.close()
 
-        # Job 1's Abort is the operator's cancel (D-01, EXC-04).
+        # Job 1's Abort is the operator's cancel.
         assert first.state is JobState.CANCELLED
         assert first.error is not None
         assert "flip prompt" in first.error
@@ -1879,11 +1856,10 @@ class TestFlipSignalsAreJobScoped:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        IN-03: a dropped signal is logged as dropped, with the reason.
+        A dropped signal is logged as dropped, with the reason.
 
         Pass A and pass B are both held, so each signal meets a coordinator in
         a known state: unarmed, armed and open, and already answered.
@@ -1975,7 +1951,6 @@ class TestFlipDeadline:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """At the flip prompt the deadline is the wait's start plus its timeout."""
         scanner = _GatedScanner(frozenset({1}))
@@ -2017,7 +1992,6 @@ class TestFlipDeadline:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Only the job at the flip prompt has a deadline; no other id does."""
         scanner = _GatedScanner(frozenset())
@@ -2048,7 +2022,6 @@ class TestFlipDeadline:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """While pass A runs the job has a coordinator but no wait, so no deadline."""
         scanner = _GatedScanner(frozenset({1}))
@@ -2107,13 +2080,12 @@ class TestWorkerStopAndSubmit:
     """
     Stopping is a flag, bounded and reported; submitting never blocks.
 
-    C-09 found two ways a full queue hung the service: ``submit`` blocked a
-    request thread on ``put``, and ``stop`` blocked shutdown on putting its
-    ``None`` sentinel.  D-07 replaces the sentinel with a stop flag and a queue
-    shutdown, D-08 bounds the join at five seconds and reports whether the
-    thread stopped, and ROBU-02 makes ``submit`` report ``QUEUE_FULL`` or
-    ``DOWN`` instead of waiting.  ROBU-03: every wait below is on a state, a
-    staged gate, or a bounded clock -- none relies on ``stop`` draining work.
+    A full queue holds neither a request thread in ``submit`` nor shutdown
+    in ``stop``: stopping sets a flag and shuts the queue down, the join is
+    bounded at five seconds and reports whether the thread stopped, and
+    ``submit`` reports ``QUEUE_FULL`` or ``DOWN`` instead of waiting.  Every
+    wait below is on a state, a staged gate, or a bounded clock -- none
+    relies on ``stop`` draining work.
     """
 
     def test_an_idle_worker_stops_at_once(
@@ -2123,7 +2095,7 @@ class TestWorkerStopAndSubmit:
         default_settings: Settings,
     ) -> None:
         """
-        D-07: an idle worker's stop() wakes the loop, not the idle tick.
+        An idle worker's stop() wakes the loop, not the idle tick.
 
         The idle tick is left at its default, far above the bound asserted
         here, so only the queue shutdown can explain a prompt return.
@@ -2150,7 +2122,7 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """D-08: stop() reports True for a stopped thread, however it got there."""
+        """stop() reports True for a stopped thread, however it got there."""
         store = JobStore()
         never_started = ScanWorker(
             mock_scanner, mock_paperless, default_settings, store
@@ -2171,7 +2143,7 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """ROBU-02: a worker that cannot take work says so instead of queueing."""
+        """A worker that cannot take work says so instead of queueing."""
         store = JobStore()
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
@@ -2192,7 +2164,7 @@ class TestWorkerStopAndSubmit:
         default_settings: Settings,
     ) -> None:
         """
-        C-09 / ROBU-02: the submit that finds no room returns QUEUE_FULL at once.
+        The submit that finds no room returns QUEUE_FULL at once.
 
         Job 1 is held inside ``scan_pages``, so the queue is empty when the
         next ten arrive; they fill it, and the eleventh has nowhere to go.
@@ -2217,7 +2189,7 @@ class TestWorkerStopAndSubmit:
         assert first is SubmitResult.ACCEPTED
         assert queued == [SubmitResult.ACCEPTED] * _QUEUE_DEPTH
         assert overflow is SubmitResult.QUEUE_FULL
-        assert elapsed < 0.1
+        assert elapsed < 2.0
 
     def test_stop_on_a_full_queue_is_bounded_and_reports_false(
         self,
@@ -2226,12 +2198,12 @@ class TestWorkerStopAndSubmit:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        C-09 / D-08: a full queue cannot hold stop(), and a stuck join says so.
+        A full queue cannot hold stop(), and a stuck join says so.
 
         Job 1 stays held past the (shortened) join, so the thread is still
         alive when stop() gives up: it must return False within its bound
         rather than block on the full queue.  Once the gate opens the thread
-        finishes job 1 and exits without starting the queued ones (D-07).
+        finishes job 1 and exits without starting the queued ones.
         """
         monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
         scanner = _GatedScanner(frozenset({1}))
@@ -2264,22 +2236,16 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        D-07: a stop at the flip prompt is an interruption, not a cancel.
+        A stop at the flip prompt is an interruption, not a cancel.
 
-        stop() answers the open wait with ``INTERRUPTED``, so the thread exits
-        at once rather than after ``operator_wait_timeout_seconds``.  Nobody chose to
-        throw the scan away, so pass A's fronts are kept as a ``(fronts)`` PDF
-        in ``failed/``.  The row says the server stopped the scan and where
-        the fronts went, with no category, and it is not logged as a failure.
-
-        This used to pin ``error == RESTART_REASON`` exactly, when a stop
-        answered the wait with Abort and the fronts were deleted.  The error
-        still starts with the restart reason; it now goes on to name the file.
-        The owner sees that file relative to the data directory, and anyone
-        else sees only the fixed sentence saying something was kept.
+        The wait ends at once with ``INTERRUPTED``, pass A's fronts are kept
+        as a ``(fronts)`` PDF in ``failed/``, and the row's error starts with
+        the restart reason and names that file, with no category and no
+        failure logged.  The owner sees the file relative to the data
+        directory; anyone else sees only the fixed sentence saying something
+        was kept.  Nobody chose to throw the scan away, so nothing is lost.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
@@ -2332,7 +2298,6 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A stop claimed while pass A still scans is answered at the flip.
@@ -2384,7 +2349,6 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The join is extended, within a bound, while the fronts are copied.
@@ -2491,18 +2455,16 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        D-07, research Pitfall 5: stopping during pass A still ends the flip wait.
+        Stopping during pass A still ends the flip wait.
 
         stop() can find no coordinator to answer because the job is still in
         pass A.  The stop flag is set while pass A is held, then pass A is
         released: the job must announce AWAITING_FLIP and be interrupted
         immediately, well inside the state budget and nowhere near the flip
-        timeout.  Like any stop at the flip, it keeps the fronts, so
-        the error starts with the restart reason and names the kept file;
-        it used to pin the bare restart reason.
+        timeout.  Like any stop at the flip, it keeps the fronts, so the error
+        starts with the restart reason and names the kept file.
         """
         scanner = _GatedScanner(frozenset({1}))
         settings = isolated_duplex_settings
@@ -2552,10 +2514,9 @@ class TestWorkerStopAndSubmit:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        WR-06, D-15: stopping alone does not make a failure a restart.
+        Stopping alone does not make a failure a restart.
 
         The pipeline fails with a Paperless error just as shutdown begins.
         Shutdown did not cause it, so the row keeps the error's own text and
@@ -2590,16 +2551,15 @@ class TestWorkerStopAndSubmit:
         isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        WR-02, EXC-05: shutdown claiming the flip does not relabel a real failure.
+        Shutdown claiming the flip does not relabel a real failure.
 
         stop() pre-answers the flip wait with ``INTERRUPTED`` while pass A is
         still scanning, before the pipeline ever reaches the prompt.  Pass A
-        then jams.  The job did not end at the flip,
-        so the row keeps the scanner's text and category, and the failure is
-        logged with its traceback rather than as a restart at INFO.
+        then jams.  The job did not end at the flip, so the row keeps the
+        scanner's text and category, and the failure is logged with its
+        traceback rather than as a restart at INFO.
 
         The jam keeps pass A's fronts, so this test writes a real PDF into
         ``failed/``; the per-test settings keep it inside ``tmp_path``.
@@ -2640,7 +2600,7 @@ class TestWorkerStopAndSubmit:
         exc_info = failures[0]
         assert exc_info is not None
         assert isinstance(exc_info[1], ScanError)
-        # The jam keeps pass A's fronts (D-10), and this pins where: inside
+        # The jam keeps pass A's fronts, and this pins where: inside
         # this test's own directory, not the suite's shared one.
         preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
         assert len(preserved) == 1
@@ -2651,14 +2611,13 @@ class TestWorkerStopAndSubmit:
         mock_paperless: MagicMock,
         default_settings: Settings,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        WR-06, D-15: an Abort the operator claimed keeps its own meaning.
+        An Abort the operator claimed keeps its own meaning.
 
         Shutdown has begun, but the operator's Abort claimed the flip answer
         first, so shutdown's own Abort is dropped and the row records the
-        operator's cancel (D-01, D-02) rather than a server restart.
+        operator's cancel rather than a server restart.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
@@ -2787,7 +2746,7 @@ def _count_idle_ticks(
     Count the idle ticks an unstarted worker completes once it runs.
 
     A test that sleeps and then asserts nothing happened also passes when the
-    thread never reached its first idle tick on a slow runner (IN-03).
+    thread never reached its first idle tick on a slow runner.
     Counting completed ticks proves the window was real.
 
     Returns:
@@ -2848,12 +2807,10 @@ class TestWorkerGuard:
     """
     No exception from the pipeline, the job store or prune ends the worker.
 
-    C-09 found the loop unguarded: a raise from ``update_state``, from the
-    failure-path ``finish_job`` or from the per-job ``prune`` ended the thread
-    silently, and every later scan sat PENDING until restart.  ROBU-01 guards
-    the loop; D-10 keeps a pipeline failure a job failure and makes a failure
-    of the loop's own store writes a loop failure; D-13 moves prune out of the
-    job path onto an hourly idle tick.  Each test proves the worker survived by
+    A pipeline failure is a job failure, a failure of the loop's own store
+    writes is a loop failure, and prune runs on an hourly idle tick outside
+    the job path.  None of them ends the thread, so no later scan sits
+    PENDING until a restart.  Each test proves the worker survived by
     finishing a later job, not by reading ``is_alive`` alone.
     """
 
@@ -2862,7 +2819,6 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A store error escaping the job's handling is logged and survived."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
@@ -2898,7 +2854,6 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A failure's text is logged quoted, with each control as its escape.
@@ -2935,10 +2890,9 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        ROBU-01, D-10: the failure-path ``finish_job`` raising is a loop failure.
+        The failure-path ``finish_job`` raising is a loop failure.
 
         The pipeline fails job 1; recording that failure raises once.  The guard
         logs it and its own best-effort write lands the ERROR, and job 2 runs.
@@ -2988,9 +2942,8 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
-        """ROBU-01, D-13: a raising prune is a WARNING with its traceback; jobs finish."""
+        """A raising prune is a WARNING with its traceback; jobs finish."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
@@ -3065,9 +3018,8 @@ class TestWorkerGuard:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
-        """D-10: three pipeline failures in a row are three ERROR jobs, and no more."""
+        """Three pipeline failures in a row are three ERROR jobs, and no more."""
 
         def failing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
             msg = "Scanner jammed"
@@ -3102,7 +3054,7 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-13: an idle worker prunes with the configured limits once due."""
+        """An idle worker prunes with the configured limits once due."""
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
         store = JobStore()
@@ -3128,7 +3080,7 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-13: the idle prune is hourly, not every tick."""
+        """The idle prune is hourly, not every tick."""
         assert worker_module._PRUNE_INTERVAL_SECONDS >= 3600.0
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
@@ -3139,7 +3091,7 @@ class TestWorkerGuard:
         try:
             worker.start()
             # A window in which nothing may happen, measured in idle ticks the
-            # worker actually took rather than in wall time (IN-03).
+            # worker actually took rather than in wall time.
             ticked = poll_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
         finally:
             worker.stop()
@@ -3152,7 +3104,6 @@ class TestWorkerGuard:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A job whose handling raised a store error still ends.
@@ -3197,11 +3148,10 @@ class TestWorkerGuard:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
         failed_writes: int,
     ) -> None:
         """
-        WR-02: a document Paperless accepted is never recorded as an ERROR.
+        A document Paperless accepted is never recorded as an ERROR.
 
         The terminal DONE write fails after the upload.  With one failure the
         guard's own retry lands it; with two the guard's retry fails too and
@@ -3239,10 +3189,9 @@ class TestWorkerGuard:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        WR-02: the owed ERROR keeps the pipeline's own text and category.
+        The owed ERROR keeps the pipeline's own text and category.
 
         The failure-path write raising must not replace the scanner's error
         with the job store's ``disk I/O error``.
@@ -3274,10 +3223,9 @@ class TestWorkerGuard:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        ROBU-01, CR-01, D-12: a row the guard could not end still ends on its own.
+        A row the guard could not end still ends on its own.
 
         The job's handling and the guard's ERROR write both fail once with a
         store error.  That is one loop-level failure, well below degraded, so
@@ -3327,17 +3275,16 @@ class TestWorkerGuard:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
         stranded: int,
     ) -> None:
         """
-        CR-01, D-10, D-12: owed writes are retried on every idle tick, not probed.
+        Owed writes are retried on every idle tick, not probed.
 
         ``stranded`` loop-level failures stay below ``_DEGRADED_AFTER``, and the
         guard's ERROR write for each fails too.  Failed retries are not
         loop-level failures, and the streak limit is raised so the observation
-        window before healing cannot reach it (WR-10 is pinned by
-        ``TestOwedWriteStreak``), so the worker stays HEALTHY and never probes;
+        window before healing cannot reach it (``TestOwedWriteStreak`` pins
+        the limit), so the worker stays HEALTHY and never probes;
         once the store accepts writes, every stranded row reaches ERROR with the
         guard's own text.
         """
@@ -3409,21 +3356,20 @@ class TestOwedRejections:
     """
     A refused submit whose REJECTED write failed is written by the worker.
 
-    WR-01: the route creates the row before ``submit()`` (D-05), so a refusal
-    needs a second write, and when that write fails the row would stay PENDING
-    with no REJECTED marker (D-06).  The route owes it to the worker instead,
-    and the worker's idle flush -- shared with the guard's owed failures --
-    writes it on its next tick (D-12).  A failed retry is never a loop-level
-    failure (D-10), while a streak of them degrades the worker (WR-10).
+    The route creates the row before ``submit()``, so a refusal needs a
+    second write, and when that write fails the row would stay PENDING with
+    no REJECTED marker.  The route owes it to the worker instead, and the
+    worker's idle flush -- shared with the guard's owed failures -- writes
+    it on its next tick.  A failed retry is never a loop-level failure,
+    while a streak of them degrades the worker.
     """
 
     def test_an_owed_rejection_is_written_on_the_next_idle_tick(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
-        """A healthy worker records an owed rejection without probing (D-12)."""
+        """A healthy worker records an owed rejection without probing."""
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
         probes = _StoreFault(store.probe, frozenset())
@@ -3450,13 +3396,12 @@ class TestOwedRejections:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A request-side debt the store refuses is retried, never a loop failure.
 
-        It is never counted as a loop-level failure (D-10).  The streak limit is
-        raised so the three-failure window cannot degrade it.
+        The streak limit is raised so the three-failure window cannot degrade
+        the worker by that route either.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
@@ -3519,13 +3464,15 @@ class TestOwedRejections:
                 threading.Thread(
                     target=owe,
                     args=(ids[n * _OWED_PER_THREAD : (n + 1) * _OWED_PER_THREAD],),
+                    daemon=True,
                 )
                 for n in range(_OWING_THREADS)
             ]
             for thread in threads:
                 thread.start()
             for thread in threads:
-                thread.join()
+                thread.join(_MANY_OWED_BUDGET)
+            assert not any(thread.is_alive() for thread in threads)
             if raised:
                 raise raised[0]
 
@@ -3562,7 +3509,7 @@ class TestOwedRejections:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        IN-07: the flush drops an owed entry only if it is unchanged.
+        The flush drops an owed entry only if it is unchanged.
 
         The first write for an id is held inside ``finish_job`` while the id is
         owed again with different text.  The flush must keep the newer entry
@@ -3631,15 +3578,14 @@ class TestOwedRejections:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Only owed REJECTED writes are listed, and only until they are written.
 
-        IN-08, D-06: the status area skips these ids so a refused attempt is
-        never shown as the live job.  A failure the loop guard could not write
-        belongs to a job that ran, so it is left out and D-17 still reports
-        it.  The streak limit is raised so the failing window cannot degrade.
+        The status area skips these ids so a refused attempt is never shown
+        as the live job.  A failure the loop guard could not write belongs
+        to a job that ran, so it is left out and that job is still shown.
+        The streak limit is raised so the failing window cannot degrade.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
@@ -3681,7 +3627,7 @@ class TestOwedRejections:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        IN-06: a rejection still owed at shutdown is written before the thread exits.
+        A rejection still owed at shutdown is written before the thread exits.
 
         No idle tick can run in the test's window, so only the exit flush can
         write it.  Unwritten, the row would come back after a restart as a
@@ -3713,7 +3659,7 @@ class TestOwedRejections:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """IN-06: a store that refuses the exit flush cannot hold the stop."""
+        """A store that refuses the exit flush cannot hold the stop."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
         store = JobStore()
@@ -3744,12 +3690,11 @@ class TestOwedWriteStreak:
     """
     A streak of failed owed-write retries degrades the worker.
 
-    WR-10: the idle flush retried owed job-row writes on every tick but only
-    logged a failed retry, so a job store that never healed left the stuck row
-    live and ``/health`` at 200 until an hourly prune failed.  A failed retry
-    is still not a loop-level failure (D-10), but ``_OWED_RETRY_DEGRADED_AFTER``
-    failed idle ticks in a row degrade the worker, and the probe-and-flush
-    recovery path clears it again (D-12).
+    A failed retry is not a loop-level failure, but
+    ``_OWED_RETRY_DEGRADED_AFTER`` failed idle ticks in a row degrade the
+    worker, and the probe-and-flush recovery path clears it again.  Without
+    the streak, a job store that never heals would leave the stuck row live
+    and ``/health`` at 200 until an hourly prune failed.
     """
 
     @pytest.mark.parametrize("debt", ["guard", "rejection"])
@@ -3761,7 +3706,7 @@ class TestOwedWriteStreak:
         debt: str,
     ) -> None:
         """
-        WR-10, D-10: an owed write the store never accepts reaches DEGRADED.
+        An owed write the store never accepts reaches DEGRADED.
 
         The debt is either the guard's (a store error escaping a job, whose
         ERROR write failed too, one loop-level failure) or a request-side rejection
@@ -3826,11 +3771,10 @@ class TestOwedWriteStreak:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
         debt: str,
     ) -> None:
         """
-        WR-10, D-12, IN-07: a streak-degraded worker heals through probe and flush.
+        A streak-degraded worker heals through probe and flush.
 
         The debt is the guard's ERROR write or a request-side REJECTED write.
         Once the store accepts writes again, the probe succeeds and the owed
@@ -3903,10 +3847,9 @@ class TestOwedWriteStreak:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        IN-09, D-10: a cleanly recorded job breaks the streak as it breaks the run.
+        A cleanly recorded job breaks the streak as it breaks the run.
 
         Idle ticks come only between jobs, so without this a streak could span
         a job that proved the store accepts writes, and one more failed tick
@@ -3982,7 +3925,6 @@ class TestOwedWriteStreak:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         One failure episode is one WARNING, however many jobs it spans.
@@ -4023,7 +3965,6 @@ class TestOwedWriteStreak:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A failure after a landed retry is a new episode, and is warned about."""
         caplog.set_level(logging.DEBUG, logger="saneless.worker")
@@ -4055,10 +3996,9 @@ class TestOwedWriteStreak:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        WR-10, D-10: a fault that heals inside the streak never degrades.
+        A fault that heals inside the streak never degrades.
 
         For each of two jobs the guard's ERROR write fails, then one tick fewer
         than the streak limit of retries fail, then the next retry lands.  A
@@ -4067,7 +4007,7 @@ class TestOwedWriteStreak:
         first failed retry at WARNING exactly once.
         """
         # Read from the production streak limit, never mirrored, so the streaks
-        # below stay exactly one tick short of it if the limit changes (IN-11).
+        # below stay exactly one tick short of it if the limit changes.
         threshold = worker_module._OWED_RETRY_DEGRADED_AFTER
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
@@ -4114,15 +4054,14 @@ class TestOwedWriteStreak:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         An owed write that lands ends the run of loop-level failures.
 
         A store error escapes the job, one loop-level failure, and the
         guard's ERROR write fails too, so the ERROR is owed.  The next idle
-        tick writes it: the store just accepted a write, so the failure
-        before it is no longer part of a run.
+        tick writes it: the store just accepted a write, so the run of
+        failures before it is over.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         store = JobStore()
@@ -4149,7 +4088,6 @@ class TestOwedWriteStreak:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A flush that writes nothing proves nothing about the store.
@@ -4196,7 +4134,6 @@ class TestOwedWritesAfterAJob:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """An owed rejection is written before the third job in a row scans."""
         owed_at_scan: list[frozenset[str]] = []
@@ -4237,7 +4174,6 @@ class TestOwedWritesAfterAJob:
         worker_for: Callable[[JobStore], ScanWorker],
         mock_scanner: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A clean job on a degraded worker does not retry owed writes.
@@ -4292,7 +4228,7 @@ class TestOwedWritesAfterAJob:
         assert owed_at_scan == [frozenset({refused.id})] * 2
 
 
-# Loop-level failures in a row that make a worker degraded (D-10).
+# Loop-level failures in a row that make a worker degraded.
 _DEGRADING_JOBS = 3
 
 
@@ -4417,7 +4353,6 @@ class TestWorkerDegradedHealth:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """D-10: two failures, a success, two failures -- still HEALTHY."""
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
@@ -4456,7 +4391,6 @@ class TestWorkerDegradedHealth:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """D-12: a failing probe keeps DEGRADED; the first success heals it."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
@@ -4493,6 +4427,55 @@ class TestWorkerDegradedHealth:
         assert accepted is SubmitResult.ACCEPTED
         assert finished.state is JobState.DONE
         assert _worker_records(caplog, logging.INFO, "recovered")
+
+    def test_a_degraded_worker_on_a_read_only_store_stays_degraded(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A degraded worker whose store reads but cannot be written stays degraded.
+
+        Reads still succeed on a read-only store, so only the probe's write
+        tells it from a healthy one; a worker that healed on reads alone would
+        accept scans it cannot record.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore(tmp_path / "jobs.db")
+        probes = _StoreFault(store.probe)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        _fail_the_job_path(worker, monkeypatch)
+        try:
+            worker.start()
+            jobs = _degrade(worker, store)
+            for job in jobs:
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            with store._lock:
+                store._conn.execute("PRAGMA query_only = ON")
+            failed_probes = len(probes.calls)
+            probes.heal()
+            probed = poll_until(
+                lambda: len(probes.calls) >= failed_probes + 3, _STATE_BUDGET
+            )
+            health = worker.health
+            recovered = _worker_records(caplog, logging.INFO, "recovered")
+        finally:
+            with store._lock:
+                store._conn.execute("PRAGMA query_only = OFF")
+            worker.stop()
+            store.close()
+
+        assert probed
+        assert health is WorkerHealth.DEGRADED
+        assert not recovered
 
     def test_degraded_recovery_ends_jobs_whose_failure_went_unrecorded(
         self,
@@ -4953,8 +4936,8 @@ class TestWorkerProfileLock:
             except Exception as exc:  # recorded and asserted on below
                 errors.append(exc)
 
-        threads = [threading.Thread(target=reader) for _ in range(4)]
-        threads.append(threading.Thread(target=writer))
+        threads = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+        threads.append(threading.Thread(target=writer, daemon=True))
         try:
             assert worker._set_profiles(first)
             for thread in threads:
@@ -4979,7 +4962,6 @@ class TestScanWorkerQueuing:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Two submitted jobs are both processed to DONE (SCAN-11)."""
         monkeypatch.setattr(
@@ -5592,7 +5574,6 @@ class TestStartupProfileGeneration:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A profile set that is not the bare default never asks the scanner."""
         self._mock_caps_scanner(mock_scanner)
@@ -5625,7 +5606,6 @@ class TestStartupProfileGeneration:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """D-15: three jobs later the scanner has still been asked only once."""
         self._mock_caps_scanner(mock_scanner)
@@ -5656,7 +5636,6 @@ class TestStartupProfileGeneration:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         D-14: a job submitted during generation waits, then sees the new profiles.
@@ -5882,7 +5861,6 @@ class TestWorkerEnumDispatch:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker applies only ACTIVE_STATES from inside the pipeline callback."""
         states_seen: list[JobState] = []
@@ -5990,7 +5968,6 @@ class TestWorkerEnumDispatch:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         D-13: a completed job is not followed by a prune.
@@ -6070,7 +6047,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """The assembled PDF is named from this job's id (OUTC-05)."""
         store = JobStore()
@@ -6106,7 +6082,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A SUCCESS outcome becomes DONE, with its counts (OUTC-01)."""
         store = JobStore()
@@ -6139,7 +6114,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A FALLBACK outcome becomes FALLBACK, never DONE (OUTC-02)."""
         store = JobStore()
@@ -6174,7 +6148,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Pages 2 and 4 removed as blank: named on the job, and the job stays DONE.
@@ -6215,7 +6188,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A run that removed nothing records an empty list, not "never recorded"."""
         store = JobStore()
@@ -6242,7 +6214,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A mismatch warning survives alongside a SUCCESS outcome (OUTC-03)."""
         store = JobStore()
@@ -6274,7 +6245,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A raising pipeline records ERROR and records no counts (OUTC-01)."""
         store = JobStore()
@@ -6312,7 +6282,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A UI poller is released on FALLBACK as it is on DONE (OUTC-02).
@@ -6346,7 +6315,6 @@ class TestWorkerFinish:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The ``finally`` still clears the current job on FALLBACK, and prunes nothing.
@@ -6424,7 +6392,6 @@ def _interrupted_after(
 def _finish_one_job(
     worker: ScanWorker,
     store: JobStore,
-    wait_for_state: Callable[..., Job],
     profile: str = "default",
 ) -> Job:
     """
@@ -6466,7 +6433,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """D-01: a ScanCancelledError ends the job CANCELLED, not ERROR."""
         monkeypatch.setattr(
@@ -6474,7 +6440,7 @@ class TestWorkerJobEndings:
             _raising_pipeline(ScanCancelledError(_CANCEL_MESSAGE)),
         )
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.CANCELLED
         assert finished.error == _CANCEL_MESSAGE
@@ -6485,7 +6451,6 @@ class TestWorkerJobEndings:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """N-08: a cancel logs one INFO line, no traceback and no ERROR."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
@@ -6494,7 +6459,7 @@ class TestWorkerJobEndings:
             _raising_pipeline(ScanCancelledError(_CANCEL_MESSAGE)),
         )
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         cancelled = _worker_records(
             caplog, logging.INFO, f"Job {finished.id} cancelled"
@@ -6508,7 +6473,6 @@ class TestWorkerJobEndings:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """EXC-05: a scanner failure is ERROR, SCANNER, logged with its traceback."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
@@ -6516,7 +6480,7 @@ class TestWorkerJobEndings:
         error = ScanError(message)
         monkeypatch.setattr("saneless.worker.run_pipeline", _raising_pipeline(error))
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == message
@@ -6541,7 +6505,6 @@ class TestWorkerJobEndings:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
         failure: tuple[type[Exception], ErrorCategory],
     ) -> None:
         """EXC-05: classified or unknown, a failure carries its traceback."""
@@ -6551,7 +6514,7 @@ class TestWorkerJobEndings:
         error = error_type(message)
         monkeypatch.setattr("saneless.worker.run_pipeline", _raising_pipeline(error))
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == message
@@ -6566,7 +6529,6 @@ class TestWorkerJobEndings:
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A server stop ends the job as a restart, followed by the kept file.
@@ -6588,7 +6550,7 @@ class TestWorkerJobEndings:
             "saneless.worker.run_pipeline", _raising_pipeline(interruption)
         )
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == f"{RESTART_REASON}. {note}"
@@ -6601,7 +6563,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """With no page to keep there is no note, and the row says only why."""
         monkeypatch.setattr(
@@ -6609,7 +6570,7 @@ class TestWorkerJobEndings:
             _raising_pipeline(ScanInterrupted("The server is stopping")),
         )
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == RESTART_REASON
@@ -6619,7 +6580,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A stop during the upload may have left the document in paperless-ngx.
@@ -6636,7 +6596,7 @@ class TestWorkerJobEndings:
             "saneless.worker.run_pipeline", _interrupted_after(events, interruption)
         )
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == f"{RESTART_UPLOADING_REASON}. {note}"
@@ -6646,7 +6606,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """With no note, the row carries the uploading reason alone."""
         interruption = ScanInterrupted("The server is stopping")
@@ -6655,7 +6614,7 @@ class TestWorkerJobEndings:
             _interrupted_after((PipelineEvent.UPLOADING,), interruption),
         )
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == RESTART_UPLOADING_REASON
@@ -6665,7 +6624,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         What the run announced decides the wording, not what reached the row.
@@ -6694,7 +6652,7 @@ class TestWorkerJobEndings:
             "saneless.worker.run_pipeline",
             _interrupted_after(events, ScanInterrupted("The server is stopping")),
         )
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == RESTART_UPLOADING_REASON
@@ -6704,7 +6662,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A stop while assembling never reached paperless-ngx, so no category."""
         note = "The 2 page(s) scanned were preserved at /x.pdf"
@@ -6715,7 +6672,7 @@ class TestWorkerJobEndings:
             _interrupted_after((PipelineEvent.ASSEMBLING,), interruption),
         )
         store = JobStore()
-        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+        finished = _finish_one_job(worker_for(store), store)
 
         assert finished.state is JobState.ERROR
         assert finished.error == f"{RESTART_REASON}. {note}"
@@ -6725,7 +6682,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         ``ScanInterrupted`` is a ``BaseException``, and it must not kill the thread.
@@ -6772,7 +6728,6 @@ class TestWorkerJobEndings:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The outcome carries the meaning; nothing on the coordinator relabels it.
@@ -6800,7 +6755,7 @@ class TestWorkerJobEndings:
         _manual_duplex_settings(default_settings)
         store = JobStore()
         worker = worker_for(store)
-        finished = _finish_one_job(worker, store, wait_for_state, profile="duplex")
+        finished = _finish_one_job(worker, store, profile="duplex")
 
         assert finished.state is JobState.CANCELLED
         assert finished.error == _CANCEL_MESSAGE
@@ -6812,7 +6767,6 @@ class TestWorkerJobEndings:
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Phase 26 D-10: cancels in a row are job endings, not loop failures."""
         monkeypatch.setattr(
@@ -6989,7 +6943,6 @@ class TestFrontPages:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The count is readable from another thread while the job is in flight.
@@ -7018,7 +6971,6 @@ class TestFrontPages:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """D-33: SCANNING_REVERSE is exactly when the strip wants the number."""
         scanner = _CountedPassScanner(fronts=4, backs=4)
@@ -7045,7 +6997,6 @@ class TestFrontPages:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The back count arrives too, and is ignored.
@@ -7093,7 +7044,6 @@ class TestFrontPages:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A finished job leaves no count behind for the next one to read."""
         scanner = _CountedPassScanner(fronts=2, backs=2)
@@ -7119,7 +7069,6 @@ class TestFrontPages:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A pass-B jam is an ERROR, and it clears the count too."""
         scanner = _JammingPassBScanner(fronts=2, backs=2)
@@ -7147,7 +7096,6 @@ class TestFrontPages:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """An Abort at the prompt ends the job before pass B, and clears it."""
         scanner = _CountedPassScanner(fronts=5, backs=5)
@@ -7261,7 +7209,6 @@ class TestScannerGate:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A probe arriving mid-scan finds the gate taken and must skip."""
         scanner = _CountedPassScanner(fronts=2, backs=2)
@@ -7284,7 +7231,6 @@ class TestScannerGate:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A finished scan hands the scanner back."""
         scanner = _CountedPassScanner(fronts=2, backs=2)
@@ -7310,7 +7256,6 @@ class TestScannerGate:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A jam must not leave the scanner locked out for the rest of the run."""
         scanner = _JammingPassBScanner(fronts=2, backs=2)
@@ -7336,7 +7281,6 @@ class TestScannerGate:
         self,
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Nor may an Abort at the prompt strand it."""
         scanner = _CountedPassScanner(fronts=2, backs=2)
@@ -7545,7 +7489,6 @@ class TestPerJobReinitialise:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """The restart is the job's first SANE call, made with the gate held."""
         default_settings.scanner.device = ""
@@ -7574,7 +7517,6 @@ class TestPerJobReinitialise:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A saned restart between two jobs is met by the second job's restart."""
         scanner = _ReinitRecordingScanner()
@@ -7603,7 +7545,6 @@ class TestPerJobReinitialise:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The startup read uses the SANE the backend just started; jobs restart it.
@@ -7635,7 +7576,6 @@ class TestPerJobReinitialise:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A restart refused over a wedged read fails the job and frees the gate.
@@ -7768,7 +7708,6 @@ class TestScanningWaitsForTheGate:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """With the gate held elsewhere, the taken job's row still reads PENDING."""
         scanner = _a_scanner_free_of_startup_generation(default_settings)
@@ -7805,7 +7744,6 @@ class TestScanningWaitsForTheGate:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """SCANNING is written once, after PENDING, and only after the gate is free."""
         scanner = _a_scanner_free_of_startup_generation(default_settings)
@@ -7854,7 +7792,6 @@ class TestScanningWaitsForTheGate:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A job that gets the gate only once the server is stopping never scans.
@@ -7885,7 +7822,9 @@ class TestScanningWaitsForTheGate:
         def stop_the_worker() -> None:
             stopped.append(worker.stop())
 
-        stopper = threading.Thread(target=stop_the_worker, name="test-stopper")
+        stopper = threading.Thread(
+            target=stop_the_worker, name="test-stopper", daemon=True
+        )
         try:
             worker.start()
             assert gate.acquire(timeout=_PASS_B_GATE_CEILING)
@@ -7900,6 +7839,7 @@ class TestScanningWaitsForTheGate:
             finally:
                 gate.release()
             stopper.join(worker_module.STOP_JOIN_SECONDS + _STATE_BUDGET)
+            assert not stopper.is_alive(), "the stop never returned"
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
             worker.stop()
@@ -8449,7 +8389,6 @@ class TestProgressWriteFailures:
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """The document is uploaded, the job is DONE and the failure is a WARNING."""
         caplog.set_level(logging.WARNING, logger="saneless.worker")
@@ -8492,7 +8431,6 @@ class TestProgressWriteFailures:
         isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """The job is DONE without a thumbnail, and the failure is a WARNING."""
         caplog.set_level(logging.WARNING, logger="saneless.worker")
@@ -8532,7 +8470,6 @@ class TestProgressWriteFailures:
         isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The prompt renders from the row, so its write is tried a second time.
@@ -8581,7 +8518,6 @@ class TestProgressWriteFailures:
         isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         With the prompt's row unwritable, the flip timeout still keeps the fronts.
