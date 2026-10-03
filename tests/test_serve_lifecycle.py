@@ -37,9 +37,10 @@ import httpx2
 import pytest
 
 from saneless.vocabulary import ExitCode
+from tests.conftest import poll_until
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Generator
 
 # The repository root: the child imports ``tests.golden_support`` from here.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -440,7 +441,7 @@ def test_sigterm_stops_an_idle_server_with_exit_0(spawner: _Spawner) -> None:
 
 
 def test_sigterm_during_a_slow_listing_stops_within_10_seconds(
-    spawner: _Spawner, poll_until: Callable[..., bool]
+    spawner: _Spawner,
 ) -> None:
     """
     A stop with a scanner listing in flight: exit 0 within 10 s, listing gone.

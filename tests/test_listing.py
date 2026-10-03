@@ -30,7 +30,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import NoReturn
 
 import pytest
 
@@ -51,9 +51,7 @@ from saneless.scanner.listing import (
     child_environment,
     run_listing_child,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from tests.conftest import poll_until
 
 _LOGGER = "saneless.scanner.listing"
 _NET_ID = "net:scanbox.lan:test:0"
@@ -661,7 +659,6 @@ class TestDeadline:
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         A process the child started dies with it, rather than outliving it.
@@ -833,7 +830,6 @@ class TestAbort:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         The abort error comes within a second, with the child already gone.

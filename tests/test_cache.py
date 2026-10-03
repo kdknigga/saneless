@@ -167,7 +167,9 @@ def test_get_or_fetch_single_flight() -> None:
         with results_lock:
             results.append(data)
 
-    threads = [threading.Thread(target=request) for _ in range(threads_count)]
+    threads = [
+        threading.Thread(target=request, daemon=True) for _ in range(threads_count)
+    ]
     for thread in threads:
         thread.start()
     try:
@@ -177,6 +179,9 @@ def test_get_or_fetch_single_flight() -> None:
         gate.set()
         for thread in threads:
             thread.join(_WAIT_SECONDS)
+    assert not any(thread.is_alive() for thread in threads), (
+        "a request thread hung behind the single-flight fetch"
+    )
 
     assert len(calls) == 1
     assert len(results) == threads_count
@@ -318,7 +323,9 @@ def test_waiters_behind_a_failing_fetch_return_at_once() -> None:
             with outcomes_lock:
                 outcomes.append(type(exc))
 
-    threads = [threading.Thread(target=request) for _ in range(threads_count)]
+    threads = [
+        threading.Thread(target=request, daemon=True) for _ in range(threads_count)
+    ]
     for thread in threads:
         thread.start()
     try:
@@ -328,6 +335,9 @@ def test_waiters_behind_a_failing_fetch_return_at_once() -> None:
         gate.set()
         for thread in threads:
             thread.join(_WAIT_SECONDS)
+    assert not any(thread.is_alive() for thread in threads), (
+        "a request thread hung behind the failing fetch"
+    )
 
     assert len(calls) == 1
     assert sorted(outcomes, key=lambda kind: kind.__name__) == [ConnectionError] + [
@@ -362,7 +372,7 @@ def test_a_waiter_gives_up_after_its_lock_timeout() -> None:
     def in_flight() -> None:
         results["in_flight"] = cache.get_or_fetch_list("tags", hung_fetch)
 
-    thread = threading.Thread(target=in_flight)
+    thread = threading.Thread(target=in_flight, daemon=True)
     thread.start()
     try:
         assert entered.wait(_WAIT_SECONDS)
@@ -372,6 +382,7 @@ def test_a_waiter_gives_up_after_its_lock_timeout() -> None:
     finally:
         release.set()
         thread.join(_WAIT_SECONDS)
+    assert not thread.is_alive(), "the in-flight fetch thread hung"
 
     assert second_calls == []
     assert results["in_flight"] == CachedList(rows, current=True)
@@ -427,15 +438,20 @@ def test_invalidate_during_an_in_flight_fetch_is_not_undone() -> None:
     def refresh() -> None:
         results["refresh"] = cache.get_or_fetch("tags", lambda: fresh)
 
-    first = threading.Thread(target=in_flight)
+    first = threading.Thread(target=in_flight, daemon=True)
     first.start()
-    assert entered.wait(_WAIT_SECONDS)
-    cache.invalidate("tags")
-    second = threading.Thread(target=refresh)
-    second.start()
-    release.set()
-    first.join(_WAIT_SECONDS)
-    second.join(_WAIT_SECONDS)
+    second = threading.Thread(target=refresh, daemon=True)
+    try:
+        assert entered.wait(_WAIT_SECONDS)
+        cache.invalidate("tags")
+        second.start()
+    finally:
+        release.set()
+        first.join(_WAIT_SECONDS)
+        if second.ident is not None:
+            second.join(_WAIT_SECONDS)
+    assert not first.is_alive(), "the stale in-flight fetch thread hung"
+    assert not second.is_alive(), "the refresh thread hung"
 
     assert results["in_flight"] is stale
     assert results["refresh"] is fresh
@@ -747,7 +763,7 @@ def test_invalidate_racing_a_failed_refresh_is_not_overwritten(
     def in_flight() -> None:
         results["in_flight"] = cache.get_or_fetch("tags", slow_failing_fetch)
 
-    thread = threading.Thread(target=in_flight)
+    thread = threading.Thread(target=in_flight, daemon=True)
     with caplog.at_level(logging.WARNING, logger=_CACHE_LOGGER):
         thread.start()
         try:
@@ -756,6 +772,7 @@ def test_invalidate_racing_a_failed_refresh_is_not_overwritten(
         finally:
             release.set()
             thread.join(_WAIT_SECONDS)
+    assert not thread.is_alive(), "the failing in-flight fetch thread hung"
 
     assert results["in_flight"] is good
     assert cache.get("tags") is None

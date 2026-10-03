@@ -1491,7 +1491,7 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     "/api/paperless/test": {"method": "GET"},
     "/api/scan": {
         "method": "POST",
-        "data": {"profile": "default", "title": "D-19 proof"},
+        "data": {"profile": "default", "title": "unreachable-SANE proof"},
     },
     "/api/jobs/current/status": {"method": "GET"},
     # Driven with the literal template path, which names no row.  That is a
