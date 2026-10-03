@@ -253,8 +253,8 @@ class TestPassCoordinatorContract:
         """
         ``ask`` is abstract, and is the only thing a coordinator must write.
 
-        Checked through the class's own record of what is abstract rather
-        than by calling it, which the type checkers rightly refuse to allow.
+        Checked through the class's own record of what is abstract, because
+        calling an abstract method is a type error.
         """
         assert inspect.isabstract(PassCoordinator)
         assert PassCoordinator.__abstractmethods__ == frozenset({"ask"})
@@ -272,7 +272,7 @@ class TestPassCoordinatorContract:
 
 
 class TestMultiPageEventsAndRequest:
-    """The three waiting events, and a request's two new, defaulted fields."""
+    """The three waiting events, and a request's two defaulted fields."""
 
     @pytest.mark.parametrize(
         "name", ["AWAITING_NEXT_PASS", "AWAITING_BLANK_DECISION", "AWAITING_RETRY"]
@@ -291,7 +291,7 @@ class TestMultiPageEventsAndRequest:
         assert len({_wait_event(wait) for wait in PassWait}) == len(PassWait)
 
     def test_a_request_is_single_pass_by_default(self) -> None:
-        """Every existing construction stays a single-pass scan with no coordinator."""
+        """A request built without either field is a single-pass scan, no coordinator."""
         request = PipelineRequest(profile_name="p", title="t")
         assert request.multi_page is False
         assert request.pass_coordinator is None
@@ -348,7 +348,7 @@ class TestSpoolLedgerAcceptAndDiscard:
 
         A signal raises wherever the main thread is; landing as the files go,
         it must leave at worst orphan files, never a ledger entry the guard
-        would try to preserve from pages that no longer exist.
+        would try to preserve from pages already deleted.
         """
         sink = _sink_with_pages(tmp_path, "a", 2)
         ledger = _SpoolLedger()
@@ -844,7 +844,7 @@ class TestMultiPageRefusals:
         scanner.scan_pages.assert_not_called()
 
     def test_a_single_pass_request_never_asks_its_coordinator(self, rig: _Rig) -> None:
-        """A coordinator on a single-pass request is ignored: one pass, as today."""
+        """A coordinator on a single-pass request is ignored: the scan is one pass."""
         scanner = DistinctPageScanner(passes=((0,),))
         coordinator = ScriptedPassCoordinator([])
 
@@ -1441,7 +1441,7 @@ class TestMultiPageScannerFault:
         assert embedded_streams(document) == _pages(scanner, [0, 2])
 
     def test_an_empty_feeder_on_the_first_pass_fails_the_job(self, rig: _Rig) -> None:
-        """With nothing kept, an empty feeder is the ordinary failure it is today."""
+        """With nothing kept, an empty feeder is the ordinary empty-feeder failure."""
         empty = FeederEmptyError("No paper detected in feeder")
         scanner = DistinctPageScanner(passes=((),), fail_on={1: empty})
         coordinator = ScriptedPassCoordinator([])
@@ -1601,7 +1601,7 @@ class TestMultiPageBlankPages:
     A single-pass scan removes blank pages on its own; a multi-page scan asks
     instead, because the operator is standing there and a page kept on purpose
     must never be removed later.  Skipped pages are reported the way removed
-    ones always were, numbered over the document the operator built.
+    ones are, numbered over the document the operator built.
     """
 
     def test_a_blank_pass_asks_once_and_skip_leaves_it_out(
@@ -1767,7 +1767,7 @@ class TestMultiPageBlankPages:
         Skipping the only page offers no Finish, and a timeout then is all-blank.
 
         A document of no pages can never be finished by a press, and a wait
-        that runs out on one fails the way a scan of blank paper always has.
+        that runs out on one fails the way a scan of blank paper does.
         """
         scanner = DistinctPageScanner(passes=((0,),), blank={0})
         coordinator = ScriptedPassCoordinator([_SKIP, PassAnswer.TIMED_OUT])
@@ -1866,7 +1866,7 @@ class TestMultiPageBlankPages:
     def test_a_single_pass_scan_still_removes_blanks_by_itself(
         self, blank_rig: _Rig
     ) -> None:
-        """Without the multi-page loop, blank pages go without a question, as before."""
+        """Without the multi-page loop, blank pages are removed without a question."""
         scanner = DistinctPageScanner(passes=((0, 1, 2, 3),), blank={1, 3})
         coordinator = ScriptedPassCoordinator([])
 

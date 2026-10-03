@@ -200,11 +200,10 @@ class TestTheFormCarriesTheCheckbox:
         self, served: _Served
     ) -> None:
         """
-        Always present, never ticked on load, described by its help line.
+        The checkbox is always present, unticked on load, with its help line.
 
-        ``autocomplete="off"`` is pinned by string as well as by the Firefox
-        reload test: it is what stops a browser restoring a tick on reload, and
-        a page reload is the one place the server cannot see.
+        ``autocomplete="off"`` is what stops a browser restoring a tick on
+        reload, and a page reload is the one place the server cannot see.
         """
         page = served.client.get("/").text
 
@@ -232,7 +231,7 @@ class TestTheFormCarriesTheCheckbox:
     def test_a_page_opening_on_manual_duplex_disables_it_with_the_reason(
         self, duplex_opens: _Served
     ) -> None:
-        """The real ``disabled`` attribute, and the reason as visible text."""
+        """The checkbox carries a real ``disabled`` and the reason as visible text."""
         page = duplex_opens.client.get("/").text
 
         assert '<option value="default" selected>' in page
@@ -250,7 +249,7 @@ class TestTheRefreshRoute:
     def test_a_flatbed_profile_renders_it_enabled_and_unticked(
         self, served: _Served
     ) -> None:
-        """No tick asked for, none given; the wrapper owns its own swap."""
+        """With no tick asked for, none is given; the wrapper owns its own swap."""
         response = served.client.get(
             "/api/profiles/multi-page", params={"profile": FLATBED}
         )
@@ -269,7 +268,7 @@ class TestTheRefreshRoute:
     def test_a_tick_survives_a_change_to_a_profile_that_allows_it(
         self, served: _Served, profile: str
     ) -> None:
-        """A profile switch must not silently drop a choice."""
+        """A switch to a profile that allows the choice keeps the tick."""
         response = served.client.get(
             "/api/profiles/multi-page",
             params={"profile": profile, "multi_page": "on"},
@@ -283,7 +282,7 @@ class TestTheRefreshRoute:
     def test_a_manual_duplex_profile_disables_it_and_drops_the_tick(
         self, served: _Served
     ) -> None:
-        """Disabled, unticked, and the reason in place of the help line."""
+        """The field is disabled and unticked, the reason in place of its help line."""
         response = served.client.get(
             "/api/profiles/multi-page",
             params={"profile": DUPLEX, "multi_page": "on"},
@@ -297,7 +296,7 @@ class TestTheRefreshRoute:
         assert "aria-disabled" not in response.text
 
     def test_an_unknown_profile_is_refused(self, served: _Served) -> None:
-        """The same 422 the profile description route gives."""
+        """An unknown profile gets the 422 the profile description route gives."""
         response = served.client.get(
             "/api/profiles/multi-page", params={"profile": "nope"}
         )
@@ -338,7 +337,7 @@ class TestTheScanSubmit:
     def test_a_ticked_submit_reaches_the_worker_as_multi_page(
         self, served: _Served, profile: str
     ) -> None:
-        """The first per-scan option, handed over beside the job."""
+        """A ticked submit hands the worker ``multi_page=True`` beside the job."""
         response = served.client.post(
             "/api/scan", data={"profile": profile, "multi_page": "on"}
         )
@@ -371,10 +370,10 @@ class TestTheScanSubmit:
 
 
 class TestTheRefusalVocabulary:
-    """The new rejection's sentence and status."""
+    """The manual-duplex multi-page refusal's sentence and status."""
 
     def test_the_refusal_is_a_422_with_its_sentence(self) -> None:
-        """Unprocessable, like an unknown profile, and says what to change."""
+        """The refusal is a 422, like an unknown profile, and says what to change."""
         rejection = RequestRejection.MULTI_PAGE_MANUAL_DUPLEX
 
         assert rejection_status_code(rejection) == 422
@@ -423,12 +422,10 @@ _BUTTON_ID = re.compile(r'\bid="(?P<id>[^"]+)"')
 _HX_VALS = re.compile(r"hx-vals='(?P<vals>[^']*)'")
 _HX_CONFIRM = re.compile(r'hx-confirm="(?P<question>[^"]*)"')
 
-# The flip prompt's template is a sibling of the multi-page prompt and must not
-# change because the multi-page prompt exists.  Its digest is recorded here as
-# the file stood after its own last deliberate change -- the line naming the
-# scan, which also names the button group, the pictures hidden behind their
-# captions, and the note saying when the wait ends.  A later deliberate change
-# to the flip prompt re-records it; a multi-page change never should.
+# The flip prompt's template is a sibling of the multi-page prompt and does not
+# change because the multi-page prompt exists.  Its digest is pinned here: a
+# deliberate change to the flip prompt re-records it; a multi-page change never
+# should.
 _FLIP_TEMPLATE = (
     Path(app_module.__file__).parent / "templates" / "partials" / "flip.html"
 )
@@ -696,7 +693,7 @@ class TestThePromptTheOwnerSees:
         self, served: _Served, stager: _Stager
     ) -> None:
         """
-        Scan next page, Finish document, Re-scan, Abort scan, each posting itself.
+        It offers Scan next page, Finish document, Re-scan, Abort scan, in order.
 
         Only Abort confirms: the others are the loop's normal moves.
         """
@@ -745,7 +742,7 @@ class TestThePromptTheOwnerSees:
     def test_finish_is_disabled_with_its_reason_when_nothing_is_kept(
         self, served: _Served, stager: _Stager
     ) -> None:
-        """The real ``disabled`` attribute, pointing at the visible reason."""
+        """Finish carries a real ``disabled``, pointing at the visible reason."""
         stager.prompt(_next_pass(kept=0))
 
         area = _status_area(_status(served))
@@ -764,7 +761,7 @@ class TestThePromptTheOwnerSees:
     def test_the_blank_page_prompt_offers_skip_keep_and_rescan(
         self, served: _Served, stager: _Stager
     ) -> None:
-        """Three answers, Skip first, and no Abort and no confirmation."""
+        """It offers three answers, Skip first, with no Abort and no confirmation."""
         waiting = stager.prompt(_blank())
         copy = pass_prompt_copy(waiting.prompt)
 
@@ -1020,7 +1017,7 @@ class TestTheAnswerRoute:
     def test_a_dropped_answer_rerenders_the_status_area_only(
         self, served: _Served, stager: _Stager, case: _Dropped
     ) -> None:
-        """200, the current truth, no message, and the prompt still waiting."""
+        """A dropped answer gets the current status area, no message, prompt open."""
         waiting = stager.prompt(_next_pass(kept=case.kept))
         served.client.cookies.set(OWNER_COOKIE, case.presented)
 
@@ -1084,7 +1081,7 @@ class TestTheScanButtonAndBusyLine:
     def test_the_scan_button_waits_for_you(
         self, served: _Served, stager: _Stager, state: JobState
     ) -> None:
-        """Disabled, captioned for the person, and without a spinner."""
+        """The Scan button is disabled, captioned for the person, with no spinner."""
         stager.job(state)
 
         button = _SCAN_BUTTON.search(_status(served))
@@ -1097,7 +1094,7 @@ class TestTheScanButtonAndBusyLine:
     def test_the_flip_caption_is_unchanged(
         self, served: _Served, stager: _Stager
     ) -> None:
-        """A manual-duplex flip still says it is waiting for the flip."""
+        """A manual-duplex flip says it is waiting for the flip."""
         stager.job(JobState.AWAITING_FLIP)
 
         button = _SCAN_BUTTON.search(_status(served))
@@ -1126,7 +1123,7 @@ class TestTheFlipPromptIsUntouched:
     """The manual-duplex flip prompt is a sibling, and it does not change."""
 
     def test_the_flip_template_is_byte_for_byte_unchanged(self) -> None:
-        """Its digest is the one recorded before the multi-page prompt existed."""
+        """The flip template's digest matches the pinned one."""
         digest = hashlib.sha256(_FLIP_TEMPLATE.read_bytes()).hexdigest()
 
         assert digest == _FLIP_TEMPLATE_SHA256
@@ -1134,7 +1131,7 @@ class TestTheFlipPromptIsUntouched:
     def test_the_flip_owner_still_sees_the_flip_prompt(
         self, served: _Served, stager: _Stager
     ) -> None:
-        """The flip branch still renders the flip prompt, and not this one."""
+        """The flip branch renders the flip prompt, and not the multi-page one."""
         stager.job(JobState.AWAITING_FLIP)
 
         area = _status_area(_status(served))
