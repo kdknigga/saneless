@@ -1250,7 +1250,7 @@ def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
 
 
 def test_paperless_test_connected(client: TestClient) -> None:
-    """GET /api/paperless/test returns connected status."""
+    """A working Paperless connection reads ``connected`` with a 200."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "connected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1258,7 +1258,7 @@ def test_paperless_test_connected(client: TestClient) -> None:
 
 
 def test_paperless_test_token_rejected(client: TestClient) -> None:
-    """GET /api/paperless/test returns token_rejected status."""
+    """A refused token reads ``token_rejected`` with a 200, not an error status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "token_rejected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1266,7 +1266,7 @@ def test_paperless_test_token_rejected(client: TestClient) -> None:
 
 
 def test_paperless_test_unreachable(client: TestClient) -> None:
-    """GET /api/paperless/test returns unreachable status."""
+    """An unreachable Paperless reads ``unreachable`` with a 200, not an error status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "unreachable"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200

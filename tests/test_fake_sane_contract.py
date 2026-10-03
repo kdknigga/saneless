@@ -978,7 +978,7 @@ class TestTheDoubleItself:
         assert dev.br_x == pytest.approx(215.9, abs=1e-4)
 
     def test_a_narrowed_constraint_rejects_a_previously_legal_value(self) -> None:
-        """The option table is injectable, so a test can narrow a constraint."""
+        """An injected option table narrows a constraint, and the double enforces it."""
         dev = FakeSaneDev(
             options=[(1, "mode", "Scan mode", "Mode desc", 3, 0, 6, 5, ["Color"])]
         )

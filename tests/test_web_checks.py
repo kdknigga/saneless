@@ -2030,7 +2030,7 @@ class TestTheWindowFollowsTheProbe:
         self, client: TestClient
     ) -> None:
         """
-        The second window is a cap, not an exemption.
+        Under a live probe the poll still gives up at the probe attempt cap.
 
         A thread that died holding the single-flight lock leaves ``locked()``
         true forever, so the larger window has to end on its own too.

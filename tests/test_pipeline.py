@@ -146,7 +146,7 @@ class TestRunPipeline:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """Full pipeline: scan -> assemble -> upload succeeds."""
+        """A scan that assembles and uploads ends SUCCESS with no warning."""
         request = PipelineRequest(profile_name="default", title="Happy Path Doc")
         result = run_pipeline(
             scanner=mock_scanner,
@@ -165,7 +165,7 @@ class TestRunPipeline:
         mock_paperless: MagicMock,
         default_settings: Settings,
     ) -> None:
-        """Scanner raises ScanError -> pipeline raises ScanError."""
+        """A ScanError from the scanner leaves the pipeline as that same ScanError."""
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = ScanError("Device not found")
 
@@ -184,7 +184,7 @@ class TestRunPipeline:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Paperless raises PaperlessError -> pipeline raises PaperlessError."""
+        """A failed upload leaves the pipeline as the PaperlessError it raised."""
         # data_dir is pointed at tmp_path too: a failing delivery preserves
         # the assembled PDF into <data_dir>/failed/, and a test must not write
         # that into the shared default outside pytest's own temp directory.
@@ -8402,7 +8402,7 @@ class TestStaleIdsAreDroppedBeforeScanning:
     def test_an_unreachable_lookup_sends_the_ids_unchecked(
         self, default_settings: Settings
     ) -> None:
-        """Cannot tell: every id is uploaded as asked and nothing is warned."""
+        """With the id lookup unreachable, every id is uploaded and nothing is warned."""
         recorder = RecordingPaperless(tags=(3,))
         paperless = _recording_client(default_settings, recorder)
         lookup = _FixedLookup(tags=None, correspondents=None)

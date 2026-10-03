@@ -4447,7 +4447,7 @@ class TestConnectionTest:
     def test_unclassified_status_is_logged(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """An unclassified non-2xx is diagnosable, not silently bucketed."""
+        """An unclassified non-2xx status is logged, not silently bucketed."""
         with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
             assert _connection_result_for_status(429) is ConnectionStatus.SERVER_ERROR
         assert any("429" in message for message in caplog.messages)

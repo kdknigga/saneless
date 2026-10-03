@@ -734,7 +734,7 @@ def test_a_requested_probe_ignores_a_closed_watch_window(
     monkeypatch: pytest.MonkeyPatch,
     started_refreshers: list[CheckRefresher],
 ) -> None:
-    """Somebody pressing the button is, by definition, somebody watching."""
+    """A requested probe runs even after the watch window has closed."""
     spy = _spy(monkeypatch)
     clock = _FakeClock()
     refresher, _cache = _build(default_settings, clock, threading.Lock())
