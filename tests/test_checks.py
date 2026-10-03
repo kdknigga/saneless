@@ -2809,7 +2809,7 @@ def _scanner_row_on(surface: str, context: CheckContext) -> CheckResult:
 
 
 class TestScannerCheck:
-    """The Scanner row, including the pre-probe that keeps it fast (APPL-02)."""
+    """The Scanner row, including the pre-probe that keeps it fast."""
 
     def test_a_named_device_is_ready(self, tmp_path: Path) -> None:
         """
@@ -2847,7 +2847,7 @@ class TestScannerCheck:
         A ``net`` backend device id is ``net:<host>:<backend>:...``.  Putting
         it on the index page would publish a LAN address to everyone who can
         load the page, which is the same reason the fallback row omits the
-        folder path (ASVS V7, T-30-21).
+        folder path.
 
         Args:
             tmp_path: The test's own directory.
@@ -2930,11 +2930,11 @@ class TestScannerCheck:
 
     def test_the_not_reachable_row_is_gone(self) -> None:
         """
-        The old red row that blamed the scanner for every empty listing is gone.
+        No row blames the scanner for every empty listing.
 
-        Its advice, "switched on and connected ... press Check again", was
-        wrong for a host that refuses this machine, which was the case that
-        produced it.
+        Advice to check the scanner is "switched on and connected" is wrong
+        for a host that refuses this machine, the commonest cause of an
+        empty listing.
         """
         assert not hasattr(checks, "_scanner_unreachable")
 
@@ -2943,12 +2943,11 @@ class TestScannerCheck:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
     ) -> None:
         """
-        The 2026-09-22 case reads as a denial, and names the file that grants access.
+        A host that resets the handshake reads as a denial naming ``saned.conf``.
 
-        saned accepted the connection and then reset it during the opening
-        handshake, so enumeration found nothing.  The row used to say the
-        scanner was not reachable and to check it was switched on, which was
-        wrong on both counts.
+        saned accepts the connection and then resets it during the opening
+        handshake, so enumeration finds nothing.  The scanner is reachable
+        and switched on, so the row must not say otherwise.
 
         Args:
             tmp_path: The test's own directory.
@@ -3123,20 +3122,15 @@ class TestScannerCheck:
         """
         A configured ``net:`` device's own host is probed before SANE is entered.
 
-        The device is not listed, which is the case that opens it.  libsane's
-        net backend dials the device's host when the device is opened, with no
-        timeout, so a switched-off host there is the ~127 s uninterruptible
-        connect the pre-probe exists to prevent -- and on the status strip it
-        would be paid holding the scanner gate.  The host is not among the
-        probed setting entries (none is configured, or it is past the cap), so
-        the preflight probes it on its own, and a host that does not answer
-        ends the check before libsane is touched at all.
+        Opening an unlisted device dials its host with no timeout -- a ~127 s
+        uninterruptible connect, held under the scanner gate on the strip --
+        so a host outside the probed entries is probed alone, and silence ends
+        the check before libsane is touched.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
-            setting: The configured ``scanner.host``, and how many hosts the
-                preflight must probe for it.
+            setting: The ``scanner.host`` and how many hosts the preflight dials.
             surface: Which of the two surfaces runs the check.
 
         """
@@ -3180,16 +3174,13 @@ class TestScannerCheck:
         """
         A refusing own host is probed, then listed and the device opened.
 
-        A refused connect returns at once inside libsane, so it costs the open
-        nothing, and the open is how the check learns whether a scan could use
-        the device.  This one opens, so the row is amber and names the stopped
-        scanner service without naming the host.
+        A refused connect costs libsane's open nothing.  The device opens, so
+        the row is amber and names the stopped service, never the host.
 
         Args:
             tmp_path: The test's own directory.
             monkeypatch: pytest's patcher.
-            setting: The configured ``scanner.host``, and how many hosts the
-                preflight must probe for it.
+            setting: The ``scanner.host`` and how many hosts the preflight dials.
             hosts_subject: How the row counts the refusing host.
             surface: Which of the two surfaces runs the check.
 
@@ -3251,13 +3242,9 @@ class TestScannerCheck:
         """
         A setting's probe on another port does not cover the device's host.
 
-        ``scanbox.lan:7000`` is probed on port 7000, but libsane opens a
-        ``net:scanbox.lan:...`` device on saned's registered port.  The answer
-        on 7000 says nothing about that port, so the device's host is probed
-        on it as well.  A silent answer there ends the check before libsane
-        is touched: no listing, and no open.  A refusal there does not,
-        because a refused connect returns at once inside libsane, so the
-        device is listed and then opened.
+        libsane opens ``net:scanbox.lan:...`` on saned's registered port, so
+        the host is probed there too: silence ends the check before listing or
+        opening, while a refusal, which costs libsane nothing, does not.
 
         Args:
             tmp_path: The test's own directory.
@@ -3446,7 +3433,7 @@ class TestScannerCheck:
 
     def test_no_scanner_support_is_its_own_row(self, tmp_path: Path) -> None:
         """
-        A machine without python-sane gets the A-1 row, not a refusal to run.
+        A machine without python-sane gets its own red row, not a refusal to run.
 
         Args:
             tmp_path: The test's own directory.
@@ -3462,7 +3449,7 @@ class TestScannerCheck:
 
     def test_a_skipped_scanner_makes_no_backend_call(self, tmp_path: Path) -> None:
         """
-        D-08: while a scan runs the backend is not touched at all.
+        While a scan runs the backend is not touched at all.
 
         Nothing in ``sane_backend.py`` mutually excludes two SANE calls, so
         this is correctness rather than politeness -- a status probe landing on
@@ -3526,7 +3513,7 @@ class TestScannerCheck:
 
     def test_a_healthy_saned_reaches_the_backend(self, tmp_path: Path) -> None:
         """
-        A host whose saned answers the handshake then behaves as before.
+        A host whose saned answers the handshake goes on to be enumerated.
 
         Args:
             tmp_path: The test's own directory.
@@ -3662,7 +3649,7 @@ class TestScannerCheck:
         No host is configured and the configured device, if any, is not a
         ``net:`` device, so there is no entry to dial and nothing is dialled.
         This is also the fallback that cannot produce a false FAIL: the check
-        behaves exactly as it did before the probe existed.
+        goes straight to the backend.
 
         Args:
             tmp_path: The test's own directory.
@@ -3707,8 +3694,7 @@ class TestScannerCheck:
         """
         The probe dials the host SANE dials, not the one the file names.
 
-        ``_ensure_initialised`` (``sane_backend.py:876-883``) honours a
-        pre-existing ``SANE_NET_HOSTS`` and logs that it is ignoring
+        The backend's ``_ensure_initialised`` honours a pre-existing ``SANE_NET_HOSTS`` and logs that it is ignoring
         ``scanner.host``.  A probe reading only the setting can therefore
         describe a host that is not in play at all: a down config host
         producing a row while the live environment host serves devices.
@@ -3819,14 +3805,11 @@ class TestScannerCheck:
         expected: tuple[str, str],
     ) -> None:
         """
-        CR-02: a dead host is a fact about the host, not about the appliance.
+        A dead host is a fact about the host, not about the appliance.
 
-        ``SANE_NET_HOSTS`` *adds* net devices; it does not replace local
-        backend enumeration, so "a configured host did not answer" never
-        implied "there is no scanner".  A true statement about a deployment
-        that may still work is amber.  The row names the worst outcome among
-        the hosts, with a count once there is more than one, and each outcome
-        carries its own next step.
+        ``SANE_NET_HOSTS`` adds net devices beside local ones, so a silent
+        host does not mean "no scanner": the row is amber, names the worst
+        outcome with a count once there are several hosts, and its next step.
 
         Args:
             tmp_path: The test's own directory.
@@ -3895,9 +3878,8 @@ class TestScannerCheck:
         A stopped scanner service is enumerated, and a working scanner keeps it amber.
 
         A refused connect returns at once inside libsane, so the listing runs
-        and finds the usable scanner.  The row reports the worst outcome among
-        the hosts, with a count once there is more than one, in a sentence
-        with a single "but".
+        and finds the usable scanner.  The row reports the worst outcome, with
+        a count once there are several hosts, in a sentence with one "but".
 
         Args:
             tmp_path: The test's own directory.
@@ -3925,8 +3907,8 @@ class TestScannerCheck:
         """
         A host that is off and a host whose saned is stopped need different fixes.
 
-        Both still end in pressing Check again: each state was measured to
-        clear on the next Check, with no restart.  The silent host is never
+        Both end in pressing Check again, because each state clears on the
+        next Check with no restart.  The silent host is never
         enumerated, so its row is amber; the refused one is, and with nothing
         listed its row is red.
 
@@ -3983,18 +3965,13 @@ class TestScannerCheck:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        R3-CR-01 end to end: a U+00B2 in the port leaves the run green.
+        A U+00B2 in the port, end to end, leaves the run free of FAIL.
 
-        The probe half of this is stubbed -- ``_recording_dialler`` replaces
-        ``checks._probe_saned``, so the test resolves no name and
-        opens no socket.  What is measured is the row the *parser* produces:
-        before the fix the ``ValueError`` escaped into ``run_checks``' generic
-        per-check handler, so the Scanner row carried
-        ``_CHECK_FAILED_MESSAGE`` with state FAIL, ``worst_state`` was FAIL and
-        ``saneless doctor`` exited 2 on an appliance that scans fine.  The
-        setting is put in the environment rather than the config file because
-        ``_saned_host_setting`` prefers ``SANE_NET_HOSTS``, which is where a
-        container operator would hit this.
+        The probe is stubbed, so what is checked is the row the *parser*
+        produces: a ``ValueError`` from it would reach ``run_checks``' generic
+        handler, turn the run FAIL and make ``saneless doctor`` exit 2 on a
+        working appliance.  The setting goes in ``SANE_NET_HOSTS``, which
+        ``_saned_host_setting`` prefers and a container operator would use.
 
         Args:
             tmp_path: The test's own directory.
@@ -4037,12 +4014,11 @@ class TestScannerCheck:
         outcome: checks._SanedOutcome,
     ) -> None:
         """
-        ASVS V7: a LAN address never reaches a LAN-visible page through this row.
+        A LAN address never reaches a LAN-visible page through this row.
 
-        Same class of fact, and the same refusal, as ``_device_label``
-        declining to print a ``net:<host>`` identifier.  It also never falls
-        back on the red row's "switched on and connected", which was the
-        wrong advice for a host whose saned refused the connection.
+        It is the same refusal as ``_device_label`` declining to print a
+        ``net:<host>`` id.  The row never says "switched on and connected",
+        the wrong advice for a host whose saned refuses the connection.
 
         Args:
             tmp_path: The test's own directory.
@@ -4125,10 +4101,10 @@ class TestScannerCheck:
         self, tmp_path: Path
     ) -> None:
         """
-        WR-01 and CR-02 together: an IPv6 literal produces no probe and no row.
+        An IPv6 literal produces no probe and no probe verdict.
 
-        Before the refusal, ``fe80::1`` dialled host ``fe80`` on port 1, every
-        dial failed, and the short circuit turned that into a verdict.
+        Read as a host list, ``fe80::1`` would dial host ``fe80`` on port 1,
+        every dial would fail, and the short circuit would make a verdict of it.
 
         Args:
             tmp_path: The test's own directory.
@@ -4290,8 +4266,8 @@ _TIMEOUT_TEXT: Final = (
 )
 _NO_ANSWER_TEXT: Final = "The scanner library returned no answer while listing scanners"
 
-# The longest message the Scanner row could carry before these two were added,
-# which is what the status strip's layout is already known to hold.
+# The longest Scanner row message other than the listing-failure rows, which
+# is what the status strip's layout is known to hold.
 _LONGEST_SCANNER_MESSAGE: Final = _UNPROBED_DEVICE_MESSAGE
 
 _CRASHED: Final = checks._ListingFailure.CRASHED
