@@ -5,8 +5,6 @@ The cache takes its clock as a constructor parameter, so every assertion about
 the TTL here moves a float instead of waiting for one to pass, and the
 single-flight tests hold a fetch open on an Event rather than a pause.  Nothing
 in this file sleeps.
-
-Covers requirements: PLSS-05, ROBU-05.
 """
 
 from __future__ import annotations
@@ -91,7 +89,7 @@ def _raise(exc: Exception) -> _Rows:
 
 
 def test_cache_set_and_get() -> None:
-    """Cache stores and retrieves values by key (PLSS-05)."""
+    """Cache stores and retrieves values by key."""
     cache = MetadataCache(ttl=60, clock=_FakeClock())
     cache.set("tags", [{"id": 1, "name": "receipt"}])
     result = cache.get("tags")
@@ -111,7 +109,7 @@ def test_cache_ttl_expiry() -> None:
 
 
 def test_cache_invalidate() -> None:
-    """Explicit invalidation removes cached entry (PLSS-05)."""
+    """Explicit invalidation removes the cached entry."""
     cache = MetadataCache(ttl=60, clock=_FakeClock())
     cache.set("tags", [{"id": 1, "name": "receipt"}])
     cache.invalidate("tags")
@@ -128,7 +126,7 @@ def test_cache_invalidate_nonexistent() -> None:
 
 
 def test_cache_per_resource() -> None:
-    """Different resources have independent cache entries (PLSS-05)."""
+    """Different resources have independent cache entries."""
     cache = MetadataCache(ttl=60, clock=_FakeClock())
     cache.set("tags", [{"id": 1, "name": "receipt"}])
     cache.set("correspondents", [{"id": 1, "name": "ACME Corp"}])
@@ -139,7 +137,7 @@ def test_cache_per_resource() -> None:
 
 def test_get_or_fetch_single_flight() -> None:
     """
-    Concurrent misses for one key trigger a single fetch (ROBU-05).
+    Concurrent misses for one key trigger a single fetch.
 
     The fetch is held open until every thread has missed the fresh-value check
     at least once, so each of them had the chance to start a fetch of its own.
@@ -459,7 +457,7 @@ def test_invalidate_during_an_in_flight_fetch_is_not_undone() -> None:
 
 
 def test_get_or_fetch_returns_fresh_value_without_fetching() -> None:
-    """A fresh value is served from cache; an expired one is refetched (ROBU-05)."""
+    """A fresh value is served from cache; an expired one is refetched."""
     clock = _FakeClock()
     cache = MetadataCache(ttl=1, clock=clock)
     cached: _Rows = [{"id": 1, "name": "receipt"}]
