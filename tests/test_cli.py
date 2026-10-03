@@ -1,4 +1,4 @@
-"""Tests for CLI commands via click.testing.CliRunner."""
+"""The saneless commands' output, exit codes and side effects, via CliRunner."""
 
 from __future__ import annotations
 
@@ -7010,7 +7010,7 @@ def _closing_scanner() -> tuple[type[_ClosingScanner], list[_ClosingScanner]]:
 
 class TestEntryPointsCloseTheBackend:
     """
-    Each one-shot command shuts SANE down when it ends (HARD-05, D-18).
+    Each one-shot command shuts SANE down when it ends.
 
     ``sane_init`` is process-global, so somebody has to undo it, and the one
     place that knows the process is ending is the entry point that started it.
@@ -7239,8 +7239,8 @@ class TestEntryPointsCloseTheBackend:
 # The five categories a SanelessError can carry through the guard to an exit
 # code that is not ExitCode.UNEXPECTED, each paired with an exception
 # classify_error maps to it.  UNKNOWN and REJECTED are deliberately absent:
-# both map to UNEXPECTED, which takes the _report_unexpected branch, and D-12
-# leaves that branch alone because its category is a guess.
+# both map to UNEXPECTED, which takes the _report_unexpected branch, and that
+# branch prints no advice because its category is a guess.
 _ADVISED_CATEGORIES: list[tuple[ErrorCategory, type[SanelessError]]] = [
     (ErrorCategory.FEEDER, FeederEmptyError),
     (ErrorCategory.SCANNER, ScanError),
@@ -7277,16 +7277,16 @@ def _scan_raising(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> Result
 
 class TestFailureAdvice:
     """
-    The second CLI line, ``Try: <next step>`` (APPL-04, D-12).
+    A classified failure ends with a second line, ``Try: <next step>``.
 
-    Phase 28's failure line is printed byte-identically and the advice follows
-    it on stderr, so a script parsing line 1 is unaffected.
+    The failure line is printed byte for byte and the advice follows it on
+    stderr, so a script parsing line 1 is unaffected.
     """
 
     def test_feeder_failure_prints_the_failure_line_then_the_advice(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The UI-SPEC S2 specimen: the locked line, then ``Try: ``."""
+        """A feeder failure prints its failure line, then the ``Try: `` line."""
         exc = FeederEmptyError("the feeder is empty")
         result = _scan_raising(monkeypatch, exc)
 
@@ -7317,7 +7317,7 @@ class TestFailureAdvice:
         category: ErrorCategory,
         exc_type: type[SanelessError],
     ) -> None:
-        """The advice is additive: line 1 is still exactly _failure_line's."""
+        """Line 1 is exactly ``_failure_line``'s output; the advice only adds line 2."""
         exc = exc_type("boom")
         result = _scan_raising(monkeypatch, exc)
 
@@ -7332,7 +7332,7 @@ class TestFailureAdvice:
         category: ErrorCategory,
         exc_type: type[SanelessError],
     ) -> None:
-        """Phase 28's D-07 exit code per category still holds."""
+        """Each category keeps its own exit code with the advice line printed."""
         result = _scan_raising(monkeypatch, exc_type("boom"))
 
         assert result.exit_code == int(exit_code_for(category))
@@ -7359,7 +7359,7 @@ class TestFailureAdvice:
     def test_an_unexpected_saneless_error_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A bare SanelessError takes _report_unexpected, which is unchanged."""
+        """A bare SanelessError takes ``_report_unexpected``, which prints no advice."""
         result = _scan_raising(monkeypatch, SanelessError("boom"))
 
         assert result.exit_code == 5
@@ -7368,7 +7368,7 @@ class TestFailureAdvice:
     def test_a_non_saneless_exception_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The final except Exception arm is untouched by D-12."""
+        """The final ``except Exception`` arm prints no advice line."""
         result = _scan_raising(monkeypatch, RuntimeError("boom"))
 
         assert result.exit_code == 5
@@ -7446,7 +7446,7 @@ class TestFailureAdvice:
     def test_a_cancelled_scan_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A cancel is not a failure, so there is nothing to advise (D-03)."""
+        """A cancel is not a failure, so there is nothing to advise."""
         result = _scan_raising(monkeypatch, ScanCancelledError("Cancelled"))
 
         assert result.exit_code == 130
@@ -7455,7 +7455,7 @@ class TestFailureAdvice:
     def test_a_keyboard_interrupt_gets_no_advice_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ctrl-C exits 130 with one line, as it did before D-12."""
+        """Ctrl-C exits 130 with one line and no advice."""
         result = _scan_raising(monkeypatch, KeyboardInterrupt())
 
         assert result.exit_code == 130
@@ -7476,8 +7476,7 @@ class _RaiseSite:
     Attributes:
         setup: Arranges the failure and returns the runner and the argv.
         exit_code: The documented exit code.
-        line_one: How the failure line starts, as it did before advice moved
-            to the raise site.
+        line_one: How the failure line starts.
         next_step: The ``Try:`` line's text: the site's own fix.
 
     """
@@ -7786,8 +7785,8 @@ _RAISE_SITES: dict[str, _RaiseSite] = {
     ),
 }
 
-# The five refusals that used to print their line and exit on their own, each
-# with the whole first line it prints, which is unchanged.
+# The five refusals that exit 2 through the group guard, each with the whole
+# first line it prints.
 _REFUSALS: dict[str, str] = {
     "unknown profile": "Unknown profile: nonesuch",
     "multi-page with manual duplex": multi_page_manual_duplex_refusal(_DUPLEX_PROFILE),
@@ -7811,7 +7810,7 @@ class TestRaiseSiteAdvice:
     def test_each_raise_site_prints_its_own_next_step(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, site: str
     ) -> None:
-        """Line 1 is the failure as before; line 2 is the site's own fix."""
+        """Line 1 is the failure line; line 2 is the site's own fix."""
         case = _RAISE_SITES[site]
         with contextlib.ExitStack() as stack:
             runner, args = case.setup(monkeypatch, tmp_path, stack)
@@ -7836,8 +7835,7 @@ class TestRaiseSiteAdvice:
         """
         A refusal is logged at ERROR, as every other failure is, and exits 2.
 
-        Its first line is the line it printed before it went through the
-        guard, byte for byte.
+        Its first line is the refusal's own line, byte for byte.
         """
         case = _RAISE_SITES[site]
         caplog.set_level(logging.ERROR, logger="saneless.cli")
@@ -7890,7 +7888,7 @@ def _refusing_paperless() -> type:
     Build a PaperlessClient stand-in whose construction fails the test.
 
     ``scan`` builds the client after the scanner, so reaching it at all would
-    mean the D-16 guard ran too late.
+    mean the token refusal ran too late.
 
     Returns:
         A class that raises if it is ever constructed.
@@ -7901,7 +7899,7 @@ def _refusing_paperless() -> type:
         """A paperless client that must not be reached."""
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            """Fail loudly: D-16 refuses before this point."""
+            """Fail loudly: the token refusal comes before this point."""
             msg = "PaperlessClient was built despite a placeholder token"
             raise AssertionError(msg)
 
@@ -7912,8 +7910,8 @@ def _open_counting_scanner(opens: list[str]) -> type[ScannerBackend]:
     """
     Build a scanner class that records every construction and device query.
 
-    "Before the scanner is opened" is the whole point of D-16, so it is
-    asserted from a counter rather than assumed from the exit code.
+    "Before the scanner is opened" is the whole point of the token refusal,
+    so it is asserted from a counter rather than assumed from the exit code.
 
     Args:
         opens: The list every call appends its name to.
@@ -7965,10 +7963,10 @@ def _token_settings(
 
 class TestScanTokenRefusal:
     """
-    ``saneless scan`` refuses a placeholder token before paper moves (D-16).
+    ``saneless scan`` refuses a placeholder token before paper moves.
 
     The check runs before the scanner is opened, it is unconditional, and the
-    three commands that never talk to paperless-ngx are untouched (APPL-07).
+    three commands that never talk to paperless-ngx are untouched.
     """
 
     def test_a_blank_token_is_a_placeholder_and_exits_2_before_the_scanner(
@@ -8022,7 +8020,7 @@ class TestScanTokenRefusal:
     def test_a_consume_dir_fallback_does_not_soften_the_placeholder_refusal(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """D-16: a configured fallback must not make the surfaces disagree."""
+        """A configured consume-dir fallback does not soften the token refusal."""
         opens: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
@@ -8039,7 +8037,7 @@ class TestScanTokenRefusal:
     def test_the_placeholder_refusal_names_the_title_and_profile_then_advises(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """It is a ConfigError, so it wears the D-08 shape and the D-12 advice."""
+        """As a ConfigError it names the title and profile, then gives the advice."""
         runner, _ = _patch_cli(
             monkeypatch,
             settings=_token_settings(tmp_path, "changeme"),
@@ -8059,7 +8057,7 @@ class TestScanTokenRefusal:
     def test_the_placeholder_refusal_never_echoes_the_value(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """ASVS V7: the token is passed to the predicate, never rendered."""
+        """The token is passed to the predicate, never rendered."""
         secret = "your-token-here"
         runner, _ = _patch_cli(
             monkeypatch,
@@ -8169,7 +8167,7 @@ def cli_local_zone(monkeypatch: pytest.MonkeyPatch) -> Generator[Callable[[str],
     """
     Give one test control of the process's local zone, then restore it.
 
-    The same technique plan 30-01's ``local_zone`` fixture uses: ``local_time``
+    The same technique as test_vocabulary's ``local_zone``: ``local_time``
     renders whatever zone the C library reports, so pinning ``TZ`` and calling
     ``time.tzset()`` is the only way to assert an exact string on a host in an
     unknown zone. The trailing ``tzset`` is what makes the C library notice the
@@ -8207,7 +8205,7 @@ def _jobs_header_title_width(header: str) -> int:
 
 
 class TestJobsTableWidth:
-    """The human ``jobs`` table renders local time and still fits (APPL-12)."""
+    """The human ``jobs`` table renders local time and still fits."""
 
     @staticmethod
     def _settings_for(tmp_path: Path) -> Settings:
@@ -8230,7 +8228,7 @@ class TestJobsTableWidth:
         return recorded
 
     def test_the_cli_and_the_web_share_one_formatter_object(self) -> None:
-        """D-35: cli.py imports the function, it does not re-derive the format."""
+        """cli.py imports the formatter; it does not re-derive the format."""
         assert cli_module.local_time is vocabulary_module.local_time
 
     def test_the_table_renders_local_time_with_the_zone_named(
@@ -8263,12 +8261,10 @@ class TestJobsTableWidth:
         """
         At 80 columns the title keeps its floor of 15.
 
-        It was 24 until the Status column had to hold "Uploaded with a
-        warning", seven characters wider than "Saved to folder", and 17 until
-        it had to hold "Waiting: blank pages found", three wider again.  The
-        Profile column gave up one character so the title did not drop below
-        its floor.  The zone token still fits in the timestamp column's own
-        slack.
+        The Status column is wide enough for "Waiting: blank pages found",
+        and the Profile column gives up one character so the title does not
+        drop below its floor.  The zone token fits in the timestamp column's
+        own slack.
         """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
@@ -8299,7 +8295,7 @@ class TestJobsTableWidth:
 
 
 class TestJobsJsonContract:
-    """``jobs --json`` stays UTC ISO-8601: it is a machine contract (D-34)."""
+    """``jobs --json`` stays UTC ISO-8601: it is a machine contract."""
 
     @staticmethod
     def _settings_for(tmp_path: Path) -> Settings:
@@ -8375,7 +8371,7 @@ def _raise_runtime_error(message: str) -> None:
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeLogging:
     """
-    ``serve`` streams to stderr and writes no log file (D-34..D-40, DLVR-04).
+    ``serve`` streams to stderr and writes no log file.
 
     Every test here patches in the **real** ``configure_logging``: a stub that
     attaches nothing can neither prove a handler was attached nor prove one
@@ -8417,7 +8413,7 @@ class TestServeLogging:
     def test_serve_attaches_no_file_handler_and_creates_no_log_directory(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A service writes no file: the platform owns retention (D-35, D-40)."""
+        """A service writes no file: the platform owns retention."""
         settings = self._serve_settings(tmp_path)
         TestServeCommand._stub_create_app(monkeypatch)
         _fake_server_run(monkeypatch)
@@ -8446,7 +8442,7 @@ class TestServeLogging:
         The Serving on line reaches stderr exactly once, whatever the level.
 
         A service's log stream is stderr too, so printing the line and also
-        logging it put the same fact on the same stream twice; a log record
+        logging it would put the same fact on the same stream twice; a record
         alone would vanish at ``log_level = "WARNING"``.
         """
         settings = self._serve_settings(tmp_path)
@@ -8468,7 +8464,7 @@ class TestServeLogging:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Exactly one stream handler carries the service's records (D-36).
+        Exactly one stream handler carries the service's records.
 
         The handlers are counted by difference against a snapshot, because
         pytest keeps capture handlers of its own on the root logger. That the
@@ -8536,10 +8532,10 @@ class TestServeLogging:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args: list[str]
     ) -> None:
         """
-        The serve stream renders tracebacks with and without ``-v`` (D-36 amended).
+        The serve stream renders tracebacks with and without ``-v``.
 
-        D-06's traceback-free rule was justified by "stderr is the user's
-        terminal now". For a service the stream *is* the log, journald is
+        A one-shot command keeps tracebacks off stderr because stderr is the
+        user's terminal. For a service the stream *is* the log, journald is
         nobody's terminal, and no file carries the traceback instead, so a
         traceback-free stream would discard every one of them.
         """
@@ -8566,7 +8562,7 @@ class TestServeLogging:
         """
         An exit-5 line under ``serve`` does not tell the operator to restart.
 
-        The stream already rendered the traceback (D-36 amended), so "Run
+        The stream already rendered the traceback, so "Run
         again with -v to see the traceback" would send someone to restart a
         running service to see what is printed directly above the line.
         """
@@ -8633,11 +8629,10 @@ class TestServeLogging:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A one-shot command's logging is untouched by the mode split (D-34).
+        A one-shot command gets the rotating file handler, unlike ``serve``.
 
-        The regression guard: ``jobs`` still gets the rotating file handler and
-        still records ``log_file``, so "Full details in <log_file>" keeps
-        working. If this fails, the service mode leaked into CLI mode.
+        ``jobs`` records ``log_file``, so "Full details in <log_file>" works.
+        A failure here means the service mode leaked into CLI mode.
         """
         log_file = tmp_path / "logs" / "saneless.log"
         settings = _make_settings(
