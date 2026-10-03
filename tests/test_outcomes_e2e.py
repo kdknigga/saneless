@@ -1,14 +1,12 @@
 """
-End-to-end proof of Phase 23: the real worker driving the real pipeline.
+Every scan outcome is persisted correctly by the real worker on the real pipeline.
 
-What makes this module different from every other test file in the repository:
-it is the only one that runs the real :func:`saneless.pipeline.run_pipeline`
-inside the real :class:`saneless.worker.ScanWorker`.  All 49 ``ScanWorker(...)``
-construction sites in ``tests/test_worker.py`` replace the pipeline entry
-point in the worker's own module namespace, which makes them tests of the
-worker's *handling* of a result rather than tests of the result.  This module
-patches run_pipeline nowhere, and an acceptance grep enforces that the
-patch target's dotted name does not appear below.
+This is the only module that runs the real :func:`saneless.pipeline.run_pipeline`
+inside the real :class:`saneless.worker.ScanWorker`.  The ``ScanWorker(...)``
+tests in ``tests/test_worker.py`` replace the pipeline entry point in the
+worker's own module namespace, which makes them tests of the worker's
+*handling* of a result rather than tests of the result.  This module patches
+run_pipeline nowhere.
 
 Exactly two things are stubbed, and nothing else:
 
@@ -31,7 +29,7 @@ filtering, real preservation into ``<data_dir>/failed/``, a real file-backed
 SQLite job store, and a real background thread.  Every assertion reads the
 **persisted job row** through ``store.get_job`` rather than a mock's call list,
 because a row in the database is the thing a user's web page and ``saneless
-jobs`` actually render (T-23-38).
+jobs`` actually render.
 
 **On speed.**  Apart from the one-second flip timeout below, all the cases
 together sleep for well under a second, using only seams that already exist:
@@ -57,10 +55,9 @@ together sleep for well under a second, using only seams that already exist:
   request, before any sleep, and cost nothing.
 
 The sleep primitive itself is **not** patched anywhere here, and no flat
-pause appears in this module -- an acceptance grep enforces both.  Patching it
-in ``saneless.paperless`` would disable the ``min(delay, remaining)`` deadline
-clamp that plan 23-04 added, which is part of what these cases prove; Phase 32
-owns that sweep.  The upload's and the poll's own waits go through the
+pause appears in this module.  Patching it in ``saneless.paperless`` would
+disable the ``min(delay, remaining)`` deadline clamp, which is part of what
+these cases prove.  The upload's and the poll's own waits go through the
 client's ``PaperlessTiming`` seam, which exists because a 60 s budget cannot be waited
 out under pytest's 60 s timeout; where a case needs no retry it simply gets a
 zero budget.
@@ -135,10 +132,10 @@ _TITLE = "Quarterly Report"
 # The scans run under a profile that is deliberately NOT the one named
 # "default".  auto_profiles.is_bare_default matches a profile set of exactly
 # one untouched profile called "default", and on that match the worker's startup
-# generation (D-14) would build profiles from the stub scanner and swap them in
-# while these runs read them.  It writes only to settings.config_path (D-16),
-# which is None for these directly-built settings, so nothing would reach the
-# disk (D-17) -- but the swap alone would change the profile set under test.
+# generation would build profiles from the stub scanner and swap them in
+# while these runs read them.  It writes only to settings.config_path, which
+# is None for these directly-built settings, so nothing would reach the
+# disk -- but the swap alone would change the profile set under test.
 # Settings requires a "default" profile to exist, so it is defined alongside
 # this one: two entries make is_bare_default return on its length check and
 # startup generation skip before it asks the scanner anything.
@@ -146,10 +143,10 @@ _PROFILE = "e2e"
 
 _SIMPLEX_SOURCE = "Flatbed"
 # A manual-duplex profile names a real feeder source and says ``duplex =
-# "manual"``: source is a pure SANE value and no longer selects the strategy.
+# "manual"``: source is a pure SANE value and does not select the strategy.
 _DUPLEX_SOURCE = "ADF"
-# The deprecated one-key form, kept as its own case so DPLX-02's "still loads
-# AND scans" is proven through the real pipeline, not only at config load.
+# The deprecated one-key form, kept as its own case so that it still loads
+# AND scans is proven through the real pipeline, not only at config load.
 _LEGACY_DUPLEX_SOURCE = "ADF Manual Duplex"
 
 # The shipped default, used by every case that does not time out a poll: their first
@@ -172,11 +169,11 @@ _TIMEOUT_BUDGET = 1
 # answer arrives first, so the bound never elapses.
 _PRODUCTION_FLIP_TIMEOUT = 600
 
-# One second, the smallest value config accepts.  Zero used to be the zero-cost
-# seam here, but OutputConfig now rejects it (WR-01: a zero wait fails every
-# manual-duplex job right after pass A), and the field is typed ``int``, so a
-# fractional float like 0.05 is rejected too.  This one second is the only wall
-# clock this module spends, and it proves the same property end to end: nothing
+# One second, the smallest value config accepts.  OutputConfig rejects zero,
+# since a zero wait would fail every manual-duplex job right after pass A, and
+# the field is typed ``int``, so a fractional float like 0.05 is rejected too.
+# This second, and the same second the multi-page cases wait, is the only wall
+# clock this module spends, and it proves the property end to end: nothing
 # answered within the bound, so the coordinator resolves TIMED_OUT and the
 # pipeline raises before pass B.  Every terminal wait on a run that waits this
 # out uses ``case.flip_timeout + 2.0``, keeping the 2 s margin on top of it.
@@ -190,7 +187,7 @@ _DUPLICATE_TASK = "e2e-task-duplicate"
 _EXISTING_DOCUMENT = 42
 _PAPERLESS_MESSAGE = "Document consumption failed: unsupported PDF producer"
 
-# The mid-batch fault HARD-02 is about, shaped like the SANE backend's own
+# A mid-batch scanner fault, shaped like the SANE backend's own
 # per-page error text so the end-to-end message is the one a user would read.
 _SCANNER_MESSAGE = "Scanner error on page 4: Document feeder jammed"
 _SCANNER_FAILURE = ScanError(_SCANNER_MESSAGE)
@@ -245,7 +242,7 @@ def _v10_tasks(task_id: str, status: str, error_message: str) -> dict[str, objec
     v10 paginates the list into ``{"count", "next", "previous", "results"}``,
     spells its statuses in lowercase, and carries the failure text in
     ``result_data["error_message"]`` rather than a flat ``result`` string.
-    OUTC-11's tolerance for all three differences is exercised at the unit
+    The client's tolerance for all three differences is exercised at the unit
     level; this is the e2e layer proving it against the real pipeline.
 
     Args:
@@ -542,7 +539,7 @@ class _Case:
             not a handler, so per-case counters start fresh every run.
         expected_state: The persisted JobState the run must end in.
         expected_outcome: The persisted ScanOutcome, or None when the run
-            failed -- D-01: a failure raises, so the column stays NULL rather
+            failed -- a failure raises, so the column stays NULL rather
             than claiming a measurement nobody made.
         expected_pages: (scanned, removed, uploaded), all None on a failure.
         expected_failed_pdfs: How many PDFs must survive in <data_dir>/failed/.
@@ -719,11 +716,10 @@ _CASES = [
         expected_state=JobState.ERROR,
         expected_outcome=None,
         expected_pages=(None, None, None),
-        # One, since plan 29-09: the timeout raises before pass B and before
-        # the document's own assembly, but pass A's three fronts are on the
-        # spool and nobody chose to stop, so D-10 keeps them as a ``(fronts)``
-        # partial.  Phase 23's guard, which spans upload and poll only, still
-        # never runs on this path.
+        # One: the timeout raises before pass B and before the document's
+        # own assembly, but pass A's three fronts are on the spool and nobody
+        # chose to stop, so they are kept as a ``(fronts)`` partial.  The
+        # upload-and-poll preservation guard never runs on this path.
         expected_failed_pdfs=1,
         expected_consume_pdfs=0,
         source=_DUPLEX_SOURCE,
@@ -803,7 +799,7 @@ def _build_scanner(scan_passes: tuple[int, ...]) -> MagicMock:
 
 def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
     """
-    Stub a scanner that spools ``pages`` sheets and then jams (HARD-02).
+    Stub a scanner that spools ``pages`` sheets and then jams.
 
     The sheets go into the pipeline's own ``SpooledPageSink``, so the files the
     preservation guard finds are real ones written by production code -- the
@@ -840,7 +836,7 @@ def _build_settings(
     ``failed_dir`` and ``db_path`` both derive from ``data_dir``, so putting
     ``data_dir`` under ``tmp_dir`` would make a correctly preserved scan
     indistinguishable from a leaked temporary directory, and would trip the
-    temp-cleanup assertions the pipeline tests rely on (T-23-40).  No absolute
+    temp-cleanup assertions the pipeline tests rely on.  No absolute
     path outside ``tmp_path`` appears anywhere in this module.
 
     Args:
@@ -952,7 +948,7 @@ def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) ->
         assert job.error is not None
         for fragment in case.error_contains:
             assert fragment in job.error
-        # OUTC-04: the error has to name the file the operator must go and
+        # The error has to name the file the operator must go and
         # find, not merely say that something was kept somewhere.
         for pdf in preserved:
             assert pdf.name in job.error
@@ -961,7 +957,7 @@ def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) ->
 
     delivered = sorted(consume_dir.iterdir()) if consume_dir.exists() else []
     assert len(delivered) == case.expected_consume_pdfs
-    # OUTC-05: the staged dotfile must have been renamed into place, not left
+    # The staged dotfile must have been renamed into place, not left
     # behind for paperless-ngx's inotify watcher to trip over.
     assert all(item.suffix == ".pdf" for item in delivered)
     assert not any(item.name.startswith(".") for item in delivered)
@@ -1007,7 +1003,7 @@ class TestFiveOutcomesEndToEnd:
                 # The persisted AWAITING_FLIP is observed first because the
                 # coordinator only accepts an answer once armed, and the worker
                 # arms it as it announces AWAITING_FLIP: a Continue sent any
-                # earlier is dropped, not queued (CR-01).
+                # earlier is dropped, not queued.
                 wait_for_state(store, job.id, JobState.AWAITING_FLIP, 2.0)
                 worker.continue_flip(job.id)
             # A 2 s budget, far below pytest-timeout's 60 s SIGALRM.  The
@@ -1015,7 +1011,7 @@ class TestFiveOutcomesEndToEnd:
             # stuck, so letting this run to the global ceiling would print a
             # traceback for this wait loop rather than for the stuck worker.
             # A run that waits out the flip timeout gets that timeout on top,
-            # so the 2 s margin survives the one-second flip wait (WR-01).
+            # so the 2 s margin survives the one-second flip wait.
             budget = 2.0
             if case.awaits_flip and not case.operator_flips:
                 budget = case.flip_timeout + 2.0
@@ -1031,13 +1027,12 @@ class TestFiveOutcomesEndToEnd:
 
 class TestAPartialScanSurvivesTheWorker:
     """
-    HARD-02 end to end: a jam mid-stack keeps the sheets already fed.
+    A jam mid-stack keeps the sheets already fed, end to end.
 
     The unit coverage in ``tests/test_pipeline.py`` proves the guard; this
-    exists to prove the *outcome* -- that the persisted row still ends ERROR
-    with the scanner category and a NULL outcome, exactly as a mid-batch
-    failure did before anything was preserved, and that the error a user reads
-    names the file they have to go and find (OUTC-04).
+    proves the *outcome* -- the persisted row ends ERROR with the scanner
+    category and a NULL outcome, and the error a user reads names the file
+    they have to go and find.
     """
 
     def test_partial_scan_preserved_is_recorded_on_the_job_row(
@@ -1069,7 +1064,7 @@ class TestAPartialScanSurvivesTheWorker:
             store.close()
 
         assert finished.state is JobState.ERROR
-        # D-01: a failure raises, so the pipeline measured nothing and the
+        # A failure raises, so the pipeline measured nothing and the
         # outcome and page columns stay NULL rather than claiming a count.
         assert finished.outcome is None
         assert (
@@ -1077,8 +1072,8 @@ class TestAPartialScanSurvivesTheWorker:
             finished.pages_removed,
             finished.pages_uploaded,
         ) == (None, None, None)
-        # Unchanged by the new branch: still a scanner failure, so still exit 1
-        # at the CLI and still the scanner category on the row.
+        # Keeping the sheets does not change the failure: it is a scanner
+        # failure, so exit 1 at the CLI and the scanner category on the row.
         assert finished.error_category is ErrorCategory.SCANNER
 
         preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
@@ -1092,7 +1087,7 @@ class TestAPartialScanSurvivesTheWorker:
 
 
 class TestFlipTimeoutReleasesTheWorker:
-    """A flip wait that runs out fails its job and frees the worker (DPLX-05)."""
+    """A flip wait that runs out fails its job and frees the worker."""
 
     def test_the_next_job_runs_after_a_flip_timeout(
         self,
@@ -1101,14 +1096,11 @@ class TestFlipTimeoutReleasesTheWorker:
         """
         After a timed-out flip, a second submitted job still reaches terminal.
 
-        This is roadmap criterion 3's "releases the scanner for the next job",
-        and what that phrase does and does not mean matters.  ``scan_pages``
-        opens and closes the device on every call, so the device *handle* is
-        already released between pass A and pass B whether or not anyone ever
-        flips.  What an unbounded wait actually held was the single worker
-        thread, queueing every later job behind a forgotten prompt -- M-07's
-        real complaint.  So the proof is a second job getting through, not a
-        handle being closed.
+        ``scan_pages`` opens and closes the device on every call, so the
+        device *handle* is released between pass A and pass B whether or not
+        anyone flips.  What an unbounded wait would hold is the single worker
+        thread, queueing every later job behind a forgotten prompt.  So the
+        proof is a second job getting through, not a handle being closed.
         """
         case = next(case for case in _CASES if case.label == "flip-timeout")
         settings = _build_settings(tmp_path, case)
