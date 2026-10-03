@@ -7325,15 +7325,18 @@ def test_the_anchor_validation_reader_reports_anything_but_warn(text: str) -> No
 # The repository-wide sweep for the legacy config file name
 # ---------------------------------------------------------------------------
 
-# The passages allowed to name the superseded config filename without also
-# naming the current one. Each entry is an exact ``(repo-relative path,
-# passage)`` pair, so widening the exception to a neighbouring passage, or
-# letting it drift to another file, fails the guard rather than passing
-# quietly. Every entry carries the reason it is here.
-#
-# The texts are assembled from ``LEGACY_CONFIG_NAME`` for the reason given
-# where that constant is defined: the guard below scans this file too, and a
-# literal here would make it report its own allowlist.
+# The module that builds the config search, where a regression that loads the
+# legacy file would land.
+_CONFIG_MODULE = "src/saneless/config.py"
+
+# The Python constants allowed to give the superseded config filename as their
+# value without also naming the current one. Each entry is an exact
+# ``(repo-relative path, constant name)`` pair, and it exempts one string: the
+# whole value of that constant's single module-level assignment. Every other
+# string in the same file is judged like any other, and a second assignment
+# exempts neither, so a literal beside the constant, or the exception drifting
+# to another file, fails the guard rather than passing quietly. Every entry
+# carries the reason it is here.
 _LEGACY_NAME_ALLOWED: frozenset[tuple[str, str]] = frozenset(
     {
         # The one place the superseded name is spelled in shipped source.
@@ -7341,7 +7344,7 @@ _LEGACY_NAME_ALLOWED: frozenset[tuple[str, str]] = frozenset(
         # leftover file -- and the constant exists precisely so that this is
         # the only string which has to carry it. Detecting the old name is not
         # supporting it: the file is stat-ed and never opened.
-        ("src/saneless/config.py", LEGACY_CONFIG_NAME),
+        (_CONFIG_MODULE, "LEGACY_CONFIG_FILENAME"),
     }
 )
 
@@ -7458,7 +7461,33 @@ def _comment_passages(text: str) -> list[tuple[int, str]]:
     return passages
 
 
-def _python_passages(text: str) -> list[tuple[int, str]]:
+def _assigned_strings(
+    tree: ast.Module, constant: str
+) -> list[tuple[ast.Constant, str]]:
+    """Return each string assigned whole to ``constant`` at module level."""
+    found: list[tuple[ast.Constant, str]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if (
+            any(
+                isinstance(target, ast.Name) and target.id == constant
+                for target in targets
+            )
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        ):
+            found.append((value, value.value))
+    return found
+
+
+def _python_passages(
+    text: str, allowed: frozenset[str] = frozenset()
+) -> list[tuple[int, str]]:
     """
     Split Python source into the passages the legacy-name guard judges.
 
@@ -7466,6 +7495,11 @@ def _python_passages(text: str) -> list[tuple[int, str]]:
     other string is a passage of its own -- implicitly concatenated pieces
     already joined by the parser, and an f-string's literal parts joined --
     because a string that names a path is what the code would open.
+
+    Args:
+        text: The source.
+        allowed: Constants whose value is left out, when the module assigns
+            it exactly once.
 
     Returns:
         ``(line, passage)`` for each passage.
@@ -7477,6 +7511,10 @@ def _python_passages(text: str) -> list[tuple[int, str]]:
     for node, docstring in docstrings:
         passages.extend(_text_passages(docstring, node.lineno))
     skipped = {id(node) for node, _ in docstrings}
+    for constant in allowed:
+        assigned = _assigned_strings(tree, constant)
+        if len(assigned) == 1:
+            skipped.add(id(assigned[0][0]))
     for node in ast.walk(tree):
         if isinstance(node, ast.JoinedStr):
             skipped.update(id(part) for part in node.values)
@@ -7500,7 +7538,10 @@ def _python_passages(text: str) -> list[tuple[int, str]]:
 def _passages(name: str, text: str) -> list[tuple[int, str]]:
     """Return a shipped file's passages, read as Python, as prose or by line."""
     if name.endswith(".py"):
-        return _python_passages(text)
+        allowed = frozenset(
+            constant for path, constant in _LEGACY_NAME_ALLOWED if path == name
+        )
+        return _python_passages(text, allowed)
     if PurePosixPath(name).suffix in _PROSE_SUFFIXES:
         return _text_passages(text)
     return _line_passages(text)
@@ -7524,8 +7565,6 @@ def _legacy_name_offences(name: str, text: str) -> list[str]:
     for line, passage in _passages(name, text):
         if LEGACY_CONFIG_NAME not in passage:
             continue
-        if (name, passage) in _LEGACY_NAME_ALLOWED:
-            continue
         if CONFIG_NAME not in passage or _RENAME_TO_LEGACY.search(passage):
             offences.append(f"{name}:{line}: {' '.join(passage.split())[:200]}")
     return offences
@@ -7539,7 +7578,8 @@ def test_no_shipped_file_names_the_legacy_config_file() -> None:
     legacy name on one page and the current name on another cannot tell which
     is stale. A paragraph, table row or string naming both is a rename note,
     the way the upgrade sections are written, and passes. Anything else is an
-    offender unless it appears verbatim in ``_LEGACY_NAME_ALLOWED``.
+    offender unless it is the value of a constant ``_LEGACY_NAME_ALLOWED``
+    names.
     """
     offenders: list[str] = []
     for name in _shipped_files():
@@ -7677,32 +7717,50 @@ def test_the_legacy_name_guard_judges_prose_by_passage_and_code_by_line(
     assert bool(_legacy_name_offences(name, text)) is offending
 
 
+@pytest.mark.parametrize(
+    "addition",
+    [
+        f'\n\ndef _extra_candidate(d):\n    return d / "{LEGACY_CONFIG_NAME}"\n',
+        f'\n\nOLD = Path("/etc/saneless").with_name("{LEGACY_CONFIG_NAME}")\n',
+        f'\n\nLEGACY_CONFIG_FILENAME = "{LEGACY_CONFIG_NAME}"\n',
+    ],
+    ids=["second-literal", "literal-in-a-call", "second-assignment"],
+)
+def test_the_config_module_exemption_covers_only_its_constant(addition: str) -> None:
+    """Another string naming the legacy file in the config module is reported."""
+    text = (REPO_ROOT / _CONFIG_MODULE).read_text(encoding="utf-8")
+    assert _legacy_name_offences(_CONFIG_MODULE, text) == []
+    assert _legacy_name_offences(_CONFIG_MODULE, text + addition)
+
+
 def test_legacy_name_allowlist_entries_still_exist() -> None:
     """
-    Every allowlisted passage is present, verbatim, in the file it names.
+    Every allowlisted constant is assigned once, to a value naming the old file.
 
     Without this the allowlist rots into a silent pass: the guard above only
-    ever *subtracts*, so an entry whose passage was reworded, moved or deleted
-    goes on excusing something that is not there, and the next passage to
-    match its text inherits the exemption without anyone deciding to grant it.
+    ever *subtracts*, so an entry whose constant was renamed, moved or deleted
+    goes on excusing something that is not there, and the next assignment to
+    take its name inherits the exemption without anyone deciding to grant it.
     """
     missing: list[str] = []
-    for name, expected in sorted(_LEGACY_NAME_ALLOWED):
+    for name, constant in sorted(_LEGACY_NAME_ALLOWED):
         try:
             text = (REPO_ROOT / name).read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            missing.append(f"{name}: is not UTF-8, so the passage cannot be found")
+            missing.append(f"{name}: is not UTF-8, so the constant cannot be found")
             continue
         except OSError:
             missing.append(f"{name}: cannot be read")
             continue
-        if expected not in [passage for _, passage in _passages(name, text)]:
-            missing.append(f"{name}: {expected}")
+        values = [value for _, value in _assigned_strings(ast.parse(text), constant)]
+        if len(values) != 1 or LEGACY_CONFIG_NAME not in values[0]:
+            missing.append(f"{name}: {constant} = {values}")
     assert not missing, (
-        "an entry in _LEGACY_NAME_ALLOWED no longer matches a passage in "
-        "the file it exempts, so it excuses nothing while the next passage to "
-        "match its text would be exempted by accident. Remove the entry, or "
-        "correct it to the passage that is really there:\n" + "\n".join(missing)
+        "an entry in _LEGACY_NAME_ALLOWED no longer names a constant assigned "
+        f"exactly once, to a value naming {LEGACY_CONFIG_NAME}, in the file it "
+        "exempts, so it excuses nothing while the next assignment to take its "
+        "name would be exempted by accident. Remove the entry, or correct it "
+        "to the constant that is really there:\n" + "\n".join(missing)
     )
 
 
