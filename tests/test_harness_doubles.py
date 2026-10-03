@@ -15,6 +15,9 @@ import threading
 import httpx2
 import pytest
 
+from saneless.job import Job, JobStore
+from saneless.vocabulary import JobState
+from tests.conftest import wait_for_state
 from tests.fake_clock import FakeClock
 from tests.golden_support import (
     CORRESPONDENTS_PATH,
@@ -33,6 +36,30 @@ _BASE = "http://paperless.test"
 # How long the gated-upload test lets the client wait for an answer.  Far
 # shorter than the gate's own five-second hold, so the timeout is the client's.
 _CLIENT_READ_TIMEOUT = 0.3
+
+
+class _SettlingStore(JobStore):
+    """An in-memory store whose one job is scanning until its first read is over."""
+
+    def __init__(self) -> None:
+        """Open an empty in-memory store with no reads made yet."""
+        super().__init__()
+        self.reads = 0
+
+    def get_job(self, job_id: str) -> Job | None:
+        """
+        Return the job as scanning on the first read and done on every later one.
+
+        Args:
+            job_id: The id to stamp on the returned job.
+
+        Returns:
+            A fresh job in the state this read sees.
+
+        """
+        self.reads += 1
+        state = JobState.SCANNING if self.reads == 1 else JobState.DONE
+        return Job(id=job_id, profile="default", title="Settling", state=state)
 
 
 def _client(recorder: RecordingPaperless) -> httpx2.Client:
@@ -102,6 +129,18 @@ def test_fake_clock_refuses_a_negative_step(step: str) -> None:
 
     assert clock.now() == 0.0
     assert clock.waits == []
+
+
+def test_wait_for_state_reads_the_job_once_more_after_its_deadline() -> None:
+    """A state reached during the last pause is still returned, not reported late."""
+    store = _SettlingStore()
+    try:
+        job = wait_for_state(store, "job-1", JobState.DONE, timeout=0.0)
+    finally:
+        store.close()
+
+    assert job.state is JobState.DONE
+    assert store.reads == 2
 
 
 def test_before_send_failure_raises_connect_error_and_is_recorded() -> None:
