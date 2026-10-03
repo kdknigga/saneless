@@ -1,15 +1,11 @@
 """
-Rate floors for the endpoints that reach paperless-ngx on every call.
+The endpoints that reach paperless-ngx on every call have a rate floor.
 
 ``POST /api/cache/invalidate`` and ``GET /api/paperless/test`` are
-unauthenticated on the LAN and each one used to send one token-bearing request
-upstream per call, so a loop against either turned into unbounded Paperless
-traffic.  Both are now bounded by ``saneless.web.throttle``: a minimum interval
-per invalidated resource, and a shared, briefly reused connection-test result.
-
-The unit tests move a fake clock instead of waiting for one, and the thread
-tests wait on events with short timeouts, so a regression fails in seconds
-rather than hanging until pytest-timeout.  Nothing here sleeps.
+unauthenticated on the LAN and each call could send a token-bearing request
+upstream, so a loop against either must not become unbounded paperless-ngx
+traffic.  Each invalidated resource has a minimum interval between refetches,
+and the connection test shares one briefly reused result between callers.
 """
 
 from __future__ import annotations
@@ -43,7 +39,7 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.usefixtures("offline_paperless")
 
 # How long a thread test waits for something that should happen at once.  Far
-# below pytest-timeout's 60 s, so a regression reports what it was waiting for.
+# below pytest-timeout's 60 s, so a failing test reports what it was waiting for.
 _EVENT_TIMEOUT_SECONDS = 5.0
 
 # How long a thread test watches for something that must *not* happen yet --
@@ -72,10 +68,10 @@ class _FakeClock:
 
 
 class TestMinimumInterval:
-    """The floor extracted from ``CheckCache``'s manual-refresh claim."""
+    """A minimum interval between granted claims, shared with manual refresh."""
 
     def test_the_floor_is_the_manual_refresh_floor(self) -> None:
-        """Everything paperless-bound shares one 2 s floor, still importable."""
+        """Everything paperless-bound shares one 2 s floor, the cache's included."""
         assert MIN_MANUAL_REFRESH_SECONDS == 2.0
         assert (
             checks_cache_module.MIN_MANUAL_REFRESH_SECONDS == MIN_MANUAL_REFRESH_SECONDS
@@ -95,7 +91,7 @@ class TestMinimumInterval:
         assert floor.claim() is None
 
     def test_a_second_claim_inside_the_interval_is_refused(self) -> None:
-        """Two claims at the same instant get one grant between them."""
+        """A second claim 1.9 s after a grant is refused."""
         clock = _FakeClock()
         floor = MinimumInterval(clock=clock)
         assert floor.claim() is not None
