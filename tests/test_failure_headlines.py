@@ -19,9 +19,6 @@ Beyond the category, the table pins what each cause must never be called:
 
 Two outcomes are not exceptions and have tests of their own: a duplicate is a
 delivered scan with a warning, and a restart while uploading is stored amber.
-
-Nothing here waits in real time: every client runs its send budget and its
-poll on a fake clock.
 """
 
 from __future__ import annotations
@@ -104,7 +101,7 @@ _IMPOSSIBLE_RESERVE_MB = 1_000_000_000
 _CHECK_FIRST = "document list"
 _BLIND_RESCAN = "start the scan again"
 
-# The categories a full disk used to be filed under, one per old raise site.
+# The categories a full disk must never be filed under.
 _NOT_A_FULL_DISK = frozenset(
     {ErrorCategory.SCANNER, ErrorCategory.ASSEMBLY, ErrorCategory.CONFIG}
 )
@@ -735,8 +732,8 @@ def test_headline_follows_cause(
     exc = case.build(tmp_path, monkeypatch)
 
     category = classify_error(exc)
-    # What each cause used to be misfiled as is ruled out by name first, so a
-    # regression says which wrong category it fell back to.
+    # The likeliest wrong categories are ruled out by name first, so a failure
+    # says which wrong category the cause was filed under.
     if case.category is ErrorCategory.DISK_SPACE:
         assert category not in _NOT_A_FULL_DISK, f"a full disk filed as {category}"
     if case.category is ErrorCategory.SCANNER:

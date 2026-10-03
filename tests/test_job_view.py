@@ -1,5 +1,5 @@
 """
-Tests for ``saneless.web.job_view``, what one viewer may see of one job.
+A job's owner sees its detail with host paths scrubbed; others see none of it.
 
 The owner of a job -- the browser whose token was recorded with it -- sees its
 title, thumbnail and its error and warning text, with every host path and the
@@ -391,7 +391,7 @@ def test_a_path_after_only_is_not_a_kept_file(
     """
     Only "preserved at " marks a kept file; "Only <path>" is somebody's words.
 
-    Preservation no longer writes "Only <path> was kept", so text that says
+    Preservation never writes "Only <path> was kept", so text that says
     "Only" before a path under the failed folder -- a library's message, say
     -- must not tell every viewer that part of the scan was kept.
     """

@@ -4,28 +4,15 @@ SIGTERM and SIGHUP end a one-shot command cleanly, keeping the pages scanned.
 A one-shot command given SIGTERM or SIGHUP was not stopped by the operator, so
 it is an interruption, not a cancel: the pages already scanned are kept in
 ``failed/`` and the command exits 128 plus the signal number (143 or 129) with
-one ``Interrupted:`` line naming what was kept.  Ctrl-C stays the deliberate
+one ``Interrupted:`` line naming what was kept.  Ctrl-C is the deliberate
 cancel that keeps nothing (exit 130).
 
-Every signal here is real, sent with ``os.kill`` to this very process, and each
-is sent from inside the run at the moment it matters: from the in-memory
-paperless-ngx while it receives the upload, and from inside the wait of the
-flip prompt or a multi-page question, where a dropped SSH session delivers its
-hangup.  That is the only way
-to prove the handler is live at that moment, rather than merely installed at
-some point.
-
-The safety rule: a signal is sent only when ``signal.getsignal`` shows a
-Python handler installed for it -- a callable other than
-``signal.default_int_handler``.  With the default disposition in place,
-SIGTERM or SIGHUP would kill pytest itself; so the sender refuses instead,
-records the refusal and raises ``AssertionError("no <SIG> handler installed")``.
-Each test checks for a refusal first, so a run without handlers fails with
-that line rather than taking the test runner down.
-
-An autouse fixture puts both dispositions back after every test whatever the
-command did, so a handler that leaks cannot reach any later test; the test
-that checks the command restores them itself asserts before that fixture runs.
+Every signal is real, sent with ``os.kill`` to this process from inside the run
+at the moment it matters, so each test shows the handler is live then.  A
+signal is sent only when a Python handler is installed for it; otherwise the
+sender records a refusal and raises ``AssertionError("no <SIG> handler
+installed")`` instead of killing the test runner.  An autouse fixture restores
+both dispositions after every test, so a leaked handler reaches no later test.
 """
 
 from __future__ import annotations
@@ -607,11 +594,10 @@ def test_a_hangup_whose_end_of_input_lands_first_still_keeps_the_fronts(
     """
     End of input first, SIGHUP a moment later: still an interruption, not a cancel.
 
-    The other order of the same race.  The question reads end of input (the
-    run's stdin is empty) before SIGHUP arrives; the signal is sent from
-    inside the pause end of input makes for it, so it lands after end of
-    input by construction, with no timed pause.  Settling ABORTED without
-    that pause would end the run as a cancel that keeps nothing.
+    The question reads end of input (the run's stdin is empty) before SIGHUP
+    arrives; the signal is sent from inside the pause end of input makes for
+    it, so it lands after end of input by construction.  Settling ABORTED
+    without that pause would end the run as a cancel that keeps nothing.
     """
     signaller = _Signaller()
     paused: list[float] = []
@@ -741,12 +727,11 @@ def test_a_hangup_whose_end_of_input_lands_first_at_a_multi_page_question(
     """
     End of input first, SIGHUP a moment later, at a multi-page question: kept.
 
-    The multi-page question's version of the flip prompt's race.  The second
-    question reads end of input (the run's stdin holds only the first
-    answer) before SIGHUP arrives; the signal is sent from inside the pause
-    end of input makes for it, so it lands after end of input by
-    construction, with no timed pause.  Settling the question as an abort
-    without that pause would end the run as a cancel that keeps nothing.
+    The second question reads end of input (the run's stdin holds only the
+    first answer) before SIGHUP arrives; the signal is sent from inside the
+    pause end of input makes for it, so it lands after end of input by
+    construction.  Settling the question as an abort without that pause
+    would end the run as a cancel that keeps nothing.
     """
     signaller = _Signaller()
     paused: list[float] = []

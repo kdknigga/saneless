@@ -1,9 +1,10 @@
 """
-Tests for ``saneless.text_safety``, the control-character helpers.
+Control characters in text are detected, and escaped visibly for display.
 
 A character counts as a control exactly when Unicode files it under the
-``Cc`` category: the C0 range, DEL and the C1 range. Everything else,
-accented letters and no-break spaces included, passes through untouched.
+``Cc`` category: the C0 range, DEL and the C1 range. Display escaping also
+covers bidi controls and Unicode separators; accented letters, no-break spaces
+and right-to-left text pass through untouched.
 """
 
 from __future__ import annotations
