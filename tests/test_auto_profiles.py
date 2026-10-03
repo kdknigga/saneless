@@ -64,21 +64,21 @@ class TestSourceToSlug:
     """Source name to profile slug conversion."""
 
     def test_flatbed(self) -> None:
-        """Flatbed slugs from its own name (D-14)."""
+        """Flatbed slugs from its own name."""
         assert source_to_slug("Flatbed") == "flatbed"
 
     def test_adf(self) -> None:
-        """ADF slugs from its own name (D-14)."""
+        """ADF slugs from its own name."""
         assert source_to_slug("ADF") == "adf"
 
     def test_automatic_document_feeder(self) -> None:
-        """Automatic Document Feeder slugs from its own name (D-14)."""
+        """Automatic Document Feeder slugs from its own name."""
         assert (
             source_to_slug("Automatic Document Feeder") == "automatic-document-feeder"
         )
 
     def test_adf_duplex(self) -> None:
-        """ADF Duplex slugs from its own name (D-14)."""
+        """ADF Duplex slugs from its own name."""
         assert source_to_slug("ADF Duplex") == "adf-duplex"
 
     def test_case_insensitive_adf_duplex(self) -> None:
@@ -86,38 +86,31 @@ class TestSourceToSlug:
         assert source_to_slug("Adf-duplex") == "adf-duplex"
 
     def test_adf_front(self) -> None:
-        """ADF Front slugs from its own name (D-14)."""
+        """ADF Front slugs from its own name."""
         assert source_to_slug("ADF Front") == "adf-front"
 
     def test_auto_source(self) -> None:
-        """Auto slugs from its own name (D-14)."""
+        """Auto slugs from its own name."""
         assert source_to_slug("Auto") == "auto"
 
     def test_flatbed_duplex_slugs_from_its_own_name(self) -> None:
         """
-        A name carrying both "flatbed" and "duplex" slugs verbatim (CTR-04).
+        A name carrying both "flatbed" and "duplex" slugs verbatim.
 
-        This case used to assert classify_source's branch order *through*
-        source_to_slug: the slug was picked from the returned SourceKind, and
-        because duplex is tested before flatbed (scanner/base.py) this name
-        took the duplex kind's hard-coded name rather than the flatbed kind's.
-        D-14 severed that coupling -- the slug is now the device's own wording,
-        so this case can no longer witness the precedence. It is re-pointed
-        rather than deleted
-        so the change of meaning is recorded; the classifier's branch order is
-        asserted directly against classify_source in the scanner tests.
+        The slug is the device's own wording, so it says nothing about the
+        classifier's branch order; that order is asserted against
+        classify_source in the scanner tests.
         """
         assert source_to_slug("Flatbed Duplex") == "flatbed-duplex"
 
     def test_auto_is_matched_exactly_not_as_a_substring(self) -> None:
         """
-        "Automatic Document Feeder" is a feeder, not an Auto source (CTR-04).
+        "Automatic Document Feeder" is a feeder, not an Auto source.
 
-        The name begins with the letters "auto"; a substring rule would have
-        collapsed it onto the Auto source's slug and routed a stack of pages
-        down the single-page path. D-14 makes that collapse impossible by
-        construction -- each source keeps its own wording -- so the guarantee
-        survives here as an assertion on the two distinct new values.
+        The name begins with the letters "auto"; a substring rule would
+        collapse it onto the Auto source's slug and route a stack of pages
+        down the single-page path. Each source keeps its own wording, so the
+        two slugs stay distinct.
         """
         assert (
             source_to_slug("Automatic Document Feeder") == "automatic-document-feeder"
@@ -134,53 +127,50 @@ class TestSourceToSlug:
 
     def test_adf_front_and_back_never_collide(self) -> None:
         """
-        Two distinct feeder sources never collapse onto one slug (N-09).
+        Two distinct feeder sources never collapse onto one slug.
 
-        "ADF Front" and "ADF Back" both classify as FEEDER -- they ARE feeders
-        for routing purposes -- so any rule that named the profile from the
-        SourceKind gave them the same slug and silently lost one. D-14 names
-        from the source string itself, so distinctness holds by construction.
+        "ADF Front" and "ADF Back" both classify as FEEDER -- they are feeders
+        for routing purposes -- so a rule naming the profile from the
+        SourceKind would give them the same slug and silently lose one. The
+        slug comes from the source string itself, so they stay distinct.
         """
         assert source_to_slug("ADF Front") != source_to_slug("ADF Back")
 
     def test_parentheses_do_not_survive(self) -> None:
-        """Canon's "ADF (left aligned)" loses its parentheses (D-15)."""
+        """Canon's "ADF (left aligned)" loses its parentheses."""
         assert source_to_slug("ADF (left aligned)") == "adf-left-aligned"
 
     def test_slash_does_not_survive(self) -> None:
         """
-        A path separator never reaches the slug (D-15).
+        A path separator never reaches the slug.
 
-        Measured before the hardening: "Flachbett/Einzug" slugged
-        "flachbett/einzug", passing "/" straight through. Slugs are TOML keys
-        rather than filesystem paths today, so this was not exploitable -- but
-        it is one careless reuse away, which is exactly why Phase 23's D-19
-        refused to reuse this sanitiser for PDF filenames.
+        Passed through, "Flachbett/Einzug" would slug as "flachbett/einzug".
+        Slugs are TOML keys rather than filesystem paths, so "/" is not
+        exploitable here, but it is one careless reuse away from a path.
         """
         assert source_to_slug("Flachbett/Einzug") == "flachbett-einzug"
 
     def test_hyphen_runs_collapse(self) -> None:
-        """A doubled space collapses to a single hyphen (D-15)."""
+        """A doubled space collapses to a single hyphen."""
         assert source_to_slug("ADF  Duplex") == "adf-duplex"
 
     def test_leading_and_trailing_hyphens_are_stripped(self) -> None:
-        """Leading and trailing hyphens are stripped (D-15)."""
+        """Leading and trailing hyphens are stripped."""
         assert source_to_slug("---ADF---") == "adf"
 
     def test_degenerate_name_still_yields_a_usable_slug(self) -> None:
         """
-        A whitespace-only source name still yields a non-empty slug (D-15).
+        A whitespace-only source name still yields a non-empty slug.
 
-        Measured before the hardening: "  " degenerated to "--", which is not
-        addressable as a --profile value. The guarded fallback keeps the
-        profile reachable.
+        Collapsed naively, "  " would become "--", which is not addressable as
+        a --profile value; the guarded fallback keeps the profile reachable.
         """
         slug = source_to_slug("  ")
         assert re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug), slug
 
 
 class TestSlugCharacterSet:
-    """The D-15 character-set invariant, over every name the suite exercises."""
+    """The slug character-set invariant, over every name the suite exercises."""
 
     @pytest.mark.parametrize("source", _SLUG_INPUTS)
     def test_slug_uses_only_lowercase_alphanumerics_and_hyphens(
@@ -219,15 +209,14 @@ class TestPickClosestResolution:
 
 class TestPickClosestResolutionHonoursARange:
     """
-    A range-reporting device gets a resolution it actually offers (D-13, N-01).
+    A range-reporting device gets a resolution it actually offers.
 
-    This function returned the target unchanged whenever the word list was
-    empty -- which is precisely what a range-reporting device produces. So the
-    SANE ``test`` backend got 300 not because it offered 300 but because nothing
-    had been read at all, and a device whose ceiling sat below 300 was asked for
-    a resolution it had never advertised.
+    A range-reporting device leaves the word list empty, so returning the
+    target whenever the list is empty would give it 300 whether or not it
+    offers 300, and ask a device whose ceiling sits below 300 for a resolution
+    it never advertised.
 
-    A word list is an exhaustive enumeration, so it still wins when present; a
+    A word list is an exhaustive enumeration, so it wins when present; a
     range is a span, and the value chosen from it has to be both inside the span
     and on the step grid, or it is still a value the device never offered.
     """
@@ -306,11 +295,11 @@ class TestPickClosestResolutionHonoursARange:
 
     def test_generated_profiles_use_a_resolution_the_range_allows(self) -> None:
         """
-        End to end: a range-only device no longer gets a silent 300.
+        End to end: a range-only device gets a resolution inside its range.
 
-        A device whose ceiling is 200 dpi would previously have had every
-        generated profile ask for 300 -- a resolution it cannot deliver, which
-        SANE then silently substitutes.
+        Otherwise a device whose ceiling is 200 dpi would have every generated
+        profile ask for 300 -- a resolution it cannot deliver, which SANE then
+        silently substitutes.
         """
         caps = DeviceCapabilities(
             sources=["Flatbed"],
@@ -488,12 +477,12 @@ class TestIsBareDefault:
 
     def test_manual_duplex_default_not_bare(self) -> None:
         """
-        A hand-written manual-duplex default is not bare (WR-04).
+        A hand-written manual-duplex default is not bare.
 
-        Comparing only source, resolution and mode treated it as untouched, so
-        the first web job's auto-generation replaced it in memory with a
-        generated flatbed profile: the operator got one flatbed snapshot and a
-        green DONE instead of a flip prompt.
+        Comparing only source, resolution and mode would treat it as untouched,
+        and auto-generation would replace it with a generated flatbed profile:
+        the operator would get one flatbed snapshot and a green DONE instead of
+        a flip prompt.
         """
         settings = Settings(profiles={"default": ProfileConfig(duplex="manual")})
         assert is_bare_default(settings) is False
@@ -570,7 +559,7 @@ class TestIsBareDefault:
         expected: bool,
     ) -> None:
         """
-        Every untouched shape of the default profile is bare (ROBU-07, WR-04).
+        Every untouched shape of the default profile is bare.
 
         Each shape goes through the real ``load_settings`` path, so the profile
         is whatever TOML parsing, the nested-env merge and the ``title`` alias
@@ -595,14 +584,15 @@ class TestIsBareDefault:
 
 
 class TestNoRederivedConfigPath:
-    """Generated profiles are written only to the loaded config file (D-16)."""
+    """Generated profiles are written only to the loaded config file."""
 
     def test_the_rederived_write_path_is_gone(self) -> None:
         """
-        M-04: the re-derived write path no longer exists.
+        ``auto_profiles`` derives no config path of its own.
 
-        It ignored ``--config`` and could drop ``./saneless.toml`` into the
-        daemon's working directory; ``Settings.config_path`` replaced it.
+        A re-derived path would ignore ``--config`` and could drop
+        ``./saneless.toml`` into the daemon's working directory; the write
+        target is ``Settings.config_path``.
         """
         assert not hasattr(auto_profiles, "resolve_config_path")
 
@@ -694,13 +684,11 @@ class TestGenerateProfilesPlatenFromDeviceType:
     """
     A declared device type is platen evidence beside the source names.
 
-    Regression cover for the HP LaserJet 3030 on the ``hpaio`` backend: it has
-    a platen, hpaio names its sources only ``Auto`` and ``ADF``, and every
-    generated profile therefore carried ``auto_source_mode = "adf"``. A scan
-    from the glass was routed down ``_scan_adf_pages``, which probed for a page
-    2 the glass could not supply; the device answered with a device I/O error
-    and a "Memory is low" panel message, and a good one-page scan was reported
-    as a scanner fault.
+    The HP LaserJet 3030 on the ``hpaio`` backend has a platen, but hpaio
+    names its sources only ``Auto`` and ``ADF``. Judged on the names alone,
+    every generated profile would carry ``auto_source_mode = "adf"``, a glass
+    scan would probe for a page 2 the glass cannot supply, and the device's
+    I/O error would turn a good one-page scan into a reported scanner fault.
     """
 
     HP_SOURCES: ClassVar[list[str]] = ["Auto", "ADF"]
@@ -818,13 +806,12 @@ class TestGenerateProfilesUsesClassifier:
 
     def test_auto_spelled_with_surrounding_whitespace(self) -> None:
         """
-        " AUTO " still receives the auto_source_mode treatment (D-02, Q9).
+        " AUTO " receives the auto_source_mode treatment.
 
-        The rule this replaces was ``source.lower() == "auto"``, which a device
-        reporting stray whitespace defeats: " auto " is not "auto", so the
-        source fell through to the flatbed default and a single-source Auto
-        scanner was told to behave as a flatbed. classify_source strips before
-        comparing, so every spelling reaches the same branch.
+        An exact ``source.lower() == "auto"`` rule is defeated by stray
+        whitespace, and a single-source Auto scanner would be told to behave
+        as a flatbed. classify_source strips before comparing, so every
+        spelling reaches the same branch.
         """
         caps = DeviceCapabilities(
             sources=[" AUTO "],
@@ -835,12 +822,7 @@ class TestGenerateProfilesUsesClassifier:
         assert profiles["auto"].auto_source_mode == "adf"
 
     def test_auto_spelled_lowercase(self) -> None:
-        """
-        A lowercase "auto" receives the auto_source_mode treatment.
-
-        This spelling was already handled by the equality rule -- it is
-        asserted so the swap to classify_source cannot quietly regress it.
-        """
+        """A lowercase "auto" receives the auto_source_mode treatment."""
         caps = DeviceCapabilities(
             sources=["auto"],
             resolutions=[300],
@@ -853,11 +835,10 @@ class TestGenerateProfilesUsesClassifier:
         """
         "Flatbed Duplex" is a duplex feeder, so it never backs the default.
 
-        The rule this replaces asked ``"flatbed" in s.lower()``, which is true
-        of "Flatbed Duplex" -- so a duplex feeder became the flatbed-backed
-        default profile, and an Auto source beside it was told to behave as a
-        flatbed. classify_source tests duplex before flatbed, deliberately, and
-        answers FEEDER_DUPLEX.
+        A ``"flatbed" in s.lower()`` rule is true of "Flatbed Duplex", which
+        would make a duplex feeder the flatbed-backed default and tell an Auto
+        source beside it to behave as a flatbed. classify_source tests duplex
+        before flatbed and answers FEEDER_DUPLEX.
         """
         caps = DeviceCapabilities(
             sources=["Auto", "Flatbed Duplex"],
@@ -885,10 +866,8 @@ class TestGenerateProfilesUsesClassifier:
         """
         A device reporting no flatbed source falls back to its first source.
 
-        This assertion used to read ``"default" not in profiles``, which pinned
-        a defect rather than a guarantee: Settings requires the key, so the set
-        this function returned for a sheet-fed scanner could be written to disk
-        and then never loaded again.
+        Settings requires the ``default`` key, so a generated set without it
+        could be written to disk and then never loaded again.
         """
         caps = DeviceCapabilities(
             sources=["Automatic Document Feeder"],
@@ -927,7 +906,7 @@ class TestGenerateProfilesUsesClassifier:
         after auto-profiles has run is the user-visible promise. The generated
         set is therefore written to disk and read back through load_settings,
         whose ``validate_default_profile`` refuses any config without the key,
-        for each of the three device shapes a scanner can have (DPLX-07).
+        for each of the three device shapes a scanner can have.
         """
         caps = DeviceCapabilities(
             sources=sources,
@@ -942,7 +921,7 @@ class TestGenerateProfilesUsesClassifier:
 
 
 class TestGenerateProfilesDuplex:
-    """Generated profiles carry duplex from the source classifier (D-06)."""
+    """Generated profiles carry duplex from the source classifier."""
 
     @staticmethod
     def _written_profiles(config_file: Path) -> dict[str, dict[str, object]]:
@@ -956,7 +935,7 @@ class TestGenerateProfilesDuplex:
         """
         A FEEDER_DUPLEX source yields duplex = "hardware", in memory and on disk.
 
-        D-06 is a statement about what is written to disk, so the file is
+        The property is about what is written to disk, so the file is
         asserted as well as the model: an in-memory assertion alone would not
         catch a writer that drops the key.
         """
@@ -1085,12 +1064,12 @@ class TestGenerateProfilesDuplex:
 
 class TestProfileLabels:
     """
-    Generated profiles carry human text derived from the classifier (D-19).
+    Generated profiles carry human text derived from the classifier.
 
     The label and the description come from ``classify_source`` and nothing
     else: no new probe, no new config key, and no vendor string. Every
     returned value is a developer-authored constant, which is what keeps a
-    SANE source name from reaching the scan page through this path (T-30-17).
+    SANE source name from reaching the scan page through this path.
     """
 
     # One representative SANE source name per SourceKind. Parametrising over
@@ -1126,7 +1105,7 @@ class TestProfileLabels:
             ("Card Back", "Scanner source"),
         ],
     )
-    def test_label_uses_the_three_d19_forms_verbatim(
+    def test_label_uses_the_fixed_feeder_duplex_and_glass_wording(
         self, source: str, expected: str
     ) -> None:
         """
@@ -1234,7 +1213,7 @@ class TestProfileLabels:
         self, shape: str
     ) -> None:
         """
-        T-30-17: the vendor-controlled source name is never interpolated.
+        The vendor-controlled source name is never interpolated.
 
         A source name is device-controlled input that ends up in a file the
         web UI renders. Both functions select a constant instead of building
@@ -1487,7 +1466,7 @@ class TestGeneratedLabelsAreUnique:
 
 
 class TestGenerateProfilesSlugCollision:
-    """Two names that normalise alike both survive, with a tie-break (Q5)."""
+    """Two names that normalise alike both survive, with a tie-break."""
 
     _COLLIDING = ("ADF-Front", "ADF Front")
 
@@ -1511,11 +1490,10 @@ class TestGenerateProfilesSlugCollision:
         """
         N distinct source strings yield N source profiles.
 
-        The assignment was unguarded, so the second collider overwrote the
-        first and the device lost a source -- which is N-09's actual complaint.
-        Counting keys is no longer the way to ask: the required "default" key
-        aliases one of the sources, so the question is put to the source
-        strings the profiles actually carry.
+        A second collider must not overwrite the first. The required
+        "default" key aliases one of the sources, so counting keys cannot
+        answer this; the question is put to the source strings the profiles
+        carry.
         """
         profiles = generate_profiles(self._caps())
         sources = [
@@ -1558,12 +1536,12 @@ class TestAutoGeneratedField:
 
 class TestMalformedProfilesSection:
     """
-    A ``[profiles]`` key that is not a table is refused, not crashed on (WR-05).
+    A ``[profiles]`` key that is not a table is refused, not crashed on.
 
-    The parsed document was cast to a shape it is not guaranteed to have, and
-    ``cast`` is a promise to the type checker rather than a check, so
-    ``profiles = "oops"`` reached ``.items()`` on a tomlkit String. The user
-    saw an unhandled AttributeError out of ``auto-profiles``.
+    ``cast`` is a promise to the type checker rather than a check, so without
+    a real one ``profiles = "oops"`` would reach ``.items()`` on a tomlkit
+    String and the user would see an unhandled AttributeError out of
+    ``auto-profiles``.
     """
 
     _MALFORMED = 'profiles = "oops"\n'
@@ -1600,12 +1578,10 @@ class TestReservedDefaultSlug:
     A source whose slug is "default" is not overwritten by the default profile.
 
     ``_claim_slug`` exists so that N distinct source strings yield N source
-    profiles, but "default" was never reserved and the default profile is
-    assigned after the loop with a bare ``profiles["default"] = ...``. A
-    scanner reporting a source literally named "Default" therefore claimed the
-    slug, was written, and was then overwritten: two sources in, one source
-    represented -- the precise invariant _claim_slug was added to guarantee,
-    broken by the line that runs after it.
+    profiles, and the default profile is assigned after the loop. Unless
+    "default" is reserved, a scanner reporting a source literally named
+    "Default" claims the slug, is written, and is then overwritten: two
+    sources in, one source represented.
     """
 
     _SOURCES = ("Default", "Flatbed")
@@ -1639,7 +1615,7 @@ class TestReservedDefaultSlug:
     def test_the_collision_warning_names_the_reserved_slug(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The operator is told the source was renamed, and to what."""
+        """The warning tells the operator the source's slug moved, and to what."""
         with caplog.at_level(logging.WARNING, logger="saneless.auto_profiles"):
             generate_profiles(self._caps())
 
@@ -1653,13 +1629,11 @@ class TestReservedDefaultSlug:
 
 
 class TestOrphanedProfilePrune:
-    """Auto-generated profiles absent from the new set are pruned (D-16)."""
+    """Auto-generated profiles absent from the new set are pruned."""
 
-    # "legacy-feeder" stands for a profile generated under the pre-D-14 naming
-    # scheme, which the rename strands. It is given a neutral name on purpose:
-    # the slugs D-14 retired must appear nowhere in the tree, so this fixture
-    # cannot spell them even as historic content. The prune keys on the
-    # auto_generated flag, never on the name, so the substitution is faithful.
+    # "legacy-feeder" stands for a profile an earlier naming scheme generated,
+    # which a rename strands. The prune keys on the auto_generated flag, never
+    # on the name, so any name stands in faithfully.
     _EXISTING = """\
 # saneless configuration -- hand written, keep this comment
 [profiles.default]
@@ -1708,7 +1682,7 @@ auto_generated = false
         force governs overwriting keys that are *present* in the generated set;
         an orphan is by definition absent from it, so force has nothing to say
         about it. Without the prune a rename leaves the stale profile behind,
-        still functional, which is the quiet duplication D-16 prevents.
+        still functional: a quiet duplication.
         """
         config_file = self._write(tmp_path, force=force)
         parsed = tomllib.loads(config_file.read_text())
@@ -1833,9 +1807,9 @@ class TestNoSourceDevice:
     A scanner with no SANE ``source`` option still gets a working ``default``.
 
     Such a device feeds without being told where from, and the backend assigns
-    no source to it. Generating nothing for it left a config that saneless
+    no source to it. Generating nothing for it would leave a config saneless
     refuses to load, and let the prune delete every flagged profile an earlier
-    run had written, together with the operator's ``default_tags``.
+    run wrote, together with the operator's ``default_tags``.
     """
 
     _CAPS = DeviceCapabilities(
@@ -1917,8 +1891,8 @@ auto_generated = true
         """
         ``--force`` deletes the ``source`` an earlier run wrote into ``default``.
 
-        The generation owns ``source`` and no longer writes one, so a refresh
-        removes it, as it does any owned key a fresh generation omits.
+        The generation owns ``source`` and writes none for this device, so a
+        refresh removes it, as it does any owned key a fresh generation omits.
         """
         config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._PREVIOUS_RUN)
@@ -1983,7 +1957,7 @@ class TestTomlWriting:
 
     def test_overwrite_with_force(self, tmp_path: Path) -> None:
         """
-        Force does not overwrite a profile saneless did not generate (D-01).
+        Force does not overwrite a profile saneless did not generate.
 
         ``auto_generated = false`` marks a hand-written profile, and there is
         no flag that hands it to the tool: it is skipped, reported, and left
@@ -2077,13 +2051,13 @@ class TestTomlWriting:
 
 class TestForceMerge:
     """
-    ``--force`` merges generated keys instead of replacing profiles (M-09).
+    ``--force`` merges generated keys instead of replacing profiles.
 
-    D-01: a profile without a truthy ``auto_generated`` is never touched, under
-    force too, and is reported. D-02: in a flagged profile the owned keys are
+    A profile without a truthy ``auto_generated`` is never touched, under
+    force too, and is reported. In a flagged profile the owned keys are
     written onto the existing table, so every other key and comment survives
-    and a hand edit to an owned key is overwritten. D-03: an owned key the fresh
-    generation does not write is deleted. D-04: the outcome comes back grouped.
+    and a hand edit to an owned key is overwritten. An owned key the fresh
+    generation does not write is deleted, and the outcome comes back grouped.
     """
 
     _DEFAULT_BLOCK = """\
@@ -2155,7 +2129,7 @@ auto_generated = true
         return config_file, result
 
     def test_force_refreshes_owned_keys_in_place(self, tmp_path: Path) -> None:
-        """D-02: owned keys take the generated values, a hand edit included."""
+        """Owned keys take the generated values, a hand edit included."""
         config_file, _ = self._write(tmp_path, force=True)
         scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
         assert scan["source"] == "ADF"
@@ -2164,13 +2138,13 @@ auto_generated = true
         assert scan["auto_generated"] is True
 
     def test_force_deletes_a_stale_owned_key(self, tmp_path: Path) -> None:
-        """D-03: ``duplex`` is not generated for this source, so it goes."""
+        """``duplex`` is not generated for this source, so it goes."""
         config_file, _ = self._write(tmp_path, force=True)
         scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
         assert "duplex" not in scan
 
     def test_force_merge_keeps_unowned_keys_and_comments(self, tmp_path: Path) -> None:
-        """D-02: ``default_tags``, ``title`` and the table comment survive."""
+        """``default_tags``, ``title`` and the table comment survive."""
         config_file, _ = self._write(tmp_path, force=True)
         text = config_file.read_text()
         scan = tomllib.loads(text)["profiles"]["scan"]
@@ -2183,12 +2157,12 @@ auto_generated = true
     def test_force_never_touches_an_unflagged_profile(
         self, tmp_path: Path, *, force: bool
     ) -> None:
-        """D-01: the hand-written ``default`` block is byte-for-byte unchanged."""
+        """The hand-written ``default`` block is byte-for-byte unchanged."""
         config_file, _ = self._write(tmp_path, force=force)
         assert self._DEFAULT_BLOCK.encode() in config_file.read_bytes()
 
     def test_force_merge_result_groups(self, tmp_path: Path) -> None:
-        """D-04: refreshed, skipped and removed names are reported apart."""
+        """Refreshed, skipped and removed names are reported apart."""
         _, result = self._write(tmp_path, force=True)
         assert result.added == ()
         assert result.refreshed == ("scan",)
@@ -2434,8 +2408,8 @@ class TestLabelAndDescriptionAreOwnedKeys:
     """
     ``label`` and ``description`` behave exactly like every other owned key.
 
-    D-18 chose one consistent ownership rule over a special case for free
-    text: ``--force`` overwrites both in place on a flagged profile, and a
+    One ownership rule covers the free-text keys too, with no special case:
+    ``--force`` overwrites both in place on a flagged profile, and a
     profile without ``auto_generated`` is never touched. The fixture is the
     same shape ``TestForceMerge`` uses, so the comment and ``default_tags``
     preservation assertions are the ones that file already trusts.
@@ -2525,8 +2499,8 @@ auto_generated = true
         """
         Emission is unconditional, unlike auto_source_mode and duplex.
 
-        This is what makes Phase 27 D-03's delete branch unreachable for the
-        two free-text keys.
+        This is what keeps the stale-owned-key delete branch from ever firing
+        for the two free-text keys.
         """
         profile = ProfileConfig(
             source=source,
@@ -2570,7 +2544,7 @@ auto_generated = true
     def test_force_overwrites_a_hand_typed_label_and_description(
         self, tmp_path: Path
     ) -> None:
-        """D-18: free text is owned text while the flag is set."""
+        """Free text is owned text while the flag is set."""
         config_file = self._write(tmp_path, force=True)
         scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
         assert scan["label"] == "Feeder, front side only"
@@ -2579,7 +2553,7 @@ auto_generated = true
     def test_force_refresh_keeps_unowned_keys_and_comments(
         self, tmp_path: Path
     ) -> None:
-        """Overwriting the two new keys costs nothing else in the table."""
+        """Overwriting the two free-text keys costs nothing else in the table."""
         config_file = self._write(tmp_path, force=True)
         text = config_file.read_text()
         scan = tomllib.loads(text)["profiles"]["scan"]
@@ -2592,7 +2566,7 @@ auto_generated = true
     def test_a_profile_without_the_flag_never_gains_a_label(
         self, tmp_path: Path, *, force: bool
     ) -> None:
-        """D-01: an unflagged profile's absent label stays absent."""
+        """An unflagged profile's absent label stays absent."""
         config_file = self._write(tmp_path, force=force)
         handwritten = tomllib.loads(config_file.read_text())["profiles"]["handwritten"]
         assert "label" not in handwritten
@@ -2604,7 +2578,7 @@ auto_generated = true
         """
         A table that had both keys still has both after a refresh.
 
-        Phase 27 D-03 deletes an owned key a fresh generation does not write.
+        A refresh deletes an owned key a fresh generation does not write.
         Unconditional emission is what keeps a free-text field from being
         silently pruned; this asserts the consequence rather than the cause.
         """
@@ -2627,11 +2601,11 @@ auto_generated = true
 
 class TestScanProfileHowToDocumentsOwnership:
     """
-    The how-to says in plain words what ``--force`` does to a typed label.
+    The how-to lists the profile keys and says what ``--force`` does to them.
 
-    D-18's overwrite rule makes ``label`` the first free-text casualty, so
-    the escape hatch has to be stated next to the rule and not only implied
-    by the owned-key list (30-RESEARCH §7, Amendment A-3).
+    The overwrite rule makes ``label`` the first free-text casualty, so the
+    escape hatch has to be stated next to the rule and not only implied by
+    the owned-key list.
     """
 
     @staticmethod
@@ -2642,38 +2616,70 @@ class TestScanProfileHowToDocumentsOwnership:
             / "docs"
             / "how-to"
             / "configure-scan-profiles.md"
-        ).read_text()
+        ).read_text(encoding="utf-8")
 
-    @pytest.mark.parametrize("key", ["label", "description"])
-    def test_guide_documents_both_new_keys(self, key: str) -> None:
-        """Each key appears as a field the guide describes."""
-        assert f"`{key}`" in self._guide()
+    @classmethod
+    def _section(cls, heading: str) -> str:
+        """
+        Return the guide's ``## heading`` section, up to the next ``##`` heading.
+
+        Args:
+            heading: The section's title, without the hashes.
+
+        Returns:
+            The section's text, its own heading line excluded.
+
+        """
+        match = re.search(
+            rf"^## {re.escape(heading)}\n(?P<body>.*?)(?=^## |\Z)",
+            cls._guide(),
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, f"the guide has no '## {heading}' section"
+        return match.group("body")
+
+    def test_field_reference_lists_every_profile_key(self) -> None:
+        """The field reference table has one row per profile key, and no others."""
+        rows = re.findall(
+            r"^\| `(?P<key>[a-z_]+)` \|",
+            self._section("Profile field reference"),
+            re.MULTILINE,
+        )
+        keys = {
+            field.alias or name for name, field in ProfileConfig.model_fields.items()
+        }
+        assert sorted(rows) == sorted(keys)
 
     def test_guide_names_the_force_command_and_the_escape_hatch(self) -> None:
-        """The overwrite rule and the way out are both stated."""
-        guide = self._guide()
-        assert "auto-profiles --force" in guide
-        assert "auto_generated" in guide
+        """The auto-generated section states the overwrite rule and the way out."""
+        section = self._section("Auto-generated profiles")
+        assert re.search(r"\bsaneless auto-profiles --force\b", section)
+        assert re.search(r"\bdelete the `auto_generated` line\b", section)
 
     def test_owned_key_list_in_the_guide_names_every_owned_key(self) -> None:
         """
-        The verbatim owned-key list does not drift from ``_OWNED_KEYS``.
+        The guide's list of keys ``--force`` rewrites is exactly ``_OWNED_KEYS``.
 
         The list is prose, so nothing but a test keeps it honest.
         """
-        guide = self._guide()
-        for key in auto_profiles._OWNED_KEYS:
-            assert f"`{key}`" in guide, key
+        match = re.search(
+            r"only the generated keys \((?P<keys>[^)]*)\)",
+            self._section("Auto-generated profiles"),
+        )
+        assert match is not None, "the guide no longer lists the generated keys"
+        listed = re.findall(r"`([^`]+)`", match.group("keys"))
+        assert len(listed) == len(set(listed)), listed
+        assert set(listed) == set(auto_profiles._OWNED_KEYS)
 
 
 class TestOwnershipReadsTheFlagLikeTheLoader:
     """
     The writer decides ownership the way ``load_settings`` parses the flag.
 
-    CR-01: pydantic's lax ``bool`` reads ``"false"``, ``"no"``, ``"off"`` and
+    pydantic's lax ``bool`` reads ``"false"``, ``"no"``, ``"off"`` and
     ``"0"`` as False, so the loader calls such a profile hand-written. Plain
-    truthiness called the same non-empty string True, and the tool refreshed
-    or pruned a profile it did not own (D-01).
+    truthiness would call the same non-empty string True and let the tool
+    refresh or prune a profile it does not own.
     """
 
     _FALSY_STRINGS = ("false", "no", "off", "0", "f", "n")
@@ -2780,10 +2786,9 @@ class TestDurableConfigWrite:
     """
     Config rewrites are UTF-8, line-ending preserving, guarded and atomic.
 
-    CFG-08 / M-10: the old write truncated the file in place in the locale
-    encoding and translated CRLF to LF. D-05: bytes are decoded as UTF-8 and
-    the dumped text is re-parsed before ``replace_file_atomically`` swaps it
-    in. D-07: a symlinked config is written through and both paths are logged.
+    Bytes are decoded as UTF-8, line endings are kept as written, and the
+    dumped text is re-parsed before ``replace_file_atomically`` swaps it in.
+    A symlinked config is written through and both paths are logged.
     """
 
     @staticmethod
@@ -2796,7 +2801,7 @@ class TestDurableConfigWrite:
         }
 
     def test_crlf_utf8_config_keeps_crlf_and_comment(self, tmp_path: Path) -> None:
-        """Every line ending stays CRLF, lines tomlkit adds included (D-05)."""
+        """Every line ending stays CRLF, lines tomlkit adds included."""
         config_file = tmp_path / "saneless.toml"
         config_file.write_bytes(
             '# café\r\n[profiles.default]\r\nsource = "Flatbed"\r\n'.encode()
@@ -2812,9 +2817,9 @@ class TestDurableConfigWrite:
 
     def test_mixed_line_endings_are_not_rewritten(self, tmp_path: Path) -> None:
         """
-        A file mixing CRLF and LF keeps each line's ending (WR-08, D-05).
+        A file mixing CRLF and LF keeps each line's ending.
 
-        One CRLF anywhere used to turn every bare LF in the output into CRLF,
+        One CRLF anywhere must not turn every bare LF in the output into CRLF,
         rewriting lines the user wrote with LF.
         """
         config_file = tmp_path / "saneless.toml"
@@ -2865,11 +2870,10 @@ class TestDurableConfigWrite:
 
     def test_invalid_toml_config_is_config_error(self, tmp_path: Path) -> None:
         """
-        A config tomlkit cannot parse is a ConfigError, file untouched (D-12).
+        A config tomlkit cannot parse is a ConfigError, file untouched.
 
-        tomlkit's ``ParseError`` used to escape ``write_profiles_to_config`` raw
-        (M-17, EXC-01); it now names the file, line and column and is chained,
-        since tomlkit's message holds no document text.
+        The error names the file, line and column and is chained to tomlkit's
+        ``ParseError``, whose message holds no document text.
         """
         config_file = tmp_path / "saneless.toml"
         original = b"a = = 1\n"
@@ -2881,8 +2885,7 @@ class TestDurableConfigWrite:
         message = str(caught.value)
         assert message.startswith(f"Cannot update {config_file}:")
         assert "line 1, column 4" in message
-        assert "Unexpected character" in message
-        # The position is given once, not again in tomlkit's own suffix (IN-03).
+        # The position is given once, not again in tomlkit's own suffix.
         assert " col 4" not in message
         assert isinstance(caught.value.__cause__, ParseError)
         assert config_file.read_bytes() == original
@@ -2891,7 +2894,7 @@ class TestDurableConfigWrite:
         self, tmp_path: Path
     ) -> None:
         """
-        Every tomlkit error is a ConfigError, not only ``ParseError`` (IN-03).
+        Every tomlkit error is a ConfigError, not only ``ParseError``.
 
         A table redefined under a dotted header raises ``KeyAlreadyPresent``,
         a ``TOMLKitError`` that is not a ``ParseError`` and carries no position,
@@ -2945,7 +2948,7 @@ class TestDurableConfigWrite:
         self, tmp_path: Path, *, force: bool
     ) -> None:
         """
-        Output that parses but means something else is refused (CR-02).
+        Output that parses but means something else is refused.
 
         With top-level dotted profile keys, tomlkit moves the second dotted
         line under the table it adds, so the dumped text is valid TOML that
@@ -3039,7 +3042,7 @@ class TestDurableConfigWrite:
     def test_symlink_config_is_written_through_and_logged(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """D-07: the link survives, the real file changes, both are named."""
+        """The link survives, the real file changes, both are named."""
         real = tmp_path / "dotfiles" / "saneless.toml"
         real.parent.mkdir()
         real.write_text('[profiles.default]\nsource = "Flatbed"\n')
