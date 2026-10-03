@@ -5121,11 +5121,11 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
     auto-profiles refuses to write while a superseded-name file is the only one.
 
     With nothing loaded, ``auto-profiles`` creates a file in a searched
-    directory, and the next start loads it.  A ``saneless.toml`` written
-    while an unread ``config.toml`` holds the only copy of the Paperless URL
-    and token would bury them: the search would stop at the new file and the
-    red row saying to rename the old one would drop to amber, with the
-    appliance still running on defaults.
+    directory, and the next start loads it.
+    A ``saneless.toml`` written while an unread ``config.toml`` holds the only
+    copy of the Paperless URL and token would bury them: the search would stop
+    at the new file and the red row saying to rename the old one would drop to
+    amber, with the appliance still running on defaults.
     """
 
     @staticmethod
