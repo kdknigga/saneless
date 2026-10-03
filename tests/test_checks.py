@@ -4978,10 +4978,9 @@ class TestScannerVerdict:
         """
         No row tells the reader to restart saneless for a state a Check clears.
 
-        The old conditional advice, restart if ``saneless devices`` lists the
-        scanner, answered a stale scanner library in a long-lived process.  A
-        fresh library on every listing retired it, so it must never come back,
-        and any restart a row still advises names the setting it follows.
+        Every listing runs with a fresh scanner library, so a restart conditional
+        on ``saneless devices`` listing the scanner would be wrong advice.  Any
+        restart a row advises names the setting it follows.
 
         Args:
             case: The inputs to the verdict.
@@ -5042,8 +5041,8 @@ class TestScannerVerdict:
         A usable scanner beside a host problem is one sentence with one "but".
 
         The refused wording on its own already has a "but" in it ("is on, but
-        its scanner service is not running"), so appending it to "is ready,
-        but" read as two.  The ready row words that outcome its own way.
+        its scanner service is not running"), so appended to "is ready, but" it
+        would read as two.  The ready row words that outcome its own way.
 
         Args:
             probes: What each configured host's probe found.
@@ -5089,7 +5088,7 @@ class TestScannerVerdict:
         self, message: str
     ) -> None:
         """
-        The new rows are no longer than a message the status strip already holds.
+        A listing-failure row fits wherever the strip's longest message fits.
 
         Args:
             message: One of the two listing-failure messages.
@@ -5353,13 +5352,12 @@ class TestScannerCheckAgainstAFakeSaned:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        The 2026-09-22 signature reads as a denial and names saned.conf.
+        Accept-then-close with nothing listed reads as a denial naming saned.conf.
 
-        saned accepted the connection and closed it before replying, which is
-        what its access list does to a peer it does not allow.  The row this
-        used to produce said the scanner was not reachable and to check it was
-        switched on and connected; it must say the host is refusing this
-        machine.
+        saned accepts the connection and closes it before replying, which is
+        what its access list does to a peer it does not allow.  The row says the
+        host is refusing this machine, never that the scanner should be checked
+        for being switched on and connected.
 
         Args:
             tmp_path: The test's own directory.
@@ -5500,12 +5498,10 @@ class TestScannerCheckAgainstAFakeSaned:
         """
         A configured device's own host is dialled for real, then the device opened.
 
-        No scanner host is configured, and the backend lists nothing, so the
-        check opens the configured ``net:`` id.  The default saned port is
-        pointed at a closed loopback port, so the host refuses, which returns
-        at once inside libsane and so does not keep the open out.  The open
-        fails, and the row blames the device's own host rather than saying
-        the scanner was not found.
+        With no scanner host configured and nothing listed, the check opens the
+        configured ``net:`` id.  Its host refuses on a closed loopback port,
+        which returns at once inside libsane and so does not keep the open out;
+        the failed open is blamed on that host, not on a scanner not found.
 
         Args:
             tmp_path: The test's own directory.
@@ -5706,14 +5702,14 @@ _PROBE_OUTCOMES = [
 
 
 class TestPaperlessCheck:
-    """The Paperless row reuses the five sentences that already exist (D-02)."""
+    """The Paperless row reuses the five existing connection-status sentences."""
 
     @pytest.mark.parametrize("token", ["", "   ", "changeme", "YOUR_TOKEN_HERE"])
     def test_a_placeholder_token_fails_without_a_request(
         self, tmp_path: Path, token: str
     ) -> None:
         """
-        D-14: an unset token is decided before any network call is made.
+        An unset token is decided before any network call is made.
 
         Args:
             tmp_path: The test's own directory.
@@ -5743,8 +5739,8 @@ class TestPaperlessCheck:
         An empty ``paperless.url`` is a setting to fill in, not a network fault.
 
         Probing it would fail inside httpx2 before any request is sent, and
-        that failure used to be reported as "Could not reach paperless-ngx",
-        sending the operator to look for a server that was never named.
+        reporting that as "Could not reach paperless-ngx" would send the
+        operator to look for a server that was never named.
 
         Args:
             tmp_path: The test's own directory.
@@ -6031,7 +6027,7 @@ class TestPaperlessCheck:
 
 
 class TestProfilesCheck:
-    """One result, chosen by a precedence this test pins (D-22, A-3)."""
+    """The Profiles row is one result, chosen by a fixed precedence."""
 
     def test_no_profiles_fails(self, tmp_path: Path) -> None:
         """
@@ -6049,7 +6045,7 @@ class TestProfilesCheck:
 
     def test_a_readonly_config_location_is_amber(self, tmp_path: Path) -> None:
         """
-        D-22, verbatim: a read-only config location is a warning, not a failure.
+        A read-only config location is a warning, not a failure.
 
         Args:
             tmp_path: The test's own directory.
@@ -6092,7 +6088,7 @@ class TestProfilesCheck:
 
     def test_an_unnamed_generated_profile_is_amber(self, tmp_path: Path) -> None:
         """
-        A-3: a generated profile with no label shows as a name the dropdown fakes.
+        A generated profile with no label shows as a name the dropdown fakes.
 
         Args:
             tmp_path: The test's own directory.
@@ -6111,7 +6107,7 @@ class TestProfilesCheck:
         self, tmp_path: Path
     ) -> None:
         """
-        The A-3 warning is about generated profiles, not hand-written ones.
+        The unnamed-profile warning is about generated profiles only.
 
         Args:
             tmp_path: The test's own directory.
@@ -6177,11 +6173,11 @@ class TestProfilesCheck:
 
 
 class TestFallbackCheck:
-    """A missing fallback folder is amber, never red (APPL-11, D-22)."""
+    """An unset fallback folder is amber; a configured one must take a write."""
 
     def test_an_unset_fallback_is_amber(self, tmp_path: Path) -> None:
         """
-        APPL-11 verbatim: not configured is a warning about a real risk.
+        Not configured is a warning about a real risk.
 
         Args:
             tmp_path: The test's own directory.
@@ -6252,7 +6248,7 @@ class TestFallbackCheck:
 
     def test_no_row_renders_the_folder_path(self, tmp_path: Path) -> None:
         """
-        The configured path never reaches the page (T-30-21).
+        The configured path never reaches the page.
 
         Args:
             tmp_path: The test's own directory.
@@ -6400,7 +6396,7 @@ class TestDataFolderRow:
 
     def test_both_existing_and_usable_is_ok(self, tmp_path: Path) -> None:
         """
-        The healthy case keeps its existing wording.
+        Two existing, usable folders give the plain "writable" row.
 
         Args:
             tmp_path: The test's own directory.
@@ -6666,7 +6662,7 @@ def _broken_context(tmp_path: Path) -> CheckContext:
 
 
 class TestRunChecks:
-    """The registry is complete, ordered, total and unable to raise (D-02)."""
+    """The registry is complete, ordered, total and unable to raise."""
 
     def test_every_key_appears_exactly_once(self, tmp_path: Path) -> None:
         """
@@ -6733,10 +6729,9 @@ class TestRunChecks:
 
     def test_warnings_alone_do_not_collapse_to_fail(self, tmp_path: Path) -> None:
         """
-        D-01, D-22: a missing fallback and a read-only config are amber together.
+        A missing fallback and a read-only config are amber together.
 
-        This is the case the whole three-state design exists for: the
-        appliance scans and files perfectly, and a scripted health gate must
+        The appliance scans and files perfectly, so a scripted health gate must
         not go red because it could be tidier.
 
         Args:
@@ -6785,10 +6780,10 @@ class TestRunChecks:
         """
         ASVS V7: nothing internal reaches a LAN-visible page through a row.
 
-        The one exception is narrow and is asserted as such (Phase 37 D-14):
-        the Configuration row's next step, in a superseded-name state, may
-        carry one of three fixed documented spellings.  Strip those and the
-        rule is unchanged -- no other slash, from any row, in either field.
+        The one exception is narrow and asserted as such: the Configuration
+        row's next step, in a superseded-name state, may carry one of three
+        fixed documented spellings.  Strip those and no other slash appears,
+        from any row, in either field.
 
         Args:
             tmp_path: The test's own directory.
