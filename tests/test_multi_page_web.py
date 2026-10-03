@@ -430,7 +430,7 @@ _FLIP_TEMPLATE = (
     Path(app_module.__file__).parent / "templates" / "partials" / "flip.html"
 )
 _FLIP_TEMPLATE_SHA256 = (
-    "80f5d15c8df0edd511d45dfa52462785dd2f0a40ab36de167c92d00b10daae73"
+    "f614c4590cdacce7e976e6234062d54abfba447e6fe39ed62d32a1fbc9770f2d"
 )
 
 

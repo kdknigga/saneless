@@ -1,10 +1,9 @@
 {# The ONLY copy of the Scan button markup.  index.html includes
    it inline; partials/status_response.html includes it with oob = true so every
-   status response re-renders it from server state.  Keep type="submit"
-   id="scan-btn" as the first two attributes, in that order: the _SCAN_BUTTON
-   regex in tests/test_web_state_rendering.py depends on it.  Never include this
-   inside partials/status.html -- the page includes that partial too, so the
-   page would carry a duplicate id="scan-btn".
+   status response re-renders it from server state.  type="submit" makes it
+   submit the scan form, and id="scan-btn" is what the form's hx-disabled-elt
+   names.  Never include this inside partials/status.html -- the page includes
+   that partial too, so the page would carry a duplicate id="scan-btn".
 
    The blocked flag below is the second, independent source of disabled: a
    paperless-ngx token nobody set means an upload is impossible before any paper

@@ -16,15 +16,16 @@ or the paperless-ngx address.
 from __future__ import annotations
 
 import dataclasses
-import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import jinja2
 import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from jinja2 import nodes
 
 from saneless.config import PaperlessConfig, ProfileConfig
 from saneless.job import JobResult
@@ -457,16 +458,18 @@ class TestTemplateContract:
         """A template reading a Job-only attribute would bypass the owner gate."""
         allowed = {field.name for field in dataclasses.fields(JobView)}
         allowed |= {"is_active", "is_busy"}
-        comment = re.compile(r"\{#.*?#\}", re.DOTALL)
+        environment = jinja2.Environment(autoescape=True)
         read: set[tuple[str, str]] = set()
         templates = sorted(TEMPLATES.rglob("*.html"))
         assert templates
         for template in templates:
-            source = comment.sub("", template.read_text(encoding="utf-8"))
+            tree = environment.parse(template.read_text(encoding="utf-8"))
             # ``last_job`` is the page's finished job, a view like ``job``.
             read.update(
-                (template.name, name)
-                for name in re.findall(r"\b(?:last_)?job\.([a-z_]+)", source)
+                (template.name, node.attr)
+                for node in tree.find_all(nodes.Getattr)
+                if isinstance(node.node, nodes.Name)
+                and node.node.name in {"job", "last_job"}
             )
 
         assert read, "no template reads a job attribute; the pattern has broken"

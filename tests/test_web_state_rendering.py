@@ -18,6 +18,7 @@ functions themselves.
 
 from __future__ import annotations
 
+import ast
 import html
 import json
 import re
@@ -25,13 +26,16 @@ import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple, override
 from urllib.parse import parse_qs, urlsplit
 
+import jinja2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from jinja2 import nodes
 from markupsafe import escape
 
 from saneless.config import (
@@ -92,6 +96,7 @@ from tests.conftest import (
     poll_until,
     quiet_window,
 )
+from tests.template_support import template_markup, template_start_tags
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -161,12 +166,223 @@ _PACKAGE_DIR = Path(app_module.__file__).parent
 _TEMPLATES_DIR = _PACKAGE_DIR / "templates"
 _APP_CSS = _PACKAGE_DIR / "static" / "app.css"
 
-# The scan button, captured whole so attribute and text assertions cannot be
-# satisfied by markup somewhere else on the page.
-_SCAN_BUTTON = re.compile(
-    r'<button type="submit" id="scan-btn"(?P<attrs>[^>]*)>(?P<text>.*?)</button>',
-    re.DOTALL,
-)
+
+class _ScanButton(NamedTuple):
+    """
+    The Scan button as one response renders it.
+
+    Captured whole, so attribute and text assertions cannot be satisfied by
+    markup somewhere else on the page.
+    """
+
+    attributes: dict[str, str | None]
+    """The opening tag's attributes, in whatever order they are written."""
+    text: str
+    """The markup between the opening and the closing tag."""
+    markup: str
+    """The whole element, from its opening tag to its closing tag."""
+    start: int
+    """Where the opening tag starts in the response."""
+
+
+class _ScanButtonFinder(HTMLParser):
+    """Count the elements carrying the Scan button's id and locate each button."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.ids = 0
+        self.buttons: list[
+            tuple[tuple[int, int], str, dict[str, str | None], tuple[int, int]]
+        ] = []
+        self._open: tuple[tuple[int, int], str, dict[str, str | None]] | None = None
+
+    @override
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if attributes.get("id") != "scan-btn":
+            return
+        self.ids += 1
+        opening = self.get_starttag_text()
+        if tag == "button" and opening is not None:
+            self._open = (self.getpos(), opening, attributes)
+
+    @override
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "button" and self._open is not None:
+            position, opening, attributes = self._open
+            self.buttons.append((position, opening, attributes, self.getpos()))
+            self._open = None
+
+
+def _offset(markup: str, position: tuple[int, int]) -> int:
+    """
+    Convert a parser's line and column into an offset into ``markup``.
+
+    Args:
+        markup: The text the parser read.
+        position: The parser's one-based line and zero-based column.
+
+    Returns:
+        The same place as an index into ``markup``.
+
+    """
+    line, column = position
+    return sum(len(text) + 1 for text in markup.split("\n")[: line - 1]) + column
+
+
+def _scan_buttons(markup: str) -> tuple[int, list[_ScanButton]]:
+    """
+    Parse every Scan button out of a response.
+
+    Args:
+        markup: The rendered response body.
+
+    Returns:
+        How many elements carry ``id="scan-btn"``, and each Scan button.
+
+    """
+    finder = _ScanButtonFinder()
+    finder.feed(markup)
+    finder.close()
+    buttons: list[_ScanButton] = []
+    for opened, opening, attributes, closed in finder.buttons:
+        start = _offset(markup, opened)
+        body = start + len(opening)
+        close = _offset(markup, closed)
+        end = markup.index(">", close) + 1
+        buttons.append(
+            _ScanButton(attributes, markup[body:close], markup[start:end], start)
+        )
+    return finder.ids, buttons
+
+
+def _scan_button(markup: str) -> _ScanButton | None:
+    """Return the first Scan button in ``markup``, or None when there is none."""
+    _ids, buttons = _scan_buttons(markup)
+    return buttons[0] if buttons else None
+
+
+class _StartTagReader(HTMLParser):
+    """Collect every start tag of a rendered response with its attributes."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: list[tuple[str, dict[str, str | None]]] = []
+
+    @override
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.tags.append((tag, dict(attrs)))
+
+
+def _rendered_start_tags(markup: str) -> list[tuple[str, dict[str, str | None]]]:
+    """Return the start tags of a rendered response, in document order."""
+    reader = _StartTagReader()
+    reader.feed(markup)
+    reader.close()
+    return reader.tags
+
+
+def _template_tags(*parts: str) -> list[tuple[str, dict[str, str | None]]]:
+    """Return the start tags of the template at ``parts`` under the templates."""
+    return template_start_tags(_TEMPLATES_DIR.joinpath(*parts))
+
+
+def _all_template_tags() -> list[tuple[Path, str, dict[str, str | None]]]:
+    """Return every start tag of every template, with the template it is in."""
+    return [
+        (path, tag, attributes)
+        for path in sorted(_TEMPLATES_DIR.rglob("*.html"))
+        for tag, attributes in template_start_tags(path)
+    ]
+
+
+def _template_tree(path: Path) -> nodes.Template:
+    """
+    Parse a template into Jinja's syntax tree.
+
+    Comments never reach the tree, so a check that walks it sees only the
+    expressions and statements the template evaluates.
+    """
+    return jinja2.Environment(autoescape=True).parse(path.read_text(encoding="utf-8"))
+
+
+def _template_names(tree: nodes.Template) -> list[str]:
+    """Return every name, attribute, filter and string constant a template uses."""
+    found: list[str] = []
+    for node in tree.find_all((nodes.Name, nodes.Getattr, nodes.Filter, nodes.Const)):
+        if isinstance(node, (nodes.Name, nodes.Filter)):
+            found.append(node.name)
+        elif isinstance(node, nodes.Getattr):
+            found.append(node.attr)
+        elif isinstance(node, nodes.Const) and isinstance(node.value, str):
+            found.append(node.value)
+    return found
+
+
+def _job_attribute(node: nodes.Node) -> str | None:
+    """Return ``attr`` when ``node`` is ``job.attr``, and None otherwise."""
+    if (
+        isinstance(node, nodes.Getattr)
+        and isinstance(node.node, nodes.Name)
+        and node.node.name == "job"
+    ):
+        return node.attr
+    return None
+
+
+def _conditions(tree: nodes.Template) -> list[nodes.Node]:
+    """Return the test of every ``if``, ``elif`` and inline ``if`` in a template."""
+    tests: list[nodes.Node] = [node.test for node in tree.find_all(nodes.If)]
+    tests.extend(node.test for node in tree.find_all(nodes.CondExpr))
+    return tests
+
+
+def _truth_tested_job_attributes(test: nodes.Node) -> list[str]:
+    """
+    Return the ``job`` attributes a condition tests for truthiness.
+
+    An attribute counts when the condition is the attribute itself, its
+    negation, or one side of an ``and`` or ``or``; a comparison, a test or a
+    filter applied to it does not.
+    """
+    attribute = _job_attribute(test)
+    if attribute is not None:
+        return [attribute]
+    if isinstance(test, nodes.Not):
+        return _truth_tested_job_attributes(test.node)
+    if isinstance(test, (nodes.And, nodes.Or)):
+        return [
+            *_truth_tested_job_attributes(test.left),
+            *_truth_tested_job_attributes(test.right),
+        ]
+    return []
+
+
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_BLOCK = re.compile(r"(?P<selector>[^{}]*)\{(?P<body>[^{}]*)\}")
+
+
+def _css_rules(css: str) -> list[tuple[str, str]]:
+    """
+    Return every innermost rule of a stylesheet, with its comments removed.
+
+    Args:
+        css: The stylesheet's text.
+
+    Returns:
+        Each rule's selector, whitespace normalised, and its body.
+
+    """
+    return [
+        (" ".join(block.group("selector").split()), block.group("body"))
+        for block in _CSS_BLOCK.finditer(_CSS_COMMENT.sub("", css))
+    ]
+
+
+def _declarations(body: str) -> dict[str, str]:
+    """Return a rule body's declarations as property names and their values."""
+    pairs = [part.split(":", 1) for part in body.split(";") if ":" in part]
+    return {name.strip(): value.strip() for name, value in pairs}
 
 
 # The paperless-ngx credential a configured appliance has. Anything outside
@@ -184,7 +400,7 @@ def _make_app(
     tmp_path: Path,
     *,
     credential: str = _REAL_CREDENTIAL,
-    url: str = "http://localhost:8000",
+    url: str = "http://paperless.invalid",
     show_lists: bool = True,
 ) -> FastAPI:
     """
@@ -683,7 +899,7 @@ def test_status_area_carries_no_aria_busy(
     assert "aria-busy" not in area
     assert ('<p class="busy-line">' in area) is (state in BUSY_STATES)
     button = _only_scan_button(text)
-    assert ('aria-busy="true"' in button.group("attrs")) is (state in BUSY_STATES)
+    assert (button.attributes.get("aria-busy") == "true") is (state in BUSY_STATES)
 
 
 @pytest.mark.parametrize("owner", [True, False], ids=["owner", "other-viewer"])
@@ -867,14 +1083,15 @@ class TestStatusAreaError:
         The rendered-page assertion above proves this app does not leak one;
         this proves no template *could*, which is the durable half (T-30-52).
         """
+        log_path = re.compile(r"log_file|log_path|logfile", re.IGNORECASE)
         offenders = sorted(
-            path.name
+            (path.name, name)
             for path in _TEMPLATES_DIR.rglob("*.html")
-            if re.search(
-                r"log_file|log_path|logfile",
-                path.read_text(encoding="utf-8"),
-                re.IGNORECASE,
-            )
+            for name in [
+                *_template_names(_template_tree(path)),
+                template_markup(path.read_text(encoding="utf-8")),
+            ]
+            if log_path.search(name)
         )
         assert offenders == []
 
@@ -911,9 +1128,8 @@ class TestStatusAreaError:
         Rare control or not, it is still one someone taps standing at the
         scanner.
         """
-        css = _APP_CSS.read_text(encoding="utf-8")
-        assert "details.tech-details > summary {" in css
-        assert "min-height: 2.75rem;" in css
+        summary = _declarations(_css_rule("details.tech-details > summary"))
+        assert summary.get("min-height") == "2.75rem"
 
 
 class TestAmberErrorRendering:
@@ -1017,11 +1233,20 @@ class TestAmberErrorRendering:
         upload once reached green, and it would be how an amber failure
         reached red.
         """
-        history = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
-            encoding="utf-8"
-        )
-        assert "job_status_class(job.warning, job.error_category)" in history
-        assert "job.state == JobState" not in history
+        tree = _template_tree(_TEMPLATES_DIR / "partials" / "history.html")
+        classes = [
+            (_job_attribute(node.node), [_job_attribute(arg) for arg in node.args])
+            for node in tree.find_all(nodes.Filter)
+            if node.name == "job_status_class" and node.node is not None
+        ]
+        assert classes == [("state", ["warning", "error_category"])]
+        state_comparisons = [
+            node
+            for node in tree.find_all(nodes.Compare)
+            if _job_attribute(node.expr) == "state"
+            or any(_job_attribute(operand.expr) == "state" for operand in node.ops)
+        ]
+        assert state_comparisons == []
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -1032,12 +1257,12 @@ def test_scan_button_disabled_and_busy_split(
     # On a page that waits for no list, so the job is the only source.
     client = listless_client
     _job_in_state(client, state)
-    match = _SCAN_BUTTON.search(client.get("/").text)
+    match = _scan_button(client.get("/").text)
     assert match is not None, "scan button markup not found"
-    attrs = match.group("attrs")
+    attrs = match.attributes
 
     assert ("disabled" in attrs) is (state in ACTIVE_STATES)
-    assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
+    assert (attrs.get("aria-busy") == "true") is (state in BUSY_STATES)
 
 
 def _scan_caption(state: JobState) -> str:
@@ -1065,9 +1290,9 @@ def _scan_caption(state: JobState) -> str:
 def test_scan_button_text(client: TestClient, state: JobState) -> None:
     """The button keeps its exact captions, HTML entity included (UI-07)."""
     _job_in_state(client, state)
-    match = _SCAN_BUTTON.search(client.get("/").text)
+    match = _scan_button(client.get("/").text)
     assert match is not None, "scan button markup not found"
-    text = match.group("text").strip()
+    text = match.text.strip()
 
     expected = _scan_caption(state)
     assert text == expected
@@ -1077,12 +1302,12 @@ _OOB_ATTR = ' hx-swap-oob="true"'
 _OOB_MESSAGE_CLEAR = '<div id="status-message" hx-swap-oob="innerHTML"></div>'
 
 
-def _only_scan_button(text: str) -> re.Match[str]:
+def _only_scan_button(text: str) -> _ScanButton:
     """Return the single scan button in `text`, failing on none or several."""
-    assert text.count('id="scan-btn"') == 1, "expected exactly one scan button"
-    match = _SCAN_BUTTON.search(text)
-    assert match is not None, "scan button markup not found"
-    return match
+    ids, buttons = _scan_buttons(text)
+    assert ids == 1, "expected exactly one scan button"
+    assert len(buttons) == 1, "scan button markup not found"
+    return buttons[0]
 
 
 def test_page_renders_one_inline_scan_button(client: TestClient) -> None:
@@ -1094,7 +1319,7 @@ def test_page_renders_one_inline_scan_button(client: TestClient) -> None:
     page would carry two ``id="scan-btn"`` and this count would catch it.
     """
     match = _only_scan_button(client.get("/").text)
-    assert "hx-swap-oob" not in match.group("attrs")
+    assert "hx-swap-oob" not in match.attributes
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -1114,13 +1339,13 @@ def test_poll_scan_button_matches_the_page_button(
     page = _only_scan_button(client.get("/").text)
     poll = _only_scan_button(client.get("/api/jobs/current/status").text)
 
-    assert _OOB_ATTR in poll.group("attrs")
-    assert poll.group(0).replace(_OOB_ATTR, "", 1) == page.group(0)
+    assert poll.attributes.get("hx-swap-oob") == "true"
+    assert poll.markup.replace(_OOB_ATTR, "", 1) == page.markup
 
 
 # What the page's button adds while its lists load: the third disabled source,
 # and the hold line it points at.
-_HOLD_ATTRS = frozenset({"disabled", 'aria-describedby="scan-hold-reason"'})
+_HOLD_ATTRS = frozenset({("disabled", None), ("aria-describedby", "scan-hold-reason")})
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -1138,13 +1363,13 @@ def test_page_button_differs_from_the_poll_only_by_the_hold(
     _job_in_state(client, state)
     page = _only_scan_button(client.get("/").text)
     poll = _only_scan_button(client.get("/api/jobs/current/status").text)
-    page_attrs = set(page.group("attrs").split())
-    poll_attrs = set(poll.group("attrs").split())
+    page_attrs = set(page.attributes.items())
+    poll_attrs = set(poll.attributes.items())
 
     assert page_attrs - poll_attrs <= _HOLD_ATTRS
     assert page_attrs >= _HOLD_ATTRS
-    assert poll_attrs - page_attrs == {_OOB_ATTR.strip()}
-    assert page.group("text") == poll.group("text")
+    assert poll_attrs - page_attrs == {("hx-swap-oob", "true")}
+    assert page.text == poll.text
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -1163,7 +1388,7 @@ def test_lazy_load_scan_button_matches_the_poll_button(
     loaded = _only_scan_button(lists)
     poll = _only_scan_button(client.get("/api/jobs/current/status").text)
 
-    assert loaded.group(0) == poll.group(0)
+    assert loaded.markup == poll.markup
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -1178,14 +1403,14 @@ def test_poll_scan_button_follows_the_state_table(
     _job_in_state(client, state)
     text = client.get("/api/jobs/current/status").text
     match = _only_scan_button(text)
-    attrs = match.group("attrs")
+    attrs = match.attributes
 
     assert ("disabled" in attrs) is (state in ACTIVE_STATES)
-    assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
+    assert (attrs.get("aria-busy") == "true") is (state in BUSY_STATES)
     assert 'aria-busy="false"' not in text
 
     expected = _scan_caption(state)
-    assert match.group("text").strip() == expected
+    assert match.text.strip() == expected
 
 
 # Offline, so the job the submit starts fails its upload at once instead of
@@ -1208,7 +1433,7 @@ def test_scan_success_carries_button_status_and_message_clear(
     text = response.text
 
     match = _only_scan_button(text)
-    assert _OOB_ATTR in match.group("attrs")
+    assert match.attributes.get("hx-swap-oob") == "true"
     assert text.count('id="status-area"') == 1
     assert text.count(_OOB_MESSAGE_CLEAR) == 1
     assert text.count("status-message") == 1
@@ -1222,7 +1447,7 @@ def test_poll_never_clears_the_status_message(client: TestClient) -> None:
     """
     _job_in_state(client, JobState.SCANNING)
     text = client.get("/api/jobs/current/status").text
-    assert _OOB_ATTR in _only_scan_button(text).group("attrs")
+    assert _only_scan_button(text).attributes.get("hx-swap-oob") == "true"
     assert "status-message" not in text
 
 
@@ -1235,7 +1460,7 @@ def test_flip_responses_never_clear_the_status_message(
     job_id = _app(client).state.worker._current_job_id
     response = client.post(f"/api/flip/{answer}", data={"job_id": job_id})
     assert response.status_code == 200
-    assert _OOB_ATTR in _only_scan_button(response.text).group("attrs")
+    assert _only_scan_button(response.text).attributes.get("hx-swap-oob") == "true"
     assert "status-message" not in response.text
 
 
@@ -1255,14 +1480,16 @@ def test_scan_error_response_carries_the_button_only_to_return_focus(
         headers={"HX-Request": "true"},
     )
     assert response.status_code == 422
-    button = _only_scan_button(response.text).group("attrs")
-    assert button.startswith(_OOB_ATTR)
+    button = _only_scan_button(response.text).attributes
+    assert button.get("hx-swap-oob") == "true"
     assert "disabled" not in button
-    assert re.search(r"\sautofocus\b", button) is not None
+    assert "autofocus" in button
     assert "status-area" not in response.text
 
 
-_SCAN_FORM = re.compile(r'<form hx-post="/api/scan"[^>]*>')
+# The rendered scan form's opening tag.  The element carries further
+# attributes, so its open tag has whitespace after the URL.
+_SCAN_FORM = re.compile(r'<form hx-post="/api/scan"\s+[^>]*>', re.DOTALL)
 _TITLE_INPUT = re.compile(r'<input[^>]*id="title-input"[^>]*>')
 
 
@@ -1330,12 +1557,12 @@ def test_idle_page_button_and_status(client: TestClient) -> None:
     """
     page = client.get("/").text
     held = _only_scan_button(page)
-    assert held.group("text").strip() == "Scan"
-    assert "disabled" in held.group("attrs")
+    assert held.text.strip() == "Scan"
+    assert "disabled" in held.attributes
     match = _only_scan_button(load_the_lists(client, page))
-    assert match.group("text").strip() == "Scan"
-    assert "disabled" not in match.group("attrs")
-    assert "aria-busy" not in match.group("attrs")
+    assert match.text.strip() == "Scan"
+    assert "disabled" not in match.attributes
+    assert "aria-busy" not in match.attributes
 
     status = client.get("/api/jobs/current/status").text
     assert "<p>Ready to scan.</p>" in status
@@ -1726,12 +1953,14 @@ class TestPageCounts:
         A fifth column would drift against `colspan`, and would compete with
         the Time column S7 simultaneously widens.
         """
-        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
-        history = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
-            encoding="utf-8"
-        )
-        assert index.count("<th>") == 4
-        assert history.count('colspan="4"') == 1
+        headers = [tag for tag, _ in _template_tags("index.html") if tag == "th"]
+        spans = [
+            attributes["colspan"]
+            for _, attributes in _template_tags("partials", "history.html")
+            if "colspan" in attributes
+        ]
+        assert len(headers) == 4
+        assert spans == ["4"]
 
     def test_no_template_guards_a_page_count_with_truthiness(self) -> None:
         """
@@ -1741,9 +1970,11 @@ class TestPageCounts:
         template is allowed to write one (D-32, Pitfall 4).
         """
         offenders = sorted(
-            path.name
+            (path.name, attribute)
             for path in _TEMPLATES_DIR.rglob("*.html")
-            if "if job.pages_" in path.read_text(encoding="utf-8")
+            for test in _conditions(_template_tree(path))
+            for attribute in _truth_tested_job_attributes(test)
+            if attribute.startswith("pages_")
         )
         assert offenders == []
 
@@ -1754,10 +1985,16 @@ class TestPageCounts:
         Muted rather than a status colour, because a count is a measurement and
         not an outcome.
         """
-        css = _APP_CSS.read_text(encoding="utf-8")
-        assert css.count(".page-counts") == 1
-        assert "display: block;" in css
-        assert "color: var(--pico-muted-color);" in css
+        selectors = [
+            selector
+            for selector, _ in _css_rules(_APP_CSS.read_text(encoding="utf-8"))
+            if ".page-counts" in selector
+        ]
+        assert selectors == [".page-counts"]
+        assert _declarations(_css_rule(".page-counts")) == {
+            "display": "block",
+            "color": "var(--pico-muted-color)",
+        }
 
 
 # Four pages scanned, the backs of two sheets removed as blank, two uploaded.
@@ -1873,11 +2110,11 @@ class TestHistoryTimeCell:
         cannot disagree about the zone or the format without editing the one
         implementation (UI-SPEC S7).
         """
-        source = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
-            encoding="utf-8"
+        names = _template_names(
+            _template_tree(_TEMPLATES_DIR / "partials" / "history.html")
         )
-        assert "strftime" not in source
-        assert source.count("local_time") == 1
+        assert "strftime" not in names
+        assert names.count("local_time") == 1
 
 
 # How long the owed-write test waits for the worker to act.  Idle ticks run at
@@ -1972,14 +2209,14 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
         # The guard's write, then at least one idle-tick retry.
         assert poll_until(lambda: finishes.calls >= 2, _OWED_WRITE_BUDGET)
         stuck = _only_scan_button(tc.get("/api/jobs/current/status").text)
-        assert "disabled" in stuck.group("attrs")
+        assert "disabled" in stuck.attributes
         assert tc.get("/health").status_code == 200
 
         broken.clear()
 
         def button_enabled() -> bool:
             text = tc.get("/api/jobs/current/status").text
-            return "disabled" not in _only_scan_button(text).group("attrs")
+            return "disabled" not in _only_scan_button(text).attributes
 
         assert poll_until(button_enabled, _OWED_WRITE_BUDGET)
         finished = job_store.get_job(job_id)
@@ -2038,7 +2275,7 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
 
         def button_enabled() -> bool:
             text = tc.get("/api/jobs/current/status").text
-            return "disabled" not in _only_scan_button(text).group("attrs")
+            return "disabled" not in _only_scan_button(text).attributes
 
         assert poll_until(button_enabled, _OWED_WRITE_BUDGET)
         finished = job_store.get_job(job_id)
@@ -2118,10 +2355,6 @@ _NON_OWNER_LINE = non_owner_wait_line(JobState.AWAITING_FLIP, deadline=None)
 
 _STATUS_OPEN = re.compile(r'<div id="status-area"[^>]*>', re.DOTALL)
 _SEEN_TOKEN = re.compile(r"seen=[0-9a-f]+")
-# The real element, not the prose reference to it in the comment above the
-# status card: the element carries at least one further attribute, so it is
-# the only one of the two whose open tag has whitespace after the URL.
-_SCAN_FORM = re.compile(r'<form hx-post="/api/scan"\s+[^>]*>', re.DOTALL)
 _THUMBNAIL_START = '<img src="data:image/jpeg;base64,'
 
 # Any control that would let a second browser seize an answered-for job.  D-26
@@ -2199,11 +2432,11 @@ def _around_the_flip_block(markup: str) -> tuple[str, str]:
     """
     opening = _STATUS_OPEN.search(markup)
     assert opening is not None
-    button = _SCAN_BUTTON.search(markup)
+    button = _scan_button(markup)
     assert button is not None
     masked = _SEEN_TOKEN.sub("seen=<token>", opening.group(0))
     assert masked != opening.group(0)
-    return masked, button.group(0)
+    return masked, button.markup
 
 
 class TestOwnerGatedFlipPrompt:
@@ -2342,8 +2575,12 @@ class TestOwnerGatedFlipPrompt:
 
         markup = _as_browser(client, _OWNING_BROWSER)
 
-        assert f'hx-confirm="{_ABORT_CONFIRMATION}"' in markup
-        assert markup.count("hx-confirm") == 1
+        confirming = [
+            (tag, attributes["hx-confirm"])
+            for tag, attributes in _rendered_start_tags(markup)
+            if "hx-confirm" in attributes
+        ]
+        assert confirming == [("button", _ABORT_CONFIRMATION)]
 
     def test_flip_confirmation_is_on_the_button_not_the_scan_form(self) -> None:
         """
@@ -2353,14 +2590,16 @@ class TestOwnerGatedFlipPrompt:
         confirm, and would need the form's inheritance list extended -- the
         exact landmine Phase 26 spent a regression test on.
         """
-        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
-        flip = (_TEMPLATES_DIR / "partials" / "flip.html").read_text(encoding="utf-8")
+        index = _template_tags("index.html")
+        flip = _template_tags("partials", "flip.html")
 
-        form = _SCAN_FORM.search(index)
-        assert form is not None
-        assert "hx-confirm" not in index
-        assert 'hx-disinherit="hx-disabled-elt"' in form.group(0)
-        assert flip.count("hx-confirm") == 1
+        assert [
+            attributes for _, attributes in index if "hx-confirm" in attributes
+        ] == []
+        assert _scan_form_attributes().get("hx-disinherit") == "hx-disabled-elt"
+        assert [tag for tag, attributes in flip if "hx-confirm" in attributes] == [
+            "button"
+        ]
 
 
 # A deadline a stubbed worker reports.  Aware, as the worker's always is, and
@@ -2559,22 +2798,28 @@ class TestWaitingCopy:
         _flip_job(client, _OWNING_BROWSER)
 
         prompt = _flip_prompt(_as_browser(client, _OWNING_BROWSER))
-        template = (_TEMPLATES_DIR / "partials" / "flip.html").read_text(
-            encoding="utf-8"
+        template = template_markup(
+            (_TEMPLATES_DIR / "partials" / "flip.html").read_text(encoding="utf-8")
         )
 
         for source in (prompt, template):
             assert _FLIP_INSTRUCTIONS in source
             for caption in _FLIP_CAPTIONS:
                 assert caption in source
-            assert f'hx-confirm="{_ABORT_CONFIRMATION}"' in source
+        for tags in (
+            _rendered_start_tags(prompt),
+            _template_tags("partials", "flip.html"),
+        ):
+            assert ("button", _ABORT_CONFIRMATION) in [
+                (tag, attributes.get("hx-confirm")) for tag, attributes in tags
+            ]
 
 
 def _status_area_of(markup: str) -> str:
     """Return a status response's status area, without the out-of-band button."""
-    button = _SCAN_BUTTON.search(markup)
+    button = _scan_button(markup)
     assert button is not None
-    return markup[: button.start()]
+    return markup[: button.start]
 
 
 # --- S8: the blocked Scan button and its reason line (APPL-07, D-14, D-15) ---
@@ -2593,47 +2838,61 @@ _REASON_LINE = re.compile(
     re.DOTALL,
 )
 
-# The scan form's opening tag. The whitespace after the URL is required because
-# the comment above the status card mentions `<form hx-post="/api/scan">` in
-# prose, and a looser pattern matches that instead of the element.
-_SCAN_FORM_TAG = re.compile(r'<form hx-post="/api/scan"\s+(?P<attrs>[^>]*)>')
-
-# The four htmx attributes the scan form carries, in order. Phase 30 adds none:
-# `hx-disinherit` is the C-10 fix and `hx-disabled-elt` is what it protects, so
-# the list is asserted whole rather than by membership.
+# The scan form's attributes, in order. `hx-disinherit` is the C-10 fix and
+# `hx-disabled-elt` is what it protects, so the list is asserted whole rather
+# than by membership.
 #
-# Two more lead them now.  `method` and `action` are not htmx attributes and
-# nothing inherits them: they make a submit with JavaScript off a POST, so the
-# title never lands in a URL, and the server refuses that POST with a page.
+# `method` and `action` are not htmx attributes and nothing inherits them: they
+# make a submit with JavaScript off a POST, so the title never lands in a URL,
+# and the server refuses that POST with a page.
 _SCAN_FORM_ATTRS = [
-    'method="post"',
-    'action="/api/scan"',
-    'hx-target="#status-area"',
-    'hx-swap="outerHTML"',
-    'hx-disabled-elt="#scan-btn"',
-    'hx-disinherit="hx-disabled-elt"',
+    ("hx-post", "/api/scan"),
+    ("method", "post"),
+    ("action", "/api/scan"),
+    ("hx-target", "#status-area"),
+    ("hx-swap", "outerHTML"),
+    ("hx-disabled-elt", "#scan-btn"),
+    ("hx-disinherit", "hx-disabled-elt"),
 ]
 
-_DESCRIBED_BY = 'aria-describedby="scan-blocked-reason"'
 
-# The button's opening literal, which `_SCAN_BUTTON` above depends on.
-_PINNED_BUTTON_OPENING = '<button type="submit" id="scan-btn"'
+def _scan_form_attributes() -> dict[str, str | None]:
+    """Return the attributes of the page template's one scan form, as written."""
+    forms = [
+        attributes
+        for tag, attributes in _template_tags("index.html")
+        if tag == "form" and attributes.get("hx-post") == "/api/scan"
+    ]
+    assert len(forms) == 1, forms
+    return forms[0]
+
 
 # The package root, for the assertions that follow the copy rather than markup.
 _SRC_DIR = _PACKAGE_DIR.parent
 
 
-def _button_partial() -> str:
+def _source_strings(path: Path) -> list[str]:
     """
-    Return the one copy of the Scan button markup.
+    Return the text a source file can put on a page, without its comments.
+
+    Args:
+        path: A Python module, a template or a stylesheet.
 
     Returns:
-        The partial's source, header comment included.
+        A module's string constants, a template's markup and string
+        constants, or a stylesheet's text with its comments removed.
 
     """
-    return (_TEMPLATES_DIR / "partials" / "scan_button.html").read_text(
-        encoding="utf-8"
-    )
+    source = path.read_text(encoding="utf-8")
+    if path.suffix == ".py":
+        return [
+            node.value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+    if path.suffix == ".html":
+        return [template_markup(source), *_template_names(_template_tree(path))]
+    return [_CSS_COMMENT.sub("", source)]
 
 
 def _css_rule(selector: str) -> str:
@@ -2644,14 +2903,16 @@ def _css_rule(selector: str) -> str:
         selector: The selector, without its opening brace.
 
     Returns:
-        Everything between that rule's braces.
+        Everything between that rule's braces, without comments.
 
     """
-    css = _APP_CSS.read_text(encoding="utf-8")
-    opening = f"{selector} {{"
-    assert css.count(opening) == 1, f"expected exactly one {selector} rule"
-    body = css[css.index(opening) + len(opening) :]
-    return body[: body.index("}")]
+    bodies = [
+        body
+        for found, body in _css_rules(_APP_CSS.read_text(encoding="utf-8"))
+        if found == selector
+    ]
+    assert len(bodies) == 1, f"expected exactly one {selector} rule"
+    return bodies[0]
 
 
 def _done_job_that_is_not_current(client: TestClient, title: str) -> str:
@@ -2697,12 +2958,12 @@ class TestScanBlocked:
     ) -> None:
         """A blocked appliance with nothing running still offers one word."""
         match = _only_scan_button(blocked_client.get("/").text)
-        attrs = match.group("attrs")
+        attrs = match.attributes
 
         assert "disabled" in attrs
-        assert _DESCRIBED_BY in attrs
+        assert attrs.get("aria-describedby") == "scan-blocked-reason"
         assert "aria-busy" not in attrs
-        assert match.group("text").strip() == "Scan"
+        assert match.text.strip() == "Scan"
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_blocked_button_leaves_the_job_label_and_aria_busy_alone(
@@ -2716,14 +2977,14 @@ class TestScanBlocked:
         """
         _job_in_state(blocked_client, state)
         match = _only_scan_button(blocked_client.get("/").text)
-        attrs = match.group("attrs")
+        attrs = match.attributes
 
         assert "disabled" in attrs
-        assert _DESCRIBED_BY in attrs
-        assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
+        assert attrs.get("aria-describedby") == "scan-blocked-reason"
+        assert (attrs.get("aria-busy") == "true") is (state in BUSY_STATES)
 
         expected = _scan_caption(state)
-        assert match.group("text").strip() == expected
+        assert match.text.strip() == expected
 
     def test_an_unblocked_page_carries_no_describedby_and_no_reason(
         self, client: TestClient
@@ -2732,7 +2993,7 @@ class TestScanBlocked:
         page = client.get("/").text
         match = _only_scan_button(page)
 
-        assert _DESCRIBED_BY not in match.group("attrs")
+        assert match.attributes.get("aria-describedby") != "scan-blocked-reason"
         assert "scan-blocked-reason" not in page
         assert _REASON_LINE.search(page) is None
 
@@ -2754,8 +3015,8 @@ class TestScanBlocked:
         match = _only_scan_button(page)
         rendered = _REASON_LINE.findall(page)
 
-        assert "disabled" in match.group("attrs")
-        assert _DESCRIBED_BY in match.group("attrs")
+        assert "disabled" in match.attributes
+        assert match.attributes.get("aria-describedby") == "scan-blocked-reason"
         assert [text.strip() for text in rendered] == [
             "The paperless-ngx address has not been set \N{EM DASH} "
             "see System status above."
@@ -2786,8 +3047,8 @@ class TestScanBlocked:
             match = _only_scan_button(
                 blocked_client.get("/api/jobs/current/status").text
             )
-            assert "disabled" in match.group("attrs")
-            assert _DESCRIBED_BY in match.group("attrs")
+            assert "disabled" in match.attributes
+            assert match.attributes.get("aria-describedby") == "scan-blocked-reason"
 
     def test_blocked_followed_job_poll_carries_the_blocked_button(
         self, blocked_client: TestClient
@@ -2796,8 +3057,8 @@ class TestScanBlocked:
         job_id = _job_in_state(blocked_client, JobState.DONE)
         match = _only_scan_button(blocked_client.get(f"/api/jobs/{job_id}/status").text)
 
-        assert "disabled" in match.group("attrs")
-        assert _DESCRIBED_BY in match.group("attrs")
+        assert "disabled" in match.attributes
+        assert match.attributes.get("aria-describedby") == "scan-blocked-reason"
 
     @pytest.mark.parametrize("route", ["continue", "abort"], ids=["continue", "abort"])
     def test_blocked_flip_responses_carry_the_blocked_button(
@@ -2808,8 +3069,8 @@ class TestScanBlocked:
         response = blocked_client.post(f"/api/flip/{route}", data={"job_id": job_id})
         match = _only_scan_button(response.text)
 
-        assert "disabled" in match.group("attrs")
-        assert _DESCRIBED_BY in match.group("attrs")
+        assert "disabled" in match.attributes
+        assert match.attributes.get("aria-describedby") == "scan-blocked-reason"
 
     def test_checks_refresh_carries_no_button_and_no_blocked_reason(
         self, blocked_client: TestClient
@@ -2848,28 +3109,22 @@ class TestScanBlocked:
             assert 'id="scan-blocked-reason"' not in text
             assert _REASON_LINE.search(text) is None
 
-    def test_the_blocked_button_keeps_its_pinned_first_two_attributes(
+    def test_the_blocked_page_renders_the_one_submit_scan_button(
         self, blocked_client: TestClient
     ) -> None:
-        """
-        `type="submit" id="scan-btn"` stay first, in that order (ROBU-04).
-
-        The `_SCAN_BUTTON` regex in this module depends on it, and so does the
-        partial's own header comment.
-
-        Asserted against the partial's first line of markup rather than a fixed
-        number of leading lines, because the header comment above it is
-        deliberately long and is meant to grow.
-        """
-        markup = [
-            line for line in _button_partial().splitlines() if line.startswith("<")
+        """The partial's one button submits the scan form, and the page has one."""
+        buttons = [
+            attributes
+            for tag, attributes in _template_tags("partials", "scan_button.html")
+            if tag == "button"
         ]
-        assert markup, "no markup in the button partial"
-        assert markup[0].startswith(_PINNED_BUTTON_OPENING)
+        assert len(buttons) == 1
+        assert buttons[0].get("type") == "submit"
+        assert buttons[0].get("id") == "scan-btn"
 
-        page = blocked_client.get("/").text
-        assert page.count(_PINNED_BUTTON_OPENING) == 1
-        assert _only_scan_button(page).group("text").strip() == "Scan"
+        button = _only_scan_button(blocked_client.get("/").text)
+        assert button.attributes.get("type") == "submit"
+        assert button.text.strip() == "Scan"
 
     def test_the_scan_form_element_gains_no_attribute(self) -> None:
         """
@@ -2878,11 +3133,7 @@ class TestScanBlocked:
         The blocked state lives in the button partial and nowhere else, so the
         inheritance fix and its comment are untouched.
         """
-        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
-        match = _SCAN_FORM_TAG.search(index)
-
-        assert match is not None
-        assert match.group("attrs").split() == _SCAN_FORM_ATTRS
+        assert list(_scan_form_attributes().items()) == _SCAN_FORM_ATTRS
 
     def test_no_template_reaches_for_aria_disabled_or_a_tooltip(self) -> None:
         """
@@ -2893,9 +3144,17 @@ class TestScanBlocked:
         to `aria-disabled="true"` to make it focusable is forbidden: it would
         break Phase 26's `disabled` contract and `hx-disabled-elt`.
         """
-        for path in sorted(_TEMPLATES_DIR.rglob("*.html")):
-            assert "aria-disabled" not in path.read_text(encoding="utf-8"), path
-        assert "title=" not in _button_partial()
+        offenders = [
+            (path.name, tag)
+            for path, tag, attributes in _all_template_tags()
+            if "aria-disabled" in attributes
+        ]
+        assert offenders == []
+        assert [
+            tag
+            for tag, attributes in _template_tags("partials", "scan_button.html")
+            if "title" in attributes
+        ] == []
 
     def test_the_blocked_reason_copy_lives_in_python_and_in_no_template(self) -> None:
         """
@@ -2910,7 +3169,7 @@ class TestScanBlocked:
             for path in _SRC_DIR.rglob("*")
             if path.is_file()
             and path.suffix in {".py", ".html", ".css"}
-            and _BLOCKED_REASON in path.read_text(encoding="utf-8")
+            and any(_BLOCKED_REASON in text for text in _source_strings(path))
         )
 
         assert len(carrying) == 1, carrying
@@ -2962,8 +3221,8 @@ class TestScanButtonFollowsTheRenderedJob:
         match = _only_scan_button(text)
 
         assert "Mine, Already Done" in text
-        assert "disabled" not in match.group("attrs")
-        assert match.group("text").strip() == "Scan"
+        assert "disabled" not in match.attributes
+        assert match.text.strip() == "Scan"
 
     def test_a_browser_that_submitted_nothing_still_sees_the_appliance_busy(
         self, client: TestClient
@@ -2974,8 +3233,8 @@ class TestScanButtonFollowsTheRenderedJob:
 
         match = _only_scan_button(client.get("/api/jobs/current/status").text)
 
-        assert "disabled" in match.group("attrs")
-        assert match.group("text").strip() == "Scanning…"
+        assert "disabled" in match.attributes
+        assert match.text.strip() == "Scanning…"
 
     def test_the_button_never_describes_a_job_the_status_area_is_not_showing(
         self, client: TestClient
@@ -3005,8 +3264,8 @@ class TestScanButtonFollowsTheRenderedJob:
             blocked_client.get(f"/api/jobs/{finished}/status").text
         )
 
-        assert "disabled" in match.group("attrs")
-        assert _DESCRIBED_BY in match.group("attrs")
+        assert "disabled" in match.attributes
+        assert match.attributes.get("aria-describedby") == "scan-blocked-reason"
 
 
 # Every help line on the scan form, keyed by the id the control points at
@@ -3317,12 +3576,12 @@ class TestFormHelpTextAndTagPicker:
         `hx-params="not q"` on the form, which would have needed the
         `hx-disinherit` list extended.
         """
-        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
-        match = _SCAN_FORM_TAG.search(index)
-
-        assert match is not None
-        assert match.group("attrs").split() == _SCAN_FORM_ATTRS
-        assert "hx-confirm" not in index
+        assert list(_scan_form_attributes().items()) == _SCAN_FORM_ATTRS
+        assert [
+            tag
+            for tag, attributes in _template_tags("index.html")
+            if "hx-confirm" in attributes
+        ] == []
 
     def test_noscript_line_follows_the_scan_heading(self, client: TestClient) -> None:
         """
@@ -3344,10 +3603,13 @@ class TestFormHelpTextAndTagPicker:
 
     def test_no_template_keeps_the_tag_multi_select(self) -> None:
         """D-30: one control, one partial -- the multi-select is deleted."""
-        for path in sorted(_TEMPLATES_DIR.rglob("*.html")):
-            source = path.read_text(encoding="utf-8")
-            assert 'name="tags" multiple' not in source, path
-            assert '<select name="tags"' not in source, path
+        offenders = [
+            (path.name, tag)
+            for path, tag, attributes in _all_template_tags()
+            if attributes.get("name") == "tags"
+            and (tag == "select" or "multiple" in attributes)
+        ]
+        assert offenders == []
 
     def test_the_tag_and_correspondent_refresh_buttons_survive_the_rewrite(
         self, client: TestClient
@@ -3477,17 +3739,26 @@ def test_stylesheet_has_no_dead_fallbacks_or_deprecated_clip(
     """
     response = client.get("/static/app.css")
     assert response.status_code == 200
-    css = response.text
+    rules = _css_rules(response.text)
+    declarations = [
+        (name, value)
+        for _, body in rules
+        for name, value in _declarations(body).items()
+    ]
 
-    assert ", green)" not in css
-    assert ", red)" not in css
-    assert "table-layout: fixed" not in css
-    assert "word-break: break-word" not in css
+    named_fallbacks = [
+        value for _, value in declarations if ", green)" in value or ", red)" in value
+    ]
+    assert named_fallbacks == []
+    assert ("table-layout", "fixed") not in declarations
+    assert ("word-break", "break-word") not in declarations
+    assert [name for name, _ in declarations if name == "clip"] == []
 
-    sr_only = re.search(r"^\.sr-only \{(?P<body>[^}]*)\}", css, re.MULTILINE)
-    assert sr_only is not None, ".sr-only rule not found"
-    assert "clip-path: inset(50%);" in sr_only.group("body")
-    assert "clip: rect(" not in css
+    sr_only = [
+        _declarations(body) for selector, body in rules if selector == ".sr-only"
+    ]
+    assert len(sr_only) == 1, ".sr-only rule not found"
+    assert sr_only[0].get("clip-path") == "inset(50%)"
 
 
 # --- Where focus goes after an action (the focus map) -----------------------
@@ -3612,7 +3883,7 @@ class TestFocusEmission:
 
         assert response.status_code == 200, response.text
         assert _takes_focus(_status_open_tag(response.text))
-        assert not _takes_focus(_only_scan_button(response.text).group("attrs"))
+        assert "autofocus" not in _only_scan_button(response.text).attributes
         assert "focus" not in _status_poll_query(response.text)
 
     def test_focus_map_continue_autofocuses_the_status_area(
@@ -3639,7 +3910,7 @@ class TestFocusEmission:
 
         assert _takes_focus(_status_open_tag(text))
         assert "focus" not in _status_poll_query(text)
-        assert not _takes_focus(_only_scan_button(text).group("attrs"))
+        assert "autofocus" not in _only_scan_button(text).attributes
 
     def test_focus_map_claimed_abort_bakes_focus_scan(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -3659,9 +3930,9 @@ class TestFocusEmission:
         assert str(escape(flip_answer_label(FlipOutcome.ABORTED))) in text
         assert _takes_focus(_status_open_tag(text))
         assert _status_poll_query(text)["focus"] == [_FOCUS_SCAN]
-        button = _only_scan_button(text).group("attrs")
+        button = _only_scan_button(text).attributes
         assert "disabled" in button
-        assert not _takes_focus(button)
+        assert "autofocus" not in button
 
     def test_focus_map_unclaimed_abort_bakes_nothing(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -3679,7 +3950,7 @@ class TestFocusEmission:
 
         assert _app(client).state.worker.flip_answer(job_id) is None
         assert "focus" not in _status_poll_query(text)
-        assert not _takes_focus(_only_scan_button(text).group("attrs"))
+        assert "autofocus" not in _only_scan_button(text).attributes
 
     def test_an_abort_claimed_after_the_job_ended_focuses_scan_at_once(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -3698,9 +3969,9 @@ class TestFocusEmission:
 
         text = _flip_answer_response(client, job_id, "abort")
 
-        button = _only_scan_button(text).group("attrs")
+        button = _only_scan_button(text).attributes
         assert "disabled" not in button
-        assert _takes_focus(button)
+        assert "autofocus" in button
         assert not _takes_focus(_status_open_tag(text))
 
     def test_focus_scan_autofocuses_an_enabled_scan_button_only(
@@ -3717,18 +3988,18 @@ class TestFocusEmission:
         waiting = client.get(
             f"/api/jobs/{active}/status", params={"focus": _FOCUS_SCAN}
         ).text
-        waiting_button = _only_scan_button(waiting).group("attrs")
+        waiting_button = _only_scan_button(waiting).attributes
         assert "disabled" in waiting_button
-        assert not _takes_focus(waiting_button)
+        assert "autofocus" not in waiting_button
         assert _status_poll_query(waiting)["focus"] == [_FOCUS_SCAN]
 
         ended = _job_in_state(client, JobState.CANCELLED)
         asked = client.get(
             f"/api/jobs/{ended}/status", params={"focus": _FOCUS_SCAN}
         ).text
-        asked_button = _only_scan_button(asked).group("attrs")
+        asked_button = _only_scan_button(asked).attributes
         assert "disabled" not in asked_button
-        assert _takes_focus(asked_button)
+        assert "autofocus" in asked_button
         assert not _takes_focus(_status_open_tag(asked))
 
         plain = client.get(f"/api/jobs/{ended}/status").text
@@ -3748,7 +4019,7 @@ class TestFocusEmission:
 
         assert waiting.status_code == asked.status_code == 200
         assert "focus" not in _status_poll_query(waiting.text)
-        assert not _takes_focus(_only_scan_button(asked.text).group("attrs"))
+        assert "autofocus" not in _only_scan_button(asked.text).attributes
         for text in (waiting.text, asked.text):
             assert value not in text
             assert str(escape(value)) not in text
@@ -3769,7 +4040,7 @@ class TestFocusEmission:
         for url in ("/api/jobs/current/status", f"/api/jobs/{job_id}/status"):
             text = client.get(url).text
             assert not _takes_focus(_status_open_tag(text))
-            assert not _takes_focus(_only_scan_button(text).group("attrs"))
+            assert "autofocus" not in _only_scan_button(text).attributes
 
     @pytest.mark.parametrize("action", _FOCUS_ACTIONS)
     def test_first_poll_after_an_action_is_still_204(
@@ -3840,7 +4111,7 @@ class TestPromptAutofocus:
 
         assert 'id="flip-abort"' in text
         assert _focused_buttons(text) == ["flip-continue"]
-        assert "autofocus" not in _only_scan_button(text).group("attrs")
+        assert "autofocus" not in _only_scan_button(text).attributes
         assert not _takes_focus(_status_open_tag(text))
 
     @pytest.mark.parametrize("presented", [_OWNING_BROWSER + "-not", None])
@@ -4082,8 +4353,8 @@ class TestLastScanLine:
         # The page holds Scan only for its lists; once they land, a finished
         # job leaves it offered again.
         button = _only_scan_button(load_the_lists(client, page))
-        assert "disabled" not in button.group("attrs")
-        assert button.group("text").strip() == "Scan"
+        assert "disabled" not in button.attributes
+        assert button.text.strip() == "Scan"
 
     @pytest.mark.parametrize(
         ("recorded", "presented", "sees_detail"),
@@ -4203,8 +4474,8 @@ def test_queued_button_reads_queued(client: TestClient, *, queued: bool) -> None
         job_id = _job_in_state(client, JobState.PENDING)
     for text in (client.get("/").text, client.get(f"/api/jobs/{job_id}/status").text):
         button = _only_scan_button(text)
-        assert button.group("text").strip() == "Queued…"
-        assert "disabled" in button.group("attrs")
+        assert button.text.strip() == "Queued…"
+        assert "disabled" in button.attributes
         assert "Scanning…" not in text
 
 
