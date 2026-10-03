@@ -1,9 +1,9 @@
 """
 Tests for PDF assembly module.
 
-``assemble_pdf`` takes ``PageRecord``s now, not images: the spool has already
+``assemble_pdf`` takes ``PageRecord``s, not images: the spool has already
 written every page as a PNG, and that file is what img2pdf embeds, losslessly
-and with no second encode (D-03). So the pages these tests assemble are spooled
+and with no second encode. So the pages these tests assemble are spooled
 through a real ``SpooledPageSink`` into a real directory, and the assertions
 about what assembly left behind are scoped to the *output* directory -- which
 is deliberately not the spool, because the spooled pages are supposed to
@@ -344,14 +344,11 @@ class TestAssemblePdf:
         output_dir: Path,
     ) -> None:
         """
-        D-03: assembly re-saves nothing -- it embeds the spooled PNG itself.
+        Assembly re-saves nothing -- it embeds the spooled PNG itself.
 
-        The deleted code wrote a ``page_NNNN.png`` copy of every page into a
-        ``TemporaryDirectory`` under ``output_dir`` and handed img2pdf those.
-        Three facts together say it is gone: no PNG of any name survives
-        anywhere under the output directory, the output directory holds nothing
-        but the PDF, and the spool still holds exactly the pages that were
-        spooled, byte for byte.
+        No PNG of any name exists anywhere under the output directory, the
+        output directory holds nothing but the PDF, and the spool still holds
+        exactly the pages that were spooled, byte for byte.
         """
         images = [Image.new("RGB", (100, 100), colour) for colour in ("white", "red")]
         records = spool_pages(images)
@@ -400,7 +397,7 @@ class TestAssemblePdf:
         output_dir: Path,
     ) -> None:
         """
-        Reversing the records reverses the PDF, with no sort and no glob (D-02).
+        Reversing the records reverses the PDF, with no sort and no glob.
 
         The spooled names are unchanged between the two assemblies, so a
         directory listing cannot tell the two PDFs apart -- only the record
@@ -426,15 +423,14 @@ class TestAssemblePdf:
 
 class TestBoundedAssembly:
     """
-    D-03 as amended: one convert per page, then a qpdf merge.
+    One convert per page, then a qpdf merge.
 
     ``img2pdf.convert`` reads every input fully into memory and finalises the
     whole document before ``outputstream`` is written, so a single convert is
-    linear in page count whether it streams or not (measured: 1395 MB and
-    787 MB respectively at 48 pages). Converting one page at a time and merging
-    the single-page PDFs with qpdf measured flat at 131 MB for both 12 and 48
-    pages. These tests hold that shape in place and prove the merged document
-    is not a different document.
+    linear in page count whether it streams or not.  Converting one page at a
+    time and merging the single-page PDFs with qpdf is flat in page count.
+    These tests hold that shape in place and prove the merged document is not
+    a different document.
     """
 
     def test_merge_produces_one_page_per_record_in_record_order(
@@ -508,7 +504,7 @@ class TestBoundedAssembly:
         assert argv[0] == "qpdf"
         assert "--pages" in argv
         assert argv[-1] == str(pdf_path)
-        # T-29-29: every input named in the argv is a file this call created
+        # Every input named in the argv is a file this call created
         # inside its own scratch directory under the output directory.
         singles = argv[argv.index("--pages") + 1 : argv.index("--")]
         assert len(singles) == len(records)
@@ -528,8 +524,8 @@ class TestBoundedAssembly:
         The merged document is the single-convert document, page for page.
 
         Same page count, the same exact MediaBox on every page, and the same
-        embedded image stream bytes -- which is what makes the amendment a
-        change of memory profile rather than a change of output.
+        embedded image stream bytes, so merging per page changes the memory
+        profile, not the output.
         """
         records = spool_pages(
             [
@@ -541,9 +537,8 @@ class TestBoundedAssembly:
 
         merged = assemble_pdf(records, output_dir, filename="merged.pdf", title=_TITLE)
 
-        # No outputstream here, so convert returns the bytes -- the very
-        # contract whose other half (None when streaming) retired the old
-        # ``pdf_bytes is None`` guard.
+        # No outputstream here, so convert returns the bytes; given one, it
+        # returns None.
         reference_bytes = img2pdf.convert(
             [str(record.path) for record in records],
             layout_fun=img2pdf.get_fixed_dpi_layout_fun((300, 300)),
@@ -606,10 +601,10 @@ class TestBoundedAssembly:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        EXC-01 is unaffected: the existing broad boundary already covers pikepdf.
+        A failing qpdf merge surfaces as ``PdfError``.
 
         ``Job.run()`` raises pikepdf exception types, which are ordinary
-        ``Exception`` subclasses, so no new ``except`` clause was needed and the
+        ``Exception`` subclasses, so the broad boundary covers them and the
         message keeps its shape -- the page count and the target path.
         """
         records = spool_pages(
@@ -667,7 +662,7 @@ class TestDocumentInfo:
 
     Without ``/Info`` a document in paperless-ngx has no producer to trace it
     back to and no embedded title, and a qpdf merge that had to repair its
-    input used to look exactly like a clean one.
+    input would look exactly like a clean one.
     """
 
     def test_title_and_producer_are_written(
@@ -697,9 +692,9 @@ class TestDocumentInfo:
         """
         Run from a source tree, the version is unknown and the scan still works.
 
-        The lookup used to run inside assembly's catch-all, where a missing
-        distribution became a PdfError on every scan.  It is resolved once at
-        import instead, falling back to a bare ``saneless``.
+        The version is resolved once at import, falling back to a bare
+        ``saneless``, so a missing distribution never becomes a PdfError inside
+        assembly's catch-all.
         """
 
         def not_installed(_name: str) -> str:
@@ -809,9 +804,9 @@ _RGB_BANDS = 3
 # ru_maxrss is reported in kilobytes on Linux (getrusage(2)); every other
 # figure in this test is in bytes, so the conversion happens exactly once.
 _RU_MAXRSS_UNIT_BYTES = 1024
-# A bounded wait, not a sleep (TEST-02).  Measured at 0.9 s and 3.0 s for the
-# two runs, so 20 s is slack rather than a limit, and two of them still leave
-# the test far inside pytest-timeout's 60 s.
+# A bounded wait, not a sleep.  Each run takes a few seconds, so 20 s is
+# slack rather than a limit, and two of them still leave the test far inside
+# pytest-timeout's 60 s.
 _MEMORY_CHILD_TIMEOUT_SECONDS = 20
 
 _MEMORY_CHILD_SOURCE = """\
@@ -862,8 +857,8 @@ def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[st
     no suppressions. ``shell=False`` throughout -- the shell is an explicit
     program running an explicit literal, with nothing interpolated into it.
 
-    ``saneless`` is installed editable, so the child's imports resolve from
-    ``sys.executable`` alone with no ``PYTHONPATH`` fiddling.
+    The child inherits this process's environment, ``PYTHONPATH`` included,
+    so it imports the same ``saneless`` the test does.
 
     Args:
         script: The child source, already written to disk.
@@ -898,22 +893,17 @@ def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[st
 
 
 class TestAssemblyMemory:
-    """HARD-01's memory sentence, measured rather than asserted."""
+    """Assembly memory is flat in page count, measured rather than asserted."""
 
     def test_peak_memory_is_flat_in_page_count(self, tmp_path: Path) -> None:
         """
         Assembling four times as many pages does not cost four times the RAM.
 
-        Measured the way RESEARCH.md Finding 3 measured it: peak
-        ``ru_maxrss`` in a child process. ``tracemalloc`` is unusable for this
-        -- a 26 MB Pillow image adds 460 bytes to its traced total, because the
-        pixels are malloc'd in C -- and in-process measurement has no honest
-        peak anyway once an earlier test has already grown the heap.
-
-        The same measurement against the single-convert implementation grew
-        from 454 MB at 12 pages to 1395 MB at 48, and to 787 MB with
-        ``outputstream=`` alone; the per-page-plus-qpdf path measured flat at
-        131 MB for both. A regression to either of the old shapes fails here.
+        Peak ``ru_maxrss`` is read in a child process.  ``tracemalloc`` cannot
+        see Pillow's pixels, which are malloc'd in C, and in-process
+        measurement has no honest peak once an earlier test has grown the
+        heap.  An assembly that holds every page until it finishes, as a
+        single convert does, grows past the budget.
         """
         script = tmp_path / "measure_assembly_memory.py"
         script.write_text(_MEMORY_CHILD_SOURCE, encoding="utf-8")
@@ -944,11 +934,10 @@ class TestPdfBoundary:
     """
     ``assemble_pdf`` is a module boundary that raises only ``PdfError``.
 
-    M-17 and D-04: img2pdf raises seven unrelated error classes plus bare
-    ``Exception``, ``TypeError`` and ``ValueError``, and Pillow raises
-    ``OSError`` and ``SystemError`` while a page is read.  Each must surface as
-    ``PdfError`` carrying the original text, with the original chained on
-    ``__cause__`` (Phase 28 success criterion 1).
+    img2pdf raises seven unrelated error classes plus bare ``Exception``,
+    ``TypeError`` and ``ValueError``, and Pillow raises ``OSError`` and
+    ``SystemError`` while a page is read.  Each surfaces as ``PdfError``
+    carrying the original text, with the original chained on ``__cause__``.
     """
 
     @pytest.mark.parametrize(
@@ -1029,7 +1018,7 @@ class TestPdfBoundary:
         output_dir: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-08: the one-line message names the page count and the PDF path."""
+        """The one-line message names the page count and the PDF path."""
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(ValueError("valued")))
 
         with pytest.raises(PdfError) as excinfo:
@@ -1044,7 +1033,7 @@ class TestPdfBoundary:
     def test_empty_page_list_is_refused_before_img2pdf(
         self, output_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """EXC-03: an empty list never reaches img2pdf's empty-list ValueError."""
+        """An empty list never reaches img2pdf's empty-list ValueError."""
         calls: list[object] = []
 
         def fake_convert(*args: object, **_kwargs: object) -> bytes:
@@ -1331,7 +1320,7 @@ class TestBuildPdfFilename:
 
 
 class TestMediaBox:
-    """Page geometry: a page scanned at N DPI must declare N DPI (OUTC-06)."""
+    """Page geometry: a page scanned at N DPI declares N DPI."""
 
     def test_a4_at_300_dpi_is_an_a4_page(
         self,
