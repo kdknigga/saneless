@@ -11,6 +11,7 @@ measurements that sink stored, rather than numbers typed in by a test.
 
 from __future__ import annotations
 
+import ast
 import base64
 import inspect
 import io
@@ -20,6 +21,7 @@ import re
 import subprocess
 import sys
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -57,7 +59,6 @@ from tests.blank_fixtures import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-    from pathlib import Path
 
     from saneless.scanner.base import PageRecord
 
@@ -102,17 +103,51 @@ _CHILD_IMPORT_SECONDS = 30.0
 
 # Run in a fresh interpreter, so no earlier import in the test session can
 # have changed Pillow's limit first.  Prints the limit before and after
-# importing every imaging module saneless has.
+# importing every saneless module but the ``python -m`` entry point, then the
+# names of the modules imported.
 _IMPORT_CHECK = """
+import importlib
+import pkgutil
+
 import PIL.Image
 
-before = PIL.Image.MAX_IMAGE_PIXELS
-import saneless.pages
-import saneless.pdf
-import saneless.scanner.sane_backend
+import saneless
 
-print(before, PIL.Image.MAX_IMAGE_PIXELS)
+before = PIL.Image.MAX_IMAGE_PIXELS
+imported = []
+for info in pkgutil.walk_packages(saneless.__path__, "saneless."):
+    if info.name != "saneless.__main__":
+        importlib.import_module(info.name)
+        imported.append(info.name)
+print(before, PIL.Image.MAX_IMAGE_PIXELS, *imported)
 """
+
+
+def _modules_importing_pil() -> set[str]:
+    """
+    Return the dotted name of every saneless module that imports PIL.
+
+    Read from the parsed source, so the import check is held to every
+    imaging module there is rather than a list written down here.
+    """
+    root = Path(saneless.__file__).parent
+    found: set[str] = set()
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ] + [
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.level == 0
+        ]
+        if any(name == "PIL" or name.startswith("PIL.") for name in names):
+            parts = path.relative_to(root.parent).with_suffix("").parts
+            found.add(".".join(parts).removesuffix(".__init__"))
+    return found
 
 
 def _spool(
@@ -635,9 +670,12 @@ class TestLargeScanPixelLimit:
         )
 
         assert result.returncode == 0, result.stderr
-        before, after = result.stdout.split()
+        before, after, *imported = result.stdout.split()
         assert after == before
         assert int(after) != _LARGE_SCAN_PIXEL_LIMIT
+        imaging = _modules_importing_pil()
+        assert imaging, "no saneless module imports PIL, so nothing was checked"
+        assert imaging <= set(imported), imaging - set(imported)
 
     def test_main_relaxes_the_limit_before_running_the_cli(
         self, monkeypatch: pytest.MonkeyPatch
