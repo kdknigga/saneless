@@ -1,14 +1,11 @@
 """
-Per-state rendering contract for the web templates.
+Every job state renders the markup the web templates promise for it.
 
-Covers requirements: UI-03, UI-07, CTR-01, ROBU-01, ROBU-04, ROBU-08.
-
-The templates are the one surface neither ``ty`` nor ``pyrefly`` can see. Once
-the hand-written state lists moved behind ``Job.is_active`` / ``Job.is_busy``
-and the ``job_label`` / ``progress_label`` filters, nothing mechanical pinned
-*which* state produces *which* markup any more: the grep gates in the plan only
-prove the string literals are gone, and the browser suite only exercises the
-idle page. These tests pin the mapping for every ``JobState`` member.
+The templates are the one surface neither ``ty`` nor ``pyrefly`` can see, and
+with the state checks behind ``Job.is_active`` / ``Job.is_busy`` and the
+``job_label`` / ``progress_label`` filters, nothing else pins *which* state
+produces *which* markup.  These tests pin the mapping for every ``JobState``
+member.
 
 Every case is parametrised over ``list(JobState)`` rather than a hand-written
 list of names, so an eighth member cannot be added without forcing a decision
@@ -111,7 +108,7 @@ class _StubScanner(StubScannerBackend):
     The shared stub backend, but reporting one device instead of none.
 
     Only ``get_devices`` differs: the profile dropdown and the worker's
-    startup profile generation (D-14) both read it, and a device list of one
+    startup profile generation both read it, and a device list of one
     is what these tests render against.  Capabilities and ``scan_pages`` come
     straight from ``StubScannerBackend``; these tests never run a scan.
     """
@@ -134,15 +131,15 @@ class _StubScanner(StubScannerBackend):
         ]
 
 
-# The log file every app in this module writes to. D-13 forbids a host
-# filesystem path from reaching a LAN-visible page, so this name is deliberately
-# unlike anything a template could produce by accident.
+# The log file every app in this module writes to. A host filesystem path must
+# never reach a LAN-visible page, so this name is deliberately unlike anything a
+# template could produce by accident.
 _LOG_FILE_NAME = "render-test-do-not-render-me.log"
 
 # The category `_job_in_state` records on an ERROR row unless a test asks for
 # another. Production never writes an ERROR row without one -- the worker always
 # classifies (`worker.py`) -- so this, not NULL, is the shape the status area's
-# main path renders. REJECTED is avoided because D-06 gives it its own routing.
+# main path renders. REJECTED is avoided because it has its own routing.
 _DEFAULT_ERROR_CATEGORY = ErrorCategory.SCANNER
 
 # The two failures that may already be in paperless-ngx.  They render amber
@@ -387,12 +384,12 @@ def _declarations(body: str) -> dict[str, str]:
 
 # The paperless-ngx credential a configured appliance has. Anything outside
 # `config.PLACEHOLDER_TOKENS` counts as real: the predicate is a fixed literal
-# set and never a shape heuristic (D-14).
+# set and never a shape heuristic.
 _REAL_CREDENTIAL = "test-token"
 
 # The shipped stand-in the predicate refuses -- docker-compose.yml and the
 # docker reference both carry it, so it is the placeholder a real installation
-# is most likely to be left with (D-14, APPL-07).
+# is most likely to be left with.
 _SHIPPED_PLACEHOLDER = "changeme"
 
 
@@ -410,7 +407,7 @@ def _make_app(
         tmp_path: The directory the app writes its database and files under.
         credential: The paperless-ngx token this appliance is configured with.
             The default is a real one; pass `_SHIPPED_PLACEHOLDER` for the
-            blocked-Scan-button case (UI-SPEC S8).
+            blocked-Scan-button case.
         url: The paperless-ngx address; empty means unset, which blocks the
             Scan button too.
         show_lists: Whether the form shows the tag list and the correspondent
@@ -427,13 +424,13 @@ def _make_app(
         output=OutputConfig(
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
-            # Named distinctively so `test_no_log_path_reaches_the_page` can
+            # Named distinctively so `test_no_log_path_reaches_the_rendered_page` can
             # search the rendered markup for it and mean something: the default
             # would be a path fragment that could collide with tmp_path itself.
             log_file=str(tmp_path / _LOG_FILE_NAME),
         ),
         # Two profiles, so the set is not the bare default.  With only
-        # ``default``, the worker's startup generation (D-14) would build
+        # ``default``, the worker's startup generation would build
         # profiles from _StubScanner's device and swap them in while these
         # requests read the dropdown -- generation these tests do not intend.
         profiles={
@@ -502,7 +499,7 @@ def blocked_client(tmp_path: Path) -> Iterator[TestClient]:
 
     The verdict is derived from `Settings`, which is read once at process
     start, so a second app is the only honest way to drive the blocked case:
-    there is no runtime setter to reach for (UI-SPEC S8).
+    there is no runtime setter to reach for.
     """
     with TestClient(_make_app(tmp_path, credential=_SHIPPED_PLACEHOLDER)) as tc:
         yield tc
@@ -544,11 +541,10 @@ def _set_warning(job_store: JobStore, job_id: str, warning: str) -> None:
     """
     Write the `warning` column directly.
 
-    `JobStore` grows no warning writer until plan 23-07, but the FALLBACK status
-    markup interpolates `job.warning` now, so the escaping contract (T-23-21)
-    needs a value to escape today. A single parameterised UPDATE is narrower
-    than adding a production setter that nothing else would call yet, and it is
-    the same kind of deliberate reach-through as `_adopt_as_current_job` above.
+    The status markup interpolates `job.warning`, so the escaping tests need
+    a value to escape whatever the row's state.  A single parameterised UPDATE
+    stages exactly that, the same kind of deliberate reach-through as
+    `_adopt_as_current_job` above.
     """
     with job_store._conn:
         job_store._conn.execute(
@@ -569,8 +565,8 @@ def _job_in_state(
     The category is written for every state, exactly as `error` already was:
     only the ERROR branch reads either, so the other states are unaffected, and
     keeping one write means the helper has one shape. Pass
-    ``error_category=None`` to get a pre-Phase-21 row, whose status area falls
-    back to the specific message alone.
+    ``error_category=None`` to get a row recorded with no category, whose
+    status area falls back to the specific message alone.
 
     Returns:
         The job's id, which the technical-details assertions need.
@@ -594,7 +590,7 @@ def test_history_cell_shows_the_shared_label(
     client: TestClient, state: JobState
 ) -> None:
     """
-    Each state reaches `state_label` in the history table (CTR-01).
+    Each state reaches `state_label` in the history table.
 
     This pins the wiring -- which state is routed through which filter -- not
     the label text, because the expectation is built from the same function the
@@ -609,7 +605,7 @@ def test_history_cell_shows_the_shared_label(
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_history_cell_css_class(client: TestClient, state: JobState) -> None:
-    """Only the four terminal history cells carry a status CSS class (CTR-01, D-01)."""
+    """Only the four terminal history cells carry a status CSS class."""
     _job_in_state(client, state)
     text = client.get("/api/jobs/history").text
     assert ('<td class="status-done">' in text) is (state is JobState.DONE)
@@ -622,7 +618,7 @@ def test_history_cell_css_class(client: TestClient, state: JobState) -> None:
 def test_status_area_polls_only_while_active(
     client: TestClient, state: JobState
 ) -> None:
-    """The 1s status poll is attached for exactly the active states (UI-07)."""
+    """The 1s status poll is attached for exactly the active states."""
     _job_in_state(client, state)
     text = client.get("/api/jobs/current/status").text
     assert ('hx-trigger="every 1s"' in text) is (state in ACTIVE_STATES)
@@ -672,7 +668,7 @@ def test_flip_buttons_have_stable_ids(client: TestClient) -> None:
 @pytest.mark.parametrize("state", list(JobState))
 def test_status_area_prose(client: TestClient, state: JobState) -> None:
     """
-    Each state renders its own status markup (UI-03, CTR-01).
+    Each state renders its own status markup.
 
     As above, the busy line is built from `progress_label`, so it pins routing
     rather than text; the literal spot check below guards the text itself.
@@ -696,10 +692,10 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     if state is JobState.DONE:
         assert '<p class="status-done">&#10003; Done: Render Test</p>' in text
     if state is JobState.ERROR:
-        # APPL-04, UI-SPEC S2: the paragraph now carries the category sentence
-        # and has lost the literal `Error: ` prefix, because the sentence names
-        # the problem itself. `role="alert"` moved to a wrapping <div> so the
-        # next step is announced too; it is asserted in TestStatusAreaError.
+        # The paragraph carries the category sentence with no literal `Error: `
+        # prefix, because the sentence names the problem itself. `role="alert"`
+        # is on a wrapping <div> so the next step is announced too; it is
+        # asserted in TestStatusAreaError.
         sentence = escape(error_message(_DEFAULT_ERROR_CATEGORY))
         assert f'<p class="status-error">&#10007; {sentence}</p>' in text
         assert "&#10007; Error: disk on fire" not in text
@@ -712,7 +708,7 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
         assert 'role="alert"' not in text
     if state is JobState.CANCELLED:
         assert '<p class="status-cancelled">&#8856; Cancelled: Render Test</p>' in text
-        # A cancel is a deliberate stop, not a failure: no role="alert" here (D-01).
+        # A cancel is a deliberate stop, not a failure: no role="alert" here.
         assert 'role="alert"' not in text
     # The history-refresh hook belongs to the terminal states only -- all four
     # of them, FALLBACK and CANCELLED included, or the table goes stale.
@@ -941,10 +937,9 @@ _TECH_DETAILS = re.compile(
     re.DOTALL,
 )
 
-# The legacy ERROR line, byte for byte. A row written before Phase 21 carries no
-# category, and UI-SPEC S2 requires today's shape verbatim for it: substituting
-# UNKNOWN would print "Something went wrong." over a row that still holds a
-# truthful specific message.
+# The ERROR line of a row recorded with no category, byte for byte.
+# Substituting UNKNOWN would print "Something went wrong." over a row that
+# still holds a truthful specific message.
 _LEGACY_ERROR_LINE = (
     '<p role="alert" class="status-error">&#10007; Error: disk on fire</p>'
 )
@@ -952,12 +947,12 @@ _LEGACY_ERROR_LINE = (
 
 class TestStatusAreaError:
     """
-    The ERROR branch after APPL-04: a sentence, a next step, and a disclosure.
+    The ERROR branch renders a sentence, a next step, and a disclosure.
 
-    UI-SPEC S2. The three things worth breaking a test over are that the alert
-    covers the next step and not just the sentence, that the specific message
-    was relocated rather than deleted, and that no host filesystem path ever
-    reaches the markup (D-13).
+    The three things worth breaking a test over are that the alert covers the
+    next step and not just the sentence, that the specific message is still
+    rendered, inside the disclosure, and that no host filesystem path ever
+    reaches the markup.
     """
 
     @staticmethod
@@ -978,7 +973,7 @@ class TestStatusAreaError:
         self, client: TestClient, category: ErrorCategory
     ) -> None:
         """
-        The alert announces the message *and* what to do about it (APPL-04).
+        The alert announces the message *and* what to do about it.
 
         The next step is the most actionable content on the page; leaving it
         outside the alert would mean a screen-reader user never hears it.
@@ -1028,12 +1023,12 @@ class TestStatusAreaError:
         self, client: TestClient
     ) -> None:
         """
-        The specific message is relocated, not removed (UI-SPEC S2, D-13).
+        The disclosure holds the specific message, the category and the job id.
 
-        ``vocabulary.error_message``'s own docstring warns that swapping the
-        specific message for a category sentence would be a regression, so
-        ``job.error`` is still rendered -- inside the disclosure, with the two
-        other facts D-13 permits and nothing else.
+        ``vocabulary.error_message``'s own docstring warns against swapping the
+        specific message for a category sentence, so ``job.error`` is rendered
+        inside the disclosure, beside the category and the job id and nothing
+        else.
         """
         job_id = _job_in_state(client, JobState.ERROR)
         details = _TECH_DETAILS.search(self._status(client))
@@ -1048,10 +1043,10 @@ class TestStatusAreaError:
         self, client: TestClient
     ) -> None:
         """
-        A pre-Phase-21 row keeps today's shape, with no next step and no detail.
+        A row with no category renders its message alone, with no next step.
 
         Substituting UNKNOWN would print "Something went wrong." over a row
-        that still holds a truthful specific message (UI-SPEC S2).
+        that still holds a truthful specific message.
         """
         _job_in_state(client, JobState.ERROR, error_category=None)
         text = self._status(client)
@@ -1066,7 +1061,7 @@ class TestStatusAreaError:
         self, client: TestClient, category: ErrorCategory | None
     ) -> None:
         """
-        The configured log file never appears in the markup (D-13, T-30-52).
+        The configured log file never appears in the markup.
 
         It is a host filesystem path on a LAN-visible page. Both the
         categorised and the legacy branch are checked, because the disclosure
@@ -1081,7 +1076,8 @@ class TestStatusAreaError:
         No template under ``web/templates/`` references a log path at all.
 
         The rendered-page assertion above proves this app does not leak one;
-        this proves no template *could*, which is the durable half (T-30-52).
+        this proves no template *could*.  The templates' expressions and markup
+        are read, not their comments.
         """
         log_path = re.compile(r"log_file|log_path|logfile", re.IGNORECASE)
         offenders = sorted(
@@ -1099,11 +1095,11 @@ class TestStatusAreaError:
         self, client: TestClient
     ) -> None:
         """
-        ``job.error`` is exception-derived text and is escaped (T-30-54).
+        ``job.error`` is exception-derived text and is escaped.
 
-        Moving it into a disclosure moved an untrusted string to a new place in
-        the document; autoescaping is a setting, and a setting can be changed,
-        so the property is pinned here as it already is for ``job.warning``.
+        The disclosure puts an untrusted string in the document; autoescaping is
+        a setting, and a setting can be changed, so the property is pinned here
+        as it is for ``job.warning``.
         """
         job_store: JobStore = _app(client).state.job_store
         job = job_store.create_job(
@@ -1123,7 +1119,7 @@ class TestStatusAreaError:
 
     def test_the_summary_clears_the_touch_target_floor(self) -> None:
         """
-        The summary is a finger-sized row (UI-SPEC S2, WCAG 2.5.5).
+        The summary is a finger-sized row (WCAG 2.5.5).
 
         Rare control or not, it is still one someone taps standing at the
         scanner.
@@ -1229,9 +1225,8 @@ class TestAmberErrorRendering:
         """
         The history cell's class comes from one vocabulary function.
 
-        An inline chain of state comparisons in the template was how a warned
-        upload once reached green, and it would be how an amber failure
-        reached red.
+        An inline chain of state comparisons in the template is how a warned
+        upload would reach green and an amber failure red.
         """
         tree = _template_tree(_TEMPLATES_DIR / "partials" / "history.html")
         classes = [
@@ -1253,7 +1248,7 @@ class TestAmberErrorRendering:
 def test_scan_button_disabled_and_busy_split(
     listless_client: TestClient, state: JobState
 ) -> None:
-    """`disabled` follows is_active; `aria-busy` follows the narrower is_busy (UI-07)."""
+    """`disabled` follows is_active; `aria-busy` follows the narrower is_busy."""
     # On a page that waits for no list, so the job is the only source.
     client = listless_client
     _job_in_state(client, state)
@@ -1288,7 +1283,7 @@ def _scan_caption(state: JobState) -> str:
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_scan_button_text(client: TestClient, state: JobState) -> None:
-    """The button keeps its exact captions, HTML entity included (UI-07)."""
+    """The button shows the exact caption for each state."""
     _job_in_state(client, state)
     match = _scan_button(client.get("/").text)
     assert match is not None, "scan button markup not found"
@@ -1312,11 +1307,11 @@ def _only_scan_button(text: str) -> _ScanButton:
 
 def test_page_renders_one_inline_scan_button(client: TestClient) -> None:
     """
-    The full page carries exactly one Scan button, and it is not OOB (T1).
+    The full page carries exactly one Scan button, and it is not OOB.
 
-    The button markup lives in one partial (ROBU-04, C-10).  If the OOB include
-    ever moved into ``partials/status.html``, which the page also includes, the
-    page would carry two ``id="scan-btn"`` and this count would catch it.
+    The button markup lives in one partial.  Were the OOB include in
+    ``partials/status.html``, which the page also includes, the page would
+    carry two ``id="scan-btn"`` and this count would catch it.
     """
     match = _only_scan_button(client.get("/").text)
     assert "hx-swap-oob" not in match.attributes
@@ -1327,12 +1322,12 @@ def test_poll_scan_button_matches_the_page_button(
     listless_client: TestClient, state: JobState
 ) -> None:
     """
-    The poll's OOB button is the page's button plus the OOB flag (T2, ROBU-04).
+    The poll's OOB button is the page's button plus the OOB flag.
 
-    One template renders both, so for the same job the two copies must be
-    byte-identical once ``hx-swap-oob`` is removed.  A second source of truth
-    for the button's state is exactly what C-10 was.  On a page that waits
-    for no list; the next test pins what a page with lists adds.
+    One template renders both, so for the same job the two copies are
+    byte-identical once ``hx-swap-oob`` is removed, and the button's state
+    has one source of truth.  The page waits for no list; the next test pins
+    what a page with lists adds.
     """
     client = listless_client
     _job_in_state(client, state)
@@ -1396,7 +1391,7 @@ def test_poll_scan_button_follows_the_state_table(
     client: TestClient, state: JobState
 ) -> None:
     """
-    The OOB button on every poll carries the S4 state table (T2, ROBU-04).
+    The OOB button on every poll follows the job's state.
 
     ``aria-busy`` is omitted, never ``"false"``, when the job is not busy.
     """
@@ -1421,7 +1416,7 @@ def test_scan_success_carries_button_status_and_message_clear(
     client: TestClient,
 ) -> None:
     """
-    A successful scan re-renders the button and clears the slot OOB (T3, D-03).
+    A successful scan re-renders the button and clears the slot OOB.
 
     The clear is for this response only: it empties an error left in
     ``#status-message`` by an earlier rejected submit.
@@ -1441,7 +1436,7 @@ def test_scan_success_carries_button_status_and_message_clear(
 
 def test_poll_never_clears_the_status_message(client: TestClient) -> None:
     """
-    A poll re-renders the button OOB but never touches the slot (T3, D-03).
+    A poll re-renders the button OOB but never touches the slot.
 
     Carrying the clear here would erase a 429 shown mid-scan within a second.
     """
@@ -1455,7 +1450,7 @@ def test_poll_never_clears_the_status_message(client: TestClient) -> None:
 def test_flip_responses_never_clear_the_status_message(
     client: TestClient, answer: str
 ) -> None:
-    """Flip Continue and Abort re-render the button OOB, not the slot (T3, D-03)."""
+    """Flip Continue and Abort re-render the button OOB, not the slot."""
     _job_in_state(client, JobState.AWAITING_FLIP)
     job_id = _app(client).state.worker._current_job_id
     response = client.post(f"/api/flip/{answer}", data={"job_id": job_id})
@@ -1468,7 +1463,7 @@ def test_scan_error_response_carries_the_button_only_to_return_focus(
     client: TestClient,
 ) -> None:
     """
-    A rejected scan renders the error and hands focus back to Scan (ROBU-04, S4).
+    A rejected scan renders the error and hands focus back to Scan.
 
     The button rides along once, out-of-band, enabled and with ``autofocus``,
     so the keyboard user whose press was refused is back on it.  It is the only
@@ -1497,12 +1492,12 @@ def test_scan_form_disables_the_button_without_inheritance(
     client: TestClient,
 ) -> None:
     """
-    The form disables the button for its own round-trip only (ROBU-04, S4).
+    The form disables the button for its own round-trip only.
 
-    ``hx-disabled-elt`` replaces the deleted app.js handler.  ``hx-disinherit``
-    is mandatory: the selects and refresh buttons inside the form would
-    otherwise inherit it and disable the button for the length of their own
-    requests (C-10).
+    ``hx-disabled-elt`` does it with no script of the page's own.
+    ``hx-disinherit`` is mandatory: the selects and refresh buttons inside the
+    form would otherwise inherit it and disable the button for the length of
+    their own requests.
     """
     match = _SCAN_FORM.search(client.get("/").text)
     assert match is not None, "scan form markup not found"
@@ -1512,7 +1507,7 @@ def test_scan_form_disables_the_button_without_inheritance(
 
 
 def test_title_input_is_capped_at_the_server_limit(client: TestClient) -> None:
-    """``#title-input`` carries the server's title cap as maxlength (ROBU-08)."""
+    """``#title-input`` carries the server's title cap as maxlength."""
     match = _TITLE_INPUT.search(client.get("/").text)
     assert match is not None, "title input markup not found"
     assert f'maxlength="{TITLE_MAX_LENGTH}"' in match.group(0)
@@ -1530,7 +1525,7 @@ def test_title_input_cap_comes_from_the_route_context(
 
 
 def test_page_loads_no_app_script_and_no_remote_url(client: TestClient) -> None:
-    """No application JavaScript and no off-box URL remain on the page (S4)."""
+    """The page loads no application JavaScript and no off-box URL."""
     text = client.get("/").text
     assert "app.js" not in text
     assert "http://" not in text
@@ -1539,7 +1534,7 @@ def test_page_loads_no_app_script_and_no_remote_url(client: TestClient) -> None:
 
 
 def test_app_script_is_gone(client: TestClient) -> None:
-    """``/static/app.js`` no longer exists; its 404 uses the one renderer."""
+    """``/static/app.js`` does not exist; its 404 uses the one renderer."""
     response = client.get("/static/app.js")
     assert response.status_code == 404
     assert response.json() == {
@@ -1597,7 +1592,7 @@ def test_fallback_reloads_the_history_table(client: TestClient) -> None:
     FALLBACK is terminal, so the history table must refresh the moment the
     status area swaps to it -- exactly as it does for DONE and ERROR. Without
     the div the table keeps showing the job as Uploading until the user
-    reloads the page (T-23-24).
+    reloads the page.
     """
     _job_in_state(client, JobState.FALLBACK)
     assert _HISTORY_RELOAD in client.get("/api/jobs/current/status").text
@@ -1611,7 +1606,7 @@ def test_fallback_warning_renders_inline(client: TestClient) -> None:
     The warning is a second visible paragraph, not a tooltip or a hidden detail.
 
     A user whose title, tags and correspondent were dropped has to be told so
-    without hovering anything (D-05).
+    without hovering anything.
     """
     _job_in_state(client, JobState.FALLBACK, warning="Metadata was not applied.")
     text = client.get("/api/jobs/current/status").text
@@ -1631,14 +1626,13 @@ def test_fallback_without_a_warning_renders_no_empty_paragraph(
 
 def test_fallback_warning_is_escaped_not_injected(client: TestClient) -> None:
     """
-    A warning carrying markup is escaped, never interpolated as HTML (T-23-21).
+    A warning carrying markup is escaped, never interpolated as HTML.
 
-    `job.warning` is a new interpolation of a field whose text can originate
-    upstream of saneless -- a paperless-ngx response body reaches it via plan
-    23-04. Jinja2 autoescaping is on by default under `Jinja2Templates`, but
-    "by default" is a setting, and a setting can be changed; this pins the
-    property itself. If this test ever fails the fix is to re-enable
-    autoescaping, never to sanitise at the call site.
+    `job.warning` can carry text from upstream of saneless, such as a
+    paperless-ngx response body.  Jinja2 autoescaping is on by default under
+    `Jinja2Templates`, but "by default" is a setting, and a setting can be
+    changed; this pins the property itself.  If this test fails the fix is to
+    re-enable autoescaping, never to sanitise at the call site.
     """
     _job_in_state(client, JobState.FALLBACK, warning="<script>alert(1)</script>")
     text = client.get("/api/jobs/current/status").text
@@ -1764,7 +1758,7 @@ _COUNTS = JobResult(
 )
 
 # The one-page scan that measured no blanks. Its zero is a true measurement and
-# must render as 0; only a NULL suppresses the sentence (D-32, Pitfall 4).
+# must render as 0; only a NULL suppresses the sentence.
 _ONE_PAGE = JobResult(
     outcome=None,
     warning=None,
@@ -1773,10 +1767,10 @@ _ONE_PAGE = JobResult(
     pages_uploaded=1,
 )
 
-# The six terminal cases UI-SPEC S3 enumerates, and what each records. Only the
-# first two record counts: `worker.py` leaves them NULL on error and on cancel,
-# `job.py` leaves them NULL on a refused submit, and no pre-Phase-23 row was
-# ever backfilled. Four of six is the common path, not an edge.
+# The six terminal cases, and what each records. Only the first two record
+# counts: `worker.py` leaves them NULL on error and on cancel, `job.py` leaves
+# them NULL on a refused submit, and an older row may carry none at all. Four
+# of six is the common path, not an edge.
 _TERMINAL_CASES = [
     pytest.param(JobState.DONE, None, _COUNTS, id="done"),
     pytest.param(JobState.FALLBACK, None, _COUNTS, id="fallback"),
@@ -1825,11 +1819,11 @@ def _finished_job(
 
 class TestPageCounts:
     """
-    Where the page counts render, and where they deliberately do not (APPL-03).
+    Where the page counts render, and where they deliberately do not.
 
-    UI-SPEC S3, D-32. Success criterion 3 means "every terminal job that
-    recorded counts": ERROR and CANCELLED rows have none by construction, and
-    D-32 accepts that, so a later reader need not chase a phantom.
+    Counts render for every terminal job that recorded them.  ERROR and
+    CANCELLED rows have none by construction, so their absence there is
+    expected rather than a gap.
     """
 
     @pytest.mark.parametrize(("state", "category", "result"), _TERMINAL_CASES)
@@ -1869,7 +1863,7 @@ class TestPageCounts:
 
     def test_a_measured_zero_pages_renders_as_zero(self, client: TestClient) -> None:
         """
-        A scan where nothing was blank really did remove 0 pages (D-32).
+        A scan where nothing was blank really did remove 0 pages.
 
         The guard is the filter returning None, never truthiness; a truthiness
         guard anywhere on this path would delete this line.
@@ -1885,7 +1879,7 @@ class TestPageCounts:
         self, client: TestClient
     ) -> None:
         """
-        The counts are the last paragraph of the terminal branch (UI-SPEC S3).
+        The counts are the last paragraph of the terminal branch.
 
         They are a footnote to the outcome, so they read after it -- and before
         the preview, which is the end of the status area.
@@ -1930,7 +1924,7 @@ class TestPageCounts:
         The counts are a second line in the Title cell, not a fifth column.
 
         A span with `display: block`, so it forms its own line inside the cell
-        the mobile rule already wraps (UI-SPEC S3).
+        the mobile rule already wraps.
         """
         _finished_job(client, JobState.DONE, _COUNTS)
         sentence = page_counts(_COUNTS)
@@ -1948,10 +1942,11 @@ class TestPageCounts:
 
     def test_the_history_table_still_has_four_columns(self) -> None:
         """
-        Pitfall 11 is designed out, not guarded against (UI-SPEC S3).
+        The history table has four headers and an empty row spanning four.
 
-        A fifth column would drift against `colspan`, and would compete with
-        the Time column S7 simultaneously widens.
+        The page counts are a second line in the Title cell, so no fifth column
+        drifts against `colspan` or competes with the Time column, which the
+        zone name already widens.
         """
         headers = [tag for tag, _ in _template_tags("index.html") if tag == "th"]
         spans = [
@@ -1967,7 +1962,7 @@ class TestPageCounts:
         The guard is the filter returning None, never a count's truthiness.
 
         `{% if job.pages_removed %}` would silently delete a true zero, so no
-        template is allowed to write one (D-32, Pitfall 4).
+        template is allowed to write one.
         """
         offenders = sorted(
             (path.name, attribute)
@@ -1980,7 +1975,7 @@ class TestPageCounts:
 
     def test_the_stylesheet_gains_one_muted_pages_rule(self) -> None:
         """
-        One class, one rule, no new colour literal (UI-SPEC S3).
+        The one ``.page-counts`` rule is a muted block, with no colour literal.
 
         Muted rather than a status colour, because a count is a measurement and
         not an outcome.
@@ -2014,8 +2009,8 @@ class TestRemovedPagesNote:
     """
     The pages removed as blank are named beside the counts, as information.
 
-    D-07: the note is not a warning, so a DONE that removed blank backs keeps
-    its green tick; D-08: pages are named by scanned position.
+    The note is not a warning, so a DONE that removed blank backs keeps its
+    green tick, and pages are named by scanned position.
     """
 
     def test_the_status_poll_names_the_removed_pages(self, client: TestClient) -> None:
@@ -2075,7 +2070,7 @@ class TestRemovedPagesNote:
 
 
 class TestHistoryTimeCell:
-    """The history Time cell names its zone (APPL-12, D-34, D-35, UI-SPEC S7)."""
+    """The history Time cell names its zone."""
 
     def test_the_time_cell_names_the_zone(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -2104,11 +2099,11 @@ class TestHistoryTimeCell:
 
     def test_the_time_cell_renders_through_the_shared_filter(self) -> None:
         """
-        No `strftime` survives in the template: one function serves both surfaces.
+        The template formats the time with `local_time` alone, never `strftime`.
 
         `cli.py` imports the same object, so the web table and the CLI table
         cannot disagree about the zone or the format without editing the one
-        implementation (UI-SPEC S7).
+        implementation.
         """
         names = _template_names(
             _template_tree(_TEMPLATES_DIR / "partials" / "history.html")
@@ -2175,8 +2170,8 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
     """
     A job the guard could not end stops disabling Scan once the store heals.
 
-    ROBU-01 success criterion 1, CR-01, D-12: one loop-level failure whose
-    best-effort ERROR write also failed leaves the row active and the button
+    One loop-level failure whose best-effort ERROR write also failed leaves
+    the row active and the button
     disabled while ``/health`` stays 200.  The streak limit is raised here so
     the worker never degrades and no probe runs; the owed write must still
     land on an idle tick, and the next status poll must render ``#scan-btn``
@@ -2232,9 +2227,9 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
     A job store that keeps refusing an owed write shows on ``/health``.
 
     A store error escapes the job's handling and the guard's ERROR write
-    fails, and every idle retry of the owed write fails too.  After a short streak of failed retries the worker degrades, so
-    ``/health`` answers 503 "job store failing" and a new scan is refused with
-    503.  Once the store heals, the recovery probe and the owed write land:
+    fails, and every idle retry of the owed write fails too.  After a short
+    streak of failed retries the worker degrades, so ``/health`` answers 503
+    "job store failing" and a new scan is refused with 503.  Once the store heals, the recovery probe and the owed write land:
     ``/health`` is 200 again and the status poll renders ``#scan-btn`` enabled.
     """
     # Before the lifespan starts the worker: patched later, it would sit in a
