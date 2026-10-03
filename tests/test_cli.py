@@ -2357,13 +2357,13 @@ class TestLazySettingsLoading:
     """
     Settings load lazily, once, inside the commands that need them.
 
-    CFG-10 / N-25: ``saneless <subcommand> --help`` must work with a broken or
-    missing configuration. Click runs the group callback *before* a subcommand
-    parses its own ``--help``, and ``ctx.resilient_parsing`` is False there
-    (verified against Click 8.3), so the group callback cannot load anything;
-    each command loads on first need instead. A ConfigError from loading is
-    printed by the group guard as rendered, exit 2; an unwritable log file is
-    not a failure, it falls back to stderr.
+    ``saneless <subcommand> --help`` must work with a broken or missing
+    configuration. Click runs the group callback *before* a subcommand
+    parses its own ``--help``, and ``ctx.resilient_parsing`` is False there,
+    so the group callback cannot load anything; each command loads on first
+    need instead. A ConfigError from loading is printed by the group guard
+    as rendered, exit 2; an unwritable log file is not a failure, it falls
+    back to stderr.
     """
 
     @pytest.mark.parametrize("command", _ALL_COMMANDS)
@@ -2408,7 +2408,7 @@ class TestLazySettingsLoading:
     def test_real_config_error_printed_once_with_its_own_header(
         self, tmp_path: Path
     ) -> None:
-        """The loader's rendered error is echoed as-is, not prefixed again (D-10)."""
+        """The loader's rendered error is echoed as-is, not prefixed again."""
         config_file = _write_real_config(tmp_path, paperless={"tokne": "x"})
 
         with _restored_logging():
@@ -2421,7 +2421,7 @@ class TestLazySettingsLoading:
         assert not (tmp_path / "logs").exists()
 
     def test_missing_config_exits_2_naming_the_path(self, tmp_path: Path) -> None:
-        """``--config`` to a file that does not exist exits 2 and names it (CFG-02)."""
+        """``--config`` to a file that does not exist exits 2 and names it."""
         missing = tmp_path / "nope.toml"
 
         with _restored_logging():
@@ -2434,10 +2434,10 @@ class TestLazySettingsLoading:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        ``--config ""`` is an explicit, unusable path, not "no path" (WR-05).
+        ``--config ""`` is an explicit, unusable path, not "no path".
 
-        ``saneless --config "$CFG" ...`` with ``CFG`` unset used to load -- and
-        ``auto-profiles`` to write -- whichever file discovery found.
+        ``saneless --config "$CFG" ...`` with ``CFG`` unset must not load -- or
+        let ``auto-profiles`` write -- whichever file discovery would find.
         """
         _write_real_config(tmp_path)
         monkeypatch.chdir(tmp_path)
@@ -2453,7 +2453,7 @@ class TestLazySettingsLoading:
         self, tmp_path: Path
     ) -> None:
         """
-        An unwritable ``log_file`` warns on stderr; the command still runs (WR-07).
+        An unwritable ``log_file`` warns on stderr; the command still runs.
 
         The real ``configure_logging`` catches the OSError from creating the
         log directory or opening the file and logs to stderr instead, so this
@@ -2473,11 +2473,11 @@ class TestLazySettingsLoading:
 
     def test_toml_syntax_error_is_one_line_exit_2(self, tmp_path: Path) -> None:
         """
-        A TOML syntax error exits 2 without a traceback, under the D-10 header.
+        A TOML syntax error exits 2 without a traceback, under the config header.
 
         The loader turns the ``TOMLDecodeError`` into a ConfigError naming the
-        line and column (D-12), so it reaches the ConfigError handler rather
-        than the generic one.
+        line and column, so it reaches the ConfigError handler rather than the
+        generic one.
         """
         config_file = tmp_path / "saneless.toml"
         config_file.write_text("[output\n")
@@ -2614,11 +2614,10 @@ class TestFirstRunFileModes:
 
 class TestStartupConfigLog:
     """
-    One INFO record says where the configuration came from (CFG-11).
+    One INFO record says where the configuration came from.
 
-    Names only, never values (D-14, CFG-05): a token supplied through the
-    environment, or typed under a misspelt key, never reaches a log record or
-    the terminal.
+    Names only, never values: a token supplied through the environment, or
+    typed under a misspelt key, never reaches a log record or the terminal.
     """
 
     def test_config_sources_logged_once_without_values(
@@ -2651,7 +2650,7 @@ class TestStartupConfigLog:
         assert secret not in (tmp_path / "logs" / "saneless.log").read_text()
 
     def test_mistyped_key_error_never_echoes_its_value(self, tmp_path: Path) -> None:
-        """A token under a misspelt key is not printed with the error (D-14)."""
+        """A token under a misspelt key is not printed with the error."""
         secret = "tok-SECRET-51ab"
         config_file = _write_real_config(tmp_path, paperless={"tokne": secret})
 
@@ -2686,14 +2685,14 @@ def _break_libsane(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestRequireSane:
     """
-    Every SANE command refuses at once when python-sane cannot be imported (D-05).
+    Every SANE command refuses at once when python-sane cannot be imported.
 
     python-sane is a mandatory dependency, so a missing package or an
     unloadable libsane is a setup problem: one line naming the import's reason
     and the SANE development package to install, exit 2, before the config is
     loaded or the scanner touched. ``jobs`` does not need a scanner and must
-    keep working, and ``--help`` never reaches a command body (CFG-10), so
-    neither imports python-sane.
+    keep working, and ``--help`` never reaches a command body, so neither
+    imports python-sane.
     """
 
     @pytest.mark.parametrize("command", _SANE_COMMANDS)
@@ -2712,7 +2711,7 @@ class TestRequireSane:
         break_sane: Callable[[pytest.MonkeyPatch], None],
         reason: str,
     ) -> None:
-        """One install-hint line and exit 2; no config load, no scanner (D-05)."""
+        """One install-hint line and exit 2; no config load, no scanner."""
         runner, settings = _patch_cli(monkeypatch)
         calls: list[str] = []
 
@@ -2748,7 +2747,7 @@ class TestRequireSane:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        ``jobs`` runs without python-sane and shows an empty history (D-05).
+        ``jobs`` runs without python-sane and shows an empty history.
 
         On a fresh install the data directory does not exist yet: the command
         prints the header with no rows, exit 0, and creates nothing, because
@@ -2780,7 +2779,7 @@ class TestRequireSane:
     def test_help_runs_without_python_sane(
         self, monkeypatch: pytest.MonkeyPatch, command: str
     ) -> None:
-        """``<command> --help`` exits 0 without checking for python-sane (CFG-10)."""
+        """``<command> --help`` exits 0 without checking for python-sane."""
         runner, _ = _patch_cli(monkeypatch)
         calls: list[str] = []
 
@@ -2854,7 +2853,7 @@ class TestJobsCommand:
         store.close()
 
     def test_jobs_empty(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """Jobs with no jobs in DB shows empty output (exit 0)."""
+        """Jobs on an empty history prints the header and rule, no rows, exit 0."""
         settings = self._settings_for(tmp_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         # Create empty DB
@@ -2932,11 +2931,10 @@ class TestJobsCommand:
         """
         The widest status label still fits, unwrapped, in 80 columns.
 
-        The status column's reserve was sized for the raw enum values, the
-        longest of which was `AWAITING_FLIP`. Humanised labels are longer, and
-        "Saved to folder" is longer than `FALLBACK`, so the reserve is derived
-        from `state_label` -- and from the warned-upload label, the widest of
-        all -- rather than hardcoded.
+        Humanised labels are longer than the raw enum values, and "Saved to
+        folder" is longer than `FALLBACK`, so the status column's reserve is
+        derived from `state_label` -- and from the warned-upload label, the
+        widest of all -- rather than hardcoded.
         """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
@@ -2972,7 +2970,7 @@ class TestJobsCommand:
         data = json.loads(result.output)
         assert data[0]["state"] == "FALLBACK"
         assert "Saved to folder" not in result.output
-        # No writer for either column until plan 23-07, so both read None today.
+        # update_state records no outcome or warning, so both read None.
         assert data[0]["outcome"] is None
         assert data[0]["warning"] is None
 
@@ -3118,7 +3116,7 @@ class TestJobsCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        ``--json`` adds the stored error verbatim, host path included (D-15).
+        ``--json`` adds the stored error verbatim, host path included.
 
         The web page shows a failure only as a path-free sentence pointing
         here, so this output is where the full text lives. The field is
@@ -3169,9 +3167,9 @@ class TestJobsCommand:
         """
         The three counts and the removed positions follow every existing key.
 
-        Appended, so a script reading the old keys -- in their old order --
-        is unaffected.  The positions are 1-based scanned-page numbers, and
-        mean nothing without the scanned count beside them.
+        Appended, so a script reading the earlier keys, in their order, is
+        unaffected.  The positions are 1-based scanned-page numbers, and mean
+        nothing without the scanned count beside them.
         """
         settings = self._settings_for(tmp_path)
         store = JobStore(db_path=settings.output.db_path)
@@ -3256,8 +3254,8 @@ class TestJobsCommand:
         """
         ``--limit`` below 1 is a usage error, exit 2.
 
-        SQLite reads a negative LIMIT as no limit at all, so ``-1`` used to
-        print the whole history, and ``0`` asked for nothing.
+        SQLite reads a negative LIMIT as no limit at all, so ``-1`` would print
+        the whole history, and ``0`` would ask for nothing.
         """
         settings = self._settings_for(tmp_path)
         self._populate_store(settings.output.db_path, count=3)
@@ -3857,18 +3855,16 @@ class TestServeCommand:
         """
         A stop tells the refresher at once, so the drain does not let it go on.
 
-        The stop lands while the refresher's scanner check is running, and the
-        check finishes during the request drain.  The Paperless check after
-        it is one request that cannot be cut short; here it never ends.  Told
-        to stop only by the lifespan, after the drain, the refresher would
-        already be inside that request and miss its join, and the lifespan
-        would close nothing.  Told when the stop is asked for, it ends its run
-        after the scanner check, and all three closes run.
+        The stop lands during the refresher's scanner check, which finishes in
+        the request drain; the Paperless check after it never ends here. Told to
+        stop only after the drain, the refresher would be inside that request,
+        miss its join, and the lifespan would close nothing. Told at once, it
+        ends its run after the scanner check and all three closes run.
 
         uvicorn is replaced by a run that does what it does around a SIGTERM:
-        start the lifespan, hand the signal to ``handle_exit`` as its own
-        handler would, wait out the drain, then shut the lifespan down.  The
-        join is cut to 1 s so a broken stop fails fast.
+        start the lifespan, hand the signal to ``handle_exit``, wait out the
+        drain, then shut the lifespan down. The join is cut to 1 s so a broken
+        stop fails fast.
         """
         monkeypatch.setattr(app_module, "STOP_JOIN_SECONDS", 1.0)
         held = _HeldRefresherChecks()
@@ -4004,20 +4000,16 @@ class TestServeCommand:
         """
         A signal that lands while the main thread stops the refresher is safe.
 
-        The lifespan stops the refresher on the main thread, both at shutdown
-        and after a start-up that failed part way, and uvicorn's signal handler
-        is installed throughout and runs on that same thread.  Setting a
-        ``threading.Event`` holds the Event's own lock, which is not
-        reentrant, so a handler that set the same Event from inside that call
-        would wait on the frame it interrupted, for ever.  The server would
-        then hang until it was killed.  After a failed start-up the server has
-        not been told to stop, so the handler cannot tell the two cases apart
-        by ``should_exit``.
+        The lifespan stops the refresher on the main thread, at shutdown and
+        after a failed start-up, and uvicorn's signal handler runs on that same
+        thread. ``threading.Event.set`` holds a non-reentrant lock, so a handler
+        setting the same Event from inside that call would wait for ever on the
+        frame it interrupted. After a failed start-up ``should_exit`` is unset,
+        so the handler cannot tell the two cases apart by it.
 
-        The patched ``set`` stands in for the Event's lock: a second ``set``
-        of the refresher's stop event that begins while the first is still
-        inside is recorded instead of blocking.  The handler is called from
-        inside the first, as a signal arriving there would run it.
+        The patched ``set`` stands in for that lock: a second ``set`` beginning
+        inside the first is recorded instead of blocking, and the handler is
+        called from inside the first, as a signal arriving there would run it.
         """
         app = create_app(self._loopback_settings(tmp_path), StubScannerBackend())
         refresher: CheckRefresher = app.state.refresher
@@ -4143,8 +4135,8 @@ class TestServeCommand:
 
         A resolver lists ``::1`` first on a typical host.  Binding only that
         would refuse a reverse proxy pointed at ``127.0.0.1``; binding every
-        address keeps what uvicorn did when it bound the name itself.  With
-        port 0 the OS picks the port once and every address shares it.
+        address matches uvicorn binding the name itself.  With port 0 the OS
+        picks the port once and every address shares it.
         """
         _resolving_to(monkeypatch, "::1", "127.0.0.1")
         runs = _fake_server_run(monkeypatch)
@@ -4475,25 +4467,17 @@ class TestServeCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Uvicorn's own start-up exit code never becomes this CLI's (DEP-09, D-13).
+        Uvicorn's own start-up exit code never becomes this CLI's.
 
-        Nothing about uvicorn is stubbed here (D-14): ``serve`` binds a real
-        ephemeral loopback socket and hands it to the real
-        ``uvicorn.Server.run(sockets=...)``, so the production pre-bound-socket
-        path executes end to end. Newer uvicorn exits the process itself when
-        start-up fails, with a code that happens to be this project's Paperless
-        code, so a caller reading exit codes would be told the wrong cause.
+        Nothing about uvicorn is stubbed: ``serve`` hands a real loopback socket
+        to the real ``uvicorn.Server.run(sockets=...)``. Newer uvicorn exits the
+        process itself when start-up fails, with a code that is this project's
+        Paperless code, so a caller would be told the wrong cause.
 
-        The lifespan is made to refuse by patching ``saneless.cli.create_app``
-        rather than by pointing a configured directory somewhere unwritable
-        (the corrected D-15): the CLI's own settings pre-flight calls
-        ``validate_settings_dirs`` and exits 2 from there, before
-        ``_run_server`` is ever reached, so the configuration route would pass
-        on an unfixed tree and prove nothing.
-
-        This is the one serve test that reaches real uvicorn, so it is the one
-        that needs ``_invoke_on_a_worker_thread``; see that helper for why the
-        main thread cannot be used once the browser module has run.
+        The lifespan refuses through a patched ``saneless.cli.create_app``: an
+        unwritable configured directory would be refused by the settings
+        pre-flight, exit 2, before ``_run_server`` is reached, and prove nothing.
+        It reaches real uvicorn, so it runs on ``_invoke_on_a_worker_thread``.
         """
         self._refusing_create_app(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
