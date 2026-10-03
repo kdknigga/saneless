@@ -1,7 +1,9 @@
 """
-Tests for the shared saneless vocabulary module.
+The shared vocabulary gives every state, category and sentence one definition.
 
-Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
+Job states, error categories, outcomes, exit codes and the operator-facing
+copy all live in ``saneless.vocabulary``; these tests pin each mapping, its
+totality over its enum, and the exact words the operator reads.
 """
 
 from __future__ import annotations
@@ -168,7 +170,7 @@ _AMBER_CATEGORIES = frozenset(
 
 
 class TestJobStateMembers:
-    """JobState membership tests."""
+    """JobState has thirteen members, each valued as its name."""
 
     def test_job_state_has_exactly_thirteen_members(self) -> None:
         """
@@ -183,19 +185,19 @@ class TestJobStateMembers:
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:
-        """Every JobState value is identical to its member name (CTR-01)."""
+        """Every JobState value is identical to its member name."""
         assert state.value == state.name
 
 
 class TestErrorCategoryMembers:
-    """ErrorCategory membership tests."""
+    """ErrorCategory is the documented set of categories, each valued as its name."""
 
     def test_error_category_member_names(self) -> None:
         """
-        ErrorCategory names are the documented categories (CTR-05, D-06).
+        ErrorCategory names are the documented categories.
 
         The documented categories include REJECTED for a submit that never
-        ran (D-06), ASSEMBLY for a PDF that could not be built (D-04) and
+        ran, ASSEMBLY for a PDF that could not be built and
         ALL_BLANK for a scan whose every page empty-page detection judged
         blank, which is not a scanner fault.  UNCONFIRMED_SEND and
         UNCONFIRMED_FILING mark an upload that may already be in
@@ -221,16 +223,16 @@ class TestErrorCategoryMembers:
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
     def test_error_category_value_equals_name(self, category: ErrorCategory) -> None:
-        """Every ErrorCategory value is identical to its member name (CTR-05)."""
+        """Every ErrorCategory value is identical to its member name."""
         assert category.value == category.name
 
 
 class TestScanOutcomeMembers:
-    """ScanOutcome membership tests."""
+    """ScanOutcome is SUCCESS or FALLBACK, each valued as its name."""
 
     def test_scan_outcome_has_exactly_two_members(self) -> None:
         """
-        ScanOutcome is exactly SUCCESS and FALLBACK (CTR-02, OUTC-02).
+        ScanOutcome is exactly SUCCESS and FALLBACK.
 
         There is no FAILED member and there will not be one: a failure raises,
         so ``outcome`` stays NULL and ``JobState.ERROR`` carries the failure.
@@ -241,16 +243,16 @@ class TestScanOutcomeMembers:
 
     @pytest.mark.parametrize("outcome", list(ScanOutcome))
     def test_scan_outcome_value_equals_name(self, outcome: ScanOutcome) -> None:
-        """Every ScanOutcome value is identical to its member name (CTR-02)."""
+        """Every ScanOutcome value is identical to its member name."""
         assert outcome.value == outcome.name
 
 
 class TestProfileStorage:
-    """ProfileStorage membership tests (APPL-06, Amendment A-2, D-22)."""
+    """ProfileStorage names where the startup profiles ended up."""
 
     def test_profile_storage_member_names(self) -> None:
         """
-        ProfileStorage names the three outcomes of the startup persist (A-2).
+        ProfileStorage names the three outcomes of the startup persist.
 
         ``_persist_generated_profiles`` returns None for two genuinely
         different situations -- no config file was loaded, and the file could
@@ -265,7 +267,7 @@ class TestProfileStorage:
 
     @pytest.mark.parametrize("storage", list(ProfileStorage))
     def test_profile_storage_value_equals_name(self, storage: ProfileStorage) -> None:
-        """Every ProfileStorage value is identical to its member name (A-2)."""
+        """Every ProfileStorage value is identical to its member name."""
         assert storage.value == storage.name
 
     def test_profile_storage_is_a_str_enum(self) -> None:
@@ -278,15 +280,15 @@ class TestStateClassifications:
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_every_state_is_active_xor_terminal(self, state: JobState) -> None:
-        """Each JobState is either active or terminal, never both (CTR-01)."""
+        """Each JobState is either active or terminal, never both."""
         assert (state in ACTIVE_STATES) ^ (state in TERMINAL_STATES)
 
     def test_classifications_cover_every_state(self) -> None:
-        """ACTIVE_STATES and TERMINAL_STATES together are all of JobState (CTR-01)."""
+        """ACTIVE_STATES and TERMINAL_STATES together are all of JobState."""
         assert set(JobState) == ACTIVE_STATES | TERMINAL_STATES
 
     def test_classifications_do_not_overlap(self) -> None:
-        """ACTIVE_STATES and TERMINAL_STATES share no member (CTR-01)."""
+        """ACTIVE_STATES and TERMINAL_STATES share no member."""
         assert not (ACTIVE_STATES & TERMINAL_STATES)
 
     def test_active_states_membership(self) -> None:
@@ -309,7 +311,7 @@ class TestStateClassifications:
         )
 
     def test_terminal_states_membership(self) -> None:
-        """TERMINAL_STATES is DONE, ERROR, FALLBACK and CANCELLED (OUTC-02, D-01)."""
+        """TERMINAL_STATES is DONE, ERROR, FALLBACK and CANCELLED."""
         assert (
             frozenset(
                 {
@@ -323,7 +325,7 @@ class TestStateClassifications:
         )
 
     def test_cancelled_is_not_busy(self) -> None:
-        """A cancelled job is finished, so the machine is not working (D-01)."""
+        """A cancelled job is finished, so the machine is not working."""
         assert JobState.CANCELLED not in BUSY_STATES
         assert JobState.CANCELLED.value == "CANCELLED"
 
@@ -378,17 +380,17 @@ class TestStateClassifications:
         assert WAITING_STATES <= ACTIVE_STATES
 
     def test_awaiting_flip_is_active_but_not_busy(self) -> None:
-        """AWAITING_FLIP is in flight but the machine is idle then (CTR-01)."""
+        """AWAITING_FLIP is in flight but the machine is idle then."""
         assert JobState.AWAITING_FLIP in ACTIVE_STATES
         assert JobState.AWAITING_FLIP not in BUSY_STATES
 
     def test_busy_states_is_a_subset_of_active_states(self) -> None:
-        """No state can be busy without also being active (CTR-01)."""
+        """No state can be busy without also being active."""
         assert BUSY_STATES <= ACTIVE_STATES
 
 
 class TestStateLabel:
-    """state_label short-label lookup tests."""
+    """state_label gives every JobState a short label."""
 
     @pytest.mark.parametrize(
         ("state", "expected"),
@@ -409,19 +411,19 @@ class TestStateLabel:
         ],
     )
     def test_state_label_strings(self, state: JobState, expected: str) -> None:
-        """state_label returns the label the history table has always shown (CTR-01)."""
+        """state_label returns the label the history table shows."""
         assert state_label(state) == expected
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_state_label_is_complete(self, state: JobState) -> None:
-        """Every JobState has a label that is not just its raw value (CTR-01)."""
+        """Every JobState has a label that is not just its raw value."""
         label = state_label(state)
         assert label
         assert label != state.value
 
 
 class TestProgressLabel:
-    """progress_label progress-prose lookup tests."""
+    """progress_label gives every JobState its progress prose."""
 
     @pytest.mark.parametrize(
         ("state", "expected"),
@@ -444,18 +446,18 @@ class TestProgressLabel:
         ],
     )
     def test_progress_label_strings(self, state: JobState, expected: str) -> None:
-        """progress_label returns the prose the status area has always shown (CTR-01)."""
+        """progress_label returns the prose the status area shows."""
         assert progress_label(state) == expected
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_progress_label_is_complete(self, state: JobState) -> None:
-        """Every JobState has progress prose that is not its raw value (CTR-01)."""
+        """Every JobState has progress prose that is not its raw value."""
         label = progress_label(state)
         assert label
         assert label != state.value
 
     def test_terminal_states_have_progress_prose_for_totality(self) -> None:
-        """The four terminal states carry prose purely to stay total (CTR-01)."""
+        """The four terminal states carry prose purely to stay total."""
         assert progress_label(JobState.DONE) == "Complete"
         assert progress_label(JobState.ERROR) == "Failed"
         assert progress_label(JobState.FALLBACK) == "Saved to folder"
@@ -463,7 +465,7 @@ class TestProgressLabel:
 
 
 class TestFlipAnswerLabel:
-    """flip_answer_label acknowledgment-copy lookup tests."""
+    """flip_answer_label gives every FlipOutcome its acknowledgment copy."""
 
     @pytest.mark.parametrize(
         ("outcome", "expected"),
@@ -481,7 +483,7 @@ class TestFlipAnswerLabel:
     def test_flip_answer_label_strings(
         self, outcome: FlipOutcome, expected: str
     ) -> None:
-        """flip_answer_label returns the acknowledgment copy (DPLX-06, CR-01)."""
+        """flip_answer_label returns the acknowledgment copy."""
         assert flip_answer_label(outcome) == expected
 
     def test_a_flip_wait_ends_in_one_of_four_ways(self) -> None:
@@ -500,7 +502,7 @@ class TestFlipAnswerLabel:
 
     @pytest.mark.parametrize("outcome", list(FlipOutcome))
     def test_flip_answer_label_is_complete(self, outcome: FlipOutcome) -> None:
-        """Every FlipOutcome has acknowledgment prose ending in ASCII dots (CR-01)."""
+        """Every FlipOutcome has acknowledgment prose ending in ASCII dots."""
         label = flip_answer_label(outcome)
         assert label
         assert label != outcome.value
@@ -559,7 +561,7 @@ class TestPassAnswer:
         ]
 
     def test_flip_outcome_is_not_widened(self) -> None:
-        """The flip wait keeps its four outcomes; the new answers are a sibling."""
+        """The flip wait has four outcomes; multi-page answers are a separate enum."""
         assert [outcome.value for outcome in FlipOutcome] == [
             "CONTINUED",
             "ABORTED",
@@ -611,7 +613,7 @@ class TestPassAnswer:
 
 
 class TestPassPrompt:
-    """PassPrompt value-type tests."""
+    """PassPrompt is a frozen, slotted value with fixed fields."""
 
     @staticmethod
     def _prompt() -> PassPrompt:
@@ -970,7 +972,7 @@ def _audit_cases(
 
 
 class TestErrorAdvice:
-    """error_advice category-to-advice lookup tests (APPL-04, D-10, D-11)."""
+    """error_advice gives every ErrorCategory its advice."""
 
     @pytest.mark.parametrize(
         ("category", "member", "phrase"), _audit_cases(_CATEGORY_AUDIT)
@@ -1002,7 +1004,7 @@ class TestErrorAdvice:
         )
 
     def test_error_advice_fields(self) -> None:
-        """ErrorAdvice carries exactly a message and a next step (APPL-04)."""
+        """ErrorAdvice carries exactly a message and a next step."""
         assert [field.name for field in fields(ErrorAdvice)] == [
             "message",
             "next_step",
@@ -1027,7 +1029,7 @@ class TestErrorAdvice:
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
     def test_error_advice_is_complete(self, category: ErrorCategory) -> None:
-        """Every ErrorCategory has a message and a next step (APPL-04, CTR-05)."""
+        """Every ErrorCategory has a message and a next step."""
         advice = error_advice(category)
         assert advice.message
         assert advice.next_step
@@ -1039,7 +1041,7 @@ class TestErrorAdvice:
     @pytest.mark.parametrize("category", list(ErrorCategory))
     def test_error_advice_accessors_agree(self, category: ErrorCategory) -> None:
         """
-        error_message and error_next_step read the one lookup (D-10, D-11).
+        error_message and error_next_step read the one lookup.
 
         There is exactly one ``match`` over ErrorCategory in the module and the
         two accessors are one-liners over it, so the pair cannot drift apart
@@ -1050,7 +1052,7 @@ class TestErrorAdvice:
         assert error_next_step(category) == advice.next_step
 
     def test_error_advice_raises_on_unrecognised_value(self) -> None:
-        """error_advice raises on a value outside ErrorCategory (CTR-05)."""
+        """error_advice raises on a value outside ErrorCategory."""
         bad = cast("ErrorCategory", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             error_advice(bad)
@@ -1107,13 +1109,13 @@ class TestErrorAdvice:
     def test_error_next_step_strings(
         self, category: ErrorCategory, expected: str
     ) -> None:
-        """The next steps are the approved copy (APPL-04)."""
+        """The next steps are the approved copy."""
         assert error_next_step(category) == expected
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
     def test_error_next_step_is_surface_neutral(self, category: ErrorCategory) -> None:
         """
-        No next step names a surface, because both surfaces render it (D-12).
+        No next step names a surface, because both surfaces render it.
 
         The web page has no command line and the CLI has no Scan button, so a
         string naming either would be wrong on the other.
@@ -1125,9 +1127,9 @@ class TestErrorAdvice:
 
     def test_error_message_strings(self) -> None:
         """
-        The messages are the approved copy (APPL-04).
+        The messages are the approved copy.
 
-        CONFIG's no longer calls the configuration invalid, because a port in
+        CONFIG's does not call the configuration invalid, because a port in
         use, a missing libsane or an unwritable folder is filed there too.
         """
         assert error_message(ErrorCategory.FEEDER) == (
@@ -1261,7 +1263,7 @@ class TestErrorAdvice:
         assert numbers <= allowed
 
     def test_rejected_error_message(self) -> None:
-        """REJECTED explains that the scan never started (D-05, D-06)."""
+        """REJECTED explains that the scan never started."""
         assert error_message(ErrorCategory.REJECTED) == (
             "This scan was not started. Check that saneless is ready to scan, "
             "then try again."
@@ -1269,10 +1271,10 @@ class TestErrorAdvice:
 
 
 class TestTokenUnsetRejection:
-    """RequestRejection.TOKEN_UNSET vocabulary tests (APPL-07, D-15)."""
+    """An unset paperless-ngx token is a rejection of its own, with its own copy."""
 
     def test_token_unset_member_exists(self) -> None:
-        """TOKEN_UNSET is a RequestRejection member of its own (D-15)."""
+        """TOKEN_UNSET is a RequestRejection member of its own."""
         assert RequestRejection.TOKEN_UNSET.value == "TOKEN_UNSET"
         assert RequestRejection.TOKEN_UNSET.name == "TOKEN_UNSET"
 
@@ -1281,7 +1283,7 @@ class TestTokenUnsetRejection:
         assert rejection_status_code(RequestRejection.TOKEN_UNSET) == 503
 
     def test_token_unset_message(self) -> None:
-        """The TOKEN_UNSET sentence is the approved UI-SPEC S8 copy (APPL-07)."""
+        """The TOKEN_UNSET sentence is the approved copy, word for word."""
         assert rejection_message(RequestRejection.TOKEN_UNSET) == (
             "The paperless-ngx API token has not been set, so the scan was not "
             "started. Put a real API token in the saneless config file, then "
@@ -1290,7 +1292,7 @@ class TestTokenUnsetRejection:
 
     def test_token_unset_does_not_reuse_worker_degraded_copy(self) -> None:
         """
-        WORKER_DEGRADED is deliberately not reused for an unset token (D-15).
+        WORKER_DEGRADED is deliberately not reused for an unset token.
 
         "The scan service was unavailable" is untrue when the truth is that
         nobody ever set the token, so the two carry different words.
@@ -1301,7 +1303,7 @@ class TestTokenUnsetRejection:
         assert TOKEN_UNSET_JOB_ERROR != WORKER_DEGRADED_JOB_ERROR
 
     def test_token_unset_job_error(self) -> None:
-        """The job-row error carries no trailing period, like its siblings (D-05)."""
+        """The job-row error carries no trailing period, like its siblings."""
         assert TOKEN_UNSET_JOB_ERROR == (
             "Not started: the paperless-ngx API token has not been set"
         )
@@ -1309,13 +1311,13 @@ class TestTokenUnsetRejection:
 
 
 class TestDeveloperConstantStrings:
-    """Every user-facing string in this module is a developer constant (V7)."""
+    """Every user-facing string in this module is a developer constant."""
 
     @pytest.mark.parametrize("rejection", list(RequestRejection))
     def test_rejection_message_carries_no_internals(
         self, rejection: RequestRejection
     ) -> None:
-        """No rejection message can carry input, a URL or exception text (V7)."""
+        """No rejection message can carry input, a URL or exception text."""
         message = rejection_message(rejection)
         assert "{" not in message
         assert "%s" not in message
@@ -1324,7 +1326,7 @@ class TestDeveloperConstantStrings:
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
     def test_error_advice_carries_no_internals(self, category: ErrorCategory) -> None:
-        """No ErrorAdvice field can carry input, a URL or exception text (V7)."""
+        """No ErrorAdvice field can carry input, a URL or exception text."""
         advice = error_advice(category)
         for text in (advice.message, advice.next_step):
             assert "{" not in text
@@ -1353,16 +1355,16 @@ def local_zone(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None
 
 
 class TestLocalTime:
-    """local_time shared timestamp formatter tests (APPL-12, D-34, D-35)."""
+    """local_time renders an instant in the server's zone, with the zone named."""
 
     def test_local_time_format_is_the_one_shared_format(self) -> None:
-        """The web filter and the CLI table read one format constant (D-35)."""
+        """The web filter and the CLI table read one format constant."""
         assert LOCAL_TIME_FORMAT == "%Y-%m-%d %H:%M %Z"
 
     def test_local_time_renders_the_servers_zone(
         self, local_zone: Callable[[str], None]
     ) -> None:
-        """A UTC instant renders in the server's local zone, named (D-34)."""
+        """A UTC instant renders in the server's local zone, named."""
         local_zone("America/Chicago")
         assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC)) == (
             "2026-09-16 14:03 CDT"
@@ -1371,7 +1373,7 @@ class TestLocalTime:
     def test_local_time_names_utc_when_the_server_is_utc(
         self, local_zone: Callable[[str], None]
     ) -> None:
-        """A UTC server still gets the zone named on the line (D-35)."""
+        """A UTC server still gets the zone named on the line."""
         local_zone("UTC")
         assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC)) == (
             "2026-09-16 19:03 UTC"
@@ -1381,7 +1383,7 @@ class TestLocalTime:
         self, local_zone: Callable[[str], None]
     ) -> None:
         """
-        A value carrying another zone still renders the server's (D-34).
+        A value carrying another zone still renders the server's.
 
         ``astimezone()`` is called with no argument, so the answer is the
         process's zone whatever the argument's tzinfo happens to be.
@@ -1395,34 +1397,28 @@ class TestLocalTime:
 
 class TestLocalTimeTrailingSpace:
     """
-    local_time never emits trailing whitespace (IN-06, APPL-12).
+    local_time never emits trailing whitespace.
 
     ``LOCAL_TIME_FORMAT`` ends in ``%Z``, which ``strftime`` renders as the
     empty string on a platform that reports no zone abbreviation, leaving the
-    separator before it dangling.  ``resolve_job_title`` interpolates the
-    result straight into ``f"Scan {local_time(now)}"``, so such a host files a
-    paperless-ngx document whose title ends in a space.
+    separator before it dangling, and a job title built from it would end in
+    a space.
 
-    That platform cannot be reproduced portably -- POSIX requires a zone
-    abbreviation of at least three characters, so no ``TZ`` value produces an
-    empty ``%Z`` on glibc -- so these tests pin the *property* instead, by
-    monkeypatching the module's format to one that ends in whitespace.  Read
-    together with ``test_the_shared_format_still_names_the_zone`` they say: the
-    zone stays on the line, and whatever it renders as, the result is clean.
+    No ``TZ`` value produces an empty ``%Z`` on glibc, so these tests pin the
+    property by patching the module's format to one that ends in whitespace.
     """
 
     #: Stand-ins for a format whose final ``%Z`` rendered empty.  A literal
     #: space is the real case; the tab and the double space are there so the
-    #: fix cannot be a special case for one character.
+    #: strip cannot be a special case for one character.
     WHITESPACE_FORMATS = ("%Y-%m-%d %H:%M ", "%Y-%m-%d %H:%M\t", "%Y-%m-%d %H:%M  ")
 
     def test_the_shared_format_still_names_the_zone(self) -> None:
         """
-        The fix must not reach its goal by dropping ``%Z`` (D-34).
+        The shared format ends in ``%Z``, so the zone stays on the line.
 
-        A doc truth: D-34 pins the ``2026-09-16 14:03 CDT`` shape, so removing
-        the zone would satisfy the trailing-space property and break the
-        contract the constant exists to hold.
+        Dropping the zone would satisfy the trailing-space property and break
+        the documented ``2026-09-16 14:03 CDT`` shape.
         """
         assert LOCAL_TIME_FORMAT.endswith("%Z")
 
@@ -1501,10 +1497,10 @@ class TestLocalTimeTrailingSpace:
 
 
 class TestPageCounts:
-    """page_counts sentence tests (APPL-03, D-32)."""
+    """page_counts sentence tests."""
 
     def test_page_counts_sentence(self) -> None:
-        """The three counts render as one sentence (APPL-03)."""
+        """The three counts render as one sentence."""
         job = Job(
             id="j",
             profile="default",
@@ -1531,9 +1527,9 @@ class TestPageCounts:
 
     def test_page_counts_renders_a_measured_zero(self) -> None:
         """
-        A measured 0 is a measurement and renders as 0 (D-32, Pitfall 4).
+        A measured 0 is a measurement and renders as 0.
 
-        D-32's "never render 0" is about NULL.  A scan where nothing was blank
+        Rendering nothing is for a NULL count.  A scan where nothing was blank
         really did remove 0 pages, and saying so is the truth.
         """
         job = Job(
@@ -1559,7 +1555,7 @@ class TestPageCounts:
     def test_page_counts_is_none_when_any_count_is_null(
         self, scanned: int | None, removed: int | None, uploaded: int | None
     ) -> None:
-        """One NULL count means nothing at all is rendered (D-32)."""
+        """One NULL count means nothing at all is rendered."""
         job = Job(
             id="j",
             profile="default",
@@ -1572,16 +1568,16 @@ class TestPageCounts:
         assert page_counts(job) is None
 
     def test_page_counts_is_none_for_an_uncounted_job(self) -> None:
-        """An ERROR or pre-Phase-23 row has no counts, so renders none (D-32)."""
+        """A job that recorded no counts, such as an ERROR row, renders none."""
         job = Job(id="j", profile="default", title="t", state=JobState.ERROR)
         assert page_counts(job) is None
 
 
 class TestRemovedPagesNote:
-    """The informational note naming the pages removed as blank (D-07, D-08)."""
+    """The informational note naming the pages removed as blank."""
 
     def test_several_positions_are_listed_in_order(self) -> None:
-        """The D-08 sentence, with the plural noun."""
+        """Several removed pages are listed in order, with the plural noun."""
         assert (
             removed_pages_note((2, 4, 6), 12)
             == "Removed as blank: pages 2, 4, 6 of 12 scanned."
@@ -1646,28 +1642,28 @@ class TestRemovedPagesNote:
 
 
 class TestBusyLine:
-    """busy_line in-progress line tests (APPL-08, D-25, D-33)."""
+    """busy_line in-progress line tests."""
 
     @pytest.mark.parametrize("state", sorted(BUSY_STATES))
     def test_busy_line_falls_back_to_progress_label(self, state: JobState) -> None:
-        """With nothing extra known, the busy line is today's prose (D-33)."""
+        """With nothing extra known, the busy line is the progress prose."""
         assert busy_line(state) == progress_label(state)
 
     def test_busy_line_names_the_job_ahead(self) -> None:
-        """A queued job is told what it is waiting for (APPL-08, D-25)."""
+        """A queued job is told what it is waiting for."""
         assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=1) == (
             "Waiting for 'Tax return' to finish (1 ahead of you)"
         )
 
     def test_busy_line_counts_more_than_one_ahead(self) -> None:
-        """The count is the number of jobs ahead, not a fixed word (APPL-08)."""
+        """The count is the number of jobs ahead, not a fixed word."""
         assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=2) == (
             "Waiting for 'Tax return' to finish (2 ahead of you)"
         )
 
     def test_busy_line_says_next_in_line_instead_of_zero_ahead(self) -> None:
         """
-        "(0 ahead of you)" is never rendered (D-25).
+        "(0 ahead of you)" is never rendered.
 
         It is technically true and reads like a bug.
         """
@@ -1676,25 +1672,25 @@ class TestBusyLine:
         )
 
     def test_busy_line_needs_both_halves_of_the_queue_position(self) -> None:
-        """A title with no count is not enough to claim a position (D-25)."""
+        """A title with no count is not enough to claim a position."""
         assert busy_line(JobState.PENDING, queue_title="Tax return") == progress_label(
             JobState.PENDING
         )
 
     def test_busy_line_shows_the_front_count(self) -> None:
-        """Pass B names how many fronts are already scanned (D-33, APPL-03)."""
+        """Pass B names how many fronts are already scanned."""
         assert busy_line(JobState.SCANNING_REVERSE, front_pages=12) == (
             "Front: 12 pages · " + progress_label(JobState.SCANNING_REVERSE)
         )
 
     def test_busy_line_pluralises_the_front_count(self) -> None:
-        """One front page is a page, not pages (D-33)."""
+        """One front page is a page, not pages."""
         assert busy_line(JobState.SCANNING_REVERSE, front_pages=1) == (
             "Front: 1 page · " + progress_label(JobState.SCANNING_REVERSE)
         )
 
     def test_busy_line_omits_an_unknown_front_count(self) -> None:
-        """An unknown front count renders no count at all (D-33)."""
+        """An unknown front count renders no count at all."""
         assert busy_line(JobState.SCANNING_REVERSE, front_pages=None) == (
             progress_label(JobState.SCANNING_REVERSE)
         )
@@ -1706,7 +1702,7 @@ class TestBusyLine:
         )
 
     def test_busy_line_queue_position_wins_over_the_front_count(self) -> None:
-        """The queue line is the first branch, whatever else is known (D-33)."""
+        """The queue line is the first branch, whatever else is known."""
         assert busy_line(
             JobState.SCANNING_REVERSE,
             front_pages=12,
@@ -1730,7 +1726,7 @@ class TestBusyLine:
     def test_busy_line_omits_an_empty_or_unknown_pages_kept(
         self, pages_kept: int | None
     ) -> None:
-        """With no page kept yet the first pass reads exactly as before."""
+        """With no page kept yet, the first pass reads as the plain progress prose."""
         assert busy_line(JobState.SCANNING, pages_kept=pages_kept) == (
             progress_label(JobState.SCANNING)
         )
@@ -1763,7 +1759,7 @@ class TestWorkerHealth:
     """WorkerHealth membership and /health detail tests."""
 
     def test_worker_health_members(self) -> None:
-        """WorkerHealth is exactly HEALTHY, DEGRADED and DOWN (ROBU-01)."""
+        """WorkerHealth is exactly HEALTHY, DEGRADED and DOWN."""
         assert [health.value for health in WorkerHealth] == [
             "HEALTHY",
             "DEGRADED",
@@ -1772,7 +1768,7 @@ class TestWorkerHealth:
 
     @pytest.mark.parametrize("health", list(WorkerHealth))
     def test_worker_health_value_equals_name(self, health: WorkerHealth) -> None:
-        """Every WorkerHealth value is identical to its member name (ROBU-01)."""
+        """Every WorkerHealth value is identical to its member name."""
         assert health.value == health.name
 
     @pytest.mark.parametrize(
@@ -1786,26 +1782,26 @@ class TestWorkerHealth:
     def test_worker_health_detail_strings(
         self, health: WorkerHealth, expected: str
     ) -> None:
-        """worker_health_detail returns the documented /health detail (ROBU-01)."""
+        """worker_health_detail returns the documented /health detail."""
         assert worker_health_detail(health) == expected
 
     @pytest.mark.parametrize("health", list(WorkerHealth))
     def test_worker_health_detail_is_complete(self, health: WorkerHealth) -> None:
-        """Every WorkerHealth has a non-empty detail string (ROBU-01)."""
+        """Every WorkerHealth has a non-empty detail string."""
         assert worker_health_detail(health)
 
     def test_worker_health_detail_raises_on_unrecognised_value(self) -> None:
-        """worker_health_detail raises on a value outside WorkerHealth (ROBU-01)."""
+        """worker_health_detail raises on a value outside WorkerHealth."""
         bad = cast("WorkerHealth", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             worker_health_detail(bad)
 
 
 class TestSubmitResult:
-    """SubmitResult membership tests."""
+    """SubmitResult names the four answers a submit can get, each valued as its name."""
 
     def test_submit_result_members(self) -> None:
-        """SubmitResult is exactly ACCEPTED, QUEUE_FULL, DOWN, DEGRADED (ROBU-02)."""
+        """SubmitResult is exactly ACCEPTED, QUEUE_FULL, DOWN, DEGRADED."""
         assert [result.value for result in SubmitResult] == [
             "ACCEPTED",
             "QUEUE_FULL",
@@ -1815,7 +1811,7 @@ class TestSubmitResult:
 
     @pytest.mark.parametrize("result", list(SubmitResult))
     def test_submit_result_value_equals_name(self, result: SubmitResult) -> None:
-        """Every SubmitResult value is identical to its member name (ROBU-02)."""
+        """Every SubmitResult value is identical to its member name."""
         assert result.value == result.name
 
 
@@ -1934,7 +1930,7 @@ class TestRequestRejection:
     """RequestRejection membership, message, status code and job-row copy tests."""
 
     def test_request_rejection_members(self) -> None:
-        """RequestRejection names one member per rendered error (D-05, ROBU-02)."""
+        """RequestRejection names one member per rendered error."""
         assert {rejection.name for rejection in RequestRejection} == {
             "QUEUE_FULL",
             "WORKER_DOWN",
@@ -1958,17 +1954,17 @@ class TestRequestRejection:
     def test_request_rejection_value_equals_name(
         self, rejection: RequestRejection
     ) -> None:
-        """Every RequestRejection value is identical to its member name (D-05)."""
+        """Every RequestRejection value is identical to its member name."""
         assert rejection.value == rejection.name
 
     def test_message_table_covers_every_member(self) -> None:
-        """The pinned message table names every RequestRejection member (D-05)."""
+        """The pinned message table names every RequestRejection member."""
         assert {rejection for rejection, _ in _REJECTION_MESSAGES} == set(
             RequestRejection
         )
 
     def test_status_code_table_covers_every_member(self) -> None:
-        """The pinned status-code table names every RequestRejection member (D-05)."""
+        """The pinned status-code table names every RequestRejection member."""
         assert {rejection for rejection, _ in _REJECTION_STATUS_CODES} == set(
             RequestRejection
         )
@@ -1977,43 +1973,43 @@ class TestRequestRejection:
     def test_rejection_message_strings(
         self, rejection: RequestRejection, expected: str
     ) -> None:
-        """rejection_message returns the approved S3 copy verbatim (D-05, ROBU-02)."""
+        """rejection_message returns the approved copy verbatim."""
         assert rejection_message(rejection) == expected
 
     @pytest.mark.parametrize(("rejection", "expected"), _REJECTION_STATUS_CODES)
     def test_rejection_status_codes(
         self, rejection: RequestRejection, expected: int
     ) -> None:
-        """rejection_status_code returns the documented HTTP status (ROBU-02)."""
+        """rejection_status_code returns the documented HTTP status."""
         assert rejection_status_code(rejection) == expected
 
     @pytest.mark.parametrize("rejection", list(RequestRejection))
     def test_rejection_message_is_complete(self, rejection: RequestRejection) -> None:
-        """Every RequestRejection has a non-empty message (D-05)."""
+        """Every RequestRejection has a non-empty message."""
         assert rejection_message(rejection)
 
     @pytest.mark.parametrize("rejection", list(RequestRejection))
     def test_rejection_status_code_is_complete(
         self, rejection: RequestRejection
     ) -> None:
-        """Every RequestRejection has an HTTP error status (ROBU-02)."""
+        """Every RequestRejection has an HTTP error status."""
         assert 400 <= rejection_status_code(rejection) <= 599
 
     @pytest.mark.parametrize("rejection", list(RequestRejection))
     def test_rejection_message_style(self, rejection: RequestRejection) -> None:
-        """Every rejection message ends with a period and has no "!" (S3 style)."""
+        """Every rejection message ends with a period and has no "!"."""
         message = rejection_message(rejection)
         assert message.endswith(".")
         assert "!" not in message
 
     def test_rejection_message_raises_on_unrecognised_value(self) -> None:
-        """rejection_message raises on a value outside RequestRejection (D-05)."""
+        """rejection_message raises on a value outside RequestRejection."""
         bad = cast("RequestRejection", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             rejection_message(bad)
 
     def test_rejection_status_code_raises_on_unrecognised_value(self) -> None:
-        """rejection_status_code raises on a value outside RequestRejection (D-05)."""
+        """rejection_status_code raises on a value outside RequestRejection."""
         bad = cast("RequestRejection", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             rejection_status_code(bad)
@@ -2060,13 +2056,13 @@ class TestRequestRejection:
         )
 
     def test_title_too_long_message_reads_the_cap(self) -> None:
-        """The TITLE_TOO_LONG message names the same cap the form enforces (ROBU-08)."""
+        """The TITLE_TOO_LONG message names the same cap the form enforces."""
         assert str(TITLE_MAX_LENGTH) in rejection_message(
             RequestRejection.TITLE_TOO_LONG
         )
 
     def test_job_row_texts(self) -> None:
-        """The rejected-row texts and the restart reason are verbatim S3 (D-05)."""
+        """The rejected-row texts and the restart reason are the approved copy."""
         assert QUEUE_FULL_JOB_ERROR == "Not started: the scan queue was full"
         assert WORKER_DOWN_JOB_ERROR == "Not started: the scan service was not running"
         assert WORKER_DEGRADED_JOB_ERROR == (
@@ -2076,7 +2072,7 @@ class TestRequestRejection:
 
     @pytest.mark.parametrize("text", _JOB_ROW_TEXTS)
     def test_job_row_texts_have_no_trailing_period(self, text: str) -> None:
-        """Job-row texts follow the job.error convention of no trailing period (D-05)."""
+        """Job-row texts follow the job.error convention of no trailing period."""
         assert text
         assert not text.endswith(".")
 
@@ -2297,7 +2293,7 @@ class TestConnectionStatus:
         expected: str,
     ) -> None:
         """
-        Each member serialises to the string the web API documents (OUTC-08).
+        Each member serialises to the string the web API documents.
 
         Compared against plain str literals, not against other enum members:
         `GET /api/paperless/test` puts this value straight into a JSON body and
@@ -2307,7 +2303,7 @@ class TestConnectionStatus:
         assert status == expected
 
     def test_legacy_wire_values_are_unchanged(self) -> None:
-        """The three pre-existing API strings are byte-identical (OUTC-08)."""
+        """The connected, token_rejected and unreachable strings are spelled exactly."""
         assert ConnectionStatus.CONNECTED == "connected"
         assert ConnectionStatus.TOKEN_REJECTED == "token_rejected"
         assert ConnectionStatus.UNREACHABLE == "unreachable"
@@ -2317,7 +2313,7 @@ class TestConnectionStatus:
         self,
         status: ConnectionStatus,
     ) -> None:
-        """A member serialises as its bare string with the stdlib encoder (OUTC-08)."""
+        """A member serialises as its bare string with the stdlib encoder."""
         assert json.dumps({"status": status}) == json.dumps({"status": status.value})
 
     def test_connected_serialises_to_the_documented_body(self) -> None:
@@ -2332,13 +2328,13 @@ class TestConnectionStatus:
         self,
         status: ConnectionStatus,
     ) -> None:
-        """Every ConnectionStatus has a message that is not its raw value (OUTC-08)."""
+        """Every ConnectionStatus has a message that is not its raw value."""
         message = connection_status_message(status)
         assert message
         assert message != status.value
 
     def test_connection_status_message_strings(self) -> None:
-        """connection_status_message returns developer-authored prose (OUTC-08)."""
+        """connection_status_message returns developer-authored prose."""
         assert connection_status_message(ConnectionStatus.CONNECTED) == (
             "Connected to paperless-ngx."
         )
@@ -2366,7 +2362,7 @@ class TestConnectionStatus:
         )
 
     def test_connection_status_message_raises_on_unrecognised_value(self) -> None:
-        """connection_status_message raises on a value outside the enum (OUTC-08)."""
+        """connection_status_message raises on a value outside the enum."""
         bad = cast("ConnectionStatus", "teapot")
         with pytest.raises(AssertionError):
             connection_status_message(bad)
@@ -2377,7 +2373,7 @@ class TestJobStateFor:
 
     @pytest.mark.parametrize("outcome", list(ScanOutcome))
     def test_job_state_for_is_total(self, outcome: ScanOutcome) -> None:
-        """Every ScanOutcome maps to a state (OUTC-02)."""
+        """Every ScanOutcome maps to a state."""
         assert isinstance(job_state_for(outcome), JobState)
 
     @pytest.mark.parametrize("outcome", list(ScanOutcome))
@@ -2386,7 +2382,7 @@ class TestJobStateFor:
         outcome: ScanOutcome,
     ) -> None:
         """
-        An outcome always maps to a finished job (OUTC-02).
+        An outcome always maps to a finished job.
 
         A ScanOutcome only exists once the pipeline has resolved, so mapping one
         onto an ACTIVE_STATES member would mean the worker wrote "still in
@@ -2395,26 +2391,26 @@ class TestJobStateFor:
         assert job_state_for(outcome) in TERMINAL_STATES
 
     def test_success_maps_to_done(self) -> None:
-        """SUCCESS is the ordinary finished job (OUTC-02)."""
+        """SUCCESS is the ordinary finished job."""
         assert job_state_for(ScanOutcome.SUCCESS) is JobState.DONE
 
     def test_fallback_maps_to_fallback(self) -> None:
-        """FALLBACK gets its own state rather than being folded into DONE (OUTC-02)."""
+        """FALLBACK gets its own state rather than being folded into DONE."""
         assert job_state_for(ScanOutcome.FALLBACK) is JobState.FALLBACK
 
     def test_job_state_for_raises_on_unrecognised_value(self) -> None:
-        """job_state_for raises on a value outside ScanOutcome (OUTC-02)."""
+        """job_state_for raises on a value outside ScanOutcome."""
         bad = cast("ScanOutcome", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             job_state_for(bad)
 
 
 class TestUnrecognisedValue:
-    """Total-lookup fall-through behaviour tests."""
+    """Every total lookup raises on a value outside its enum."""
 
     def test_state_label_raises_on_unrecognised_value(self) -> None:
         """
-        state_label raises rather than echoing an unknown value back (CTR-01).
+        state_label raises rather than echoing an unknown value back.
 
         Raising is safe here because ``Job.state`` is only ever built through
         ``JobState(row[3])`` in ``JobStore.get_job`` and ``JobStore.list_recent``,
@@ -2432,13 +2428,13 @@ class TestUnrecognisedValue:
             state_label(bad)
 
     def test_progress_label_raises_on_unrecognised_value(self) -> None:
-        """progress_label raises on a value outside JobState (CTR-01)."""
+        """progress_label raises on a value outside JobState."""
         bad = cast("JobState", "UNKNOWN")
         with pytest.raises(AssertionError):
             progress_label(bad)
 
     def test_error_message_raises_on_unrecognised_value(self) -> None:
-        """error_message raises on a value outside ErrorCategory (CTR-05)."""
+        """error_message raises on a value outside ErrorCategory."""
         bad = cast("ErrorCategory", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             error_message(bad)
@@ -2448,27 +2444,27 @@ class TestClassifyError:
     """classify_error exception-to-category mapping tests."""
 
     def test_feeder_empty_error_is_feeder(self) -> None:
-        """FeederEmptyError classifies as FEEDER (CTR-05)."""
+        """FeederEmptyError classifies as FEEDER."""
         assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
 
     def test_config_error_is_config(self) -> None:
-        """ConfigError classifies as CONFIG (CTR-05)."""
+        """ConfigError classifies as CONFIG."""
         assert classify_error(ConfigError("bad toml")) is ErrorCategory.CONFIG
 
     def test_scan_error_is_scanner(self) -> None:
-        """ScanError classifies as SCANNER (CTR-05)."""
+        """ScanError classifies as SCANNER."""
         assert classify_error(ScanError("device busy")) is ErrorCategory.SCANNER
 
     def test_paperless_error_is_upload(self) -> None:
-        """PaperlessError classifies as UPLOAD (CTR-05)."""
+        """PaperlessError classifies as UPLOAD."""
         assert classify_error(PaperlessError("http 500")) is ErrorCategory.UPLOAD
 
     def test_unrelated_exception_is_unknown(self) -> None:
-        """An exception outside the saneless hierarchy is UNKNOWN (CTR-05)."""
+        """An exception outside the saneless hierarchy is UNKNOWN."""
         assert classify_error(ValueError("who knows")) is ErrorCategory.UNKNOWN
 
     def test_paperless_timeout_error_subclasses_paperless_error(self) -> None:
-        """PaperlessTimeoutError narrows PaperlessError rather than SanelessError (OUTC-08)."""
+        """PaperlessTimeoutError narrows PaperlessError rather than SanelessError."""
         assert issubclass(PaperlessTimeoutError, PaperlessError)
 
     def test_paperless_timeout_error_is_unconfirmed_filing(self) -> None:
@@ -2525,7 +2521,7 @@ class TestClassifyError:
         assert issubclass(exc_type, PaperlessError)
 
     def test_plain_paperless_error_is_still_upload(self) -> None:
-        """The narrower arms leave the base class where it was."""
+        """A plain PaperlessError is UPLOAD; the narrower arms do not catch it."""
         assert classify_error(PaperlessError("x")) is ErrorCategory.UPLOAD
 
     def test_disk_space_error_is_disk_space(self) -> None:
@@ -2537,17 +2533,17 @@ class TestClassifyError:
         assert classify_error(NoScannerFoundError("x")) is ErrorCategory.SCANNER
 
     def test_feeder_empty_wins_over_its_scan_error_base(self) -> None:
-        """FeederEmptyError is checked before its ScanError base class (CTR-05)."""
+        """FeederEmptyError is checked before its ScanError base class."""
         assert issubclass(FeederEmptyError, ScanError)
         assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
 
     def test_classify_error_pdf_error_is_assembly(self) -> None:
-        """PdfError classifies as ASSEMBLY, never as SCANNER (EXC-01, D-04)."""
+        """PdfError classifies as ASSEMBLY, never as SCANNER."""
         assert classify_error(PdfError("disk full")) is ErrorCategory.ASSEMBLY
 
     def test_classify_error_scan_cancelled_error_is_unknown(self) -> None:
         """
-        ScanCancelledError has no category of its own (D-01).
+        ScanCancelledError has no category of its own.
 
         A cancel is not a failure category: callers test for it before they
         classify, so reaching ``classify_error`` with one is already a bug and
@@ -2556,12 +2552,12 @@ class TestClassifyError:
         assert classify_error(ScanCancelledError("stopped")) is ErrorCategory.UNKNOWN
 
     def test_all_pages_blank_error_is_all_blank(self) -> None:
-        """AllPagesBlankError classifies as ALL_BLANK, never SCANNER (D-10)."""
+        """AllPagesBlankError classifies as ALL_BLANK, never SCANNER."""
         assert classify_error(AllPagesBlankError("x")) is ErrorCategory.ALL_BLANK
 
     def test_classify_error_storage_error_is_unknown(self) -> None:
         """
-        StorageError stays UNKNOWN; its exit code 2 is assigned by type (D-07).
+        StorageError stays UNKNOWN; its exit code 2 is assigned by type.
 
         ``ErrorCategory`` is persisted on job records, and a job database that
         cannot be opened is not any job's configuration failure.  The CLI guard
@@ -2592,13 +2588,11 @@ class TestExitCode:
 
     def test_exit_code_members_and_values(self) -> None:
         """
-        ExitCode is the one definition of the CLI exit codes (EXC-02, D-07).
+        ExitCode is the one definition of the CLI exit codes.
 
-        Rewritten when the all-blank failure (8) and the two signal
-        interruptions (129 for SIGHUP, 143 for SIGTERM) joined the enum, and
-        again for the upload that may already be in paperless-ngx (9) and the
-        full disk (10), and once more for the broken pipe (141, 128 + SIGPIPE),
-        so the pinned set lists all fifteen members.
+        The pinned set lists all fifteen members: saneless's own codes 0 to
+        10, then the shell-convention codes for SIGHUP (129), Ctrl-C (130),
+        a broken pipe (141) and SIGTERM (143).
         """
         assert {(member.name, int(member)) for member in ExitCode} == {
             ("SUCCESS", 0),
@@ -2622,10 +2616,8 @@ class TestExitCode:
         """
         The enum lists its codes in value order, as every table pinned to it does.
 
-        This replaces a test that pinned 130 as the last member.  That held
-        while 130 was the only shell-convention code; SIGTERM's 143 (128 + 15)
-        now follows it, so the lasting rule is value order: saneless's own
-        small codes first, then 129, 130, 141 and 143.
+        saneless's own small codes come first, then the shell-convention codes
+        129, 130, 141 and 143, each 128 plus a signal number.
         """
         values = [int(member) for member in ExitCode]
         assert values == sorted(values)
@@ -2639,12 +2631,12 @@ class TestExitCodeForSignal:
     """exit_code_for_signal maps an interrupting signal to 128 + its number."""
 
     def test_sighup_is_hangup(self) -> None:
-        """A dropped SSH session's SIGHUP exits 129 (D-13)."""
+        """A dropped SSH session's SIGHUP exits 129."""
         assert exit_code_for_signal(signal.SIGHUP) is ExitCode.HANGUP
         assert int(ExitCode.HANGUP) == 128 + signal.SIGHUP
 
     def test_sigterm_is_terminated(self) -> None:
-        """A SIGTERM exits 143 (D-13)."""
+        """A SIGTERM exits 143."""
         assert exit_code_for_signal(signal.SIGTERM) is ExitCode.TERMINATED
         assert int(ExitCode.TERMINATED) == 128 + signal.SIGTERM
 
@@ -2659,7 +2651,7 @@ class TestExitCodeForSignal:
         assert exit_code_for_signal(signum) is ExitCode.UNEXPECTED
 
     def test_exit_code_table_covers_every_category(self) -> None:
-        """The pinned mapping table names every ErrorCategory member (D-07)."""
+        """The pinned mapping table names every ErrorCategory member."""
         assert {category for category, _ in _EXIT_CODES_FOR_CATEGORIES} == set(
             ErrorCategory
         )
@@ -2668,16 +2660,16 @@ class TestExitCodeForSignal:
     def test_exit_code_for_mapping(
         self, category: ErrorCategory, expected: ExitCode
     ) -> None:
-        """exit_code_for returns the documented exit code per category (D-07)."""
+        """exit_code_for returns the documented exit code per category."""
         assert exit_code_for(category) is expected
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
     def test_exit_code_for_is_total(self, category: ErrorCategory) -> None:
-        """Every ErrorCategory maps to an ExitCode (D-07)."""
+        """Every ErrorCategory maps to an ExitCode."""
         assert isinstance(exit_code_for(category), ExitCode)
 
     def test_exit_code_for_raises_on_unrecognised_value(self) -> None:
-        """exit_code_for raises on a value outside ErrorCategory (D-07)."""
+        """exit_code_for raises on a value outside ErrorCategory."""
         bad = cast("ErrorCategory", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             exit_code_for(bad)
@@ -2956,29 +2948,29 @@ class TestOutcomeLine:
 
 
 class TestJobModuleReExports:
-    """saneless.job re-export tests."""
+    """saneless.job re-exports the vocabulary's enums, not copies of them."""
 
     def test_job_module_re_exports_the_same_job_state(self) -> None:
-        """saneless.job.JobState is the vocabulary object, not a copy (CTR-01)."""
+        """saneless.job.JobState is the vocabulary object, not a copy."""
         assert saneless.job.JobState is JobState
 
     def test_job_module_re_exports_the_same_error_category(self) -> None:
-        """saneless.job.ErrorCategory is the vocabulary object, not a copy (CTR-05)."""
+        """saneless.job.ErrorCategory is the vocabulary object, not a copy."""
         assert saneless.job.ErrorCategory is ErrorCategory
 
     def test_existing_from_import_still_resolves(self) -> None:
-        """The long-standing `from saneless.job import ...` spelling still works (CTR-01)."""
+        """`from saneless.job import ...` resolves to the vocabulary enums."""
         assert JobErrorCategory is ErrorCategory
         assert JobJobState is JobState
 
     def test_job_module_declares_no_enum_of_its_own(self) -> None:
-        """job.py owns no enum definition any more (CTR-01)."""
+        """job.py defines no enum of its own; both live in the vocabulary."""
         assert JobState.__module__ == "saneless.vocabulary"
         assert ErrorCategory.__module__ == "saneless.vocabulary"
 
 
 class TestJobActivityProperties:
-    """Job.is_active / Job.is_busy tests."""
+    """Job.is_active and Job.is_busy follow the state classifications."""
 
     @pytest.mark.parametrize(
         ("state", "expected"),
@@ -2999,24 +2991,24 @@ class TestJobActivityProperties:
         state: JobState,
         expected: tuple[bool, bool],
     ) -> None:
-        """A Job answers is_active/is_busy for every lifecycle state (CTR-01)."""
+        """A Job answers is_active/is_busy for every lifecycle state."""
         job = Job(id="j", profile="default", title="t", state=state)
         assert (job.is_active, job.is_busy) == expected
 
     def test_awaiting_flip_is_active_but_not_busy(self) -> None:
-        """A flip prompt leaves the job in flight while the machine idles (CTR-01)."""
+        """A flip prompt leaves the job in flight while the machine idles."""
         job = Job(id="j", profile="default", title="t", state=JobState.AWAITING_FLIP)
         assert job.is_active
         assert not job.is_busy
 
     def test_done_is_neither_active_nor_busy(self) -> None:
-        """A finished job is neither in flight nor working (CTR-01)."""
+        """A finished job is neither in flight nor working."""
         job = Job(id="j", profile="default", title="t", state=JobState.DONE)
         assert not job.is_active
         assert not job.is_busy
 
     def test_properties_are_not_dataclass_fields(self) -> None:
-        """is_active/is_busy are properties, so they stay out of __init__ (CTR-01)."""
+        """is_active/is_busy are properties, so they stay out of __init__."""
         field_names = {f.name for f in fields(Job)}
         assert "is_active" not in field_names
         assert "is_busy" not in field_names

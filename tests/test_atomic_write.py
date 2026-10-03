@@ -1,5 +1,5 @@
 """
-Tests for the durable config-file replace (CFG-08, D-05..D-07).
+The durable config-file replace keeps its contract.
 
 ``replace_file_atomically`` is the only way saneless rewrites a config file.
 Its contract, which every test below pins down:
@@ -7,20 +7,20 @@ Its contract, which every test below pins down:
 * The new bytes go to a ``tempfile.mkstemp`` file in the real target's own
   directory, are fsynced, and take the target's name in one ``rename(2)``
   (``Path.replace``). A crash therefore leaves the old file or the new file,
-  never a truncated one (D-05).
+  never a truncated one.
 * The text is written as UTF-8 bytes with no newline translation, so a CRLF
-  file stays CRLF and a non-ASCII comment survives whatever the locale (D-05).
-* The temp file is removed on every failure path (D-05).
+  file stays CRLF and a non-ASCII comment survives whatever the locale.
+* The temp file is removed on every failure path.
 * A symlinked config path is written through: the real file is replaced and
-  the link keeps pointing at it (D-07).
+  the link keeps pointing at it.
 * A target the process may not write is refused before any temp file exists,
-  because a rename needs only a writable directory (Pitfall 6).
+  because a rename needs only a writable directory.
 * An existing file's mode and owner survive the rewrite; ownership is copied
-  only when the process is permitted to (D-06).
+  only when the process is permitted to.
 * A rename refused with EBUSY -- a config bind-mounted as a single file -- is
   a ``ConfigError`` that tells the operator to mount the directory, and there
-  is no non-atomic fallback (D-08). A config inside a mounted *directory*, the
-  documented ``./config:/etc/saneless`` layout, is replaced normally (CFG-09).
+  is no non-atomic fallback. A config inside a mounted *directory*, the
+  documented ``./config:/etc/saneless`` layout, is replaced normally.
 * Every extended attribute -- a POSIX ACL included -- is copied onto the temp
   file before its owner and mode, so an ACL survives exactly and the owning
   group is never handed the ACL mask. An attribute that cannot be copied
@@ -222,7 +222,7 @@ def _is_directory_fd(fd: int) -> bool:
 
 
 class TestAtomicReplace:
-    """A successful rewrite is byte-exact, durable, and tidy (D-05)."""
+    """A successful rewrite is byte-exact, durable, and tidy."""
 
     def test_atomic_replace_writes_crlf_and_utf8_bytes_exactly(
         self, tmp_path: Path
@@ -312,7 +312,7 @@ class TestAtomicReplace:
 
 
 class TestAtomicFailureCleanup:
-    """Every failure leaves the original file intact and no temp file (D-05)."""
+    """Every failure leaves the original file intact and no temp file."""
 
     def test_atomic_fsync_failure_keeps_original_and_removes_temp(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -385,7 +385,7 @@ class TestAtomicFailureCleanup:
 
 
 class TestSymlinkAndReadonly:
-    """Symlinks are written through (D-07); read-only targets are refused."""
+    """Symlinks are written through; read-only targets are refused."""
 
     def test_symlink_is_written_through_to_the_real_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -592,7 +592,7 @@ class TestSymlinkAndReadonly:
 
 class TestReadOnlyMount:
     """
-    A read-only mount is reported with the mount fix, not as EACCES (WR-01).
+    A read-only mount is reported with the mount fix, not as EACCES.
 
     ``statvfs`` is faked here so the tests run anywhere; ``TestRealBindMount``
     checks the kernel's own answer where user namespaces are available.
@@ -615,10 +615,15 @@ class TestReadOnlyMount:
 
         monkeypatch.setattr(os, "statvfs", statvfs)
 
-    def test_read_only_single_file_mount_is_the_d08_config_error(
+    def test_read_only_single_file_mount_tells_the_operator_to_mount_the_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A read-only file in a writable directory is its own mount: D-08."""
+        """
+        A read-only file in a writable directory is its own single-file mount.
+
+        The error names the file and tells the operator to mount its directory,
+        before any temp file is created.
+        """
         target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
         self._fake_read_only(monkeypatch, {target.resolve()})
@@ -719,8 +724,8 @@ class TestModeAndOwner:
         Ownership is copied first, then the mode.
 
         A host-owned config must not become root-owned after a container
-        rewrite (D-06), and chown(2) may clear set-id bits, so the mode has
-        to be applied after it (Pitfall 5).
+        rewrite, and chown(2) may clear set-id bits, so the mode has to be
+        applied after it.
         """
         target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
@@ -739,7 +744,7 @@ class TestModeAndOwner:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A process not allowed to chown still rewrites the file (D-06).
+        A process not allowed to chown still rewrites the file.
 
         On bare metal the non-root writer already owns the file, so the
         refused chown loses nothing and must not fail the write.
@@ -767,7 +772,7 @@ class TestModeAndOwner:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
     ) -> None:
         """
-        A chown the filesystem cannot perform does not fail the write (WR-02).
+        A chown the filesystem cannot perform does not fail the write.
 
         In a rootless container a host uid that is not mapped shows up as the
         overflow uid, and chown to it is EINVAL; FUSE, CIFS and vfat mounts
@@ -793,11 +798,11 @@ class TestModeAndOwner:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        When the owner cannot be set, the group is still copied (WR-02).
+        When the owner cannot be set, the group is still copied.
 
         A ``root:saneless`` 0664 config rewritten by the ``saneless`` user
         cannot keep root as owner, but the writer may set the group it is a
-        member of, and before this the group was lost too.
+        member of, so the group survives.
         """
         calls: list[tuple[int, int]] = []
         real_fchown = os.fchown
@@ -893,7 +898,7 @@ class TestModeAndOwner:
     def test_atomic_fchmod_unsupported_does_not_fail_the_write(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A filesystem without Unix modes still gets the new contents (WR-02)."""
+        """A filesystem without Unix modes still gets the new contents."""
 
         def unsupported_fchmod(fd: int, mode: int) -> None:
             """Refuse the mode change the way such a filesystem does."""
@@ -1291,8 +1296,8 @@ class TestExtendedAttributes:
         Every attribute is copied, then the owner, then the mode.
 
         Setting ``user.*`` needs write permission on the file, which the
-        writer may no longer have once the original's owner and mode are on
-        it; and ``fchmod`` after the ACL keeps the group bits on the mask.
+        writer may lack once the original's owner and mode are on it; and
+        ``fchmod`` after the ACL keeps the group bits on the mask.
         """
         recorder = _XattrRecorder(
             {
@@ -1722,7 +1727,7 @@ class TestNewDirectoryOwner:
 
 
 class TestBindMount:
-    """A single-file bind mount fails clearly (D-08); a directory mount works."""
+    """A single-file bind mount fails clearly; a directory mount works."""
 
     def test_ebusy_single_file_bind_mount_is_a_config_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1762,7 +1767,7 @@ class TestBindMount:
         The documented ``./config:/etc/saneless`` layout is rewritten normally.
 
         The temp file is created inside the mounted directory, beside
-        ``saneless.toml``, and nothing else is left there afterwards (CFG-09).
+        ``saneless.toml``, and nothing else is left there afterwards.
         """
         config_dir = tmp_path / "config"
         config_dir.mkdir()
@@ -1780,7 +1785,7 @@ class TestBindMount:
 # namespace, where a bind mount needs no root. Every argv element is a literal;
 # the per-test paths travel in the environment. It is skipped wherever user
 # namespaces are unavailable (for example a restricted CI runner); the
-# monkeypatched EBUSY test above is the requirement's evidence either way.
+# monkeypatched EBUSY test above covers the behaviour either way.
 _UNSHARE = Path("/usr/bin/unshare")
 _NAMESPACE_SCRIPT = """\
 import sys
@@ -1855,7 +1860,7 @@ def mount_namespace() -> None:
 
 @pytest.mark.usefixtures("mount_namespace")
 class TestRealBindMount:
-    """The kernel's own answer for both mount shapes (D-08, CFG-09)."""
+    """The kernel's own answer for single-file and directory bind mounts."""
 
     def test_real_single_file_bind_mount_raises_config_error(
         self, tmp_path: Path
@@ -1879,11 +1884,11 @@ class TestRealBindMount:
         self, tmp_path: Path
     ) -> None:
         """
-        A legacy ``:ro`` single-file mount gets D-08's fix, not EACCES (WR-01).
+        A ``:ro`` single-file mount is told to mount the directory, not EACCES.
 
         ``os.access`` answers False on a read-only filesystem even for root, so
-        without a mount check the operator was told "Permission denied" and
-        went looking at file permissions.
+        without a mount check the operator would read "Permission denied" and
+        go looking at file permissions.
         """
         host_file = tmp_path / "host-saneless.toml"
         host_file.write_text(_ORIGINAL, encoding="utf-8")
