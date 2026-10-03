@@ -36,7 +36,7 @@ from saneless.web import refresher as refresher_module
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import WATCH_WINDOW_SECONDS, CheckRefresher, ManualProbe
 from saneless.worker import STOP_JOIN_SECONDS
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, poll_until
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1401,7 +1401,6 @@ def test_stop_aborts_an_in_flight_listing(
     default_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    poll_until: Callable[..., bool],
     started_refreshers: list[CheckRefresher],
 ) -> None:
     """
@@ -1479,7 +1478,6 @@ class TestRequestProbe:
         self,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        poll_until: Callable[..., bool],
         started_refreshers: list[CheckRefresher],
     ) -> None:
         """The caller gets its answer at the wait, and the probe carries on."""
@@ -1527,7 +1525,6 @@ class TestRequestProbe:
         self,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        poll_until: Callable[..., bool],
     ) -> None:
         """A due tick that wins the race serves the waiting request too."""
         spy = _spy(monkeypatch)
@@ -1547,7 +1544,6 @@ class TestRequestProbe:
         self,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        poll_until: Callable[..., bool],
         started_refreshers: list[CheckRefresher],
     ) -> None:
         """Both requests are waiting before the thread runs, so one probe serves both."""
@@ -1571,7 +1567,6 @@ class TestRequestProbe:
     def test_request_stop_wakes_a_waiting_request(
         self,
         default_settings: Settings,
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         A stop answers a waiting request at once, as still pending.

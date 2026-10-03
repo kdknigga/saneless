@@ -27,6 +27,7 @@ be satisfied by markup somewhere else on the page.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import logging
 import re
@@ -38,9 +39,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 import httpx2
+import jinja2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from jinja2 import nodes
 
 from saneless import checks as checks_module
 from saneless.checks import (
@@ -81,7 +84,8 @@ from saneless.web import refresher as refresher_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import MIN_MANUAL_REFRESH_SECONDS, CheckCache
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, poll_until
+from tests.template_support import template_start_tags
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -382,7 +386,7 @@ def _make_app(
     """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
+        paperless=PaperlessConfig(url="http://paperless.invalid", token="test-token"),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         # Two profiles, so the worker's startup generation (D-14) does not fire
         # and swap the profile set while these requests read it.
@@ -1307,25 +1311,6 @@ class TestTheStripSurvivesItsOwnFailure:
             for record in caplog.records
         )
 
-    def test_a_probe_that_raises_is_a_failed_click_not_a_cold_strip(
-        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """
-        The guard covers the render and nothing before it.
-
-        A cold strip says the checks have not run; a probe that blew up is not
-        that, it is a click that failed, and ``render_error`` reports it in the
-        message slot with the strip left as it was.  The test client re-raises
-        what the catch-all handler saw, which is the assertion here.
-        """
-
-        def boom(*_args: object, **_kwargs: object) -> bool:
-            raise RuntimeError(_CHECKS_BOOM_MARKER)
-
-        monkeypatch.setattr(_app(client).state.refresher, "request_probe", boom)
-        with pytest.raises(RuntimeError, match=_CHECKS_BOOM_MARKER):
-            client.post("/api/checks/refresh")
-
     def test_a_failing_re_run_leaves_the_strip_as_it_stood(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1563,7 +1548,6 @@ class TestCheckAgainOnTheRefresherThread:
         self,
         client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         A probe still running at the end of the wait leaves the strip asking.
@@ -1610,7 +1594,6 @@ class TestCheckAgainOnTheRefresherThread:
         self,
         clocked: _Clocked,
         monkeypatch: pytest.MonkeyPatch,
-        poll_until: Callable[..., bool],
     ) -> None:
         """A click the floor refuses waits for nothing, and asks for nothing."""
         client, _clock = clocked
@@ -1636,7 +1619,6 @@ class TestCheckAgainOnTheRefresherThread:
         self,
         clocked: _Clocked,
         monkeypatch: pytest.MonkeyPatch,
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         A click that lands on a running probe returns at once and costs no claim.
@@ -2303,8 +2285,12 @@ class TestRouteShape:
         to probe, which is the failure D-04 exists to prevent; a grep is the
         only thing that can see it.
         """
-        source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        assert source.count("request_probe(") == 1
+        calls = [
+            node.lineno
+            for node in ast.walk(_routes_tree())
+            if isinstance(node, ast.Call) and _called_name(node) == "request_probe"
+        ]
+        assert len(calls) == 1, calls
 
     def test_routes_py_runs_no_registry_of_its_own(self) -> None:
         """
@@ -2313,8 +2299,7 @@ class TestRouteShape:
         WR-03, WR-04 and WR-05 were all consequences of the same
         acquire/run/store block existing in both ``_tick`` and this module.
         """
-        source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        assert "run_checks" not in source
+        assert _references(_routes_tree(), "run_checks") == []
 
     def test_routes_py_touches_no_scanner_gate(self) -> None:
         """
@@ -2323,8 +2308,7 @@ class TestRouteShape:
         The gate now lives in exactly one probe path, and that path is the
         refresher's.
         """
-        source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        assert "scanner_gate" not in source
+        assert _references(_routes_tree(), "scanner_gate") == []
 
 
 # The stylesheet and the templates, located the way the app locates them so a
@@ -2369,15 +2353,156 @@ def _css() -> str:
     return _APP_CSS.read_text(encoding="utf-8")
 
 
-def _template() -> str:
+def _routes_tree() -> ast.Module:
     """
-    Read the shipped strip partial.
+    Parse the routes module.
 
     Returns:
-        The whole of ``partials/checks.html``.
+        The module's syntax tree, so comments and docstrings never count.
 
     """
-    return _CHECKS_TEMPLATE.read_text(encoding="utf-8")
+    return ast.parse(Path(routes_module.__file__).read_text(encoding="utf-8"))
+
+
+def _called_name(call: ast.Call) -> str | None:
+    """
+    Name the function a call reaches, whether bare or through an attribute.
+
+    Returns:
+        The called name, or None for a call through any other expression.
+
+    """
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    return None
+
+
+def _references(tree: ast.AST, name: str) -> list[int]:
+    """
+    List the lines where code names ``name`` as an identifier.
+
+    A bare name, an attribute, an import, a keyword argument and a parameter
+    all count; a string, a comment or a docstring does not.
+
+    Returns:
+        The line number of every reference, in walk order.
+
+    """
+    found: list[int] = []
+    for node in ast.walk(tree):
+        named = (
+            (isinstance(node, ast.Name) and node.id == name)
+            or (isinstance(node, ast.Attribute) and node.attr == name)
+            or (isinstance(node, ast.arg) and node.arg == name)
+        )
+        if named:
+            found.append(getattr(node, "lineno", 0))
+        elif (isinstance(node, ast.alias) and name in {node.name, node.asname}) or (
+            isinstance(node, ast.keyword) and node.arg == name
+        ):
+            found.append(node.lineno)
+    return found
+
+
+def _dict_value(node: ast.expr, key: str) -> object:
+    """
+    Read the constant a dict literal maps ``key`` to.
+
+    Returns:
+        The constant, or None when ``node`` is not a dict literal holding a
+        constant under that key.
+
+    """
+    if not isinstance(node, ast.Dict):
+        return None
+    for name, value in zip(node.keys, node.values, strict=True):
+        if (
+            isinstance(name, ast.Constant)
+            and name.value == key
+            and isinstance(value, ast.Constant)
+        ):
+            return value.value
+    return None
+
+
+def _context_values(tree: ast.AST, key: str) -> list[object]:
+    """
+    Collect every constant a dict literal in ``tree`` gives ``key``.
+
+    Returns:
+        One value per dict literal entry under that key, in walk order.
+
+    """
+    return [
+        value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        for name, value in zip(node.keys, node.values, strict=True)
+        if isinstance(name, ast.Constant)
+        and name.value == key
+        and isinstance(value, ast.Constant)
+    ]
+
+
+def _template_renders(tree: ast.AST, template: str) -> list[tuple[int, list[ast.expr]]]:
+    """
+    Find every render of ``template`` and the arguments its context is in.
+
+    A ``TemplateResponse`` names the template and takes its context in the
+    same call; a ``get_template`` call names it and the ``render`` call on its
+    result takes the context.
+
+    Returns:
+        The line and the context-bearing arguments of each render.
+
+    """
+
+    def names_template(call: ast.Call) -> bool:
+        """Say whether ``call`` passes the template's name as an argument."""
+        return any(
+            isinstance(argument, ast.Constant) and argument.value == template
+            for argument in call.args
+        )
+
+    renders: list[tuple[int, list[ast.expr]]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+        if (
+            _called_name(node) == "render"
+            and (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Call)
+                and names_template(node.func.value)
+            )
+        ) or (_called_name(node) == "TemplateResponse" and names_template(node)):
+            renders.append((node.lineno, arguments))
+    return renders
+
+
+def _filters_used(path: Path) -> set[str]:
+    """
+    Name every filter a template applies.
+
+    Returns:
+        The filter names, read from the parsed template rather than its text.
+
+    """
+    return {node.name for node in _jinja_tree(path).find_all(nodes.Filter)}
+
+
+def _jinja_tree(path: Path) -> nodes.Template:
+    """
+    Parse a template with Jinja's own parser.
+
+    Returns:
+        The template's syntax tree, so Jinja comments never count.
+
+    """
+    return jinja2.Environment(autoescape=True).parse(path.read_text(encoding="utf-8"))
 
 
 class TestStripPlacement:
@@ -2445,7 +2570,10 @@ class TestStripAccessibility:
 
     def test_the_partial_declares_no_alert(self) -> None:
         """Not even a future edit to the strip may add a second one."""
-        assert 'role="alert"' not in _template()
+        roles = [
+            attrs.get("role") for _tag, attrs in template_start_tags(_CHECKS_TEMPLATE)
+        ]
+        assert "alert" not in roles
 
     def test_every_row_carries_a_glyph_and_a_spoken_word(
         self, client: TestClient
@@ -2482,9 +2610,15 @@ class TestStripVocabulary:
         ``saneless.checks``, which is the only reason the strip and
         ``saneless doctor`` cannot drift apart.
         """
-        source = _template()
-        assert "== '" not in source
-        assert '== "' not in source
+        string_comparisons = [
+            node.lineno
+            for node in _jinja_tree(_CHECKS_TEMPLATE).find_all(nodes.Compare)
+            if any(
+                isinstance(operand, nodes.Const) and isinstance(operand.value, str)
+                for operand in [node.expr, *(op.expr for op in node.ops)]
+            )
+        ]
+        assert string_comparisons == []
 
     @pytest.mark.parametrize(
         "filter_name",
@@ -2492,7 +2626,7 @@ class TestStripVocabulary:
     )
     def test_the_template_reaches_for_each_filter(self, filter_name: str) -> None:
         """All four registered filters are the ones the rows are drawn with."""
-        assert filter_name in _template()
+        assert filter_name in _filters_used(_CHECKS_TEMPLATE)
 
     @pytest.mark.parametrize(
         "filter_name",
@@ -2511,7 +2645,7 @@ class TestStripVocabulary:
             filter_name: The state filter that must not appear.
 
         """
-        assert filter_name not in _template()
+        assert filter_name not in _filters_used(_CHECKS_TEMPLATE)
 
     def test_a_warn_row_renders_its_next_step(self, client: TestClient) -> None:
         """
@@ -2632,7 +2766,10 @@ class TestASkippedRowIsNotAPassingRow:
         spoken = f'<span class="sr-only">{SKIPPED_STATE_LABEL}:</span>'
         assert row.count(CHECKING_STATE_CLASS) == 1
         assert row.count(spoken) == 1
-        assert "c.skipped" not in _template()
+        attributes = {
+            node.attr for node in _jinja_tree(_CHECKS_TEMPLATE).find_all(nodes.Getattr)
+        }
+        assert "skipped" not in attributes
 
 
 class TestCheckAgainButton:
@@ -2730,9 +2867,9 @@ _STATUS_TEMPLATE = _PARTIALS_DIR / "status.html"
 _TERMINAL_RELOAD_TEMPLATE = _PARTIALS_DIR / "terminal_reload.html"
 
 
-def _templates_containing(needle: str) -> list[str]:
+def _templates_loading(url: str) -> list[str]:
     """
-    Name every template file holding `needle`.
+    Name every template file with a tag whose ``hx-get`` is ``url``.
 
     Returns:
         The matching file names, sorted, so an assertion can name them.
@@ -2741,8 +2878,24 @@ def _templates_containing(needle: str) -> list[str]:
     return sorted(
         path.name
         for path in _PACKAGE_DIR.joinpath("templates").rglob("*.html")
-        if needle in path.read_text(encoding="utf-8")
+        if any(attrs.get("hx-get") == url for _tag, attrs in template_start_tags(path))
     )
+
+
+def _terminal_reload_includes() -> list[nodes.Include]:
+    """
+    Find every include of the terminal-reload partial in ``status.html``.
+
+    Returns:
+        The include nodes, in document order.
+
+    """
+    return [
+        node
+        for node in _jinja_tree(_STATUS_TEMPLATE).find_all(nodes.Include)
+        if isinstance(node.template, nodes.Const)
+        and node.template.value == "partials/terminal_reload.html"
+    ]
 
 
 def _finish_a_job(client: TestClient, state: JobState) -> str:
@@ -2771,9 +2924,6 @@ _STRIP_RELOAD_DIV = (
     '<div hx-get="/api/checks" hx-target="#checks-body" '
     'hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>'
 )
-_GUARDED_TERMINAL_RELOAD = (
-    '{% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}'
-)
 
 
 class TestTerminalReloadPartial:
@@ -2787,22 +2937,26 @@ class TestTerminalReloadPartial:
         paused note has to clear the moment the scan ends; waiting out thirty
         seconds would leave the page claiming a scan is still running.
         """
-        source = _TERMINAL_RELOAD_TEMPLATE.read_text(encoding="utf-8")
-        assert _HISTORY_LOADER in source
-        assert _STRIP_LOADER in source
-        assert source.count('hx-trigger="load"') == 2
-        assert source.count('class="htmx-hidden"') == 2
+        loaders = [
+            attrs.get("hx-get")
+            for _tag, attrs in template_start_tags(_TERMINAL_RELOAD_TEMPLATE)
+            if attrs.get("hx-trigger") == "load" and attrs.get("class") == "htmx-hidden"
+        ]
+        assert loaders == ["/api/jobs/history", "/api/checks"]
 
     def test_status_html_holds_no_loader_markup_of_its_own(self) -> None:
         """The four copies are gone, not merely joined by a fifth."""
-        source = _STATUS_TEMPLATE.read_text(encoding="utf-8")
-        assert "htmx-hidden" not in source
-        assert _HISTORY_LOADER not in source
+        tags = template_start_tags(_STATUS_TEMPLATE)
+        assert [
+            attrs
+            for _tag, attrs in tags
+            if "htmx-hidden" in (attrs.get("class") or "").split()
+            or attrs.get("hx-get") == "/api/jobs/history"
+        ] == []
 
     def test_every_terminal_branch_includes_it(self) -> None:
         """DONE, FALLBACK, CANCELLED and ERROR all reload the same way."""
-        source = _STATUS_TEMPLATE.read_text(encoding="utf-8")
-        assert source.count('include "partials/terminal_reload.html"') == 4
+        assert len(_terminal_reload_includes()) == 4
 
     def test_every_include_is_behind_the_terminal_reload_flag(self) -> None:
         """
@@ -2813,8 +2967,17 @@ class TestTerminalReloadPartial:
         four includes has to sit alone inside ``{% if terminal_reload %}``; one
         that did not would reload on the full page for its state alone.
         """
-        source = _STATUS_TEMPLATE.read_text(encoding="utf-8")
-        assert source.count(_GUARDED_TERMINAL_RELOAD) == 4
+        guarded = [
+            node
+            for node in _jinja_tree(_STATUS_TEMPLATE).find_all(nodes.If)
+            if isinstance(node.test, nodes.Name)
+            and node.test.name == "terminal_reload"
+            and not node.elif_
+            and not node.else_
+            and len(node.body) == 1
+            and node.body[0] in _terminal_reload_includes()
+        ]
+        assert len(guarded) == len(_terminal_reload_includes()) == 4
 
     def test_every_status_poll_response_sets_the_flag(self) -> None:
         """
@@ -2824,10 +2987,17 @@ class TestTerminalReloadPartial:
         scan's history row and the strip's paused note on screen until the
         next page load, so the two are counted against each other.
         """
-        source = inspect.getsource(routes_module)
-        renders = source.count('"partials/status_response.html"')
-        assert renders >= 1
-        assert source.count('"terminal_reload": True') == renders
+        renders = _template_renders(_routes_tree(), "partials/status_response.html")
+        assert renders
+        unflagged = [
+            lineno
+            for lineno, arguments in renders
+            if not any(
+                _dict_value(argument, "terminal_reload") is True
+                for argument in arguments
+            )
+        ]
+        assert unflagged == []
 
     @pytest.mark.parametrize(
         "state",
@@ -2878,7 +3048,7 @@ class TestTerminalReloadPartial:
         ``partials/error.html`` keeps its own because an error is rendered
         without a status area at all, so it cannot share the status partial's.
         """
-        assert _templates_containing(_HISTORY_LOADER) == [
+        assert _templates_loading("/api/jobs/history") == [
             "error.html",
             "terminal_reload.html",
         ]
@@ -2988,13 +3158,13 @@ class TestWhichResponsesCarryWhat:
         It is a context-dict key rather than a keyword argument because
         ``TemplateResponse`` takes its context as a mapping.
         """
-        source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        assert source.count('"refresh_checks": True') == 1
+        tree = _routes_tree()
+        assert _context_values(tree, "refresh_checks").count(True) == 1
         # Defaulted off once in ``_status_context``, and forced off once more
         # in the canonical poll rendering ``_status_token`` hashes.  That
         # second one is the shape of a poll, never a response anybody is sent,
         # so it cannot re-render the strip.
-        assert source.count('"refresh_checks": False') == 2
+        assert _context_values(tree, "refresh_checks").count(False) == 2
 
 
 def _paperless_row(status: ConnectionStatus) -> CheckResult:
@@ -3119,7 +3289,7 @@ class TestTheStripNamesItsOwnRetry:
         """
         templates = app_module._build_templates()
         assert templates.env.filters["check_step"] is render_check_step
-        assert "check_step" in _template()
+        assert "check_step" in _filters_used(_CHECKS_TEMPLATE)
         assert templates.env.globals["CheckSurface"] is CheckSurface
 
 

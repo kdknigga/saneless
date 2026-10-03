@@ -187,8 +187,8 @@ def test_concurrent_stores_leave_a_consistent_entry() -> None:
         cache.store(value)
 
     threads = [
-        threading.Thread(target=store, args=(first,)),
-        threading.Thread(target=store, args=(second,)),
+        threading.Thread(target=store, args=(first,), daemon=True),
+        threading.Thread(target=store, args=(second,), daemon=True),
     ]
     for thread in threads:
         thread.start()
@@ -362,7 +362,7 @@ class TestClaimManualRefresh:
             with granted_lock:
                 granted.append(outcome)
 
-        threads = [threading.Thread(target=claim) for _ in range(2)]
+        threads = [threading.Thread(target=claim, daemon=True) for _ in range(2)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -501,7 +501,7 @@ class TestReleaseManualClaim:
             barrier.wait()
             refused.append(cache.claim_manual_refresh())
 
-        thread = threading.Thread(target=compete)
+        thread = threading.Thread(target=compete, daemon=True)
         thread.start()
         barrier.wait()
         thread.join(timeout=_BARRIER_TIMEOUT_SECONDS)
@@ -539,7 +539,7 @@ class TestReleaseManualClaim:
             regranted.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
             releases.append(cache.release_manual_claim(stamp))
 
-        thread = threading.Thread(target=claim_release_and_release_again)
+        thread = threading.Thread(target=claim_release_and_release_again, daemon=True)
         thread.start()
         assert released.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
         clock.advance(0.1)
