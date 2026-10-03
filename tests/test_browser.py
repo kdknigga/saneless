@@ -134,6 +134,7 @@ from saneless.web.app import TEMPLATE_DIR, create_app
 from saneless.worker import WorkerFlipCoordinator, WorkerPassCoordinator
 from tests.conftest import (
     StubScannerBackend,
+    browser_quiet_window,
     poll_until,
     refusing_paperless_client,
     scan_batch,
@@ -2041,7 +2042,7 @@ class TestCancelledStatusRendering:
             cancelled_page.locator("#status-area").get_attribute("hx-trigger") is None
         )
 
-        cancelled_page.wait_for_timeout(_POLL_OBSERVATION_MS)
+        browser_quiet_window(cancelled_page, _POLL_OBSERVATION_MS)
         assert polls == [], polls
 
     def test_scan_button_re_enables_after_a_cancelled_swap(
@@ -2303,6 +2304,9 @@ _SUBMIT_UNKNOWN_PROFILE = """
 # shape of its URL rather than by one literal path.  The URL carries the token
 # of what the page shows as a query string, so the path may end there too.
 _POLL_URL = re.compile(r"/api/jobs/[^/?]+/status(\?|$)")
+# How long one status poll may take to arrive: the poll fires every second, so
+# this is generous headroom for a loaded CI runner.
+_ONE_POLL_BUDGET_MS = 5_000
 
 
 def _fill_queue_until_rejected(url: str) -> None:
@@ -2518,9 +2522,16 @@ class TestRequestErrorSlot:
         expect(slot).to_contain_text(_UNKNOWN_PROFILE_TEXT)
         assert "zz-nonexistent-profile" not in slot.inner_text()
         polls_before = len(polls)
-        page.wait_for_timeout(2500)
+        # Wait for the two polls themselves rather than for a fixed stretch the
+        # polls are expected to fall in; each one gets a bounded budget.
+        for _ in range(2):
+            page.wait_for_event(
+                "response",
+                predicate=lambda response: bool(_POLL_URL.search(response.url)),
+                timeout=_ONE_POLL_BUDGET_MS,
+            )
         polls_during = len(polls) - polls_before
-        assert polls_during >= 2, f"only {polls_during} polls arrived in 2.5 s"
+        assert polls_during >= 2, f"only {polls_during} polls arrived"
         # Read once, without retrying: the claim is that the message is there
         # now, after the polls, not that it can be found again within a timeout.
         assert _UNKNOWN_PROFILE_TEXT in slot.inner_text(), "a poll erased the error"
@@ -5787,7 +5798,7 @@ class TestColdStartPollIsBounded:
         record_property("cold_start_poll_attempt_cap", POLL_ATTEMPT_CAP)
         assert at_give_up == POLL_ATTEMPT_CAP, polled
 
-        page.wait_for_timeout(_POLL_SETTLE_MS)
+        browser_quiet_window(page, _POLL_SETTLE_MS)
         assert len(polled) == at_give_up, polled[at_give_up:]
 
         # Still a strip, and still a way forward.
@@ -5965,7 +5976,7 @@ class TestPollEndsOnAnErrorResponse:
         expect(page.locator("#checks-body")).to_have_count(0)
         at_swap = len(polled)
 
-        page.wait_for_timeout(_ERROR_POLL_WINDOW_MS)
+        browser_quiet_window(page, _ERROR_POLL_WINDOW_MS)
         record_property("error_poll_requests", len(polled))
         record_property("error_poll_window_ms", _ERROR_POLL_WINDOW_MS)
         assert len(polled) == at_swap, polled[at_swap:]
@@ -6019,7 +6030,7 @@ class TestPollEndsOnAnErrorResponse:
             1, timeout=_POLL_SETTLE_MS
         )
         before = page.locator("#status-message").inner_text()
-        page.wait_for_timeout(_ERROR_POLL_WINDOW_MS)
+        browser_quiet_window(page, _ERROR_POLL_WINDOW_MS)
         assert page.locator("#status-message").inner_text() == before
         expect(page.locator("#status-message .status-error")).to_have_count(0)
 

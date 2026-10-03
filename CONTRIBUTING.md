@@ -164,8 +164,11 @@ The ban covers `time.sleep` and nothing else, so it does not prove that no test 
 until their condition holds or their budget runs out. A test that proves something does
 *not* happen has nothing to poll for, so it may leave the code a short fixed window
 through `quiet_window` in `tests/conftest.py`, which keeps every such pause findable by
-name. The `no-inline-fixed-waits` hook fails on the inline `Event().wait(...)` spelling
-of a pause; a pause written any other way is left to review.
+name. A browser test does the same through `browser_quiet_window`, which waits through
+the page so Playwright keeps delivering its events. The `no-inline-fixed-waits` hook
+fails on the inline `Event().wait(...)` and `wait_for_timeout(...)` spellings of a pause
+anywhere under `tests/` except `tests/conftest.py`, which holds the two helpers; a pause
+written any other way is left to review.
 
 Comments in `src/` state their reasons in words and never cite planning IDs (decision,
 finding or requirement numbers, phase or plan numbers, planning file names), because the
