@@ -167,7 +167,7 @@ class TestConfigureLogging:
             self._cleanup_handlers()
 
     def test_log_level_warning_and_critical_by_name(self, tmp_path: Path) -> None:
-        """WARNING and CRITICAL resolve to their numeric levels (CFG-04)."""
+        """WARNING and CRITICAL resolve to their numeric levels."""
         log_file = tmp_path / "test.log"
         try:
             configure_logging(
@@ -189,7 +189,7 @@ class TestConfigureLogging:
 
         The root logger keeps the configured level, and a DEBUG record emitted
         on a library's own logger is discarded before it reaches any handler.
-        Two things now hold that record back: the root level, and the HTTP
+        Two things hold that record back: the root level, and the HTTP
         library loggers' own capped level (``TestLibraryLoggerCap``). The cap
         alone would still hide the sentinel if -v raised the root to DEBUG, so
         the root-level assertion at the end is the one that fails then.
@@ -305,7 +305,12 @@ class TestConfigureLogging:
             self._cleanup_handlers()
 
     def test_verbose_adds_stderr_handler(self, tmp_path: Path) -> None:
-        """verbose=True adds a StreamHandler alongside the file handler."""
+        """
+        verbose=True adds one ``saneless.stderr`` mirror, writing to ``sys.stderr``.
+
+        pytest keeps its own stream handlers on the root logger, so the mirror is
+        found by its name and its stream rather than by its class.
+        """
         log_file = tmp_path / "test.log"
         try:
             configure_logging(
@@ -356,7 +361,7 @@ class TestConfigureLogging:
         """
         A writable log file returns True and attaches a RotatingFileHandler.
 
-        The CLI prints "Full details in <log_file>" only on True (D-06).
+        The CLI prints "Full details in <log_file>" only on True.
         """
         log_file = tmp_path / "logs" / "saneless.log"
         try:
@@ -419,7 +424,7 @@ class TestConfigureLogging:
         The stderr fallback prints a failure's message, never its traceback.
 
         stderr is the user's terminal once the log file cannot be opened, and
-        a traceback reaches it only with -v (CR-01, D-06).
+        a traceback reaches it only with -v.
         """
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
@@ -549,7 +554,7 @@ def _stderr_stream_handlers() -> list[logging.Handler]:
 
 
 class TestConfigureLoggingStreamMode:
-    """No log file: the 12-factor service shape ``serve`` uses (D-35, DLVR-04)."""
+    """No log file: the 12-factor service shape ``serve`` uses."""
 
     def _cleanup_handlers(self) -> None:
         """
@@ -569,7 +574,7 @@ class TestConfigureLoggingStreamMode:
 
     def test_stream_mode_attaches_no_file_handler(self) -> None:
         """
-        With no log file nothing on the root logger writes to disk (D-40).
+        With no log file nothing on the root logger writes to disk.
 
         That the configured ``log_file`` path is left untouched -- no file, no
         parent directory -- is pinned end to end at the CLI seam, by
@@ -585,7 +590,7 @@ class TestConfigureLoggingStreamMode:
     def test_stream_mode_attaches_one_stderr_handler_at_the_configured_level(
         self,
     ) -> None:
-        """Exactly one stderr handler, root at the configured level (D-36)."""
+        """Exactly one stderr handler, root at the configured level."""
         try:
             configure_logging(None, "DEBUG", max_bytes=1024, backup_count=1)
             assert len(_stderr_stream_handlers()) == 1
@@ -597,9 +602,8 @@ class TestConfigureLoggingStreamMode:
         """
         Stream mode returns False, so the caller records no ``log_file``.
 
-        ``ctx.obj["log_file"] = settings.output.log_file if attached else None``
-        needs no edit: nothing can print "Full details in <log_file>" for a
-        service that writes no file.
+        The CLI keeps ``log_file`` only when this is true, so nothing prints
+        "Full details in <log_file>" for a service that writes no file.
         """
         try:
             assert configure_logging(None, max_bytes=1024, backup_count=1) is False
@@ -610,7 +614,7 @@ class TestConfigureLoggingStreamMode:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """
-        The serve stream renders a traceback without ``-v`` (D-36 amended).
+        The serve stream renders a traceback without ``-v``.
 
         The inverse of ``test_stderr_fallback_renders_no_traceback``, and
         deliberately so: the stream *is* the log here, and no file carries the
