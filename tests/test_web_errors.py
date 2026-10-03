@@ -62,6 +62,7 @@ from saneless.web.app import create_app
 from saneless.web.routes import OWNER_COOKIE
 from saneless.worker import ScanOptions, ScanWorker
 from tests.conftest import StubScannerBackend, poll_until
+from tests.template_support import template_start_tags
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -642,10 +643,11 @@ class TestRequestErrorDisclosure:
         Asserted against the template source as well as the responses above,
         so a branch no test happens to drive cannot introduce a second alert.
         """
-        source = (WEB_DIR / "templates" / "partials" / "error.html").read_text(
-            encoding="utf-8"
-        )
-        assert 'role="alert"' not in source
+        tags = template_start_tags(WEB_DIR / "templates" / "partials" / "error.html")
+        assert tags, "no markup in the error partial"
+        assert [
+            tag for tag, attributes in tags if attributes.get("role") == "alert"
+        ] == []
 
 
 # --- Framework-raised errors -------------------------------------------------
@@ -1433,7 +1435,8 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
 # How long a rejection owed to the worker may take to land: many fast ticks.
 _OWED_REJECTION_BUDGET = 2.0
 
-_SCAN_BUTTON_TAG = re.compile(r'<button type="submit" id="scan-btn"(?P<attrs>[^>]*)>')
+# The rendered Scan button's opening tag, whatever order its attributes are in.
+_SCAN_BUTTON_TAG = re.compile(r'<button\s(?=[^>]*\bid="scan-btn")(?P<attrs>[^>]*)>')
 
 
 def _fail_first_call(original: Callable[..., object]) -> Callable[..., object]:
@@ -2218,13 +2221,35 @@ class TestUnsetUrlRefusal:
 WEB_DIR = Path(__file__).parent.parent / "src" / "saneless" / "web"
 STATUS_MESSAGE_SLOT = '<div id="status-message" role="alert"></div>'
 _HTMX_CONFIG_META = re.compile(r"""<meta name="htmx-config"\s+content='([^']*)'>""")
-# The slot's inset rule. Phase 30 gave the slot a second child -- the
-# "Technical details" disclosure -- so the one rule now names both children on
-# one selector list rather than only the paragraph: a disclosure that hung a rem
-# to the left of the sentence it explains would read as another element's.
-_CSS_RULE = re.compile(
-    r"#status-message > p,\s*#status-message > details \{(?P<body>[^}]*)\}"
-)
+# The slot's inset rule names both of its children, the sentence and the
+# "Technical details" disclosure, on one selector list: a disclosure that hung a
+# rem to the left of the sentence it explains would read as another element's.
+_INSET_SELECTOR = "#status-message > p, #status-message > details"
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_BLOCK = re.compile(r"(?P<selector>[^{}]*)\{(?P<body>[^{}]*)\}")
+
+
+def _css_rules(css: str) -> list[tuple[str, str]]:
+    """
+    Return every innermost rule of a stylesheet, with its comments removed.
+
+    Args:
+        css: The stylesheet's text.
+
+    Returns:
+        Each rule's selector, whitespace normalised, and its body.
+
+    """
+    return [
+        (" ".join(block.group("selector").split()), block.group("body"))
+        for block in _CSS_BLOCK.finditer(_CSS_COMMENT.sub("", css))
+    ]
+
+
+def _declarations(body: str) -> dict[str, str]:
+    """Return a rule body's declarations as property names and their values."""
+    pairs = [part.split(":", 1) for part in body.split(";") if ":" in part]
+    return {name.strip(): value.strip() for name, value in pairs}
 
 
 def test_status_message_slot_is_one_empty_alert_above_the_status_area(
@@ -2270,30 +2295,35 @@ def test_htmx_config_restates_all_three_response_handling_entries(
 
 def test_htmx_config_meta_sits_between_color_scheme_and_title() -> None:
     """The meta follows the color-scheme meta and precedes <title> (UI-SPEC S1)."""
-    base = (WEB_DIR / "templates" / "base.html").read_text()
-    assert base.count('name="htmx-config"') == 1
-    color_scheme = base.index('<meta name="color-scheme"')
-    htmx_config = base.index('<meta name="htmx-config"')
-    title = base.index("<title>")
-    assert color_scheme < htmx_config < title
+    tags = template_start_tags(WEB_DIR / "templates" / "base.html")
+    order = [
+        attributes.get("name") if tag == "meta" else tag
+        for tag, attributes in tags
+        if tag == "title"
+        or (tag == "meta" and attributes.get("name") in {"color-scheme", "htmx-config"})
+    ]
+    assert order == ["color-scheme", "htmx-config", "title"]
 
 
 def test_status_message_children_are_inset_like_the_status_area() -> None:
     """The slot's message and disclosure line up with the status area (D-03)."""
-    css = (WEB_DIR / "static" / "app.css").read_text()
-    assert "!important" not in css
-    rules = _CSS_RULE.findall(css)
-    assert len(rules) == 1
-    body = rules[0]
-    assert "padding-left: 1rem;" in body
-    assert "border-left: var(--pico-border-width) solid transparent;" in body
+    rules = _css_rules((WEB_DIR / "static" / "app.css").read_text(encoding="utf-8"))
+    assert [selector for selector, body in rules if "!important" in body] == []
+    bodies = [body for selector, body in rules if selector == _INSET_SELECTOR]
+    assert len(bodies) == 1
+    declarations = _declarations(bodies[0])
+    assert declarations.get("padding-left") == "1rem"
+    assert declarations.get("border-left") == (
+        "var(--pico-border-width) solid transparent"
+    )
 
 
 # --- Focus after a refused Scan ----------------------------------------------
 
-# The Scan button a refused htmx submit carries out-of-band, captured whole.
+# The Scan button a refused htmx submit carries out-of-band, captured whole,
+# whatever order its attributes are in.
 _OOB_SCAN_BUTTON = re.compile(
-    r'<button type="submit" id="scan-btn" hx-swap-oob="true"(?P<attrs>[^>]*)>'
+    r'<button\s(?=[^>]*\bid="scan-btn")(?=[^>]*\shx-swap-oob="true")(?P<attrs>[^>]*)>'
 )
 _AUTOFOCUS = re.compile(r"\sautofocus\b")
 
