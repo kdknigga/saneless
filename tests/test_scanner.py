@@ -4300,19 +4300,17 @@ print(f"returned={returned} cancels={device.cancels} closes={device.closes}")
 
 class TestStuckReadDoesNotBlockProcessExit:
     """
-    HARD-03's only honest proof, and the reason the executor had to go.
+    A process with a permanently stuck SANE read still exits on its own.
 
-    It cannot be made in-process: a test asserting "the interpreter would have
-    exited" is asserting about something that has not happened yet.  So a real
-    child is started, wedged in a real blocking read, and required to exit on
-    its own.
+    No in-process test can show that the interpreter would exit, so a real
+    child is started, wedged in a real blocking read, and required to exit.
     """
 
     def test_process_exits(self, tmp_path: Path) -> None:
         """
         A child with a permanently stuck reader still exits, and exits 0.
 
-        The printed line carries the whole D-12 sequence in one assertion:
+        The printed line carries the whole cancel sequence in one assertion:
         the read did not return, exactly one cancel was fired, and no close
         was issued on a handle a read is still inside.
 
@@ -4329,9 +4327,8 @@ class TestStuckReadDoesNotBlockProcessExit:
         }
 
         # Every argv element is a literal and the per-run paths travel in the
-        # environment, quoted so they are never re-split -- the shape
-        # test_atomic_write.py established for the one other child-process
-        # test in this suite.
+        # environment, quoted so they are never re-split, as in the
+        # child-process test in test_atomic_write.py.
         result = subprocess.run(
             ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" "$SANELESS_TEST_CHILD"'],
             env=env,
@@ -4346,7 +4343,7 @@ class TestStuckReadDoesNotBlockProcessExit:
 
 
 class TestSaneBackendADFCleanup:
-    """ADF cleanup (cancel/close) tests."""
+    """A feeder scan cancels and closes the device, however it ends."""
 
     def test_cancel_called_after_adf_scan(
         self,
@@ -4354,17 +4351,7 @@ class TestSaneBackendADFCleanup:
         fake_sane_module: FakeSaneModule,
         page_sink: SpooledPageSink,
     ) -> None:
-        """
-        Both cancel() and close() run after an ADF multi_scan completes.
-
-        ``test_iterator_deleted_before_cancel`` was deleted here by D-17. It
-        built a TrackingIterator with a ``__del__`` probe and a device double to
-        host it, but its own comment conceded the deletion "may or may not
-        appear depending on GC" -- so the only thing it ever actually asserted
-        was that cancel had run, which is asserted here. Nothing was lost but
-        the double, and the ``del iterator`` it nominally guarded is still in
-        the backend's own ``finally``.
-        """
+        """Both cancel() and close() run after an ADF multi_scan completes."""
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings, page_sink)
         mock_dev = fake_sane_module.device
@@ -4376,8 +4363,7 @@ class TestSaneBackendADFCleanup:
     ) -> None:
         """dev.cancel() and dev.close() run even when the ADF scan errors."""
         # The fault lands on the second sheet, so a page has already been
-        # acquired when it arrives -- the same shape the hand-rolled error
-        # iterator modelled, now driven through the one shared fake.
+        # acquired when it arrives.
         dev = FakeSaneDev(
             pages=5,
             start_error=FakeSaneError("hardware error"),
@@ -4388,7 +4374,7 @@ class TestSaneBackendADFCleanup:
             source="Automatic Document Feeder", resolution=300, mode="Color"
         )
 
-        # D-03: a fault after the first page is translated to ScanError
+        # A fault after the first page is translated to ScanError
         # carrying the device's own text, rather than propagating raw.
         with pytest.raises(ScanError, match="hardware error"):
             backend.scan_pages("test:0", settings, page_sink)
@@ -4399,12 +4385,11 @@ class TestSaneBackendADFCleanup:
 
 class TestFakeFeederStartOrdering:
     """
-    ``start()`` checks the armed error before the page budget (WR-07).
+    The fake's ``start()`` checks the armed error before the page budget.
 
-    The budget check used to run first, so an error armed at the index one past
-    the last page -- the end-of-feed probe -- could never fire: the test
-    silently became a clean-feed test rather than failing loudly as a
-    misconfiguration.
+    An error armed at the index one past the last page -- the end-of-feed
+    probe -- has to fire, or the test silently becomes a clean-feed test
+    instead of failing loudly as a misconfiguration.
     """
 
     def test_an_error_armed_at_the_probe_index_is_reachable(
@@ -4413,8 +4398,8 @@ class TestFakeFeederStartOrdering:
         """
         A jam on the probe surfaces instead of reading as a clean end of feed.
 
-        With the budget checked first this device returned three pages and no
-        error at all, so the arming was a silent no-op.
+        With the budget checked first, this device would return three pages
+        and no error at all, and the arming would be a silent no-op.
         """
         dev = FakeSaneDev(
             pages=3,
@@ -4435,8 +4420,8 @@ class TestFakeFeederStartOrdering:
 # ---------------------------------------------------------------------------
 
 
-# The hyphenated spelling get_options() reports, which D-09's presence check
-# reads.  Assignment uses underscores (dev.tl_x); see fake_sane._GEOMETRY_NAMES.
+# The hyphenated spelling get_options() reports, which the geometry presence
+# check reads.  Assignment uses underscores (dev.tl_x); see fake_sane._GEOMETRY_NAMES.
 _GEOMETRY_OPTION_NAMES = ("tl-x", "tl-y", "br-x", "br-y")
 
 # A4 is 210 x 297 mm; at 300 dpi that is 2480.3 x 3507.87 px, which rounds to
@@ -4466,8 +4451,7 @@ def _geometry_less_device(pages: int = 1) -> FakeSaneDev:
     """
     Build a device whose option list does not mention the geometry options.
 
-    This is the condition the old geometry-less double claimed to model and
-    inverted.  The real ``SaneDev.__setattr__`` *stores* an unknown name
+    The real ``SaneDev.__setattr__`` *stores* an unknown name
     (``sane.py:188``), so such a device accepts ``dev.br_y`` without complaint
     -- which is exactly why the presence check, and not an exception, is what
     makes the crop fallback reachable.
@@ -4489,7 +4473,7 @@ def _geometry_less_device(pages: int = 1) -> FakeSaneDev:
 
 
 class TestPaperSizeGeometry:
-    """Paper size geometry option setting tests."""
+    """A paper size is written to the device's scan-area options."""
 
     def test_a4_sets_geometry(
         self,
@@ -4524,10 +4508,9 @@ class TestPaperSizeGeometry:
         sane_backend.scan_pages("test:device:001", settings, page_sink)
 
         # Asserted against the device's own assignment log rather than by
-        # writing a sentinel and reading it back. The deleted double stored any
-        # float verbatim, so a test could write -1.0 and see -1.0; a real device
-        # clamps to the option's range, so that sentinel would have come back
-        # 0.0 and the test would have passed only by coincidence.
+        # writing a sentinel and reading it back: a real device clamps to the
+        # option's range, so a sentinel such as -1.0 comes back 0.0 and the
+        # read-back proves nothing.
         geometry = [
             name for name in mock_dev.assignments if name.startswith(("tl_", "br_"))
         ]
@@ -4561,7 +4544,7 @@ class TestPaperSizeGeometry:
 
 
 class TestPaperSizeCropFallback:
-    """Pillow crop fallback when geometry options are unavailable."""
+    """Without scan-area options, the page is cropped to size by Pillow."""
 
     def test_crop_fallback_when_geometry_fails(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
@@ -4615,29 +4598,23 @@ class TestPaperSizeCropFallback:
 
 class TestFakeDeviceAreaMatchesTheLibrary:
     """
-    ``area`` raises what python-sane raises on a geometry-less device (WR-06).
+    The fake's ``area`` raises what python-sane raises on a geometry-less device.
 
-    The fake read ``_values`` directly, so a device whose option table omits
-    the geometry options -- the exact table ``build_option_table(omit=...)``
-    exists to produce -- raised ``KeyError``.  The real library composes
-    ``area`` from attribute reads (``sane.py:220``) and raises
-    ``AttributeError("No such attribute: tl_x")``.
-
-    No production path reaches this today, because ``_set_geometry`` checks
-    presence before reading ``area``.  But that ordering is a property of
-    today's code, and the fake's whole premise is that it cannot quietly
-    diverge from the library it stands in for.
+    The real library composes ``area`` from attribute reads (``sane.py:220``)
+    and raises ``AttributeError("No such attribute: tl_x")`` when the option
+    table omits the geometry options.  ``_set_geometry`` checks presence first,
+    but the fake must not diverge from the library it stands in for.
     """
 
     def test_a_geometry_less_device_raises_attribute_error(self) -> None:
-        """Not KeyError, which the real library never raises here."""
+        """A device without geometry options raises AttributeError, not KeyError."""
         dev = FakeSaneDev(options=build_option_table(omit=_GEOMETRY_OPTION_NAMES))
 
         with pytest.raises(AttributeError, match="No such attribute"):
             _ = dev.area
 
     def test_a_device_reporting_the_options_still_returns_its_box(self) -> None:
-        """Composing from attribute reads must not change the happy path."""
+        """A device reporting the geometry options returns its box."""
         dev = FakeSaneDev()
         dev.tl_x = 5.0
         dev.br_x = 100.0
@@ -4650,15 +4627,13 @@ class TestFakeDeviceAreaMatchesTheLibrary:
 
 class TestGeometryPresenceCheck:
     """
-    Geometry is written only on a device that reports the options (D-09).
+    Geometry is written only on a device that reports the options.
 
     The real ``SaneDev.__setattr__`` stores an unrecognised option name in
     ``__dict__`` and returns -- no device call, no validation, no raise
     (``sane.py:188``).  So assigning ``dev.br_y`` on a device that has no
-    geometry options *succeeds*, ``_set_geometry`` returned True, and the Pillow
-    crop fallback it guarded could never run.  That is M-15, and it shipped
-    green because the double it was tested against raised on exactly the
-    assignment the real library stores.
+    geometry options *succeeds*, and only the presence check lets the Pillow
+    crop fallback run.
 
     Every test here drives a fake that stores silently, as the real library
     does, so each one fails if the presence check is removed.
@@ -4666,10 +4641,10 @@ class TestGeometryPresenceCheck:
 
     def test_a_device_without_geometry_options_stores_br_y_silently(self) -> None:
         """
-        The premise the whole fallback rests on, asserted rather than assumed.
+        A device without geometry options stores ``br_y`` without complaint.
 
-        If this ever raises, the fake has drifted back to modelling a library
-        that does not exist and every test below it proves nothing.
+        The whole fallback rests on this.  If it raises, the fake models a
+        library that does not exist and every test below it proves nothing.
         """
         dev = FakeSaneDev(options=build_option_table(omit=_GEOMETRY_OPTION_NAMES))
 
@@ -4683,7 +4658,7 @@ class TestGeometryPresenceCheck:
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """
-        SCNR-04's reachability proof: the page comes back at A4's pixel size.
+        The crop fallback runs and the page comes back at A4's pixel size.
 
         A return-value assertion alone would not show this -- the fallback has
         to actually produce a correctly sized page, from a 3000x4000 scan.
@@ -4724,7 +4699,7 @@ class TestGeometryPresenceCheck:
         page_sink: SpooledPageSink,
     ) -> None:
         """
-        The bare ``except Exception`` names what it swallowed (M-15's other half).
+        A rejected geometry assignment is logged with the exception it raised.
 
         Here the options are reported but marked not software-settable, so the
         assignment raises for a structural reason rather than being stored.
@@ -4778,12 +4753,11 @@ def _device_reporting_unit(
 
 class TestGeometryUnit:
     """
-    The scan-area scale factor comes from the descriptor the device sent (D-10).
+    The scan-area scale factor comes from the unit the device reports.
 
-    ``_set_geometry`` wrote ``br_x = 210.0`` for A4 on every device, assuming
-    millimetres, although the unit lives at index 5 of the option tuple (N-03).
-    A device reporting ``UNIT_PIXEL`` was handed 210 *pixels* -- about 18 mm at
-    300 dpi -- and returned a sliver of the page with no error.
+    The unit lives at index 5 of the option tuple.  Writing A4's 210 mm as-is
+    to a device reporting ``UNIT_PIXEL`` would hand it 210 *pixels* -- about
+    18 mm at 300 dpi -- and return a sliver of the page with no error.
 
     There is no ``UNIT_CM`` and no ``UNIT_INCH``: the complete set is the seven
     codes below, confirmed against the ``_sane`` extension itself.
@@ -4798,11 +4772,12 @@ class TestGeometryUnit:
         self, unit: GeometryUnit
     ) -> None:
         """
-        Parametrised over the enum itself, so a new member is covered for free.
+        Every SANE unit is either converted to a scale factor or declined.
 
-        This is Phase 21's D-09.  A member added without a matching ``match``
-        arm leaves the scale unbound and fails here at runtime, as well as
-        failing ``assert_never`` under both type checkers at edit time.
+        Parametrised over the enum itself, so a new member is covered for free:
+        one added without a matching ``match`` arm leaves the scale unbound and
+        fails here at runtime, as well as failing ``assert_never`` under both
+        type checkers.
         """
         scale = sane_backend_mod._units_per_mm(unit, 300, fallback="will crop")
 
@@ -4836,8 +4811,8 @@ class TestGeometryUnit:
         The pixel conversion follows the dpi the device chose, not the request.
 
         5000 dpi is clamped by the device to 1200.  Converting with the
-        requested value would reintroduce the very substitution bug D-11 cures,
-        one layer further down.
+        requested value would size the area for a resolution the device is not
+        using.
 
         A scan area in pixels is an integer option on a real device, so the
         device is given whole pixels: A4 at 1200 dpi is 9921.26 x 14031.50
@@ -4914,18 +4889,17 @@ class TestGeometryUnit:
 
 class TestNonPositiveGeometryScale:
     """
-    A scale of zero is declined, not written as a zero-size box (WR-01).
+    A scale of zero is declined, not written as a zero-size box.
 
     ``_units_per_mm`` returns ``resolution / 25.4`` for UNIT_PIXEL, so a device
     whose read-back resolution truncates to 0 yields ``0.0``.  That value is
-    not ``None``, so it passed the only guard ``_set_geometry`` had: the
-    expected box became ``(0.0, 0.0)``, the device stored it, and the clamp
-    check agreed with itself inside a tolerance that was also 0.  A zero-area
-    scan reported as success is worse than the crop it bypassed.
+    not ``None``, so a ``None`` check alone would write a ``(0.0, 0.0)`` box,
+    and the clamp check would agree with itself inside a tolerance that is
+    also 0.  A zero-area scan reported as success is worse than the crop.
     """
 
     def test_a_sub_one_dpi_read_back_yields_a_zero_scale(self) -> None:
-        """The arithmetic really does produce 0.0 -- the premise, measured."""
+        """A read-back resolution below 1 dpi yields a scale factor of 0.0."""
         assert (
             sane_backend_mod._units_per_mm(
                 GeometryUnit.UNIT_PIXEL, 0, fallback="will crop"
@@ -4934,13 +4908,13 @@ class TestNonPositiveGeometryScale:
         )
 
     def test_a_zero_scale_falls_back_to_the_crop(self) -> None:
-        """``_set_geometry`` declines, which is what makes the crop run."""
+        """A zero scale makes ``_set_geometry`` decline, so the crop runs."""
         dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
 
         assert sane_backend_mod._set_geometry(dev, "a4", dev.get_options(), 0) is False
 
     def test_no_zero_size_box_reaches_the_device(self) -> None:
-        """Declining happens before any corner is assigned."""
+        """No corner is assigned when the scale is zero."""
         dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
 
         sane_backend_mod._set_geometry(dev, "a4", dev.get_options(), 0)
@@ -4951,14 +4925,13 @@ class TestNonPositiveGeometryScale:
 
 class TestClampedScanArea:
     """
-    A scan area the device quietly shrank is caught on read-back (D-19).
+    A scan area the device quietly shrank is caught on read-back.
 
-    Measured against the real ``test`` backend: writing A4's 210 mm to a device
-    whose ``br-x`` range is ``(0.0, 200.0, 1.0)`` yields 200.0, with no error
-    and no ``INFO_INEXACT`` the caller can see.  ``_set_geometry`` could
-    therefore return True having set an area that is not the one requested --
-    the same silent-substitution shape M-16 cures for DPI, and the page comes
-    out quietly wrong.
+    The real ``test`` backend, asked for A4's 210 mm on a ``br-x`` range of
+    ``(0.0, 200.0, 1.0)``, stores 200.0 with no error and no ``INFO_INEXACT``
+    the caller can see.  Without the read-back, ``_set_geometry`` would report
+    an area that is not the one requested, and the page would come out
+    quietly wrong.
     """
 
     def test_a_clamped_area_falls_through_to_the_crop(
@@ -4992,11 +4965,10 @@ class TestClampedScanArea:
         A device whose geometry range starts above 0 clamps ``tl``, not ``br``.
 
         ``dev.tl_x = 0.0`` is clamped up to the range minimum while ``br`` is
-        accepted verbatim, so comparing the far corner alone reports success
-        over an area short by the whole minimum on each axis.  The read-back
-        already had the measured top-left in hand and threw it away: an A4
-        request silently yielded a 200 x 287 mm page, with no warning, no crop,
-        and a PDF MediaBox disagreeing with its own content.
+        accepted verbatim, so comparing the far corner alone would report
+        success over an area short by the whole minimum on each axis: an A4
+        request would yield a 200 x 287 mm page, with no warning, no crop, and
+        a PDF MediaBox disagreeing with its own content.
         """
         dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (10.0, 300.0, 1.0))
         backend = _backend_with(dev, monkeypatch)
@@ -5073,8 +5045,8 @@ class TestClampedScanArea:
         A clamped dpi must not yield a crop box computed at the requested dpi.
 
         The crop arithmetic and the device's actual sampling have to agree, or
-        a clamped resolution produces M-16's cut-off page even when the
-        fallback runs correctly.
+        a clamped resolution produces a cut-off page even when the fallback
+        runs correctly.
         """
         dev = _geometry_less_device()
         # Selecting the source reloads the descriptors and reveals a 75 dpi
@@ -5314,7 +5286,7 @@ class TestFeederPaperSize:
     def test_integer_page_size_options_are_given_whole_numbers(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """A float refused by an integer option would fail the whole scan."""
+        """Integer page-size options get whole numbers, as a float fails the scan."""
         dev = _feeder_device(page_size_options=False)
         dev.offer_page_size_options(
             value_type=TYPE_INT,
@@ -5370,8 +5342,8 @@ class TestIntegerGeometry:
     A scan area of integer options is written as whole numbers.
 
     python-sane refuses a float for an integer option, even a whole one, so
-    writing ``0.0`` to a pixel scan area raised, and the page fell back to a
-    crop that the device could have done itself.
+    writing ``0.0`` to a pixel scan area would raise, and the page would fall
+    back to a crop that the device could have done itself.
     """
 
     @pytest.mark.parametrize(
@@ -5416,7 +5388,7 @@ class TestIntegerGeometry:
 
 
 # ---------------------------------------------------------------------------
-# D-17: the shared fake and the measured python-sane contract
+# The shared fake and the python-sane contract it models
 # ---------------------------------------------------------------------------
 
 
@@ -5454,7 +5426,7 @@ class TestFakeSaneOptionReload:
         assert dev.resolution == 600.0
 
     def test_a_value_set_before_the_reload_is_not_re_validated(self) -> None:
-        """The stranded value is the hazard that makes ordering observable."""
+        """A value set before a reload is not re-validated against the new range."""
         dev = FakeSaneDev()
         dev.narrow_resolution_for_source("ADF Duplex", (1.0, 600.0, 1.0))
         dev.resolution = 1000
@@ -5487,7 +5459,7 @@ class TestFakeSaneOptionReload:
 
 
 # ---------------------------------------------------------------------------
-# D-11: source-first option ordering and the resolution read-back
+# Source-first option ordering and the resolution read-back
 # ---------------------------------------------------------------------------
 
 
@@ -5539,12 +5511,12 @@ class TestDeviceOptionOrdering:
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """
-        A feeder ceiling of 600 is respected because the source was set first.
+        A feeder ceiling of 600 is respected because the source is set first.
 
-        Under the old mode/resolution/source order the 1000 dpi request was
-        validated against the platen's 1200 dpi range and then stranded there
-        when selecting the feeder reloaded the descriptors, so the device was
-        left holding a value its active constraint no longer permits.
+        In mode/resolution/source order the 1000 dpi request would be validated
+        against the platen's 1200 dpi range and then stranded there when
+        selecting the feeder reloads the descriptors, leaving the device holding
+        a value its active constraint does not permit.
         """
         feeder = "Automatic Document Feeder"
         dev = FakeSaneDev(pages=1)
@@ -5556,8 +5528,7 @@ class TestDeviceOptionOrdering:
 
         # ``resolution`` is declared on the fake with the type the real device
         # hands back, so this isinstance is a runtime assertion rather than a
-        # static narrowing: it pins that the device really reports a float,
-        # which is what the Protocol quietly misdeclared for three phases.
+        # static narrowing: it pins that the device really reports a float.
         resolution = dev.resolution
         assert isinstance(resolution, float)
         assert 1.0 <= resolution <= 600.0
@@ -5727,8 +5698,8 @@ class TestAdfMode:
         """
         A single-sided feeder name and no ``adf-mode``: one side, said aloud.
 
-        Nothing the device reports selects duplex, so the scan goes ahead as it
-        always has, and a WARNING says only one side of each sheet is scanned.
+        Nothing the device reports selects duplex, so the scan goes ahead, and a
+        WARNING says only one side of each sheet is scanned.
         """
         dev = FakeSaneDev(pages=1)
         dev.report_sources(["Flatbed", _ADF_SOURCE])
@@ -5851,15 +5822,10 @@ class TestResolutionConstraintShapes:
     A SANE device reports its resolution support as *either* a word list *or* a
     ``(min, max, step)`` range, never both.  So ``resolutions`` and
     ``resolution_range`` are two different facts rather than two spellings of
-    one, and neither is derived from the other (Q6): expanding a range into a
-    list would print saneless's invention rather than the device's answer, and
+    one, and neither is derived from the other: expanding a range into a list
+    would print saneless's invention rather than the device's answer, and
     inferring a range from a list would claim support for values between the
     listed ones.  At most one of the two is ever populated.
-
-    ``get_capabilities`` used to read only the word-list shape, so the SANE
-    ``test`` backend's measured ``(1.0, 1200.0, 1.0)`` arrived as an empty
-    list: the CLI printed a label with nothing after it and auto-profiles fell
-    back to 300 regardless of what the device actually supported (N-01).
     """
 
     @pytest.mark.parametrize(
@@ -5899,7 +5865,7 @@ class TestResolutionConstraintShapes:
     def test_sources_and_modes_still_come_from_their_list_constraints(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Reading the range shape did not disturb the two list-shaped options."""
+        """Sources and modes come from their word lists beside a range resolution."""
         caps = _capabilities_for((1.0, 1200.0, 1.0), monkeypatch)
 
         assert caps.sources == ["Flatbed", "ADF Duplex"]
@@ -5914,7 +5880,7 @@ class TestResolutionConstraintShapes:
         self, constraint: object, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A device-supplied tuple of the wrong shape yields neither field (T-24-27).
+        A device-supplied tuple of the wrong shape yields neither field.
 
         The constraint object comes from the device, so nothing guarantees it is
         one of the three documented shapes.  An unrecognised one must leave both
@@ -5928,17 +5894,12 @@ class TestResolutionConstraintShapes:
 
     def test_a_range_whose_members_are_not_numbers_is_not_guessed_at(self) -> None:
         """
-        The same guard for non-numeric members, asserted where it protects.
+        A range whose members are not numbers yields neither field.
 
-        This case is driven straight through ``_constraint`` rather than through
-        a device, and deliberately so: the shared fake coerces a range's members
-        with ``float()`` when it builds a device's starting values, so it cannot
-        hold this table at all.  That refusal is correct -- no real SANE backend
-        can report a range of strings -- and widening the fake to accept one
-        would make it model a library that does not exist, which is the very
-        drift D-17 exists to stop.  The guard is defensive hardening against a
-        malformed device, so the honest place to assert it is the function that
-        does the hardening.
+        Driven straight through ``_constraint``: the shared fake coerces a
+        range's members with ``float()``, as no real SANE backend can report a
+        range of strings, so this guard against a malformed device is asserted
+        at the function that does the hardening.
         """
         found = sane_backend_mod._constraint(
             [_option(2, "resolution", _FIXED_OPTION, ("low", "high", "step"))],
