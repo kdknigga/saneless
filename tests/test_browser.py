@@ -22,7 +22,7 @@ import socket
 import sqlite3
 import threading
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime
 from http import HTTPStatus
 from itertools import pairwise
@@ -308,6 +308,20 @@ class _BrowserServer(NamedTuple):
     url: str
     app: FastAPI
     scanner: _BrowserTestScanner
+
+
+def _remove_job_row(app: FastAPI, job_id: str) -> None:
+    """
+    Delete one job row from the live server's database through a fresh connection.
+
+    A test removes a row through its own ``sqlite3`` connection, never through
+    the server's.  The store's connection is shared by the web and worker
+    threads under its lock, and the database runs in WAL mode, so a second
+    connection can write beside it without touching the store's internals.
+    """
+    db_path = app.state.settings.output.db_path
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
 
 # The two sentences the profile description swap moves between.  They are
@@ -742,7 +756,7 @@ def scan_harness(
                 )
         finally:
             for job_id in created:
-                job_store.delete_job(job_id)
+                _remove_job_row(browser_server.app, job_id)
             browser_server.app.state.worker._current_job_id = None
         # Reached only when every job finished, so it cannot mask the failure
         # that stopped a wait. A row left behind here would follow every later
@@ -1087,7 +1101,7 @@ class TestFlipPromptUI:
             # page rather than this job through the most-recent-job fallback.
             worker._flip_coordinator = None
             worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
 
 
 _COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').length"
@@ -1674,12 +1688,8 @@ class TestFallbackStatusRendering:
             owner_token=_as_owner(page, browser_server.url),
         )
         # finish_job is the public writer for the warning column, and the worker
-        # reaches FALLBACK through it. Writing the column through
-        # job_store._conn instead would break the store's own rules: every
-        # public writer is wrapped in @_locked because the web and worker
-        # threads share one connection opened with check_same_thread=False, and
-        # sqlite3 connection context managers do not nest -- an inner
-        # `with conn:` commits the outer transaction.
+        # reaches FALLBACK through it, so the test drives the same path the
+        # worker does rather than writing the column behind the store's back.
         job_store.finish_job(
             job.id,
             JobState.FALLBACK,
@@ -1702,7 +1712,7 @@ class TestFallbackStatusRendering:
             # here would follow every later test onto what should be the idle
             # page. Deleting the row is what restores the idle state.
             app.state.worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
 
     def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
         """Load the page under an emulated OS colour-scheme preference."""
@@ -1843,7 +1853,7 @@ class TestWarnedDoneStatusRendering:
             # alone leaves this row as the most recent job, which the idle page
             # of every later test would then render. Deleting it restores idle.
             app.state.worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])
     def test_warned_done_colour_matches_the_fallback_amber(
@@ -1920,7 +1930,7 @@ class TestCancelledStatusRendering:
             # the pointer leaves this job as list_recent's most recent row, and
             # every later "idle" page would render it.
             app.state.worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
 
     def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
         """Load the page under an emulated OS colour-scheme preference."""
@@ -3008,7 +3018,7 @@ class TestOwnerCookieInABrowser:
             # the row deleted, as the other flip browser test does.
             worker._flip_coordinator = None
             worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
 
 
 @pytest.mark.browser
@@ -5436,7 +5446,7 @@ class TestStatusStripInChromium:
                 assert meta.inner_text().startswith(_PAUSED_PREFIX), meta.inner_text()
         finally:
             worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(server.app, job.id)
 
     def test_check_again_replaces_the_body_it_is_aimed_at(
         self, page: Page, cold_strip_server: _BrowserServer
@@ -6136,7 +6146,7 @@ class TestErrorRenderingInChromium:
             assert ".log" not in source
         finally:
             worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(server.app, job.id)
 
 
 @pytest.mark.browser
@@ -6232,8 +6242,8 @@ class TestAmberErrorRenderingInChromium:
             expect(page.locator("#status-area .status-fallback")).to_have_count(0)
         finally:
             worker._current_job_id = None
-            job_store.delete_job(amber_id)
-            job_store.delete_job(upload_id)
+            _remove_job_row(server.app, amber_id)
+            _remove_job_row(server.app, upload_id)
 
 
 @pytest.mark.browser
@@ -6295,7 +6305,7 @@ class TestPageCountsInChromium:
             expect(title_cell.locator(".page-counts")).to_have_text(expected)
         finally:
             worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(server.app, job.id)
 
 
 # Every word in the history headers and in the Time, Profile and Status cells,
@@ -6427,7 +6437,7 @@ class TestHistoryTableOnAPhone:
             assert overflow <= 0, f"the page scrolls sideways by {overflow}px at 390px"
         finally:
             for job in (waiting, unconfirmed, warned):
-                job_store.delete_job(job.id)
+                _remove_job_row(server.app, job.id)
 
 
 _FRONT_PAGES = 12
@@ -6751,7 +6761,7 @@ class TestTimestampZonesInChromium:
             # own TZ.
             assert freshness.endswith(f"{zone}."), (freshness, zone)
         finally:
-            job_store.delete_job(job.id)
+            _remove_job_row(server.app, job.id)
 
 
 # ---------------------------------------------------------------------------
@@ -7428,7 +7438,7 @@ class TestOnlyTheOwnerSeesTheScan:
         finally:
             viewer_ctx.close()
             app.state.worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
@@ -7663,7 +7673,7 @@ class TestBlockedButtonThroughTheStatusPoll:
             expect(page.locator(_BLOCKED_REASON_SELECTOR)).to_be_visible()
         finally:
             worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(server.app, job.id)
 
 
 @pytest.mark.browser
@@ -7781,7 +7791,7 @@ class TestRemovedBlankPagesRendering:
             # the pointer leaves this job as list_recent's most recent row, and
             # every later "idle" page would render it.
             app.state.worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
 
     @pytest.fixture
     def all_blank_error_page(
@@ -7811,7 +7821,7 @@ class TestRemovedBlankPagesRendering:
             yield page, str(kept)
         finally:
             app.state.worker._current_job_id = None
-            job_store.delete_job(job.id)
+            _remove_job_row(app, job.id)
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])
     def test_removed_positions_note_is_shown_and_done_stays_green(
@@ -8142,7 +8152,7 @@ def _staged_prompt(
         asker.join(_JOB_FINISH_TIMEOUT)
         worker._pass_coordinator = None
         worker._current_job_id = None
-        job_store.delete_job(job.id)
+        _remove_job_row(server.app, job.id)
         assert not asker.is_alive(), "the staged prompt's ask never returned"
 
 
@@ -8734,7 +8744,7 @@ def _parked(
         yield job.id
     finally:
         worker._current_job_id = None
-        job_store.delete_job(job.id)
+        _remove_job_row(stage.server.app, job.id)
 
 
 def _open_on(stage: _Stage, line: str) -> None:
@@ -8774,7 +8784,7 @@ def _reflow_queued(stage: _Stage) -> Generator[None]:
             yield
         finally:
             for job_id in queued:
-                job_store.delete_job(job_id)
+                _remove_job_row(stage.server.app, job_id)
 
 
 @contextmanager
@@ -8982,7 +8992,7 @@ def _reflow_non_owner_flip_wait(stage: _Stage) -> Generator[None]:
             yield
     finally:
         worker._current_job_id = None
-        job_store.delete_job(job.id)
+        _remove_job_row(stage.server.app, job.id)
 
 
 @contextmanager

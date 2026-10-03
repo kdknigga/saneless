@@ -250,9 +250,6 @@ the text -- which quotes a title read back from a workspace on disk -- are
 bound, never written into the statement.
 """
 
-_DELETE_BY_ID = "DELETE FROM jobs WHERE id = ?"
-"""Delete a single job by its primary key.  One bound parameter, the job id."""
-
 _NEWEST_RUN_IDS = (
     "SELECT id FROM jobs WHERE error_category IS NOT ? ORDER BY created_at DESC LIMIT ?"
 )
@@ -792,7 +789,7 @@ class Job:
 
     @property
     def is_active(self) -> bool:
-        """Whether this job is still in flight (not DONE or ERROR)."""
+        """Whether this job is still in flight (not in a terminal state)."""
         return self.state in ACTIVE_STATES
 
     @property
@@ -806,20 +803,10 @@ class JobResult:
     """
     Everything a finished scan recorded, bundled into one argument.
 
-    It exists to keep :meth:`JobStore.finish_job` within ruff's ``PLR0913``
-    limit of five non-``self`` parameters.  :meth:`JobStore.create_job` sits
-    exactly at that limit and passes, which is the evidence both that five is
-    the ceiling and that ``self`` is not counted; spelling these six facts out
-    as individual parameters alongside ``job_id``, ``state``, ``error`` and
-    ``error_category`` would make ten.
-
-    The fields deliberately mirror :class:`saneless.pipeline.ScanResult`
-    *without* importing it.  ``job.py`` importing ``pipeline.py`` would invert
-    the dependency direction -- the pipeline is the layer that knows about
-    persistence, not the reverse -- so the worker does the field-for-field copy
-    at its single call site instead.  Taking a ``ScanResult`` directly, and
-    raising the ``PLR0913`` limit, were both weighed and rejected for those two
-    reasons respectively.
+    :meth:`JobStore.finish_job` takes it.  The fields mirror :class:`saneless.pipeline.ScanResult` without importing
+    it: ``job.py`` does not import the pipeline and the pipeline does not
+    import ``job.py``.  The worker copies the fields across at its one call
+    site.
 
     Every field is optional, because a caller that has no result to record
     passes no ``JobResult`` at all rather than a zero-filled one.
@@ -1164,17 +1151,8 @@ class JobStore:
         """
         Create and persist a new job.
 
-        ``owner_token`` occupies the parameter slot ``thumbnail`` used to hold.
-        Nothing ever passed ``thumbnail`` to this method -- verified by grep
-        across ``src/`` and ``tests/`` before it was removed -- because
-        :meth:`update_thumbnail` is the live writer, called by the worker once
-        a scan has produced an image (from the thumbnail callback in
-        ``ScanWorker._scan_job``).  Spending the freed slot rather than adding
-        a sixth parameter is deliberate: ruff's ``PLR0913`` ceiling is five
-        non-``self`` parameters and it counts keyword-only ones too, so a sixth
-        would need either a suppression, which this project does not write, or
-        a frozen-dataclass bundle in the shape of :class:`JobResult`.  Neither
-        is warranted to make room for a parameter that replaces a dead one.
+        A new job has no thumbnail: :meth:`update_thumbnail` writes it once
+        the worker has a scanned image.
 
         Args:
             profile: Scan profile name.
@@ -1201,12 +1179,7 @@ class JobStore:
                     None,  # error_category
                     json.dumps(tags or []),
                     correspondent,
-                    # thumbnail -- never a submission field.  update_thumbnail
-                    # writes it once the worker has an image to write
-                    # (the thumbnail callback in ScanWorker._scan_job), which is
-                    # why the parameter that used to sit in this position could
-                    # be spent on owner_token.
-                    None,
+                    None,  # thumbnail -- update_thumbnail writes it later
                     datetime.now(tz=UTC).isoformat(),
                     # A new job has recorded nothing yet, so every result
                     # column starts NULL -- deliberately, because NULL means
@@ -1522,12 +1495,9 @@ class JobStore:
         variable-length ``IN`` ``fail_active_jobs`` needs -- but the state value
         is still bound rather than written into the statement text.
 
-        No production caller wants this list *as* a list.  What production
-        wants from the ordering is one job's place in it, which
-        :meth:`queue_position` reports for the status area's "N ahead of you"
-        line.  Both methods read it through ``_pending_jobs``, so
-        this method is the ordering's public shape and its tests are the
-        ordering's proof.
+        The web layer reads it to find the viewer's own queued job.
+        :meth:`queue_position` reads the same ordering, through
+        ``_pending_jobs``, for the status area's "N ahead of you" line.
 
         Returns:
             List of Job instances awaiting a scanner, ordered by creation time
@@ -1822,31 +1792,6 @@ class JobStore:
         if deleted > 0:
             logger.debug("Pruned %d old jobs", deleted)
         return deleted
-
-    @_locked
-    def delete_job(self, job_id: str) -> bool:
-        """
-        Remove one job by id.
-
-        :meth:`prune` deletes by age and by row count, which is the wrong shape
-        for a caller holding a single id.  Without this, removing one named job
-        meant reaching past the store into ``_conn`` and opening a transaction
-        on the shared connection while holding none of the store's lock -- the
-        exact pattern the ``@_locked`` discipline exists to prevent.
-
-        Args:
-            job_id: The UUID string of the job.
-
-        Returns:
-            True if a job was removed, False if no job carried that id.
-
-        """
-        with self._conn:
-            deleted = self._conn.execute(_DELETE_BY_ID, (job_id,)).rowcount
-
-        if deleted > 0:
-            logger.debug("Deleted job %s", job_id)
-        return deleted > 0
 
     @_locked
     def enable_incremental_auto_vacuum(self) -> bool:
