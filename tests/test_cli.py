@@ -211,7 +211,7 @@ def _patch_cli(
         """
         Return the test settings, recording ``--config`` as load_settings does.
 
-        ``auto-profiles`` writes to ``settings.config_path`` (D-16); a stub that
+        ``auto-profiles`` writes to ``settings.config_path``; a stub that
         dropped the path would send its writes to ``./saneless.toml`` in the
         suite's working directory.
 
@@ -254,11 +254,8 @@ def _patch_cli(
             """
             Mock scanner backend for CLI tests.
 
-            Subclasses the shared conftest stub, which subclasses the ABC, so
-            the type checkers can see the contract at all. This was one of the
-            two CLI stubs that would *not* have failed when ScanBatch replaced
-            the generator in this phase -- every stub that does subclass was
-            caught by the checkers, and the sink switch caught this one.
+            It subclasses the shared conftest stub, which subclasses the ABC, so the
+            type checkers hold it to the backend contract.
 
             Only the two device-reporting methods are local, because these
             tests read the richer device list and capabilities back out of the
@@ -319,14 +316,13 @@ def _patch_cli(
 
 def _failure_lines(result: Result) -> list[str]:
     """
-    Return a classified failure's stderr with the D-12 advice line removed.
+    Return a classified failure's stderr with the advice line removed.
 
     Every ``SanelessError`` the guard classifies to a code other than
-    ``UNEXPECTED`` now prints two things: Phase 28's locked failure line and
-    the category's ``Try: `` next step (APPL-04, D-12). The tests below were
-    written when there was only the first, and each still means "one failure
-    line and no traceback" -- so the advice line is *asserted* and stripped in
-    one place rather than each assertion being loosened to a substring check.
+    ``UNEXPECTED`` prints two things: the failure line and the category's
+    ``Try: `` next step. The tests below each mean "one failure line and no
+    traceback", so the advice line is *asserted* and stripped in one place
+    rather than each assertion being loosened to a substring check.
 
     Args:
         result: The CliRunner result of a command that failed.
@@ -371,8 +367,8 @@ class TestVersionOption:
     """
     ``saneless --version`` reports the installed distribution version.
 
-    D-03/D-04, DLVR-10. The number comes from ``importlib.metadata``, so
-    ``pyproject.toml`` stays its single source, and the line is click's default
+    The number comes from ``importlib.metadata``, so ``pyproject.toml`` stays
+    its single source, and the line is click's default
     ``%(prog)s, version %(version)s`` with no Python or platform block --
     ``saneless doctor`` already covers the diagnostics such a block would
     duplicate.
@@ -401,7 +397,7 @@ class TestVersionOption:
     def test_version_option_needs_no_config(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``--version`` loads no settings and configures no logging (CFG-10)."""
+        """``--version`` loads no settings and configures no logging."""
         calls: list[str] = []
 
         def failing_load(*_args: object, **_kwargs: object) -> Settings:
@@ -590,7 +586,7 @@ class TestScanCommand:
     def test_scan_blank_title_uses_the_profile_title(
         self, monkeypatch: pytest.MonkeyPatch, typed: str | None, tmp_path: Path
     ) -> None:
-        """An omitted or blank ``--title`` resolves to the profile's title (D-16)."""
+        """An omitted or blank ``--title`` resolves to the profile's title."""
         args = ["scan", "--profile", "receipt"]
         if typed is not None:
             args += ["--title", typed]
@@ -657,7 +653,7 @@ class TestScanCommand:
     def test_scan_unknown_profile_exits_2_before_title_resolution(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """An unknown profile is still refused with exit 2 and no pipeline run."""
+        """An unknown profile is refused with exit 2 and no pipeline run."""
         result, request = self._capture_title_run(
             monkeypatch, tmp_path, ["scan", "--profile", "nope"]
         )
@@ -781,7 +777,7 @@ class TestScanCommand:
     def test_scan_config_value_error_exits_5(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A bare ValueError while loading is not a saneless type -> exit 5 (D-06)."""
+        """A bare ValueError while loading is not a saneless type -> exit 5."""
         runner = CliRunner()
 
         def bad_load(*_args: object, **_kwargs: object) -> None:
@@ -803,14 +799,9 @@ class TestScanCommand:
             """
             Scanner that always raises ScanError.
 
-            The return type used to be annotated ``-> None`` against an ABC
-            whose scan_pages returns ScanBatch. That annotation was "true"
-            only because the body always raises, and the checkers had nothing
-            to compare it against because the class did not subclass the ABC
-            it was standing in for.
-
-            ``get_devices`` comes from the shared conftest stub, which answers
-            ``[]`` exactly as the local copy did.
+            It subclasses the shared conftest stub, so ``scan_pages`` is checked
+            against the ABC's ``ScanBatch`` return type even though its body only
+            raises. ``get_devices`` comes from that stub and answers ``[]``.
             """
 
             def __init__(self, host: str = "") -> None:
@@ -865,7 +856,7 @@ class TestScanCommand:
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 3
         assert "Server down" in result.output
-        # The scan is not lost when the upload is (OUTC-04), and this pins
+        # The scan is not lost when the upload is, and this pins
         # where it went: this test's own directory, not the shared one.
         preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
         assert len(preserved) == 1
@@ -893,19 +884,16 @@ class TestScanCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        WR-09: the CLI mints a job id, so a same-second rescan cannot overwrite.
+        The CLI mints a job id, so a same-second rescan cannot overwrite.
 
-        ``build_pdf_filename`` rests its whole collision argument on the job
-        id -- "uniqueness comes from the job id, not from the timestamp" -- and
-        ``saneless scan`` supplied none, so every CLI run composed
-        ``{timestamp}-{title-slug}.pdf``.  Preservation moves onto an explicit
-        destination path, which overwrites silently, so two scans of one title
-        landing in the same second destroyed one of them.
+        ``build_pdf_filename`` takes uniqueness from the job id, not from the
+        timestamp, and preservation writes to an explicit destination path that
+        overwrites silently. Without a job id two scans of one title in the same
+        second would land on one file.
 
-        The two runs are driven back to back in one second, which is the case
-        the timestamp alone cannot separate; asserting on the *files* rather
-        than on the request's ``job_id`` is what makes this a test of the
-        guarantee and not of the implementation.
+        The two runs are driven back to back in one second, and the assertion is
+        on the *files* rather than on the request's ``job_id``, so it tests the
+        guarantee rather than the implementation.
         """
 
         class FailPaperless:
@@ -948,7 +936,7 @@ _DUPLEX_PROFILE = "duplex"
 # sentence so a rewording of the tail does not break the ordering checks.
 _FLIP_PROMPT_FRAGMENT = "Flip the stack"
 
-# The one line an operator's abort at the flip prompt prints (D-03, N-08).
+# The one line an operator's abort at the flip prompt prints.
 _FLIP_CANCEL_LINE = "Manual duplex scan cancelled at the flip prompt"
 
 
@@ -1077,17 +1065,14 @@ class TestManualDuplexPrompt:
     """
     The CLI flip prompt, its non-terminal refusal, abort, and bounded wait.
 
-    Read the two halves of the TTY policy together, because they look
-    contradictory and are not.  ``CliRunner`` genuinely is not a terminal, so
-    the refusal test runs with ``_stdin_is_interactive`` *unpatched* -- it is
-    telling the truth about its environment.  The prompt tests patch that one
-    seam to ``True`` so they can reach the question at all.  Neither test
-    lies, and neither can be "simplified" into the other: without the seam, one
-    of the two could not be written.
+    ``CliRunner`` is not a terminal, so the refusal test runs with
+    ``_stdin_is_interactive`` *unpatched*; the prompt tests patch that one
+    seam to ``True`` so they can reach the question at all. Neither test can
+    be folded into the other: without the seam, one of them could not exist.
 
     The question waits for stdin to be readable before it reads a line, and
     ``CliRunner``'s stdin has no descriptor to wait on, so the prompt tests
-    also replace that one wait (``tests.prompt_support``).  The line is then
+    also replace that one wait (``tests.prompt_support``). The line is then
     read, parsed and answered for real.
     """
 
@@ -1131,7 +1116,7 @@ class TestManualDuplexPrompt:
         assert result.exit_code == 0, result.output
         assert len(calls) == 2
         assert uploads == ["uploaded"]
-        # C-02's own prescribed check: the prompt is echoed into the output,
+        # The prompt is echoed into the output,
         # and it lands after the fronts and before the backs.
         fronts = result.output.index("Scanning...")
         prompt = result.output.index(_FLIP_PROMPT_FRAGMENT)
@@ -1145,9 +1130,9 @@ class TestManualDuplexPrompt:
         Answering no cancels the scan: one line, exit 130, nothing uploaded.
 
         A no is the operator choosing to stop, so it is a cancel rather than a
-        scan error (N-08, D-02), and it exits with the shell's interrupt code
-        so a script still sees a non-zero status (D-03, D-07).  The prompt
-        itself is echoed to stdout, so the cancel line is read from stderr.
+        scan error, and it exits with the shell's interrupt code so a script
+        still sees a non-zero status. The prompt itself is echoed to stdout, so
+        the cancel line is read from stderr.
         """
         calls: list[str] = []
         uploads: list[str] = []
@@ -1175,7 +1160,7 @@ class TestManualDuplexPrompt:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        EOF (Ctrl-D) at the prompt cancels exactly as answering no does (D-03).
+        EOF (Ctrl-D) at the prompt cancels exactly as answering no does.
 
         Both are the operator's abort, so both exit 130 with the same cancel
         line, one scan pass and no upload -- the way a web Abort ends CANCELLED.
@@ -1592,8 +1577,8 @@ class TestManualDuplexPrompt:
         """
         An answer that is neither yes nor no is refused, and the question asked again.
 
-        The refusal is click's own wording, so an operator used to the old
-        prompt sees nothing new.
+        The refusal is click's own wording, the one every click confirmation
+        prompt prints.
         """
         calls: list[str] = []
         uploads: list[str] = []
@@ -2072,8 +2057,8 @@ class TestDevicesCommand:
         """
         On an 80-column terminal no line of the table is wider than 80.
 
-        A device type as long as SANE's own "multi-function peripheral" used
-        to be printed whole after three fixed columns, so every row wrapped.
+        That holds even for a device type as long as SANE's own
+        "multi-function peripheral" after three fixed columns.
         """
 
         class _LongFields(StubScannerBackend):
@@ -2164,7 +2149,7 @@ class TestDevicesCommand:
     def test_devices_capabilities_prints_a_reported_word_list(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A list-reporting device prints its exact values, as it always did."""
+        """A list-reporting device prints its exact values."""
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["devices", "--capabilities"])
@@ -2180,9 +2165,9 @@ class TestDevicesCommand:
         """
         A range-reporting device's minimum, maximum and step all reach the operator.
 
-        This is the N-01 symptom the user actually sees. The SANE ``test``
-        backend constrains resolution with ``(1.0, 1200.0, 1.0)``, which used to
-        arrive as an empty list and print a label with nothing after it.
+        The SANE ``test`` backend constrains resolution with
+        ``(1.0, 1200.0, 1.0)``; printed as a list, that range would be a label
+        with nothing after it.
         """
         runner, _ = _patch_cli(monkeypatch, scanner_cls=_RangeScanner)
 
@@ -2268,7 +2253,7 @@ class TestCliFlags:
 
 
 class TestLegacyDuplexWarningReachesLogFile:
-    """The legacy manual-duplex warning lands in the configured log file (WR-05)."""
+    """The legacy manual-duplex warning lands in the configured log file."""
 
     def test_warning_is_written_to_log_file(self, tmp_path: Path) -> None:
         """
