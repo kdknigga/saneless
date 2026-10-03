@@ -223,12 +223,12 @@ def _sigpipe_blocked_like_saneless() -> None:
 @pytest.fixture(autouse=True, scope="session")
 def _suite_leaves_cwd_config_alone() -> Iterator[None]:
     """
-    Fail the run if the suite creates or changes ``./saneless.toml`` (T-26-32).
+    Fail the run if the suite creates or changes ``./saneless.toml``.
 
-    The retired lazy auto-profile generation wrote there from inside a job, and
-    the file is gitignored, so ``git status`` after a run cannot show a stray
-    copy.  The path is fixed when the session starts, before any test changes
-    the working directory.
+    Nothing in the suite may write a config file into the working directory,
+    and the file is gitignored, so ``git status`` after a run cannot show a
+    stray copy.  The path is fixed when the session starts, before any test
+    changes the working directory.
 
     Yields:
         Nothing; the check runs after the last test.
@@ -297,13 +297,12 @@ def sane_test_backend_config(
     its libsane rows only.  It is not autouse, because a test that never
     touches libsane has no reason to carry the variable.
 
-    Session-scoped deliberately, and this is not a style choice.  It was
-    measured that ``SANE_CONFIG_DIR`` is honoured only before the first
-    ``sane.init()`` in a process, that ``sane.exit()`` followed by a re-init
-    does *not* reset it, and that backends accumulate across re-inits so the
-    developer's real scanner never leaves the device list.  The natural thing
-    to write -- a function-scoped fixture calling ``setenv`` -- was measured
-    to fail.  ``pytest.MonkeyPatch.context()`` is used here because the
+    Session-scoped deliberately, and this is not a style choice.
+    ``SANE_CONFIG_DIR`` is honoured only before the first ``sane.init()`` in a
+    process, ``sane.exit()`` followed by a re-init does *not* reset it, and
+    backends accumulate across re-inits so the developer's real scanner never
+    leaves the device list.  A function-scoped fixture calling ``setenv``
+    therefore does not work.  ``pytest.MonkeyPatch.context()`` is used here because the
     function-scoped fixture of that name is unavailable at session scope, and
     the context manager guarantees the variable is unset at session end.
 
@@ -330,7 +329,7 @@ def reset_sane_process_state() -> None:
     """
     Return SANE to "never initialised, not wedged" for the next test.
 
-    ``_INIT`` and ``_WEDGE`` are process-global by design (D-17, D-13): the
+    ``_INIT`` and ``_WEDGE`` are process-global by design: the
     first ``SaneBackend`` built in a process initialises SANE and every later
     one deliberately does not, and a read that never came back refuses the
     next scan on a *different* backend object.  Both are exactly the kind of
@@ -339,8 +338,8 @@ def reset_sane_process_state() -> None:
 
     The reset goes through the public ``shutdown()`` and not into the guard's
     own fields, because "after a shutdown a later init is allowed" is the
-    behaviour D-17 promises; reaching past it would let that promise rot while
-    the tests kept passing.
+    behaviour the backend promises; reaching past it would let that promise
+    rot while the tests kept passing.
 
     ``shutdown()`` has one documented refusal: it leaves the guard armed when a
     read is still recorded as outstanding, because ``sane_exit()`` closes every
@@ -384,7 +383,7 @@ def reset_sane_process_state() -> None:
 @pytest.fixture(autouse=True)
 def sane_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """
-    Give every test in the suite an uninitialised, unwedged SANE (D-17, D-13).
+    Give every test in the suite an uninitialised, unwedged SANE.
 
     This is suite-wide and not module-wide on purpose.  The guard is process
     state, so a single module that builds a real ``SaneBackend`` over a fake
@@ -697,9 +696,9 @@ def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """
     Give the web app a Paperless client that never leaves the process.
 
-    The web settings name ``http://localhost:8000``, so a test that submits a
-    scan used to have its worker really connect there: refused on most
-    machines, then backed off for a real one and two seconds -- and on a
+    The web settings name ``http://localhost:8000``, so without this a test
+    that submits a scan would have its worker really connect there: refused on
+    most machines, then backed off for a real one and two seconds -- and on a
     developer machine running Paperless, delivered with the test token.
 
     ``create_app`` still builds a real ``PaperlessClient``; only its transport
@@ -771,12 +770,12 @@ def scan_batch(
     Build a ScanBatch for a stubbed scanner.
 
     ``scan_pages`` returns a record rather than yielding, so a stub handing back
-    ``iter([...])`` no longer models the backend at all -- and because a
+    ``iter([...])`` does not model the backend at all -- and because a
     ``MagicMock`` will return whatever it is given, that mismatch surfaces as a
     confusing failure deep in the pipeline rather than at the stub.
 
     ``pages`` is the ordered ``PageRecord`` tuple a sink produced, not a list of
-    images (D-01). A test that only needs "a scan happened" should not hand-build
+    images. A test that only needs "a scan happened" should not hand-build
     records for this: ``spooling`` runs real pages through the caller's own sink
     and the records come back from there, so the spooled files behind them
     actually exist.
@@ -817,7 +816,7 @@ def spooling(
     cap_reached: PassCapReached | None = None,
 ) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
     """
-    Build the ``side_effect`` a stubbed ``scan_pages`` needs (D-01).
+    Build the ``side_effect`` a stubbed ``scan_pages`` needs.
 
     A factory returning a callable, rather than a ready-made batch for
     ``return_value``, because the sink does not exist until the call happens:
@@ -829,7 +828,7 @@ def spooling(
     The same argument ``scan_batch`` records still applies to the shape of the
     stub itself: a ``MagicMock`` returns whatever it is given, so a stub that
     does not model the backend surfaces as a confusing failure deep in the
-    pipeline rather than at the stub. Modelling the backend now means taking
+    pipeline rather than at the stub. Modelling the backend means taking
     the sink and filling it.
 
     Args:
@@ -878,7 +877,7 @@ def spooling_in_turn(
     itself is callable, and a *list* is consumed as an iterable of results, so
     each element is handed back as-is. A list of functions would therefore make
     ``scan_pages`` return a function object, and the failure lands wherever the
-    pipeline first treats it as a batch (29-RESEARCH.md Pitfall 5). The
+    pipeline first treats it as a batch. The
     in-repo precedent is ``tests/test_worker.py``'s ``_PassBGatedScanner``,
     which tracks ``scan_calls`` on itself for the same reason.
 
@@ -916,14 +915,13 @@ def images_of(batch: ScanBatch) -> list[Image.Image]:
     """
     Read a batch's spooled pages back, in record order.
 
-    The pages a scan produced are files now, so an assertion about what was
-    scanned has to open them. This is the one place that happens, so an
-    existing image assertion survives the record switch by being handed
-    ``images_of(batch)`` instead of ``batch.pages`` -- a one-line change per
-    site rather than a rewrite.
+    The pages a scan produced are files, so an assertion about what was
+    scanned has to open them. This is the one place that happens: an image
+    assertion is handed ``images_of(batch)`` rather than ``batch.pages``.
 
     Order comes from the record list and nothing else: the directory is never
-    sorted or globbed, which is the invariant HARD-01's own test attacks (D-02).
+    sorted or globbed, so a scan whose files sort differently from their page
+    order still reads back in page order.
 
     Args:
         batch: The batch whose spooled pages to read.
@@ -952,15 +950,12 @@ class StubScannerBackend(ScannerBackend):
     ``get_capabilities`` are the same everywhere. They live here so a subclass
     overrides the one method it cares about.
 
-    Subclasses the ABC rather than duck-typing it, for the reason Phase 24's
-    WR-08 measured and ``tests/test_cli.py``'s ``MockSaneBackend`` records:
-    every stub that subclassed was caught by the type checkers when its
-    contract changed, and the ones that did not were missed. This phase is
-    exactly such a contract change, which is what makes the point again.
+    Subclasses the ABC rather than duck-typing it, so the type checkers catch
+    a stub that falls out of step with the backend contract.
 
     Import it as ``from tests.conftest import StubScannerBackend``; the bare
-    ``conftest`` form raises ``ModuleNotFoundError`` under pytest 9's importlib
-    mode.
+    ``conftest`` form raises ``ModuleNotFoundError``, because ``tests/`` is a
+    package, so pytest's default prepend mode imports it as ``tests.*``.
     """
 
     def get_devices(self) -> list[DeviceInfo]:
@@ -1015,14 +1010,13 @@ class AlwaysContinueFlipCoordinator(FlipCoordinator):
     flip wait itself.  A manual-duplex request has to carry a coordinator, and
     this one answers ``CONTINUED`` at once, so pass B starts straight away.
 
-    Subclasses the ABC rather than duck-typing it, for the reason Phase 24's
-    WR-08 measured and ``tests/test_cli.py``'s ``MockSaneBackend`` records:
-    every stub that subclassed was caught by the type checkers when its
-    contract changed, and the ones that did not were missed.
+    Subclasses the ABC rather than duck-typing it, so the type checkers catch
+    a coordinator that falls out of step with the contract.
 
     Import it as ``from tests.conftest import AlwaysContinueFlipCoordinator``;
-    the bare ``conftest`` form raises ``ModuleNotFoundError`` under pytest 9's
-    importlib mode.
+    the bare ``conftest`` form raises ``ModuleNotFoundError``, because
+    ``tests/`` is a package, so pytest's default prepend mode imports it as
+    ``tests.*``.
     """
 
     def wait_for_flip(self, timeout: float) -> FlipOutcome:
@@ -1151,10 +1145,10 @@ def _wait_for_state_fixture() -> Callable[..., Job]:
     """
     Hand the wait_for_state helper to a test module.
 
-    pytest 9 imports test modules in ``importlib`` mode, so ``tests/`` never
-    lands on ``sys.path`` and ``from conftest import wait_for_state`` raises
-    ``ModuleNotFoundError``.  A fixture is the supported route for a conftest
-    helper, and it is the only one that also keeps ty and pyrefly happy.
+    ``tests/`` is a package, so pytest's default prepend mode imports it as
+    ``tests.*`` and ``from conftest import wait_for_state`` raises
+    ``ModuleNotFoundError``.  A test module takes the helper either from this
+    fixture or as ``from tests.conftest import wait_for_state``.
 
     Returns:
         The wait_for_state function itself, uncalled.
@@ -1200,8 +1194,9 @@ def _poll_until_fixture() -> Callable[..., bool]:
     """
     Hand the poll_until helper to a test module.
 
-    A fixture for the same reason as ``wait_for_state``: test modules cannot
-    import from conftest by name under pytest 9's importlib mode.
+    A fixture for the same reason as ``wait_for_state``: ``tests/`` is a
+    package, so pytest's default prepend mode imports it as ``tests.*``, and a
+    test module takes the helper from this fixture or from ``tests.conftest``.
 
     Returns:
         The poll_until function itself, uncalled.
@@ -1381,8 +1376,8 @@ def _flatten_routes(routes: Sequence[BaseRoute]) -> list[BaseRoute]:
 
     Selection is by ``isinstance``, never by probing for the attribute: a
     ``getattr`` defaulting to ``None`` when ``original_router`` is missing
-    would silently return nothing the moment that attribute were renamed while
-    the wrapper survived, which is exactly the hole the raise in
+    would silently return nothing if that attribute went away while the
+    wrapper remained, which is exactly the hole the raise in
     ``leaf_routes`` exists to close.  The private class is imported when the
     routes are walked, so its disappearance fails the tests that walk routes,
     loudly, without stopping the rest of the suite from importing this module.
