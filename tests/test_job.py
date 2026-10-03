@@ -88,11 +88,11 @@ V3_COLUMNS = (("pages_removed_at", "TEXT"),)
 """The one column migration step 3 adds, spelled out independently of job.py."""
 
 PUBLIC_METHOD_FLOOR = 7
-"""The number of public JobStore methods that exist today.
+"""The fewest methods the structural lock tests may find.
 
-A floor, not a roster.  The reflective lock-coverage test asserts the
-enumeration found at least this many, so a predicate that silently matches
-nothing -- the way a reflective test quietly dies -- cannot pass.
+A floor, not a roster.  The lock-coverage and nested-transaction tests assert
+their enumerations found at least this many, so a predicate that silently
+matches nothing -- the way a reflective test quietly dies -- cannot pass.
 """
 
 STRESS_ROUNDS = 200
@@ -157,10 +157,10 @@ SAFE_AGE_DAYS = 365
 """An age bound generous enough that a prune under it deletes nothing by age."""
 
 CONCURRENT_ROWS = 20
-"""Jobs the concurrent prune tests insert before racing a create_job against prune."""
+"""Jobs the prune trace test inserts before pruning down to CONCURRENT_MAX_ROWS."""
 
 CONCURRENT_MAX_ROWS = 5
-"""The row cap the concurrent prune tests prune against -- below CONCURRENT_ROWS."""
+"""The row cap the prune trace test prunes against -- below CONCURRENT_ROWS."""
 
 TRANSACTION_VERBS = frozenset(
     {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"}
@@ -303,13 +303,12 @@ CREATE_JOB_PARAMETERS = (
     "correspondent",
     "owner_token",
 )
-"""The exact parameter tuple ``JobStore.create_job`` is pinned to (APPL-09).
+"""The exact parameter tuple ``JobStore.create_job`` is pinned to.
 
 Five non-``self`` parameters is ruff's ``PLR0913`` ceiling, and this project
 adds no suppressions.  Spelled out here so a sixth parameter cannot be added
 without editing a constant whose docstring says why it may not be, and so
-``thumbnail`` cannot be silently restored to the slot ``owner_token`` now holds
-(RESEARCH Pitfall 5).
+``thumbnail`` cannot be silently put back in the slot ``owner_token`` holds.
 """
 
 OWNER_TOKEN = "owner-token-4NcRfUjXn2r5u8x_A?D(G+KbPeShVmYq"
