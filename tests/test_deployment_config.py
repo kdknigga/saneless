@@ -2751,8 +2751,8 @@ def test_every_readme_docs_link_resolves_to_a_page() -> None:
     assert not offenders, (
         "a README documentation link points at a path with no page behind it, "
         "so the reader lands on a 404. The expectation is the docs/ tree "
-        "itself rather than a hard-coded list, so a page renamed in a later "
-        "phase cannot leave a dead link on the front page:\n" + "\n".join(offenders)
+        "itself rather than a hard-coded list, so a renamed page cannot leave "
+        "a dead link on the front page:\n" + "\n".join(offenders)
     )
 
 
@@ -4969,7 +4969,7 @@ def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
         )
     assert not offenders, (
         "a tracked Python file silences a checker with a suppression comment, "
-        "which CLAUDE.md and CONTRIBUTING.md both forbid. Fix what the checker "
+        "which CONTRIBUTING.md forbids. Fix what the checker "
         "reported, at source, or change the rule set deliberately in "
         "pyproject.toml where the whole project can see it. Remove the comment "
         "from each line below:\n" + "\n".join(offenders)
