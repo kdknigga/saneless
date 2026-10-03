@@ -22,6 +22,7 @@ from html.parser import HTMLParser
 from typing import TYPE_CHECKING, override
 
 from saneless.web.app import STATIC_DIR, TEMPLATE_DIR
+from tests.template_support import template_markup, template_start_tags
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -115,6 +116,29 @@ def _stylesheet_rules(
     return rules
 
 
+_EXTERNAL_URL = re.compile(r"https?://", re.IGNORECASE)
+
+
+class _TextCollector(HTMLParser):
+    """Collect the text content of an HTML document, leaving comments out."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.chunks: list[str] = []
+
+    @override
+    def handle_data(self, data: str) -> None:
+        self.chunks.append(data)
+
+
+def _rendered_text(path: Path) -> str:
+    """Return the text a template's markup renders, without Jinja or comments."""
+    collector = _TextCollector()
+    collector.feed(template_markup(path.read_text(encoding="utf-8")))
+    collector.close()
+    return "".join(collector.chunks)
+
+
 def sri_sha384(data: bytes) -> str:
     """Return the Subresource Integrity string for ``data`` using SHA-384."""
     digest = hashlib.sha384(data).digest()
@@ -172,13 +196,17 @@ def test_vendored_file_sizes() -> None:
 
 
 def test_templates_reference_no_external_url() -> None:
-    """No template contains an http:// or https:// URL, so no internet is needed."""
+    """No template renders an http:// or https:// URL, so no internet is needed."""
     templates = sorted(TEMPLATE_DIR.rglob("*.html"))
     assert templates
     for template in templates:
-        text = template.read_text(encoding="utf-8")
-        assert "http://" not in text, f"{template} references http://"
-        assert "https://" not in text, f"{template} references https://"
+        for tag, attrs in template_start_tags(template):
+            for name, value in attrs.items():
+                assert not _EXTERNAL_URL.search(value or ""), (
+                    f"{template}: <{tag} {name}={value!r}>"
+                )
+        text = _rendered_text(template)
+        assert not _EXTERNAL_URL.search(text), f"{template} renders an external URL"
 
 
 def test_licence_notices_present() -> None:
