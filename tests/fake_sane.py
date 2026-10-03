@@ -1,9 +1,8 @@
 """
 One faithful double for python-sane 2.9.2, shared by every test that needs one.
 
-This module exists because hand-written doubles disagreed with the real library
-and with each other, and each disagreement let a shipped defect earn a green
-test.  The specification is not this docstring: it is
+A double that disagrees with the real library lets a defect earn a green test,
+so every test shares this one, and it is held to the library.  The specification is not this docstring: it is
 ``tests/test_fake_sane_contract.py``, which runs each rule below against this
 double and against the real SANE ``test:0`` backend in the same parametrised
 row, so a rule the double gets wrong turns red there.  python-sane's own
@@ -65,15 +64,14 @@ that branch is exercisable.  Either way a group raises ``AttributeError``; only
 the message differs.
 
 ``narrow_resolution_for_source`` models the option-reload *hazard* rather than
-a measured device.  ``sane.py`` reloads every option descriptor when a
+one particular device.  ``sane.py`` reloads every option descriptor when a
 ``set_option`` reports ``INFO_RELOAD_OPTIONS``, which a source change does, so a
 resolution accepted against the platen's range can be left standing against a
 feeder's narrower one.  The knob swaps in the narrower range on a source
 assignment and deliberately does **not** re-validate the value already stored,
 which is precisely what makes assignment ordering observable.  The SANE
-``test`` backend was measured **not** to behave this way, so this hazard
-cannot be reproduced against real hardware and is modelled here on purpose
-rather than discovered there.
+``test`` backend does **not** behave this way, so this hazard cannot be
+reproduced against it and is modelled here on purpose.
 """
 
 from __future__ import annotations
@@ -165,9 +163,9 @@ _INVALID_ARGUMENT = "Invalid argument"
 _SANE_FIXED_TYPE_ERROR = "SANE_FIXED requires a floating point number"
 _SANE_INT_TYPE_ERROR = "SANE_INT and SANE_BOOL require an integer"
 
-# Realistic constraints.  The long feeder name is one a real device reports and
-# code has mishandled, and resolution is a range because code has shipped that
-# only understood a list.
+# Realistic constraints.  The long feeder name is one a real device reports,
+# and resolution is a range, so code that only understands a list of
+# resolutions fails against the default table.
 _DEFAULT_SOURCES = ["Flatbed", "Automatic Document Feeder", "ADF Duplex"]
 _DEFAULT_MODES = ["Color", "Gray", "Lineart"]
 _DEFAULT_RESOLUTION_RANGE = (1.0, 1200.0, 1.0)
@@ -223,8 +221,8 @@ _READ_GATE_CEILING_SECONDS = 30.0
 
 # The denominator that makes a post-cancel page truncated rather than absent.
 #
-# Measured on real libsane: a cancelled ``snap()``
-# returns a *truncated image* rather than raising -- 3779x242 of a full page,
+# On real libsane a cancelled ``snap()`` can
+# return a *truncated image* rather than raising -- 3779x242 of a full page,
 # which clears the backend's 10 KB floor and would be spooled by any code that
 # used a late value.  A quarter of the default 200x300 page is 200x75, i.e.
 # 45,000 bytes of RGB data, which clears that same floor for the same reason.
@@ -270,13 +268,13 @@ class ReadBlockMode(StrEnum):
     """
     How an Event-gated read ends, and whether ``cancel()`` ends it at all.
 
-    The three variants are the three things real libsane was measured or read
-    to do when a read is cancelled, and a test double that offered only one of
-    them would let the backend's timeout path look correct on the other two.
+    The three variants are the three things real libsane can do when a read
+    is cancelled, and a test double that offered only one of them would let
+    the backend's timeout path look correct on the other two.
     """
 
-    # cancel() releases the gate and the read returns a truncated page -- the
-    # measured behaviour, and the one the backend must refuse to spool.
+    # cancel() releases the gate and the read returns a truncated page -- what
+    # real libsane does, and the page the backend must refuse to spool.
     PARTIAL = "partial"
     # cancel() releases the gate and the read raises, as a backend reporting a
     # status that is neither GOOD nor EOF does.
@@ -451,12 +449,10 @@ def build_option_table(
     reach: ``FakeSaneDev.__init__`` already carries ruff's maximum of five
     arguments (``PLR0913``), and this project forbids suppressing the rule.
 
-    ``omit`` exists for the crop fallback.  A device whose option list does not
-    mention the geometry options is the case the old geometry-less double
-    claimed to model and got backwards: the real library *stores* ``dev.br_y``
-    on such a device rather than raising, so an omitted option table is the
-    only way to reproduce the condition that makes the crop fallback
-    reachable.
+    ``omit`` exists for the crop fallback.  On a device whose option list does
+    not mention the geometry options, the real library *stores* ``dev.br_y``
+    rather than raising, so an omitted option table is the only way to
+    reproduce the condition that makes the crop fallback reachable.
 
     ``geometry_unit`` exists for the unit conversion.  The unit lives at index
     5 of the option tuple, and a backend is free to report its scan area in
@@ -467,13 +463,13 @@ def build_option_table(
         geometry_range: The ``(min, max, step)`` constraint shared by the four
             geometry options.
         geometry_unit: The SANE unit code the geometry options report at index
-            5.  Defaults to ``UNIT_MM``, which is what real hardware was
-            measured reporting.
+            5.  Defaults to ``UNIT_MM``, which is what real hardware
+            reports.
         omit: Hyphenated option names to leave out of the table entirely, as a
             device lacking them would report it.
         geometry_settable: When False the geometry options are still reported
-            but are marked not software-settable, so assigning one raises the
-            measured ``AttributeError`` instead of storing the value.
+            but are marked not software-settable, so assigning one raises
+            python-sane's ``AttributeError`` instead of storing the value.
         geometry_type: The SANE value type the geometry options report at
             index 4: ``TYPE_FIXED``, the default, or ``TYPE_INT``, which some
             backends use for a scan area in pixels.  An integer option's
@@ -877,7 +873,7 @@ def _fixed_words(constraint: object) -> object:
 
 def _reject_unsettable(option: tuple, key: str) -> None:
     """
-    Raise the measured ``AttributeError`` for an option that cannot be set.
+    Raise python-sane's ``AttributeError`` for an option that cannot be set.
 
     Args:
         option: The nine-element option tuple.
@@ -905,7 +901,7 @@ def _reject_unsettable(option: tuple, key: str) -> None:
 
 def _reject_unreadable(option: tuple, key: str) -> None:
     """
-    Raise the measured ``AttributeError`` for an option that cannot be read.
+    Raise python-sane's ``AttributeError`` for an option that cannot be read.
 
     Reads do not check settability -- a read-only option reads back fine.
 
@@ -972,7 +968,7 @@ def _page_image(index: int, size: tuple[int, int] = _DEFAULT_PAGE_SIZE) -> Image
     Build one page with enough variance to survive page validation.
 
     Args:
-        index: Zero-based page number, used to make pages distinguishable.
+        index: Zero-based page number, which makes pages distinguishable.
         size: The ``(width, height)`` pixel size of the page.
 
     Returns:
@@ -1056,23 +1052,23 @@ class FakeSaneDev:
     A SANE device that behaves like the real one, and the state its handles share.
 
     ``FakeSaneModule.open()`` wraps it in a :class:`FakeSaneHandle`; a test
-    can also drive it directly, as a handle that is never closed.  Configure it through the constructor rather than by subclassing, so that a
-    later plan can narrow a constraint or arm an error without creating a
-    fourth divergent double.
+    can also drive it directly, as a handle that is never closed.  Configure
+    it through the constructor and its arming methods rather than by
+    subclassing, so a test can narrow a constraint or arm an error without
+    creating a divergent double of its own.
     """
 
     # The options the default table serves, declared with the types the real
     # device hands them back as.
     #
     # These are annotations only: no value is assigned, so attribute lookup
-    # still falls through to __getattr__ at runtime and the dynamic behaviour is
-    # completely unchanged.  Declaring them is what lets the fake be passed to
-    # production code that expects the ``SaneDevice`` protocol.  The real
-    # python-sane object serves these through __getattr__ too, so a purely
-    # structural check against it can never succeed -- and the three deleted
-    # doubles satisfied the protocol only by declaring concrete attributes the
-    # real library does not have: a fake kinder than the library, in
-    # miniature.
+    # still falls through to __getattr__ at runtime, as on the real device.
+    # Declaring them is what lets the fake be passed to production code that
+    # expects the ``SaneDevice`` protocol.  The real python-sane object serves
+    # these through __getattr__ too, so a purely structural check against it
+    # can never succeed.  Concrete attributes would satisfy the protocol only
+    # by giving the fake attributes the real library does not have: a fake
+    # kinder than the library.
     mode: str
     resolution: float
     source: str
@@ -1140,7 +1136,7 @@ class FakeSaneDev:
                 ``start_error`` fires.
             geometry_range: The ``(min, max, step)`` constraint for the four
                 geometry options.  The default admits A4; pass
-                ``(0.0, 200.0, 1.0)`` to reproduce ``test:0``'s measured clamp.
+                ``(0.0, 200.0, 1.0)`` to reproduce ``test:0``'s clamp.
 
         """
         state = self.__dict__
@@ -1330,7 +1326,7 @@ class FakeSaneDev:
             )
 
     def _cancel_ended(self) -> None:
-        """Count a cancel as no longer in flight."""
+        """Count a cancel as finished, so it is not in flight."""
         with self._cancel_count_lock:
             self.__dict__["_cancels_in_flight"] = self._cancels_in_flight - 1
 
@@ -1365,8 +1361,8 @@ class FakeSaneDev:
         Build the partial page a cancelled read hands back.
 
         Full width, a fraction of the height, and still above the backend's
-        byte floor -- see ``_TRUNCATED_PAGE_DIVISOR`` for the measurement this
-        models.  Mode ``RGB``, like every other page this fake produces, so the
+        byte floor -- see ``_TRUNCATED_PAGE_DIVISOR`` for the libsane behaviour
+        this models.  Mode ``RGB``, like every other page this fake produces, so the
         backend's byte-count arithmetic stays exact.
 
         Returns:
@@ -1421,8 +1417,7 @@ class FakeSaneDev:
         referent has been collected answers ``None``, so what is counted is
         exactly the pages something else is still holding.
 
-        Two measured facts decided the mechanism, and neither is a style
-        preference:
+        Two facts about the instruments fix the mechanism:
 
         1. ``weakref``'s hash-based *set* container cannot hold Pillow images.
            ``Image`` defines ``__eq__`` without ``__hash__``, so it is
@@ -1884,11 +1879,11 @@ class FakeSaneDev:
         Composed from attribute reads, exactly as ``sane.py:220`` does, so a
         device whose option table omits the geometry options raises
         ``AttributeError("No such attribute: tl_x")``.  Reading ``_values``
-        directly raised ``KeyError`` instead -- an exception the real library
-        never raises here, and precisely the species of quiet divergence this
-        module exists to eliminate.  No production path reaches it today,
-        because ``_set_geometry`` checks presence before reading ``area``, but
-        that ordering is a property of today's code rather than a guarantee.
+        directly would raise ``KeyError`` instead -- an exception the real
+        library never raises here, and precisely the species of quiet
+        divergence this module exists to eliminate.  ``_set_geometry`` checks
+        presence before reading ``area``, but the fake does not rely on that
+        ordering.
 
         Returns:
             The ``((tl_x, tl_y), (br_x, br_y))`` box.
@@ -1985,7 +1980,7 @@ class FakeSaneDev:
 
         Raises:
             BaseException: The configured ``start_error`` at its page index.
-            FakeSaneError: Carrying the measured end-of-feed message once the
+            FakeSaneError: Carrying python-sane's end-of-feed message once the
                 page budget is exhausted.
 
         """
@@ -1993,8 +1988,9 @@ class FakeSaneDev:
         # The armed error is checked before the page budget so that arming it
         # at the index one past the last page -- the end-of-feed probe -- is
         # reachable at all.  With the budget first, ``FakeSaneDev(pages=3,
-        # start_error=..., start_error_page=3)`` never fired: the test quietly
-        # became a clean-feed test rather than failing as a misconfiguration.
+        # start_error=..., start_error_page=3)`` would never fire, and the test
+        # would quietly become a clean-feed test rather than failing as a
+        # misconfiguration.
         if self._start_error is not None and self._page_index == self._start_error_page:
             raise self._start_error
         if self._page_index >= self._pages:
@@ -2447,8 +2443,7 @@ class FakeSaneModule:
         ``sane_exit`` closes every handle that is still open **and** runs
         holding the GIL, so calling it while a read is outstanding is the same
         hazard as ``close()`` and then some.  ``exit_while_blocked`` records
-        it; ``exit_call_count`` keeps the meaning the shutdown assertions
-        already read it with, unchanged.
+        it; ``exit_call_count`` counts every call, blocked or not.
         """
         if self._device.read_is_blocked():
             self.exit_while_blocked = True

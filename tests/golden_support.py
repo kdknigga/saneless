@@ -32,10 +32,9 @@ metadata, reaching paperless-ngx exactly once:
   ``loopback_paperless(answer_gate=...)`` reads a whole upload, then holds its
   answer until the gate is set, as a paperless-ngx that answers late does.
 
-Import it as ``from tests.golden_support import ...``; the bare
-``golden_support`` form raises ``ModuleNotFoundError`` under pytest 9's
-importlib mode, for the same reason ``tests.conftest`` is imported by its
-package path.
+``tests/`` is a package, so pytest's default prepend mode imports it as
+``tests.*``, and the helper is imported by that package name.  Import it as
+``from tests.golden_support import ...``.
 """
 
 from __future__ import annotations

@@ -1,12 +1,12 @@
 """
 Synthetic scanned pages for the blank-page detector's verdict tests.
 
-The pages follow the cases the code review gave for blank-page detection: a
-page carrying nothing but a footer page number, a lone small digit, faint
-pencil, one typed line, a highlighter stroke, a dark "reverse text" cover,
-and the blanks that must still go -- a tinted, noisy sheet, a sheet with a
-few dust specks and a sheet framed by a dark border or backing.  Real paper
-is a follow-up; these are the stand-ins until then.
+The pages cover the hard cases for blank-page detection: a page carrying
+nothing but a footer page number, a lone small digit, faint pencil, one typed
+line, a highlighter stroke, a dark "reverse text" cover, and the blanks that
+must still go -- a tinted, noisy sheet, a sheet with a few dust specks and a
+sheet framed by a dark border or backing.  They stand in for real scanned
+paper.
 
 Each builder returns a fresh A4 page at 300 dpi (2480 x 3508) unless its
 ``dpi`` keyword says otherwise.  Every page but the highlighter and the
@@ -31,10 +31,9 @@ A4 page costs milliseconds, and nothing is cached between tests.
 - ``highlighter_stroke``: an RGB page whose only mark is a yellow band.
 - ``reverse_text_cover``: white type on a solid dark page.
 
-Import it as ``from tests.blank_fixtures import ...``; the bare
-``blank_fixtures`` form raises ``ModuleNotFoundError`` under pytest 9's
-importlib mode, for the same reason ``tests.conftest`` is imported by its
-package path.
+``tests/`` is a package, so pytest's default prepend mode imports it as
+``tests.*``, and the helper is imported by that package name.  Import it as
+``from tests.blank_fixtures import ...``.
 """
 
 from __future__ import annotations
