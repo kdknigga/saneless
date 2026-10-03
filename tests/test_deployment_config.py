@@ -6613,11 +6613,11 @@ def test_the_sbom_step_pins_the_syft_it_runs_and_withholds_the_token() -> None:
     The SBOM step names the syft release it runs and passes it no token.
 
     The action's SHA pin covers the action's own code, not the syft binary it
-    downloads at run time from a release tag. Naming an exact release tag
-    (one that was checked to be immutable when it was chosen) fixes those
-    bytes; leaving the input out hands the choice to whatever default the
-    action ships. syft inherits the action's environment, inputs included,
-    and this step uploads nothing, so it gets no GitHub token.
+    downloads at run time from a release tag. Naming an exact, immutable
+    release tag fixes those bytes; leaving the input out hands the choice to
+    whatever default the action ships. syft inherits the action's
+    environment, inputs included, and this step uploads nothing, so it gets
+    no GitHub token.
     """
     sboms = _steps_using(_release_job("publish-docker"), SBOM_ACTION)
     assert len(sboms) == 1, f"publish-docker has no single {SBOM_ACTION} step"
@@ -6883,7 +6883,7 @@ def test_every_remote_hook_repo_is_pinned_to_a_frozen_commit() -> None:
     prek clones a remote hook repo at its ``rev:`` and runs the code there
     with the developer's or the runner's privileges. A tag is a name its owner
     can move, so a compromised upstream account could hand every checkout new
-    code under the old version. A full commit SHA cannot be moved, and the
+    code under the same version. A full commit SHA cannot be moved, and the
     ``# frozen: vX.Y.Z`` comment keeps the pin readable and is what Dependabot
     rewrites together with the SHA.
     """
@@ -6945,10 +6945,9 @@ def test_the_hook_file_has_no_sync_with_uv_hook() -> None:
     No hook rewrites a frozen remote rev back to a tag.
 
     ``sync-with-uv`` sets each remote hook's rev to the version ``uv.lock``
-    holds. Run against a frozen pin it replaced the SHA with the tag and left
-    the ``# frozen:`` comment behind, so the file claimed a pin it no longer
-    had. ruff, the one tool it kept in step, now runs from the lock through
-    local hooks, so the syncing hook has nothing left to do.
+    holds. On a frozen pin that replaces the SHA with the tag and leaves the
+    ``# frozen:`` comment claiming a pin the file lacks. ruff runs from the
+    lock through local hooks, so there is nothing for the hook to keep in step.
     """
     repos = [
         repo
@@ -7033,8 +7032,8 @@ jobs:
     steps:
       - run: {test_run}
 """
-# The lint job as it was before the hook file became the gate: each checker
-# its own step, the commit stage alone, and no push stage.
+# A lint job that runs each checker as its own step and the hook file at its
+# commit stage alone, with no push stage.
 _SEEDED_OLD_LINT_STEPS = """\
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -7047,7 +7046,7 @@ _SEEDED_OLD_LINT_STEPS = """\
 def test_the_ci_lint_scan_reports_direct_checkers_and_missing_stages(
     tmp_path: Path,
 ) -> None:
-    """The old separate-steps shape is reported; the hook-file shape is not."""
+    """Separate checker steps are reported; a lint job running the hook file is not."""
     old = tmp_path / "old.yml"
     old.write_text(
         _SEEDED_CI.format(
@@ -7229,7 +7228,7 @@ def test_the_anchor_validation_reader_reports_anything_but_warn(text: str) -> No
 
 
 # ---------------------------------------------------------------------------
-# Phase 37: the repository-wide sweep guard (CFG-05, D-13)
+# The repository-wide sweep for the legacy config file name
 # ---------------------------------------------------------------------------
 
 # The lines allowed to name the superseded config filename without also naming
@@ -7258,15 +7257,13 @@ _LEGACY_NAME_ALLOWED_LINES: frozenset[tuple[str, str]] = frozenset(
 
 def test_no_shipped_file_names_the_legacy_config_file() -> None:
     """
-    No tracked file outside ``.planning/`` names the old config file (D-13).
+    No tracked file outside the planning directory names the legacy config file.
 
-    The sweep is total because a half-swept tree is worse than an unswept one:
-    a reader who meets the old name on one page and the new name on another
-    has no way to tell which is stale. A line may still carry the old name
-    when it also carries the new one, because such a line is a rename
-    instruction rather than a leftover -- which is how the upgrade sections
-    are written. Anything else is an offender unless it appears verbatim in
-    ``_LEGACY_NAME_ALLOWED_LINES``.
+    A half-swept tree is worse than an unswept one: a reader who meets the
+    legacy name on one page and the current name on another cannot tell which
+    is stale. A line naming both is a rename instruction, the way the upgrade
+    sections are written, and passes. Anything else is an offender unless it
+    appears verbatim in ``_LEGACY_NAME_ALLOWED_LINES``.
     """
     offenders: list[str] = []
     for name in _shipped_files():
@@ -7299,7 +7296,7 @@ def test_no_shipped_file_names_the_legacy_config_file() -> None:
 
 def test_legacy_name_allowlist_entries_still_exist() -> None:
     """
-    Every allowlisted line is still present, verbatim, in the file it names.
+    Every allowlisted line is present, verbatim, in the file it names.
 
     Without this the allowlist rots into a silent pass: the guard above only
     ever *subtracts*, so an entry whose line was reworded, moved or deleted
