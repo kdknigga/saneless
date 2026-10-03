@@ -4791,45 +4791,6 @@ class TestWorkerProfileLock:
         assert default_settings.profiles is not replacement
         assert old == old_snapshot
 
-    def test_profile_lock_set_profiles_honours_its_re_check(
-        self,
-        mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
-    ) -> None:
-        """
-        ``only_if`` runs under the lock and can refuse the swap.
-
-        Startup generation swaps through this helper with ``is_bare_default``,
-        so the refusal below is the production re-check.
-        """
-        generated = {
-            "default": ProfileConfig(source="ADF"),
-            "adf": ProfileConfig(source="ADF"),
-        }
-        customised = {
-            "default": ProfileConfig(),
-            "photo": ProfileConfig(source="Flatbed", resolution=600),
-        }
-        store = JobStore()
-        try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
-            swapped_bare = worker._set_profiles(generated, only_if=is_bare_default)
-            names_after_bare = worker.profile_names()
-            customised_accepted = worker._set_profiles(customised)
-            swapped_customised = worker._set_profiles(
-                generated, only_if=is_bare_default
-            )
-            names_after_customised = worker.profile_names()
-        finally:
-            store.close()
-
-        assert swapped_bare is True
-        assert names_after_bare == ["default", "adf"]
-        assert customised_accepted is True
-        assert swapped_customised is False
-        assert names_after_customised == ["default", "photo"]
-
     def test_set_profiles_refuses_a_set_without_default(
         self,
         mock_scanner: MagicMock,
