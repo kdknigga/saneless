@@ -1,24 +1,15 @@
 """
 The one health-check registry both surfaces read.
 
-Covers requirements: APPL-01, APPL-02, APPL-06, APPL-07, APPL-11.
+``saneless doctor`` and the web status strip report the same checks with the
+same words, because ``checks.py`` owns one registry and both surfaces iterate
+``CheckKey``.  Every vocabulary case is parametrised over ``list(CheckKey)``
+and ``list(CheckState)``, so a seventh check or a fourth state cannot be added
+without a decision here.
 
-``saneless doctor`` and the web status strip are required to report the *same*
-checks with the *same* words (D-02).  Nothing mechanical enforces that if each
-surface owns its own list, so ``checks.py`` owns one registry and both surfaces
-iterate ``CheckKey``.  These tests are what makes that a fact rather than a
-convention: every vocabulary case is parametrised over ``list(CheckKey)`` and
-``list(CheckState)``, so a seventh check or a fourth state cannot be added
-without forcing a decision here -- the discipline
-``tests/test_vocabulary.py`` already applies to the lookup functions and
-``tests/test_web_state_rendering.py`` applies to the templates.
-
-The saned pre-probe is tested against real loopback sockets.  It has no analog
-anywhere in the tree: libsane's listing is a blocking C call with no timeout
-of its own, and the listing child's deadline bounds it only by abandoning it,
-so this socket probe is what finds a dead host quickly and is therefore
-treated as new code rather than as a variation on something already proven.
-No test here sleeps.
+The saned pre-probe is tested against real loopback sockets: libsane's listing
+is a blocking C call with no timeout of its own, so this socket probe is what
+finds a dead host quickly.  No test here sleeps.
 """
 
 from __future__ import annotations
@@ -113,7 +104,7 @@ _PROBE_BUDGET = 0.5
 _REAL_TOKEN = "a-real-looking-token"
 
 # The only three strings a check row is allowed to spell a filesystem path
-# with (Phase 37 D-14).  They are built from the config constants so this file
+# with.  They are built from the config constants so this file
 # never holds the superseded name on its own, and they are the exception the
 # V7 guard below carves out -- one row, one field, two states, three constants.
 # Longest first, so stripping them from a string cannot leave a shorter one's
@@ -253,26 +244,25 @@ def _result(state: CheckState, key: CheckKey = CheckKey.SCANNER) -> CheckResult:
 
 
 class TestCheckVocabulary:
-    """The enums and their four presentation lookups are total (D-01, D-02)."""
+    """The enums and their four presentation lookups are total."""
 
     def test_check_state_has_exactly_three_members(self) -> None:
         """
-        Three states, no more (D-01).
+        There are three check states, no more.
 
-        A fourth state would have to be given an exit code, a glyph, a colour
-        class and a screen-reader label, and ``doctor``'s "non-zero on FAIL
-        only" rule would have to be re-decided.  The count is asserted so that
-        happens deliberately.
+        A fourth state would need an exit code, a glyph, a colour class and a
+        screen-reader label, and ``doctor``'s "non-zero on FAIL only" rule
+        would need deciding again, so adding one has to be deliberate.
         """
         assert len(list(CheckState)) == 3
         assert set(CheckState) == {CheckState.OK, CheckState.WARN, CheckState.FAIL}
 
     def test_check_key_has_exactly_six_members(self) -> None:
         """
-        Six checks, and this enum is the contract that both surfaces see them.
+        There are six checks, and this enum is how both surfaces see them.
 
-        D-02: neither ``saneless doctor`` nor the status strip may hold a check
-        the other does not have.  Both iterate ``CheckKey``, so the only way to
+        Neither ``saneless doctor`` nor the status strip may hold a check the
+        other does not have.  Both iterate ``CheckKey``, so the only way to
         add a seventh is here.
         """
         assert len(list(CheckKey)) == 6
@@ -287,13 +277,12 @@ class TestCheckVocabulary:
 
     def test_configuration_is_the_first_member(self) -> None:
         """
-        Phase 37 D-03: the cause is read above the symptoms.
+        The Configuration check comes first, so the cause is read above the symptoms.
 
         Both surfaces render in member order, so first here is first on the
-        page and first in ``doctor``'s transcript.  On 2026-09-22 four rows
-        went red or amber for one missing config file and the reader had to
-        infer the cause from the symptoms; this row states it, and it states
-        it before they are read.
+        page and first in ``doctor``'s transcript.  One missing config file
+        can turn several other rows red or amber; this row names it before
+        they are read.
         """
         assert next(iter(CheckKey)) is CheckKey.CONFIGURATION
 
@@ -312,10 +301,9 @@ class TestCheckVocabulary:
 
     def test_check_names_are_the_ui_spec_column(self) -> None:
         """
-        The name column is UI-SPEC S1's, verbatim, in member order.
+        The check names are the designed column, verbatim, in member order.
 
-        "Configuration" joins it at the head (Phase 37 D-03); the five the
-        spec named are unchanged and still in their order.
+        "Configuration" heads it, followed by the other five in their order.
         """
         assert [check_name(key) for key in CheckKey] == [
             "Configuration",
@@ -353,11 +341,10 @@ class TestCheckVocabulary:
 
     def test_state_glyphs_have_text_presentation(self) -> None:
         """
-        The glyphs are the three UI-SPEC code points, and none is an emoji.
+        The glyphs are three fixed code points, and none is an emoji.
 
-        ``!`` rather than U+26A0 or U+2757 is deliberate: every Unicode warning
-        symbol has emoji presentation on at least one shipping platform, and
-        the master spec already records U+26A0 as rejected for that reason.
+        ``!`` stands in for U+26A0 or U+2757 because every Unicode warning
+        symbol has emoji presentation on at least one shipping platform.
         """
         assert check_state_glyph(CheckState.OK) == "✓"
         assert check_state_glyph(CheckState.WARN) == "!"
@@ -392,15 +379,14 @@ class TestCheckVocabulary:
 
 class TestRowMarkersReadTheSkippedFlag:
     """
-    R3-WR-03: the marker a row renders comes from the whole result, not the state.
+    The marker a row renders comes from the whole result, not the state.
 
-    ``CheckResult.skipped`` is D-08's "we did not look".  The state beside it is
-    ``OK`` on purpose -- the row still needs a colour and a scripted health gate
-    must not go red for a probe nobody took (D-01) -- which means a marker
-    derived from the state alone shows a green tick in front of a sentence
-    saying nothing was checked.  These three functions are what stops that, so
-    they are pinned over *every* state rather than over the one the skipped
-    rows happen to carry today.
+    ``CheckResult.skipped`` means "we did not look".  The state beside it is
+    ``OK`` -- the row still needs a colour and a scripted health gate must not
+    go red for a probe nobody took -- so a marker derived from the state alone
+    would show a green tick in front of a sentence saying nothing was checked.
+    The three row-marker functions are pinned over every state, not only the
+    one skipped rows carry.
     """
 
     @pytest.mark.parametrize("state", list(CheckState))
@@ -510,7 +496,7 @@ class TestCheckResult:
 
 
 class TestWorstState:
-    """The collapse rule behind ``doctor``'s exit code (D-01)."""
+    """The collapse rule behind ``doctor``'s exit code."""
 
     def test_no_results_is_ok(self) -> None:
         """Nothing wrong was found, so nothing is reported wrong."""
@@ -576,20 +562,13 @@ class TestSanedHostParsing:
         """
         A number among three or more segments refuses the whole setting.
 
-        This asserted three entries until plan 30-28, on the reasoning that a
-        segment which is really a port "simply fails to resolve, which costs
-        one refused connect and no wrong answer".  Both halves of that were
-        false.  glibc reads a bare integer as the single-integer IPv4 form, so
-        ``getaddrinfo('6566', 6566)`` resolves rather than failing; and through
-        the pre-probe's short circuit a junk dial that happens to answer is a
-        wrong answer, not merely a wasted one.
-
-        With no all-digit segment allowed to be a host name, ``6566`` is no
-        longer a plausible one, so the existing more-than-two-segment guard
-        fires and the setting is refused.  Refusal is this module's documented
-        safe fallback: no entries means no probe, which means the scanner
-        check calls ``get_devices()`` and behaves exactly as it did before the
-        probe existed.
+        glibc reads a bare integer as the single-integer IPv4 form, so
+        ``getaddrinfo('6566', 6566)`` resolves rather than failing, and through
+        the pre-probe's short circuit a junk dial that answers is a wrong
+        answer.  ``6566`` is not a plausible host name, so the
+        more-than-two-segment guard refuses the setting.  Refusal is the safe
+        fallback: no entries means no probe, and the scanner check calls
+        ``get_devices()`` directly.
         """
         assert _saned_hosts("host-a:6566:host-b") == ()
 
@@ -597,18 +576,13 @@ class TestSanedHostParsing:
         """
         A number no socket could bind is dropped, leaving the host beside it.
 
-        No reading of such a segment as a *port* is safe: ``connect`` raises
-        ``OverflowError``, which is not an ``OSError`` and so is not caught by
-        the probe, and ``getaddrinfo`` truncates it modulo 65536 instead,
-        which would have ``host-a:99999`` quietly dial port 34463.
-
-        Reading it as a *host name* is not safe either, which is what R2-WR-01
-        established and what this case asserted until plan 30-28.  Measured on
-        this machine, ``getaddrinfo('99999', 6566)`` answers
-        ``0.1.134.159:6566`` -- glibc's single-integer IPv4 form.  Dialling
-        ``host-a:34463`` and dialling ``0.1.134.159:6566`` are both connections
-        to an address nobody configured; dropping the segment is what actually
-        avoids one.
+        Read as a *port*, ``connect`` raises ``OverflowError``, which the
+        probe does not catch, and ``getaddrinfo`` truncates it modulo 65536,
+        so ``host-a:99999`` would dial port 34463.  Read as a *host name*,
+        glibc answers ``getaddrinfo('99999', 6566)`` with
+        ``0.1.134.159:6566``, its single-integer IPv4 form.  Both are
+        connections to an address nobody configured; dropping the segment
+        avoids them.
         """
         assert _saned_hosts("host-a:99999") == (("host-a", SANED_PORT),)
 
@@ -616,13 +590,10 @@ class TestSanedHostParsing:
         """
         A fully written-out literal is refused, like its compressed form.
 
-        The blank-segment rule 30-21 added fires on an empty interior segment
-        or a rejected character, and an expanded literal has neither, so this
-        slipped straight through: measured before the fix,
-        ``_saned_hosts('2001:db8:0:0:0:0:0:1')`` returned eight entries --
-        ``('2001', 6566)``, ``('db8', 6566)``, ``('0', 6566)`` five times and
-        ``('1', 6566)``.  The stdlib is asked first now, and it recognises
-        both spellings.
+        An expanded literal has no empty interior segment and no rejected
+        character, so the blank-segment rule alone would read it as eight
+        host entries.  The stdlib's ``ipaddress`` is asked first, and it
+        recognises both spellings.
         """
         assert _saned_hosts("2001:db8:0:0:0:0:0:1") == ()
 
@@ -634,8 +605,7 @@ class TestSanedHostParsing:
         so this one is caught by the segment rules rather than by
         ``ipaddress``: ``2001`` is all digits, so it is not a plausible host
         name and the more-than-two-segment guard refuses the setting.  Both
-        halves of the defence are load-bearing, which is why neither was
-        removed.
+        halves of the defence are load-bearing.
         """
         assert _saned_hosts("[2001:db8:0:0:0:0:0:1]:6566") == ()
 
@@ -643,9 +613,8 @@ class TestSanedHostParsing:
         """
         A link-local literal carrying its interface is refused too.
 
-        ``ipaddress.ip_address`` has accepted scoped literals since Python
-        3.9, so ``fe80::1%eth0`` parses as version 6 with no help from this
-        module -- verified against the interpreter this project pins.
+        ``ipaddress.ip_address`` accepts scoped literals, so ``fe80::1%eth0``
+        parses as version 6 with no help from this module.
         """
         assert _saned_hosts("fe80::1%eth0") == ()
 
@@ -653,8 +622,8 @@ class TestSanedHostParsing:
         """
         ``0`` is dropped, because dialling it reaches this machine.
 
-        Measured on this machine, ``getaddrinfo('0', 6566)`` answers
-        ``0.0.0.0:6566``, and on Linux a ``connect()`` to ``0.0.0.0`` reaches
+        glibc answers ``getaddrinfo('0', 6566)`` with ``0.0.0.0:6566``, and
+        on Linux a ``connect()`` to ``0.0.0.0`` reaches
         loopback.  So an all-digit segment is not merely untidy: a ``0``
         reaching the dial list lets the probe report the configured scanner
         host "reachable" off any unrelated local process that happens to
@@ -666,8 +635,8 @@ class TestSanedHostParsing:
         """
         ``2001`` is dropped rather than resolved as an address.
 
-        Measured on this machine, ``getaddrinfo('2001', 6566)`` answers
-        ``0.0.7.209:6566``.  glibc *accepts* these strings, which is why the
+        glibc answers ``getaddrinfo('2001', 6566)`` with ``0.0.7.209:6566``.
+        It *accepts* these strings, which is why the
         all-digit rejection is a security rule and not a cosmetic one: half an
         IPv6 literal resolves to a routable address nobody typed.
         """
@@ -677,8 +646,7 @@ class TestSanedHostParsing:
         """
         ``99999`` on its own is dropped, the same as beside a host.
 
-        Measured on this machine, ``getaddrinfo('99999', 6566)`` answers
-        ``0.1.134.159:6566``.
+        glibc answers ``getaddrinfo('99999', 6566)`` with ``0.1.134.159:6566``.
         """
         assert _saned_hosts("99999") == ()
 
@@ -691,10 +659,10 @@ class TestSanedHostParsing:
         ``fe80::1`` is refused rather than read as a host and a port.
 
         An IPv6 literal is exactly the input where "colon-separated list of
-        hosts" and "one address" are indistinguishable.  Before the refusal
-        this parsed to ``(("fe80", 1),)`` -- host ``fe80`` on port 1 -- so
-        every dial failed and, through the pre-probe's short circuit, a
-        perfectly healthy appliance went red (WR-01 feeding CR-02).
+        hosts" and "one address" are indistinguishable.  Read as a list it
+        is ``(("fe80", 1),)`` -- host ``fe80`` on port 1 -- so every dial
+        fails and, through the pre-probe's short circuit, a healthy
+        appliance goes red.
         """
         assert _saned_hosts("fe80::1") == ()
 
@@ -702,18 +670,14 @@ class TestSanedHostParsing:
         """
         ``[fe80::1]:6566`` is refused rather than read as three host names.
 
-        Before the refusal this parsed to ``(("[fe80", 6566), ("1]", 6566),
+        Read as a list it is ``(("[fe80", 6566), ("1]", 6566),
         ("6566", 6566))`` -- three names no resolver can answer, and three
         connect budgets spent to learn nothing.
         """
         assert _saned_hosts("[fe80::1]:6566") == ()
 
     def test_the_ipv6_loopback_produces_no_entries_to_probe(self) -> None:
-        """
-        ``::1`` is refused rather than read as the host name ``1``.
-
-        Before the refusal this parsed to ``(("1", 6566),)``.
-        """
+        """``::1`` is refused rather than read as the host name ``1``."""
         assert _saned_hosts("::1") == ()
 
     def test_a_dotted_name_is_still_one_host_on_the_default_port(self) -> None:
@@ -755,36 +719,26 @@ class TestSanedHostParsing:
         """
         The ``OverflowError`` guard is not weakened by the drop.
 
-        ``99999`` is still not a port a socket could reach, so it is still not
-        read as one.  This asserted two entries until plan 30-28, for the same
-        reason ``test_an_out_of_range_port_is_dropped_rather_than_dialled``
-        did, and it changed for the same reason: glibc resolves ``99999`` to
-        ``0.1.134.159``, so keeping it as a host name dialled an address nobody
-        configured (R2-WR-01).
+        ``99999`` is not a port a socket could reach, so it is not read as
+        one, and glibc resolves it to ``0.1.134.159``, so it is not kept as a
+        host name either: that would dial an address nobody configured.
         """
         assert _saned_hosts("scanner.local:99999") == (("scanner.local", SANED_PORT),)
 
 
 class TestUnicodeDigitPorts:
-    """R3-CR-01: ``str.isdigit()`` is True for characters ``int()`` refuses."""
+    """A port segment ``str.isdigit()`` accepts but ``int()`` refuses is no port."""
 
     def test_a_superscript_two_port_does_not_raise(self) -> None:
         """
         ``host:²`` parses instead of raising ``ValueError``.
 
-        ``"²".isdigit()`` is True -- U+00B2 is Unicode category ``No`` --
-        and ``int("²")`` raises.  Nothing between here and ``run_checks``
-        catches it: ``_saned_hosts`` catches nothing, ``_scanner_preflight``
-        catches nothing, and the probe's ``except OSError`` is never reached
-        because the raise happens before any socket call.  So the exception
-        escaped into ``run_checks``' generic per-check handler, which rendered
-        the Scanner row as "This check could not be completed." with state
-        FAIL -- and ``saneless doctor`` then exited 2 on an appliance whose
-        scanner works.
-
-        The value asserted is the reading this module already gives an
-        unparseable port: the port branch declines and the final filter keeps
-        the host, exactly as ``host:99999`` yields ``host`` alone.
+        ``"²".isdigit()`` is True -- U+00B2 is Unicode category ``No`` -- and
+        ``int("²")`` raises before any socket call, so nothing short of
+        ``run_checks``' generic handler would catch it: the Scanner row would
+        read "This check could not be completed." as FAIL and ``saneless
+        doctor`` would exit 2 on a working appliance.  The segment reads like
+        any unparseable port: the host is kept alone, as with ``host:99999``.
         """
         assert _saned_hosts("host:²") == (("host", SANED_PORT),)
 
@@ -802,17 +756,16 @@ class TestUnicodeDigitPorts:
         """
         ``host:١٢٣٤`` never becomes port 1234.
 
-        This is the half of R3-CR-01 that does not raise: ``int()`` accepts
-        non-ASCII decimals, so the old gate read Arabic-Indic 1234 as port
-        1234 -- a number libsane's C-side parsing would never derive from that
-        string, which is the exact divergence ``_saned_host_setting`` exists to
-        prevent.  1234 rather than 6566 is deliberate: with 6566 the wrong
-        answer and the right answer are the same tuple.
+        ``int()`` accepts non-ASCII decimals, so a gate built on it would read
+        Arabic-Indic 1234 as port 1234 -- a number libsane's C-side parsing
+        would never derive from that string, the divergence
+        ``_saned_host_setting`` exists to prevent.  1234 rather than 6566 keeps
+        the wrong answer and the right answer different tuples.
         """
         assert _saned_hosts("host:١٢٣٤") == (("host", SANED_PORT),)
 
     def test_an_ascii_port_is_untouched(self) -> None:
-        """The ASCII-decimal reading is exactly what it always was."""
+        """An ASCII-decimal port reads as that number."""
         assert _saned_hosts("host:6566") == (("host", 6566),)
 
     def test_the_lowest_ascii_port_is_untouched(self) -> None:
@@ -821,7 +774,7 @@ class TestUnicodeDigitPorts:
 
 
 class TestNumericAddressShorthand:
-    """R3-WR-01: glibc reads far more than all-digit strings as an address."""
+    """glibc reads far more than all-digit strings as an address."""
 
     @pytest.mark.parametrize(
         "setting",
@@ -831,19 +784,12 @@ class TestNumericAddressShorthand:
         """
         No segment glibc reads as a number reaches the dial list.
 
-        Measured by round 3 on this machine: ``0.0`` and ``0x0.0`` resolve to
-        ``0.0.0.0``, ``0x7f.1`` and ``127.1`` resolve to ``127.0.0.1``, and
-        ``6566.0`` costs one unbounded lookup before NXDOMAIN.  All five passed
-        the old all-digit guard because they contain a ``.``.  On Linux a
-        ``connect()`` to ``0.0.0.0`` reaches loopback, so any unrelated local
-        process listening on 6566 made ``any(...)`` true, suppressed
-        ``_scanner_host_unanswered`` and let the check fall through to
-        ``get_devices()`` -- reinstating the ~127 s uninterruptible hang the
-        pre-probe exists to avoid.
-
-        ``0xdeadbeef`` covers the bare hex form and ``01.02.03.04`` the octal
-        one: leading-zero parts are octal to glibc, so the four numbers it
-        dials are not the four an operator reading the setting would expect.
+        ``0.0`` and ``0x0.0`` resolve to ``0.0.0.0`` and ``127.1`` to
+        ``127.0.0.1``, though each contains a ``.``.  A loopback dial answered
+        by any unrelated local process on 6566 would let the check fall
+        through to the ~127 s uninterruptible ``get_devices()`` hang the
+        pre-probe exists to avoid.  ``0xdeadbeef`` is the bare hex form and
+        ``01.02.03.04`` the octal one, whose parts glibc reads as octal.
 
         Args:
             setting: One numeric spelling glibc accepts as an address.
@@ -855,9 +801,8 @@ class TestNumericAddressShorthand:
         """
         ``host:0.0`` drops the invented segment rather than dialling it.
 
-        The operator never typed an address here.  A stray ``.`` in a port was
-        enough: before the fix this returned ``(("host", 6566), ("0.0", 6566))``
-        and the second entry reached loopback.
+        The operator never typed an address here.  Kept, the stray ``0.0``
+        segment would be a second entry that dials loopback.
         """
         assert _saned_hosts("host:0.0") == (("host", SANED_PORT),)
 
@@ -868,14 +813,12 @@ class TestNumericAddressShorthand:
     @pytest.mark.parametrize("setting", ["0.0.0.0", "0.0.0.0:6566"])
     def test_the_unspecified_address_is_never_dialled(self, setting: str) -> None:
         """
-        R4-WR-03: the one legal dotted quad that is still the hazard.
+        ``0.0.0.0`` is refused although it is a legal dotted quad.
 
-        ``0.0.0.0`` parses as a legal literal, so the shorthand refusal let it
-        through -- and the guard's own docstring names it as the worst case:
-        on Linux a ``connect()`` to it reaches loopback, so it makes
-        ``any(...)`` true off any unrelated local listener on 6566 and lets a
-        dead scanner host fall through to the ~127 s ``get_devices()``.  No
-        scanner is at the unspecified address, so refusing it costs nothing.
+        On Linux a ``connect()`` to it reaches loopback, so any unrelated
+        local listener on 6566 would let a dead scanner host fall through to
+        the ~127 s ``get_devices()``.  No scanner is at the unspecified
+        address, so refusing it costs nothing.
 
         Args:
             setting: The unspecified address, bare and with an explicit port.
@@ -905,7 +848,7 @@ class TestNumericAddressShorthand:
 
 
 class TestProbeHostCap:
-    """R3-IN-05: the walk over the entries runs inside a request thread."""
+    """The probe list is capped, because the walk over it runs in a request thread."""
 
     def test_a_long_host_list_is_capped(self) -> None:
         """
@@ -926,9 +869,8 @@ class TestProbeHostCap:
         The tail is what is dropped, so the first-named host is still probed.
 
         No entry means no probe for that host, and the scanner check falls
-        through to ``get_devices()`` exactly as it did before the probe
-        existed -- which still dials the tail, so this is a documented loss
-        of the pre-probe's protection for it, not only of its latency saving.
+        through to ``get_devices()``, which still dials the tail, so the tail
+        loses the pre-probe's protection, not only its latency saving.
         """
         entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
         assert entries[0] == ("h1", SANED_PORT)
@@ -958,20 +900,17 @@ class TestProbeHostCap:
 
 
 class TestTheParserDocstringIsTrue:
-    """R3-IN-04: one test per sentence of ``_saned_hosts``' contract."""
+    """One test per sentence of ``_saned_hosts``' documented contract."""
 
     def test_a_stray_colon_after_a_port_refuses_the_setting(self) -> None:
         """
         ``localhost:6566:`` yields ``()``, not one host on a port.
 
-        The docstring claimed a stray colon at either edge "stays tolerated,
-        because ``: host-a :`` has only ever meant one host".  That is true of
-        a bare name and false in combination with a port: the trailing colon
-        takes the setting to three segments, so the more-than-two-segment
-        refusal fires on ``6566`` not being a plausible host name and the whole
-        setting is refused.  Refusal is the safe direction -- it costs the
-        pre-probe's latency saving and never produces a wrong verdict -- but it
-        is not what the sentence said.
+        A stray edge colon is tolerated beside a bare name, but beside a port
+        it takes the setting to three segments, and ``6566`` is not a
+        plausible host name, so the whole setting is refused.  Refusal is the
+        safe direction: it costs the pre-probe's latency saving and never
+        produces a wrong verdict.
         """
         assert _saned_hosts("localhost:6566:") == ()
 
@@ -981,7 +920,7 @@ class TestTheParserDocstringIsTrue:
 
     def test_a_leading_zero_port_is_read_as_decimal(self) -> None:
         """
-        ``host:065`` is port 65, and the docstring now says so.
+        ``host:065`` is port 65, as the parser's docstring says.
 
         Nothing here claims libsane reads ``065`` the same way.  The range test
         and the ASCII-decimal test are the whole of what this module
@@ -995,10 +934,8 @@ class TestTheParserDocstringIsTrue:
         ``scanner.local.`` is legal DNS and is still refused.
 
         ``_looks_like_a_host_name``'s trailing-dot rule rejects it, so the name
-        loses its pre-probe.  The behaviour is documented and pinned rather
-        than fixed: widening the accept surface for a spelling that appears
-        nowhere in this project's config examples buys nothing, and the cost of
-        leaving it is one latency saving.
+        loses its pre-probe.  Widening the accept surface for a spelling no
+        config example uses buys nothing; the cost is one latency saving.
         """
         assert _saned_hosts("scanner.local.") == ()
 
@@ -1031,9 +968,9 @@ class TestSanedProbe:
 
         saned's access check runs before it reads anything and closes the
         socket when the peer is not allowed, so the client sees a reset or an
-        end of file where the reply should be.  A bare ``connect()`` counted
-        that as reachable, which is how the denial came to be reported as a
-        scanner that was switched off.  The race between the fake's close and
+        end of file where the reply should be.  A bare ``connect()`` would
+        count that as reachable and report the denial as a scanner that is
+        switched off.  The race between the fake's close and
         the probe's send can surface as a reset, a broken pipe or an end of
         file; all three must read the same.
         """
@@ -1149,12 +1086,7 @@ class TestSanedProbe:
         assert _probe("scanbox.lan") is checks._SanedOutcome.UNRESOLVED
 
     def test_the_registered_port_is_used(self) -> None:
-        """
-        6566 is IANA's ``sane-port``, verified in ``/etc/services``.
-
-        RESEARCH assumption A1 flagged this as unverified; it is settled, and
-        the constant is pinned so a future edit has to argue with this test.
-        """
+        """The saned port is 6566, IANA's ``sane-port`` in ``/etc/services``."""
         assert SANED_PORT == 6566
 
     def test_the_handshake_budget_is_separate_from_the_connect_budget(self) -> None:
@@ -1473,7 +1405,7 @@ class _RecordingSocket:
 
 
 # Three addresses for one name: the shape a dual-stack scanner host has, and
-# the one WR-02 costed at three connect budgets instead of one.
+# the one a per-address budget would charge three connect budgets for.
 _THREE_ADDRESSES = [
     (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 6566, 0, 0)),
     (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 6566)),
@@ -1762,7 +1694,7 @@ class TestSanedHandshake:
 
 
 class TestSanedProbeBound:
-    """One configured host costs one connect budget, not one per address (WR-02)."""
+    """One configured host costs one connect budget, not one per address."""
 
     def test_three_resolved_addresses_share_one_budget(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1770,40 +1702,12 @@ class TestSanedProbeBound:
         """
         Every resolved address is dialled, and all of them share one budget.
 
-        This is the property plan 30-21 wanted.  What it asserted instead was
-        an attempt *count* of one, which is a stronger and different claim,
-        and is the cause of R2-CR-01: the single address dialled was the
-        resolver's first, and RFC 6724 puts IPv6 first.  The bound is a
-        deadline taken once before the walk rather than a per-socket timeout,
-        so three addresses cost at most what one address used to.
-
-        **The forbidden implementation, named.**  A ``probe.settimeout(
-        PROBE_CONNECT_SECONDS)`` on each socket, with no deadline over the
-        walk, hands out three *equal* budgets and lets one configured host cost
-        three.  Until R3-IN-02 this test could not tell that apart from the one
-        it is named after: its three assertions were ``timeouts[0] <= budget``,
-        ``all(t > 0)`` and ``timeouts == sorted(timeouts, reverse=True)``, and
-        ``[2.0, 2.0, 2.0]`` satisfies every one of them -- the last because a
-        reverse sort of equal values is the same list.
-
-        It could not tell them apart for a reason worth keeping in mind here:
-        nothing in this file waits, so under a real clock three refused
-        connects land in the same microsecond and each one is handed very
-        nearly the whole budget whichever implementation is underneath.  So the
-        clock is scripted and driven by the dial itself, the way
-        ``test_the_deadline_stops_the_walk``'s is, and the property is measured
-        twice.
-
-        With a dial that spends its whole allowance, the granted timeouts must
-        **sum** to no more than one budget: the first attempt takes all of it
-        and the deadline leaves nothing for the second.  A per-socket
-        implementation sums to three budgets.  No tolerance is needed because
-        the scripted clock's arithmetic is exact.
-
-        With a dial that spends a quarter of its allowance, all three addresses
-        are reached and each one must be granted **strictly** less than the one
-        before.  A per-socket implementation grants three equal budgets, which
-        is not a strictly decreasing sequence.
+        A per-socket timeout would hand out three equal budgets.  The clock is
+        scripted and driven by the dial, because under a real clock three
+        refused connects land in the same microsecond and look alike.  When a
+        dial spends its whole allowance the grants sum to one budget at most;
+        when it spends a quarter, all three addresses are reached with
+        strictly decreasing grants.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1842,11 +1746,9 @@ class TestSanedProbeBound:
         """
         A timeout set after the connect would bound nothing at all.
 
-        Comparing the first index of each event is no longer enough now that
-        there are three attempts -- one ``settimeout`` before the first
-        ``connect`` would satisfy that while leaving the other two attempts
-        unbounded.  The event list is walked instead, so every ``connect`` has
-        to be preceded by a ``settimeout`` of its own.
+        With three attempts, one ``settimeout`` before the first ``connect``
+        would leave the other two unbounded, so the event list is walked and
+        every ``connect`` must be preceded by a ``settimeout`` of its own.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1867,18 +1769,13 @@ class TestSanedProbeBound:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A host answering on its second address is healthy, not dead (R2-CR-01).
+        A host answering on its second address is healthy, not dead.
 
-        Measured on this machine, ``localhost`` resolves to ``::1`` and then
-        ``127.0.0.1``: ``getaddrinfo`` is called without ``AI_ADDRCONFIG``, so
-        glibc returns AAAA records even with no IPv6 route, and RFC 6724 puts
-        the IPv6 address first.  saned commonly binds v4-only.  Dialling only
-        the resolver's first answer therefore called every such host dead, and
-        the pre-probe's short circuit turned that into a permanent amber row
-        on an appliance that scans perfectly well.
-
-        The third address is never dialled, because the walk stops at the
-        first address that connects and the handshake on it decides.
+        ``getaddrinfo`` is called without ``AI_ADDRCONFIG``, so glibc returns
+        AAAA records even with no IPv6 route and RFC 6724 puts them first,
+        while saned commonly binds v4-only.  Dialling only the first answer
+        would leave a permanent amber row on a working appliance.  The third
+        address is never dialled: the first that connects decides.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1912,12 +1809,12 @@ class TestSanedProbeBound:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        An empty resolver answer is UNRESOLVED, not an ``IndexError`` (R2-IN-01).
+        An empty resolver answer is UNRESOLVED, not an ``IndexError``.
 
-        ``getaddrinfo(...)[0]`` on an empty list raises ``IndexError``, which
-        is not an ``OSError`` and so escaped the probe's one ``except`` arm
-        into ``run_checks``' generic red row.  The walk has no subscript, so
-        an empty answer is simply a loop body that never runs.
+        ``getaddrinfo(...)[0]`` on an empty list would raise ``IndexError``,
+        which is not an ``OSError`` and would reach ``run_checks``' generic
+        red row.  The walk has no subscript, so an empty answer is a loop
+        body that never runs.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1999,14 +1896,12 @@ class TestSanedProbeBound:
         """
         A dual-stack host whose saned is stopped is REFUSED, not TIMED_OUT.
 
-        The resolver is asked without ``AI_ADDRCONFIG``, so a dual-stack name
-        answers its IPv6 address first even inside a container with no IPv6
-        at all, and that address fails on this machine at once.  That says
-        nothing about the scanner host, and it must not outweigh the IPv4
-        addresses' definite answer: the host is up and nothing listens on
-        saned's port, so the advice is to start saned, not to switch the host
-        on.  libsane fails the same address just as fast, so it is no hang
-        risk either.
+        Without ``AI_ADDRCONFIG`` a dual-stack name answers its IPv6 address
+        first even in a container with no IPv6, and that address fails here at
+        once.  That says nothing about the scanner host and must not outweigh
+        the IPv4 addresses' definite answer: the host is up and saned is not,
+        so the advice is to start saned.  libsane fails the same address just
+        as fast, so it is no hang risk.
 
         Args:
             monkeypatch: pytest's patcher.
