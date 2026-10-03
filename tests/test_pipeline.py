@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import dataclasses
 import errno
-import inspect
 import io
 import logging
 import os
@@ -1151,6 +1151,7 @@ class TestFlipAnswerSlot:
             threading.Thread(
                 target=_offer,
                 args=(FlipOutcome.CONTINUED if i % 2 else FlipOutcome.ABORTED,),
+                daemon=True,
             )
             for i in range(contenders)
         ]
@@ -1158,6 +1159,7 @@ class TestFlipAnswerSlot:
             thread.start()
         for thread in threads:
             thread.join(timeout=5)
+            assert not thread.is_alive()
 
         assert len(results) == contenders
         winners = [outcome for outcome, claimed in results if claimed]
@@ -6585,8 +6587,10 @@ class TestRejectedPagesAreNotBlankPages:
             )
 
         assert result.pages_removed == 0
-        assert result.warning is not None
-        assert "2" in result.warning
+        assert result.warning == (
+            "2 page(s) could not be read by the scanner and were skipped. "
+            "They were not removed for being blank; rescan those sheets."
+        )
 
     def test_a_clean_scan_reports_zero_for_both_counts(
         self,
@@ -7337,17 +7341,62 @@ class TestTitleLogEscaping:
         for word in ("Q4", "final", "done"):
             assert word in message
 
-    def test_no_quoted_percent_s_interpolation_remains(self) -> None:
+    @pytest.mark.source_structure
+    def test_no_logger_call_quotes_a_percent_s_placeholder(self) -> None:
         """
-        No ``'%s'``-shaped interpolation is left to paste input into a line.
+        No ``logger`` call in the pipeline formats input into a quoted ``'%s'``.
 
         A source-level guard rather than a behaviour one: it catches a new
-        call site added later that follows the old style, which no per-call
-        test would notice.
+        call site that quotes its own placeholder, which no per-call test
+        would notice. Only the format constants of logger calls are read, so
+        a comment or docstring can neither satisfy nor break it.
         """
-        source = inspect.getsource(pipeline_module)
+        source = Path(pipeline_module.__file__).read_text(encoding="utf-8")
 
-        assert "'%s'" not in source
+        assert _quoted_percent_s_logger_calls(source) == []
+
+    def test_the_log_format_check_reports_a_quoted_placeholder(self) -> None:
+        """The check names a quoted ``'%s'`` format and ignores comments and docs."""
+        offending = (
+            "import logging\n"
+            "logger = logging.getLogger(__name__)\n"
+            "def scan(title):\n"
+            "    logger.info(\"title '%s'\", title)\n"
+        )
+        harmless = (
+            "def scan(title):\n"
+            '    """Log the title, never as \'%s\'."""\n'
+            "    # logger.info(\"title '%s'\", title)\n"
+            '    logger.info("title %r", title)\n'
+        )
+
+        assert _quoted_percent_s_logger_calls(offending) == [4]
+        assert _quoted_percent_s_logger_calls(harmless) == []
+
+
+def _quoted_percent_s_logger_calls(source: str) -> list[int]:
+    """
+    List the lines of ``logger`` calls whose format constant quotes a ``'%s'``.
+
+    Args:
+        source: Python source to parse.
+
+    Returns:
+        The line number of each offending call, in source order.
+
+    """
+    return sorted(
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "logger"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and "'%s'" in node.args[0].value
+    )
 
 
 _PRIVATE_DIR_MODE = 0o700

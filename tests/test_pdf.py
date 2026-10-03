@@ -16,6 +16,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
@@ -39,7 +41,7 @@ from saneless.vocabulary import ErrorCategory, classify_error
 from tests.golden_support import embedded_streams, png_idat
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from saneless.scanner.base import PageRecord
 
@@ -199,6 +201,30 @@ class _FailingJob:
         """Fail the way qpdf fails, with a pikepdf exception type."""
         msg = "fake qpdf merge failure"
         raise pikepdf.PdfError(msg)
+
+
+_FAR_FROM_UTC_ZONE = "Pacific/Kiritimati"
+_FAR_FROM_UTC_OFFSET_SECONDS = 14 * 3600
+
+
+@pytest.fixture
+def far_from_utc_zone() -> Iterator[None]:
+    """
+    Run the test with the process's local time fourteen hours ahead of UTC.
+
+    The zone is applied with ``time.tzset`` and re-applied after ``TZ`` is
+    restored, so no later test sees it. The offset is checked, so a missing
+    zone database cannot quietly leave the test running in UTC.
+    """
+    with pytest.MonkeyPatch.context() as zone:
+        zone.setenv("TZ", _FAR_FROM_UTC_ZONE)
+        time.tzset()
+        try:
+            assert time.localtime().tm_gmtoff == _FAR_FROM_UTC_OFFSET_SECONDS
+            yield
+        finally:
+            zone.undo()
+            time.tzset()
 
 
 @pytest.fixture
@@ -898,18 +924,19 @@ class TestAssemblyMemory:
         assert small["pages"] == _MEMORY_SMALL_PAGES
         assert large["pages"] == _MEMORY_LARGE_PAGES
 
-        # The budget is derived, not chosen: it is exactly what the extra
-        # pages weigh decoded, so exceeding it means assembly was holding
-        # them.  A linear assembly holds each page's compressed bytes *and*
-        # the whole finished document, so it overshoots this by about 2x.
+        # The budget is derived, not chosen: half of what the extra pages
+        # weigh decoded.  Noise does not compress, so an assembly that keeps
+        # each finished page alive grows by about their full decoded size,
+        # twice the budget, while the per-page path stays flat.
         decoded_page_bytes = _MEMORY_PAGE_WIDTH * _MEMORY_PAGE_HEIGHT * _RGB_BANDS
         extra_pages = _MEMORY_LARGE_PAGES - _MEMORY_SMALL_PAGES
-        budget_bytes = decoded_page_bytes * extra_pages
+        budget_bytes = decoded_page_bytes * extra_pages // 2
         growth_bytes = (large["peak_kib"] - small["peak_kib"]) * _RU_MAXRSS_UNIT_BYTES
 
         assert growth_bytes < budget_bytes, (
             f"peak grew {growth_bytes} bytes over {extra_pages} extra pages, "
-            f"which is not less than the {budget_bytes} bytes they decode to"
+            f"which is not less than the {budget_bytes} bytes, half of what "
+            "they decode to"
         )
 
 
@@ -1247,11 +1274,21 @@ class TestBuildPdfFilename:
         assert "-.pdf" not in name
         assert name.endswith(".pdf")
 
+    @pytest.mark.usefixtures("far_from_utc_zone")
     def test_starts_with_a_utc_timestamp(self) -> None:
-        """The name is sortable: a YYYYmmdd-HHMMSS prefix leads it."""
+        """
+        The name is sortable: a UTC ``YYYYmmdd-HHMMSS`` prefix leads it.
+
+        The local zone is fourteen hours ahead of UTC, so a stamp taken in
+        local time falls far outside the window around the call.
+        """
+        before = datetime.now(tz=UTC).replace(microsecond=0)
         name = build_pdf_filename(JOB_A, "Tax Return")
+        after = datetime.now(tz=UTC).replace(microsecond=0)
 
         assert re.match(r"^\d{8}-\d{6}-", name), name
+        stamp = datetime.strptime(name[:15], "%Y%m%d-%H%M%S").replace(tzinfo=UTC)
+        assert before <= stamp <= after, (name, before, after)
 
     @pytest.mark.parametrize("hostile", HOSTILE_TITLES)
     def test_whole_name_stays_inside_its_directory(
@@ -1310,22 +1347,6 @@ class TestMediaBox:
             box = _rounded_media_box(pdf.pages[0])
 
         assert box == [0, 0, 595, 842]
-
-    def test_a4_page_is_not_the_unlayouted_default(
-        self,
-        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
-        output_dir: Path,
-    ) -> None:
-        """The layout function is provably in play, not passing by accident."""
-        # img2pdf.default_dpi is 96, so an unlayouted 2480 x 3508 raster
-        # becomes 1860 x 2631 pt.  Seeing that means no layout_fun was passed.
-        records = spool_pages([Image.new("RGB", (2480, 3508), "white")])
-        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", title=_TITLE)
-
-        with pikepdf.open(pdf_path) as pdf:
-            box = _rounded_media_box(pdf.pages[0])
-
-        assert box != [0, 0, 1860, 2631]
 
     def test_cropped_a4_also_rounds_to_a4(
         self,
