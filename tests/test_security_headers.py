@@ -1,5 +1,5 @@
 """
-Tests for the security headers every response carries.
+Every response carries the security headers, each exactly once.
 
 A page on another site can frame saneless and steer a real click onto Scan or
 a flip answer; the click is the user's own, so the cross-site check cannot see
@@ -59,8 +59,8 @@ _BOOM_PATH = "/_test/boom"
 _CROSS_SITE = {"Sec-Fetch-Site": "cross-site"}
 _HTMX = {"HX-Request": "true"}
 
-# The responseHandling array base.html has always carried.  htmx 2.0.10 merges
-# the meta configuration shallowly, so the new keys must sit beside this array,
+# The responseHandling array base.html carries.  htmx 2.0.10 merges the meta
+# configuration shallowly, so the security switches sit beside this array,
 # restated in full, rather than replace it.
 _RESPONSE_HANDLING = [
     {"code": "204", "swap": False},
