@@ -1375,9 +1375,8 @@ class _Wedge:
     and which this project does not suppress, so this state lives in a
     container instead of in a name.
 
-    ``device`` and ``iterator`` are **strong** references, deliberately.
-    ``SaneDev_dealloc`` calls ``sane_close()`` and ``_SaneIterator.__del__``
-    calls ``device.cancel()``, so letting a wedged handle be garbage-collected
+    ``device`` is a **strong** reference, deliberately.  ``SaneDev_dealloc``
+    calls ``sane_close()``, so letting a wedged handle be garbage-collected
     would reintroduce exactly the close-while-reading this module now avoids.
 
     ``done`` identifies *which* acquisition is wedged.  A reader that wakes up
@@ -1411,7 +1410,6 @@ class _Wedge:
     stuck: bool = False
     done: threading.Event | None = None
     device: SaneDevice | None = None
-    iterator: object = None
     device_id: str = ""
     page_label: str = ""
     settling: bool = False
@@ -2017,17 +2015,10 @@ def _cancel_read(dev: SaneDevice, done: threading.Event) -> None:
 
 
 def _clear_wedge() -> None:
-    """
-    Forget the wedge record.  The caller holds ``_WEDGE_LOCK``.
-
-    Dropping the retained iterator here runs its finaliser's cancel, which is
-    harmless only because every caller has either closed the handle first or
-    never retained one.
-    """
+    """Forget the wedge record.  The caller holds ``_WEDGE_LOCK``."""
     _WEDGE.stuck = False
     _WEDGE.done = None
     _WEDGE.device = None
-    _WEDGE.iterator = None
     _WEDGE.device_id = ""
     _WEDGE.page_label = ""
     _WEDGE.settling = False
@@ -2161,30 +2152,6 @@ def _release_wedge(dev: SaneDevice, done: threading.Event, holder: str) -> None:
         # later scan job's SANE restart until saneless itself was restarted.
         _handle_closed(dev)
         _clear_wedge()
-
-
-def _retain_iterator(dev: SaneDevice, iterator: object) -> bool:
-    """
-    Keep a wedged device's iterator alive, reversing the old ``del``.
-
-    ``del iterator`` used to be the cleanup; on this path it is the hazard.
-    ``_SaneIterator.__del__`` calls ``device.cancel()``, so dropping the last
-    reference to a wedged device's iterator issues a SANE call on a handle a
-    read is still inside -- the thing this whole sequence exists to prevent.
-
-    Args:
-        dev: The handle the iterator drives.
-        iterator: The ``multi_scan()`` iterator.
-
-    Returns:
-        True if the iterator was retained because the device is wedged.
-
-    """
-    with _WEDGE_LOCK:
-        if _WEDGE.stuck and _WEDGE.device is dev:
-            _WEDGE.iterator = iterator
-            return True
-        return False
 
 
 def _name_wedged_device(dev: SaneDevice, device_id: str) -> bool:
@@ -2690,16 +2657,13 @@ def _acquire_pages(
             # -- and what is spooled is exactly what the PDF embeds.
             records.append(sink.add(framing.crop(page_image), dpi=framing.resolution))
     finally:
-        # Dropping the last reference runs ``_SaneIterator.__del__``, which
-        # calls ``device.cancel()``, so where the iterator goes depends on
-        # whether a cancel may still be sent.  When the device is wedged a
-        # read is still inside it: the wedge record takes the reference, and
-        # the reader thread drops it when it finally returns.  When a cancel
-        # was already issued -- the page timed out, or the wait was
-        # interrupted -- one more would be a second, unbounded request on this
-        # thread: the handle's record takes the reference and drops it after
-        # the close.  Only a scan that ended without a cancel drops it here.
-        if not _retain_iterator(dev, iterator) and not _park_iterator(dev, iterator):
+        # A cancel already issued means one more, from the iterator's
+        # finaliser, would be a second unbounded request on this thread, so the
+        # handle's record takes the iterator and drops it after the close.
+        # Otherwise the reference is dropped here, which is safe even for a
+        # wedged device: the reader thread's own callable keeps the iterator
+        # alive until its read returns.
+        if not _park_iterator(dev, iterator):
             del iterator
 
     if page_num == 0:
