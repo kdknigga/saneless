@@ -14,9 +14,10 @@ Every dependency is injected instead: the settings, the scanner backend, the
 Paperless client and the worker's profile-storage outcome all arrive as
 parameters on ``CheckContext``.  That is also what lets ``doctor`` run on a
 machine with no python-sane at all -- it passes ``scanner=None`` and still
-reports all six rows.
+reports every row.
 
-ASVS V7 applies to every string this module can render.  No message and no next
+ASVS 4.0.3 V7.4 applies to every string this module can render.  No message and
+no next
 step carries a filesystem path, a URL, a token value or exception text.  The
 Paperless URL says where paperless-ngx runs (a user name or password in it is
 refused when the config loads) and the fallback folder is a host path, both on
@@ -77,10 +78,12 @@ from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.vocabulary import (
     RETRY_PLACEHOLDER,
     RETRY_SENTENCE_PLACEHOLDER,
+    UNSET_CREDENTIAL_CLAUSE,
     ConfigFileState,
     ConnectionStatus,
     ProfileStorage,
     connection_status_message,
+    sentence_case,
 )
 
 if TYPE_CHECKING:
@@ -379,7 +382,7 @@ POLL_GAVE_UP_LINE: Final = "The checks have not run yet. Press Check again to tr
 # expectation is the safe direction.  Held to exactly
 # ``POLL_GAVE_UP_LINE``'s rule: no host, no address, no port, no path, no URL
 # and no exception text, because it renders on a page the whole LAN can read
-# (ASVS V7).
+# (ASVS 4.0.3 V7.4).
 POLL_STILL_CHECKING_LINE: Final = (
     "The first check is still running. This can take a couple of minutes "
     "if the scanner is not reachable."
@@ -387,7 +390,7 @@ POLL_STILL_CHECKING_LINE: Final = (
 
 # How much of a device's own description a row will print.  Nothing else bounds
 # what a scanner can call itself, and the row is rendered into HTML next to
-# four others whose width is fixed.
+# columns whose width is fixed.
 _DEVICE_LABEL_MAX_LENGTH: Final = 60
 
 # The row a check that raised is rendered as.  Developer constants, because the
@@ -423,7 +426,7 @@ class CheckState(StrEnum):
 
 class CheckKey(StrEnum):
     """
-    The six checks, and the contract that both surfaces show all six.
+    Every check, and the contract that both surfaces show every one.
 
     This enum *is* the "neither surface may define a check the other does not
     have" rule.  ``run_checks`` iterates it and returns one result per member,
@@ -437,13 +440,18 @@ class CheckKey(StrEnum):
     amber at once, each of them reporting a symptom truthfully and none of
     them naming the cause; a reader who meets the cause first has the other
     rows explained before reaching them, and one who meets it last has already
-    drawn three wrong conclusions.
+    drawn a wrong conclusion from each of them.
 
-    Adding a seventh member is therefore a deliberate act with a visible cost:
-    ``check_name`` stops type-checking until the new key has a name, the
-    dispatch in ``run_checks`` stops type-checking until it has a check
-    function, and the completeness test in ``tests/test_checks.py`` fails until
-    the count is updated.
+    Adding a member is therefore a deliberate act with a visible cost.  The
+    ``match`` in ``check_name`` stops type-checking until the new key has a
+    name, and the ``match`` in ``_dispatch`` stops type-checking until it has a
+    check function.  ``test_check_names_are_the_ui_spec_column`` fails until
+    the designed column names it, and the row tests hold both surfaces to one
+    row per member: ``test_all_ok_prints_one_line_per_check`` and
+    ``test_rows_are_printed_in_check_key_order`` for ``saneless doctor``, and
+    ``test_index_renders_the_cached_rows`` and
+    ``test_cold_start_renders_one_checking_row_per_check`` for the status
+    strip.
 
     ``DATA_DIR`` is the member name, and ``"Data folder"`` is what a household
     member reads.  The member names are internal; only ``check_name`` is user
@@ -481,10 +489,10 @@ class CheckResult:
     probe, not a verdict about the appliance.
 
     Attributes:
-        key: Which of the six checks this is.
+        key: Which ``CheckKey`` this is.
         state: How it came out.
         message: A developer-authored sentence.  Never a path, a URL, a token
-            or exception text (ASVS V7).  The module docstring states the one
+            or exception text (ASVS 4.0.3 V7.4).  The module docstring states the one
             exception: the Configuration row's ``next_step``, in its two
             superseded-name states, carries one of three fixed documented
             spellings of the file to rename -- never a resolved host path, and
@@ -542,7 +550,7 @@ class ScannerRefusal(StrEnum):
 @dataclass(frozen=True, slots=True)
 class CheckContext:
     """
-    Everything the six checks need, handed in rather than reached for.
+    Everything the checks need, handed in rather than reached for.
 
     Every dependency is injected because the two surfaces build them
     differently, and neither may be the one this module knows about.
@@ -551,7 +559,7 @@ class CheckContext:
     builds what it needs for one command.
 
     ``scanner=None`` means no scanner backend could be built.  That is what
-    lets ``doctor`` report all six rows on such a machine instead of refusing
+    lets ``doctor`` report every row on such a machine instead of refusing
     at ``require_sane()`` and reporting none -- the thing an operator most
     needs a diagnostic for is the machine where the diagnostic would otherwise
     not run.  ``scanner_refusal`` says why: python-sane is not installed, or
@@ -707,11 +715,12 @@ def check_state_glyph(state: CheckState) -> str:
     U+2713 and U+2717 are already in use for ``Done`` and ``Error``, so the
     strip borrows them rather than inventing a second visual language.
 
-    The warning glyph is a plain ASCII ``!``.  Every Unicode warning symbol --
-    U+26A0, U+2757 -- renders with emoji presentation on at least one shipping
-    platform, and the master spec already records U+26A0 as rejected for
-    exactly that reason.  ``!`` has text presentation everywhere and needs no
+    Every Unicode warning sign -- U+26A0, U+2757 -- renders with emoji
+    presentation on at least one shipping platform, so the warning glyph stays
+    a plain ASCII ``!``, which has text presentation everywhere and needs no
     variation selector.
+
+    See docs/explanation/decisions/0013-text-presentation-glyphs.md.
 
     Args:
         state: The state to mark.
@@ -1248,7 +1257,7 @@ class _SanedOutcome(StrEnum):
     """
     What the saned pre-probe learnt about one configured host.
 
-    Five outcomes, each a different thing an operator has to do, which is why
+    Each outcome is a different thing an operator has to do, which is why
     the probe tells them apart at all:
 
     - ``UNRESOLVED``: the resolver raised, or answered with no address.
@@ -1268,7 +1277,7 @@ class _SanedOutcome(StrEnum):
     - ``HEALTHY``: a valid ``SANE_NET_INIT`` reply.
 
     Private, and every consumer is a total ``match`` ending in
-    ``assert_never``, so a sixth outcome stops type-checking until each of
+    ``assert_never``, so a new member stops type-checking until each of
     them decides what it means.
     """
 
@@ -1524,7 +1533,7 @@ def _probe_saned(
     answer once raised ``IndexError``, which is not an ``OSError`` and so
     escaped into ``run_checks``' generic red row.  Log lines carry the outcome
     and ``type(exc).__name__`` only -- no host, no address, no port and no
-    exception text (ASVS V7).
+    exception text (ASVS 4.0.3 V7.1).
 
     Args:
         host: The host name or address to dial.
@@ -1611,7 +1620,7 @@ class _HostProbe:
     The host and port are kept only so enumeration can match a configured
     ``net:`` device to the host it lives on, on the port libsane opens it
     on.  Neither is ever rendered or logged: rows interpolate counts, not
-    hosts (ASVS V7).
+    hosts (ASVS 4.0.3 V7.1, V7.4).
 
     Attributes:
         host: The configured entry that was dialled.
@@ -1894,7 +1903,7 @@ def _host_problem_next_step(outcome: _SanedOutcome) -> str:
     which wins over ``[scanner] host`` whenever it is exported and not empty
     (``effective_sane_net_hosts``).  Naming only the config file would send
     an operator with the variable exported to edit a setting that changes
-    nothing.  The variable is named; the host never is (ASVS V7).
+    nothing.  The variable is named; the host never is (ASVS 4.0.3 V7.4).
 
     Args:
         outcome: The outcome being reported.
@@ -1933,7 +1942,7 @@ def _net_device_entry(device_id: str) -> str | None:
     literal keeps its brackets.
 
     The result is only ever compared with a probed host.  It is never dialled,
-    rendered or logged, because it is a LAN address (ASVS V7).
+    rendered or logged, because it is a LAN address (ASVS 4.0.3 V7.1, V7.4).
 
     Args:
         device_id: A SANE device id, as configured or as listed.
@@ -2051,7 +2060,7 @@ def _device_label(device: DeviceInfo) -> str:
     ``DeviceInfo.name`` is the SANE device id, and for the ``net`` backend it
     is ``net:<host>:<backend>:...`` -- a LAN address.  Putting it in a row
     would publish that address to everyone who can load the index page, which
-    is the same reason the fallback row omits the folder path (ASVS V7).
+    is the same reason the fallback row omits the folder path (ASVS 4.0.3 V7.4).
     ``vendor`` and ``model`` are what the device calls itself and what is
     printed on its lid, so they are what a household member can match against
     the machine in front of them.
@@ -2227,8 +2236,8 @@ def configuration_check(
     """
     Report which configuration file is in use, and whether an old one is not.
 
-    The row that exists because four rows once went red or amber for one
-    missing file and not one of them named it.  Its five outcomes come from
+    The row that exists because the other rows once went red or amber for one
+    missing file and not one of them named it.  Its outcomes come from
     ``config_file_state``, which is the single derivation the startup log, the
     status strip, ``saneless doctor`` and the one-shot commands all read, so
     none of them can describe the same appliance differently.
@@ -2350,7 +2359,7 @@ def _scanner_host_unanswered(probes: tuple[_HostProbe, ...]) -> CheckResult:
     Neither string names a host, its address or its port; the only thing
     interpolated is a count.  A LAN address on a LAN-visible page is the same
     class of disclosure as the SANE device id ``_device_label`` refuses to
-    print (ASVS V7).
+    print (ASVS 4.0.3 V7.4).
 
     Args:
         probes: What each configured host's probe found; at least one of them
@@ -2435,7 +2444,7 @@ def _scanner_busy() -> CheckResult:
     would be asking them to act on a condition that is already clearing.
 
     The message names no scan, and it names no host, address, port, path or
-    exception either (ASVS V7), which is the same omission
+    exception either (ASVS 4.0.3 V7.4), which is the same omission
     ``_scanner_host_unanswered`` makes on purpose.
 
     Returns:
@@ -2695,7 +2704,7 @@ def _scanner_configured_unprobed_row() -> CheckResult:
     The next step names both ways out.  A host in ``[scanner] host`` is one
     SANE lists devices from, so the device becomes a listed one; a device
     ``saneless devices`` lists is one the check can find.  Either is a config
-    edit, which needs a restart.  Neither names the host (ASVS V7).
+    edit, which needs a restart.  Neither names the host (ASVS 4.0.3 V7.4).
 
     Returns:
         The amber Scanner row.
@@ -2722,7 +2731,7 @@ def _scanner_listing_crashed_row() -> CheckResult:
     the whole of the advice.
 
     Nothing is interpolated: the crash is not tied to any one host, and a host
-    or device id on this LAN-visible row would be a disclosure (ASVS V7).
+    or device id on this LAN-visible row would be a disclosure (ASVS 4.0.3 V7.4).
 
     Returns:
         The amber Scanner row.
@@ -2750,7 +2759,7 @@ def _scanner_listing_timed_out_row() -> CheckResult:
     The next step asks for the scanner, and its host if it has one, to be on
     and reachable, and it deliberately avoids "switched on and connected",
     the phrase no row reporting a rejection may use.  Nothing is interpolated,
-    for the same reason as the crash row (ASVS V7).
+    for the same reason as the crash row (ASVS 4.0.3 V7.4).
 
     Returns:
         The amber Scanner row.
@@ -2775,7 +2784,8 @@ def _scanner_listing_no_answer_row() -> CheckResult:
     Whatever the child printed is in the log, and the next listing starts
     another child, so pressing Check again is the whole of the advice.
 
-    Nothing is interpolated, for the same reason as the crash row (ASVS V7).
+    Nothing is interpolated, for the same reason as the crash row (ASVS 4.0.3
+    V7.4).
 
     Returns:
         The amber Scanner row.
@@ -2948,7 +2958,7 @@ def _scanner_verdict(
 
     Rows interpolate counts and ``_device_label`` output only.  The
     configured id and the listed device ids are compared, never rendered,
-    because they are LAN addresses on a LAN-visible page (ASVS V7).
+    because they are LAN addresses on a LAN-visible page (ASVS 4.0.3 V7.4).
 
     Args:
         probes: What each configured host's probe found, in configured order;
@@ -3343,7 +3353,7 @@ def _check_paperless(context: CheckContext) -> CheckResult:
         return CheckResult(
             key=CheckKey.PAPERLESS,
             state=CheckState.FAIL,
-            message="The paperless-ngx API token has not been set.",
+            message=f"{sentence_case(UNSET_CREDENTIAL_CLAUSE)}.",
             next_step=(
                 "Put a real API token in the saneless config file, "
                 "then restart saneless."
@@ -3784,59 +3794,25 @@ def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
 
 def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> CheckResult:
     """
-    Run the scanner check, holding the worker's gate for the part that needs it.
+    Run the scanner check, holding the worker's gate only around the listing.
 
-    This is the only place in the registry that takes the gate, because the
-    enumeration is the only thing any check does inside libsane.  The check
-    is the same three steps ``_check_scanner`` runs, and what matters is which
-    of them holds the gate.  The preflight runs *first*, with the gate free:
-    it is name resolution and the opening of the SANE network handshake, and
-    resolution is outside every budget this module states, so holding the
-    gate across it could park a ``ScanWorker._scan_job`` whose job row
-    already reads ``SCANNING`` for as long as a broken resolver takes.  A
-    preflight that settles the row -- no python-sane, or a configured host
-    that timed out -- therefore never touches the gate at all.
-    Only ``_scanner_enumeration`` is held: the device listing, and the open of
-    an unlisted configured device, inside one hold.  Both run in the backend's
-    listing child, and the gate is held for that child's whole life: the
-    backend does not return, or raise, until the launcher has reaped the
-    child, whether it answered, crashed or was killed at
-    ``LISTING_DEADLINE_SECONDS``, so the release in ``finally`` always comes
-    after the reap.  A gate released while the child was still inside libsane
-    would let a scan in beside it.  The verdict runs after the release,
-    because it is pure and enters nothing.
+    This is the only check that takes the gate, because the device listing is
+    the only thing any check does inside libsane.  The preflight -- name
+    resolution and the saned handshake -- runs with the gate free, and a
+    preflight that settles the row never touches it.  The listing, and the
+    open of an unlisted configured device, run in the backend's listing child
+    inside one non-blocking hold, released in a ``finally`` only after the
+    child is reaped; the verdict runs after the release.  A gate already held
+    is reported as the neutral busy row, not waited on.
 
-    The attempt is non-blocking and a failure is reported rather than waited
-    out, which is the single move ``ScanWorker.scanner_gate`` documents as
-    permitted: blocking here would queue behind a scan that can legitimately
-    run for minutes and then enter SANE at some arbitrary later moment.  A
-    failed acquire is ``_scanner_busy()`` and not ``_scanner_skipped()``: the
-    latter names a running scan, and ``run_checks`` has already dealt with that
-    case before this function is reached, so the only thing a lost gate
-    establishes is that somebody else is in SANE -- today, the worker's startup
-    capability read, which runs before any job exists.
+    Holding the gate across resolution could park a scan whose job row already
+    reads ``SCANNING`` behind a broken resolver, waiting on it would queue the
+    probe behind a scan that runs for minutes, and releasing it while the child
+    is still inside libsane would let a scan in beside it.
+    ``test_a_gated_run_returns_what_an_ungated_run_returns`` holds this path to
+    the rows ``_check_scanner`` gives ``saneless doctor``.
 
-    The release is in a ``finally``, so a check that raises still hands the
-    scanner back before the exception reaches ``run_checks``' per-check
-    handler.  A registry that left the gate held would lock the worker out of
-    its own scanner for the life of the process.
-
-    What the split costs is worth recording: this function no longer routes
-    through ``_dispatch``, so the uniform-dispatch seam no longer guarantees
-    that the gated path and ``saneless doctor``'s ungated ``_check_scanner``
-    agree.  A test guarantees it instead --
-    ``test_a_gated_run_returns_what_an_ungated_run_returns`` in
-    ``tests/test_checks.py`` -- and that is where anyone changing either half
-    should look.  It is parametrised over the contexts whose rows differ: no
-    python-sane, a configured host that refuses the pre-probe's connection
-    and is enumerated, one that does not answer it, a host that answers and
-    enumerates one device, an enumeration that raises, a host that refuses
-    this machine, a host whose name does not resolve, a configured device
-    that is not listed and does not open, one that is not listed but opens,
-    a ``net:`` device that is not listed and whose host cannot be probed, a
-    listing whose child crashed, and one whose child ran out of time.
-    Together they reach every branch of this function and compare each
-    against ``_check_scanner``.
+    See docs/explanation/decisions/0003-scanner-gate-is-a-lock.md.
 
     Args:
         context: The injected dependencies and configuration.
@@ -3888,7 +3864,7 @@ def run_checks(
     call, and that is deliberate.  Only ``_check_scanner`` enters
     libsane.  ``_check_paperless`` carries a multi-second HTTP budget, and
     ``_check_fallback`` and ``_check_data_dir`` each create and delete a real
-    file.  A caller that wrapped all six made the lock that exists to keep two
+    file.  A caller that wrapped every check made the lock that exists to keep two
     callers out of libsane into the lock a scan start waits on: ``ScanWorker``
     would sit in ``with self._scanner_gate:`` with the job row already written
     ``SCANNING`` while a health probe waited on a Paperless timeout.  Passing
@@ -3903,7 +3879,7 @@ def run_checks(
 
     A check that raises is caught and rendered as a red row with a
     developer-constant message.  A registry that could raise would take the
-    whole strip down and with it the four checks that were fine, and the
+    whole strip down and with it the checks that passed, and the
     exception text is exactly the thing that must not reach a LAN-visible page.
     That handler covers the gated scanner branch too, and the gate is released
     on the way out of it.

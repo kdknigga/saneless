@@ -119,6 +119,7 @@ from .vocabulary import (
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
     UNKNOWN_PROFILE_NEXT_STEP,
+    UNSET_CREDENTIAL_CLAUSE,
     WARNED_UPLOAD_LABEL,
     CheckSurface,
     ConfigFileState,
@@ -266,17 +267,10 @@ _FLIP_PROMPT = (
     "Flip the stack over and load it back into the feeder. Scan the back sides?"
 )
 
-# Why `scan` refuses when nobody configured paperless-ngx. A developer
-# constant: it names the problem and never the value, the URL or the config
-# path. Lower-cased and without a full stop because it is the tail of the CLI's
-# `<what saneless was doing>: <problem>` error line, unlike checks.py's
-# sentence for the same fact, which stands alone in a table row.
-#
-# The name carries no password-ish word on purpose: ruff's S105 reads the
-# *name* of the target, not the value, so `_TOKEN_...` here would be flagged as
-# a hardcoded credential. This is vocabulary.py's `_REJECTED_WIRE_VALUE` idiom
-# rather than a suppression.
-_UNSET_CREDENTIAL_PROBLEM = "the paperless-ngx API token has not been set"
+# Why `scan` refuses when nobody configured paperless-ngx: the tail of the CLI's
+# `<what saneless was doing>: <problem>` error line, which names the problem and
+# never the value, the URL or the config path.
+_UNSET_CREDENTIAL_PROBLEM = UNSET_CREDENTIAL_CLAUSE
 # The same refusal for an empty paperless.url, which names the setting.
 _UNSET_ADDRESS_PROBLEM = "the paperless-ngx address in paperless.url has not been set"
 
@@ -1514,7 +1508,7 @@ def _load_cli_settings(
             ``doctor`` passes it: a folder start-up would refuse is one of the
             things it reports, and its Fallback and Data folder rows ask the
             same questions that validation asks, so refusing first would
-            replace six rows with one line.  Every other command keeps the
+            replace every row with one line.  Every other command keeps the
             refusal, because it is about to use those folders.
 
     Returns:
@@ -1697,7 +1691,7 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
     # This is the second place cli.py unwraps the token; the PaperlessClient
     # construction below is the other. The value goes to the predicate and
     # nowhere else -- it is never logged, echoed or interpolated into the
-    # message, which is a developer constant (ASVS V7). The line is built in the
+    # message, which is a developer constant (ASVS 4.0.3 V7.1). The line is built in the
     # `<what saneless was doing>: <problem>` shape because ErrorCategory.CONFIG
     # prints the exception as-is (_failure_line), so the "what saneless was
     # doing" half has to be part of the message.
@@ -2916,15 +2910,15 @@ def _row_marker(result: CheckResult) -> str:
     return _state_marker(result.state)
 
 
-# The three column widths `saneless doctor` renders with, all derived rather
-# than written down, exactly as _STATUS_COL_WIDTH is and for the same reason: a
-# sixth CheckKey with a longer name, or a fourth CheckState with a wider token,
+# The column widths `saneless doctor` renders with, all derived rather than
+# written down, exactly as _STATUS_COL_WIDTH is and for the same reason: a new
+# CheckKey member with a longer name, or a CheckState member with a wider token,
 # must not be able to overflow an 80-column terminal without anyone noticing.
 # The indent puts a next step underneath the message it belongs to, so a row
 # and its remedy read as one item rather than two.
 #
 # The marker width counts `_SKIPPED_MARKER` alongside the state tokens rather
-# than relying on the four strings happening to be the same length, so the
+# than relying on the markers happening to be the same length, so the
 # derivation stays correct if any one of them is ever respelled.
 _MARKER_WIDTH = max(
     len(marker)
@@ -3119,7 +3113,7 @@ def _doctor_paperless(
     carries a user name or password, a token an HTTP header cannot carry, and
     a TLS trust store it cannot read.  Each is a ``PaperlessError``, which the
     group guard would turn into exit 3: that would cost the operator the
-    other five rows, and put a code in ``doctor``'s output that its
+    other rows, and put a code in ``doctor``'s output that its
     documented table does not list.  So each becomes the Paperless row
     instead, and which row depends on the reason.  The trust store is caught
     first, because its type is a ``PaperlessError`` too: its remedy is
@@ -3229,18 +3223,18 @@ def doctor(ctx: click.Context) -> None:
 
     _echo_config_resolution(settings)
 
-    # Any failing check exits 2, and no new ExitCode member expresses it. Three
+    # Any failing check exits 2, and no new ExitCode member expresses it. The
     # reasons, in order: the deployment-config tests
     # test_cli_reference_global_exit_code_table_matches_exit_code_enum and
     # test_troubleshooting_page_is_linked_and_covers_every_exit_code assert the
-    # documented global tables equal every member, so a sixth code is a
-    # documentation change in three files and a revision of the exit-code table;
-    # 2 already means "can't start, fix your setup", which is what every red
-    # check is saying; and `doctor` reports a list, so one process has one exit
-    # code to give and splitting a red Paperless row out to 3 would mean
-    # choosing which red row the shell gets to hear about. A WARN is
-    # deliberately not a failure -- an appliance that scans and files is not
-    # broken because it could be tidier, and a gate that goes red for tidiness
-    # gets ignored.
+    # documented global tables equal every member, so a new member is a
+    # documentation change in every documented table and a revision of the
+    # exit-code table; 2 already means "can't start, fix your setup", which is
+    # what every red check is saying; and `doctor` reports a list, so one
+    # process has one exit code to give and splitting a red Paperless row out
+    # to 3 would mean choosing which red row the shell gets to hear about. A
+    # WARN is deliberately not a failure -- an appliance that scans and files
+    # is not broken because it could be tidier, and a gate that goes red for
+    # tidiness gets ignored.
     if worst_state(results) is CheckState.FAIL:
         ctx.exit(ExitCode.CONFIG)
