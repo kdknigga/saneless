@@ -2725,6 +2725,7 @@ def test_the_citation_hook_covers_shipped_sources_tests_and_ci() -> None:
     ):
         assert files.match(name), name
     assert files.match("docs/index.md") is None
+    assert files.match("docs/explanation/decisions/README.md")
     assert files.match("src.dockerignore") is None
 
 
