@@ -6000,7 +6000,7 @@ class TestWebLogsNoClientSecret:
 
 # The lazy list load's out-of-band Scan button, and the emptied hold reason.
 _METADATA_SCAN_BUTTON = re.compile(
-    r'<button type="submit" id="scan-btn" hx-swap-oob="true"[^>]*>'
+    r'<button(?=[^>]*\sid="scan-btn")(?=[^>]*\shx-swap-oob="true")\s[^>]*>'
 )
 _EMPTIED_HOLD_REASON = '<small id="scan-hold-reason" hx-swap-oob="true"></small>'
 
@@ -6554,7 +6554,8 @@ _CORRESPONDENT_SELECT_BODY = re.compile(
     r"(?P<body>.*?)</select>",
     re.DOTALL,
 )
-_PAGE_SCAN_BUTTON = re.compile(r'<button type="submit" id="scan-btn"[^>]*>')
+# The Scan button's opening tag, found by its id in any attribute order.
+_PAGE_SCAN_BUTTON = re.compile(r'<button(?=[^>]*\sid="scan-btn")\s[^>]*>')
 _LOADING_HELP = (
     f'<small id="correspondent-help">{html.escape(CORRESPONDENTS_LOADING)}</small>'
 )

@@ -409,9 +409,9 @@ _DEVICE_ERROR = "Error during device I/O on /dev/bus/usb/001/004"
 
 # Every status response renders the status area first and the Scan button
 # out-of-band after it, so the button's opening tag is where the area ends.
-_SCAN_BUTTON_START = '<button type="submit" id="scan-btn"'
+# The button is found by its id, whatever order its attributes are in.
 _SCAN_BUTTON = re.compile(
-    r'<button type="submit" id="scan-btn"(?P<attrs>[^>]*)>(?P<text>.*?)</button>',
+    r'<button(?=[^>]*\sid="scan-btn")(?P<attrs>\s[^>]*)>(?P<text>.*?)</button>',
     re.DOTALL,
 )
 _BUTTON = re.compile(r"<button\b(?P<attrs>[^>]*)>(?P<text>.*?)</button>", re.DOTALL)
@@ -621,8 +621,9 @@ def _status(served: _Served) -> str:
 
 def _status_area(text: str) -> str:
     """Return the status area of a status response, without the Scan button."""
-    assert _SCAN_BUTTON_START in text, text
-    return text[: text.index(_SCAN_BUTTON_START)]
+    button = _SCAN_BUTTON.search(text)
+    assert button is not None, text
+    return text[: button.start()]
 
 
 def _buttons(area: str) -> list[tuple[str, str]]:

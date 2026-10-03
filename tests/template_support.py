@@ -10,6 +10,8 @@ is left, so comments of either kind may name attributes freely:
   comment, statement and expression removed.
 - ``template_start_tags`` returns every start tag of a template file, with its
   attributes, in document order.  HTML comments never yield a tag.
+- ``markup_start_tags`` does the same for rendered HTML, such as a response
+  body, so a check can compare attributes whatever order they are written in.
 
 A Jinja expression inside an attribute value leaves the value empty, and an
 attribute written inside a Jinja conditional is kept on its tag, so a check
@@ -73,5 +75,17 @@ def template_start_tags(path: Path) -> list[tuple[str, dict[str, str | None]]]:
     """
     collector = _StartTagCollector()
     collector.feed(template_markup(path.read_text(encoding="utf-8")))
+    collector.close()
+    return collector.tags
+
+
+def markup_start_tags(markup: str) -> list[tuple[str, dict[str, str | None]]]:
+    """
+    Return the start tags of rendered HTML and their attributes, in order.
+
+    Import it as ``from tests.template_support import markup_start_tags``.
+    """
+    collector = _StartTagCollector()
+    collector.feed(markup)
     collector.close()
     return collector.tags

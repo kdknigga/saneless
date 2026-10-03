@@ -76,7 +76,7 @@ from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import MIN_MANUAL_REFRESH_SECONDS, CheckCache
 from tests.conftest import StubScannerBackend, poll_until
-from tests.template_support import template_start_tags
+from tests.template_support import markup_start_tags, template_start_tags
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -2754,7 +2754,10 @@ class TestStripStyles:
 _HISTORY_LOADER = 'hx-get="/api/jobs/history"'
 _STRIP_LOADER = 'hx-get="/api/checks"'
 _OOB_CHECKS = re.compile(r'<div id="checks-body" hx-swap-oob="true"')
-_OOB_SCAN_BTN = 'id="scan-btn" hx-swap-oob="true"'
+# The out-of-band Scan button, found by its attributes in any order.
+_OOB_SCAN_BTN = re.compile(
+    r'<button(?=[^>]*\sid="scan-btn")(?=[^>]*\shx-swap-oob="true")\s[^>]*>'
+)
 
 _PARTIALS_DIR = _PACKAGE_DIR / "templates" / "partials"
 _STATUS_TEMPLATE = _PARTIALS_DIR / "status.html"
@@ -3025,7 +3028,7 @@ class TestWhichResponsesCarryWhat:
         )
         assert response.status_code != 200
         assert _OOB_CHECKS.search(response.text) is None
-        assert _OOB_SCAN_BTN not in response.text
+        assert _OOB_SCAN_BTN.search(response.text) is None
 
     def test_a_refresh_does_not_re_render_the_scan_button(
         self, client: TestClient
@@ -3037,8 +3040,12 @@ class TestWhichResponsesCarryWhat:
         button the server had deliberately disabled.
         """
         response = client.post("/api/checks/refresh")
-        assert _OOB_SCAN_BTN not in response.text
-        assert 'id="scan-btn"' not in response.text
+        assert _OOB_SCAN_BTN.search(response.text) is None
+        assert not [
+            attributes
+            for _tag, attributes in markup_start_tags(response.text)
+            if attributes.get("id") == "scan-btn"
+        ]
 
     def test_the_flag_is_set_by_exactly_one_handler(self) -> None:
         """

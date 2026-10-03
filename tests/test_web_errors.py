@@ -60,7 +60,7 @@ from saneless.web.app import create_app
 from saneless.web.routes import OWNER_COOKIE
 from saneless.worker import ScanOptions, ScanWorker
 from tests.conftest import StubScannerBackend, poll_until
-from tests.template_support import template_start_tags
+from tests.template_support import markup_start_tags, template_start_tags
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -278,11 +278,19 @@ def _assert_json_error(
     }
 
 
-# The Scan button a refused htmx Scan press carries out-of-band, whitespace
-# collapsed: enabled and with ``autofocus``, so focus goes back to the button
-# the press came from.
-SCAN_REFOCUS = (
-    '<button type="submit" id="scan-btn" hx-swap-oob="true" autofocus> Scan </button>'
+# The Scan button a refused htmx Scan press carries out-of-band: enabled and
+# with ``autofocus``, so focus goes back to the button the press came from.
+# Compared as attributes, so their order in the markup does not matter.
+SCAN_REFOCUS = {
+    "type": "submit",
+    "id": "scan-btn",
+    "hx-swap-oob": "true",
+    "autofocus": None,
+}
+
+# The rendered Scan button, found by its id in any attribute order.
+_SCAN_BUTTON_ELEMENT = re.compile(
+    r'<button(?=[^>]*\sid="scan-btn")\s[^>]*>(?P<label>.*?)</button>', re.DOTALL
 )
 
 
@@ -297,9 +305,12 @@ def _slot_of_scan_refusal(text: str) -> str:
         Everything before the out-of-band Scan button, stripped.
 
     """
-    start = text.index('<button type="submit" id="scan-btn"')
-    assert " ".join(text[start:].split()) == SCAN_REFOCUS
-    return text[:start].strip()
+    button = _SCAN_BUTTON_ELEMENT.search(text)
+    assert button is not None, text
+    assert markup_start_tags(button.group(0)) == [("button", SCAN_REFOCUS)]
+    assert button.group("label").strip() == "Scan"
+    assert not text[button.end() :].strip(), text
+    return text[: button.start()].strip()
 
 
 def _assert_scan_refusal(
@@ -2301,7 +2312,7 @@ def test_status_message_children_are_inset_like_the_status_area() -> None:
 # The Scan button a refused htmx submit carries out-of-band, captured whole,
 # whatever order its attributes are in.
 _OOB_SCAN_BUTTON = re.compile(
-    r'<button\s(?=[^>]*\bid="scan-btn")(?=[^>]*\shx-swap-oob="true")(?P<attrs>[^>]*)>'
+    r'<button(?=[^>]*\sid="scan-btn")(?=[^>]*\shx-swap-oob="true")(?P<attrs>\s[^>]*)>'
 )
 _AUTOFOCUS = re.compile(r"\sautofocus\b")
 
