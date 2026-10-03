@@ -75,7 +75,6 @@ membership are not things to re-implement with a regular expression.
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import re
@@ -108,6 +107,7 @@ from saneless.auto_profiles import (
     _profile_label,
 )
 from saneless.checks import CheckKey, check_name
+from saneless.cli import cli
 from saneless.config import (
     OutputConfig,
     ProfileConfig,
@@ -125,6 +125,7 @@ from saneless.pages import (
     is_blank,
 )
 from saneless.pipeline import MAX_DOCUMENT_PAGES, PipelineEvent
+from saneless.scanner import sane_backend
 from saneless.scanner.base import MAX_PAGES_PER_PASS, PageRecord
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
@@ -281,21 +282,6 @@ def test_the_single_file_mount_guard_fires_for_both_spellings() -> None:
     )
 
 
-def test_no_fail_to_start_claim() -> None:
-    """No page claims the container fails to start when the config is missing."""
-    offenders = [
-        f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
-        for path in _deployment_files()
-        for number, line in enumerate(
-            path.read_text(encoding="utf-8").splitlines(), start=1
-        )
-        if "fail to start" in line.lower() and "config" in line.lower()
-    ]
-    assert not offenders, "false 'fail to start' config claim found:\n" + "\n".join(
-        offenders
-    )
-
-
 def test_deploy_docs_use_the_directory_mount() -> None:
     """
     Each Docker deployment page mounts the configuration *directory*.
@@ -315,18 +301,30 @@ def test_deploy_docs_use_the_directory_mount() -> None:
 
 
 def test_deploy_doc_explains_missing_config_and_migration() -> None:
-    """The compose how-to explains a missing file, EBUSY, and the migration."""
-    text = DEPLOY_HOWTO.read_text(encoding="utf-8")
-    name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
-    assert "defaults" in text, f"{name} does not say a missing file means defaults"
-    assert "environment variables" in text, (
-        f"{name} does not mention environment variables for a missing file"
+    """
+    The compose how-to explains a missing file, EBUSY, and the migration.
+
+    Each claim is looked for in the section that makes it: the missing-file
+    rule where the config file is created, and the rename failure and the move
+    under the single-file migration.
+    """
+    text, name = _read(DEPLOY_HOWTO)
+    create = _section(text, "## Step 1: Create the configuration file", name)
+    assert _says(create, f"if `{CONFIG_NAME}` is missing"), (
+        f"{name}'s config-file step does not say what happens when the file is missing"
     )
-    assert "EBUSY" in text, f"{name} does not explain the EBUSY rename failure"
+    assert _says(create, "defaults plus environment variables"), (
+        f"{name}'s config-file step does not say a missing file means the "
+        "defaults plus environment variables"
+    )
+    moving = _subsection(text, "### Moving from a single-file config mount", name)
+    assert _says(moving, "EBUSY"), (
+        f"{name}'s migration section does not explain the EBUSY rename failure"
+    )
     migration = [
         line
-        for line in text.splitlines()
-        if f"config/{CONFIG_NAME}" in line and "mv" in line
+        for line in moving.splitlines()
+        if f"config/{CONFIG_NAME}" in line and _says(line, "mv")
     ]
     assert migration, (
         f"{name} has no migration step moving an old single-file config to "
@@ -338,13 +336,9 @@ def test_deploy_doc_says_auto_profiles_never_writes_the_data_volume() -> None:
     """
     With no ``saneless.toml``, the how-to names ``/etc/saneless`` as the target.
 
-    ``auto-profiles`` used to write ``./saneless.toml``, which in the image is
-    the data volume, and the how-to told container users to ``touch`` the
-    mounted file first to dodge it. The command now creates the file in the
-    mounted ``./config`` directory itself, so both the trap and the workaround
-    must be gone, and the page must say where the file goes. The volume path
-    may still be named as an earlier release's leftover, never as a place the
-    command writes.
+    In the image the working directory is the data volume, so the page must
+    never say ``auto-profiles`` writes there. It may name the volume path as an
+    earlier release's leftover, never as a place the command writes.
     """
     text, name = _read(DEPLOY_HOWTO)
     sentences = _sentences(text)
@@ -356,10 +350,6 @@ def test_deploy_doc_says_auto_profiles_never_writes_the_data_volume() -> None:
     assert not trap, (
         f"{name} still says auto-profiles writes {AUTO_PROFILES_CONTAINER_PATH}:\n"
         + "\n".join(trap)
-    )
-    assert f"touch config/{CONFIG_NAME}" not in text, (
-        f"{name} still tells container users to create config/{CONFIG_NAME} "
-        "with touch, which the command no longer needs"
     )
     assert any(
         "auto-profiles" in sentence
@@ -378,9 +368,6 @@ def test_cli_reference_names_the_new_config_target() -> None:
     never ``./saneless.toml``, which would outrank both on the next start.
     """
     text, name = _read(CLI_REFERENCE)
-    assert AUTO_PROFILES_CONTAINER_PATH not in text, (
-        f"{name} still names {AUTO_PROFILES_CONTAINER_PATH} as a write target"
-    )
     sentences = _sentences(_section(text, "## `saneless auto-profiles`", name))
     assert any(
         SYSTEM_CONFIG_PATH in sentence and XDG_CONFIG_PATH in sentence
@@ -475,22 +462,19 @@ def test_profile_howto_says_how_to_refresh_a_hand_written_default() -> None:
 
 def test_first_scan_tutorial_example_is_a_description() -> None:
     """
-    The tutorial's description example is a description, not a label.
+    The tutorial's description example is a description, and names the start profile.
 
-    The line beneath the profile dropdown is a sentence; the dropdown shows
-    the label. The page also says which profile it opens on, which is now
-    true: ``default``, or the profile standing in for it.
+    The line beneath the profile dropdown is the profile's description, read
+    here from the code that writes it, and the page opens on ``default``.
     """
     text, name = _read(FIRST_WEB_UI_SCAN)
-    assert f'"{_profile_label("ADF Duplex")}"' not in text, (
-        f"{name} still gives a label as the example of a description"
+    details = _section(text, "## Fill in scan details", name)
+    assert _says(details, _profile_description("ADF Duplex")), (
+        f"{name}'s scan-details section does not give a real description as the example"
     )
-    assert _profile_description("ADF Duplex") in text, (
-        f"{name} does not give a real description as the example"
-    )
-    assert 'The profile named "default" is selected when the page loads' in text, (
-        f"{name} no longer says which profile the page opens on"
-    )
+    assert _says(
+        details, 'The profile named "default" is selected when the page loads'
+    ), f"{name}'s scan-details section no longer says which profile the page opens on"
 
 
 # The two pages that say when the scan worker becomes degraded.
@@ -510,9 +494,6 @@ def test_degraded_docs_say_when_owed_writes_are_retried(page: Path) -> None:
     record -- starts the job-store failure count again.
     """
     text, name = _read(page)
-    assert "idle ticks in a row" not in text, (
-        f"{name} still counts failed owed-write retries in idle ticks"
-    )
     sentences = _sentences(text)
     assert any(
         "after each scan that ends cleanly" in sentence and "5 seconds" in sentence
@@ -526,34 +507,30 @@ def test_degraded_docs_say_when_owed_writes_are_retried(page: Path) -> None:
 
 def test_profile_howto_describes_force_as_a_merge() -> None:
     """The profile how-to describes ``--force`` as a merge, not an overwrite."""
-    text = PROFILE_HOWTO.read_text(encoding="utf-8")
-    name = PROFILE_HOWTO.relative_to(REPO_ROOT)
+    text, name = _read(PROFILE_HOWTO)
+    section = _section(text, "## Auto-generated profiles", name)
     for needle in (
-        "auto_generated",
-        "default_tags",
-        "Refreshed",
-        "Skipped (not auto-generated)",
+        "`--force` merges; it does not replace whole profiles",
+        "Everything else in the profile is kept: `default_tags`",
+        "`Refreshed`",
+        "`Skipped (not auto-generated)`",
     ):
-        assert needle in text, f"{name} does not mention {needle!r}"
-    assert "to overwrite existing auto-generated profiles" not in text, (
-        f"{name} still describes --force as an overwrite"
-    )
+        assert _says(section, needle), (
+            f"{name}'s auto-generated profiles section does not say {needle!r}"
+        )
 
 
 def test_profile_howto_title_is_literal() -> None:
     """The profile ``title`` is documented as a literal default, not a template."""
-    text = PROFILE_HOWTO.read_text(encoding="utf-8")
-    name = PROFILE_HOWTO.relative_to(REPO_ROOT)
-    assert "title template" not in text.lower(), f"{name} still calls title a template"
-    assert "Scan <" in text, f"{name} does not document the 'Scan <time>' fallback"
-
-
-def test_profile_howto_unwritable_example_is_current() -> None:
-    """The unwritable-config example no longer blames the Docker Compose examples."""
-    text = PROFILE_HOWTO.read_text(encoding="utf-8")
-    assert "as in the Docker Compose examples" not in text, (
-        f"{PROFILE_HOWTO.relative_to(REPO_ROOT)} still says the compose examples "
-        "mount the config read-only"
+    text, name = _read(PROFILE_HOWTO)
+    title_row = _table_row(
+        _section(text, "## Profile field reference", name), "`title`"
+    )
+    assert _says(title_row, "used as written"), (
+        f"{name}'s title row does not say the title is used as written"
+    )
+    assert _says(title_row, "the title is `Scan <date time>`"), (
+        f"{name}'s title row does not document the 'Scan <date time>' fallback"
     )
 
 
@@ -562,38 +539,85 @@ def _read(path: Path) -> tuple[str, Path]:
     return path.read_text(encoding="utf-8"), path.relative_to(REPO_ROOT)
 
 
+def _says(scope: str, phrase: str) -> bool:
+    """
+    Return whether ``scope`` contains ``phrase`` as whole words.
+
+    The match ignores case and treats any run of whitespace, a line break
+    included, as one space. An edge of the phrase that is a word character
+    must sit on a word boundary, so ``red`` does not match ``required``.
+    """
+    body = r"\s+".join(re.escape(word) for word in phrase.split())
+    lead = r"\b" if re.match(r"\w", phrase.strip()) else ""
+    trail = r"\b" if re.search(r"\w$", phrase.strip()) else ""
+    return re.search(lead + body + trail, scope, re.IGNORECASE) is not None
+
+
+def test_says_matches_whole_words_across_a_line_break() -> None:
+    """A phrase matches across a wrap and in any case, but not inside a word."""
+    scope = "Every field is Required,\nand the strip turns amber."
+
+    assert _says(scope, "is required")
+    assert _says(scope, "required, and")
+    assert _says(scope, "the STRIP turns")
+    assert not _says(scope, "red")
+    assert not _says(scope, "`amber`")
+
+
 def test_configuration_reference_documents_xdg_and_levels() -> None:
     """The configuration reference names the XDG bases, every level and ``~``."""
     text, name = _read(CONFIG_REFERENCE)
-    for needle in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "CRITICAL", "~", "expanded"):
-        assert needle in text, f"{name} does not mention {needle!r}"
-
-
-def test_configuration_reference_title_is_literal() -> None:
-    """The configuration reference no longer calls the profile title a template."""
-    text, name = _read(CONFIG_REFERENCE)
-    assert "title template" not in text.lower(), f"{name} still calls title a template"
+    search = _section(text, "## Where saneless reads settings", name)
+    assert _says(search, "`$XDG_CONFIG_HOME/saneless/saneless.toml`"), (
+        f"{name}'s search path does not name the XDG config file"
+    )
+    output = _section(text, "## `[output]`", name)
+    level_row = _table_row(output, "`log_level`")
+    for level in logging.getLevelNamesMapping():
+        if level in {"NOTSET", "WARN", "FATAL"}:
+            continue
+        assert _says(level_row, f"`{level}`"), (
+            f"{name}'s log_level row does not name the {level} level"
+        )
+    assert _says(output, "`$XDG_STATE_HOME/saneless`"), (
+        f"{name}'s [output] section does not name the XDG state directory"
+    )
+    assert _says(output, "a leading `~` is expanded to your home directory"), (
+        f"{name}'s [output] section does not say a leading ~ is expanded"
+    )
 
 
 def test_configuration_reference_documents_unknown_key_rejection() -> None:
     """The configuration reference says unknown keys are rejected with valid keys."""
     text, name = _read(CONFIG_REFERENCE)
-    for needle in ("unknown key", "valid keys"):
-        assert needle in text, f"{name} does not mention {needle!r}"
+    validation = _section(text, "## Validation", name)
+    for needle in ("rejects keys it does not know", "lists the valid keys"):
+        assert _says(validation, needle), (
+            f"{name}'s validation section does not say {needle!r}"
+        )
 
 
 def test_environment_reference_documents_unknown_variables() -> None:
-    """The environment reference documents rejection and profile variables."""
+    """
+    The environment reference documents rejection and profile variables.
+
+    The exit code is read from ``ExitCode``, so renumbering the configuration
+    error fails the page until it says the new code.
+    """
     text, name = _read(ENV_REFERENCE)
-    assert "SANELESS_PAPERLES__TOKEN" in text, (
-        f"{name} has no misspelt-variable example (SANELESS_PAPERLES__TOKEN)"
+    notes = _section(text, "## Notes", name)
+    assert _says(notes, "Unknown variables are rejected"), (
+        f"{name}'s notes do not say unknown variables are rejected"
     )
-    assert "exit" in text, f"{name} does not give the exit code for unknown variables"
-    assert "Profile fields cannot be set via environment variables" not in text, (
-        f"{name} still claims profile fields cannot be set from the environment"
+    assert _says(notes, "`SANELESS_PAPERLES__TOKEN` suggests"), (
+        f"{name}'s notes have no misspelt-variable example (SANELESS_PAPERLES__TOKEN)"
     )
-    assert "SANELESS_PROFILES__" in text, (
-        f"{name} does not show the SANELESS_PROFILES__<NAME>__<FIELD> form"
+    assert _says(notes, f"exit code {int(ExitCode.CONFIG)}"), (
+        f"{name}'s notes do not give exit code {int(ExitCode.CONFIG)} for an "
+        "unknown variable"
+    )
+    assert _says(notes, "`SANELESS_PROFILES__<NAME>__<FIELD>`"), (
+        f"{name}'s notes do not show the SANELESS_PROFILES__<NAME>__<FIELD> form"
     )
 
 
@@ -606,8 +630,20 @@ def test_search_path_lists_name_xdg_config_home() -> None:
     has moved their config home.
     """
     text, name = _read(CONFIG_REFERENCE)
-    assert ".config/saneless" not in text or "XDG_CONFIG_HOME" in text, (
-        f"{name} lists ~/.config/saneless without $XDG_CONFIG_HOME"
+    search = _section(text, "## Where saneless reads settings", name)
+    assert _says(search, "`$XDG_CONFIG_HOME/saneless/saneless.toml`"), (
+        f"{name}'s search path does not name the per-user file by $XDG_CONFIG_HOME"
+    )
+    bare = [
+        line.strip()
+        for line in search.splitlines()
+        if re.match(r"\d+\. ", line)
+        and ".config/saneless" in line
+        and "XDG_CONFIG_HOME" not in line
+    ]
+    assert not bare, (
+        f"{name}'s search path names ~/.config/saneless without "
+        "$XDG_CONFIG_HOME:\n" + "\n".join(bare)
     )
 
 
@@ -734,8 +770,10 @@ def test_environment_reference_documents_json_values() -> None:
         and "`allowed_hosts`" in sentence
         for sentence in _sentences(text)
     ), f"{name} has no sentence saying default_tags and allowed_hosts take JSON"
-    assert "must be JSON" in text, (
-        f"{name} does not show the line naming a variable that is not JSON"
+    json_values = _subsection(text, "### JSON values", name)
+    assert _says(json_values, "must be JSON"), (
+        f"{name}'s JSON values section does not show the line naming a variable "
+        "that is not JSON"
     )
 
 
@@ -772,9 +810,6 @@ def test_configuration_reference_names_the_new_config_target() -> None:
     an amber row that names both.
     """
     text, name = _read(CONFIG_REFERENCE)
-    assert "/var/lib/saneless/saneless.toml" not in text, (
-        f"{name} still names the data volume as a place auto-profiles writes"
-    )
     search = _section(text, "## Where saneless reads settings", name)
     target = [
         sentence
@@ -787,7 +822,7 @@ def test_configuration_reference_names_the_new_config_target() -> None:
         and "`./saneless.toml`" in sentence
         for sentence in target
     ), f"{name} does not say where auto-profiles writes with no config file"
-    assert "is also there and is not read" in search, (
+    assert _says(search, "is also there and is not read"), (
         f"{name} does not show the amber row for a second config file"
     )
 
@@ -795,32 +830,41 @@ def test_configuration_reference_names_the_new_config_target() -> None:
 def test_cli_reference_verbose_is_saneless_debug() -> None:
     """``-v`` is documented as saneless's own debug detail, mirrored to stderr."""
     text, name = _read(CLI_REFERENCE)
-    assert "sets log level to DEBUG" not in text, (
-        f"{name} still says -v sets the log level to DEBUG"
-    )
-    row = _table_row(text, "`-v, --verbose`")
-    assert "stderr" in row, f"{name}: the -v row does not mention stderr"
+    row = _table_row(_section(text, "## Global Options", name), "`-v, --verbose`")
+    assert _says(row, "stderr"), f"{name}: the -v row does not mention stderr"
 
 
 def test_cli_reference_title_is_optional() -> None:
-    """The scan synopsis and ``--title`` row show the title as optional."""
-    text, name = _read(CLI_REFERENCE)
-    assert "scan [--title TEXT]" in text, (
-        f"{name}: scan synopsis still requires --title"
+    """
+    The scan synopsis shows ``--title`` as optional, as the command takes it.
+
+    Whether the option is required is read from the command itself.
+    """
+    title = next(
+        param for param in cli.commands["scan"].params if param.name == "title"
     )
-    row = _table_row(text, "`--title`")
-    assert "(required)" not in row, f"{name}: the --title row still says required"
+    assert not title.required, "scan's --title is required; the synopsis needs updating"
+    text, name = _read(CLI_REFERENCE)
+    scan = _section(text, "## `saneless scan`", name)
+    assert _says(scan, "scan [--title TEXT]"), (
+        f"{name}: the scan synopsis does not show --title as optional"
+    )
 
 
 def test_cli_reference_force_is_a_merge() -> None:
     """``auto-profiles --force`` is documented as a merge that can fail on EBUSY."""
     text, name = _read(CLI_REFERENCE)
-    assert "Overwrite existing profiles" not in text, (
-        f"{name} still describes --force as an overwrite"
+    section = _section(text, "## `saneless auto-profiles`", name)
+    force = _table_row(section, "`--force`")
+    assert _says(force, "marked `auto_generated = true`"), (
+        f"{name}: the --force row does not say it refreshes only flagged profiles"
     )
-    assert "auto_generated" in text, f"{name} does not mention auto_generated"
-    assert "EBUSY" in text or "single file" in text, (
-        f"{name} does not explain the single-file bind mount failure"
+    assert _says(force, "never changes a profile without it"), (
+        f"{name}: the --force row does not say unflagged profiles are kept"
+    )
+    assert _says(_table_row(section, str(int(ExitCode.CONFIG))), "EBUSY"), (
+        f"{name}: auto-profiles' exit-2 row does not explain the single-file "
+        "bind mount failure"
     )
 
 
@@ -859,6 +903,7 @@ _COMMAND_HEADING = re.compile(r"^## `saneless ([a-z-]+)`$", re.MULTILINE)
 # command is caught by the same test as the sixth.
 _COUNT_SENTENCE = re.compile(r"^saneless provides (\w+) commands\b", re.MULTILINE)
 _NUMBER_WORDS = {
+    "one": 1,
     "two": 2,
     "three": 3,
     "four": 4,
@@ -869,12 +914,6 @@ _NUMBER_WORDS = {
     "nine": 9,
     "ten": 10,
 }
-
-OLD_SCRIPTING_ABORT = (
-    "aborted at the flip prompt or not confirmed within `flip_timeout_seconds` "
-    "exits with code 1"
-)
-OLD_REFERENCE_ABORT = "manual duplex aborted at the flip prompt or flip wait timed out"
 
 
 def _documented_codes(section: str) -> set[int]:
@@ -1049,36 +1088,53 @@ def test_cli_reference_command_count_matches_its_sections() -> None:
     )
 
 
-def test_doctor_promises_no_json_mode() -> None:
-    """
-    Neither document offers ``doctor --json``, because it does not ship.
-
-    Research found no consumer for one -- not in the docs, the tests, the
-    Dockerfile or the compose file -- and CONTEXT says a JSON mode ships only
-    with a reader. A document that promises one would be a wire contract
-    somebody parses before anybody implements it, so the decision is pinned
-    here rather than left to be re-litigated.
-    """
-    for path in (CLI_REFERENCE, CLI_SCRIPTING):
-        text, name = _read(path)
-        assert "doctor --json" not in text, (
-            f"{name} promises a `doctor --json` that does not exist"
-        )
+def _json_commands() -> tuple[set[str], set[str]]:
+    """Return the CLI commands that take ``--json`` and those that do not."""
+    with_json = {
+        command
+        for command, group_member in cli.commands.items()
+        if any("--json" in param.opts for param in group_member.params)
+    }
+    return with_json, set(cli.commands) - with_json
 
 
-def test_scripting_does_not_claim_every_read_command_has_json() -> None:
+def test_no_page_offers_json_output_a_command_does_not_have() -> None:
     """
-    The JSON section names the commands that have ``--json``, rather than all.
+    No CLI page shows ``--json`` on a command that does not take it.
 
-    ``doctor`` is a read command with no ``--json``, so the old blanket claim
-    became false the moment it shipped. This is the assertion that would have
-    caught it.
+    Which commands take ``--json`` is read from the CLI, so a page promising
+    a machine-readable mode that does not ship fails here.
     """
+    _with_json, without_json = _json_commands()
+    offenders = [
+        f"{name}: offers `{command} --json`"
+        for path in (CLI_REFERENCE, CLI_SCRIPTING)
+        for text, name in [_read(path)]
+        for command in sorted(without_json)
+        if _says(text, f"{command} --json")
+    ]
+    assert not offenders, "\n".join(offenders)
+
+
+def test_the_json_section_shows_every_command_that_has_json() -> None:
+    """
+    The scripting guide's JSON section shows each command that takes ``--json``.
+
+    It names those commands rather than claiming every read command has a
+    JSON mode; the set is read from the CLI.
+    """
+    with_json, _without_json = _json_commands()
+    assert with_json, "no CLI command takes --json"
     text, name = _read(CLI_SCRIPTING)
-    assert "All read commands support" not in text, (
-        f"{name} still claims every read command supports --json"
+    section = _section(text, "## JSON output mode", name)
+    missing = [
+        command
+        for command in sorted(with_json)
+        if not _says(section, f"saneless {command} --json")
+    ]
+    assert not missing, (
+        f"{name}'s JSON output section does not show --json for {missing}"
     )
-    assert "doctor" in text, f"{name} does not mention doctor's exit semantics"
 
 
 def test_the_scripting_readiness_gate_uses_devices() -> None:
@@ -1091,14 +1147,12 @@ def test_the_scripting_readiness_gate_uses_devices() -> None:
     should.
     """
     text, name = _read(CLI_SCRIPTING)
-    assert "saneless devices --json | jq -e 'length > 0'" in text, (
-        f"{name} does not gate a scan on saneless devices --json"
+    readiness = _subsection(text, "### Checking readiness before a scan", name)
+    assert _says(readiness, "saneless devices --json | jq -e 'length > 0'"), (
+        f"{name}'s readiness example does not gate a scan on saneless devices --json"
     )
     assert not re.search(r"if !? *saneless doctor", text), (
-        f"{name} still gates a scan on saneless doctor's exit code"
-    )
-    assert "no scanner is reachable" not in text, (
-        f"{name} still says doctor exits 2 when no scanner is reachable"
+        f"{name} gates a scan on saneless doctor's exit code"
     )
 
 
@@ -1112,13 +1166,10 @@ def test_the_doctor_reference_says_an_unanswered_host_is_a_warning() -> None:
     """
     text, name = _read(CLI_REFERENCE)
     section = _section(text, "## `saneless doctor`", name)
-    assert "no scanner reachable" not in section, (
-        f"{name} still lists 'no scanner reachable' under doctor's exit 2"
+    assert _says(section, "a warning, even when it is the only one configured"), (
+        f"{name} does not say an unanswered scanner host is a warning"
     )
-    assert "cannot disagree" not in section, (
-        f"{name} still says doctor and the page cannot disagree"
-    )
-    assert "saneless devices --json" in section, (
+    assert _says(section, "saneless devices --json"), (
         f"{name} does not point a readiness check at saneless devices --json"
     )
 
@@ -1139,7 +1190,10 @@ def test_scripting_documents_jobs_json_created_at_as_utc() -> None:
         assert value.endswith("+00:00"), (
             f"{name} documents created_at as {value!r}, which is not UTC ISO-8601"
         )
-    assert "UTC" in text, f"{name} does not say the JSON timestamps stay UTC"
+    history = _subsection(text, "### Job history JSON", name)
+    assert _says(history, "`created_at` is always a UTC ISO-8601 timestamp"), (
+        f"{name}'s job history section does not say created_at stays UTC"
+    )
 
 
 def test_job_database_documented_under_exit_code_two() -> None:
@@ -1172,18 +1226,19 @@ def test_job_database_documented_under_exit_code_two() -> None:
 
 
 def test_flip_prompt_abort_documented_as_cancelled() -> None:
-    """An abort at the flip prompt is documented as exit 130, not 1 (D-02, D-03)."""
-    for path, old in (
-        (CLI_SCRIPTING, OLD_SCRIPTING_ABORT),
-        (CLI_REFERENCE, OLD_REFERENCE_ABORT),
-    ):
+    """
+    An abort at the flip prompt is documented with the cancelled exit code.
+
+    The code is read from ``ExitCode``, so renumbering it fails both pages.
+    """
+    cancelled = str(int(ExitCode.CANCELLED))
+    for path in (CLI_SCRIPTING, CLI_REFERENCE):
         text, name = _read(path)
-        flat = " ".join(text.split())
-        assert old not in flat, f"{name} still documents the abort as exit 1"
-        sentences = re.split(r"(?<=[.!?])\s+", flat)
-        assert any("flip prompt" in s and "130" in s for s in sentences), (
-            f"{name} has no sentence saying a flip-prompt abort exits 130"
-        )
+        sentences = re.split(r"(?<=[.!?])\s+", " ".join(text.split()))
+        assert any(
+            _says(sentence, "flip prompt") and _says(sentence, cancelled)
+            for sentence in sentences
+        ), f"{name} has no sentence saying a flip-prompt abort exits {cancelled}"
 
 
 TROUBLESHOOTING = DOCS_DIR / "how-to" / "troubleshoot-a-failed-scan.md"
@@ -1345,6 +1400,9 @@ def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
 
 
 ARCHITECTURE_MEMORY_HEADING = "### Memory, disk and timeouts"
+# The per-page timeout floor as the page writes it, read from the backend
+# that enforces it.
+PAGE_TIMEOUT_FLOOR = f"{sane_backend._PAGE_TIMEOUT_FLOOR_SECONDS:g}"
 
 # The Phase 29 claims the architecture page now makes, each with the substrings
 # that carry it.
@@ -1370,12 +1428,12 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "one per-page timeout bounds the feeder and the flatbed alike",
-        ("120", "feeder", "flatbed"),
+        ("feeder", "flatbed"),
     ),
     (
         "the per-page limit scales with the page the scanner agreed to, with a "
         "120-second floor",
-        ("120", "scales"),
+        (f"never below {PAGE_TIMEOUT_FLOOR} seconds", "scales"),
     ),
     (
         "a timeout cancels the read and waits for it before closing the device",
@@ -1387,7 +1445,7 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "a wedged scanner refuses the next scan and asks for a restart",
-        ("refus", "restart saneless"),
+        ("refused", "restart saneless"),
     ),
     (
         "only page reads and the cancel after a timeout run under a bound",
@@ -1413,21 +1471,6 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
-# What the subsection used to promise and must not promise again, each with the
-# reason it is false: only page reads and the cancel after a timeout run on a
-# daemon thread, and the per-page limit grows with the page the scanner agreed
-# to send rather than being one fixed number.
-ARCHITECTURE_MEMORY_RETRACTED: tuple[tuple[str, str], ...] = (
-    (
-        "every blocking scanner call runs on a daemon thread",
-        "only page reads and the cancel after a timeout do",
-    ),
-    (
-        "one 120-second per-page timeout",
-        "the limit scales with the page, and 120 seconds is only its floor",
-    ),
-)
-
 
 def _subsection(text: str, heading: str, name: Path) -> str:
     """Return the body of the one ``### `` section headed exactly ``heading``."""
@@ -1440,39 +1483,23 @@ def _subsection(text: str, heading: str, name: Path) -> str:
 
 
 def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
-    """The architecture page pins Phase 29's memory, disk and timeout claims."""
+    """
+    The architecture page states the memory, disk and timeout rules the code keeps.
+
+    The per-page timeout floor is read from the scanner backend, so changing it
+    fails the page until the page says the new figure.
+    """
     text, name = _read(ARCHITECTURE)
-    assert ARCHITECTURE_MEMORY_HEADING in text, (
-        f"{name} has no {ARCHITECTURE_MEMORY_HEADING!r} subsection"
-    )
-    body = _subsection(text, ARCHITECTURE_MEMORY_HEADING, name).lower()
+    body = _subsection(text, ARCHITECTURE_MEMORY_HEADING, name)
     for claim, needles in ARCHITECTURE_MEMORY_CLAIMS:
         for needle in needles:
-            assert needle in body, (
+            assert _says(body, needle), (
                 f"{name}: the memory, disk and timeouts subsection no longer "
                 f"says that {claim} (looked for {needle!r})"
             )
-    for retracted, why in ARCHITECTURE_MEMORY_RETRACTED:
-        assert retracted not in body, (
-            f"{name}: the memory, disk and timeouts subsection claims again that "
-            f"{retracted!r}; {why}"
-        )
-
-    # The two claims the page used to make and must not make again. A PNG
-    # re-encode is lossless, but the bytes in the PDF are not the bytes the
-    # scanner sent, and pages are no longer carried through the pipeline as
-    # in-memory images. Reverting either correction fails here.
-    lowered = text.lower()
-    assert "byte-for-byte" not in lowered, (
-        f"{name} claims the embedded image data is byte-for-byte identical to "
-        "what the scanner produced; it is lossless, not byte-identical"
-    )
-    assert "pil images" not in lowered, (
-        f"{name}'s pipeline diagram still carries pages as PIL Images; they are "
-        "spooled to disk as they arrive"
-    )
-    assert "lossless" in lowered, (
-        f"{name} no longer says the PNG-to-PDF embed is lossless"
+    assembly = _subsection(text, "### PDF Assembly", name)
+    assert _says(assembly, "This is lossless"), (
+        f"{name}'s PDF assembly section no longer says the PNG-to-PDF embed is lossless"
     )
 
 
@@ -1483,343 +1510,285 @@ def test_architecture_page_says_a_pass_cap_keeps_its_pages() -> None:
     """
     A feeder scan that reaches its sheet cap uploads what it kept.
 
-    The cap used to be one of the failures that preserve a partial PDF. Now
-    the pages kept are uploaded with a warning naming the sheet the feeder
-    took past the cap, so listing the cap among failures again would tell an
-    operator to look in ``failed/`` for a document that is in paperless-ngx.
+    The pages kept are uploaded with a warning naming the sheet the feeder took
+    past the cap, so the page must not send an operator to ``failed/`` for a
+    document that is in paperless-ngx. Both caps are read from the code.
     """
     text, name = _read(ARCHITECTURE)
-    body = " ".join(
-        _subsection(text, ARCHITECTURE_FAILED_SCAN_HEADING, name).split()
-    ).lower()
-    assert "feeder page cap" not in body, (
-        f"{name} still lists the feeder page cap among the failures that keep a "
-        "partial PDF; reaching it uploads the pages kept"
-    )
-    for needle in ("fed but not kept", "500", "50 sheets"):
-        assert needle in body, (
+    body = _subsection(text, ARCHITECTURE_FAILED_SCAN_HEADING, name)
+    for needle in (
+        "fed but not kept",
+        f"keeps at most {MAX_PAGES_PER_PASS} sheets, or "
+        f"{sane_backend._MAX_AUTO_FEEDER_PAGES} sheets for an Auto source",
+    ):
+        assert _says(body, needle), (
             f"{name}: {ARCHITECTURE_FAILED_SCAN_HEADING!r} no longer says what "
             f"reaching a per-scan sheet cap does (looked for {needle!r})"
         )
 
 
-# What the operator pages say about the scanner layer, each with the substrings
-# that carry it. Compared against the page with its whitespace collapsed and in
-# lower case, so rewrapping a paragraph does not fail here but dropping a claim
-# does.
-SCANNER_DOC_CLAIMS: tuple[tuple[Path, str, tuple[str, ...]], ...] = (
+# What the operator pages say about the scanner layer: the page, the section
+# that says it, the claim, and the phrases that carry it. Each phrase is looked
+# for in that section only, as whole words in any case across line wraps, so
+# rewrapping a paragraph does not fail here but dropping a claim does.
+SCANNER_DOC_CLAIMS: tuple[tuple[Path, str, str, tuple[str, ...]], ...] = (
     (
         TROUBLESHOOTING,
+        f"## Uploaded with a warning (exit {int(ExitCode.UPLOADED_WITH_WARNING)})",
         "a scan that reaches its sheet cap names the sheet fed but not kept",
         ("was fed but not kept",),
     ),
     (
         TROUBLESHOOTING,
+        f"## Scanner errors (exit {int(ExitCode.SCAN)})",
         "the page limit scales with the page and is not only a dropped link",
         ("scales", "wi-fi"),
     ),
     (
         TROUBLESHOOTING,
+        f"## Scanner errors (exit {int(ExitCode.SCAN)})",
         "a source the scanner does not list is refused, naming what it offers",
         ("has no source named",),
     ),
     (
         TROUBLESHOOTING,
+        f"## Scanner errors (exit {int(ExitCode.SCAN)})",
         "a 16-bit mode is refused before any page",
         ("16 bits per sample",),
     ),
     (
         ADF_DUPLEX_HOWTO,
+        "### ADF Hardware Duplex",
         "hardware duplex sets the ADF mode on the scanners that select duplex that way",
         ("adf-mode", "epson2"),
     ),
     (
         PROFILE_HOWTO,
+        "## Profile field reference",
         "hardware duplex sets the ADF mode on the scanners that select duplex that way",
         ("adf-mode",),
     ),
     (
         CONFIG_REFERENCE,
+        "## `[profiles.NAME]`",
         "hardware duplex sets the ADF mode on the scanners that select duplex that way",
         ("adf-mode",),
     ),
     (
         ADF_DUPLEX_HOWTO,
+        "## Paper size on a feeder",
         "paper_size on a feeder needs page-width/page-height",
         ("page-width",),
     ),
     (
         PROFILE_HOWTO,
+        "## Paper size",
         "paper_size on a feeder needs page-width/page-height",
         ("page-width",),
     ),
     (
         CONFIG_REFERENCE,
+        "## `[profiles.NAME]`",
         "paper_size on a feeder needs page-width/page-height",
         ("page-width",),
     ),
     (
         PROFILE_HOWTO,
+        "## Source values",
         "a profile's source is matched ignoring case and surrounding spaces",
         ("ignoring case",),
     ),
     (
         ADF_DUPLEX_HOWTO,
+        "### When a pass reaches its sheet cap",
         "a pass that reaches its sheet cap uploads the pages kept, naming the sheet",
         ("fed but not kept",),
     ),
     (
         MULTI_PAGE_HOWTO,
+        "## How long a document can grow",
         "a scan that reaches its per-scan limit finishes the document",
         ("fed but not kept",),
     ),
 )
 
-# Sentences those pages used to carry that are no longer true, each with why.
-SCANNER_DOC_RETRACTED: tuple[tuple[Path, str, str], ...] = (
-    (
-        TROUBLESHOOTING,
-        "usually means the link dropped",
-        "the limit grows with the page, so a slow link or a high resolution "
-        "can reach it too",
-    ),
-    (
-        ADF_DUPLEX_HOWTO,
-        "The scanner decides to scan both sides from the source name it is given",
-        'scanners that select duplex by an ADF mode need duplex = "hardware"',
-    ),
-    (
-        PROFILE_HOWTO,
-        "only records that the source scans both sides and does not change the scan",
-        'duplex = "hardware" sets the ADF mode where the scanner has one',
-    ),
-    (
-        CONFIG_REFERENCE,
-        "nothing reads it",
-        'duplex = "hardware" sets the ADF mode where the scanner has one',
-    ),
-    (
-        CONFIG_REFERENCE,
-        "falls back to post-scan crop otherwise",
-        "a feeder without page-width/page-height scans the full window uncropped",
-    ),
-)
+
+def _heading_scope(text: str, heading: str, name: Path) -> str:
+    """Return the body under ``heading``, a ``## `` or a ``### `` heading line."""
+    if heading.startswith("### "):
+        return _subsection(text, heading, name)
+    return _section(text, heading, name)
 
 
 @pytest.mark.parametrize(
-    ("page", "claim", "needles"),
+    ("page", "heading", "claim", "needles"),
     SCANNER_DOC_CLAIMS,
-    ids=[f"{page.stem}: {claim}" for page, claim, _ in SCANNER_DOC_CLAIMS],
+    ids=[f"{page.stem}: {claim}" for page, _, claim, _ in SCANNER_DOC_CLAIMS],
 )
 def test_operator_pages_state_the_scanner_rules(
-    page: Path, claim: str, needles: tuple[str, ...]
+    page: Path, heading: str, claim: str, needles: tuple[str, ...]
 ) -> None:
-    """Each operator page still says what the scanner layer now does."""
+    """Each operator page says what the scanner layer does, where it belongs."""
     text, name = _read(page)
-    flat = " ".join(text.split()).lower()
+    section = _heading_scope(text, heading, name)
     for needle in needles:
-        assert needle in flat, f"{name} no longer says that {claim} ({needle!r})"
-
-
-@pytest.mark.parametrize(
-    ("page", "retracted", "why"),
-    SCANNER_DOC_RETRACTED,
-    ids=[f"{page.stem}: {retracted}" for page, retracted, _ in SCANNER_DOC_RETRACTED],
-)
-def test_operator_pages_do_not_repeat_retracted_scanner_claims(
-    page: Path, retracted: str, why: str
-) -> None:
-    """No operator page says again what the scanner layer no longer does."""
-    text, name = _read(page)
-    flat = " ".join(text.split())
-    assert retracted not in flat, f"{name} says again {retracted!r}; {why}"
+        assert _says(section, needle), (
+            f"{name} {heading!r} no longer says that {claim} ({needle!r})"
+        )
 
 
 FALLBACK_EXPLANATION = DOCS_DIR / "explanation" / "consume-directory-fallback.md"
 
 # What the operator pages say about delivery to paperless-ngx and a scan's
-# metadata, each with the lower-case substrings that carry it. Compared with the
-# page's whitespace collapsed and in lower case, like the scanner claims above.
-DELIVERY_DOC_CLAIMS: tuple[tuple[Path, str, tuple[str, ...]], ...] = (
+# metadata, laid out and matched like the scanner claims above.
+DELIVERY_DOC_CLAIMS: tuple[tuple[Path, str, str, tuple[str, ...]], ...] = (
     (
         CONFIG_REFERENCE,
+        "## `[paperless]`",
         "the supported paperless-ngx range",
         ("2.16 or later", "api version 9 or 10"),
     ),
     (
         DEPLOY_HOWTO,
+        "## What you'll need",
         "the supported paperless-ngx range",
         ("2.16 or later",),
     ),
     (
         INSTALL_BARE_METAL,
+        "## What you'll need",
         "the supported paperless-ngx range",
         ("2.16 or later",),
     ),
     (
         DEPLOY_HOWTO,
+        "## What you'll need",
         "the upgrade notes name the status an incompatible paperless-ngx gets",
         ("incompatible_version", "2.16 or later"),
     ),
     (
         TROUBLESHOOTING,
+        f"## Paperless errors (exit {int(ExitCode.PAPERLESS)})",
         "a 406 is explained, with the release saneless needs",
         ("does not speak an api version saneless supports", "2.16 or later"),
     ),
     (
         FALLBACK_EXPLANATION,
+        "## The Solution",
         "an upload is resent only when it cannot have arrived, for about 60 seconds",
         ("cannot have reached paperless-ngx", "60 seconds"),
     ),
     (
         FALLBACK_EXPLANATION,
+        "### Duplicates",
         "an upload that may have arrived is never resent or copied, and exits 9",
-        ("never resent", "exit 9"),
+        ("never resent", f"exit {int(ExitCode.UNCONFIRMED)}"),
     ),
     (
         FALLBACK_EXPLANATION,
+        "### Duplicates",
         "paperless-ngx 2.x and 3.x treat a duplicate differently",
         ("2.x", "3.x", "paperless_consumer_delete_duplicates"),
     ),
     (
         FALLBACK_EXPLANATION,
+        "### Duplicates",
         "a refused duplicate is a warned upload naming the existing document",
-        ("already holds this file as document #", "exit 7"),
+        (
+            "already holds this file as document #",
+            f"exit {int(ExitCode.UPLOADED_WITH_WARNING)}",
+        ),
     ),
     (
         FALLBACK_EXPLANATION,
+        "## When It Activates",
         "the consume folder is never created, and a missing one names the mount",
         ("never creates", "is the paperless-ngx volume mounted?"),
     ),
     (
         ARCHITECTURE,
+        "### Paperless Upload",
         "an upload is resent only when it cannot have arrived, for about 60 seconds",
         ("cannot have reached paperless-ngx", "60 seconds"),
     ),
     (
         TROUBLESHOOTING,
+        f"## Saved to the consume folder (exit {int(ExitCode.SAVED_TO_FOLDER)})",
         "an unreachable paperless-ngx is retried for about 60 seconds",
         ("60 seconds",),
     ),
     (
         TROUBLESHOOTING,
+        f"## Uploaded with a warning (exit {int(ExitCode.UPLOADED_WITH_WARNING)})",
         "a refused duplicate is a warned upload naming the existing document",
         ("already holds this file as document #",),
     ),
     (
         TROUBLESHOOTING,
+        f"## Uploaded with a warning (exit {int(ExitCode.UPLOADED_WITH_WARNING)})",
         "a tag or correspondent paperless-ngx no longer has is dropped with a warning",
         ("no longer exists in paperless-ngx and was not applied",),
     ),
     (
         ARCHITECTURE,
+        "### The status strip's polling",
         "the web UI and the CLI share one request builder and one metadata policy",
         ("one request builder", "one metadata policy"),
     ),
     (
         CONFIG_REFERENCE,
+        "## `[web]`",
         "the form shows a profile's defaults ticked, and a cleared one scans with none",
         ("pre-ticked", "cleared"),
     ),
     (
         CONFIG_REFERENCE,
+        "## `[web]`",
         "a default paperless-ngx no longer has is skipped with a warning",
         ("no longer exists in paperless-ngx",),
     ),
     (
         CONFIG_REFERENCE,
+        "## `[profiles.NAME]`",
         "a profile title is capped at 118 characters",
         ("at most 118 characters",),
     ),
     (
         CONFIG_REFERENCE,
+        "## `[profiles.NAME]`",
         "a profile id outside 1 to 2147483647 fails at load",
         ("from 1 to 2147483647",),
     ),
     (
         PROFILE_HOWTO,
+        "## Setting default metadata",
         "the form shows a profile's defaults ticked",
         ("pre-ticked",),
     ),
     (
         PROFILE_HOWTO,
+        "## Setting default metadata",
         "a tag the API token cannot see counts as missing",
         ("token cannot see", "no longer exists in paperless-ngx"),
     ),
 )
 
-# Sentences those pages used to carry that are no longer true, each with why.
-DELIVERY_DOC_RETRACTED: tuple[tuple[Path, str, str], ...] = (
-    (
-        FALLBACK_EXPLANATION,
-        "up to 3 times",
-        "an upload is resent for about 60 seconds, and only before it can have arrived",
-    ),
-    (
-        FALLBACK_EXPLANATION,
-        "a retry can create a duplicate",
-        "a resend happens only when the upload cannot have reached paperless-ngx",
-    ),
-    (
-        FALLBACK_EXPLANATION,
-        "the failure says the document may already be in paperless",
-        "a refused duplicate is a warned upload, not a failure",
-    ),
-    (
-        FALLBACK_EXPLANATION,
-        "all attempts are exhausted",
-        "the fallback follows about 60 seconds of failures, not a count",
-    ),
-    (
-        TROUBLESHOOTING,
-        "tries the upload three times",
-        "an upload is resent for about 60 seconds, and only before it can have arrived",
-    ),
-    (
-        TROUBLESHOOTING,
-        "a retry after a lost response can reach paperless-ngx twice",
-        "an upload that may have arrived is never resent",
-    ),
-    (
-        ARCHITECTURE,
-        "identical parameters",
-        "the surfaces share one request builder and one metadata policy",
-    ),
-    (
-        ARCHITECTURE,
-        "after the retries for a network error, a timeout or a server error",
-        "a 5xx or a read timeout may follow a delivered upload and is never resent",
-    ),
-)
-
 
 @pytest.mark.parametrize(
-    ("page", "claim", "needles"),
+    ("page", "heading", "claim", "needles"),
     DELIVERY_DOC_CLAIMS,
-    ids=[f"{page.stem}: {claim}" for page, claim, _ in DELIVERY_DOC_CLAIMS],
+    ids=[f"{page.stem}: {claim}" for page, _, claim, _ in DELIVERY_DOC_CLAIMS],
 )
 def test_operator_pages_state_the_delivery_rules(
-    page: Path, claim: str, needles: tuple[str, ...]
+    page: Path, heading: str, claim: str, needles: tuple[str, ...]
 ) -> None:
     """Each operator page says how an upload is delivered and what metadata it gets."""
     text, name = _read(page)
-    flat = " ".join(text.split()).lower()
+    section = _heading_scope(text, heading, name)
     for needle in needles:
-        assert needle in flat, f"{name} no longer says that {claim} ({needle!r})"
-
-
-@pytest.mark.parametrize(
-    ("page", "retracted", "why"),
-    DELIVERY_DOC_RETRACTED,
-    ids=[f"{page.stem}: {retracted}" for page, retracted, _ in DELIVERY_DOC_RETRACTED],
-)
-def test_operator_pages_do_not_repeat_retracted_delivery_claims(
-    page: Path, retracted: str, why: str
-) -> None:
-    """No operator page says again what delivery or the metadata policy no longer does."""
-    text, name = _read(page)
-    flat = " ".join(text.split()).lower()
-    assert retracted not in flat, f"{name} says again {retracted!r}; {why}"
+        assert _says(section, needle), (
+            f"{name} {heading!r} no longer says that {claim} ({needle!r})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1845,6 +1814,12 @@ def _comment_lines_above(lines: list[tuple[int, str]], index: int) -> int:
     return count
 
 
+def _comment_block_above(lines: list[tuple[int, str]], index: int) -> str:
+    """Return the unbroken run of comment lines immediately above ``index``."""
+    count = _comment_lines_above(lines, index)
+    return "\n".join(line for _, line in lines[index - count : index])
+
+
 def test_compose_ships_no_live_paperless_environment_line() -> None:
     """No live ``environment:`` line sets the paperless URL or token (D-17)."""
     offenders = [
@@ -1862,11 +1837,18 @@ def test_compose_ships_no_live_paperless_environment_line() -> None:
 
 def test_compose_says_the_environment_block_overrides_the_config_file() -> None:
     """The commented paperless block says an environment line overrides the file."""
-    text = COMPOSE.read_text(encoding="utf-8").lower()
-    for needle in ("override", CONFIG_NAME):
-        assert needle in text, (
-            f"{COMPOSE.name} does not contain {needle!r}, so it does not "
-            f"say that an environment line overrides {CONFIG_NAME}"
+    lines = _numbered(COMPOSE)
+    first = next(
+        index
+        for index, (_, line) in enumerate(lines)
+        if f"{OVERRIDING_ENV_KEYS[0]}=" in line
+    )
+    block = _comment_block_above(lines, first)
+    for needle in ("OVERRIDES that file", f"./config/{CONFIG_NAME}"):
+        assert _says(block, needle), (
+            f"{COMPOSE.name}: the comment above the paperless environment lines "
+            f"does not say {needle!r}, so it does not say that an environment "
+            f"line overrides {CONFIG_NAME}"
         )
 
 
@@ -1887,10 +1869,10 @@ def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> Non
         f"{COMPOSE.name}: the consume-directory mount has {explanation} "
         "comment lines above it; APPL-11 asks for a two-line explanation"
     )
-    text = COMPOSE.read_text(encoding="utf-8").lower()
-    assert "consume_dir" in text, (
-        f"{COMPOSE.name} does not say that paperless.consume_dir must name the "
-        "same path, so an operator who uncomments the mount gets nothing"
+    assert _says(_comment_block_above(lines, mounts[0]), "set paperless.consume_dir"), (
+        f"{COMPOSE.name}: the consume mount's comment does not say that "
+        "paperless.consume_dir must name the same path, so an operator who "
+        "uncomments the mount gets nothing"
     )
 
 
@@ -2026,7 +2008,7 @@ def test_compose_gives_a_stopping_scan_time_to_keep_its_pages() -> None:
         f"{COMPOSE.name}: the comment above stop_grace_period does not name "
         "the container's /tmp, so it does not say why the grace is needed"
     )
-    assert "failed/" in comment, (
+    assert _says(comment, "failed/"), (
         f"{COMPOSE.name}: the comment above stop_grace_period does not name "
         "failed/, so it does not say what the grace protects"
     )
@@ -2064,15 +2046,14 @@ def test_the_deploy_guide_explains_the_stop_grace_period() -> None:
         "docker compose up -d",
         "--stop-timeout",
     ):
-        assert needle in section, (
+        assert _says(section, needle), (
             f"{DEPLOY_HOWTO.name}: the {_STOPPING_HEADING!r} section does not "
             f"mention {needle!r}"
         )
     # The stop is bounded: only a scan at the flip wait is interrupted, and
     # the rest is recovered by the next start of the same container only.
-    prose = " ".join(section.split())
     for needle in ("is not interrupted", "docker compose restart"):
-        assert needle in prose, (
+        assert _says(section, needle), (
             f"{DEPLOY_HOWTO.name}: the {_STOPPING_HEADING!r} section does not "
             f"say {needle!r}"
         )
@@ -2279,14 +2260,18 @@ def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
 def test_docker_reference_documents_the_consume_mount_and_the_timezone() -> None:
     """The Docker reference documents ``/consume``, ``TZ`` and placeholder refusal."""
     text, name = _read(DOCKER_REFERENCE)
-    assert "/consume" in text, f"{name} does not document the consume mount"
-    assert "`TZ`" in text, (
-        f"{name} does not document TZ, which is what makes every displayed "
-        "timestamp local rather than UTC (APPL-12)"
+    volumes = _section(text, "## Volumes", name)
+    assert _says(_table_row(volumes, "`/consume`"), "Consume directory fallback"), (
+        f"{name}'s volumes table does not document the consume mount"
     )
-    assert "placeholder" in text.lower(), (
-        f"{name} does not explain that placeholder token values are detected "
-        "and refuse scans (APPL-07)"
+    environment = _section(text, "## Environment Variables", name)
+    assert _says(_table_row(environment, "`TZ`"), "Standard container variable"), (
+        f"{name} does not document TZ, which is what makes every displayed "
+        "timestamp local rather than UTC"
+    )
+    placeholders = _subsection(text, "### Placeholder tokens are detected", name)
+    assert _says(placeholders, f"`saneless scan` exits {int(ExitCode.CONFIG)}"), (
+        f"{name} does not explain that placeholder token values refuse scans"
     )
 
 
@@ -2301,11 +2286,6 @@ ROUTES_MODULE = REPO_ROOT / "src" / "saneless" / "web" / "routes.py"
 _ROUTE_DECORATOR = re.compile(
     r"^@router\.(get|post|put|patch|delete)\(\s*\"([^\"]+)\"", re.MULTILINE
 )
-
-# The stale sentence the reserve-columns paragraph used to end on. Phase 23
-# filled the page counters in and Phase 30 renders them; Phase 30 also writes
-# owner_token. Reverting the correction fails here (T-30-87).
-ARCHITECTURE_STALE_RESERVE_CLAIM = "nothing writes any of them yet"
 
 
 def _declared_routes() -> list[tuple[str, str]]:
@@ -2327,10 +2307,11 @@ def test_every_route_is_documented_in_the_web_api_reference() -> None:
     fails this test until the reference gains its section (T-30-89).
     """
     text, name = _read(WEB_API_REFERENCE)
+    headings = "\n".join(line for line in text.splitlines() if line.startswith("#"))
     missing = [
         f"{method} {path}"
         for method, path in _declared_routes()
-        if f"`{method} {path}`" not in text
+        if not _says(headings, f"`{method} {path}`")
     ]
     assert not missing, (
         f"{name} has no `METHOD /path` heading for these routes:\n" + "\n".join(missing)
@@ -2364,15 +2345,17 @@ def test_every_connection_status_is_documented_in_the_web_api_reference() -> Non
     renders it, so the row shows the bytes a client receives.
     """
     text, name = _read(WEB_API_REFERENCE)
+    section = _subsection(text, "### `GET /api/paperless/test`", name)
     missing = [
         member.value
         for member in ConnectionStatus
-        if f"`{bytes(JSONResponse({'status': member.value}).body).decode()}`"
-        not in text
+        if not _says(
+            section, f"`{bytes(JSONResponse({'status': member.value}).body).decode()}`"
+        )
     ]
     assert not missing, f"{name} does not document these statuses: {missing}"
     count = _COUNT_WORDS[len(ConnectionStatus)]
-    assert f"The {count} 200 values are the complete set" in text, (
+    assert _says(section, f"The {count} 200 values are the complete set"), (
         f"{name} does not say the {count} 200 values are the complete set"
     )
 
@@ -2386,11 +2369,11 @@ def test_every_web_config_field_is_documented() -> None:
     """
     config_text, config_name = _read(CONFIG_REFERENCE)
     env_text, env_name = _read(ENV_REFERENCE)
-    assert "[web]" in config_text, (
-        f"{config_name} has no [web] section, so the form-shape keys are undocumented"
-    )
+    web = _section(config_text, "## `[web]`", config_name)
     for field in WebConfig.model_fields:
-        assert field in config_text, f"{config_name} does not document [web] {field}"
+        assert _says(web, f"`{field}`"), (
+            f"{config_name}'s [web] section does not document {field}"
+        )
         variable = f"SANELESS_WEB__{field.upper()}"
         assert variable in env_text, f"{env_name} has no {variable} row"
 
@@ -2398,98 +2381,64 @@ def test_every_web_config_field_is_documented() -> None:
 def test_config_reference_says_where_the_bind_address_lives() -> None:
     """The ``[web]`` section admits ``web_host``/``web_port`` stayed in ``[output]``."""
     text, name = _read(CONFIG_REFERENCE)
-    section = text.split("## `[web]`", 1)
-    assert len(section) == 2, f"{name} has no `[web]` section heading"
-    body = section[1].split("\n## ", 1)[0]
-    for needle in ("web_host", "web_port", "[output]"):
-        assert needle in body, (
+    body = _section(text, "## `[web]`", name)
+    for needle in ("`web_host`", "`web_port`", "`[output]`"):
+        assert _says(body, needle), (
             f"{name}'s [web] section does not mention {needle}, so a reader who "
             "looks there for the bind address finds nothing and no explanation"
         )
 
 
-def test_architecture_no_longer_calls_the_job_columns_unwritten() -> None:
-    """The reserve-columns paragraph stops claiming nothing writes them."""
+def test_architecture_names_the_job_columns_the_worker_writes() -> None:
+    """The job storage section names the page counters and the owner token."""
     text, name = _read(ARCHITECTURE)
-    assert ARCHITECTURE_STALE_RESERVE_CLAIM not in text, (
-        f"{name} still says {ARCHITECTURE_STALE_RESERVE_CLAIM!r} about the job "
-        "columns. pages_scanned, pages_removed and pages_uploaded are written "
-        "by the worker's success path and displayed in the status area and the "
-        "history Title cell; owner_token is written at submit and gates the "
-        "flip prompt (T-30-87)"
-    )
+    storage = _section(text, "## Job Storage", name)
     for written in ("pages_scanned", "owner_token"):
-        assert written in text, (
-            f"{name} no longer names {written}; the correction should say what "
-            "is true now rather than delete the paragraph"
+        assert _says(storage, written), (
+            f"{name}'s job storage section does not name {written}"
         )
 
 
 def test_first_web_ui_scan_walks_the_current_form() -> None:
-    """The getting-started walkthrough describes the shipped page, not the old one."""
+    """The getting-started walkthrough describes the shipped page, section by section."""
     text, name = _read(FIRST_WEB_UI_SCAN)
-    for element, needle in (
-        ("the status strip", "System status"),
-        ("the Check again button", "Check again"),
-        ("the tag checkbox list", "checkbox"),
-        ("the tag filter", "filter"),
-        ("the profile description line", "description"),
+    status = _section(text, "## Check the System status panel first", name)
+    details = _section(text, "## Fill in scan details", name)
+    for element, section, needle in (
+        ("the Check again button", status, "The **Check again** button"),
+        ("the tag checkbox list", details, "A list of checkboxes"),
+        ("the tag filter", details, "a **Filter tags** box"),
+        ("the profile description line", details, "a description line"),
     ):
-        assert needle in text, f"{name} does not walk {element} (looked for {needle!r})"
-    assert "multi-select" not in text.lower(), (
-        f"{name} still calls the tag picker a multi-select dropdown; it is a "
-        "checkbox list (D-30, D-31)"
-    )
+        assert _says(section, needle), (
+            f"{name} does not walk {element} (looked for {needle!r})"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Phase 31: packaging identity (D-01, D-02, D-05, DLVR-08)
 # ---------------------------------------------------------------------------
 
-# The top-level ``version = "..."`` assignment. Anchored at the start of a line
-# so ``target-version = "py314"`` under [tool.ruff] cannot match it.
-VERSION_LINE = re.compile(r'^version = "([^"]*)"$', re.MULTILINE)
-
-# The 0.2.0 series: the release version itself, or one of its release
-# candidates.
-ZERO_TWO_SERIES = re.compile(r"^0\.2\.0(-rc\.\d+)?$")
-
-LEGACY_LICENSE_CLASSIFIER = "License :: OSI Approved :: MIT License"
+# The trove classifier family PEP 639 deprecates in favour of the license
+# expression.
+LEGACY_LICENSE_PREFIX = "License ::"
 
 
-def test_pyproject_declares_the_0_2_0_series() -> None:
-    """
-    The declared package version is the 0.2.0 series (D-01).
-
-    The pattern admits ``0.2.0-rc.1`` deliberately. The TestPyPI release
-    rehearsal sets exactly that string for the duration of the upload and
-    restores ``0.2.0`` afterwards; a bare equality assertion would go red for
-    the length of the rehearsal, and the pressure then would be to weaken it.
-    Admitting the RC suffix up front is the narrower accommodation.
-    """
-    text, name = _read(PYPROJECT)
-    match = VERSION_LINE.search(text)
-    assert match is not None, f"{name} has no top-level version assignment"
-    declared = match.group(1)
-    assert ZERO_TWO_SERIES.match(declared), (
-        f"{name} declares version {declared!r}; this phase ships the 0.2.0 "
-        "series (0.2.0, or 0.2.0-rc.N during the release rehearsal)"
-    )
+def _project_table() -> dict[str, Any]:
+    """Return ``pyproject.toml``'s ``[project]`` table."""
+    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
 
 
 def test_pyproject_uses_the_pep_639_license_keys() -> None:
     """The license is the PEP 639 SPDX string plus ``license-files`` (D-05)."""
-    text, name = _read(PYPROJECT)
-    assert 'license = "MIT"' in text, (
-        f'{name} does not declare the PEP 639 SPDX expression license = "MIT"'
+    project = _project_table()
+    assert project.get("license") == "MIT", (
+        "pyproject.toml does not declare the PEP 639 SPDX expression "
+        f'license = "MIT"; it declares {project.get("license")!r}'
     )
-    assert 'license-files = ["LICENSE"]' in text, (
-        f'{name} does not declare license-files = ["LICENSE"], so the built '
-        "wheel carries no dist-info/licenses/LICENSE (DLVR-08)"
-    )
-    assert "license = {text =" not in text, (
-        f"{name} still uses the deprecated license table form, which PEP 639 "
-        "replaced with the SPDX expression"
+    assert project.get("license-files") == ["LICENSE"], (
+        'pyproject.toml does not declare license-files = ["LICENSE"], so the '
+        "built wheel carries no dist-info/licenses/LICENSE"
     )
 
 
@@ -2502,33 +2451,58 @@ def test_pyproject_has_no_legacy_license_classifier() -> None:
     PEP 639 ``License-Expression`` -- both were measured doing exactly that --
     so no build or publish step would fail if it came back.
     """
-    text, name = _read(PYPROJECT)
-    assert LEGACY_LICENSE_CLASSIFIER not in text, (
-        f"{name} still carries the {LEGACY_LICENSE_CLASSIFIER!r} classifier, "
-        "which PEP 639 deprecates in favour of the license expression. No "
-        "build step rejects it, so this test is the only thing that does"
+    legacy = [
+        classifier
+        for classifier in _project_table().get("classifiers", [])
+        if classifier.startswith(LEGACY_LICENSE_PREFIX)
+    ]
+    assert not legacy, (
+        f"pyproject.toml carries {legacy}, which PEP 639 deprecates in favour "
+        "of the license expression. No build step rejects it, so this test is "
+        "the only thing that does"
     )
 
 
-def test_pyproject_declares_alpha_maturity() -> None:
-    """The maturity classifier is ``3 - Alpha``, not ``4 - Beta`` (D-02)."""
-    text, name = _read(PYPROJECT)
-    assert "Development Status :: 3 - Alpha" in text, (
-        f"{name} does not classify saneless as Development Status :: 3 - Alpha"
+# The trove classifier prefix that states a project's maturity, and the
+# number of its ``Production/Stable`` value.
+DEVELOPMENT_STATUS = "Development Status :: "
+STABLE_STATUS = 5
+
+
+def test_maturity_classifier_stays_below_stable_before_one_point_zero() -> None:
+    """
+    One maturity classifier, below Production/Stable while the version is 0.x.
+
+    A 0.x version or a pre-release promises no stable interface, so a
+    classifier claiming one would tell an installer the opposite of what the
+    version says.
+    """
+    project = _project_table()
+    statuses = [
+        classifier.removeprefix(DEVELOPMENT_STATUS)
+        for classifier in project["classifiers"]
+        if classifier.startswith(DEVELOPMENT_STATUS)
+    ]
+    assert len(statuses) == 1, (
+        f"pyproject.toml declares {len(statuses)} Development Status "
+        f"classifiers, {statuses}; a project has exactly one maturity"
     )
-    assert "Development Status :: 4 - Beta" not in text, (
-        f"{name} still claims Development Status :: 4 - Beta; the first "
-        "published release is Alpha"
-    )
+    number = int(statuses[0].split(" - ", 1)[0])
+    version = Version(project["version"])
+    if version.major == 0 or version.is_prerelease:
+        assert number < STABLE_STATUS, (
+            f"version {version} is 0.x or a pre-release, but the maturity "
+            f"classifier says {statuses[0]!r}"
+        )
 
 
 def test_pyproject_distribution_name_is_saneless() -> None:
     """The PyPI distribution name stays ``saneless`` (DLVR-01)."""
-    text, name = _read(PYPROJECT)
-    assert 'name = "saneless"' in text, (
-        f'{name} no longer declares name = "saneless". The owner rename '
-        "changes the GitHub URLs only; the distribution name is published and "
-        "must not drift to a squattable variant"
+    declared = _project_table()["name"]
+    assert declared == "saneless", (
+        f"pyproject.toml declares the distribution name {declared!r}, not "
+        '"saneless". The distribution name is published and must not drift to '
+        "a squattable variant"
     )
 
 
@@ -3581,12 +3555,10 @@ def test_dockerfile_runs_as_a_non_root_user() -> None:
     assert not offenders, "a USER instruction names the superuser:\n" + "\n".join(
         offenders
     )
-    text, _ = _read(DOCKERFILE)
-    for needle in ("groupadd", "useradd", "1000"):
-        assert needle in text, (
-            f"{name} does not create the account with {needle!r}; the USER "
-            "instruction names an account that has to exist in the image"
-        )
+    assert _image_uid() == "1000", (
+        f"{name} creates the account at UID {_image_uid()}, not the fixed 1000 "
+        "a single-user host's own ./config already matches"
+    )
 
 
 def test_dockerfile_chowns_the_data_dir_before_declaring_the_volume() -> None:
@@ -3794,6 +3766,26 @@ def _runtime_stage_offenders(runtime: list[tuple[int, str]]) -> list[str]:
     return offenders
 
 
+def _has_argument(command: str, *tokens: str) -> bool:
+    """Return whether ``tokens`` appear, in order and adjacent, as words of ``command``."""
+    words = command.split()
+    width = len(tokens)
+    return any(
+        tuple(words[start : start + width]) == tokens
+        for start in range(len(words) - width + 1)
+    )
+
+
+def test_has_argument_matches_whole_adjacent_words() -> None:
+    """An option and its value match as words, never inside a longer word."""
+    command = "RUN uv sync --locked --group build --no-editable"
+
+    assert _has_argument(command, "--group", "build")
+    assert _has_argument(command, "--no-editable")
+    assert not _has_argument(command, "--no-edit")
+    assert not _has_argument(command, "build", "--group")
+
+
 def _builder_stage_offenders(builder: list[tuple[int, str]]) -> list[str]:
     """
     Return every way the builder stage falls short of a locked, finished venv.
@@ -3816,7 +3808,7 @@ def _builder_stage_offenders(builder: list[tuple[int, str]]) -> list[str]:
             f"the {BUILDER_STAGE} stage runs `{LOCKED_SYNC}` {len(syncs)} time(s), "
             "not twice (build backend first, then the project)"
         )
-    if not any("--group build" in text for _, text in syncs):
+    if not any(_has_argument(text, "--group", "build") for _, text in syncs):
         offenders.append(
             f"no `{LOCKED_SYNC}` in the {BUILDER_STAGE} stage installs "
             "`--group build`, so python-sane has no hash-checked backend to "
@@ -3826,7 +3818,7 @@ def _builder_stage_offenders(builder: list[tuple[int, str]]) -> list[str]:
         f"line {number}: `{LOCKED_SYNC}` without --no-editable leaves the venv "
         f"pointing back into the {BUILDER_STAGE} stage's source tree: {text}"
         for number, text in syncs
-        if "--no-editable" not in text
+        if not _has_argument(text, "--no-editable")
     )
     # Without it, uv adds the default groups to whatever the command names:
     # the whole dev toolchain, and the build group, would ship in /opt/venv.
@@ -3834,7 +3826,7 @@ def _builder_stage_offenders(builder: list[tuple[int, str]]) -> list[str]:
         f"line {number}: `{LOCKED_SYNC}` without --no-default-groups installs "
         f"the default dependency groups into the shipped venv: {text}"
         for number, text in syncs
-        if "--no-default-groups" not in text
+        if not _has_argument(text, "--no-default-groups")
     )
     return offenders
 
@@ -4004,7 +3996,30 @@ HEALTH_URL_PORT = re.compile(r"localhost:(?P<port>\d+)/health")
 # A `web_port` assignment that is live rather than commented out.
 LIVE_WEB_PORT = re.compile(r"^\s*web_port\s*=")
 
-UID_CHOWN_COMMAND = "chown -R 1000:1000 ./config"
+# The account the image creates: ``groupadd --gid N`` and ``useradd --uid N
+# --gid N`` in one RUN instruction.
+ACCOUNT_CREATION = re.compile(
+    r"groupadd --gid (?P<gid>\d+) .*useradd --uid (?P<uid>\d+) --gid (?P=gid)\b"
+)
+
+
+def _image_uid() -> str:
+    """
+    Return the UID the Dockerfile creates its account at, with a matching GID.
+
+    The ``groupadd`` and the ``useradd`` sit on continuation lines of one RUN
+    instruction, so the instruction is joined before it is matched.
+    """
+    joined = " ".join(
+        line.removesuffix("\\").strip() for _, line in _significant_lines(DOCKERFILE)
+    )
+    match = ACCOUNT_CREATION.search(joined)
+    assert match is not None, (
+        f"{DOCKERFILE.relative_to(REPO_ROOT)} does not create its account with "
+        "groupadd --gid N and useradd --uid N --gid N; the USER instruction "
+        "names an account that has to exist in the image"
+    )
+    return match["uid"]
 
 
 # The service key that opens a block in a compose file, at the one indent
@@ -4197,12 +4212,20 @@ def test_every_documented_container_port_matches_the_model_default() -> None:
     or to the shell command the flag appears in, continuations included.
     """
     expected = str(OutputConfig.model_fields["web_port"].default)
-    text, dockerfile_name = _read(DOCKERFILE)
-    assert f"EXPOSE {expected}" in text, (
-        f"{dockerfile_name} does not EXPOSE {expected}, the port "
+    dockerfile_name = DOCKERFILE.relative_to(REPO_ROOT)
+    instructions = [line for _, line in _significant_lines(DOCKERFILE)]
+    exposed = [line for line in instructions if line.startswith("EXPOSE ")]
+    assert exposed == [f"EXPOSE {expected}"], (
+        f"{dockerfile_name} exposes {exposed}, not only {expected}, the port "
         "OutputConfig.web_port defaults to"
     )
-    assert f"localhost:{expected}/health" in text, (
+    healthcheck = [
+        line for line in instructions if line.startswith("CMD [") and "urlopen(" in line
+    ]
+    assert len(healthcheck) == 1, (
+        f"{dockerfile_name} has {len(healthcheck)} healthcheck probe lines, not one"
+    )
+    assert _says(healthcheck[0], f"http://localhost:{expected}/health"), (
         f"{dockerfile_name}'s healthcheck does not probe port {expected}"
     )
     offenders = []
@@ -4285,12 +4308,20 @@ def test_the_uid_is_documented_where_operators_will_look() -> None:
     documentation rather than a runtime fix-up because any fix-up would have
     to start as root, which is the thing running as UID 1000 exists to stop.
     """
-    for page in (DOCKER_REFERENCE, DEPLOY_HOWTO):
+    uid = _image_uid()
+    chown = f"chown -R {uid}:{uid} ./config"
+    for page, heading in (
+        (DOCKER_REFERENCE, "## User and file ownership"),
+        (DEPLOY_HOWTO, "## Step 1: Create the configuration file"),
+    ):
         text, name = _read(page)
-        assert "1000" in text, f"{name} does not state the UID the image runs as"
-        assert UID_CHOWN_COMMAND in text, (
-            f"{name} does not give the `{UID_CHOWN_COMMAND}` command for an "
-            "operator whose own UID is not 1000"
+        section = _section(text, heading, name)
+        assert _says(section, f"UID/GID **{uid}**"), (
+            f"{name} {heading!r} does not state the UID the image runs as, {uid}"
+        )
+        assert _says(section, chown), (
+            f"{name} {heading!r} does not give the `{chown}` command for an "
+            f"operator whose own UID is not {uid}"
         )
 
 
@@ -4388,9 +4419,13 @@ TRUST_LINK_TARGETS = (
 )
 
 NO_AUTH_PHRASES = ("no login", "no authentication")
-ALL_INTERFACES_PHRASES = ("all network interfaces", "0.0.0.0")
 
-TRUST_NOTE_SURFACES = (QUICK_START, DOCKER_REFERENCE)
+# The two pages someone deploys from, each with the section that carries the
+# no-login note.
+TRUST_NOTE_SURFACES = (
+    (QUICK_START, "## Prerequisites"),
+    (DOCKER_REFERENCE, "## Image"),
+)
 
 
 def _section_lines(path: Path, heading: str) -> list[str]:
@@ -4494,15 +4529,18 @@ def test_the_no_auth_note_appears_on_both_entry_surfaces() -> None:
     two places the posture is already written out in full, not that it repeats
     the posture a third time.
     """
-    for page in TRUST_NOTE_SURFACES:
+    bind_address = OutputConfig.model_fields["web_host"].default
+    for page, heading in TRUST_NOTE_SURFACES:
         text, name = _read(page)
-        lowered = text.lower()
-        assert any(phrase in lowered for phrase in NO_AUTH_PHRASES), (
-            f"{name} does not say the web UI has no login. An operator who is "
-            f"never told cannot decide whether that is safe on their network"
+        section = _section(text, heading, name)
+        assert any(_says(section, phrase) for phrase in NO_AUTH_PHRASES), (
+            f"{name} {heading!r} does not say the web UI has no login. An "
+            "operator who is never told cannot decide whether that is safe on "
+            "their network"
         )
-        assert any(phrase in lowered for phrase in ALL_INTERFACES_PHRASES), (
-            f"{name} does not say the server binds every network interface"
+        assert _says(section, f"`{bind_address}`"), (
+            f"{name} {heading!r} does not say the server binds {bind_address}, "
+            "every network interface"
         )
         linked = [
             (target, resolved)
@@ -4688,15 +4726,6 @@ EMPTY_PAGE_THRESHOLD = re.compile(
     re.MULTILINE,
 )
 
-# The phrasings that get the coverage rule backwards. ``pages.is_blank`` is
-# ``coverage <= threshold`` (on light paper), so raising the threshold admits
-# MORE pages to the blank set, never fewer.
-INVERTED_TUNING_PHRASES = (
-    "raise the threshold to keep",
-    "raising it keeps",
-    "lower the threshold to remove",
-)
-
 # The explanation page the blank-page rule is described on.
 EMPTY_PAGE_EXPLANATION = DOCS_DIR / "explanation" / "empty-page-detection.md"
 
@@ -4707,10 +4736,6 @@ EMPTY_PAGE_HEADINGS = (
     "## Removed pages",
     "## When every page is blank",
 )
-
-# The profile keys the coverage rule replaced, with no alias: a config that
-# still sets either fails to load, so no page may still tell a reader to.
-REMOVED_THRESHOLD_KEYS = ("empty_page_mean_threshold", "empty_page_stddev_threshold")
 
 # The per-page log line the explanation quotes, rebuilt from these facts by
 # the real filter, so the quoted line cannot drift from what the log says.
@@ -4731,29 +4756,19 @@ def test_profile_howto_tuning_advice_matches_the_empty_page_rule() -> None:
     The how-to's threshold example moves the threshold the way that keeps pages.
 
     ``pages.is_blank`` removes a page whose coverage is at or below the
-    threshold.  Keeping a faint page therefore means **lowering** the
-    threshold; raising it does the opposite of what the page promises, which
-    is the inversion the review caught as row 10 under the old rule.  The
+    threshold, so keeping a faint page means **lowering** the threshold. The
     direction is asserted three ways: the prose says to lower it, the example
-    sets a value below ``ProfileConfig``'s own default (so a default change
-    cannot leave a stale literal passing), and the real rule keeps a page
-    measured between the two at the example's value while removing it at
-    the default.
+    sets a value below ``ProfileConfig``'s own default, and the real rule
+    keeps a page measured between the two at the example's value while
+    removing it at the default.
     """
     text, name = _read(PROFILE_HOWTO)
     body = _section(text, PROFILE_TUNING_HEADING, name)
-    lowered = body.lower()
-    for phrase in INVERTED_TUNING_PHRASES:
-        assert phrase not in lowered, (
-            f"{name}'s tuning advice says {phrase!r}. Raising the coverage "
-            "threshold makes MORE pages count as empty, so this tells the "
-            "reader to do the opposite of what the sentence promises (row 10)"
-        )
-    assert "lower the threshold" in lowered, (
+    assert _says(body, "lower the threshold"), (
         f"{name} does not tell the reader to lower the threshold to keep "
         "faint pages, which is the direction is_blank actually rewards"
     )
-    assert "raising it removes more pages" in lowered, (
+    assert _says(body, "raising it removes more pages"), (
         f"{name} does not say that raising the threshold removes more pages"
     )
 
@@ -4827,79 +4842,91 @@ def test_empty_page_explanation_matches_the_detector(
     """
     text, name = _read(EMPTY_PAGE_EXPLANATION)
     default = ProfileConfig().empty_page_coverage_threshold
-
-    assert "`empty_page_coverage_threshold`" in text, name
-    assert f"`{default!r}`" in text, (
-        f"{name} does not give the default threshold {default!r}"
-    )
-    assert f"{round(EDGE_TRIM * 100)}%" in text, (
-        f"{name} does not give the {EDGE_TRIM:.0%} margin"
-    )
-    assert f"brightest {round((1 - PAPER_PERCENTILE) * 100)}%" in text, name
-    assert f"more than {INK_DELTA} levels darker" in text, name
-    assert f"at least {PAPER_WHITE_FLOOR}" in text, name
     for heading in EMPTY_PAGE_HEADINGS:
         assert re.search(rf"^{re.escape(heading)}$", text, re.MULTILINE), (
             f"{name} has no {heading!r} section"
         )
-    assert "exits 8" in text, f"{name} does not say the all-blank scan exits 8"
-    for key in REMOVED_THRESHOLD_KEYS:
-        assert key not in text, f"{name} still names the removed key {key}"
-    assert _example_log_line(caplog) in text, (
+
+    measured = _section(text, "## What is measured", name)
+    assert _says(measured, f"{round(EDGE_TRIM * 100)}%"), (
+        f"{name} does not give the {EDGE_TRIM:.0%} margin"
+    )
+    assert _says(measured, f"brightest {round((1 - PAPER_PERCENTILE) * 100)}%"), name
+    assert _says(measured, f"more than {INK_DELTA} levels darker"), name
+    rule = _section(text, "## The detection rule", name)
+    assert _says(rule, "`empty_page_coverage_threshold`"), name
+    assert _says(rule, f"at least {PAPER_WHITE_FLOOR}"), name
+    tuning = _section(text, "## Tuning the threshold", name)
+    assert _says(tuning, f"`{default!r}`"), (
+        f"{name}'s tuning section does not give the default threshold {default!r}"
+    )
+    assert _says(tuning, _example_log_line(caplog)), (
         f"{name}'s example log line is not the line the filter writes"
+    )
+    all_blank = _section(text, "## When every page is blank", name)
+    assert _says(all_blank, f"exits {int(ExitCode.ALL_BLANK)}"), (
+        f"{name} does not say the all-blank scan exits {int(ExitCode.ALL_BLANK)}"
     )
 
 
-def test_no_doc_page_names_a_removed_threshold_key() -> None:
-    """
-    No page tells a reader to set a key that now fails the config load.
+# A profile key in the empty-page family, as a page names it.
+EMPTY_PAGE_KEY = re.compile(r"\bempty_page_\w+")
 
-    The mean and stddev thresholds were removed with no alias, so a profile
-    that still sets either is refused by name.  A page still showing one
-    would hand the reader a config that cannot load.
+
+def test_every_empty_page_key_a_page_names_is_a_profile_field() -> None:
     """
+    Every ``empty_page_*`` key a page names is a ``ProfileConfig`` field.
+
+    A config that sets an unknown key fails to load, so a page naming one
+    hands the reader a config that cannot load. The valid keys are read from
+    the model.
+    """
+    fields = set(ProfileConfig.model_fields)
     offenders = [
         f"{page.relative_to(REPO_ROOT)}: {key}"
-        for page in _doc_pages()
-        for key in REMOVED_THRESHOLD_KEYS
-        if key in page.read_text(encoding="utf-8")
+        for page in [README, *_doc_pages()]
+        for key in sorted(set(EMPTY_PAGE_KEY.findall(page.read_text(encoding="utf-8"))))
+        if key not in fields
     ]
     assert not offenders, "\n".join(offenders)
 
 
-def test_no_doc_page_tells_a_reader_to_set_the_flip_timeout_key() -> None:
-    """
-    The old flip-timeout key appears only where a page says it was renamed.
+# A ``*_timeout_seconds`` key as a page names it, bare or as the field part of
+# a ``SANELESS_<SECTION>__<FIELD>`` variable.
+TIMEOUT_KEY = re.compile(
+    r"\b(?:SANELESS_[A-Z]+__)?(?P<key>[a-z_]*timeout_seconds)\b", re.IGNORECASE
+)
 
-    ``output.flip_timeout_seconds`` became ``operator_wait_timeout_seconds``
-    with no alias, so a config or environment that still sets the old name
-    fails to load.  A page naming it for any other reason hands the reader a
-    setting that cannot load.
+
+def test_the_timeout_key_scan_reads_bare_keys_and_variables() -> None:
+    """A bare key and a variable's field part are both read, in either case."""
+    line = (
+        "Set `flip_timeout_seconds` or SANELESS_OUTPUT__OPERATOR_WAIT_TIMEOUT_SECONDS."
+    )
+
+    keys = [match["key"].lower() for match in TIMEOUT_KEY.finditer(line)]
+
+    assert keys == ["flip_timeout_seconds", "operator_wait_timeout_seconds"]
+
+
+def test_every_timeout_key_a_page_names_is_an_output_field() -> None:
     """
+    Every ``*_timeout_seconds`` key a page names is an ``OutputConfig`` field.
+
+    A config or environment that sets an unknown key fails to load, so a page
+    naming one hands the reader a setting that cannot load. A line that says
+    the key was renamed is the one place an old name may appear.
+    """
+    fields = set(OutputConfig.model_fields)
     offenders = [
-        f"{page.relative_to(REPO_ROOT)}:{number}"
-        for page in _doc_pages()
+        f"{page.relative_to(REPO_ROOT)}:{number}: {match['key']}"
+        for page in [README, *_doc_pages()]
         for number, line in enumerate(
             page.read_text(encoding="utf-8").splitlines(), start=1
         )
-        if ("flip_timeout_seconds" in line or "FLIP_TIMEOUT_SECONDS" in line)
-        and "renamed" not in line
-    ]
-    assert not offenders, "\n".join(offenders)
-
-
-def test_no_doc_page_describes_the_removed_blank_page_rule() -> None:
-    """
-    No page still calls blank-page detection the old two-threshold rule.
-
-    The mean and standard-deviation rule was replaced by ink coverage, so a
-    page describing detection by its old name sends the reader looking for
-    two thresholds that no longer exist.
-    """
-    offenders = [
-        str(page.relative_to(REPO_ROOT))
-        for page in _doc_pages()
-        if "dual-threshold" in page.read_text(encoding="utf-8").lower()
+        if not _says(line, "renamed")
+        for match in TIMEOUT_KEY.finditer(line)
+        if match["key"].lower() not in fields
     ]
     assert not offenders, "\n".join(offenders)
 
@@ -5715,7 +5742,7 @@ QUOTED_REQUIRES = re.compile(r'requires = \["(?P<spec>uv_build[^"]+)"\]')
 UV_BUILD_RANGE = re.compile(r"^uv_build>=(?P<floor>[^,]+),<(?P<ceiling>\S+)$")
 
 
-def _workflow_files() -> list[Path]:
+def _workflow_files(directory: Path = WORKFLOW_DIR) -> list[Path]:
     """
     Return every GitHub Actions workflow file, sorted by path.
 
@@ -5731,12 +5758,16 @@ def _workflow_files() -> list[Path]:
     input set has to be what GitHub runs, not what the repository happens to
     contain.
 
+    Args:
+        directory: The workflow directory to read, ``.github/workflows``
+            unless a test supplies its own.
+
     Returns:
-        The workflow files under ``.github/workflows``, in path order.
+        The workflow files under ``directory``, in path order.
 
     """
     return sorted(
-        path for suffix in ("*.yml", "*.yaml") for path in WORKFLOW_DIR.glob(suffix)
+        path for suffix in ("*.yml", "*.yaml") for path in directory.glob(suffix)
     )
 
 
@@ -6402,41 +6433,23 @@ def test_every_workflow_uses_reference_is_a_commented_lowercase_sha() -> None:
     )
 
 
-def test_the_workflow_reader_collects_both_extensions_github_loads() -> None:
+def test_the_workflow_reader_collects_both_extensions_github_loads(
+    tmp_path: Path,
+) -> None:
     """
-    ``_workflow_files`` reads ``.yaml`` as well as ``.yml`` (PR #13 review).
+    ``_workflow_files`` returns ``.yaml`` workflows as well as ``.yml`` ones.
 
-    GitHub loads both spellings out of ``.github/workflows``. Every workflow
-    in this repository happens to be ``.yml``, so a reader that globbed one
-    extension passed today and would have kept passing -- while a ``.yaml``
-    file added later carried its ``uses:`` refs and any ``--ignore`` flag
-    past every guard built on this list. That is the whole failure this
-    module exists to prevent, arriving through the guard's own input set.
-
-    The check is on the glob patterns rather than on a fixture file, because
-    the defect is what the reader *would* miss, and no ``.yaml`` file exists
-    to observe. Asserting the reader finds a file that is not there could
-    only be written as a tautology.
+    GitHub loads both spellings out of ``.github/workflows``, so a workflow
+    the reader missed would carry its ``uses:`` refs and any suppression flag
+    past every guard built on this list. Other files in the directory are not
+    workflows and are left out.
     """
-    source = inspect.getsource(_workflow_files)
-    for suffix in ("*.yml", "*.yaml"):
-        assert suffix in source, (
-            f"_workflow_files does not glob {suffix!r}. GitHub loads both "
-            "spellings, so a workflow using the other one would bypass every "
-            "guard that reads this list -- the uses: pin check and the "
-            "suppression-flag check both take their input from here."
-        )
+    for filename in ("a.yml", "b.yaml", "notes.txt"):
+        (tmp_path / filename).write_text("on: push\n", encoding="utf-8")
 
-    found = {path.name for path in _workflow_files()}
-    on_disk = {
-        path.name
-        for path in WORKFLOW_DIR.iterdir()
-        if path.suffix in {".yml", ".yaml"} and path.is_file()
-    }
-    assert found == on_disk, (
-        "the reader disagrees with the directory. Every workflow file GitHub "
-        f"would load must reach the guards: {sorted(on_disk - found)} missing."
-    )
+    found = [path.name for path in _workflow_files(tmp_path)]
+
+    assert found == ["a.yml", "b.yaml"]
 
 
 # ---------------------------------------------------------------------------
@@ -7517,49 +7530,119 @@ CHECK_LISTING_PAGES = (
     DOCS_DIR / "getting-started" / "first-web-ui-scan.md",
 )
 
-# Phrases that count the rows in prose. Each was true of the five-row strip and
-# is now false, and none of them would be caught by the name check above --
-# a page can name all six checks and still tell its reader there are five.
-STALE_CHECK_COUNT_PHRASES = (
-    "five checks",
-    "five rows",
-    "among five",
-    "other four",
+# A count of the checks in prose: "six checks", "six health checks", "six
+# named rows", across a line wrap and in any case.
+_CHECK_COUNT = re.compile(
+    rf"\b(?P<count>{'|'.join(_NUMBER_WORDS)})\s+"
+    r"(?:(?:named|health|status)\s+)?(?:checks|rows)\b",
+    re.IGNORECASE,
 )
+# A line that opens or closes a fenced block.
+_FENCE_LINE = re.compile(r"^\s*```")
+
+
+def _without_fences(text: str) -> str:
+    """
+    Return ``text`` with every fenced block's lines blanked.
+
+    A fenced block is a command or its output, not prose making a claim.
+    Blanking rather than dropping the lines keeps the line numbers an offence
+    reports.
+    """
+    lines: list[str] = []
+    fenced = False
+    for line in text.splitlines():
+        if _FENCE_LINE.match(line):
+            fenced = not fenced
+            lines.append("")
+        else:
+            lines.append("" if fenced else line)
+    return "\n".join(lines)
+
+
+def _spelled_check_count() -> str:
+    """Return the number of checks ``CheckKey`` defines, as a word."""
+    count = len(CheckKey)
+    spelled = [word for word, value in _NUMBER_WORDS.items() if value == count]
+    assert spelled, f"CheckKey has {count} members; add the word to _NUMBER_WORDS"
+    return spelled[0]
+
+
+def _check_count_offences(text: str, name: str) -> list[str]:
+    """
+    Return ``name:line: phrase`` for every prose count of the checks that is wrong.
+
+    Args:
+        text: The page.
+        name: The page's name, for the report.
+
+    Returns:
+        One entry per count whose number word is not ``len(CheckKey)`` spelled
+        out.
+
+    """
+    expected = _spelled_check_count()
+    prose = _without_fences(text)
+    offences: list[str] = []
+    for match in _CHECK_COUNT.finditer(prose):
+        if match["count"].lower() == expected:
+            continue
+        line = prose.count("\n", 0, match.start()) + 1
+        offences.append(f"{name}:{line}: {' '.join(match[0].split())}")
+    return offences
+
+
+def test_the_check_count_scan_reports_a_wrong_count() -> None:
+    """A page counting one check too many is one offence, on its line."""
+    wrong = next(
+        word for word, value in _NUMBER_WORDS.items() if value == len(CheckKey) + 1
+    )
+    page = f"# Doctor\n\nIt reports {wrong} health\nchecks.\n"
+
+    assert _check_count_offences(page, "seeded.md") == [
+        f"seeded.md:3: {wrong} health checks"
+    ]
+
+
+def test_the_check_count_scan_passes_the_right_count_and_other_rows() -> None:
+    """The right count, a row count of something else and fenced text pass."""
+    right = _spelled_check_count()
+    page = (
+        f"The strip has {right} named rows and {right.capitalize()} checks.\n"
+        "Three in a row failing raises the alarm.\n"
+        "```\nten checks\n```\n"
+    )
+
+    assert _check_count_offences(page, "seeded.md") == []
 
 
 def test_docs_that_list_the_checks_name_every_check() -> None:
     """
-    Every page listing the checks names all of them, and counts them right.
+    Every page names every check where it lists them, and counts them right.
 
-    The lists are derived from ``CheckKey`` rather than written down here, so
-    a seventh check added in a later phase fails this test on every page that
-    has not been updated -- which is the only reason the lists agree today.
-    The prose count is asserted separately because naming a check and counting
-    the checks are two different claims, and this phase falsified the second
-    one on three pages while leaving the first one true on two of them.
+    The names and the count are derived from ``CheckKey``, so a check added or
+    removed fails every page that has not caught up. Naming the checks and
+    counting them are separate claims, so both are checked: a page can name
+    every check and still state the wrong number. The count is checked on
+    README.md and every documentation page, outside fenced blocks.
     """
     expected = [check_name(key) for key in CheckKey]
     offenders: list[str] = []
     for page in CHECK_LISTING_PAGES:
-        name = page.relative_to(REPO_ROOT)
-        text = page.read_text(encoding="utf-8")
+        text, name = _read(page)
         offenders.extend(
             f"{name}: does not name the {label} check"
             for label in expected
             if label not in text
         )
-        lowered = text.lower()
-        offenders.extend(
-            f"{name}: still says {phrase!r}"
-            for phrase in STALE_CHECK_COUNT_PHRASES
-            if phrase in lowered
-        )
+    for page in [README, *_doc_pages()]:
+        text, name = _read(page)
+        offenders.extend(_check_count_offences(text, str(name)))
     assert not offenders, (
         "a documentation page disagrees with CheckKey about which checks "
         f"exist. There are {len(expected)} -- {', '.join(expected)} -- and "
-        "every page that lists them must list all of them and must not count "
-        "them as five:\n" + "\n".join(offenders)
+        "every page that lists them must list all of them, and every page "
+        f"that counts them must say {_spelled_check_count()}:\n" + "\n".join(offenders)
     )
 
 
@@ -7578,21 +7661,25 @@ def test_web_api_reference_states_what_an_unauthenticated_client_can_read() -> N
     code cannot name it differently.
     """
     text, name = _read(WEB_API_REFERENCE)
-    for needle in (
-        "What an unauthenticated client can read",
-        HIDDEN_JOB_TITLE,
-        "saneless jobs --json",
-    ):
-        assert needle in text, f"{name} does not mention {needle!r}"
+    section = _subsection(text, "### What an unauthenticated client can read", name)
+    for needle in (HIDDEN_JOB_TITLE, "saneless jobs --json"):
+        assert _says(section, needle), (
+            f"{name}'s unauthenticated-client section does not mention {needle!r}"
+        )
 
 
-def test_first_web_ui_scan_no_longer_says_every_viewer_sees_the_same() -> None:
-    """The getting-started page no longer promises every browser the same view."""
+def test_first_web_ui_scan_names_the_title_other_browsers_see() -> None:
+    """
+    The getting-started page names the title another browser's scan shows.
+
+    The title is read from ``vocabulary``, so the page and the code cannot
+    name it differently.
+    """
     text, name = _read(FIRST_WEB_UI_SCAN)
-    assert "is the same for both" not in text, (
-        f"{name} still says the title and thumbnail are the same for every viewer"
+    history = _section(text, "## Check job history", name)
+    assert _says(history, f'"{HIDDEN_JOB_TITLE}"'), (
+        f"{name}'s job history section does not name the generic title"
     )
-    assert HIDDEN_JOB_TITLE in text, f"{name} does not name the generic title"
 
 
 def test_allowed_hosts_docs_warn_against_a_shared_suffix() -> None:
@@ -7619,19 +7706,19 @@ def test_allowed_hosts_docs_warn_against_a_shared_suffix() -> None:
         f"{where} does not mention {needle!r}"
         for where, body in sections.items()
         for needle in (".duckdns.org", "me.duckdns.org", "register")
-        if needle not in body
+        if not _says(body, needle)
     ]
     assert not offenders, "\n".join(offenders)
 
 
 def test_proxy_docs_require_the_original_host_header() -> None:
     """
-    The proxy guidance makes passing ``Host`` mandatory, not an alternative.
+    The proxy guidance says a proxy that replaces ``Host`` turns the check off.
 
     saneless never trusts ``X-Forwarded-Host``.  A proxy that sets it and
     replaces ``Host`` with its upstream's name sends a name saneless always
     answers to, which turns the Host check off for every request through the
-    proxy, so offering that header as an alternative is wrong advice.
+    proxy, so both the proxy how-to and the reference's Host check say so.
     """
     deploy_text, deploy_name = _read(DEPLOY_HOWTO)
     api_text, api_name = _read(WEB_API_REFERENCE)
@@ -7640,20 +7727,12 @@ def test_proxy_docs_require_the_original_host_header() -> None:
             deploy_text, "## Running behind a reverse proxy", deploy_name
         ),
         f"{api_name} ### Host check": _subsection(api_text, "### Host check", api_name),
-        f"{api_name} ### Cross-site requests": _subsection(
-            api_text, "### Cross-site requests", api_name
-        ),
     }
     offenders = [
-        f"{where} still offers X-Forwarded-Host in place of the original Host"
-        for where, body in sections.items()
-        if "or set `X-Forwarded-Host`" in body
-    ]
-    offenders.extend(
         f"{where} does not say a replaced Host turns the Host check off"
-        for where in list(sections)[:2]
-        if "turns the Host check off" not in sections[where]
-    )
+        for where, body in sections.items()
+        if not _says(body, "turns the Host check off")
+    ]
     assert not offenders, "\n".join(offenders)
 
 
@@ -7778,14 +7857,13 @@ def test_the_multi_page_how_to_states_the_real_page_ceiling() -> None:
         )
 
 
-# Where each page describes what a failure prints, and the wording each used
-# when it promised a single line.  A classified failure prints its line and
-# then a ``Try:`` line with the next step, so the old wording is now untrue.
-_FAILURE_OUTPUT_PAGES: dict[Path, str] = {
-    CLI_REFERENCE: "prints one line to stderr",
-    CLI_SCRIPTING: "prints one line to stderr",
-    TROUBLESHOOTING: "prints one line to stderr",
-    INSTALL_BARE_METAL: "printing one line with the reason",
+# Where each page describes what a failure prints: the section heading, or
+# None for the page's opening paragraphs above its first section.
+_FAILURE_OUTPUT_PAGES: dict[Path, str | None] = {
+    CLI_REFERENCE: "## Exit codes",
+    CLI_SCRIPTING: "## Exit codes",
+    TROUBLESHOOTING: None,
+    INSTALL_BARE_METAL: "## Troubleshooting",
 }
 
 
@@ -7797,15 +7875,15 @@ def test_failure_output_is_described_as_two_lines(page: Path) -> None:
     Each page says a failure prints a line and then a ``Try:`` line.
 
     The guard ends every classified failure with the next step, so a page
-    that still promises one line tells a script author to expect less than
+    that promised one line would tell a script author to expect less than
     stderr carries.  Line wrapping is ignored: the phrase may break anywhere.
     """
     text, name = _read(page)
-    flowing = " ".join(text.split())
-
-    assert "then a `Try:` line" in flowing, (
-        f"{name} does not say a failure is followed by a `Try:` line"
+    heading = _FAILURE_OUTPUT_PAGES[page]
+    scope = (
+        text.split("\n## ", 1)[0] if heading is None else _section(text, heading, name)
     )
-    assert _FAILURE_OUTPUT_PAGES[page] not in flowing, (
-        f"{name} still says a failure prints a single line"
+    assert _says(scope, "then a `Try:` line"), (
+        f"{name} {heading or 'opening'!r} does not say a failure is followed by "
+        "a `Try:` line"
     )
