@@ -5154,9 +5154,8 @@ def stale_config_strip_server(
     """
     Serve a private app that found only a file under the superseded config name.
 
-    The 2026-09-22 failure, rebuilt: a file sits in the third searched
-    directory under the old name, nothing loaded, and the appliance is running
-    on defaults.  The recording is made by the real ``discover_config`` over
+    A file sits in the third searched directory under the superseded name,
+    nothing is loaded, and the appliance runs on defaults.  The recording is made by the real ``discover_config`` over
     three directories inside ``tmp_path``, so the search that the page reports
     is a search that really ran and the host's own ``/etc`` is never touched.
 
@@ -5237,7 +5236,7 @@ def _probe_now(server: _BrowserServer) -> None:
 @pytest.mark.browser
 class TestStatusStripInChromium:
     """
-    The health strip, read from a real page (APPL-02, D-06, D-08).
+    The health strip, read from a real page.
 
     Four claims live only here. Which card a household member's eye lands on
     first is a document-order fact about the rendered page; the poll starting
@@ -5251,14 +5250,13 @@ class TestStatusStripInChromium:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        ``#checks-card`` is the first card, and the alert slot is untouched (P1).
+        ``#checks-card`` is the first card, and the alert slot keeps its place.
 
-        "At a glance" is the phase goal and at a glance means first, so the
-        ordinal is asserted rather than merely the presence. The second half is
-        phase 26's invariant: ``#status-message`` is the immediate element
-        sibling above the status block -- ``#status-live``, the persistent
-        region whose one child is ``#status-area`` -- and inserting a card
-        above the form must not have moved either of them.
+        The strip is read at a glance, and at a glance means first, so the
+        ordinal is asserted rather than merely the presence. ``#status-message``
+        stays the immediate element sibling above the status block --
+        ``#status-live``, the persistent region whose one child is
+        ``#status-area`` -- with the strip's card above the form.
         """
         page.goto(browser_server_url)
 
@@ -5290,7 +5288,7 @@ class TestStatusStripInChromium:
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
         """
-        The cold body carries the 2 s poll; the body that replaces it does not (P2).
+        The cold body carries the 2 s poll; the body that replaces it does not.
 
         This is the in-tree "the response ends its own poll" idiom, and it is
         the one thing about it a template assertion cannot say: that htmx really
@@ -5327,7 +5325,7 @@ class TestStatusStripInChromium:
         cls: Literal["check-ok", "check-warn", "check-fail"],
     ) -> None:
         """
-        The three verdict colours are legible where the strip really is (P3).
+        The three verdict colours are legible where the strip really is.
 
         The card is the binding surface: the strip lives inside an
         ``<article>``, and the dark card is lighter than the dark page, so it is
@@ -5353,7 +5351,7 @@ class TestStatusStripInChromium:
         cls: Literal["check-ok", "check-warn", "check-fail"],
     ) -> None:
         """
-        A forced ``data-theme`` reaches all three, under a light OS (P3).
+        A forced ``data-theme`` reaches all three, under a light OS.
 
         The OS preference alone never sets ``data-theme``, so the emulated case
         above cannot exercise the forced-dark rule at all. One of the three
@@ -5376,20 +5374,14 @@ class TestStatusStripInChromium:
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
         """
-        The Scanner row is skipped, marked neutral, and says why (P4, D-08).
+        During a scan the Scanner row is skipped, marked neutral, and says why.
 
-        The two inputs are set to exactly what a live scan produces -- a current
-        job on the worker, and the scanner gate held -- rather than by running
-        one. What a gate-holding worker does is ``tests/test_worker.py``'s
-        subject and the skip decision is ``tests/test_refresher.py``'s; what is
-        only provable here is that the pair of them renders as a paused strip
-        rather than a stale or a blank one, which is the whole of D-08.
-
-        The marker assertions are R3-WR-03's, and this is the one place they
-        can be made against a skipped row the application really produced: the
-        row's state is ``CheckState.OK``, so before ``check_row_glyph`` existed
-        Chromium drew a green tick here, in front of a sentence saying nothing
-        had been checked, and announced it as "OK: Scanner".
+        The inputs are what a live scan produces -- a current job on the
+        worker, and the scanner gate held -- set directly rather than by
+        running one, and they render as a paused strip rather than a stale or
+        blank one. The skipped row's state is ``CheckState.OK``, so this is
+        the one place a real skipped row proves it shows the neutral glyph and
+        the skipped label, not a green tick announced as "OK: Scanner".
         """
         server = cold_strip_server
         job_store: JobStore = server.app.state.job_store
@@ -5430,17 +5422,10 @@ class TestStatusStripInChromium:
         """
         A real click on Check again swaps ``#checks-body`` ``outerHTML``.
 
-        Plan 30-17 drove this same route over HTTP on purpose, so that the swap
-        its cold-start test observed was the *poll's*; nobody had yet pressed
-        the button in a browser. The claim here is the opposite of P8's: the
-        description slot must survive its swap, and this body must not -- the
-        button replaces the element it targets, trigger attribute and all, and
-        the witness set from the test is what tells replacement from update.
-
-        The checks are probed before the page opens so the body arrives with no
-        poll trigger on it. That is what makes the click the only thing in the
-        run that can swap this element, and it is why the assertion below needs
-        no interval arithmetic.
+        The button replaces the element it targets, trigger attribute and all,
+        and the witness set from the test tells replacement from update. The
+        checks are probed before the page opens, so the body arrives with no
+        poll trigger and the click is the only thing that can swap it.
         """
         server = cold_strip_server
         _probe_now(server)
@@ -5492,7 +5477,7 @@ class TestStatusStripInChromium:
         focus is detached by its own swap.  htmx puts focus back on the element
         with the same id, which is the only thing standing between a keyboard
         user and a focus that has fallen to the top of the page.  The witness
-        proves the body really was replaced, so the focus assertion is about
+        proves the body itself is swapped out, so the focus assertion is about
         the new button and not the old one surviving an in-place update.
         """
         server = cold_strip_server
@@ -5514,18 +5499,13 @@ class TestStatusStripInChromium:
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
         """
-        At 320 px the rows wrap instead of widening the page (UI-SPEC S1).
+        At 320 px the rows wrap instead of widening the page.
 
-        320 px is the narrowest viewport the spec names and the narrowest this
-        module has ever measured -- every other responsive assertion here stops
-        at 375. The design is a wrapping flex row with a fixed 1 rem glyph
-        gutter and a 7 rem name column, so what has to be proved is that those
-        two fixed columns plus a message do not push the document wider than
-        the viewport, and that the message wrapped rather than overflowed.
-
-        The document width is the load-bearing assertion: a household member
-        who has to scroll sideways to read a health verdict has not been told
-        anything at a glance.
+        Each row is a wrapping flex row with a fixed 1 rem glyph gutter and a
+        7 rem name column; those two columns plus a message must not push the
+        document wider than the viewport, and the message must wrap rather
+        than overflow. A household member who has to scroll sideways to read a
+        health verdict has not been told anything at a glance.
         """
         server = cold_strip_server
         _probe_now(server)
@@ -5603,11 +5583,10 @@ class TestStatusStripInChromium:
         """
         The longest Scanner message wraps beside its name, not under it.
 
-        A message wider than the space beside the name used to move, as a
-        whole, onto its own line, so at 1280 px the refused row alone started
-        under its name while the other five started beside theirs.  Every
-        message has to start at one x and on its name's line, with nothing
-        scrolling sideways.
+        At 1280 px every message, the refused row's included, starts at one x
+        and on its name's line, with nothing scrolling sideways.  A message
+        that moved as a whole onto its own line would leave one row out of
+        step with the other five.
         """
         server = refused_scanner_strip_server
         _probe_now(server)
@@ -5638,13 +5617,11 @@ class TestStatusStripInChromium:
         self, page: Page, stale_config_strip_server: _BrowserServer, tmp_path: Path
     ) -> None:
         """
-        The 2026-09-22 evening, as a household member would now have read it.
+        A config file left under the superseded name is the first row, and red.
 
-        The strip that night showed four red or amber rows and named no cause.
-        This asserts the row that names it: first on the page, red, carrying
-        the rename and the file's documented spelling -- and carrying no host
-        path, which is the one thing the exception to the no-path rule is not
-        allowed to become.
+        The row names the cause: it carries the rename and the file's
+        documented spelling -- and no host path, which is the one thing the
+        exception to the no-path rule is not allowed to become.
         """
         server = stale_config_strip_server
         _probe_now(server)
@@ -5738,21 +5715,14 @@ def storing_strip_server(
 @pytest.mark.browser
 class TestColdStartPollIsBounded:
     """
-    What the cold-start poll really costs a tab nobody closes (IN-07).
+    The cold-start poll a tab nobody closes runs at its interval and then stops.
 
-    The markup says ``every 2s``, and every assertion in the suite until now
-    read that claim off the attribute. Whether the browser *obeys* it is a
-    different question: htmx fires the ``load`` trigger on content it has just
-    swapped in, and this body swaps in a copy of itself, so a trigger list
-    naming both ``load`` and an interval can run at the round-trip rate rather
-    than at the advertised one. Only a request count says which.
-
-    That count was measured before the cap existed: 254 requests in six
-    seconds, 42 a second, eighty-five times the advertised rate. It is why the
-    fix is two things rather than one -- a server-side attempt cap, and ``load``
-    dropped from every polled body so that the interval in the markup is the
-    interval the browser really uses. A cap counted in attempts is only a cap in
-    time if the interval is honest.
+    The markup says ``every 2s``, but whether the browser obeys it is a
+    request count, not an attribute: htmx fires a ``load`` trigger on content
+    it has just swapped in, and this body swaps in a copy of itself, so a
+    trigger list naming ``load`` would run at the round-trip rate. The server
+    caps the attempts, and a cap counted in attempts is only a cap in time if
+    the interval is honest.
     """
 
     def test_an_abandoned_cold_strip_stops_asking(
@@ -5762,20 +5732,15 @@ class TestColdStartPollIsBounded:
         record_property: Callable[[str, object], None],
     ) -> None:
         """
-        A cache that is never filled runs the poll out of attempts (IN-07).
+        A cache that is never filled runs the poll out of attempts, then stops.
 
         ``cold_strip_server`` pauses the refresher's ticks, which to the page is
-        the appliance whose background thread has died -- the case this class
-        is about, and the one where the poll's original terminating condition
-        can never fire. The count is
-        asserted against the cap now rather than merely recorded, and the
-        stillness afterwards is asserted separately: a poll that had paused
-        rather than stopped would have fired at least three times inside the
-        settle window.
-
-        The three things the give-up state must not lose are checked on the
-        page itself, because "stops asking" would be a bad trade for a strip
-        that had gone blank.
+        an appliance whose background thread has died, so results never arrive
+        to end the poll. The count equals the cap, and the stillness afterwards
+        is asserted separately: a poll that had paused rather than stopped
+        would fire at least three times inside the settle window. The give-up
+        state keeps its rows, its button and its line, because "stops asking"
+        would be a bad trade for a strip that had gone blank.
         """
         polled = _record_checks_requests(page)
         page.goto(cold_strip_server.url)
@@ -5811,10 +5776,8 @@ class TestColdStartPollIsBounded:
 
         This is the property the cap must leave alone, and it is the reason the
         cap is ten rather than two: the strip has to be allowed to keep asking
-        for as long as a real appliance could plausibly take to answer.
-        Measured before the fix it cost 39 requests, because every swapped-in
-        body re-fired ``load``; after it, the same cold start costs a couple at
-        the honest interval and still settles on its own.
+        for as long as a real appliance could plausibly take to answer. The
+        request count is recorded, not asserted.
         """
         polled = _record_checks_requests(page)
         page.goto(storing_strip_server.url)
@@ -5828,10 +5791,9 @@ class TestColdStartPollIsBounded:
 
 
 # How long the error-path poll is watched after the failure has been swapped
-# in, in milliseconds. Four and a half of the 2 s intervals the markup names,
-# which is the window the planner's standalone measurement used, so a poll that
-# had survived its own failed request would have fired four more times inside
-# it and been caught.
+# in, in milliseconds. Four and a half of the 2 s intervals the markup names, so
+# a poll that had survived its own failed request would fire four more times
+# inside it and be caught.
 _ERROR_POLL_WINDOW_MS = 9000
 
 # base.html's htmx-config, captured whole. Single-quoted in the template
@@ -5876,11 +5838,10 @@ def _tamper_the_checks_poll(page: Page) -> None:
 
     The request is tampered with and passed on, never answered here. A handler
     that fulfilled the request itself would be measuring a response this
-    application never sends: the previous version of this class did exactly
-    that, with a hand-written body carrying no headers at all, which is why it
-    could not fail for the property it is named after. ``route.continue_`` puts
-    the application back in the loop, so the browser receives the real 422 that
-    ``render_error`` builds, with the real headers on it.
+    application never sends, with hand-written headers or none at all.
+    ``route.continue_`` keeps the application in the loop, so the browser
+    receives the real 422 that ``render_error`` builds, with the real headers
+    on it.
 
     A page-level handler takes priority over the module's context-level egress
     gate for the URLs it matches, which ``_record_checks_requests`` explains is
@@ -5910,7 +5871,7 @@ def _record_checks_responses(page: Page) -> list[tuple[int, dict[str, str]]]:
     """
     Start recording the status and headers of every poll response.
 
-    The headers are the fact the fix turns on, so they are read off the wire
+    The headers decide where an error response lands, so they are read off the wire
     rather than inferred from what the page ended up looking like.
 
     Args:
@@ -5935,31 +5896,15 @@ def _record_checks_responses(page: Page) -> list[tuple[int, dict[str, str]]]:
 @pytest.mark.browser
 class TestPollEndsOnAnErrorResponse:
     """
-    R3-CR-02, measured: the strip's own failure is what ends the strip's poll.
+    The strip's own failed poll replaces the strip, and so ends the poll.
 
-    There was a defect here, and the previous version of this class concluded
-    there was not. ``render_error`` set ``HX-Retarget: #status-message`` on
-    every htmx error response, and htmx 2.0.10 applies ``HX-Retarget`` to the
-    response's target *before* it decides what to swap. So a 4xx from
-    ``GET /api/checks`` was written into ``#status-message``: ``#checks-body``
-    was never replaced, kept its ``every 2s`` trigger, and went on polling and
-    failing for as long as the tab stayed open -- overwriting the scan-progress
-    line twice a minute while it did.
-
-    The old measurement could not see that, because it fulfilled the poll from
-    inside the browser with a hand-written body that carried no response
-    headers at all. With no ``HX-Retarget`` on it, the fabricated failure
-    swapped exactly as this class wanted; the application's own failure did
-    not. Every case here now drives the failure through the server.
-
-    The fix is one condition in ``errors.py``: a request whose ``HX-Target`` is
-    the strip's swap target gets no ``HX-Retarget`` and no ``HX-Reswap``, so
-    the response is swapped by the polling element's own ``hx-target="this"
-    hx-swap="outerHTML"``, ``#checks-body`` leaves the DOM, and htmx's ``ct()``
-    loop stops re-arming because ``se(e)`` -- "is this element still attached"
-    -- is false on the next tick. ``base.html``'s ``{"code":"[45]..",
-    "swap":true,"error":true}`` rule is what makes an error body swap at all,
-    so it is load-bearing for the fix and is still pinned below.
+    An error response to a request whose ``HX-Target`` is the strip carries no
+    ``HX-Retarget`` and no ``HX-Reswap``, so the polling element's own
+    ``hx-target="this" hx-swap="outerHTML"`` swaps it out and htmx stops
+    re-arming a trigger on a detached element. With a retarget, htmx would
+    write the error into ``#status-message`` and leave ``#checks-body``
+    polling and failing for as long as the tab stayed open. Every case drives
+    the failure through the server, so the headers are the application's own.
     """
 
     def test_a_failed_poll_request_replaces_the_strip_and_stops(
@@ -6005,7 +5950,7 @@ class TestPollEndsOnAnErrorResponse:
         record_property: Callable[[str, object], None],
     ) -> None:
         """
-        The header the fix turns on, read off the wire (R3-CR-02).
+        The failing poll response carries no retarget, read off the wire.
 
         Asserted on its own because the swap above is downstream of it: if
         ``HX-Retarget`` came back, the error would land in ``#status-message``
@@ -6032,12 +5977,10 @@ class TestPollEndsOnAnErrorResponse:
         cold_strip_server: _BrowserServer,
     ) -> None:
         """
-        D-03's slot is left alone, which is the other half of the defect.
+        A failing poll leaves ``#status-message`` exactly as it was.
 
-        A scan's progress line lives here. While the retarget applied, a poll
-        that failed every two seconds replaced that line with a generic error
-        sentence twice a minute -- so "the error landed somewhere else" is not
-        a detail of the fix, it is the user-visible half of it.
+        A scan's progress line lives there, and a poll failing every two
+        seconds must not replace it with a generic error sentence.
         """
         _tamper_the_checks_poll(page)
         page.goto(cold_strip_server.url)
@@ -6052,14 +5995,13 @@ class TestPollEndsOnAnErrorResponse:
 
     def test_the_htmx_config_meta_swaps_error_responses(self) -> None:
         """
-        The rule the measurements above depend on, asserted on its own.
+        The htmx-config meta swaps ``[45]..`` responses and flags them as errors.
 
-        It is load-bearing *for the fix*, not evidence that there was never a
-        defect. Dropping ``HX-Retarget`` only ends the poll because an error
-        body is swapped at all, and that is this meta's doing: flipped back to
-        htmx's default -- ``swap`` false for ``[45]..`` -- the exempt response
-        would be discarded, the polling body would survive its own failed
-        request, and the chain would run for as long as the tab stayed open.
+        An error body is swapped at all only because of this rule. Under
+        htmx's default -- ``swap`` false for ``[45]..`` -- the strip's error
+        response would be discarded, the polling body would survive its own
+        failed request, and the chain would run for as long as the tab stayed
+        open.
         """
         match = _HTMX_CONFIG_META.search(BASE_HTML.read_text(encoding="utf-8"))
         assert match is not None
@@ -6070,15 +6012,15 @@ class TestPollEndsOnAnErrorResponse:
         assert errors[0]["error"] is True
 
 
-# The counts UI-SPEC S3 pins, for the three cases that behave differently: a
+# The counts footnote's wording, for the three cases that behave differently: a
 # measured set, a measured zero in the middle clause, and never-recorded.
 _MEASURED_COUNTS = "12 pages scanned, 2 blank removed, 10 uploaded"
 _ZERO_BLANK_COUNTS = "12 pages scanned, 0 blank removed, 12 uploaded"
 
-# The category this phase's error rendering is read through. UPLOAD is chosen
-# over UNKNOWN on purpose: UNKNOWN's next step ends "check the saneless log",
-# and a test whose own fixture data contains the word the D-13 assertion is
-# hunting for would be arguing with itself.
+# The category the error rendering is read through. UPLOAD rather than UNKNOWN:
+# UNKNOWN's next step ends "check the saneless log", and a test whose own
+# fixture data contains the word the no-log-path assertion is hunting for would
+# be arguing with itself.
 _ERROR_CATEGORY = ErrorCategory.UPLOAD
 
 _ERROR_DETAIL = "connect to paperless-ngx failed: [Errno 111] Connection refused"
@@ -6106,7 +6048,7 @@ def empty_history_server(
 @pytest.mark.browser
 class TestErrorRenderingInChromium:
     """
-    The plain-language failure, read from a rendered page (APPL-04, D-13).
+    The plain-language failure, read from a rendered page.
 
     What a screen reader is handed is a property of the DOM and not of the
     template text: whether the next step falls inside the alert, and whether
@@ -6119,7 +6061,7 @@ class TestErrorRenderingInChromium:
         self, page: Page, empty_history_server: _BrowserServer
     ) -> None:
         """
-        One alert, the details outside it and shut, and no path anywhere (P5).
+        One alert, the details outside it and shut, and no path anywhere.
 
         The count of one is the point of the wrapping ``<div role="alert">``:
         the sentence and the next step are announced together, once, and the
@@ -6168,7 +6110,7 @@ class TestErrorRenderingInChromium:
             assert log_file not in source, log_file
             # Not just this deployment's path: any filename that looks like a
             # log would be a host filesystem detail on a page the whole LAN can
-            # read, so the substring is what is refused (D-13).
+            # read, so the substring is what is refused.
             assert ".log" not in source
         finally:
             worker._current_job_id = None
@@ -6275,7 +6217,7 @@ class TestAmberErrorRenderingInChromium:
 @pytest.mark.browser
 class TestPageCountsInChromium:
     """
-    The counts footnote, in both places it renders (APPL-03, D-32).
+    The counts footnote, in both places it renders.
 
     One class and one rule serve the status area and the Title cell alike, and
     the guard for both is the filter returning None rather than a count's own
@@ -6301,7 +6243,7 @@ class TestPageCountsInChromium:
         expected: str | None,
     ) -> None:
         """
-        Measured counts render twice; never-recorded ones render nowhere (P6).
+        Measured counts render twice; never-recorded ones render nowhere.
 
         The three cases are separate page loads on a server with an empty
         history precisely so the negative case can be stated at full strength:
@@ -6402,8 +6344,8 @@ class TestHistoryTableOnAPhone:
         """
         No header, time, profile or status word is split, and nothing scrolls.
 
-        Under a fixed table layout every column got a quarter of the width
-        whatever it held, so a long label was broken mid-word.  The document
+        A fixed table layout would give every column a quarter of the width
+        whatever it held, and break a long label mid-word.  The document
         width is checked as well, because keeping words whole by widening the
         page would trade one failure for another.
 
@@ -6487,10 +6429,9 @@ class _ManualDuplexScanner(_BrowserTestScanner):
 
     ``_BrowserTestScanner`` spools one page per pass, which would pin the front
     count at 1 and leave the singular branch of the busy line as the only thing
-    a browser could ever be shown. Twelve is the number UI-SPEC P7 writes, and
-    it arrives by the real route: pass A returns twelve records, the pipeline
-    counts them and hands the count to the worker through the pass-count
-    callback, before it announces AWAITING_FLIP (D-33).
+    a browser could ever be shown. Twelve arrives by the real route: pass A
+    returns twelve records, the pipeline counts them and hands the count to the
+    worker through the pass-count callback, before it announces AWAITING_FLIP.
 
     Only pass B waits on the inherited gate, so the job parks in
     SCANNING_REVERSE for exactly as long as the assertions need.
@@ -6547,7 +6488,7 @@ def duplex_server(
 @pytest.mark.browser
 class TestManualDuplexFrontCountInChromium:
     """
-    The front count leads the busy line at SCANNING_REVERSE (APPL-03, D-33).
+    The front count leads the busy line at SCANNING_REVERSE.
 
     The number exists only between the end of pass A and the end of the job,
     and it lives on the worker rather than in a job column, so the only way to
@@ -6562,7 +6503,7 @@ class TestManualDuplexFrontCountInChromium:
         duplex_server: _BrowserServer,
     ) -> None:
         """
-        At ``SCANNING_REVERSE`` the busy line opens ``Front: 12 pages ·`` (P7).
+        At ``SCANNING_REVERSE`` the busy line opens ``Front: 12 pages ·``.
 
         ``startswith`` rather than a containment check: the count leads the
         line, because it is the thing the operator standing at the feeder wants
@@ -6606,8 +6547,9 @@ class TestManualDuplexFrontCountInChromium:
 
 
 # The two profiles the swap needs beyond the shared pair, plus the one that has
-# nothing to say. Amendment A-3's fallback is only observable when some profile
-# carries a human name and another does not, so both cases are configured.
+# nothing to say. The fall-back to the profile's own name is only observable
+# when some profile carries a human name and another does not, so both cases
+# are configured.
 _LABELLED_PROFILE = "labelled"
 _LABELLED_NAME = "Everyday scan"
 _UNNAMED_PROFILE = "unnamed"
@@ -6622,8 +6564,8 @@ def _described_profile_settings(tmp_dir: Path) -> Settings:
     ``default`` is the flatbed and ``duplex`` the feeder, both inherited from
     the shared settings so the two sentences the swap moves between stay the
     ones the rest of the module uses. ``labelled`` carries a human name and
-    ``unnamed`` carries none, which is the pair Amendment A-3's fallback needs
-    to be visible at all; ``silent`` carries no description, which is what the
+    ``unnamed`` carries none, which is the pair the fall-back to the profile's
+    own name needs to be visible at all; ``silent`` carries no description, which is what the
     ``:empty`` rule exists for.
 
     Args:
@@ -6667,7 +6609,7 @@ def described_profile_server(
 @pytest.mark.browser
 class TestProfileDescriptionInChromium:
     """
-    The dropdown explains itself live, without losing the slot (APPL-05, S4).
+    The dropdown explains itself live, without losing the slot.
 
     ``TestProfileDescriptionSwap`` above proves the swap happens and that the
     id, the live region and the ``aria-describedby`` target survive it. What is
@@ -6680,7 +6622,7 @@ class TestProfileDescriptionInChromium:
         self, page: Page, described_profile_server: _BrowserServer
     ) -> None:
         """
-        The text changes and the element does not (P8, S4).
+        The text changes and the element does not.
 
         A witness attribute set from the test is what tells "this element was
         updated" apart from "an identical element was put in its place". Only
@@ -6706,12 +6648,11 @@ class TestProfileDescriptionInChromium:
         self, page: Page, described_profile_server: _BrowserServer
     ) -> None:
         """
-        ``label or name``, both halves, in the rendered options (P8, A-3).
+        ``label or name``, both halves, in the rendered options.
 
-        A config written before this phase carries no label until
-        ``auto-profiles --force`` has been run, and a dropdown that rendered it
-        as a blank row would be unusable. The labelled profile is asserted
-        alongside so the fallback cannot pass by never being reached.
+        A profile with no label is offered under its key rather than as a
+        blank, unusable row. The labelled profile is asserted alongside so the
+        fallback cannot pass by never being reached.
         """
         page.goto(described_profile_server.url)
 
@@ -6726,7 +6667,7 @@ class TestProfileDescriptionInChromium:
         self, page: Page, described_profile_server: _BrowserServer
     ) -> None:
         """
-        An emptied slot is hidden outright, not left as a stray margin (P8).
+        An emptied slot is hidden outright, not left as a stray margin.
 
         The route answers a description-less profile with a byte-empty body so
         ``:empty`` still matches; a single whitespace text node would be a child
@@ -6755,7 +6696,7 @@ _TIME_CELL_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} (\S+)$")
 @pytest.mark.browser
 class TestTimestampZonesInChromium:
     """
-    Every timestamp on the page names its zone (APPL-12, D-34, D-35).
+    Every timestamp on the page names its zone.
 
     The zone is named on every row rather than once as a column caption, so a
     line somebody copies into a message is self-describing. Both surfaces go
@@ -6769,7 +6710,7 @@ class TestTimestampZonesInChromium:
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
         """
-        The Time cell matches the pinned shape and the strip echoes its zone (P15).
+        The Time cell matches the pinned shape and the strip echoes its zone.
 
         The checks are probed before the page is opened, so the strip renders
         its "Last checked" line in the first response and there is no swap to
@@ -6805,8 +6746,8 @@ class TestTimestampZonesInChromium:
 # Every other owner-gate assertion in this module is made from one browser: the
 # non-owner case is staged by writing a foreign token onto a job row, which
 # proves the server branches correctly but says nothing about the two cookie
-# jars that decision exists to tell apart. Phase 30's fifth success criterion
-# is about two people at one appliance, so it is answered here with two of them.
+# jars that decision exists to tell apart. The gate is about two people at one
+# appliance, so it is checked here with two of them.
 # ---------------------------------------------------------------------------
 
 _FLIP_CONTROL_SELECTOR = "[hx-post^='/api/flip/']"
@@ -6825,11 +6766,10 @@ before the worker records when the wait began, and either form carries this.
 _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
 """The question ``hx-confirm`` puts in the native dialog."""
 
-# D-26 forbids a third way out of the flip prompt: no override, no take-over,
-# no force-continue. The absence IS the rendering, so it is asserted rather
-# than left to a reviewer's memory -- and it is asserted on the words as well
-# as on the controls, because a page offering one in prose would have smuggled
-# the same affordance past a control count.
+# There is no third way out of the flip prompt: no override, no take-over, no
+# force-continue. The absence is asserted on the words as well as on the
+# controls, because a page offering one in prose would smuggle the same
+# affordance past a control count.
 _NO_THIRD_WAY_OUT = re.compile(r"override|take over|force", re.IGNORECASE)
 
 _FLIP_JOB_TITLE = "Two Browsers One Stack"
@@ -6922,20 +6862,14 @@ def _assert_only_the_owner_is_named(owner: Page, viewer: Page, title: str) -> No
 @pytest.mark.browser
 class TestTwoBrowsersOneStack:
     """
-    One appliance, two browsers, one owner (APPL-09, D-24, D-26, success 5).
+    One appliance, two browsers, one owner.
 
     The owner is offered the flip, and is the only one shown the scan's title
     and preview; the second browser sees that a scan is waiting, and how it
-    ends, under the generic title.
-
-    The owner gate is a statement about two cookie jars, and a cookie jar is
-    something only a browser has. Staging the non-owner by writing a foreign
-    token onto a job row -- how the rest of this module does it -- proves the
-    server branches correctly but leaves research assumption A6 untested: that
-    a browser really keeps the ``Set-Cookie`` an htmx XHR returned, really
-    sends it back on the next poll, and that a second browser really has none.
-    Two contexts is the honest sample, so this is where success criterion 5 is
-    answered.
+    ends, under the generic title. The owner gate is a statement about two
+    cookie jars: a browser keeps the ``Set-Cookie`` an htmx XHR returned,
+    sends it back on the next poll, and a second browser has none. Writing a
+    foreign token onto a job row cannot show that, so two contexts do.
     """
 
     def test_the_owner_is_offered_the_flip_and_the_second_browser_is_not(
@@ -6945,14 +6879,14 @@ class TestTwoBrowsersOneStack:
         egress_allowlist: list[str],
     ) -> None:
         """
-        Two cookie jars, one prompt, and nothing else differs (P9, D-24, D-26).
+        Two cookie jars, one prompt, and nothing else differs.
 
         Both contexts are built by hand, so neither inherits the overridden
         ``context`` fixture's routing: each installs ``_make_gate`` explicitly
         and both share one ``blocked`` list, which is the arrangement that
-        factory exists for (Pitfall 9). Without it these two pages would be the
-        only ones in the module able to reach the real internet, and nothing in
-        the suite would have said so.
+        factory exists for. Without it these two pages would be the only ones
+        in the module able to reach the real internet, and nothing in the
+        suite would say so.
         """
         server = flip_server
         job_store: JobStore = server.app.state.job_store
@@ -7001,8 +6935,8 @@ class TestTwoBrowsersOneStack:
                 expect(viewer_status).to_contain_text(_WAITING_LINE)
                 expect(viewer_page.locator(_FLIP_CONTROL_SELECTOR)).to_have_count(0)
 
-                # A6, measured rather than assumed: the owner's jar holds the
-                # cookie the scan response minted, and the second jar does not.
+                # The owner's jar holds the cookie the scan response minted,
+                # and the second jar does not.
                 owner_cookies = [
                     cookie
                     for cookie in owner_ctx.cookies()
@@ -7027,7 +6961,7 @@ class TestTwoBrowsersOneStack:
                     owner_page, viewer_page, _FLIP_JOB_TITLE
                 )
 
-                # D-26's absence guard, on both pages.
+                # No third way out of the prompt, in words, on either page.
                 for reader in (owner_page, viewer_page):
                     body = reader.locator("body").inner_text()
                     assert _NO_THIRD_WAY_OUT.search(body) is None, body
@@ -7156,11 +7090,11 @@ class TestTwoBrowsersOneStack:
         flip_server: _BrowserServer,
     ) -> None:
         """
-        The confirm is really raised, and dismissing it aborts nothing (P10).
+        The confirm is really raised, and dismissing it aborts nothing.
 
         ``hx-confirm`` is one attribute in a template, and a template test can
         only see that it is there. Whether a browser raises a dialog, whether
-        the question it shows is the locked copy, and above all whether a "no"
+        the question it shows is the expected copy, and above all whether a "no"
         really stops the request are three facts about htmx and Chromium
         together. The "no" half is asserted from a recorded request list rather
         than from a timeout, so it says "no abort was sent" and not "none was
@@ -7489,7 +7423,7 @@ class TestOnlyTheOwnerSeesTheScan:
 
 
 # ---------------------------------------------------------------------------
-# The simpler form: [web] show_tags = false (D-28, D-29).
+# The simpler form: [web] show_tags = false.
 # ---------------------------------------------------------------------------
 
 _SIMPLE_FORM_DEFAULT_TAGS = [11, 13]
