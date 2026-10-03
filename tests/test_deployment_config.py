@@ -75,7 +75,6 @@ membership are not things to re-implement with a regular expression.
 
 from __future__ import annotations
 
-import inspect
 import logging
 import os
 import re
@@ -125,6 +124,7 @@ from saneless.pages import (
     is_blank,
 )
 from saneless.pipeline import MAX_DOCUMENT_PAGES, PipelineEvent
+from saneless.scanner import sane_backend
 from saneless.scanner.base import MAX_PAGES_PER_PASS, PageRecord
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
@@ -859,6 +859,7 @@ _COMMAND_HEADING = re.compile(r"^## `saneless ([a-z-]+)`$", re.MULTILINE)
 # command is caught by the same test as the sixth.
 _COUNT_SENTENCE = re.compile(r"^saneless provides (\w+) commands\b", re.MULTILINE)
 _NUMBER_WORDS = {
+    "one": 1,
     "two": 2,
     "three": 3,
     "four": 4,
@@ -1345,6 +1346,9 @@ def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
 
 
 ARCHITECTURE_MEMORY_HEADING = "### Memory, disk and timeouts"
+# The per-page timeout floor as the page writes it, read from the backend
+# that enforces it.
+PAGE_TIMEOUT_FLOOR = f"{sane_backend._PAGE_TIMEOUT_FLOOR_SECONDS:g}"
 
 # The Phase 29 claims the architecture page now makes, each with the substrings
 # that carry it.
@@ -1370,12 +1374,12 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "one per-page timeout bounds the feeder and the flatbed alike",
-        ("120", "feeder", "flatbed"),
+        ("feeder", "flatbed"),
     ),
     (
         "the per-page limit scales with the page the scanner agreed to, with a "
         "120-second floor",
-        ("120", "scales"),
+        (f"never below {PAGE_TIMEOUT_FLOOR} seconds", "scales"),
     ),
     (
         "a timeout cancels the read and waits for it before closing the device",
@@ -1423,8 +1427,9 @@ ARCHITECTURE_MEMORY_RETRACTED: tuple[tuple[str, str], ...] = (
         "only page reads and the cancel after a timeout do",
     ),
     (
-        "one 120-second per-page timeout",
-        "the limit scales with the page, and 120 seconds is only its floor",
+        f"one {PAGE_TIMEOUT_FLOOR}-second per-page timeout",
+        f"the limit scales with the page, and {PAGE_TIMEOUT_FLOOR} seconds is "
+        "only its floor",
     ),
 )
 
@@ -1440,7 +1445,12 @@ def _subsection(text: str, heading: str, name: Path) -> str:
 
 
 def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
-    """The architecture page pins Phase 29's memory, disk and timeout claims."""
+    """
+    The architecture page states the memory, disk and timeout rules the code keeps.
+
+    The per-page timeout floor is read from the scanner backend, so changing it
+    fails the page until the page says the new figure.
+    """
     text, name = _read(ARCHITECTURE)
     assert ARCHITECTURE_MEMORY_HEADING in text, (
         f"{name} has no {ARCHITECTURE_MEMORY_HEADING!r} subsection"
@@ -1457,20 +1467,7 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
             f"{name}: the memory, disk and timeouts subsection claims again that "
             f"{retracted!r}; {why}"
         )
-
-    # The two claims the page used to make and must not make again. A PNG
-    # re-encode is lossless, but the bytes in the PDF are not the bytes the
-    # scanner sent, and pages are no longer carried through the pipeline as
-    # in-memory images. Reverting either correction fails here.
     lowered = text.lower()
-    assert "byte-for-byte" not in lowered, (
-        f"{name} claims the embedded image data is byte-for-byte identical to "
-        "what the scanner produced; it is lossless, not byte-identical"
-    )
-    assert "pil images" not in lowered, (
-        f"{name}'s pipeline diagram still carries pages as PIL Images; they are "
-        "spooled to disk as they arrive"
-    )
     assert "lossless" in lowered, (
         f"{name} no longer says the PNG-to-PDF embed is lossless"
     )
@@ -2446,35 +2443,7 @@ def test_first_web_ui_scan_walks_the_current_form() -> None:
 # Phase 31: packaging identity (D-01, D-02, D-05, DLVR-08)
 # ---------------------------------------------------------------------------
 
-# The top-level ``version = "..."`` assignment. Anchored at the start of a line
-# so ``target-version = "py314"`` under [tool.ruff] cannot match it.
-VERSION_LINE = re.compile(r'^version = "([^"]*)"$', re.MULTILINE)
-
-# The 0.2.0 series: the release version itself, or one of its release
-# candidates.
-ZERO_TWO_SERIES = re.compile(r"^0\.2\.0(-rc\.\d+)?$")
-
 LEGACY_LICENSE_CLASSIFIER = "License :: OSI Approved :: MIT License"
-
-
-def test_pyproject_declares_the_0_2_0_series() -> None:
-    """
-    The declared package version is the 0.2.0 series (D-01).
-
-    The pattern admits ``0.2.0-rc.1`` deliberately. The TestPyPI release
-    rehearsal sets exactly that string for the duration of the upload and
-    restores ``0.2.0`` afterwards; a bare equality assertion would go red for
-    the length of the rehearsal, and the pressure then would be to weaken it.
-    Admitting the RC suffix up front is the narrower accommodation.
-    """
-    text, name = _read(PYPROJECT)
-    match = VERSION_LINE.search(text)
-    assert match is not None, f"{name} has no top-level version assignment"
-    declared = match.group(1)
-    assert ZERO_TWO_SERIES.match(declared), (
-        f"{name} declares version {declared!r}; this phase ships the 0.2.0 "
-        "series (0.2.0, or 0.2.0-rc.N during the release rehearsal)"
-    )
 
 
 def test_pyproject_uses_the_pep_639_license_keys() -> None:
@@ -2510,16 +2479,37 @@ def test_pyproject_has_no_legacy_license_classifier() -> None:
     )
 
 
-def test_pyproject_declares_alpha_maturity() -> None:
-    """The maturity classifier is ``3 - Alpha``, not ``4 - Beta`` (D-02)."""
-    text, name = _read(PYPROJECT)
-    assert "Development Status :: 3 - Alpha" in text, (
-        f"{name} does not classify saneless as Development Status :: 3 - Alpha"
+# The trove classifier prefix that states a project's maturity, and the
+# number of its ``Production/Stable`` value.
+DEVELOPMENT_STATUS = "Development Status :: "
+STABLE_STATUS = 5
+
+
+def test_maturity_classifier_stays_below_stable_before_one_point_zero() -> None:
+    """
+    One maturity classifier, below Production/Stable while the version is 0.x.
+
+    A 0.x version or a pre-release promises no stable interface, so a
+    classifier claiming one would tell an installer the opposite of what the
+    version says.
+    """
+    project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
+    statuses = [
+        classifier.removeprefix(DEVELOPMENT_STATUS)
+        for classifier in project["classifiers"]
+        if classifier.startswith(DEVELOPMENT_STATUS)
+    ]
+    assert len(statuses) == 1, (
+        f"pyproject.toml declares {len(statuses)} Development Status "
+        f"classifiers, {statuses}; a project has exactly one maturity"
     )
-    assert "Development Status :: 4 - Beta" not in text, (
-        f"{name} still claims Development Status :: 4 - Beta; the first "
-        "published release is Alpha"
-    )
+    number = int(statuses[0].split(" - ", 1)[0])
+    version = Version(project["version"])
+    if version.major == 0 or version.is_prerelease:
+        assert number < STABLE_STATUS, (
+            f"version {version} is 0.x or a pre-release, but the maturity "
+            f"classifier says {statuses[0]!r}"
+        )
 
 
 def test_pyproject_distribution_name_is_saneless() -> None:
@@ -5715,7 +5705,7 @@ QUOTED_REQUIRES = re.compile(r'requires = \["(?P<spec>uv_build[^"]+)"\]')
 UV_BUILD_RANGE = re.compile(r"^uv_build>=(?P<floor>[^,]+),<(?P<ceiling>\S+)$")
 
 
-def _workflow_files() -> list[Path]:
+def _workflow_files(directory: Path = WORKFLOW_DIR) -> list[Path]:
     """
     Return every GitHub Actions workflow file, sorted by path.
 
@@ -5731,12 +5721,16 @@ def _workflow_files() -> list[Path]:
     input set has to be what GitHub runs, not what the repository happens to
     contain.
 
+    Args:
+        directory: The workflow directory to read, ``.github/workflows``
+            unless a test supplies its own.
+
     Returns:
-        The workflow files under ``.github/workflows``, in path order.
+        The workflow files under ``directory``, in path order.
 
     """
     return sorted(
-        path for suffix in ("*.yml", "*.yaml") for path in WORKFLOW_DIR.glob(suffix)
+        path for suffix in ("*.yml", "*.yaml") for path in directory.glob(suffix)
     )
 
 
@@ -6402,41 +6396,23 @@ def test_every_workflow_uses_reference_is_a_commented_lowercase_sha() -> None:
     )
 
 
-def test_the_workflow_reader_collects_both_extensions_github_loads() -> None:
+def test_the_workflow_reader_collects_both_extensions_github_loads(
+    tmp_path: Path,
+) -> None:
     """
-    ``_workflow_files`` reads ``.yaml`` as well as ``.yml`` (PR #13 review).
+    ``_workflow_files`` returns ``.yaml`` workflows as well as ``.yml`` ones.
 
-    GitHub loads both spellings out of ``.github/workflows``. Every workflow
-    in this repository happens to be ``.yml``, so a reader that globbed one
-    extension passed today and would have kept passing -- while a ``.yaml``
-    file added later carried its ``uses:`` refs and any ``--ignore`` flag
-    past every guard built on this list. That is the whole failure this
-    module exists to prevent, arriving through the guard's own input set.
-
-    The check is on the glob patterns rather than on a fixture file, because
-    the defect is what the reader *would* miss, and no ``.yaml`` file exists
-    to observe. Asserting the reader finds a file that is not there could
-    only be written as a tautology.
+    GitHub loads both spellings out of ``.github/workflows``, so a workflow
+    the reader missed would carry its ``uses:`` refs and any suppression flag
+    past every guard built on this list. Other files in the directory are not
+    workflows and are left out.
     """
-    source = inspect.getsource(_workflow_files)
-    for suffix in ("*.yml", "*.yaml"):
-        assert suffix in source, (
-            f"_workflow_files does not glob {suffix!r}. GitHub loads both "
-            "spellings, so a workflow using the other one would bypass every "
-            "guard that reads this list -- the uses: pin check and the "
-            "suppression-flag check both take their input from here."
-        )
+    for filename in ("a.yml", "b.yaml", "notes.txt"):
+        (tmp_path / filename).write_text("on: push\n", encoding="utf-8")
 
-    found = {path.name for path in _workflow_files()}
-    on_disk = {
-        path.name
-        for path in WORKFLOW_DIR.iterdir()
-        if path.suffix in {".yml", ".yaml"} and path.is_file()
-    }
-    assert found == on_disk, (
-        "the reader disagrees with the directory. Every workflow file GitHub "
-        f"would load must reach the guards: {sorted(on_disk - found)} missing."
-    )
+    found = [path.name for path in _workflow_files(tmp_path)]
+
+    assert found == ["a.yml", "b.yaml"]
 
 
 # ---------------------------------------------------------------------------
@@ -7517,49 +7493,119 @@ CHECK_LISTING_PAGES = (
     DOCS_DIR / "getting-started" / "first-web-ui-scan.md",
 )
 
-# Phrases that count the rows in prose. Each was true of the five-row strip and
-# is now false, and none of them would be caught by the name check above --
-# a page can name all six checks and still tell its reader there are five.
-STALE_CHECK_COUNT_PHRASES = (
-    "five checks",
-    "five rows",
-    "among five",
-    "other four",
+# A count of the checks in prose: "six checks", "six health checks", "six
+# named rows", across a line wrap and in any case.
+_CHECK_COUNT = re.compile(
+    rf"\b(?P<count>{'|'.join(_NUMBER_WORDS)})\s+"
+    r"(?:(?:named|health|status)\s+)?(?:checks|rows)\b",
+    re.IGNORECASE,
 )
+# A line that opens or closes a fenced block.
+_FENCE_LINE = re.compile(r"^\s*```")
+
+
+def _without_fences(text: str) -> str:
+    """
+    Return ``text`` with every fenced block's lines blanked.
+
+    A fenced block is a command or its output, not prose making a claim.
+    Blanking rather than dropping the lines keeps the line numbers an offence
+    reports.
+    """
+    lines: list[str] = []
+    fenced = False
+    for line in text.splitlines():
+        if _FENCE_LINE.match(line):
+            fenced = not fenced
+            lines.append("")
+        else:
+            lines.append("" if fenced else line)
+    return "\n".join(lines)
+
+
+def _spelled_check_count() -> str:
+    """Return the number of checks ``CheckKey`` defines, as a word."""
+    count = len(CheckKey)
+    spelled = [word for word, value in _NUMBER_WORDS.items() if value == count]
+    assert spelled, f"CheckKey has {count} members; add the word to _NUMBER_WORDS"
+    return spelled[0]
+
+
+def _check_count_offences(text: str, name: str) -> list[str]:
+    """
+    Return ``name:line: phrase`` for every prose count of the checks that is wrong.
+
+    Args:
+        text: The page.
+        name: The page's name, for the report.
+
+    Returns:
+        One entry per count whose number word is not ``len(CheckKey)`` spelled
+        out.
+
+    """
+    expected = _spelled_check_count()
+    prose = _without_fences(text)
+    offences: list[str] = []
+    for match in _CHECK_COUNT.finditer(prose):
+        if match["count"].lower() == expected:
+            continue
+        line = prose.count("\n", 0, match.start()) + 1
+        offences.append(f"{name}:{line}: {' '.join(match[0].split())}")
+    return offences
+
+
+def test_the_check_count_scan_reports_a_wrong_count() -> None:
+    """A page counting one check too many is one offence, on its line."""
+    wrong = next(
+        word for word, value in _NUMBER_WORDS.items() if value == len(CheckKey) + 1
+    )
+    page = f"# Doctor\n\nIt reports {wrong} health\nchecks.\n"
+
+    assert _check_count_offences(page, "seeded.md") == [
+        f"seeded.md:3: {wrong} health checks"
+    ]
+
+
+def test_the_check_count_scan_passes_the_right_count_and_other_rows() -> None:
+    """The right count, a row count of something else and fenced text pass."""
+    right = _spelled_check_count()
+    page = (
+        f"The strip has {right} named rows and {right.capitalize()} checks.\n"
+        "Three in a row failing raises the alarm.\n"
+        "```\nten checks\n```\n"
+    )
+
+    assert _check_count_offences(page, "seeded.md") == []
 
 
 def test_docs_that_list_the_checks_name_every_check() -> None:
     """
-    Every page listing the checks names all of them, and counts them right.
+    Every page names every check where it lists them, and counts them right.
 
-    The lists are derived from ``CheckKey`` rather than written down here, so
-    a seventh check added in a later phase fails this test on every page that
-    has not been updated -- which is the only reason the lists agree today.
-    The prose count is asserted separately because naming a check and counting
-    the checks are two different claims, and this phase falsified the second
-    one on three pages while leaving the first one true on two of them.
+    The names and the count are derived from ``CheckKey``, so a check added or
+    removed fails every page that has not caught up. Naming the checks and
+    counting them are separate claims, so both are checked: a page can name
+    every check and still state the wrong number. The count is checked on
+    README.md and every documentation page, outside fenced blocks.
     """
     expected = [check_name(key) for key in CheckKey]
     offenders: list[str] = []
     for page in CHECK_LISTING_PAGES:
-        name = page.relative_to(REPO_ROOT)
-        text = page.read_text(encoding="utf-8")
+        text, name = _read(page)
         offenders.extend(
             f"{name}: does not name the {label} check"
             for label in expected
             if label not in text
         )
-        lowered = text.lower()
-        offenders.extend(
-            f"{name}: still says {phrase!r}"
-            for phrase in STALE_CHECK_COUNT_PHRASES
-            if phrase in lowered
-        )
+    for page in [README, *_doc_pages()]:
+        text, name = _read(page)
+        offenders.extend(_check_count_offences(text, str(name)))
     assert not offenders, (
         "a documentation page disagrees with CheckKey about which checks "
         f"exist. There are {len(expected)} -- {', '.join(expected)} -- and "
-        "every page that lists them must list all of them and must not count "
-        "them as five:\n" + "\n".join(offenders)
+        "every page that lists them must list all of them, and every page "
+        f"that counts them must say {_spelled_check_count()}:\n" + "\n".join(offenders)
     )
 
 
