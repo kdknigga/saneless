@@ -1,5 +1,5 @@
 """
-Tests for the Host allow-list.
+Every request is refused unless its Host header names saneless.
 
 A page on any website can rebind its own name to saneless's LAN address.  The
 browser then treats saneless as same-origin with that page, so the page can read
@@ -259,10 +259,8 @@ def test_a_proxy_that_rewrites_host_is_logged_once(
     """
     A trusted Host beside an X-Forwarded-Host naming another host warns once.
 
-    Once within the report interval, that is: two requests in a row log one
-    line between them.
-
-    nginx without ``proxy_set_header Host`` sends its upstream's name, a
+    Two requests in a row, inside one report interval, log one line between
+    them.  nginx without ``proxy_set_header Host`` sends its upstream's name, a
     single label saneless always answers to, and puts the browser's name in
     X-Forwarded-Host.  Every request through it passes the Host check, so the
     check is off for them.  The request is still answered: the header is
@@ -338,7 +336,7 @@ def test_the_proxy_report_is_worded_as_an_observation(
 def test_a_proxy_that_keeps_host_is_not_reported(
     client: TestClient, caplog: pytest.LogCaptureFixture, headers: dict[str, str]
 ) -> None:
-    """Only a forwarded name that differs from Host means the Host was replaced."""
+    """Only a forwarded name that differs from Host is reported as a replaced Host."""
     with caplog.at_level(logging.WARNING, logger=GUARD_LOGGER):
         response = client.get("/health", headers=headers)
     assert response.status_code == 200
