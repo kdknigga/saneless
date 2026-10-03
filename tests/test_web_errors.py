@@ -1236,7 +1236,7 @@ def test_tag_refresh_malformed_tag_is_422(client: TestClient, value: str) -> Non
 def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A full queue is a visible 429 that reloads history (ROBU-02, D-05)."""
+    """A full queue is a visible 429 that reloads history."""
     _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
     response = client.post(
         "/api/scan",
@@ -1255,7 +1255,7 @@ def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
 def test_scan_queue_full_is_429_json(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A non-htmx submit refused by a full queue is JSON with Retry-After (D-04)."""
+    """A non-htmx submit refused by a full queue is JSON with Retry-After."""
     _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
     response = client.post(
         "/api/scan", data={"profile": "default", "title": "Queue Full"}
@@ -1284,7 +1284,7 @@ def test_scan_refused_submit_is_503_with_a_rejected_row(
     rejection: RequestRejection,
     error: str,
 ) -> None:
-    """A submit refused as down or degraded is a 503 with a row (D-05, D-11)."""
+    """A submit refused as down or degraded is a 503 with a row."""
     _refuse_submit(client, monkeypatch, result)
     response = client.post(
         "/api/scan",
@@ -1317,7 +1317,7 @@ def test_scan_unhealthy_worker_is_503_before_submit(
     rejection: RequestRejection,
     error: str,
 ) -> None:
-    """An unhealthy worker refuses the scan without offering it the job (D-11)."""
+    """An unhealthy worker refuses the scan without offering it the job."""
     offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
     _force_health(monkeypatch, health)
     response = client.post(
@@ -1347,7 +1347,7 @@ def test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails(
     error: str,
 ) -> None:
     """
-    A refused-before-row submit cannot strand a PENDING row (WR-01, D-05, D-06).
+    A refused-before-row submit cannot strand a PENDING row.
 
     ``finish_job`` failing is the store failing between two statements.  If the
     refusal were recorded as create-then-finish, the create would already have
@@ -1383,10 +1383,10 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    A rejection the store cannot record still renders, without a loader (D-05).
+    A rejection the store cannot record still renders, without a loader.
 
     The refused-before-row path records the rejection in one statement, so when
-    that statement fails no row exists at all -- never a PENDING row (WR-01).
+    that statement fails no row exists at all -- never a PENDING row.
     """
     offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
     _force_health(monkeypatch, WorkerHealth.DEGRADED)
@@ -1464,18 +1464,17 @@ def test_a_refused_submit_whose_rejection_write_fails_is_recorded_by_the_worker(
     error: str,
 ) -> None:
     """
-    A post-submit rejection the request could not write still lands (WR-01).
+    A post-submit rejection the request could not write still lands.
 
     The row has to exist before ``submit()``, or the worker could dequeue an id
-    with no row (D-05), so a refusal from ``submit()`` needs a second write.
-    When that write fails the row is PENDING with no REJECTED marker (D-06):
-    the status area shows it and the Scan button stays disabled.  The request
-    owes the write to the worker, whose next idle tick records it, so the row
-    reaches ERROR/REJECTED and the button re-enables with no restart.
+    with no row, so a refusal from ``submit()`` needs a second write.  When
+    that write fails, the request owes it to the worker, whose next idle tick
+    records it: the row reaches ERROR/REJECTED and the Scan button re-enables
+    with no restart.
 
     Only ``submit`` is patched, so the ``down`` case keeps a live worker thread
     and proves the owe path.  A truly dead thread never ticks; the next
-    startup's recovery ends that row instead (26-09).
+    startup's recovery ends that row instead.
     """
     _refuse_submit(fast_tick_client, monkeypatch, result)
     store = _job_store(fast_tick_client)
@@ -1524,15 +1523,14 @@ def test_a_refused_attempt_whose_rejection_is_still_owed_is_not_shown_as_the_liv
     error: str,
 ) -> None:
     """
-    A refused attempt waiting on the worker never renders as the live job (IN-08).
+    A refused attempt waiting on the worker never renders as the live job.
 
     When the request cannot write a refused submit's REJECTED marker it owes
-    the write to the worker (WR-01), and until an idle tick lands it the row is
-    PENDING with no marker.  D-06 says a rejected submit must not take over the
-    status area, so the status lookup skips owed rejections just as it skips
-    written ones, while D-17 still reports a job that actually ran.  The
-    ``client`` fixture's 5 s idle tick keeps the worker from writing the row
-    inside this test, and ``finish_job`` never heals anyway.
+    the write to the worker, and until an idle tick lands it the row is
+    PENDING with no marker.  A rejected submit never takes over the status
+    area, so the status lookup skips owed rejections just as it skips written
+    ones.  The ``client`` fixture's 5 s idle tick keeps the worker from
+    writing the row inside this test, and ``finish_job`` never heals anyway.
     """
     _refuse_submit(client, monkeypatch, result)
     store = _job_store(client)
@@ -1812,7 +1810,7 @@ class TestStatusPollBacksOff:
         assert f"attempt={next_attempt}" in url
 
 
-# --- The placeholder-token refusal (APPL-07, D-14, D-15) ---------------------
+# --- The placeholder-token refusal -------------------------------------------
 
 # The shipped stand-in: docker-compose.yml and the docker reference both carry
 # it, so it is the placeholder a real installation is most likely to be left
@@ -1828,13 +1826,13 @@ _REFUSED_CREDENTIALS = ["", "   ", _SHIPPED_PLACEHOLDER]
 _REFUSED_CREDENTIAL_IDS = ["blank", "whitespace", "shipped_literal"]
 
 # A credential the predicate accepts.  Deliberately not a real-looking 40-char
-# hex string: the predicate is a fixed literal set, never a shape heuristic
-# (D-14), so anything outside the set is a real token as far as it is concerned.
+# hex string: the predicate is a fixed literal set, never a shape heuristic, so
+# anything outside the set is a real token as far as it is concerned.
 _ACCEPTED_CREDENTIAL = "a-token-nobody-shipped"
 
-# The phrase WORKER_DEGRADED puts on a job row.  D-15 forbids reusing that
-# member here -- "the scan service was unavailable" is untrue when the service
-# is fine and nobody set the token -- so this path asserts it absent.
+# The phrase WORKER_DEGRADED puts on a job row.  This refusal never reuses that
+# member -- "the scan service was unavailable" is untrue when the service is
+# fine and nobody set the token -- so this path asserts it absent.
 _DEGRADED_PHRASE = "the scan service was unavailable"
 
 
@@ -1884,14 +1882,13 @@ def _appliance_with_credential(
 
 class TestPlaceholderTokenRefusal:
     """
-    ``POST /api/scan`` refuses a scan that could never upload (APPL-07, D-15).
+    ``POST /api/scan`` refuses a scan that could never upload.
 
     The one failure certain to waste paper is a paperless-ngx token nobody
     set: the pages are pulled through the scanner and then have nowhere to go.
-    D-15 splits the response deliberately -- the route guard is the
-    enforcement, the disabled button is only a courtesy -- so every test here
-    drives the route directly, with no button in sight, and one of them sends
-    no htmx header at all.
+    The route guard is the enforcement and the disabled button only a
+    courtesy, so every test here drives the route directly, with no button in
+    sight, and one of them sends no htmx header at all.
     """
 
     @pytest.mark.parametrize(
@@ -1929,7 +1926,7 @@ class TestPlaceholderTokenRefusal:
         web_scanner: StubScannerBackend,
         credential: str,
     ) -> None:
-        """The refused attempt is recorded, not silently dropped (D-05)."""
+        """The refused attempt is recorded, not silently dropped."""
         with _appliance_with_credential(
             web_settings, web_scanner, credential
         ) as client:
@@ -1944,7 +1941,7 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
-        The attempt is visible in Job History end to end (Phase 26 D-05).
+        The attempt is visible in Job History end to end.
 
         Asserted through the history route rather than the store alone,
         because "history shows the attempt" is a claim about the page a
@@ -2003,8 +2000,8 @@ class TestPlaceholderTokenRefusal:
         The refusal is unconditional, not contingent on the upload route.
 
         A configured consume directory is the one thing that could look like a
-        reason to let the scan run anyway.  D-15 does not carve that exception:
-        the predicate is the whole condition.
+        reason to let the scan run anyway.  It buys no exception: the
+        predicate is the whole condition.
         """
         with _appliance_with_credential(
             web_settings,
@@ -2024,11 +2021,11 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
-        WORKER_DEGRADED is not reused for this refusal (D-15, T-30-67).
+        The unset-token refusal never reuses WORKER_DEGRADED's wording.
 
         Saying the scan service was unavailable when the service is fine and
         nobody set the token would send a household member looking for a broken
-        server.  That untruth is what this milestone removes.
+        server.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER
@@ -2054,7 +2051,7 @@ class TestPlaceholderTokenRefusal:
         curl, a script, and a browser with ``disabled`` stripped are all refused.
 
         This request carries no htmx header and never touched a button, so it
-        stands in for every client the courtesy cannot reach (T-30-64).
+        stands in for every client the courtesy cannot reach.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER
@@ -2069,7 +2066,7 @@ class TestPlaceholderTokenRefusal:
         self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
-        A refused submit owns no job, so it is handed no owner token (D-23).
+        A refused submit owns no job, so it is handed no owner token.
 
         The guard sits ahead of the mint, which is what keeps a browser that
         never started anything from collecting an owner cookie.
@@ -2241,7 +2238,7 @@ def test_status_message_slot_is_one_empty_alert_above_the_status_area(
     client: TestClient,
 ) -> None:
     """
-    The page has one empty alert slot, just above #status-area (D-03).
+    The page has one empty alert slot, just above #status-area.
 
     It is a sibling of the polled status area, so the 1 s outerHTML poll never
     replaces it, and it sits outside the form.
@@ -2260,7 +2257,7 @@ def test_htmx_config_restates_all_three_response_handling_entries(
     client: TestClient,
 ) -> None:
     """
-    The htmx-config meta swaps error bodies without breaking 2xx swaps (D-01).
+    The htmx-config meta swaps error bodies without breaking 2xx swaps.
 
     htmx 2.0.10 merges meta config shallowly, so a meta holding only the
     ``[45]..`` entry would replace the whole array and stop every 2xx swap.
@@ -2279,7 +2276,7 @@ def test_htmx_config_restates_all_three_response_handling_entries(
 
 
 def test_htmx_config_meta_sits_between_color_scheme_and_title() -> None:
-    """The meta follows the color-scheme meta and precedes <title> (UI-SPEC S1)."""
+    """The htmx-config meta follows the color-scheme meta and precedes <title>."""
     tags = template_start_tags(WEB_DIR / "templates" / "base.html")
     order = [
         attributes.get("name") if tag == "meta" else tag
@@ -2291,7 +2288,7 @@ def test_htmx_config_meta_sits_between_color_scheme_and_title() -> None:
 
 
 def test_status_message_children_are_inset_like_the_status_area() -> None:
-    """The slot's message and disclosure line up with the status area (D-03)."""
+    """The slot's message and disclosure line up with the status area."""
     rules = _css_rules((WEB_DIR / "static" / "app.css").read_text(encoding="utf-8"))
     assert [selector for selector, body in rules if "!important" in body] == []
     bodies = [body for selector, body in rules if selector == _INSET_SELECTOR]
