@@ -1236,13 +1236,13 @@ class JobStore:
         Nothing ever passed ``thumbnail`` to this method -- verified by grep
         across ``src/`` and ``tests/`` before it was removed -- because
         :meth:`update_thumbnail` is the live writer, called by the worker once
-        a scan has produced an image (``worker.py:1288``).  Spending the freed
-        slot rather than adding a sixth parameter is deliberate: ruff's
-        ``PLR0913`` ceiling is five non-``self`` parameters and it counts
-        keyword-only ones too, so a sixth would need either a suppression,
-        which this project does not write, or a frozen-dataclass bundle in the
-        shape of :class:`JobResult`.  Neither is warranted to make room for a
-        parameter that replaces a dead one.
+        a scan has produced an image (from the thumbnail callback in
+        ``ScanWorker._scan_job``).  Spending the freed slot rather than adding
+        a sixth parameter is deliberate: ruff's ``PLR0913`` ceiling is five
+        non-``self`` parameters and it counts keyword-only ones too, so a sixth
+        would need either a suppression, which this project does not write, or
+        a frozen-dataclass bundle in the shape of :class:`JobResult`.  Neither
+        is warranted to make room for a parameter that replaces a dead one.
 
         Args:
             profile: Scan profile name.
@@ -1271,8 +1271,9 @@ class JobStore:
                     correspondent,
                     # thumbnail -- never a submission field.  update_thumbnail
                     # writes it once the worker has an image to write
-                    # (worker.py:1288), which is why the parameter that used to
-                    # sit in this position could be spent on owner_token.
+                    # (the thumbnail callback in ScanWorker._scan_job), which is
+                    # why the parameter that used to sit in this position could
+                    # be spent on owner_token.
                     None,
                     datetime.now(tz=UTC).isoformat(),
                     # A new job has recorded nothing yet, so every result

@@ -1772,7 +1772,7 @@ _TERMINAL_CASES = [
     pytest.param(JobState.ERROR, _DEFAULT_ERROR_CATEGORY, None, id="error"),
     pytest.param(JobState.CANCELLED, None, None, id="cancelled"),
     pytest.param(JobState.ERROR, ErrorCategory.REJECTED, None, id="rejected"),
-    pytest.param(JobState.DONE, None, None, id="pre-phase-23"),
+    pytest.param(JobState.DONE, None, None, id="older-done-row-without-counts"),
 ]
 
 # The two branches that record counts, so the parametrised expectation is one

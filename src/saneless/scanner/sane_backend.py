@@ -1017,13 +1017,14 @@ def _set_geometry(
     Constrain the scan area to a paper size, if the device really can.
 
     **The presence check is what makes the crop fallback reachable, and an
-    exception handler is not a substitute for it.**  ``SaneDev.__setattr__``
-    stores an unrecognised option name straight into ``__dict__`` and returns --
-    no device call, no validation, no raise (``sane.py:188``).  So on a scanner
-    with no scan-area options, ``dev.br_y = 297.0`` *succeeds*, this function
-    used to return True, and ``_maybe_crop`` never ran: ``paper_size`` was
-    silently ignored and the user got a full-bed scan.  Asking the
-    device's own option list first is the only way to tell the two cases apart.
+    exception handler is not a substitute for it.**  python-sane's
+    ``sane.SaneDev.__setattr__`` stores an unrecognised option name straight
+    into ``__dict__`` and returns -- no device call, no validation, no raise.
+    So on a scanner with no scan-area options, ``dev.br_y = 297.0``
+    *succeeds*, this function used to return True, and ``_maybe_crop`` never
+    ran: ``paper_size`` was silently ignored and the user got a full-bed scan.
+    Asking the device's own option list first is the only way to tell the two
+    cases apart.
 
     Args:
         dev: Open SANE device handle.
@@ -3120,13 +3121,13 @@ def _configure_device(
     """
     Assign the scan options to the open device, source first.
 
-    **Order is load-bearing.**  ``sane.py:188-213`` reloads every option
-    descriptor when a ``set_option`` reports ``INFO_RELOAD_OPTIONS``, and a
-    source change does exactly that.  Setting the source last therefore lets a
-    resolution validated against the platen's constraint be stranded under a
-    feeder's narrower one.  Asking the device what it is scanning *from* before
-    telling it *how* removes that whole class of failure.  The paper size is
-    applied afterwards, by ``_apply_paper_size`` in the caller.
+    **Order is load-bearing.**  ``sane.SaneDev.__setattr__`` reloads every
+    option descriptor when a ``set_option`` reports ``INFO_RELOAD_OPTIONS``,
+    and a source change does exactly that.  Setting the source last therefore
+    lets a resolution validated against the platen's constraint be stranded
+    under a feeder's narrower one.  Asking the device what it is scanning
+    *from* before telling it *how* removes that whole class of failure.  The
+    paper size is applied afterwards, by ``_apply_paper_size`` in the caller.
 
     The order is source, adf-mode, mode, depth, resolution. The option list
     is read again after the source and again after the mode, because both
@@ -3453,10 +3454,10 @@ def _snap_flatbed(
     the sink the same way however it was acquired.
 
     The one message python-sane's own ADF iterator treats as the end of the
-    feed (``sane.py:130``) is mapped to ``FeederEmptyError`` by the same exact
-    string test, so a device routed here while reporting an empty feeder still
-    tells the operator to load paper.  Every other failure --
-    ``_sane.error`` from ``start()``, ``RuntimeError("Scanner returned no
+    feed (``sane._SaneIterator.__next__``) is mapped to ``FeederEmptyError`` by
+    the same exact string test, so a device routed here while reporting an
+    empty feeder still tells the operator to load paper.  Every other failure
+    -- ``_sane.error`` from ``start()``, ``RuntimeError("Scanner returned no
     data")`` from ``snap()`` -- is a ``ScanError`` naming the device.
 
     Args:
@@ -3531,8 +3532,8 @@ class SaneDevice(Protocol):
 
     mode: str
     # The device returns a float -- measured, not assumed: 300 reads back as
-    # 300.0 and 5000 as 1200.0.  This was declared ``int`` for three phases,
-    # which made every read-back a quiet lie to the type checker.
+    # 300.0 and 5000 as 1200.0.  Declaring it ``int`` would make every
+    # read-back a quiet lie to the type checker.
     resolution: float
     source: str
     tl_x: float

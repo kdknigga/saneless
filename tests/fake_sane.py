@@ -148,12 +148,14 @@ _CAP_SETTABLE = _CAP_SOFT_SELECT | _CAP_SOFT_DETECT
 _CAP_NOT_SETTABLE = _CAP_SOFT_DETECT
 _CAP_INACTIVE_OPTION = _CAP_INACTIVE | _CAP_SETTABLE
 
-# sane.py:190 -- assigning any of these raises, whatever the option table says.
+# Following SaneDev.__setattr__, assigning any of these raises, whatever the
+# option table says.
 _READ_ONLY_ATTRIBUTES = frozenset(
     {"dev", "optlist", "area", "sane_signature", "scanner_model"}
 )
 
-# sane.py:130 -- the single message the ADF iterator converts to StopIteration.
+# The single message _SaneIterator.__next__, the ADF iterator, converts to
+# StopIteration.
 _FEEDER_EMPTY_MESSAGE = "Document feeder out of documents"
 
 # SANE_Fixed is a 16.16 fixed-point integer, so a TYPE_FIXED option can only
@@ -1184,7 +1186,7 @@ class FakeSaneDev:
 
     def __setattr__(self, key: str, value: object) -> None:
         """
-        Store or validate an assignment, following ``sane.py:188-213``.
+        Store or validate an assignment, following ``SaneDev.__setattr__``.
 
         Args:
             key: The attribute or option name.
@@ -1226,7 +1228,7 @@ class FakeSaneDev:
         Arm a narrower resolution range that selecting a given source reveals.
 
         Real feeders commonly cap resolution below the platen's ceiling, and a
-        source change reloads every option descriptor (``sane.py:188-213``).
+        source change reloads every option descriptor (``SaneDev.__setattr__``).
 
         This is a method rather than a constructor keyword because ``__init__``
         already carries ruff's maximum of five arguments (``PLR0913``) and this
@@ -1558,7 +1560,7 @@ class FakeSaneDev:
         Make ``depth`` inactive while one of ``modes`` is selected.
 
         Modelled on epson2, which switches ``depth`` off for its 1-bit modes.
-        A mode change reloads every option descriptor (``sane.py:188-213``),
+        A mode change reloads every option descriptor (``SaneDev.__setattr__``),
         so after ``mode = "Lineart"`` the device refuses a ``depth``
         assignment as inactive even though a list read before the mode was
         set reported it active.  Each ``mode`` assignment makes ``depth``
@@ -1848,7 +1850,7 @@ class FakeSaneDev:
 
     def __getattr__(self, key: str) -> object:
         """
-        Read an option value, following ``sane.py:215-236``.
+        Read an option value, following ``SaneDev.__getattr__``.
 
         Args:
             key: The option name.
@@ -1877,8 +1879,8 @@ class FakeSaneDev:
         """
         The scan area, reflecting whatever clamping the device applied.
 
-        Composed from attribute reads, exactly as ``sane.py:220`` does, so a
-        device whose option table omits the geometry options raises
+        Composed from attribute reads, exactly as ``SaneDev.__getattr__`` does,
+        so a device whose option table omits the geometry options raises
         ``AttributeError("No such attribute: tl_x")``.  Reading ``_values``
         directly would raise ``KeyError`` instead -- an exception the real
         library never raises here, and precisely the species of quiet
@@ -2177,7 +2179,7 @@ class FakeSaneHandle:
 
     def __setattr__(self, key: str, value: object) -> None:
         """
-        Assign an option through the device, following ``sane.py:188-213``.
+        Assign an option through the device, following ``SaneDev.__setattr__``.
 
         Args:
             key: The attribute or option name.
@@ -2230,7 +2232,7 @@ class FakeSaneHandle:
 
     @property
     def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
-        """The scan area, composed from option reads as ``sane.py:220`` does."""
+        """The scan area, composed from option reads as python-sane composes it."""
         return (
             (self.tl_x, self.tl_y),
             (self.br_x, self.br_y),

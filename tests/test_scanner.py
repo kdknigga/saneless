@@ -1936,7 +1936,8 @@ _MEASURED_SANE_FAULTS = [
     "Device busy",
 ]
 
-# The one message python-sane converts to StopIteration (sane.py:130).
+# The one message python-sane converts to StopIteration
+# (in _SaneIterator.__next__).
 _OUT_OF_DOCUMENTS = "Document feeder out of documents"
 
 
@@ -4451,10 +4452,10 @@ def _geometry_less_device(pages: int = 1) -> FakeSaneDev:
     """
     Build a device whose option list does not mention the geometry options.
 
-    The real ``SaneDev.__setattr__`` *stores* an unknown name
-    (``sane.py:188``), so such a device accepts ``dev.br_y`` without complaint
-    -- which is exactly why the presence check, and not an exception, is what
-    makes the crop fallback reachable.
+    The real ``SaneDev.__setattr__`` *stores* an unknown name, so such a
+    device accepts ``dev.br_y`` without complaint -- which is exactly why the
+    presence check, and not an exception, is what makes the crop fallback
+    reachable.
 
     Args:
         pages: How many sheets the feeder holds.
@@ -4600,10 +4601,11 @@ class TestFakeDeviceAreaMatchesTheLibrary:
     """
     The fake's ``area`` raises what python-sane raises on a geometry-less device.
 
-    The real library composes ``area`` from attribute reads (``sane.py:220``)
-    and raises ``AttributeError("No such attribute: tl_x")`` when the option
-    table omits the geometry options.  ``_set_geometry`` checks presence first,
-    but the fake must not diverge from the library it stands in for.
+    The real library composes ``area`` from attribute reads
+    (``SaneDev.__getattr__``) and raises ``AttributeError("No such attribute:
+    tl_x")`` when the option table omits the geometry options.
+    ``_set_geometry`` checks presence first, but the fake must not diverge
+    from the library it stands in for.
     """
 
     def test_a_geometry_less_device_raises_attribute_error(self) -> None:
@@ -4630,10 +4632,9 @@ class TestGeometryPresenceCheck:
     Geometry is written only on a device that reports the options.
 
     The real ``SaneDev.__setattr__`` stores an unrecognised option name in
-    ``__dict__`` and returns -- no device call, no validation, no raise
-    (``sane.py:188``).  So assigning ``dev.br_y`` on a device that has no
-    geometry options *succeeds*, and only the presence check lets the Pillow
-    crop fallback run.
+    ``__dict__`` and returns -- no device call, no validation, no raise.  So
+    assigning ``dev.br_y`` on a device that has no geometry options
+    *succeeds*, and only the presence check lets the Pillow crop fallback run.
 
     Every test here drives a fake that stores silently, as the real library
     does, so each one fails if the presence check is removed.

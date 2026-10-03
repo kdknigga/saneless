@@ -664,8 +664,8 @@ class ConnectionStatus(StrEnum):
 
     The values are lowercase snake_case and so break this module's otherwise
     uniform value-equals-name convention.  That is deliberate, not an
-    oversight: ``web/routes.py:128`` serialises the value straight into the
-    JSON body of ``GET /api/paperless/test`` and
+    oversight: ``web.routes.paperless_test`` serialises the value straight into
+    the JSON body of ``GET /api/paperless/test`` and
     ``docs/reference/web-api.md:54-56`` documents the exact spelling of
     ``connected``, ``token_rejected`` and ``unreachable``.  Those three strings
     are a public wire contract and have to stay byte-identical; renaming them to

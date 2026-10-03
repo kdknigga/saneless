@@ -1442,8 +1442,8 @@ def _warn_stale_config(settings: Settings) -> None:
     the same terminal the operator is watching.  A one-shot command writes its
     log to ``log_file`` and is read afterwards if at all, so the person who
     just ran ``saneless scan`` and got the defaults, or the other file's
-    settings, sees nothing at all -- which is the failure this phase exists to
-    remove, in miniature.
+    settings, sees nothing at all -- the silent misconfiguration this warning
+    exists to prevent, in miniature.
 
     The words are not written here.  ``configuration_check`` holds the one
     copy of them, and the terminal spelling is the same sentence with the file
@@ -3230,7 +3230,9 @@ def doctor(ctx: click.Context) -> None:
     _echo_config_resolution(settings)
 
     # Any failing check exits 2, and no new ExitCode member expresses it. Three
-    # reasons, in order: tests/test_deployment_config.py:393,403 assert the
+    # reasons, in order: the deployment-config tests
+    # test_cli_reference_global_exit_code_table_matches_exit_code_enum and
+    # test_troubleshooting_page_is_linked_and_covers_every_exit_code assert the
     # documented global tables equal every member, so a sixth code is a
     # documentation change in three files and a revision of the exit-code table;
     # 2 already means "can't start, fix your setup", which is what every red

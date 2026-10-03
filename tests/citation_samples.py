@@ -17,17 +17,22 @@ import re
 # requirement IDs, threat IDs, phase and plan numbers, numbered research
 # pitfalls and the planning file names. The architecture, enumeration and
 # multi-page requirement IDs are covered too, because their prefixes appear in
-# no other identifier shape above. The no-planning-citations hook in
-# .pre-commit-config.yaml carries the same pattern, and a test in
-# tests/test_deployment_config.py keeps the two identical.
+# no other identifier shape above. It also rejects a source file named with a
+# line number after a colon, the name of the assistant instructions file, and
+# a phase referred to without its number: line numbers drift, and the other
+# two cannot be looked up by a reader of the shipped tree either. The
+# no-planning-citations hook in .pre-commit-config.yaml carries the same
+# pattern, and a test in tests/test_deployment_config.py keeps the two
+# identical.
 PLANNING_CITATION = re.compile(
     r"\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
     r"API|APPL|ARCH|CFG|CTR|DARK|DLVR|DOCS|DPLX|ENUM|EXC|HARD|MPG|OUTC|ROBU|"
     r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\bT-[0-9]+-[0-9]+\b|"
-    r"\b[Pp]hase [0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
+    r"\b[Pp]hase[ -][0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
     r"\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|"
     r"SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|"
-    r"[Pp]er user decision|\.planning/"
+    r"[Pp]er user decision|\.planning/|\.py:[0-9]+|CLAUDE\.md|"
+    r"\b([Tt]his|[Tt]hat|[Tt]hree|[Ee]arlier) phases?\b"
 )
 
 # Text the pattern must match: one of each identifier family a reader is

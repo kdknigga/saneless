@@ -2411,8 +2411,9 @@ def _scanner_busy() -> CheckResult:
     one known contender, and it is not hypothetical --
     ``ScanWorker._read_generated_profiles`` takes the gate around
     ``get_devices`` and ``get_capabilities`` as the worker thread's first
-    act at startup (``worker.py:947``), while ``_current_job_id`` is still
-    ``None`` (it is set at ``worker.py:1394``).  The lifespan starts the worker
+    act at startup (``ScanWorker._run`` calls ``_generate_startup_profiles``
+    before it takes its first job), while ``_current_job_id`` is still ``None``
+    (``ScanWorker._process_job`` sets it).  The lifespan starts the worker
     and then the refresher, so that window coincides exactly with the
     cold-start poll -- which is how ``_scanner_skipped``'s sentence came to sit
     beside a last-checked time on an appliance that had never scanned.
