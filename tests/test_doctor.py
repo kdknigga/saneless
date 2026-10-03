@@ -333,7 +333,7 @@ def _make_settings(
     tmp_path: Path,
     token: str = _NOT_A_PLACEHOLDER,
     consume_dir: str = "",
-    url: str = "http://localhost:8000",
+    url: str = "http://paperless.invalid",
 ) -> Settings:
     """
     Build settings whose directories exist and are writable.

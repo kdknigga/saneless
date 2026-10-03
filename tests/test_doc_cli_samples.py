@@ -94,6 +94,7 @@ TAB_LINE = re.compile(r'^=== "(?P<label>[^"]+)"\s*$')
 PROFILES_IN = re.compile(r"^\s*Profiles in (?P<path>\S+):$", re.MULTILINE)
 # Where one sentence ends and the next begins, for the glass-wording check.
 SENTENCE_END = re.compile(r"(?<=[.;])\s+")
+GLASS_WORD = re.compile(r"\bglass\b", re.IGNORECASE)
 PROFILE_OPTION = re.compile(r"--profile(?:=|\s+)(?P<name>\S+)")
 
 
@@ -544,7 +545,7 @@ def test_tutorial_scans_from_the_glass_with_a_glass_profile(
     sentences = [
         (sentence, _named_profiles(sentence, settings))
         for sentence in SENTENCE_END.split(text)
-        if "glass" in sentence
+        if GLASS_WORD.search(sentence)
     ]
     naming = [(sentence, names) for sentence, names in sentences if names]
     assert naming, f"no sentence names {sorted(glass)} as the glass profile"
