@@ -1,22 +1,15 @@
 """
 A real ``saneless serve``, stopped with SIGTERM: exit 0, within the stop budget.
 
-A supervisor stops the web server with SIGTERM: ``docker stop``, systemd, a
-shell's ``kill``.  A running server asked to stop is a normal stop, so it
-exits 0, whether or not it is PID 1, and it must be gone well inside Docker's
-default 10 s grace period when no scan is running, even with a scanner
-listing in flight on the status strip's background thread.
+A supervisor's SIGTERM is a normal stop: the server exits 0, PID 1 or not,
+well inside Docker's 10 s grace period when no scan is running, even with a
+scanner listing in flight on the status strip's background thread.
 
-Only a real process shows either: the exit code is what the interpreter ends
-with after uvicorn has handed the signal back, and the stop time includes
-every thread the interpreter waits for at exit.  So each test here starts the
-real ``saneless`` entry point in a child process, in its own session, on an
-OS-chosen loopback port, with only the scanner, the SANE library check and
-paperless-ngx replaced, and talks to it over HTTP.
-
-Every wait has a deadline.  A child still running at its bound is killed with
-its whole session and the test failed naming the hang, and the fixture kills
-whatever a failed test left running, the scanner listing child included.
+Only a real process shows the exit code and every thread the interpreter
+waits for, so each test starts the real ``saneless`` entry point in a child
+process and session, on an OS-chosen loopback port, with only the scanner,
+the SANE library check and paperless-ngx replaced.  Every wait has a
+deadline; a child still running at its bound is killed with its session.
 """
 
 from __future__ import annotations
@@ -396,8 +389,8 @@ def _exit_within(run: _Served, seconds: float) -> tuple[int, float]:
     Wait at most ``seconds`` for the child to exit, reading its stderr.
 
     A child still running at the bound is killed, with its whole session, and
-    the test fails naming the hang, so a regression costs the bound rather
-    than the suite.
+    the test fails naming the hang, so a hang costs the bound rather than
+    the suite.
 
     Args:
         run: The child.
