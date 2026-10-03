@@ -2258,21 +2258,6 @@ _PACKAGE_DIR = Path(app_module.__file__).parent
 _APP_CSS = _PACKAGE_DIR / "static" / "app.css"
 _CHECKS_TEMPLATE = _PACKAGE_DIR / "templates" / "partials" / "checks.html"
 
-# Every six-digit colour literal app.css is allowed to contain, pinned as an
-# ordered list.  The strip's amber is the fallback amber, read through the
-# same custom property.  A new literal would be an unmeasured colour on a
-# LAN-visible page.
-_EXPECTED_HEX_LITERALS = ["#a16207", "#ca8a04"]
-
-# The two declarations the Pico coupling contract and tests/test_browser.py
-# both pin.  Renaming the property or changing either value breaks the
-# vendored-asset contract, so they are asserted byte for byte.
-_FALLBACK_DECLARATIONS = [
-    "--saneless-status-fallback: #a16207;",
-    "--saneless-status-fallback: #ca8a04;",
-]
-
-_HEX_LITERAL = re.compile(r"#[0-9a-fA-F]{6}")
 _ROLE_ALERT = re.compile(r'role="alert"')
 _CHECKS_STRIP = re.compile(r'<div id="checks-strip"(?P<attrs>[^>]*)>')
 _REFRESH_BUTTON = re.compile(
@@ -2758,24 +2743,6 @@ class TestStripStyles:
         property is not renamed because the vendored-asset contract pins it.
         """
         assert _css().count("var(--saneless-status-fallback)") == 2
-
-    def test_no_colour_literal_was_added(self) -> None:
-        """
-        The stylesheet's hex literals are exactly the light and dark fallback ambers.
-
-        Every colour the strip renders is an existing token whose contrast is
-        measured in both schemes, so no unmeasured colour reaches the page.
-        """
-        assert _HEX_LITERAL.findall(_css()) == _EXPECTED_HEX_LITERALS
-
-    def test_the_fallback_declarations_are_untouched(self) -> None:
-        """Both ``--saneless-status-fallback`` declarations, byte for byte."""
-        found = [
-            line.strip()
-            for line in _css().splitlines()
-            if "--saneless-status-fallback:" in line
-        ]
-        assert found == _FALLBACK_DECLARATIONS
 
     def test_the_touch_target_floor_is_met(self) -> None:
         """

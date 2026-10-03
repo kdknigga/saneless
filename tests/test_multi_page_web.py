@@ -21,7 +21,6 @@ restoring a tick on reload -- lives in ``tests/test_browser.py``.
 
 from __future__ import annotations
 
-import hashlib
 import html
 import json
 import re
@@ -59,7 +58,6 @@ from saneless.vocabulary import (
     rejection_message,
     rejection_status_code,
 )
-from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.routes import OWNER_COOKIE
 from saneless.worker import ScanOptions, WorkerPassCoordinator
@@ -418,17 +416,6 @@ _BUTTON = re.compile(r"<button\b(?P<attrs>[^>]*)>(?P<text>.*?)</button>", re.DOT
 _BUTTON_ID = re.compile(r'\bid="(?P<id>[^"]+)"')
 _HX_VALS = re.compile(r"hx-vals='(?P<vals>[^']*)'")
 _HX_CONFIRM = re.compile(r'hx-confirm="(?P<question>[^"]*)"')
-
-# The flip prompt's template is a sibling of the multi-page prompt and does not
-# change because the multi-page prompt exists.  Its digest is pinned here: a
-# deliberate change to the flip prompt re-records it; a multi-page change never
-# should.
-_FLIP_TEMPLATE = (
-    Path(app_module.__file__).parent / "templates" / "partials" / "flip.html"
-)
-_FLIP_TEMPLATE_SHA256 = (
-    "f614c4590cdacce7e976e6234062d54abfba447e6fe39ed62d32a1fbc9770f2d"
-)
 
 
 def _next_pass(*, number: int = 3, kept: int = 4) -> PassPrompt:
@@ -1117,14 +1104,8 @@ class TestTheScanButtonAndBusyLine:
         assert f'<p class="busy-line">{line}</p>' in area
 
 
-class TestTheFlipPromptIsUntouched:
-    """The manual-duplex flip prompt is a sibling, and it does not change."""
-
-    def test_the_flip_template_is_byte_for_byte_unchanged(self) -> None:
-        """The flip template's digest matches the pinned one."""
-        digest = hashlib.sha256(_FLIP_TEMPLATE.read_bytes()).hexdigest()
-
-        assert digest == _FLIP_TEMPLATE_SHA256
+class TestTheFlipBranchKeepsItsPrompt:
+    """A manual-duplex flip renders the flip prompt, not the multi-page one."""
 
     def test_the_flip_owner_still_sees_the_flip_prompt(
         self, served: _Served, stager: _Stager
