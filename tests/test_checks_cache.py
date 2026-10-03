@@ -11,8 +11,6 @@ from __future__ import annotations
 import threading
 from datetime import UTC, datetime
 
-import pytest
-
 from saneless.checks import CheckKey, CheckResult, CheckState
 from saneless.web.checks_cache import CheckCache
 
@@ -49,7 +47,6 @@ def test_cold_cache_has_no_results() -> None:
     entry = cache.current()
     assert entry.results is None
     assert entry.checked_at is None
-    assert entry.age_seconds is None
 
 
 def test_cold_cache_is_not_fresh() -> None:
@@ -82,17 +79,6 @@ def test_expired_entry_returns_the_same_results_marked_stale() -> None:
     assert entry.results == stored
     assert entry.stale is True
     assert cache.is_fresh() is False
-
-
-def test_expired_entry_reports_its_age() -> None:
-    """A stale entry carries how old it is, which is what the strip renders."""
-    clock = _FakeClock(start=100.0)
-    cache = CheckCache(clock=clock)
-    cache.store(_results())
-    clock.advance(30.1)
-    entry = cache.current()
-    assert entry.age_seconds is not None
-    assert entry.age_seconds == pytest.approx(30.1)
 
 
 def test_stale_entry_is_never_discarded() -> None:

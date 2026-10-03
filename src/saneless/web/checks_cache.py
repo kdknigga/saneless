@@ -23,7 +23,7 @@ __all__ = ["MIN_MANUAL_REFRESH_SECONDS", "CachedChecks", "CheckCache"]
 @dataclass(frozen=True, slots=True)
 class CachedChecks:
     """
-    What the cache hands a renderer: the results, when they were taken, and how old.
+    What the cache hands a renderer: the results, when they were taken, and whether stale.
 
     Frozen for the same reason :class:`~saneless.checks.CheckResult` is frozen.
     This is a snapshot of probes that have already happened, and the results it
@@ -42,14 +42,12 @@ class CachedChecks:
         checked_at: The aware wall-clock time of that store, or None.
         stale: True when results exist and are older than the TTL.  False at
             cold start: with nothing stored there is nothing to be stale.
-        age_seconds: How long ago the results were stored, or None.
 
     """
 
     results: tuple[CheckResult, ...] | None
     checked_at: datetime | None
     stale: bool
-    age_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +86,7 @@ class CheckCache:
        cached value is immutable all the way down and a renderer cannot mutate
        what the next renderer will read.
 
-    There is one entry rather than a keyed store: the six checks are run and
+    There is one entry rather than a keyed store: every check is run and
     shown together, so there is nothing to key on.
 
     Args:
@@ -102,8 +100,8 @@ class CheckCache:
         # 30 seconds is long enough that a reload and a few htmx swaps
         # never re-probe the network, and short enough that unplugging the
         # scanner surfaces before the operator gives up; the Refresh button
-        # covers impatience.  A default rather than a module constant, so it is
-        # read at call time and a caller or a test can shorten it.
+        # covers impatience.  The default is bound when the class is defined;
+        # a caller or a test that wants another ttl passes it.
         ttl: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -149,15 +147,12 @@ class CheckCache:
         with self._lock:
             entry = self._entry
         if entry is None:
-            return CachedChecks(
-                results=None, checked_at=None, stale=False, age_seconds=None
-            )
+            return CachedChecks(results=None, checked_at=None, stale=False)
         age = self._clock() - entry.stamp
         return CachedChecks(
             results=entry.results,
             checked_at=entry.checked_at,
             stale=age >= self._ttl,
-            age_seconds=age,
         )
 
     def store(self, results: Sequence[CheckResult]) -> None:
