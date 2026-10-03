@@ -1,4 +1,9 @@
-"""Tests for paperless-ngx REST client."""
+"""
+The paperless-ngx client delivers, polls and fetches without leaking a secret.
+
+Every failure it meets ends as a one-line ``PaperlessError`` that never quotes
+the token or URL credentials, and a send that may have arrived is never resent.
+"""
 
 from __future__ import annotations
 
@@ -101,8 +106,8 @@ def _v10_payload(status: str, message: str | None) -> object:
     """
     Build an API v10 ``/api/tasks/`` body: paginated, lowercase status.
 
-    The failure text moved into ``result_data["error_message"]`` on v10,
-    which is why a single-field extraction cannot serve both versions.
+    On v10 the failure text lives in ``result_data["error_message"]``, so a
+    single-field extraction cannot serve both versions.
     """
     task: dict[str, object] = {"task_id": "t1", "status": status.lower()}
     if message is not None:
@@ -268,7 +273,7 @@ class TestClientSignature:
         assert parameter.default is None
 
     def test_the_private_transport_spelling_is_gone(self) -> None:
-        """No ``_transport`` parameter remains alongside the public one."""
+        """``transport`` is the only transport parameter; there is no ``_transport``."""
         assert (
             "_transport" not in inspect.signature(PaperlessClient.__init__).parameters
         )
@@ -283,9 +288,9 @@ class TestClientSignature:
         """
         The send budget, its clock, its sleep and the timeout are one seam.
 
-        The budget is a time, not a count of attempts, so there is no attempt
-        count to pass any more.  The four travel together as ``timing``, which
-        is keyword-only and defaults to the production values.
+        The budget is a time, not a count of attempts.  The four travel
+        together as ``timing``, which is keyword-only and defaults to the
+        production values.
         """
         parameters = inspect.signature(PaperlessClient.__init__).parameters
         assert list(parameters) == [
@@ -351,7 +356,7 @@ def _uploaded_fields(
 
 
 class TestUploadDocument:
-    """Document upload tests."""
+    """An upload sends the PDF and its metadata, and returns what it delivered."""
 
     def test_upload_document(self, sample_pdf: Path) -> None:
         """Upload returns the task id on success."""
@@ -508,15 +513,14 @@ class TestUploadDocument:
         assert copied[0].name == "test.pdf"
         assert copied[0].read_bytes() == sample_pdf.read_bytes()
         _assert_no_staging_files(consume_dir)
-        # The result names the exact file the PDF was copied to -- something
-        # the old magic-string sentinel could not carry.
+        # The result names the exact file the PDF was copied to.
         assert result == FolderDelivery(path=copied[0])
         assert clock.now() == 60
         client.close()
 
 
 # ---------------------------------------------------------------------------
-# Upload failure translation (EXC-01, D-08, D-10)
+# Upload failure translation
 # ---------------------------------------------------------------------------
 
 
@@ -573,7 +577,7 @@ def _assert_token_absent(token: str, text: str) -> None:
     Assert neither the token as configured nor its stripped form is in ``text``.
 
     Library text shows a header value as a ``bytes`` repr, where a trailing
-    carriage return is spelled out as an escape and no longer matches the raw
+    carriage return is spelled out as an escape and does not match the raw
     token, so the stripped form is what catches it there.
 
     Args:
@@ -1048,7 +1052,7 @@ class TestRetryDecision:
 
 
 class TestUploadFailureTranslation:
-    """EXC-01 / D-10 / M-17: every upload failure ends as a PaperlessError."""
+    """Every upload failure ends as a PaperlessError."""
 
     @pytest.mark.parametrize("exc_type", _BEFORE_SEND_CASES)
     def test_before_send_budget_retries_then_raises(
@@ -1415,8 +1419,8 @@ class TestUploadFailureTranslation:
         """
         An unset paperless.url fails at once, names the setting, copies nothing.
 
-        The real transport, not a mock: this is the one way UnsupportedProtocol
-        is still reachable once a set URL is checked at load.
+        The real transport, not a mock: this is the only way UnsupportedProtocol
+        is reachable once load has checked a set URL.
         """
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
@@ -1497,7 +1501,7 @@ class TestUploadFailureTranslation:
         upload_clock: FakeClock,
     ) -> None:
         """
-        D-09: a 4xx names status, reason and the first field error.
+        A 4xx names status, reason and the first field error.
 
         An empty ``consume_name`` runs without a consume directory; either
         way a rejection is final and nothing is copied.
@@ -1536,7 +1540,7 @@ class TestUploadFailureTranslation:
         upload_clock: FakeClock,
     ) -> None:
         """
-        WR-03: a redirect is not transient, so it is never retried or copied.
+        A redirect is not transient, so it is never retried or copied.
 
         A plain ``http://`` URL behind a proxy that redirects to ``https://``
         would only be redirected again; the message names the target so the
@@ -1709,11 +1713,11 @@ class TestUploadFailureTranslation:
         self, tmp_path: Path, upload_clock: FakeClock
     ) -> None:
         """
-        IN-08: an OSError opening the PDF leaves as a PaperlessError, too.
+        An OSError opening the PDF leaves as a PaperlessError, too.
 
-        The class promises that whatever goes wrong on the upload path is a
-        ``PaperlessError``; a PDF gone from the workspace used to escape as a
-        raw ``FileNotFoundError``, which the CLI reports as a saneless bug.
+        Whatever goes wrong on the upload path is a ``PaperlessError``; a PDF
+        gone from the workspace must not escape as a raw ``FileNotFoundError``,
+        which the CLI reports as a saneless bug.
         """
         missing = tmp_path / "gone.pdf"
         handler = _CountingHandler(_answering(httpx2.Response(200, json="task-id")))
@@ -1892,7 +1896,7 @@ _JSON_BODY_CASES = [
 
 
 class TestRenderErrorBody:
-    """D-09: one renderer reduces every Paperless error body to one line."""
+    """One renderer reduces every Paperless error body to one line."""
 
     @pytest.mark.parametrize(("payload", "expected"), _JSON_BODY_CASES)
     def test_json_body_shapes(self, payload: object, expected: str) -> None:
@@ -1907,7 +1911,7 @@ class TestRenderErrorBody:
 
     def test_html_body_is_one_bounded_line(self) -> None:
         """
-        T-23-16 / M-17: a 5000-character HTML page cannot flood job.error.
+        A 5000-character HTML page cannot flood job.error.
 
         Whitespace is collapsed so no newline survives, and the text is cut
         to 200 characters plus an ellipsis.
@@ -2032,14 +2036,14 @@ class TestRenderErrorBody:
         assert _render_error_body(response, _MOCK_AUTH) == "(empty response body)"
 
     def test_multiline_json_detail_body_is_collapsed(self) -> None:
-        """No path yields a newline, including JSON-derived text (T-28-24)."""
+        """No path yields a newline, including JSON-derived text."""
         response = httpx2.Response(400, json={"detail": "line one\nline two"})
         assert _render_error_body(response, _MOCK_AUTH) == "line one line two"
 
     def test_full_body_is_logged_at_debug(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The whole body stays diagnosable, but only at DEBUG (T-28-21)."""
+        """The whole body stays diagnosable, but only at DEBUG."""
         body = "<html>" + ("x" * 900) + "</html>"
         response = httpx2.Response(502, text=body)
         with caplog.at_level(logging.DEBUG, logger="saneless.paperless"):
@@ -2058,7 +2062,7 @@ class TestRenderErrorBody:
 
 
 class TestPollTask:
-    """Task polling tests."""
+    """The task poll ends on every terminal state, on both API versions."""
 
     @pytest.mark.parametrize("build_payload", _API_SHAPES)
     def test_success_across_api_versions(
@@ -2134,7 +2138,7 @@ class TestPollTask:
         build_payload: Callable[[str, str | None], object],
         build_no_task: Callable[[], object],
     ) -> None:
-        """Pitfall #8: a 200 with no task keeps polling rather than raising."""
+        """A 200 with no task keeps polling rather than raising."""
         call_count = {"n": 0}
 
         def handler(_request: httpx2.Request) -> httpx2.Response:
@@ -2171,10 +2175,10 @@ class TestPollTask:
         """
         A refused token or a moved endpoint is reported immediately.
 
-        The counter is the point of the test: a revoked token used to be
-        silently re-polled for the full 300 s and then misreported as a
-        timeout.  The upload was accepted before the poll began, so the error
-        is "received, not confirmed".
+        The counter is the point of the test: re-polling a revoked token for
+        the full 300 s would end in a misreported timeout.  The upload was
+        accepted before the poll began, so the error is "received, not
+        confirmed".
         """
         handler = _CountingHandler(_answering(httpx2.Response(status, text="no")))
         client = _poll_client(handler, clock=poll_clock)
@@ -2209,7 +2213,7 @@ class TestPollTask:
 
     def test_non_200_body_is_rendered_as_one_line(self) -> None:
         """
-        D-09: a poll non-200 names status, reason and the DRF detail.
+        A poll non-200 names status, reason and the DRF detail.
 
         The body goes through the same single renderer as the upload 4xx, so
         a revoked token reads ``(401 Unauthorized): Invalid token.`` rather
@@ -2271,7 +2275,7 @@ class TestPollTask:
     def test_timeout_is_catchable_as_unconfirmed_and_as_a_paperless_error(
         self,
     ) -> None:
-        """D-11: `except PaperlessError` catches the timeout subclass too."""
+        """`except PaperlessError` catches the timeout subclass too."""
         assert issubclass(PaperlessTimeoutError, PaperlessUnconfirmedError)
         assert issubclass(PaperlessTimeoutError, PaperlessError)
 
@@ -2594,7 +2598,7 @@ _POLL_TRANSPORT_CASES = [
         id="remote-protocol-error",
     ),
     # A RequestError but not a TransportError: a proxy sending a corrupt gzip
-    # body.  It must not escape poll_task raw or fail the accepted upload (WR-05).
+    # body.  It must not escape poll_task raw or fail the accepted upload.
     pytest.param(
         httpx2.DecodingError("Error -3 while decompressing data"),
         id="decoding-error",
@@ -2624,13 +2628,13 @@ def _failed_poll_message(respond: Callable[[int], httpx2.Response]) -> str:
 
 
 class TestPollTaskFailureTranslation:
-    """EXC-01 / D-10 / D-11 / M-17: the read side of an accepted upload."""
+    """Every failure on the read side of an accepted upload is a PaperlessError."""
 
     def test_poll_continues_through_transport_errors_to_success(
         self, poll_clock: FakeClock
     ) -> None:
         """
-        D-11 / M-17: a network blip after the upload succeeded is not a failure.
+        A network blip after the upload succeeded is not a failure.
 
         The upload was accepted, so failing the job now invites a rescan and
         a duplicate document.  Two ReadErrors are followed by SUCCESS, and the
@@ -2658,7 +2662,7 @@ class TestPollTaskFailureTranslation:
         self, failure: httpx2.RequestError, poll_clock: FakeClock
     ) -> None:
         """
-        D-11 / OUTC-07 / T-28-38: transport errors still end at the deadline.
+        Transport errors still end at the deadline.
 
         Only the fake clock's waits move time on, so a poll that skipped the
         deadline check on a transport error would never end here.  The
@@ -2688,11 +2692,11 @@ class TestPollTaskFailureTranslation:
         self, poll_clock: FakeClock
     ) -> None:
         """
-        WR-05: an undecodable poll response is a blip, not a raw httpx2 escape.
+        An undecodable poll response is a blip, not a raw httpx2 escape.
 
         ``httpx2.DecodingError`` is a ``RequestError`` but not a
         ``TransportError``; the upload was already accepted, so the poll keeps
-        asking within its deadline (D-11).
+        asking within its deadline.
         """
 
         def respond(call: int) -> httpx2.Response:
@@ -2714,7 +2718,7 @@ class TestPollTaskFailureTranslation:
     def test_poll_deadline_without_transport_error_has_no_last_error(
         self, poll_clock: FakeClock
     ) -> None:
-        """A task that simply stays PENDING keeps today's timeout message."""
+        """A task that simply stays PENDING times out naming no last error."""
         client = _poll_client(
             _CountingHandler(_task_answer({"task_id": "t1", "status": "PENDING"})),
             clock=poll_clock,
@@ -2732,7 +2736,7 @@ class TestPollTaskFailureTranslation:
         self, poll_clock: FakeClock
     ) -> None:
         """
-        IN-02: a transport error followed by answered polls is not the cause.
+        A transport error followed by answered polls is not the cause.
 
         One blip early in a poll that then simply waited on a slow task must
         not end with "last error: ...", which would blame the network.
@@ -2757,7 +2761,7 @@ class TestPollTaskFailureTranslation:
         assert poll_clock.waits
 
     def test_poll_401_still_fails_at_once(self, poll_clock: FakeClock) -> None:
-        """OUTC-07: a non-200 is not a transport blip and ends the poll at once."""
+        """A non-200 is not a transport blip and ends the poll at once."""
         handler = _CountingHandler(_answering(httpx2.Response(401, text="Invalid")))
         client = _poll_client(handler, clock=poll_clock)
         try:
@@ -2769,7 +2773,7 @@ class TestPollTaskFailureTranslation:
         assert poll_clock.waits == []
 
     def test_poll_non_json_200_is_unconfirmed(self, poll_clock: FakeClock) -> None:
-        """EXC-01: a login page served with 200 is not a raw ValueError."""
+        """A login page served with 200 is not a raw ValueError."""
         handler = _CountingHandler(_answering(httpx2.Response(200, text="<html>")))
         client = _poll_client(handler, clock=poll_clock)
         try:
@@ -2788,7 +2792,7 @@ class TestPollTaskFailureTranslation:
         assert poll_clock.waits == []
 
     def test_non_duplicate_failure_has_no_duplicate_sentence(self) -> None:
-        """D-10: an ordinary failure is not dressed up as a duplicate."""
+        """An ordinary failure is not dressed up as a duplicate."""
         message = _failed_poll_message(
             _task_answer(
                 {"task_id": "t1", "status": "FAILURE", "result": "disk on fire"}
@@ -2797,7 +2801,7 @@ class TestPollTaskFailureTranslation:
         assert message == "Paperless task t1 ended FAILURE: disk on fire"
 
     def test_poll_failure_text_is_one_line(self) -> None:
-        """EXC-02: a multi-line failure text from Paperless is one message line."""
+        """A multi-line failure text from Paperless is one message line."""
         message = _failed_poll_message(
             _task_answer(
                 {"task_id": "t1", "status": "FAILURE", "result": "bad\nthings\r\n"}
@@ -2823,7 +2827,7 @@ class TestPollTaskFailureTranslation:
 
     def test_poll_failure_text_is_length_bounded(self) -> None:
         """
-        IN-05 / T-23-16: a long task failure cannot flood job.error or the CLI.
+        A long task failure cannot flood job.error or the CLI.
 
         Paperless failure results can embed whole OCR or consumer tracebacks;
         they are cut like an error body, with an ellipsis.
