@@ -372,7 +372,7 @@ def _owner_answers(presented: str | None, job: Job | None) -> bool:
     return matched
 
 
-# The freshness line's four variants, composed here rather than in the
+# The freshness line's variants, composed here rather than in the
 # template: the strip's templates own no vocabulary, and a page that assembled
 # its own prose would be a second place for the copy to drift.  The dash is
 # U+2014 with spaces on both sides.
@@ -393,7 +393,7 @@ class _CheckingRow:
     every one of them is a constant imported from ``saneless.checks``: the
     template still authors none of them.
 
-    Only ``key`` varies, so the six rows are built once at import.
+    Only ``key`` varies, so one row per ``CheckKey`` is built once at import.
 
     Attributes:
         key: Which check this row is standing in for.
@@ -418,13 +418,13 @@ _CHECKING_ROWS: Final = tuple(_CheckingRow(key=key) for key in CheckKey)
 
 def _freshness_line(cached: CachedChecks, *, scan_active: bool) -> str:
     """
-    Compose the one sentence under the rows, for the four situations.
+    Compose the one sentence under the rows, for each situation.
 
-    Two axes produce the four variants: whether any results exist yet, and
+    Two axes produce the variants: whether any results exist yet, and
     whether a scan is holding the scanner.  The paused wording is why the
     checks can be skipped during a scan at all -- a strip that silently showed a
     half-hour-old Scanner row during a scan would be lying by omission, and one
-    that blanked would throw away the four rows that are still true.
+    that blanked would throw away the rows that are still true.
 
     The timestamp goes through the shared ``local_time`` filter, which is the
     same object ``saneless doctor``'s table uses, so the two surfaces cannot
@@ -552,7 +552,7 @@ def _checks_context(
     ``gave_up`` means "this cold chain has stopped", and it is measured against
     the *applicable* cap rather than always against ``POLL_ATTEMPT_CAP``.  It
     still requires a cold cache, because its line says the checks have not run
-    yet and that would be a lie printed beside six rows that did run -- so a
+    yet and that would be a lie printed beside rows that did run -- so a
     settling poll that runs out of attempts leaves the normal last-checked line
     alone.  What changed is that a cold chain at ``POLL_ATTEMPT_CAP`` with a
     probe in flight has *not* stopped: it keeps asking up to
@@ -625,7 +625,7 @@ def _checks_fallback_context() -> dict[str, object]:
 
     Every value here is a developer-authored constant, and that is the whole
     point: this body is rendered on a page the whole LAN can read, so no part
-    of the exception that produced it may reach the context (ASVS V7).  The
+    of the exception that produced it may reach the context (ASVS 4.0.3 V7.4.1).  The
     exception goes to ``logger.exception`` instead.
 
     ``checks`` is ``None`` and ``checking_rows`` is the cold-start six, so the
@@ -863,7 +863,7 @@ def _tag_list_context(
     been deleted, or paperless-ngx cannot be reached.
 
     ``q`` is a Python-side substring test over the already-cached list and
-    nothing else (ASVS V5).  It is never interpolated into a paperless-ngx
+    nothing else (ASVS 4.0.3 V5.1.1).  It is never interpolated into a paperless-ngx
     query URL -- the cache holds the whole list, so there is nothing to ask
     upstream and the filter costs no request at all -- and it is
     deliberately absent from the context this returns, so it cannot be echoed
@@ -1261,7 +1261,7 @@ def _status_facts(
 
     This unwraps the configured token, and the value goes to the predicate and
     nowhere else: it is never logged, rendered or echoed, and the flag that
-    reaches the template is a bool (ASVS V7).
+    reaches the template is a bool (ASVS 4.0.3 V7.1.1).
 
     Args:
         request: The incoming request, for its cookies and the app's settings.
@@ -2673,11 +2673,10 @@ def _scan_block(settings: Settings) -> _ScanBlock | None:
     first, then an empty ``paperless.url``, matching the status strip's
     Paperless row.
 
-    This is the web layer's third place that unwraps the configured token,
-    after the PaperlessClient build in ``web/app.py`` and the Paperless check
-    in ``checks.py``.  The value goes to the predicate and nowhere else: it is
-    never logged, rendered, echoed or put in the job row, whose text names the
-    problem and the file to edit and never the secret (ASVS V7).
+    This unwraps the configured token, and the value goes to the predicate
+    and nowhere else: it is never logged, rendered, echoed or put in the job
+    row, whose text names the problem and the file to edit and never the
+    secret (ASVS 4.0.3 V7.1.1).
 
     Args:
         settings: The settings the process started with.
@@ -3390,7 +3389,7 @@ def refresh_checks(request: Request) -> Response:
     ``_checks_context`` raising here used to be a 500, and because the button
     aims at ``#checks-body`` that 500 arrived carrying the strip's own
     ``HX-Target`` -- which, until the exemption was narrowed to a GET,
-    meant the error body was written over the strip, taking the six rows and
+    meant the error body was written over the strip, taking every row and
     the only button that could bring them back.  Now a failure inside the
     strip's rendering ends as ``_checks_fallback_context`` at 200 on this route
     too, so the strip and the button stay on the page.  Everything before the

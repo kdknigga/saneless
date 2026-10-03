@@ -126,11 +126,12 @@ class CheckRefresher:
     Args:
         cache: The cache this fills.
         context_factory: Builds the ``CheckContext`` for one refresh.
-        scanner_gate: Returns the worker's scanner gate at call time, because
-            the worker may be rebuilt independently of the refresher.
-        scan_active: Reports whether the worker has a job in flight, read at
-            call time for the same reason ``scanner_gate`` is a callable -- the
-            worker may be rebuilt independently of the refresher.  This, and
+        scanner_gate: Returns the scanner gate a probe takes.  The worker
+            creates its gate once, so every call returns the same lock; this
+            is a callable only so it is injected the same way as
+            ``scan_active``.
+        scan_active: Reports whether the worker has a job in flight, read on
+            every tick because the answer changes as jobs start and end.  This, and
             not a failed acquire on the gate, is what decides whether the
             scanner check is skipped.
         clock: The monotonic source the watch window is measured with.
@@ -323,7 +324,7 @@ class CheckRefresher:
             timeout: Seconds to wait for the thread, or ``None`` for the whole
                 of ``STOP_JOIN_SECONDS``.  A negative value is clamped to
                 zero, so a caller arriving with its budget already spent gets
-                a poll rather than the unbounded wait ``join(None)`` would be.
+                a single check of the thread rather than any wait.
 
         Returns:
             Whether the refresher thread has stopped.
