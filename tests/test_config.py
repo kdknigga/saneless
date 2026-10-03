@@ -5264,12 +5264,12 @@ class TestPlaceholderToken:
 
     def test_config_module_adds_no_secret_unwrap_site(self) -> None:
         """
-        The predicate adds no secret-unwrapping call to ``config.py``.
+        ``config.py`` never unwraps a secret.
 
-        Only ``cli.py scan`` and ``web/app.py create_app`` unwrap the token;
-        ``config.py`` itself never does. The parsed module's calls are counted,
-        so a comment or docstring naming the method neither trips nor
-        satisfies the check.
+        The token is unwrapped only where its value is needed, in the surfaces
+        and the check registry, never in the module that defines it. The parsed
+        module's calls are counted, so a comment or docstring naming the method
+        neither trips nor satisfies the check.
         """
         tree = ast.parse(Path(config_mod.__file__).read_text(encoding="utf-8"))
         unwraps = [
