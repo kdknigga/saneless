@@ -1,8 +1,8 @@
 """
-Web endpoint tests for the saneless FastAPI application.
+The web app's routes render, accept and refuse what an operator's browser sends.
 
-Covers requirements: UI-01 through UI-08, PROF-03, PLSS-04,
-HLTH-01, HLTH-02, LOG-03.
+Every app here talks to a Paperless client that never leaves the process, and
+every page, partial and JSON answer is asserted as the browser receives it.
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ import re
 import sqlite3
 import threading
 import time
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, override
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from saneless.job import Job
 
 import httpx2
+import jinja2.nodes
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -91,6 +93,7 @@ from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
 from saneless.web.throttle import PAPERLESS_TEST_WAIT_SECONDS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, leaf_routes, load_the_lists
+from tests.template_support import template_start_tags
 
 # Every app built in this module, fixture or helper, talks to a Paperless client
 # whose requests fail inside the process: nothing reaches localhost:8000.
@@ -567,7 +570,7 @@ def test_architecture_owner_token_bullet_states_what_it_grants() -> None:
 
 def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
     """
-    Every route handler is a plain ``def`` (ROBU-05, M-01).
+    Every route handler is a plain ``def``.
 
     Each handler calls blocking code, and FastAPI only moves ``def`` handlers
     onto its threadpool; an ``async def`` one would block the event loop.  The
@@ -588,7 +591,7 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
 
 
 def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
-    """/health answers promptly while another request is blocked in I/O (ROBU-05)."""
+    """/health answers promptly while another request is blocked in I/O."""
     gate = threading.Event()
     entered = threading.Event()
     app = _app(client)
@@ -601,7 +604,7 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
 
     app.state.paperless.get_tags = blocking_get_tags
     app.state.cache.invalidate("tags")
-    slow = threading.Thread(target=lambda: client.get("/api/tags"))
+    slow = threading.Thread(target=lambda: client.get("/api/tags"), daemon=True)
     slow.start()
     try:
         assert entered.wait(5)
@@ -613,6 +616,7 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
     finally:
         gate.set()
         slow.join(5)
+    assert not slow.is_alive()
 
 
 def test_metadata_fetch_failure_says_the_list_is_unavailable(
@@ -655,7 +659,7 @@ def test_health_reports_degraded_worker(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A degraded worker makes /health a 503 naming the store (ROBU-05, D-10).
+    A degraded worker makes /health a 503 naming the store.
 
     The property is patched rather than the degraded Event set, so the worker
     thread's idle recovery probe cannot clear it mid-request.
@@ -669,7 +673,7 @@ def test_health_reports_degraded_worker(
 
 
 def test_health_reports_down_worker(client: TestClient) -> None:
-    """A stopped worker makes /health a 503 naming the thread (ROBU-05, D-10)."""
+    """A stopped worker makes /health a 503 naming the thread."""
     assert _app(client).state.worker.stop()
     response = client.get("/health")
     assert response.status_code == 503
@@ -677,14 +681,14 @@ def test_health_reports_down_worker(client: TestClient) -> None:
 
 
 def test_profile_dropdown(client: TestClient, web_settings: Settings) -> None:
-    """Profile names from settings appear in dropdown (PROF-03)."""
+    """Profile names from settings appear in dropdown."""
     response = client.get("/")
     for profile_name in web_settings.profiles:
         assert profile_name in response.text
 
 
 def test_scan_form_submit(client: TestClient) -> None:
-    """POST /api/scan creates job and returns status partial (PLSS-04, UI-07)."""
+    """POST /api/scan creates job and returns status partial."""
     response = client.post(
         "/api/scan", data={"profile": "default", "title": "Test Scan"}
     )
@@ -697,20 +701,20 @@ def titled_client(
     tmp_path: Path, web_scanner: StubScannerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[TestClient]:
     """
-    TestClient whose ``default`` profile has ``title = "Receipt"`` (D-16).
+    TestClient whose ``default`` profile has ``title = "Receipt"``.
 
     The worker's ``submit`` is stubbed to accept without running a pipeline,
     so the created job row is what the route resolved and nothing else.
 
-    The token is configured because ``POST /api/scan`` now refuses outright
-    when it is a placeholder (APPL-07, D-15), and an unset one here would stop
+    The token is configured because ``POST /api/scan`` refuses outright
+    when it is a placeholder, and an unset one here would stop
     these title tests at the guard instead of reaching the resolution they are
     about.  That refusal has its own tests in tests/test_web_errors.py.
     """
     auth = "test-token"
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token=auth),
+        paperless=PaperlessConfig(url="http://paperless.invalid", token=auth),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         profiles={"default": ProfileConfig(title="Receipt")},
     )
@@ -728,7 +732,7 @@ def titled_client(
 def test_scan_blank_title_uses_profile_title(
     titled_client: TestClient, typed: str
 ) -> None:
-    """A blank typed title is replaced by the profile's title (D-16, M-24)."""
+    """A blank typed title is replaced by the profile's title."""
     response = titled_client.post(
         "/api/scan", data={"profile": "default", "title": typed}
     )
@@ -738,7 +742,7 @@ def test_scan_blank_title_uses_profile_title(
 
 
 def test_scan_typed_title_beats_profile_title(titled_client: TestClient) -> None:
-    """A typed title is used as given over the profile's title (D-16)."""
+    """A typed title is used as given over the profile's title."""
     response = titled_client.post(
         "/api/scan", data={"profile": "default", "title": "Typed"}
     )
@@ -748,7 +752,7 @@ def test_scan_typed_title_beats_profile_title(titled_client: TestClient) -> None
 
 
 def test_scan_title_unknown_profile_still_rejected(titled_client: TestClient) -> None:
-    """Resolving the title never masks an unknown profile (D-16, T-27-04)."""
+    """Resolving the title never masks an unknown profile."""
     job_store: JobStore = _app(titled_client).state.job_store
     before = job_store.list_recent(limit=50)
     response = titled_client.post(
@@ -763,14 +767,51 @@ def test_scan_title_unknown_profile_still_rejected(titled_client: TestClient) ->
 
 
 def test_status_polling(client: TestClient) -> None:
-    """GET /api/jobs/current/status returns status partial (UI-02)."""
+    """GET /api/jobs/current/status returns status partial."""
     response = client.get("/api/jobs/current/status")
     assert response.status_code == 200
     assert 'id="status-area"' in response.text
 
 
+class _StatusAreaFinder(HTMLParser):
+    """Collect the attributes of every element whose id is ``status-area``."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.found: list[dict[str, str | None]] = []
+
+    @override
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if attributes.get("id") == "status-area":
+            self.found.append(attributes)
+
+
+def _status_area_attributes(markup: str) -> dict[str, str | None]:
+    """
+    Return the attributes of the one status area in rendered markup.
+
+    Args:
+        markup: A rendered page or status response.
+
+    Returns:
+        The status area's attributes, with HTML entities resolved.
+
+    """
+    finder = _StatusAreaFinder()
+    finder.feed(markup)
+    finder.close()
+    assert len(finder.found) == 1, markup
+    return finder.found[0]
+
+
 def test_status_polling_active_job(client: TestClient) -> None:
-    """Active job triggers hx-trigger polling attributes (UI-02)."""
+    """
+    An active job's status area polls the current-job URL once a second.
+
+    The poll carries only the token of the rendering it shows, and that token
+    is the real one: polling it while nothing changes is answered 204.
+    """
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Polling Test")
     job_store.update_state(job.id, JobState.SCANNING)
@@ -778,13 +819,22 @@ def test_status_polling_active_job(client: TestClient) -> None:
 
     response = client.get("/api/jobs/current/status")
     assert response.status_code == 200
-    # Active job states include polling attributes
-    has_polling = "hx-trigger" in response.text or "hx-get" in response.text
-    assert has_polling
+    area = _status_area_attributes(response.text)
+
+    assert area["hx-trigger"] == "every 1s"
+    poll = area["hx-get"]
+    assert poll is not None
+    parts = urlsplit(poll)
+    assert parts.path == "/api/jobs/current/status"
+    query = parse_qs(parts.query, keep_blank_values=True)
+    assert list(query) == ["seen"]
+    (seen,) = query["seen"]
+    assert re.fullmatch(r"[0-9a-f]{24}", seen), seen
+    assert client.get(poll).status_code == 204
 
 
 def test_flip_prompt(client: TestClient) -> None:
-    """AWAITING_FLIP state shows flip prompt with PRD wording (UI-03)."""
+    """AWAITING_FLIP state shows the flip prompt's wording and both buttons."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Flip Test")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
@@ -797,7 +847,7 @@ def test_flip_prompt(client: TestClient) -> None:
     assert 'hx-post="/api/flip/abort"' in response.text
 
     # Both buttons name the job they were rendered for, so an answer can only
-    # ever land on that job (CR-01).
+    # ever land on that job.
     buttons = re.findall(
         r"<button[^>]*hx-post=\"/api/flip/(continue|abort)\"[^>]*>", response.text
     )
@@ -813,7 +863,7 @@ def test_flip_prompt(client: TestClient) -> None:
 
 
 def test_thumbnail_display(client: TestClient) -> None:
-    """The owner's job with a thumbnail shows the base64 img tag (UI-04)."""
+    """The owner's job with a thumbnail shows the base64 img tag."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(
         profile="default", title="Thumb Test", owner_token=_as_owner(client)
@@ -827,7 +877,7 @@ def test_thumbnail_display(client: TestClient) -> None:
 
 
 def test_job_history(client: TestClient) -> None:
-    """GET /api/jobs/history returns the owner's jobs by title (UI-05)."""
+    """GET /api/jobs/history returns the owner's jobs by title."""
     job_store: JobStore = _app(client).state.job_store
     titles = ["Job Alpha", "Job Beta", "Job Gamma"]
     owner = _as_owner(client)
@@ -841,7 +891,7 @@ def test_job_history(client: TestClient) -> None:
 
 
 def test_error_display(client: TestClient) -> None:
-    """Error state shows the owner its error message in status area (LOG-03)."""
+    """Error state shows the owner its error message in status area."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(
         profile="default", title="Error Test", owner_token=_as_owner(client)
@@ -876,7 +926,7 @@ def test_cache_invalidate(client: TestClient) -> None:
 
 
 def test_cache_invalidate_rejects_an_unknown_resource(client: TestClient) -> None:
-    """Only tags and correspondents can be invalidated; nothing else is (N-20, D-19)."""
+    """Only tags and correspondents can be invalidated; nothing else is."""
     cache = _app(client).state.cache
     cache.set("tags", [{"id": 1, "name": "receipt"}])
 
@@ -900,7 +950,7 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A rejection during a run never becomes the status area's job (D-06, T8).
+    A rejection during a run never becomes the status area's job.
 
     The rejected row is newer than the running job, so once that job ends the
     status area must still report it -- not the queue-full rejection.
@@ -935,14 +985,14 @@ def test_rejected_submit_does_not_replace_the_job_that_ran(
     page = client.get("/").text
     assert "Done: Running Job" in _status_area(page)
     assert QUEUE_FULL_JOB_ERROR not in _status_area(page)
-    # History still lists the rejected attempt (D-05).  A submit refused after
+    # History still lists the rejected attempt.  A submit refused after
     # its row was written keeps the token it was written with, so the browser
     # that sent it still sees its title.
     assert "Refused Scan" in page
 
 
 def test_rejected_rows_alone_leave_the_status_area_ready(client: TestClient) -> None:
-    """With only rejected rows and no current job, nothing has run (D-06)."""
+    """With only rejected rows and no current job, nothing has run."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Never Ran")
     job_store.finish_job(
@@ -960,7 +1010,7 @@ def test_rejected_rows_alone_leave_the_status_area_ready(client: TestClient) -> 
 
 
 def test_index_lists_the_worker_profiles(client: TestClient) -> None:
-    """The profile dropdown reads the worker's locked profile set (D-19)."""
+    """The profile dropdown reads the worker's locked profile set."""
     _app(client).state.worker._set_profiles(
         {"default": ProfileConfig(), "zz-new-profile": ProfileConfig()}
     )
@@ -974,7 +1024,7 @@ def test_index_lists_the_worker_profiles(client: TestClient) -> None:
 
 def test_flip_continue(client: TestClient) -> None:
     """
-    A Continue arriving after the job ended reports that job (UI-03, M-02).
+    A Continue arriving after the job ended reports that job.
 
     The worker clears its current job id in ``_process_job``'s ``finally``, so
     a click landing as the job ends finds no current job.  The route must fall
@@ -997,7 +1047,7 @@ def test_flip_continue(client: TestClient) -> None:
 
 def test_flip_abort(client: TestClient) -> None:
     """
-    An Abort arriving after the job ended reports that job (UI-03, M-02).
+    An Abort arriving after the job ended reports that job.
 
     Otherwise an abort that aborted nothing reports nothing either: the partial
     would say "Ready to scan." while the job that timed out sits in history.
@@ -1060,7 +1110,7 @@ def test_claimed_abort_acknowledges_instead_of_the_prompt(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
     """
-    A claimed Abort renders "Aborting scan..." without the buttons (CR-01).
+    A claimed Abort renders "Aborting scan..." without the buttons.
 
     The worker has not persisted ERROR yet, so the row still reads
     AWAITING_FLIP.  Re-rendering the prompt there would look as though the
@@ -1080,7 +1130,7 @@ def test_claimed_abort_acknowledges_instead_of_the_prompt(
 def test_claimed_continue_acknowledges_instead_of_the_prompt(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """A claimed Continue renders the flip-confirmed copy without buttons (CR-01)."""
+    """A claimed Continue renders the flip-confirmed copy without buttons."""
     job_id, coordinator = waiting_flip
 
     response = client.post("/api/flip/continue", data={"job_id": job_id})
@@ -1096,7 +1146,7 @@ def test_double_clicked_abort_still_acknowledges(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
     """
-    A repeat click on an answered job renders the same acknowledgment (CR-01).
+    A repeat click on an answered job renders the same acknowledgment.
 
     The second Abort is dropped by the coordinator, so the route has no claim
     of its own; the acknowledgment must come from the answer the worker holds.
@@ -1115,7 +1165,7 @@ def test_double_clicked_abort_still_acknowledges(
 def test_continue_after_abort_reports_the_abort(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """A late Continue on an aborted job acknowledges the Abort that won (D-16)."""
+    """A late Continue on an aborted job acknowledges the Abort that won."""
     job_id, coordinator = waiting_flip
 
     client.post("/api/flip/abort", data={"job_id": job_id})
@@ -1130,7 +1180,7 @@ def test_foreign_job_id_leaves_the_prompt_open(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
     """
-    An Abort naming another job does not acknowledge the waiting job (T-25-49).
+    An Abort naming another job does not acknowledge the waiting job.
 
     The route's claim is only authoritative for the job it names; the rendered
     job is still unanswered, so its prompt and both buttons stay.
@@ -1149,7 +1199,7 @@ def test_foreign_job_id_leaves_the_prompt_open(
 def test_poll_acknowledges_an_answer_the_store_has_not_recorded_yet(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """The status poll keeps the buttons away once the job is answered (CR-01)."""
+    """The status poll keeps the buttons away once the job is answered."""
     job_id, _ = waiting_flip
     client.post("/api/flip/continue", data={"job_id": job_id})
 
@@ -1165,7 +1215,7 @@ def test_poll_acknowledges_an_answer_the_store_has_not_recorded_yet(
 def test_poll_renders_the_prompt_for_an_unanswered_flip(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """An armed, unanswered flip wait still renders the full prompt (UI-03)."""
+    """An armed, unanswered flip wait still renders the full prompt."""
     _ = waiting_flip
 
     response = client.get("/api/jobs/current/status")
@@ -1180,7 +1230,7 @@ def test_poll_renders_the_prompt_for_an_unanswered_flip(
 def test_index_acknowledges_an_answered_flip(
     client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
 ) -> None:
-    """A page reload after the answer shows the acknowledgment too (CR-01, D-17)."""
+    """A page reload after the answer shows the acknowledgment too."""
     job_id, _ = waiting_flip
     client.post("/api/flip/abort", data={"job_id": job_id})
 
@@ -1195,7 +1245,7 @@ def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
     """
     A flip answer that names no job is rejected before reaching the worker.
 
-    The job id is what scopes the answer to one job (CR-01), so a request
+    The job id is what scopes the answer to one job, so a request
     without it cannot be interpreted and is refused with 422.
     """
     response = client.post(route)
@@ -1204,7 +1254,7 @@ def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
 
 
 def test_paperless_test_connected(client: TestClient) -> None:
-    """GET /api/paperless/test returns connected status (PLSS-03)."""
+    """GET /api/paperless/test returns connected status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "connected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1212,7 +1262,7 @@ def test_paperless_test_connected(client: TestClient) -> None:
 
 
 def test_paperless_test_token_rejected(client: TestClient) -> None:
-    """GET /api/paperless/test returns token_rejected status (PLSS-03)."""
+    """GET /api/paperless/test returns token_rejected status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "token_rejected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1220,7 +1270,7 @@ def test_paperless_test_token_rejected(client: TestClient) -> None:
 
 
 def test_paperless_test_unreachable(client: TestClient) -> None:
-    """GET /api/paperless/test returns unreachable status (PLSS-03)."""
+    """GET /api/paperless/test returns unreachable status."""
     _app(client).state.paperless.test_connection = lambda timeout=None: "unreachable"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
@@ -1228,7 +1278,7 @@ def test_paperless_test_unreachable(client: TestClient) -> None:
 
 
 def test_paperless_test_error(client: TestClient) -> None:
-    """GET /api/paperless/test returns error on exception (PLSS-03)."""
+    """GET /api/paperless/test returns error on exception."""
 
     def raise_exc(*, timeout: httpx2.Timeout | None = None) -> None:
         _ = timeout
@@ -1244,20 +1294,8 @@ def test_paperless_test_error(client: TestClient) -> None:
     assert "boom" not in response.text
 
 
-def test_scan_button_disabled_during_active_job(client: TestClient) -> None:
-    """Scan button disabled during active job (UI-07)."""
-    job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title="Active Job")
-    job_store.update_state(job.id, JobState.SCANNING)
-    _app(client).state.worker._current_job_id = job.id
-
-    response = client.get("/")
-    assert "disabled" in response.text
-    assert 'id="scan-btn"' in response.text
-
-
 def test_history_humanized_labels(client: TestClient) -> None:
-    """Job history shows human-readable state labels instead of raw enum values (P12-01)."""
+    """Job history shows human-readable state labels instead of raw enum values."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Label Test")
     job_store.update_state(job.id, JobState.DONE)
@@ -1268,7 +1306,7 @@ def test_history_humanized_labels(client: TestClient) -> None:
 
 
 def test_status_no_inline_scripts(client: TestClient) -> None:
-    """Status partial contains no inline script tags for DONE or ERROR states (P12-04)."""
+    """Status partial contains no inline script tags for DONE or ERROR states."""
     job_store: JobStore = _app(client).state.job_store
 
     # DONE state
@@ -1287,13 +1325,13 @@ def test_status_no_inline_scripts(client: TestClient) -> None:
 
 
 def test_scan_form_no_hx_on(client: TestClient) -> None:
-    """Scan form does not use hx-on:: inline event attributes (P12-04)."""
+    """Scan form does not use hx-on:: inline event attributes."""
     response = client.get("/")
     assert "hx-on::before-request" not in response.text
 
 
 def test_refresh_buttons_accessible(client: TestClient) -> None:
-    """Refresh buttons have aria-label attributes and sr-only text (P12-02)."""
+    """Refresh buttons have aria-label attributes and sr-only text."""
     response = client.get("/")
     assert 'aria-label="Refresh tags"' in response.text
     assert 'aria-label="Refresh correspondents"' in response.text
@@ -1301,13 +1339,13 @@ def test_refresh_buttons_accessible(client: TestClient) -> None:
 
 
 def test_scan_form_has_heading(client: TestClient) -> None:
-    """Scan form article has an h2 heading for accessibility (P12-02)."""
+    """Scan form article has an h2 heading for accessibility."""
     response = client.get("/")
     assert "<h2>Scan</h2>" in response.text
 
 
 def test_flip_abort_label(client: TestClient) -> None:
-    """Flip prompt cancel button reads Abort scan (P12-05)."""
+    """Flip prompt cancel button reads Abort scan."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Flip Abort Test")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
@@ -1319,25 +1357,26 @@ def test_flip_abort_label(client: TestClient) -> None:
 
 
 def test_correspondent_placeholder(client: TestClient) -> None:
-    """Correspondent dropdown placeholder reads No correspondent (P12-05)."""
+    """Correspondent dropdown placeholder reads No correspondent."""
     response = client.get("/")
     assert "No correspondent" in response.text
     assert "-- None --" not in response.text
 
 
 def test_css_spacing_normalized() -> None:
-    """CSS uses PicoCSS grid-aligned spacing with no !important overrides (P12-05)."""
-    css_path = (
-        Path(__file__).parent.parent / "src" / "saneless" / "web" / "static" / "app.css"
-    )
-    css_content = css_path.read_text()
-    assert "!important" not in css_content
-    assert "padding: 0.25rem" in css_content
-    assert "var(--pico-border-width)" in css_content
+    """CSS uses PicoCSS grid-aligned spacing with no !important overrides."""
+    declarations = [
+        (prop, value)
+        for _selector, rule in _css_rules(_web_asset("static", "app.css"))
+        for prop, value in rule.items()
+    ]
+    assert not [pair for pair in declarations if "!important" in pair[1]]
+    assert _css_declarations(".refresh-btn")["padding"] == "0.25rem 0.5rem"
+    assert any("var(--pico-border-width)" in value for _prop, value in declarations)
 
 
 def test_paperless_test_500_sanitizes_exception(client: TestClient) -> None:
-    """500 response returns exception class name, not raw message with secrets (RH-04)."""
+    """500 response returns exception class name, not raw message with secrets."""
     sensitive_msg = "http://192.168.1.100:8000 token=abc123"
     _app(client).state.paperless.test_connection = _raise_factory(
         ConnectionError, sensitive_msg
@@ -1423,13 +1462,11 @@ class TestAppComposition:
     """
     What ``create_app`` must have assembled before a single request arrives.
 
-    The phase's rendering and its background refresh both depend on wiring that
-    no route can compensate for: a template cannot invent a filter, and a route
-    cannot probe on its own without undoing D-04.  Every assertion here is made
-    on an app that has **not** been entered, because construction is exactly the
-    moment that must stay free of threads and probes.
-
-    Covers requirements: APPL-02, APPL-03, APPL-04, APPL-12.
+    The rendering and the background refresh both depend on wiring that no
+    route can compensate for: a template cannot invent a filter, and a route
+    must not start a probe of its own.  Every assertion here is made on an app
+    that has **not** been entered, because construction is exactly the moment
+    that must stay free of threads and probes.
     """
 
     @pytest.fixture
@@ -1447,7 +1484,7 @@ class TestAppComposition:
     def test_registers_the_filters_the_templates_reach_for(
         self, unstarted_app: FastAPI
     ) -> None:
-        """Every name this phase's templates reach for is registered (APPL-03)."""
+        """Every filter name the templates reach for is registered."""
         filters = unstarted_app.state.templates.env.filters
         expected = {
             "check_row_class",
@@ -1469,7 +1506,7 @@ class TestAppComposition:
 
         A lambda wrapper here would pass a "renders the same string" test today
         and drift from ``saneless doctor`` the first time either side is
-        edited.  ``is`` is what makes APPL-12's "one shared place" checkable.
+        edited.  ``is`` is what makes "one shared place" checkable.
         """
         filters = unstarted_app.state.templates.env.filters
         assert filters["check_row_class"] is check_row_class
@@ -1483,14 +1520,14 @@ class TestAppComposition:
 
     def test_the_state_lookups_are_not_filters(self, unstarted_app: FastAPI) -> None:
         """
-        R4-IN-03: a filter no template may correctly use is not registered.
+        A filter no template may correctly use is not registered.
 
         ``check_state_class`` and its two siblings draw a marker from the
-        state alone, which is what rendered a skipped row as a green tick
-        (R3-WR-03).  The strip reaches for the ``check_row_*`` filters, and
-        leaving the state lookups in the template namespace handed the next
-        row's author two plausible names of which only one is right.  The
-        Python functions stay; it is the filter names that are gone.
+        state alone, so a skipped row drawn from one renders as a green tick.
+        The strip reaches for the ``check_row_*`` filters, and a state lookup
+        in the template namespace would hand the next row's author two
+        plausible names of which only one is right.  The Python functions
+        exist; they are simply not filters.
         """
         filters = unstarted_app.state.templates.env.filters
         state_lookups = {"check_state_class", "check_state_glyph", "check_state_label"}
@@ -1506,7 +1543,7 @@ class TestAppComposition:
     def test_the_cache_is_cold_before_the_app_is_entered(
         self, unstarted_app: FastAPI
     ) -> None:
-        """Construction issues no probe, so the first render says Checking (D-06)."""
+        """Construction issues no probe, so the first render says Checking."""
         cached = unstarted_app.state.checks.current()
         assert cached.results is None
         assert cached.checked_at is None
@@ -1515,7 +1552,7 @@ class TestAppComposition:
         self, unstarted_app: FastAPI, web_settings: Settings
     ) -> None:
         """
-        The five earlier injections hold, and the label filters are the right ones.
+        The app state carries its five parts, and the label filters are the right ones.
 
         ``state_label`` is deliberately absent: it reads the state alone, so it
         would call a warned upload "Complete".  Every label goes through
@@ -1544,17 +1581,19 @@ class TestAppComposition:
         assert unstarted_app.state.refresher._thread.is_alive() is False
 
 
-# --- The owner cookie (APPL-09, D-23, D-24) ---------------------------------
+# --- The owner cookie --------------------------------------------------------
 
 # The cookie's name, spelled out here rather than imported from the route
 # module: a test that imported the constant would still pass if the wire name
 # changed underneath every browser that already holds one.
 _OWNER_COOKIE = "saneless_owner"
 
-# ``secrets.token_urlsafe(32)`` is 32 random bytes in unpadded URL-safe base64,
-# which is always 43 characters.  Asserting the length is the only way this
-# suite can see the entropy behind the value it is handed.
-_MINIMUM_OWNER_COOKIE_LENGTH = 43
+# The random bytes behind a freshly minted owner token.
+_OWNER_TOKEN_BYTES = 32
+
+# What the spied mint hands back: distinctive, so the cookie can only equal it
+# if the route sent the minted value unchanged.
+_SPIED_OWNER_TOKEN = "spied-owner-token-value"
 
 # The owner cookie's lifetime, spelled out for the same reason as its name: a
 # year in seconds, so a browser keeps its ownership across restarts.
@@ -1566,7 +1605,7 @@ def _owner_set_cookie(response: httpx2.Response) -> str | None:
     Return the raw ``Set-Cookie`` header carrying the owner token, if any.
 
     The raw header is parsed instead of the client's cookie jar because the jar
-    normalises away exactly what D-06 pins: the ``Max-Age`` value and an absent
+    normalises away exactly what these tests pin: the ``Max-Age`` value and an absent
     ``Secure`` are both invisible once httpx2 has turned the header into a jar
     entry, so a jar assertion could not tell a year-long cookie from a session
     one.
@@ -1635,7 +1674,7 @@ def _other_browser(client: TestClient) -> TestClient:
     Return a second client over the same running app, with its own cookie jar.
 
     Two clients rather than one client with its jar emptied: the jar is the
-    thing under test, and two jars are what D-23's "one token per browser"
+    thing under test, and two jars are what "one token per browser"
     actually means.  The app is already started by the first client's fixture,
     so this one is used without entering its lifespan.
 
@@ -1690,15 +1729,14 @@ class TestOwnerCookie:
     """
     The owner token's mint, its reuse, and the gate it puts on a flip answer.
 
-    Covers APPL-09 and decisions D-23 (one token per browser), D-24 (the token
-    gates the two flip buttons) and D-06 (the cookie lives a year, so ownership
-    survives a browser restart).
+    There is one token per browser, it gates the two flip buttons, and the
+    cookie lives a year, so ownership survives a browser restart.
     """
 
     def test_owner_cookie_is_httponly_lax_and_lives_a_year(
         self, accepting_client: TestClient
     ) -> None:
-        """The first submit mints D-06's exact attribute set, and nothing else."""
+        """The first submit mints the cookie's exact attribute set, and nothing else."""
         response = accepting_client.post(
             "/api/scan", data={"profile": "duplex", "title": "First Scan"}
         )
@@ -1735,7 +1773,7 @@ class TestOwnerCookie:
         """
         A second submit re-sets the same token with the year-long lifetime.
 
-        The mint rule still holds -- one value per browser (D-23) -- but every
+        The mint rule still holds -- one value per browser -- but every
         accepted submit sends it back, so the lifetime is renewed each time.
         """
         first = accepting_client.post(
@@ -1756,11 +1794,10 @@ class TestOwnerCookie:
         self, accepting_client: TestClient
     ) -> None:
         """
-        A token the browser already holds comes back unchanged, now with Max-Age.
+        A session cookie the browser already holds comes back with Max-Age.
 
-        A browser upgraded from a release that set a session cookie presents
-        that token on its next submit; it keeps its ownership and the cookie
-        becomes persistent.
+        A browser holding a token without a lifetime presents it on its next
+        submit; it keeps its ownership and the cookie becomes persistent.
         """
         held = "a-token-set-by-an-older-release"
         accepting_client.cookies.set(_OWNER_COOKIE, held)
@@ -1778,7 +1815,7 @@ class TestOwnerCookie:
     def test_owner_cookie_reuse_records_the_same_value_on_a_second_job(
         self, accepting_client: TestClient
     ) -> None:
-        """Two tabs on one device do not disown each other (D-23)."""
+        """Two tabs on one device do not disown each other."""
         accepting_client.post("/api/scan", data={"profile": "duplex", "title": "One"})
         accepting_client.post("/api/scan", data={"profile": "duplex", "title": "Two"})
 
@@ -1787,15 +1824,27 @@ class TestOwnerCookie:
         assert recorded == {accepting_client.cookies[_OWNER_COOKIE]}
 
     def test_owner_cookie_carries_at_least_32_bytes_of_entropy(
-        self, accepting_client: TestClient
+        self, accepting_client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The mint is token_urlsafe(32), which is 43 characters (T-30-57)."""
+        """
+        A fresh owner cookie is the value of ``secrets.token_urlsafe(32)``.
+
+        The mint is spied rather than measured: a constant 43-character token
+        has the right length and no entropy at all.
+        """
+        requested: list[int | None] = []
+
+        def spy_token_urlsafe(nbytes: int | None = None) -> str:
+            requested.append(nbytes)
+            return _SPIED_OWNER_TOKEN
+
+        monkeypatch.setattr(routes_module.secrets, "token_urlsafe", spy_token_urlsafe)
         accepting_client.post(
             "/api/scan", data={"profile": "duplex", "title": "Entropy"}
         )
 
-        minted = accepting_client.cookies[_OWNER_COOKIE]
-        assert len(minted) >= _MINIMUM_OWNER_COOKIE_LENGTH
+        assert requested == [_OWNER_TOKEN_BYTES]
+        assert accepting_client.cookies[_OWNER_COOKIE] == _SPIED_OWNER_TOKEN
 
     @pytest.mark.parametrize("presented", ["", "   "], ids=["empty", "whitespace"])
     def test_owner_cookie_that_is_blank_is_replaced(
@@ -1821,7 +1870,7 @@ class TestOwnerCookie:
         accepting_client: TestClient,
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
-        """The browser that submitted the job answers Continue (APPL-09)."""
+        """The browser that submitted the job answers Continue."""
         job_id, coordinator = owned_flip
 
         response = accepting_client.post("/api/flip/continue", data={"job_id": job_id})
@@ -1834,7 +1883,7 @@ class TestOwnerCookie:
         accepting_client: TestClient,
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
-        """The browser that submitted the job answers Abort (APPL-09)."""
+        """The browser that submitted the job answers Abort."""
         job_id, coordinator = owned_flip
 
         response = accepting_client.post("/api/flip/abort", data={"job_id": job_id})
@@ -1848,7 +1897,7 @@ class TestOwnerCookie:
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
         """
-        A second browser's Continue is dropped, not errored (D-16, D-24).
+        A second browser's Continue is dropped, not errored.
 
         The household member who did not load the paper must not be able to
         start pass B, and must not be shown a failure for trying either: the
@@ -1869,7 +1918,7 @@ class TestOwnerCookie:
         accepting_client: TestClient,
         owned_flip: tuple[str, WorkerFlipCoordinator],
     ) -> None:
-        """A second browser's Abort is dropped the same way (D-16, D-24)."""
+        """A second browser's Abort is dropped the same way."""
         job_id, coordinator = owned_flip
 
         response = _other_browser(accepting_client).post(
@@ -1884,11 +1933,11 @@ class TestOwnerCookie:
         self, client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
     ) -> None:
         """
-        A NULL owner token means unowned, so anyone may answer (UI-SPEC S5).
+        A NULL owner token means unowned, so anyone may answer.
 
-        This is the manual-duplex job that was already in flight when the
-        appliance was upgraded.  A strict rule would make it un-continuable and
-        force it to time out.
+        A manual-duplex job whose row carries no token has no owner to check
+        against.  A strict rule would make it un-continuable and force it to
+        time out.
         """
         job_id, coordinator = waiting_flip
         job_store: JobStore = _app(client).state.job_store
@@ -1907,7 +1956,7 @@ class TestOwnerCookie:
         owned_flip: tuple[str, WorkerFlipCoordinator],
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The token appears in no rendered markup and no log record (T-30-59)."""
+        """The token appears in no rendered markup and no log record."""
         job_id, _ = owned_flip
         minted = accepting_client.cookies[_OWNER_COOKIE]
 
@@ -2099,14 +2148,14 @@ class TestPostSubmitRender:
         assert 'id="checks-body"' in body
 
 
-# --- The followed job and the queue line (APPL-08, D-25) ---------------------
+# --- The followed job and the queue line ------------------------------------
 
 
 def _displayed(markup: str) -> str:
     """
     Return the markup with its HTML entities resolved, as a reader sees it.
 
-    Jinja autoescapes the whole busy line, and APPL-08's copy quotes the title
+    Jinja autoescapes the whole busy line, and the queue copy quotes the title
     with apostrophes, so the sentence is spelled with entities in the markup
     and only reads back as written once they are resolved.  Copy assertions use
     this; escaping assertions deliberately do not, because unescaping first
@@ -2182,10 +2231,10 @@ def _polls(markup: str, job_id: str) -> bool:
 
 class TestFollowedJob:
     """
-    The status area follows the job this browser submitted (D-25).
+    The status area follows the job this browser submitted.
 
     A submitter who sees another household member's scan reported back at them
-    learns nothing about their own, which is the whole of APPL-08's complaint.
+    learns nothing about their own.
     """
 
     def test_followed_job_status_reports_that_job_not_the_running_one(
@@ -2213,7 +2262,7 @@ class TestFollowedJob:
         A pruned job degrades to today's inference, not to a 404.
 
         A 404 would also confirm to a caller which ids exist, which is a fact
-        the appliance has no reason to hand out (T-30-61).
+        the appliance has no reason to hand out.
         """
         _running_job(client, "Still Running")
 
@@ -2324,8 +2373,8 @@ class TestFollowedJob:
         """
         A reload while someone else's scan runs follows this browser's queued job.
 
-        The page used to poll the current-job URL, so a queued submitter who
-        reloaded was shown the running job instead of their own.
+        Polling the current-job URL instead would show a queued submitter who
+        reloads the running job rather than their own.
         """
         owner = _as_owner(client)
         _running_job(client, "Someone Elses Scan", owner_token="another-browser")
@@ -2551,17 +2600,17 @@ class TestStatusPollAnswersWhenChanged:
 
 class TestQueueLine:
     """
-    What a queued submitter is told while they wait (APPL-08, UI-SPEC S5).
+    What a queued submitter is told while they wait.
 
-    Every case renders through the existing busy branch; no new state branch is
-    added, which is what keeps the flip controls disappearing the moment a job
+    Every case renders through the busy branch, with no state branch of its
+    own, which is what keeps the flip controls disappearing the moment a job
     leaves AWAITING_FLIP.
     """
 
     def test_queue_line_names_the_running_job_and_the_count(
         self, client: TestClient
     ) -> None:
-        """One job ahead reads as APPL-08 writes it, to the running job's owner."""
+        """One job ahead reads as the queue copy writes it, to the running job's owner."""
         _running_job(client, "Tax return", owner_token=_as_owner(client))
         _queued_job(client, "Ahead Of Me")
         mine = _queued_job(client, "Mine")
@@ -2613,8 +2662,7 @@ class TestQueueLine:
         """
         ``(0 ahead of you)`` is never rendered.
 
-        It is technically true and reads like a bug, which is the one thing
-        this milestone is spending itself on removing.
+        It is technically true and reads like a bug.
         """
         _running_job(client, "Tax return")
         mine = _queued_job(client, "Mine")
@@ -2635,7 +2683,7 @@ class TestQueueLine:
         assert "Waiting for" not in _displayed(response.text)
 
     def test_queue_line_escapes_the_running_title(self, client: TestClient) -> None:
-        """The title is user data and is autoescaped, never injected (T-30-62)."""
+        """The title is user data and is autoescaped, never injected."""
         _running_job(client, "<script>alert(1)</script>", owner_token=_as_owner(client))
         mine = _queued_job(client, "Mine")
 
@@ -2647,7 +2695,7 @@ class TestQueueLine:
     def test_queue_line_shows_the_front_count_on_pass_b(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Pass B leads with the pages already counted on pass A (APPL-03, D-33)."""
+        """Pass B leads with the pages already counted on pass A."""
         monkeypatch.setattr(ScanWorker, "front_pages", property(lambda _self: 12))
         job_id = _running_job(client, "Duplex Stack")
         job_store: JobStore = _app(client).state.job_store
@@ -2666,11 +2714,16 @@ class TestQueueLine:
         Templates own no vocabulary (Pattern C); a page that assembled its own
         sentence would be a second place for the copy to drift.
         """
-        status = (
-            Path(app_module.__file__).parent / "templates" / "partials" / "status.html"
-        ).read_text(encoding="utf-8")
-        assert "busy_line(" not in status
-        assert "progress_label" not in status
+        tree = _template_tree("partials", "status.html")
+        called = {
+            node.node.name
+            for node in tree.find_all(jinja2.nodes.Call)
+            if isinstance(node.node, jinja2.nodes.Name)
+        }
+        named = {node.name for node in tree.find_all(jinja2.nodes.Name)}
+        assert "busy_line" in named
+        assert "busy_line" not in called
+        assert "progress_label" not in named
 
 
 def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) -> None:
@@ -2685,7 +2738,7 @@ def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) 
 
 
 class TestProfileDescriptionRoute:
-    """GET /api/profiles/description -- the sentence under the select (APPL-05)."""
+    """GET /api/profiles/description -- the sentence under the select."""
 
     def test_a_known_profile_returns_its_description_text_alone(
         self, client: TestClient
@@ -2742,7 +2795,7 @@ class TestProfileDescriptionRoute:
     def test_a_description_containing_markup_is_escaped_not_rendered(
         self, client: TestClient
     ) -> None:
-        """Config free text is autoescaped and never marked safe (T-30-70)."""
+        """Config free text is autoescaped and never marked safe."""
         _configure_profiles(
             client,
             {
@@ -2757,7 +2810,7 @@ class TestProfileDescriptionRoute:
         assert "&lt;script&gt;" in response.text
 
     def test_the_description_route_is_a_plain_def(self, client: TestClient) -> None:
-        """Every handler runs on the threadpool, this one included (ROBU-05)."""
+        """Every handler runs on the threadpool, this one included."""
         routes = [
             route
             for route in leaf_routes(_app(client))
@@ -2769,7 +2822,7 @@ class TestProfileDescriptionRoute:
 
 
 class TestProfileOrdering:
-    """The option list the select renders, and the D-21 feeder-first rule."""
+    """The option list the select renders, feeder profiles first."""
 
     def test_options_carry_the_name_label_and_description_of_each_profile(
         self, client: TestClient
@@ -2801,7 +2854,7 @@ class TestProfileOrdering:
     def test_a_blank_label_falls_back_to_the_profile_name(
         self, client: TestClient
     ) -> None:
-        """A config written before this phase never shows a blank option (A-3)."""
+        """A profile with no label shows its name, never a blank option."""
         _configure_profiles(
             client,
             {
@@ -2817,7 +2870,7 @@ class TestProfileOrdering:
     def test_feeder_profiles_lead_the_ordering_when_no_flatbed_source_exists(
         self, client: TestClient
     ) -> None:
-        """No flatbed source is the literal definition of sheet-fed (D-21)."""
+        """No flatbed source is the literal definition of sheet-fed."""
         _configure_profiles(
             client,
             {
@@ -3202,29 +3255,160 @@ class TestPageOpensOnDefault:
         assert job_store.list_recent(limit=1)[0].profile == "default"
 
 
-# The scan form element as it stood before plan 30-15, byte for byte.  The
-# profile select lives inside it and must add nothing to it: the form already
-# carries hx-disinherit="hx-disabled-elt", because an inherited hx-disabled-elt
-# would put the form's own child requests in charge of the Scan button's
-# disabled attribute (C-10).  The one line added since is ``method`` and
-# ``action``, which are not htmx attributes and which nothing inherits: they
-# keep a JavaScript-off submit's fields out of the URL.
-_SCAN_FORM_ELEMENT = """    <form hx-post="/api/scan"
-          method="post" action="/api/scan"
-          hx-target="#status-area"
-          hx-swap="outerHTML"
-          hx-disabled-elt="#scan-btn"
-          hx-disinherit="hx-disabled-elt">
-"""
+# The scan form's attributes.  The profile select lives inside the form and
+# adds nothing to it: the form carries hx-disinherit="hx-disabled-elt" because
+# an inherited hx-disabled-elt would put the form's own child requests in
+# charge of the Scan button's disabled attribute.  ``method`` and ``action``
+# are not htmx attributes and nothing inherits them: they keep a
+# JavaScript-off submit's fields out of the URL.
+_SCAN_FORM_ATTRIBUTES: dict[str, str | None] = {
+    "hx-post": "/api/scan",
+    "method": "post",
+    "action": "/api/scan",
+    "hx-target": "#status-area",
+    "hx-swap": "outerHTML",
+    "hx-disabled-elt": "#scan-btn",
+    "hx-disinherit": "hx-disabled-elt",
+}
 
-# How many six-digit colour literals app.css held before plan 30-15.  The
-# :empty rule hides an element; it introduces no colour of its own.
-_APP_CSS_COLOUR_LITERALS = 3
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_RULE = re.compile(r"([^{};]+)\{([^{}]*)\}")
+_HEX_COLOUR = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+_THEME_TOKEN = re.compile(r"var\(--(?:pico|saneless)-[a-z0-9-]+\)")
 
 
 def _web_asset(*parts: str) -> str:
     """Read one shipped template or static file, for the markup assertions."""
     return Path(app_module.__file__).parent.joinpath(*parts).read_text(encoding="utf-8")
+
+
+def _template_tree(*parts: str) -> jinja2.nodes.Template:
+    """Parse one shipped template, so a check reads its syntax and not its comments."""
+    return jinja2.Environment(autoescape=True).parse(_web_asset("templates", *parts))
+
+
+def _css_rules(css: str) -> list[tuple[str, dict[str, str]]]:
+    """
+    Return every innermost rule of a stylesheet with its declarations.
+
+    Comments are removed first, so a comment may name any selector, property or
+    value.  A rule inside an at-rule block is returned on its own, and each
+    selector has its whitespace collapsed to single spaces.
+
+    Args:
+        css: The stylesheet's text.
+
+    Returns:
+        Each rule's selector and its declarations, property to value, in order.
+
+    """
+    rules: list[tuple[str, dict[str, str]]] = []
+    for match in _CSS_RULE.finditer(_CSS_COMMENT.sub("", css)):
+        declarations: dict[str, str] = {}
+        for declaration in match.group(2).split(";"):
+            if declaration.strip():
+                prop, _, value = declaration.partition(":")
+                declarations[prop.strip()] = " ".join(value.split())
+        rules.append((" ".join(match.group(1).split()), declarations))
+    return rules
+
+
+def _css_declarations(selector: str) -> dict[str, str]:
+    """
+    Return the declarations of the one app.css rule with ``selector``.
+
+    Args:
+        selector: The rule's selector, whitespace collapsed to single spaces.
+
+    Returns:
+        The rule's declarations, property to value.
+
+    """
+    found = [
+        declarations
+        for rule, declarations in _css_rules(_web_asset("static", "app.css"))
+        if rule == selector
+    ]
+    assert len(found) == 1, f"expected exactly one {selector} rule, found {len(found)}"
+    return found[0]
+
+
+def _stylesheet_palette_problems(css: str) -> list[str]:
+    """
+    List every colour in a stylesheet that is not drawn from a theme token.
+
+    A hex literal may appear only as the whole value of a ``--saneless-*``
+    custom property, and every ``color`` or ``background-color`` declaration
+    must read a ``--pico-*`` or ``--saneless-*`` custom property.
+
+    Args:
+        css: The stylesheet's text.
+
+    Returns:
+        One line per offending declaration or stray literal; empty when clean.
+
+    """
+    problems: list[str] = []
+    declared_literals = 0
+    for selector, declarations in _css_rules(css):
+        for prop, value in declarations.items():
+            literals = _HEX_COLOUR.findall(value)
+            declared_literals += len(literals)
+            if literals and not (
+                prop.startswith("--saneless-") and _HEX_COLOUR.fullmatch(value)
+            ):
+                problems.append(f"{selector} {{ {prop}: {value} }}")
+            if prop in {"color", "background-color"} and not _THEME_TOKEN.fullmatch(
+                value
+            ):
+                problems.append(f"{selector} {{ {prop}: {value} }}")
+    stray = len(_HEX_COLOUR.findall(_CSS_COMMENT.sub("", css))) - declared_literals
+    if stray:
+        problems.append(f"{stray} hex literal(s) outside any declaration")
+    return problems
+
+
+def test_every_stylesheet_colour_is_a_theme_token() -> None:
+    """
+    Every colour app.css draws comes from a Pico or saneless custom property.
+
+    A hex literal is only ever the value of a ``--saneless-*`` property, so the
+    palette stays the theme's, and light and dark both follow it.
+    """
+    css = _web_asset("static", "app.css")
+    rules = _css_rules(css)
+
+    assert _stylesheet_palette_problems(css) == []
+    assert any(
+        prop.startswith("--saneless-") and _HEX_COLOUR.fullmatch(value)
+        for _selector, declarations in rules
+        for prop, value in declarations.items()
+    )
+    assert any("color" in declarations for _selector, declarations in rules)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        ".x { color: #123456; }",
+        ".x { background-color: red; }",
+        ".x { border: 1px solid #abc; }",
+        ":root { --pico-color: #abcdef; }",
+        ".x { color: var(--other-colour); }",
+        "#abcdef, .x { display: none; }",
+    ],
+    ids=[
+        "hex-color",
+        "named-background",
+        "hex-border",
+        "hex-pico-token",
+        "foreign-token",
+        "hex-outside-declaration",
+    ],
+)
+def test_the_palette_check_names_an_untokened_colour(rule: str) -> None:
+    """The palette check reports a colour that bypasses the theme tokens."""
+    assert _stylesheet_palette_problems(rule) != []
 
 
 def _profile_select_tag(page: str) -> str:
@@ -3234,12 +3418,12 @@ def _profile_select_tag(page: str) -> str:
 
 
 class TestProfileSelectMarkup:
-    """UI-SPEC S4: the select's wiring and its live description slot."""
+    """The select's wiring and its live description slot."""
 
     def test_the_profile_select_carries_its_htmx_and_aria_wiring(
         self, client: TestClient
     ) -> None:
-        """The seven attributes S4 specifies, and the swap is never outerHTML."""
+        """The select carries its seven wiring attributes and never swaps outerHTML."""
         response = client.get("/")
 
         select = _profile_select_tag(response.text)
@@ -3310,18 +3494,22 @@ class TestProfileSelectMarkup:
     def test_the_profile_select_adds_no_attribute_to_the_scan_form(
         self, client: TestClient
     ) -> None:
-        """The C-10 fix is untouched and the select inherits nothing harmful."""
-        source = _web_asset("templates", "index.html")
+        """Only the scan form carries hx-disabled-elt, and the select inherits none."""
+        tags = template_start_tags(
+            Path(app_module.__file__).parent / "templates" / "index.html"
+        )
 
-        assert _SCAN_FORM_ELEMENT in source
-        assert source.count('hx-disabled-elt="') == 1
+        carriers = [attrs for _tag, attrs in tags if "hx-disabled-elt" in attrs]
+        forms = [attrs for tag, attrs in tags if tag == "form"]
+        assert carriers == [_SCAN_FORM_ATTRIBUTES]
+        assert _SCAN_FORM_ATTRIBUTES in forms
         assert "hx-disabled-elt" not in _profile_select_tag(client.get("/").text)
 
     def test_the_profile_select_has_exactly_one_help_line(
         self, client: TestClient
     ) -> None:
         """
-        The description doubles as the control's help text (APPL-10).
+        The description doubles as the control's help text.
 
         The Multiple pages field sits between the profile and the title, and
         its help line belongs to its own checkbox, so the count stops where
@@ -3334,18 +3522,21 @@ class TestProfileSelectMarkup:
         )[0]
         assert under_profile.count("<small") == 1
 
-    def test_the_profile_select_empty_slot_rule_is_the_only_new_css(self) -> None:
-        """One rule, hiding the slot; no new colour value (UI-SPEC S4)."""
-        css = _web_asset("static", "app.css")
+    def test_the_profile_description_slot_rule_only_hides_it_when_empty(self) -> None:
+        """One rule styles the slot, and all it does is hide the empty slot."""
+        selectors = [
+            selector
+            for selector, _declarations in _css_rules(_web_asset("static", "app.css"))
+            if "#profile-description" in selector
+        ]
 
-        assert "#profile-description:empty {\n    display: none;\n}" in css
-        assert css.count("#profile-description") == 1
-        assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOUR_LITERALS
+        assert selectors == ["#profile-description:empty"]
+        assert _css_declarations("#profile-description:empty") == {"display": "none"}
 
     def test_the_profile_select_still_submits_the_chosen_profile(
         self, client: TestClient
     ) -> None:
-        """Changing the option text did not change what the form posts."""
+        """The option text does not change what the form posts."""
         response = client.post(
             "/api/scan", data={"profile": "duplex", "title": "Select Submit"}
         )
@@ -3374,7 +3565,7 @@ _OVER_LONG_FILTER = "a" * 500
 
 # A filter value that would be an injected script if it were ever echoed.  It is
 # well under the cap, so it reaches the filter rather than the 422 path, which is
-# the case worth proving (T-30-74).
+# the case worth proving.
 _SCRIPT_FILTER = "<script>alert(1)</script>"
 
 
@@ -3458,12 +3649,11 @@ def _checkbox(markup: str, tag_id: int) -> str:
 
 class TestTagFilter:
     """
-    UI-SPEC S6: the server-side tag filter that can never drop a tick.
+    The server-side tag filter that can never drop a tick.
 
     Two hazards are designed out rather than guarded against, and these tests
-    are what hold the design in place: a filter swap must not lose a ticked tag
-    (A-5), and the filter text must never reach paperless-ngx or the page
-    (T-30-74, T-30-75).
+    are what hold the design in place: a filter swap must not lose a ticked
+    tag, and the filter text must never reach paperless-ngx or the page.
     """
 
     def test_tag_filter_absent_renders_every_tag_as_an_unchecked_checkbox(
@@ -3497,7 +3687,7 @@ class TestTagFilter:
     def test_tag_filter_renders_the_carried_selection_checked(
         self, client: TestClient
     ) -> None:
-        """A tag id the request carries comes back ticked (A-5)."""
+        """A tag id the request carries comes back ticked."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": "rec", "tags": [3]})
@@ -3508,7 +3698,7 @@ class TestTagFilter:
     def test_tag_filter_pins_a_selected_tag_the_filter_excludes(
         self, client: TestClient
     ) -> None:
-        """A tick outside the filter stays in the DOM, above the list (A-5)."""
+        """A tick outside the filter stays in the DOM, above the list."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": "rec", "tags": [2, 3]})
@@ -3530,7 +3720,7 @@ class TestTagFilter:
     def test_tag_filter_never_echoes_the_query_into_the_response(
         self, client: TestClient
     ) -> None:
-        """The filter is a filter, never a label: it is not rendered (T-30-74)."""
+        """The filter is a filter, never a label: it is not rendered."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": _SCRIPT_FILTER})
@@ -3553,7 +3743,7 @@ class TestTagFilter:
     def test_tag_filter_rejects_an_over_long_query_with_422(
         self, client: TestClient
     ) -> None:
-        """An unbounded filter is refused at the boundary (T-30-76)."""
+        """An unbounded filter is refused at the boundary."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": _OVER_LONG_FILTER})
@@ -3563,7 +3753,7 @@ class TestTagFilter:
     def test_tag_filter_issues_no_upstream_request_when_the_cache_is_warm(
         self, client: TestClient
     ) -> None:
-        """Filtering reads the cache; it is not a new fetch (T-30-75)."""
+        """Filtering reads the cache; it is not a new fetch."""
         app = _app(client)
         handler = _count_upstream(app)
         app.state.cache.set("tags", list(_TAG_ROWS))
@@ -3577,7 +3767,7 @@ class TestTagFilter:
     def test_tag_filter_never_forwards_the_query_to_paperless(
         self, client: TestClient
     ) -> None:
-        """A cold cache fetches the whole list and carries no ``q`` (T-30-75)."""
+        """A cold cache fetches the whole list and carries no ``q``."""
         app = _app(client)
         handler = _count_upstream(app)
         app.state.cache.invalidate("tags")
@@ -3634,7 +3824,7 @@ class TestTagFilter:
         self, client: TestClient
     ) -> None:
         """
-        The belt to the form-owner attribute's braces (A-6).
+        The belt to the form-owner attribute's braces.
 
         The filter input's HTML form owner is ``#tag-filter-form``, so a scan
         cannot carry ``q`` at all.  This covers the residual case -- a scripted
@@ -3851,8 +4041,10 @@ class TestStaleDefaultAndUnlistedRows:
     def test_stale_default_template_marks_nothing_safe(self) -> None:
         """Names and notes are autoescaped text; the partials mark none safe."""
         for name in ("tags.html", "correspondents.html"):
-            source = _web_asset("templates", "partials", name)
-            assert "|safe" not in source.replace(" ", ""), name
+            tree = _template_tree("partials", name)
+            filters = {node.name for node in tree.find_all(jinja2.nodes.Filter)}
+            assert "safe" not in filters, name
+            assert not list(tree.find_all(jinja2.nodes.MarkSafe)), name
 
     def test_stale_default_correspondent_known_selection_is_selected(
         self, client: TestClient
@@ -3904,35 +4096,29 @@ class TestStaleDefaultAndUnlistedRows:
         assert markup.count("<option") == 2
 
 
-# The profile defaults the D-29 regression tests drive, chosen so neither can
+# The profile defaults the hidden-control tests drive, chosen so neither can
 # be produced by accident: no fixture tag or correspondent uses these ids.
 _PROFILE_DEFAULT_TAGS = [41, 42]
 _PROFILE_DEFAULT_CORRESPONDENT = 43
 
-# The two rules UI-SPEC S6 adds to app.css, property by property. Written out
-# here rather than matched loosely, because "the tap target is 44 px" is the
-# whole of D-30 and a rule that lost one declaration would still look right.
-# The Multiple pages checkbox shares the tag rows' rule rather than a copy.
-_TAG_OPTION_RULE = """label.tag-option,
-label.multi-page-option {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    min-height: 2.75rem;
-    margin-bottom: 0;
-    cursor: pointer;
-}"""
-
-_TAG_LIST_RULE = """.tag-list {
-    max-height: 17.5rem;
-    overflow-y: auto;
-    margin-bottom: var(--pico-spacing);
-}"""
-
-# How many six-digit colour literals app.css held before this plan. A touch
-# target is a size, not a colour, so the count may not move.
-_APP_CSS_COLOURS_BEFORE_30_16 = 3
+# The tap-target rules, declaration by declaration: "the tap target is 44 px"
+# is the whole point, and a rule that lost one declaration would still look
+# right.  The Multiple pages checkbox shares the tag rows' rule.
+_TAG_OPTION_SELECTOR = "label.tag-option, label.multi-page-option"
+_TAG_OPTION_DECLARATIONS = {
+    "display": "flex",
+    "align-items": "center",
+    "gap": "0.5rem",
+    "width": "100%",
+    "min-height": "2.75rem",
+    "margin-bottom": "0",
+    "cursor": "pointer",
+}
+_TAG_LIST_DECLARATIONS = {
+    "max-height": "17.5rem",
+    "overflow-y": "auto",
+    "margin-bottom": "var(--pico-spacing)",
+}
 
 
 def _simple_form_app(
@@ -3959,7 +4145,7 @@ def _simple_form_app(
     """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token=credential),
+        paperless=PaperlessConfig(url="http://paperless.invalid", token=credential),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
         profiles={
@@ -3979,7 +4165,7 @@ def _simple_form_app(
 @pytest.mark.usefixtures("offline_paperless")
 class TestSimpleForm:
     """
-    D-28 and D-29: the owner can shrink the form without changing the scan.
+    The owner can shrink the form without changing the scan.
 
     Two separate claims, and the second is the one that could go wrong quietly.
     Hiding a control changes what a household member is asked; it must not
@@ -4055,7 +4241,7 @@ class TestSimpleForm:
     def test_simple_form_keeps_every_control_when_both_are_on(
         self, tmp_path: Path
     ) -> None:
-        """The default shape is the full form, so an upgrade changes nothing."""
+        """The default shape is the full form, with every control shown."""
         with TestClient(_simple_form_app(tmp_path)) as client:
             page = client.get("/").text
 
@@ -4072,7 +4258,7 @@ class TestSimpleForm:
     def test_simple_form_hides_by_absence_and_never_with_css(
         self, tmp_path: Path
     ) -> None:
-        """D-28: the controls are not rendered, not rendered-then-hidden."""
+        """The controls are not rendered, not rendered-then-hidden."""
         with TestClient(
             _simple_form_app(tmp_path, show_tags=False, show_correspondent=False)
         ) as client:
@@ -4085,7 +4271,7 @@ class TestSimpleForm:
     def test_simple_form_without_tags_still_applies_the_profile_default_tags(
         self, tmp_path: Path
     ) -> None:
-        """D-29: hiding the control changes the form, never the scan."""
+        """Hiding the control changes the form, never the scan."""
         with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
@@ -4097,7 +4283,7 @@ class TestSimpleForm:
     def test_simple_form_without_correspondent_still_applies_its_default(
         self, tmp_path: Path
     ) -> None:
-        """The correspondent half of the same claim (D-29)."""
+        """The correspondent half of the same claim."""
         with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
@@ -4126,11 +4312,9 @@ class TestSimpleForm:
             assert job_store.list_recent(limit=1)[0].tags == [7]
 
     def test_simple_form_tag_rows_are_a_thumb_sized_tap_target(self) -> None:
-        """D-30: the label is the target and it clears 44 px at a 16 px root."""
-        css = _web_asset("static", "app.css")
-
-        assert _TAG_OPTION_RULE in css
-        assert _TAG_LIST_RULE in css
+        """The label is the target and it clears 44 px at a 16 px root."""
+        assert _css_declarations(_TAG_OPTION_SELECTOR) == _TAG_OPTION_DECLARATIONS
+        assert _css_declarations(".tag-list") == _TAG_LIST_DECLARATIONS
 
     def test_simple_form_tap_target_rule_outweighs_pico_by_load_order(self) -> None:
         """
@@ -4140,16 +4324,14 @@ class TestSimpleForm:
         the tie is what makes this win -- and a tie only wins because app.css
         loads second.
         """
-        css = _web_asset("static", "app.css")
+        parts = [
+            part.strip()
+            for selector, _declarations in _css_rules(_web_asset("static", "app.css"))
+            for part in selector.split(",")
+            if "tag-option" in part
+        ]
 
-        assert "\n.tag-option {" not in css
-        assert css.count("label.tag-option,\nlabel.multi-page-option {") == 1
-
-    def test_simple_form_touch_targets_add_no_colour_to_the_stylesheet(self) -> None:
-        """A tap target is a size; the palette may not move (UI-SPEC S6)."""
-        css = _web_asset("static", "app.css")
-
-        assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOURS_BEFORE_30_16
+        assert parts == ["label.tag-option"]
 
 
 def _newest_job(client: TestClient) -> Job:
@@ -4203,7 +4385,7 @@ class TestProfileDefaultsFollowTheFormShape:
         assert len(calls) == 1
 
     def test_a_cleared_tag_list_submits_no_tags(self, tmp_path: Path) -> None:
-        """The review's named regression test: unticking every box means none."""
+        """Unticking every tag box on a shown control submits no tags."""
         with TestClient(_simple_form_app(tmp_path)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Cleared"}
@@ -4215,7 +4397,7 @@ class TestProfileDefaultsFollowTheFormShape:
     def test_a_hidden_tag_control_still_applies_the_profile_default(
         self, tmp_path: Path
     ) -> None:
-        """D-29's half: with no control on the page the profile answers."""
+        """With no tag control on the page, the profile's default tags apply."""
         with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Hidden"}
@@ -4238,7 +4420,7 @@ class TestProfileDefaultsFollowTheFormShape:
     def test_a_cleared_correspondent_submits_no_correspondent(
         self, tmp_path: Path
     ) -> None:
-        """The correspondent half of the same regression."""
+        """Choosing no correspondent on a shown control submits none."""
         with TestClient(_simple_form_app(tmp_path)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Cleared"}
@@ -4250,7 +4432,7 @@ class TestProfileDefaultsFollowTheFormShape:
     def test_a_hidden_correspondent_control_still_applies_the_default(
         self, tmp_path: Path
     ) -> None:
-        """The correspondent half of D-29."""
+        """With no correspondent control on the page, the profile's default applies."""
         with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Hidden"}
@@ -4350,7 +4532,7 @@ def _pre_ticked_app(
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(
-            url="http://localhost:8000", token="a-real-looking-token"
+            url="http://paperless.invalid", token="a-real-looking-token"
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_path),
@@ -4937,7 +5119,7 @@ class TestProfileDefaultsArePreTicked:
     def test_profile_change_shows_a_stale_default_ticked_with_the_note(
         self, tmp_path: Path
     ) -> None:
-        """A default paperless-ngx no longer has is ticked, and says so."""
+        """A default missing from paperless-ngx is ticked, and says so."""
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             tags = client.get("/api/profiles/tags", params={"profile": "gone"}).text
             select = client.get(
@@ -5166,11 +5348,11 @@ class TestMetadataFollowsTheSubmittedProfile:
         self, tmp_path: Path
     ) -> None:
         """
-        The regression: ``other`` submitted with ``default``'s metadata.
+        Ticks marked for ``default`` give way when ``other`` is submitted.
 
-        This is what a restored Profile select or an unfinished swap sends,
-        and before the marker it filed ``default``'s tags and correspondent
-        under ``other`` with no warning.
+        This is what a restored Profile select or an unfinished swap sends;
+        without the markers, ``default``'s tags and correspondent would be
+        filed under ``other`` with no warning.
         """
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             response = client.post(
@@ -5519,7 +5701,7 @@ def _counted_app(
     counter = _MetadataRequestCounter()
     credential = "a-real-looking-token"
     app.state.paperless = PaperlessClient(
-        url="http://localhost:8000",
+        url="http://paperless.invalid",
         token=credential,
         transport=httpx2.MockTransport(counter),
     )
@@ -5547,7 +5729,7 @@ def _load_page_and_lists(client: TestClient) -> str:
 
 class TestHiddenControlsCostNoMetadataFetch:
     """
-    IN-01: an appliance does not pay for data its markup leaves out.
+    An appliance does not pay for data its markup leaves out.
 
     On a cold metadata cache a page load costs one paperless-ngx round trip per
     optional control, and the flags the template branches on are the same flags
