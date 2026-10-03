@@ -255,15 +255,19 @@ repos:
         stages: [pre-commit, pre-merge-commit, pre-push]
 
       # tests/ruff.toml bans time.sleep in tests, but a thread can pause just as
-      # well on an Event nobody sets, and the ban cannot see that. A fixed
-      # pause belongs in conftest's quiet_window helper, where it can be found
-      # by name, so the one-line idiom for an inline pause fails here. It is a
-      # net for the common spelling, not a proof: a named Event that is never
-      # set still gets through, and review has to catch it.
+      # well on an Event nobody sets, and a browser test can pause on the page's
+      # wait_for_timeout; the ban sees neither. A fixed pause, threaded or in
+      # the browser, belongs in conftest's named helpers (quiet_window and
+      # browser_quiet_window), where it can be found by name, so the one-line
+      # idiom for either inline pause fails here. conftest holds those helpers,
+      # so it is the one file excluded. It is a net for the common spellings,
+      # not a proof: a named Event that is never set still gets through, and
+      # review has to catch it.
       - id: no-inline-fixed-waits
         name: no inline fixed pauses in tests
         language: pygrep
-        entry: 'Event\(\)\.wait\('
+        entry: 'Event\(\)\.wait\(|wait_for_timeout\('
         files: ^tests/
+        exclude: ^tests/conftest\.py$
         types: [python]
         stages: [pre-commit, pre-merge-commit, pre-push]
