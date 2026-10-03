@@ -46,6 +46,15 @@ CITATION_SAMPLES = (
     "50-RESEARCH.md",
     "UI-SPEC",
     ".planning/",
+    "checks.py:21",
+    "worker.py:1288",
+    "sane.py:188-213",
+    "CLAUDE.md",
+    "this phase",
+    "three phases",
+    "That phase",
+    "earlier phases",
+    "pre-phase-23",
 )
 
 # Ordinary text the pattern must leave alone: encodings, standards and hash
@@ -57,4 +66,13 @@ NON_CITATIONS = (
     "A4",
     "N-1",
     "EXPLAIN QUERY PLAN",
+    "every phase of the request",
+    "the call phase",
+    "spooling phase",
+    "pool phases",
+    "test_x.py::test_y",
+    "tests/test_cli.py",
+    "a two-phase commit",
+    "phase out",
+    "seeded.md:3",
 )
