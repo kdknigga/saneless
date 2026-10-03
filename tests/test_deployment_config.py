@@ -1830,7 +1830,7 @@ def test_compose_ships_no_live_paperless_environment_line() -> None:
     assert not offenders, (
         "the shipped compose template still sets the paperless connection in "
         "its environment: block, which silently overrides "
-        "./config/saneless.toml (D-17, U-01):\n" + "\n".join(offenders)
+        "./config/saneless.toml; comment the line out:\n" + "\n".join(offenders)
     )
 
 
@@ -1866,7 +1866,8 @@ def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> Non
     explanation = _comment_lines_above(lines, mounts[0])
     assert explanation >= 2, (
         f"{COMPOSE.name}: the consume-directory mount has {explanation} "
-        "comment lines above it; APPL-11 asks for a two-line explanation"
+        "comment lines above it; an operator needs at least two lines saying "
+        "what the mount is for"
     )
     assert _says(_comment_block_above(lines, mounts[0]), "set paperless.consume_dir"), (
         f"{COMPOSE.name}: the consume mount's comment does not say that "
@@ -2582,8 +2583,9 @@ def test_no_shipped_file_references_the_old_owner() -> None:
             if FORBIDDEN_OWNER_SLUG in line
         )
     assert not offenders, (
-        "a shipped file still references the old GitHub owner, which DLVR-01 "
-        "renames. Every project URL must use the kdknigga forms -- "
+        "a shipped file still references the old GitHub owner, which no "
+        "longer hosts the project. Every project URL must use the kdknigga "
+        "forms -- "
         "github.com/kdknigga/saneless, kdknigga.github.io/saneless and "
         f"{PUBLISHED_IMAGE}:\n" + "\n".join(offenders)
     )
@@ -2796,9 +2798,8 @@ def test_readme_scan_example_carries_a_title() -> None:
     ]
     assert not offenders, (
         "a README scan example omits --title. The flag is optional at runtime "
-        "-- saneless resolves a default -- but DOCS-02 asks the front-page "
-        "example to show the reader how a document gets its name:\n"
-        + "\n".join(offenders)
+        "-- saneless resolves a default -- but the front-page example has to "
+        "show the reader how a document gets its name:\n" + "\n".join(offenders)
     )
 
 
