@@ -1,28 +1,19 @@
 """
-The status strip's routes, context and markup.
+The status strip decides when a probe happens and what markup carries it.
 
-Covers requirements: APPL-01, APPL-02, APPL-06, APPL-11 (decisions D-04, D-05,
-D-06, D-08, D-09, D-22).
+``saneless.checks`` owns every word a row can say; these tests pin the web
+half of the shared registry:
 
-This file exists because the strip is the **web half of the shared registry**.
-``saneless.checks`` already owns every word a row can say and
-``tests/test_checks.py`` pins those words; what nothing pinned until now is the
-half that decides *when* a probe happens and *what markup* carries it.  Both
-are load-bearing:
+* **No request handler probes.**  An unplugged sane-net host is a TCP connect
+  that hangs until the OS gives up, so a page that probed would hang.  The page
+  reads a cache a background thread fills, and a spy on ``run_checks`` proves
+  the page makes no call.
+* **The poll stops itself.**  The cold-start body carries ``hx-trigger`` and
+  the body that replaces it does not, so an abandoned browser tab does not keep
+  the lazy refresher awake.
 
-* **Zero probes in a request handler (D-04).**  An unplugged sane-net host is a
-  TCP connect that hangs until the OS gives up, so a page that probed would be
-  a page that hangs.  The mechanism is "the page reads a cache a background
-  thread fills", and the only way to prove the page honours it is to spy on
-  ``run_checks`` and assert the count is zero.
-* **A poll that stops itself (D-06).**  The cold-start body carries
-  ``hx-trigger``; the body that replaces it does not, so the poll ends.  A
-  steady-state poll would keep D-05's lazy refresher awake for every abandoned
-  browser tab, which is exactly what D-05 forbids.
-
-The assertion style is ``tests/test_web_state_rendering.py``'s: compiled
-regexes matched over the whole rendered page, so an attribute assertion cannot
-be satisfied by markup somewhere else on the page.
+Attributes are asserted against compiled regexes over the matched element, so
+markup elsewhere on the page cannot satisfy them.
 """
 
 from __future__ import annotations
@@ -95,8 +86,8 @@ if TYPE_CHECKING:
     from saneless.web.checks_cache import CachedChecks
     from saneless.web.refresher import CheckRefresher, ManualProbe
 
-# The paused Scanner row, quoted from UI-SPEC S1 so the route test fails if the
-# registry's sentence and the page's sentence ever drift apart (D-02).
+# The paused Scanner row, quoted from the interface spec so the route test fails
+# if the registry's sentence and the page's sentence ever drift apart.
 PAUSED_SCANNER_MESSAGE = "Not checked while a scan is running."
 PAUSED_PREFIX = "Paused during scan — "
 
@@ -118,9 +109,9 @@ class _StubScanner(StubScannerBackend):
     """
     The shared stub backend, but reporting one device instead of none.
 
-    Copied from ``tests/test_web_state_rendering.py``: the profile dropdown and
-    the worker's startup profile generation both read ``get_devices``, and a
-    device list of one is what these tests render against.
+    The profile dropdown and the worker's startup profile generation both read
+    ``get_devices``, and a device list of one is what these tests render
+    against.
     """
 
     def get_devices(self) -> list[DeviceInfo]:
@@ -316,7 +307,7 @@ def _results_with_a_skipped_scanner() -> tuple[CheckResult, ...]:
     """
     Build the six rows a refresh during a scan produces.
 
-    The Scanner row carries UI-SPEC S1's paused sentence and the ``skipped``
+    The Scanner row carries the paused sentence and the ``skipped``
     flag; its state is ``OK`` for the reason ``_scanner_skipped``'s is, which is
     exactly why a marker derived from the state alone would render it green.
 
@@ -388,7 +379,7 @@ def _make_app(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(url="http://paperless.invalid", token="test-token"),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
-        # Two profiles, so the worker's startup generation (D-14) does not fire
+        # Two profiles, so the worker's startup generation does not fire
         # and swap the profile set while these requests read it.
         profiles={
             "default": ProfileConfig(),
@@ -420,11 +411,9 @@ class _FakeClock:
     """
     A monotonic clock the test moves by hand instead of waiting for.
 
-    A local copy of ``tests/test_checks_cache.py``'s, rather than an import
-    from another test module: ten lines of duplication costs less than a
-    dependency between two test files, and nothing here may sleep -- the whole
-    reason ``CheckCache`` takes its clock as a parameter is that a suite
-    waiting on the wall clock to watch an interval elapse is slow and flaky.
+    Ten lines of duplication cost less than a dependency between two test
+    modules.  ``CheckCache`` takes its clock as a parameter so that no test
+    waits on the wall clock to watch an interval elapse.
     """
 
     def __init__(self, start: float = 100.0) -> None:
@@ -445,7 +434,7 @@ class _PaperlessRequestCounter:
     Counts the HTTP requests the Paperless check issues, at the transport.
 
     A probe spy counts calls into ``run_checks``; this counts what would
-    really have left the appliance, which is the quantity WR-05 is about.
+    really have left the appliance, which is what the refresh floor bounds.
     """
 
     def __init__(self) -> None:
@@ -494,13 +483,9 @@ def counting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Count
     """Build a client whose Paperless client answers from a counting transport."""
     counter = _PaperlessRequestCounter()
     # The refresh minimum interval is measured against CheckCache's clock, so this
-    # fixture substitutes it exactly as ``clocked`` does. Without the injection the
-    # cache runs on the wall clock and "twenty refreshes inside the window" becomes
-    # an assumption about how fast the runner is: true on a laptop (0.37 s for the
-    # whole class), false on a loaded GitHub runner, where all twenty fell outside
-    # the window and probed -- `assert (20 - 0) == 1`, run 35377527532, 2026-09-18.
-    # _FakeClock's own docstring says why the parameter exists: a suite waiting on
-    # the wall clock to watch an interval elapse is slow and flaky (TEST-01).
+    # fixture substitutes it exactly as ``clocked`` does. On the wall clock,
+    # "twenty refreshes inside the window" would be an assumption about how fast
+    # the runner is, and a loaded runner lets them fall outside it and probe.
     # The clock is never advanced here; this fixture's one test wants the window
     # held open, and a frozen clock is the only way to say that without timing luck.
     clock = _FakeClock()
@@ -565,7 +550,7 @@ def _spy(monkeypatch: pytest.MonkeyPatch) -> _ProbeSpy:
 
 
 def _warm_the_cache(client: TestClient) -> None:
-    """Store a set of results directly, so the cache is no longer cold."""
+    """Store a set of results directly, so the cache is warm."""
     _app(client).state.checks.store(_synthetic_results())
 
 
@@ -574,10 +559,9 @@ def _adopt_as_current_job(client: TestClient, job_id: str) -> None:
     Point the live worker at `job_id` without submitting real work.
 
     This writes ``ScanWorker._current_job_id`` directly, which is private.  It
-    is the single place in this module that does so, deliberately, and it is
-    the same reach-through ``tests/test_web_state_rendering.py`` documents: the
-    routes read "is a scan running" through the worker, and driving it through
-    the real submit path would run a pipeline these tests do not want.
+    is the single place in this module that does so: the routes read "is a
+    scan running" through the worker, and driving it through the real submit
+    path would run a pipeline these tests do not want.
     """
     _app(client).state.worker._current_job_id = job_id
 
@@ -696,7 +680,7 @@ def _a_recording_cache(
 
     Substituted where the app builds its cache, for the reason the ``clocked``
     fixture is: replacing ``app.state.checks`` afterwards would leave the
-    refresher holding the original and the two would no longer be one cache.
+    refresher holding the original, and the two would be separate caches.
 
     Args:
         tmp_path: The directory the data and temp folders live in.
@@ -839,7 +823,7 @@ def _follow_the_poll(client: TestClient, limit: int) -> list[str]:
 
 
 class TestNoProbeInARequest:
-    """D-04: rendering reads the cache; only Refresh is allowed to probe."""
+    """Rendering reads the cache; only Refresh is allowed to probe."""
 
     def test_index_renders_without_probing(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -867,10 +851,10 @@ class TestNoProbeInARequest:
 
 
 class TestWatcherStamping:
-    """D-05: the refresher only works while a page says someone is looking."""
+    """The refresher only works while a page says someone is looking."""
 
     def test_index_stamps_the_watcher(self, client: TestClient) -> None:
-        """Without this stamp the lazy refresher never probes at all."""
+        """A page load stamps the watcher, without which the refresher never probes."""
         before = _refresher(client).watch_count
         client.get("/")
         assert _refresher(client).watch_count == before + 1
@@ -882,7 +866,7 @@ class TestWatcherStamping:
         assert _refresher(client).watch_count == before + 1
 
     def test_refresh_stamps_the_watcher(self, client: TestClient) -> None:
-        """An explicit click is the clearest evidence of a watcher there is."""
+        """A Check again click stamps the watcher, as the clearest sign of one."""
         before = _refresher(client).watch_count
         client.post("/api/checks/refresh")
         assert _refresher(client).watch_count == before + 1
@@ -910,7 +894,7 @@ class TestWatcherStamping:
 
 
 class TestColdStart:
-    """D-06: six ``Checking…`` rows and a poll that ends itself."""
+    """A cold strip is six ``Checking…`` rows and a poll that ends itself."""
 
     def test_cold_start_renders_one_checking_row_per_check(
         self, client: TestClient
@@ -931,28 +915,25 @@ class TestColdStart:
         assert 'hx-get="/api/checks?attempt=1"' in attrs
 
     def test_a_body_with_results_does_not_poll(self, client: TestClient) -> None:
-        """The swapped-in replacement has no trigger, so the poll stops (D-06)."""
+        """The swapped-in replacement has no trigger, so the poll stops."""
         _warm_the_cache(client)
         attrs = _body_attrs(client.get("/api/checks").text)
         assert "hx-trigger" not in attrs
         assert "aria-busy" not in attrs
 
     def test_the_index_never_polls_once_results_exist(self, client: TestClient) -> None:
-        """A warm page load carries no steady-state poll either (T-30-48)."""
+        """A warm page load carries no steady-state poll either."""
         _warm_the_cache(client)
         assert "hx-trigger" not in _body_attrs(client.get("/").text)
 
 
 class TestColdStartPollChain:
     """
-    IN-07: how many times a cold strip can be made to ask (the before-state).
+    A cold strip asks a bounded number of times, followed link by link.
 
-    ``TestColdStart`` above asserts that *a* cold body polls and that *a* warm
-    body does not.  Neither says anything about the case IN-07 is about: a
-    cache that is never filled, where the only terminating condition the strip
-    has can never fire.  These follow the chain instead of looking at one link
-    of it, which is what makes "does this ever stop" a question the suite can
-    answer.
+    A cache that is never filled never fires the strip's primary ending, so
+    these tests follow the chain rather than looking at one link of it, which
+    is what makes "does this ever stop" a question the suite can answer.
     """
 
     def test_the_cold_poll_chain_ends_at_the_cap(
@@ -977,11 +958,11 @@ class TestColdStartPollChain:
         self, client: TestClient
     ) -> None:
         """
-        A cache with results ends the chain immediately, which is D-06 unchanged.
+        A cache with results ends the chain at its first link.
 
         Stated as a chain rather than as one attribute so that it stays the
-        *primary* terminating condition: whatever else is added, results
-        arriving must still stop the poll on the very next response.
+        *primary* terminating condition: results arriving stop the poll on the
+        very next response.
         """
         _warm_the_cache(client)
         assert _follow_the_poll(client, _POLL_CHAIN_LIMIT) == ["/api/checks"]
@@ -989,20 +970,13 @@ class TestColdStartPollChain:
 
 class TestBoundedPoll:
     """
-    IN-07: the cold-start poll's second ending, and what it leaves behind.
+    The cold-start poll stops at an attempt cap, and leaves the way forward.
 
-    Until now the poll had exactly one terminating condition -- results landing
-    in the cache -- so an appliance whose refresher thread had died left every
-    open tab asking forever.  Measured in Chromium before this cap existed,
-    "forever" was 42 requests a second, not the one every two seconds the
-    markup claimed: htmx fires ``load`` on content it has just swapped in, and
-    this body swaps in a copy of itself carrying ``load, every 2s``.
-
-    So the fix is two things and both are pinned here.  The server counts the
-    attempts and stops emitting the trigger, and the polling body no longer
-    carries ``load`` -- the interval in the markup is now the interval the
-    browser uses.  Results arriving stays the *primary* ending; the cap is the
-    one that fires when nothing ever arrives.
+    Results landing in the cache is the primary ending.  The cap is the one
+    that fires when nothing ever arrives, such as when the refresher thread has
+    died: the server counts the attempts and stops emitting the trigger.  Only
+    the first body carries ``load``, because htmx fires ``load`` on content it
+    has just swapped in and a polled body carrying it would ask again at once.
     """
 
     def test_a_poll_below_the_cap_names_the_next_attempt(
@@ -1020,18 +994,13 @@ class TestBoundedPoll:
         self, client: TestClient
     ) -> None:
         """
-        At the cap the swap target is inert; at attempt 0 it is not (T-30-27-04).
+        At the cap the swap target is inert; at attempt 0 it is not.
 
-        Asserted against the attributes the server really rendered rather than
-        against the template source, because a conditional a comment describes
-        and the markup does not honour would satisfy a source grep and leave
-        the loop running.  Both halves live in one test on purpose: an
-        assertion that something is absent is worth nothing without the paired
-        assertion that the same reading finds it when it is present.
-
-        ``hx-`` and not merely ``hx-trigger``: an ``outerHTML`` swap target
-        that carries any unconditional htmx request attribute re-arms itself,
-        which is the trap this file's template comment exists to prevent.
+        Asserted against the rendered attributes, and both halves in one test:
+        an absence is worth nothing without the same reading finding the
+        attribute when it is present.  ``hx-`` and not merely ``hx-trigger``,
+        because an ``outerHTML`` swap target carrying any unconditional htmx
+        request attribute re-arms itself.
         """
         first = _body_attrs(client.get("/api/checks?attempt=0").text)
         assert "hx-get" in first
@@ -1050,13 +1019,10 @@ class TestBoundedPoll:
         """
         ``load`` rides only on the body a page first parses, never on a polled one.
 
-        This is the half of the fix the attempt counter alone would not give.
         htmx re-fires ``load`` for content it has swapped in, so a polled body
-        carrying it requests again the moment it arrives -- measured at 42
-        requests a second against the 0.5 the markup advertises.  With the cap
-        in place that would spend every attempt in a quarter of a second, and
-        the legitimate cold start would be cut off before the refresher's first
-        tick.
+        carrying it would request again the moment it arrived, spend every
+        attempt in a fraction of a second and cut off a legitimate cold start
+        before the refresher's first tick.
         """
         first = _body_attrs(client.get("/api/checks?attempt=0").text)
         assert "load," in first
@@ -1105,7 +1071,7 @@ class TestBoundedPoll:
         self, client: TestClient
     ) -> None:
         """
-        A warm cache carries no trigger at any attempt: D-06 is still primary.
+        A warm cache carries no trigger at any attempt.
 
         The cap is a second ending, not a replacement for the first one, and a
         change that made the attempt number decide instead of the cache would
@@ -1123,15 +1089,11 @@ class TestBoundedPoll:
         self, client: TestClient
     ) -> None:
         """
-        An out-of-range ``attempt`` is a trigger-free 200, not a 422 (R3-CR-02).
+        An out-of-range ``attempt`` is a trigger-free 200, not a 422.
 
-        The bound used to be a ``Query`` constraint, so a number past the cap
-        was rejected during request validation and came back through
-        ``render_error``.  That was the wrong failure mode for the one element
-        on the page that polls: an error response is the thing the strip cannot
-        usefully receive, and the ordinary way past the cap is exactly the
-        ending the strip wanted anyway.  Above the cap the clamp lands on the
-        cap, which is the give-up body; the chain stops there.
+        An error response is the one thing the polling strip cannot usefully
+        receive.  Above the cap the clamp lands on the cap, which is the give-up
+        body, and the chain stops there.
         """
         cap = checks_module.POLL_ATTEMPT_CAP
         response = client.get(f"/api/checks?attempt={cap + 1}")
@@ -1160,11 +1122,10 @@ class TestBoundedPoll:
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        The clamp runs first, so only clamped numbers travel (T-30-32-02).
+        The clamp runs first, so only clamped numbers reach the context or body.
 
-        This is the property the removed ``Query`` bound was defending, and it
-        is unchanged: what changed is the status code an out-of-range value
-        earns, never whether the value itself is trusted.
+        An out-of-range value earns a 200, but the value itself is never
+        trusted.
         """
         cap = checks_module.POLL_PROBE_ATTEMPT_CAP
         seen: list[int] = []
@@ -1186,7 +1147,7 @@ class TestBoundedPoll:
         self, client: TestClient, crafted: str
     ) -> None:
         """
-        The clamp replaces a range bound, never the type (T-30-32-02).
+        The clamp bounds the range, never the type.
 
         A value that is not a number at all is still refused by request
         validation, and with the strip's retarget exemption in place that 422
@@ -1253,32 +1214,19 @@ class TestTheStripSurvivesItsOwnFailure:
     """
     An internal failure in the strip's render is a cold strip, not an error.
 
-    The strip is the one element that polls, so an error response to it is the
-    one response it cannot usefully receive: before R3-CR-02 an exception in
-    ``_checks_context`` became a 500 that was retargeted into the message slot,
-    leaving ``#checks-body`` on the page still polling, still failing, still
-    overwriting the scan-progress line every two seconds.
-
-    So this route catches its own failures and renders the cold-start body
-    instead: six named rows, the give-up line naming the button that is still
-    on the page, and no trigger.  The exception goes to the log and nowhere
-    else -- this body is rendered on a page the whole LAN can read (ASVS V7,
-    Phase 26 D-10, T-30-32-03).
-
-    ``POST /api/checks/refresh`` renders the same strip through the same
-    ``_checks_context`` and had no guard at all (R4-WR-01), so a raise there
-    was a 500 aimed at ``#checks-body`` -- and with the retarget exemption
-    keyed on that target alone, the button's own ``hx-swap="outerHTML"`` wrote
-    the error over the strip.  The refresh route now guards its render the
-    same way, and only its render: the probe is the click's action, and an
-    action that fails is reported as a failure rather than hidden behind a
-    body that says nothing has been checked.
+    The strip is the one element that polls, so an error response is the one
+    response it cannot usefully receive: retargeted into the message slot, it
+    would leave ``#checks-body`` polling and failing every two seconds, and
+    aimed at the strip it would replace the rows and the button.  Both routes
+    render the cold-start body instead: six named rows, the give-up line naming
+    the button, and no trigger.  The exception goes to the log and nowhere
+    else, because the body is on a page the whole LAN can read.
     """
 
     def test_a_failure_inside_the_refresh_render_is_a_cold_strip_at_200(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The button's render falls back to the body its sibling does (R4-WR-01)."""
+        """The button's render falls back to the body its sibling does."""
         _raise_inside_the_checks_route(client, monkeypatch, "_checks_context")
 
         response = client.post("/api/checks/refresh")
@@ -1367,7 +1315,7 @@ class TestTheStripSurvivesItsOwnFailure:
     def test_no_part_of_the_exception_reaches_the_page(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch, target: str
     ) -> None:
-        """The failed render says nothing about why (ASVS V7, T-30-32-03)."""
+        """The failed render says nothing about why."""
         _raise_inside_the_checks_route(client, monkeypatch, target)
 
         body = client.get("/api/checks").text
@@ -1392,7 +1340,7 @@ class TestTheStripSurvivesItsOwnFailure:
 
 
 class TestRefreshButton:
-    """D-09: the button re-probes, and cannot defeat the exclusive scanner."""
+    """The button re-probes, and cannot defeat the exclusive scanner."""
 
     def test_refresh_probes_once(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -1457,7 +1405,7 @@ class TestRefreshButton:
     def test_refresh_hands_the_scanner_gate_to_the_registry(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """WR-03: the gate reaches ``run_checks``, and the handler holds none."""
+        """The gate reaches ``run_checks``, and the handler holds none."""
         spy = _spy(monkeypatch)
         client.post("/api/checks/refresh")
         assert spy.gates == [_app(client).state.worker.scanner_gate]
@@ -1466,7 +1414,7 @@ class TestRefreshButton:
         self, client: TestClient
     ) -> None:
         """
-        The registry's own paused sentence reaches the page (D-08).
+        The registry's own paused sentence reaches the page.
 
         No spy here: this drives the real ``run_checks`` so the sentence in the
         markup is the one ``saneless doctor`` would print, not one this test
@@ -1481,14 +1429,11 @@ class TestRefreshButton:
         self, client: TestClient
     ) -> None:
         """
-        WR-04: checker contention on an idle appliance is not "a scan".
+        Checker contention on an idle appliance is not "a scan".
 
-        A click landing while a refresher tick is in flight used to fail its
-        non-blocking attempt on the scanner gate, and the handler read that
-        failure as a running scan -- so the strip rendered "not checked while a
-        scan is running" beside "Last checked 14:02" on an appliance with no
-        job at all.  The probe lock now turns the second checker away before it
-        reaches the gate, and the strip re-renders what the first one found.
+        The probe lock turns a second checker away before it reaches the
+        scanner gate, and the strip re-renders what the first one found, so an
+        appliance with no job never reads "not checked while a scan is running".
         """
         _warm_the_cache(client)
         assert _app(client).state.worker.current_job_id is None
@@ -1654,7 +1599,7 @@ class TestCheckAgainOnTheRefresherThread:
 
 
 class TestRefreshMinimumInterval:
-    """WR-05: the one handler allowed to probe has a floor under it."""
+    """The one handler allowed to probe has a floor under it."""
 
     def test_the_first_refresh_probes(
         self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
@@ -1682,7 +1627,7 @@ class TestRefreshMinimumInterval:
         The refusal is invisible: same status, same partial, no error.
 
         The click is not wrong, only early, so there is nothing to tell the
-        household member about -- and UI-SPEC S1 has no row for an error here.
+        household member about.
         """
         client, _clock = clocked
         _spy(monkeypatch)
@@ -1706,7 +1651,7 @@ class TestRefreshMinimumInterval:
     def test_twenty_refreshes_in_a_loop_cost_one_probe(
         self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The review's amplifier, shut: 20 requests, one run of the registry."""
+        """Twenty refreshes in a loop are one run of the registry."""
         client, _clock = clocked
         spy = _spy(monkeypatch)
         for _ in range(20):
@@ -1732,7 +1677,7 @@ class TestRefreshMinimumInterval:
     def test_a_refresh_after_the_interval_probes_again(
         self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """D-09 survives: nobody has to wait out a TTL, only a moment."""
+        """A refresh after the floor probes again, with no TTL to wait out."""
         client, clock = clocked
         spy = _spy(monkeypatch)
         client.post("/api/checks/refresh")
@@ -1755,17 +1700,12 @@ class TestRefreshMinimumInterval:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        R3-IN-03: the handler reads the grant as ``is not None``, not as truthy.
+        The handler reads the grant as ``is not None``, not as truthy.
 
-        ``time.monotonic()`` counts from boot on Linux, so the stamp a claim
-        records on a freshly booted appliance really can be 0.0 -- and 0.0 is
-        falsey.  A handler branching on the truth of the returned stamp would
-        read that grant as a refusal and never probe, which is the one click
-        that most deserves one: the floor is a rate limit, and the first
-        request after a boot has nothing to be limited against.
-
-        The cache records the grant, so this asserts against the value the
-        handler was really given rather than against one the test computed.
+        ``time.monotonic()`` counts from boot on Linux, so a grant on a freshly
+        booted appliance can be the falsey 0.0.  Read as a refusal, the first
+        click after a boot would never probe.  The cache records the grant, so
+        the assertion is against the value the handler was really given.
         """
         with _a_recording_cache(tmp_path, monkeypatch, start=0.0) as (client, cache):
             spy = _spy(monkeypatch)
@@ -1788,30 +1728,23 @@ class TestRefreshMinimumInterval:
 
 class TestCollapsedRefreshStillDelivers:
     """
-    WR-03: the one manual control must always put an answer on the page.
+    The one manual control always puts an answer on the page.
 
-    ``POST /api/checks/refresh`` did three things in sequence and they composed
-    badly.  A click landing while a background probe held the lock collapsed,
-    rendered the cache *as it stood* -- the pre-probe entry, because the probe
-    in flight had not stored yet -- and, because results already existed,
-    carried no trigger.  Nothing on the page was ever going to pick up the
-    result that probe landed a second later.  And the claim had already been
-    stamped before the collapse was discovered, so the next click inside two
-    seconds was refused as well: the button visibly doing nothing, twice.
-
-    The window is one background probe's duration out of every TTL, and the
-    Paperless read budget alone is five seconds, so it is not a narrow one.
+    A click landing while a background probe holds the lock collapses into it.
+    The collapsed body carries a trigger, so the page collects the result that
+    probe stores, and the click gives its claim back, so the next click is
+    honoured.  The window is one background probe's duration out of every TTL,
+    and the Paperless read budget alone is five seconds, so it is not narrow.
     """
 
     def test_a_collapsed_refresh_asks_the_page_to_come_back_for_the_result(
         self, client: TestClient
     ) -> None:
         """
-        The review's own case: the collapsed body carries a trigger.
+        A collapsed click's body carries a trigger.
 
-        Asserted against the rendered attributes, not the template source: a
-        conditional a comment describes and the markup does not honour would
-        satisfy a source grep and still leave the answer undelivered.
+        Asserted against the rendered attributes, so only markup the server
+        really emits can satisfy it.
         """
         _warm_the_cache(client)
         lock = _refresher(client).probe_lock
@@ -1829,10 +1762,8 @@ class TestCollapsedRefreshStillDelivers:
         """
         Two collapsed clicks cost no claim, so the next real one is honoured.
 
-        The clock never moves, so all three clicks land inside the 2 s floor.
-        Before the release existed, the first collapse stamped and the third
-        click -- the one with the lock free and a probe genuinely available --
-        was refused: ``spy.calls`` would be 0.
+        The clock never moves, so all three clicks land inside the 2 s floor,
+        and the third is honoured only if both collapses gave their claim back.
         """
         client, _clock = clocked
         spy = _spy(monkeypatch)
@@ -1851,7 +1782,7 @@ class TestCollapsedRefreshStillDelivers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        R3-IN-03: the handler carries its own grant from the claim to the release.
+        The handler carries its own grant from the claim to the release.
 
         The release is a compare-and-clear, so what it is handed decides
         whether anything is given back at all.  The two values compared here
@@ -1892,10 +1823,8 @@ class TestCollapsedRefreshStillDelivers:
         """
         The uncollided click is unchanged: same status, same partial, no poll.
 
-        This is the property 30-27 established and the reason the new disjunct
-        is a disjunct rather than a replacement.  By the time the handler
-        renders, its own probe has released the lock and stored, so there is
-        nothing left to wait for.
+        By the time the handler renders, its own probe has released the lock
+        and stored, so there is nothing left to wait for.
         """
         client, _clock = clocked
         spy = _spy(monkeypatch)
@@ -1922,13 +1851,13 @@ class TestCollapsedRefreshStillDelivers:
         self, client: TestClient
     ) -> None:
         """
-        T-30-29-02: a probe wedged in a getaddrinfo cannot make a tab ask forever.
+        A probe wedged in a getaddrinfo cannot make a tab ask forever.
 
         The settling poll rides the same ``attempt`` parameter, and while a
         probe demonstrably holds the single-flight lock the bound that applies
-        to it is ``POLL_PROBE_ATTEMPT_CAP`` rather than ``POLL_ATTEMPT_CAP``
-        (R3-WR-04).  It is still a bound: ``Lock.locked()`` stays true forever
-        if the holder dies, so the larger window is a cap and not an exemption.
+        to it is ``POLL_PROBE_ATTEMPT_CAP`` rather than ``POLL_ATTEMPT_CAP``.
+        It is still a bound: ``Lock.locked()`` stays true forever if the holder
+        dies, so the larger window is a cap and not an exemption.
         """
         _warm_the_cache(client)
         with _a_probe_in_flight(client):
@@ -1945,7 +1874,7 @@ class TestCollapsedRefreshStillDelivers:
 
         ``POLL_GAVE_UP_LINE`` says the checks have not run yet.  Printing it
         beside six rows that did run would be a lie the strip tells about
-        itself, so ``gave_up`` still requires an empty cache.
+        itself, so ``gave_up`` requires an empty cache.
         """
         _warm_the_cache(client)
         with _a_probe_in_flight(client):
@@ -1967,7 +1896,7 @@ class TestCollapsedRefreshStillDelivers:
         One longer than the cap, for the same reason the cold chain is: its
         first link is the bare route, the body a page render already carries.
         The cap it ends at is ``POLL_PROBE_ATTEMPT_CAP``, because the lock is
-        held for the whole walk (R3-WR-04).
+        held for the whole walk.
         """
         _warm_the_cache(client)
         with _a_probe_in_flight(client):
@@ -2020,39 +1949,22 @@ class TestCollapsedRefreshStillDelivers:
 
 class TestTheWindowFollowsTheProbe:
     """
-    R3-WR-04: the strip stops asking, but never while the first check is running.
+    The strip stops asking, but never while the first check is running.
 
-    ``POLL_ATTEMPT_CAP`` is ten attempts at two seconds -- about twenty seconds
-    -- and its comment justified that as "about two and a half times the worst
-    probe budget a cold start can cost".  Three things ``checks.py`` documents
-    elsewhere make that understate the worst case by more than an order of
-    magnitude: ``getaddrinfo`` sits outside every budget in the module, the
-    pre-probe pays it once per configured host up to ``_MAX_PROBE_HOSTS``, and
-    the ordinary local-USB deployment has no parseable host at all, skips the
-    pre-probe entirely and enters ``get_devices()``, which the same file costs
-    at roughly 127 s for a silently unreachable host.
-
-    So a cold start on a wedged scanner reached the cap with an empty cache and
-    printed "The checks have not run yet.  Press Check again to try now." while
-    the first probe was still legitimately in flight.  That is advice that
-    cannot help: the button starts the thing that is already running, the click
-    collapses into it, and the fresh chain gives up again twenty seconds later.
-
-    The window now follows the probe.  While a checker demonstrably holds the
-    single-flight lock the chain runs to ``POLL_PROBE_ATTEMPT_CAP`` instead and
-    the give-up line is withheld.  It is still a cap, and deliberately so:
-    ``Lock.locked()`` stays true forever if the holder dies, so a refresher
-    that died *inside* the lock must still make the asking stop.
+    ``POLL_ATTEMPT_CAP`` is about twenty seconds, and a first probe of a
+    silently unreachable scanner can take roughly 127 s in ``get_devices()``.
+    Giving up then would print "Press Check again" for a check that is already
+    running.  While a checker holds the single-flight lock the chain runs to
+    ``POLL_PROBE_ATTEMPT_CAP`` instead and the give-up line is withheld.  It is
+    still a cap: ``Lock.locked()`` stays true forever if the holder dies.
     """
 
     def test_the_second_cap_bounds_the_worst_case_this_module_documents(self) -> None:
         """
         The larger cap is larger, and large enough for the 127 s enumeration.
 
-        Asserted against the figure ``checks.py`` states for a silently
-        unreachable ``get_devices()`` rather than against a number written
-        here, so a cap trimmed back below the probe it exists to outlast fails
-        instead of quietly reintroducing R3-WR-04.
+        A cap trimmed back below the enumeration it exists to outlast fails
+        here.
         """
         assert checks_module.POLL_PROBE_ATTEMPT_CAP > checks_module.POLL_ATTEMPT_CAP, (
             "the probe window must be the larger of the two"
@@ -2063,7 +1975,7 @@ class TestTheWindowFollowsTheProbe:
         self,
     ) -> None:
         """
-        The new sentence is held to ``POLL_GAVE_UP_LINE``'s rule (ASVS V7).
+        The still-checking line is held to ``POLL_GAVE_UP_LINE``'s rule.
 
         It renders on a page the whole LAN can read, so it names no host, port,
         path, URL or exception text -- only what is happening and roughly how
@@ -2077,11 +1989,10 @@ class TestTheWindowFollowsTheProbe:
         self, client: TestClient
     ) -> None:
         """
-        The ending IN-07 needed is unchanged, and it is the contrast case.
+        A cold chain with nothing in flight gives up at ``POLL_ATTEMPT_CAP``.
 
-        Ten attempts is still the bound for a chain with nothing in flight --
-        an appliance whose refresher thread has died, and a tab left open in
-        front of it -- which is the case the cap was always sized for.
+        That is the bound for an appliance whose refresher thread has died and
+        a tab left open in front of it, and the contrast case for this class.
         """
         markup = client.get(
             f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
@@ -2106,9 +2017,8 @@ class TestTheWindowFollowsTheProbe:
         """
         The give-up line is withheld while the thing the button starts is running.
 
-        This is the sentence R3-WR-04 is about.  "Press Check again to try now"
-        beside a probe that is demonstrably in flight tells a household member
-        to do the one thing that cannot help.
+        "Press Check again to try now" beside a probe that is demonstrably in
+        flight tells a household member to do the one thing that cannot help.
         """
         with _a_probe_in_flight(client):
             markup = client.get(
@@ -2124,11 +2034,10 @@ class TestTheWindowFollowsTheProbe:
         self, client: TestClient
     ) -> None:
         """
-        The second window is a cap, not an exemption (T-30-35-01).
+        The second window is a cap, not an exemption.
 
         A thread that died holding the single-flight lock leaves ``locked()``
-        true forever, and that is precisely the failure mode this area keeps
-        hitting, so the larger window has to end on its own too.
+        true forever, so the larger window has to end on its own too.
         """
         with _a_probe_in_flight(client):
             markup = client.get(
@@ -2181,10 +2090,9 @@ class TestTheWindowFollowsTheProbe:
         The clamp's upper bound is the larger cap, so a real attempt survives it.
 
         Clamping a legitimate settling attempt down to ten would end the chain
-        early by arithmetic the browser never asked for, which is the bug the
-        larger window exists to remove.  Past the larger cap the clamp lands on
-        it, which is the ending, so an out-of-range counter is still a
-        trigger-free 200 and never a status code.
+        early by arithmetic the browser never asked for.  Past the larger cap
+        the clamp lands on it, which is the ending, so an out-of-range counter
+        is still a trigger-free 200 and never a status code.
         """
         probe_cap = checks_module.POLL_PROBE_ATTEMPT_CAP
         at_the_cap = client.get(f"/api/checks?attempt={probe_cap}")
@@ -2202,7 +2110,7 @@ class TestTheWindowFollowsTheProbe:
 
 
 class TestFreshnessLine:
-    """UI-SPEC S1 § Freshness line: four situations, four exact sentences."""
+    """The freshness line has four situations and four exact sentences."""
 
     def _meta(self, markup: str) -> str:
         """
@@ -2239,7 +2147,7 @@ class TestFreshnessLine:
         )
 
     def test_results_and_scanning(self, client: TestClient) -> None:
-        """D-08's specimen, em dash and all."""
+        """Results during a scan read "Paused during scan — last checked …"."""
         _warm_the_cache(client)
         _start_a_scan(client)
         checked_at = _app(client).state.checks.current().checked_at
@@ -2259,18 +2167,17 @@ class TestRouteShape:
         Both handlers block, so both must run on FastAPI's threadpool.
 
         An ``async def`` here would run a socket probe and an httpx2 call on the
-        event loop and stall ``/health`` and the status poll with it (ROBU-05).
+        event loop and stall ``/health`` and the status poll with it.
         """
         handler = getattr(routes_module, name)
         assert not inspect.iscoroutinefunction(handler)
 
     def test_refresh_is_refused_cross_site(self, client: TestClient) -> None:
         """
-        ``CrossOriginGuard`` covers the new POST with no per-route dependency.
+        ``CrossOriginGuard`` covers the refresh POST with no per-route dependency.
 
         The guard is app-wide middleware on every non-safe method
-        (``web/app.py``), which is the reason a route added later cannot forget
-        the check (T-30-46, D-23).
+        (``web/app.py``), so a route added later cannot forget the check.
         """
         response = client.post(
             "/api/checks/refresh", headers={"Sec-Fetch-Site": "cross-site"}
@@ -2281,9 +2188,9 @@ class TestRouteShape:
         """
         The refresh handler reaches the one probe path, and nothing else does.
 
-        A second call site in this module would be a second way for a render
-        to probe, which is the failure D-04 exists to prevent; a grep is the
-        only thing that can see it.
+        A second call in this module would be a second way for a render to
+        probe.  Calls are counted in the parsed module, so a comment or
+        docstring may name the method freely.
         """
         calls = [
             node.lineno
@@ -2296,8 +2203,8 @@ class TestRouteShape:
         """
         The handler owns no probe implementation, so none can drift from the other.
 
-        WR-03, WR-04 and WR-05 were all consequences of the same
-        acquire/run/store block existing in both ``_tick`` and this module.
+        Two copies of the acquire/run/store block would be two probe paths to
+        keep in step; code that names ``run_checks`` is what this counts.
         """
         assert _references(_routes_tree(), "run_checks") == []
 
@@ -2305,7 +2212,7 @@ class TestRouteShape:
         """
         A request handler has no business holding the lock a live scan wants.
 
-        The gate now lives in exactly one probe path, and that path is the
+        The gate lives in exactly one probe path, and that path is the
         refresher's.
         """
         assert _references(_routes_tree(), "scanner_gate") == []
@@ -2318,12 +2225,12 @@ _APP_CSS = _PACKAGE_DIR / "static" / "app.css"
 _CHECKS_TEMPLATE = _PACKAGE_DIR / "templates" / "partials" / "checks.html"
 
 # Every six-digit colour literal app.css is allowed to contain, pinned as an
-# ordered list.  This phase introduces no new colour value: the strip's amber
-# is the fallback amber, read through the same custom property.  A new literal
-# would be an unmeasured colour on a LAN-visible page.
+# ordered list.  The strip's amber is the fallback amber, read through the
+# same custom property.  A new literal would be an unmeasured colour on a
+# LAN-visible page.
 _EXPECTED_HEX_LITERALS = ["#a16207", "#ca8a04", "#ca8a04"]
 
-# The three declarations Phase 26's coupling contract and tests/test_browser.py
+# The three declarations the Pico coupling contract and tests/test_browser.py
 # both pin.  Renaming the property or changing either value breaks the
 # vendored-asset contract, so they are asserted byte for byte.
 _FALLBACK_DECLARATIONS = [
@@ -2506,7 +2413,7 @@ def _jinja_tree(path: Path) -> nodes.Template:
 
 
 class TestStripPlacement:
-    """UI-SPEC S1 § Placement, and the Phase 26 invariant it must not disturb."""
+    """The strip sits first on the page and leaves the status block in place."""
 
     def test_the_card_is_the_first_article(self, client: TestClient) -> None:
         """At a glance means first: the strip sits above the Scan card."""
@@ -2517,12 +2424,10 @@ class TestStripPlacement:
         self, client: TestClient
     ) -> None:
         """
-        Phase 26's invariant survives the persistent region around the area.
+        ``#status-message`` is the immediate sibling above the status block.
 
-        ``#status-message`` is the immediate sibling above the status block,
-        which is now ``#status-live`` holding ``#status-area`` as its first
-        child; inserting a card at the top of the block must not have moved
-        either.
+        The status block is ``#status-live`` holding ``#status-area`` as its
+        first child, and a card at the top of the page moves neither.
         """
         markup = client.get("/").text
         assert re.search(
@@ -2533,11 +2438,10 @@ class TestStripPlacement:
 
     def test_the_form_gained_no_attribute(self, client: TestClient) -> None:
         """
-        The C-10 ``hx-disinherit`` fix is exactly as it was.
+        The scan form carries its one ``hx-disinherit`` and the strip adds none.
 
-        The strip is deliberately outside the scan form so the
-        ``hx-disabled-elt`` landmine cannot reach it, which is what makes
-        touching the form unnecessary.
+        The strip is deliberately outside the scan form so the form's
+        ``hx-disabled-elt`` cannot reach it.
         """
         assert client.get("/").text.count('hx-disinherit="hx-disabled-elt"') == 1
 
@@ -2549,7 +2453,7 @@ class TestStripPlacement:
 
 
 class TestStripAccessibility:
-    """T-30-51: a health list must never interrupt a screen reader."""
+    """A health list never interrupts a screen reader."""
 
     def test_the_strip_is_not_a_live_region(self, client: TestClient) -> None:
         """
@@ -2565,7 +2469,7 @@ class TestStripAccessibility:
     def test_the_page_keeps_exactly_one_assertive_region(
         self, client: TestClient
     ) -> None:
-        """Phase 26 allows one ``role="alert"``, and it is #status-message."""
+        """The page has one ``role="alert"``, and it is #status-message."""
         assert len(_ROLE_ALERT.findall(client.get("/").text)) == 1
 
     def test_the_partial_declares_no_alert(self) -> None:
@@ -2636,10 +2540,10 @@ class TestStripVocabulary:
         self, filter_name: str
     ) -> None:
         """
-        R3-WR-03: the marker is chosen from the whole result, flag included.
+        The marker is chosen from the whole result, flag included.
 
-        A state filter at the call site is what rendered a skipped row as a
-        green tick, so the template reaches for none of the three.
+        A state filter at the call site would render a skipped row as a green
+        tick, so the template reaches for none of the three.
 
         Args:
             filter_name: The state filter that must not appear.
@@ -2649,7 +2553,7 @@ class TestStripVocabulary:
 
     def test_a_warn_row_renders_its_next_step(self, client: TestClient) -> None:
         """
-        APPL-04: a row that is not green says what to do about it.
+        A row that is not green says what to do about it.
 
         A red row a household member can only escalate is the failure this
         element exists to prevent.
@@ -2675,14 +2579,13 @@ class TestStripVocabulary:
 
 class TestASkippedRowIsNotAPassingRow:
     """
-    R3-WR-03: the strip may not tick a row it never looked at.
+    The strip never ticks a row it never looked at.
 
     ``_scanner_skipped`` and ``_scanner_busy`` both return ``CheckState.OK``
-    with ``skipped`` set -- the state is there so the row has a colour and so a
-    scripted health gate stays green for a probe nobody took (D-01).  Until the
-    call site read the flag, that made a paused Scanner row render as
-    "✓ Scanner  Not checked while a scan is running.", announced to a screen
-    reader as "OK: Scanner".  These tests are what stops that coming back.
+    with ``skipped`` set, so the row has a colour and a scripted health gate
+    stays green for a probe nobody took.  Rendered from the state alone, a
+    paused Scanner row would read "✓ Scanner  Not checked while a scan is
+    running." and be announced as "OK: Scanner".
     """
 
     def test_a_skipped_row_renders_the_neutral_marker(self, client: TestClient) -> None:
@@ -2733,7 +2636,7 @@ class TestASkippedRowIsNotAPassingRow:
 
     def test_the_cold_branch_still_says_checking(self, client: TestClient) -> None:
         """
-        D-06's six cold rows are untouched.
+        The six cold rows still say "Checking".
 
         ``_CheckingRow`` is not a ``CheckResult`` and still hands its own trio
         to the macro, so the cold word stays "Checking" and does not become
@@ -2752,14 +2655,11 @@ class TestASkippedRowIsNotAPassingRow:
         """
         Every class, glyph and word in the row comes from ``saneless.checks``.
 
-        Pattern C applied to the case that broke it: the template gained no
-        ``{% if c.skipped %}`` and never reads the attribute at all, so the
-        substitution is a Python decision the CLI reads too.
-
-        The spoken word is counted inside its own span rather than anywhere in
-        the row, because UI-SPEC S1's sentence for this row happens to begin
-        with the same two words ("Not checked while a scan is running.") and a
-        bare count would be satisfied by the message alone.
+        The template never reads ``skipped``, so the substitution is a Python
+        decision the CLI reads too.  The spoken word is counted inside its own
+        span, because the row's sentence ("Not checked while a scan is
+        running.") begins with the same two words and a bare count would be
+        satisfied by the message alone.
         """
         _app(client).state.checks.store(_results_with_a_skipped_scanner())
         row = _row_named(client.get("/").text, "Scanner")
@@ -2773,7 +2673,7 @@ class TestASkippedRowIsNotAPassingRow:
 
 
 class TestCheckAgainButton:
-    """UI-SPEC S1 § `Check again` (D-09)."""
+    """The `Check again` button is visible text wired to the refresh route."""
 
     def test_the_button_is_readable_and_wired(self, client: TestClient) -> None:
         """
@@ -2791,7 +2691,7 @@ class TestCheckAgainButton:
 
 
 class TestStripStyles:
-    """UI-SPEC § Color and § Spacing Scale: aliases only, no new value."""
+    """The strip's styles are aliases of existing tokens, with no new value."""
 
     @pytest.mark.parametrize(
         "selector",
@@ -2814,7 +2714,7 @@ class TestStripStyles:
         ],
     )
     def test_the_layout_classes_exist(self, selector: str) -> None:
-        """The seven layout rows of UI-SPEC's exhaustive class table."""
+        """Every layout class the strip's markup uses has a rule."""
         assert f"{selector} {{" in _css()
 
     def test_the_warn_class_reads_the_existing_amber(self) -> None:
@@ -2828,11 +2728,10 @@ class TestStripStyles:
 
     def test_no_colour_literal_was_added(self) -> None:
         """
-        The stylesheet's hex literals are exactly the three it already had.
+        The stylesheet's hex literals are exactly the three fallback ambers.
 
         Every colour the strip renders is an existing token whose contrast is
-        already measured in both schemes; an unmeasured colour on a LAN-visible
-        page is what this pin prevents.
+        measured in both schemes, so no unmeasured colour reaches the page.
         """
         assert _HEX_LITERAL.findall(_css()) == _EXPECTED_HEX_LITERALS
 
@@ -2847,7 +2746,7 @@ class TestStripStyles:
 
     def test_the_touch_target_floor_is_met(self) -> None:
         """
-        WCAG 2.5.5: the button is at least 44 px tall (D-30).
+        The button is at least 44 px tall, the WCAG 2.5.5 touch target.
 
         Asserted as the declaration rather than as a measurement, because the
         browser suite measures and this file pins what it measures.
@@ -2927,15 +2826,15 @@ _STRIP_RELOAD_DIV = (
 
 
 class TestTerminalReloadPartial:
-    """The four identical hidden loaders became one partial that does more."""
+    """One partial holds the hidden loaders every terminal status reloads with."""
 
     def test_the_partial_holds_both_loaders(self) -> None:
         """
         History and the strip are reloaded by the same terminal event.
 
-        The strip loader is here rather than left to the TTL because D-08's
-        paused note has to clear the moment the scan ends; waiting out thirty
-        seconds would leave the page claiming a scan is still running.
+        The strip loader is here rather than left to the TTL because the paused
+        note has to clear the moment the scan ends; waiting out thirty seconds
+        would leave the page claiming a scan is still running.
         """
         loaders = [
             attrs.get("hx-get")
@@ -2945,7 +2844,7 @@ class TestTerminalReloadPartial:
         assert loaders == ["/api/jobs/history", "/api/checks"]
 
     def test_status_html_holds_no_loader_markup_of_its_own(self) -> None:
-        """The four copies are gone, not merely joined by a fifth."""
+        """``status.html`` holds no loader markup outside the partial."""
         tags = template_start_tags(_STATUS_TEMPLATE)
         assert [
             attrs
@@ -3029,8 +2928,8 @@ class TestTerminalReloadPartial:
         """
         The same finished job, rendered as a status response, carries both.
 
-        A flip answer for a job that is no longer waiting claims nothing and
-        renders the current job, which is the finished one here.
+        A flip answer for a job that is not waiting claims nothing and renders
+        the current job, which is the finished one here.
         """
         job_id = _finish_a_job(client, JobState.DONE)
         if method == "GET":
@@ -3078,13 +2977,13 @@ class TestTerminalReloadPartial:
 # retrying a real localhost connection for a minute after the test.
 @pytest.mark.usefixtures("offline_paperless")
 class TestWhichResponsesCarryWhat:
-    """UI-SPEC § Interaction Map: the out-of-band table, asserted row by row."""
+    """Which responses carry the strip out of band, asserted response by response."""
 
     def test_a_scan_submit_carries_the_strip_out_of_band(
         self, client: TestClient
     ) -> None:
         """
-        D-08's paused note appears the instant the scan is accepted.
+        The paused note appears the instant the scan is accepted.
 
         Without this the strip would keep claiming a live Scanner reading for
         up to a full TTL after the scanner became unavailable.
