@@ -4,9 +4,9 @@ Paperless-ngx REST API client with retry, polling, and connection test.
 Uploads PDFs with metadata (title, tags, correspondent) but no document
 date, which paperless-ngx chooses itself; polls the task endpoint with
 exponential backoff until a terminal state and raises when that state is
-not success; and probes connections, reporting one of the eight
-ConnectionStatus outcomes.  Every request names API version 9 or 10, the
-highest the server has announced (see ``PaperlessClient.api_version``).
+not success; and probes connections, reporting a ConnectionStatus outcome.
+Every request names the highest supported API version the server has
+announced (see ``PaperlessClient.api_version``).
 """
 
 from __future__ import annotations
@@ -58,22 +58,17 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# The API versions this client speaks.  paperless-ngx negotiates via
-# ``Accept: application/json; version=N`` and serves its own current default to
-# a client that sends none, so every request names one, turning a hidden
-# assumption into an explicit contract.  paperless-ngx 2.16 through 2.20 allow
-# versions up to 9, and 3.x allows 9 and 10.  A server outside that range --
-# anything before 2.16 allows only up to 7 -- answers a version it does not allow
-# with 406 Not Acceptable.  The highest version a server allows is announced in
-# ``X-Api-Version``, but only on responses to an authenticated request: never on
-# a 401, and never on the 406 itself.  So the first request speaks 9, which every
-# supported server allows, and its answer says whether 10 may follow.
+# paperless-ngx serves its own default API version to a client that names none,
+# so every request names one; 2.16 to 2.20 allow up to 9, 3.x allows 9 and 10,
+# and a version a server does not allow gets 406 Not Acceptable.  The highest
+# allowed version is announced in ``X-Api-Version`` only on answers to an
+# authenticated request, never on a 401 or the 406 itself.  So the first request
+# speaks 9, and its answer says whether 10 may follow.
 _SUPPORTED_API_VERSIONS: Final = (9, 10)
 _ACCEPT_TEMPLATE: Final = "application/json; version={version}"
-# The Accept header of a request that asked for the newest version.  What was
-# learned from an announcement can go out of date -- paperless-ngx rolled back
-# from 3.x to 2.x, or another server answering at the same address -- and the
-# only sign of it is a 406 to exactly this header.
+# The Accept header of a request that asked for the newest version.  A learned
+# version goes stale when paperless-ngx is rolled back or another server answers
+# at the same address, and the only sign is a 406 to exactly this header.
 _NEWEST_ACCEPT: Final = _ACCEPT_TEMPLATE.format(version=_SUPPORTED_API_VERSIONS[-1])
 # One to three ASCII digits, the whole value: a longer, signed, spaced or
 # non-ASCII value is not a version and is never read.  ``[0-9]``, not ``\d``,
@@ -85,46 +80,36 @@ _API_VERSION_HEADER: Final = re.compile(r"[0-9]{1,3}")
 # progress, so polling it to the deadline would report a misattributed timeout.
 _TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
 
-# Upper bound on how much of an error response body is interpolated into an
-# error message.  That message is recorded verbatim in the job store and
-# rendered in the web status area and on the terminal, so an
-# upstream returning a multi-megabyte body or an HTML error page must not be
-# able to flood any of them.  The full body is logged at DEBUG instead.
+# How much of an error response body reaches an error message, which the job
+# store, the web status area and the terminal all show; a multi-megabyte body
+# must not flood them.  The full body is logged at DEBUG instead.
 _MAX_BODY_LINE_CHARS = 200
 
 _EMPTY_BODY = "(empty response body)"
 
 _NO_FAILURE_MESSAGE = "Paperless reported a failure but supplied no message"
 
-# How many tags or correspondents to ask for per page.  A typical install fits
-# in a single round trip at this size, and paperless-ngx accepts pages up to
-# 100000, so larger collections take a few requests rather than being cut off.
+# How many tags or correspondents to ask for per page; a typical install fits
+# in one round trip, and larger collections take a few.
 _METADATA_PAGE_SIZE: Final = 1000
 
 # The most pages one metadata fetch asks for when the server gives no usable
-# ``count`` to bound it: a million items at the page size above.  A server or
-# proxy that ignores ``?page=`` but varies its answer would otherwise keep the
-# fetch, and the metadata cache lock it runs under, busy forever.
+# ``count``.  A server or proxy that ignores ``?page=`` but varies its answer
+# would otherwise keep the fetch, and the metadata cache lock, busy forever.
 _METADATA_MAX_PAGES: Final = 1000
 
 # The most characters of a paperless task id that reach a log line or an error
-# message. The id is third-party text: paperless-ngx issues UUIDs, but nothing
-# stops a misbehaving server or proxy from answering with megabytes or with
-# terminal escape sequences, and the message becomes job.error.
+# message.  The id is third-party text, and a misbehaving server or proxy can
+# answer with megabytes or terminal escapes.
 _TASK_ID_LOG_LIMIT: Final = 64
 
-# How the existing document is named in a duplicate refusal's text, for a
-# server whose answer carries no structured id.  Each is searched in linear
-# time (see ``_duplicate_id_in_text``).  ``[0-9]``, not ``\d``, which also
-# matches digits from other scripts that ``int()`` accepts.
+# How a duplicate refusal's text names the existing document, for a server whose
+# answer carries no structured id.  ``[0-9]``, not ``\d``, which also matches
+# digits from other scripts that ``int()`` accepts.
 _DUPLICATE_OF: Final = re.compile(r"duplicate of ", re.IGNORECASE)
-# The two ways paperless-ngx's own refusal words a duplicate: "It is a
-# duplicate of <title> (#N)" and "It is a duplicate of document #N" from the
-# consumer, and "duplicate of document #N" on its own.  Deciding that a failure
-# IS a duplicate needs one of these, not the bare phrase: a duplicate ends the
-# job delivered and keeps no copy, so a failure whose text merely quotes
-# "duplicate of" -- a workflow error, document content -- must not qualify.
-# Both alternatives are literal prefixes, so the search is linear.
+# paperless-ngx's own wording of a duplicate refusal.  A duplicate ends the job
+# delivered and keeps no copy, so a failure whose text merely quotes "duplicate
+# of" (a workflow error, document content) must not match.
 _DUPLICATE_REFUSAL: Final = re.compile(
     r"It is a duplicate of |duplicate of document #[0-9]", re.IGNORECASE
 )
@@ -137,27 +122,25 @@ _DOCUMENT_ID_TEXT: Final = re.compile(r"[0-9]{1,18}")
 _TRASH_NOTE: Final = "existing document is in the trash"
 
 # How long an upload keeps trying while each failure proves the request never
-# reached paperless-ngx whole.  Long enough to ride out a paperless-ngx or
-# container restart; after it the consume-folder fallback, if any, takes over.
+# reached paperless-ngx whole: long enough to ride out a restart.  After it the
+# consume-folder fallback, if any, takes over.
 _SEND_BUDGET_SECONDS: Final = 60.0
 
-# The longest single wait between those attempts.  The waits double from 1 s up
-# to this, so a server that comes back is found within a few seconds of it.
+# The longest single wait between those attempts, so a server that comes back
+# is found within a few seconds.
 _MAX_BACKOFF_SECONDS: Final = 5.0
 
-# The longest single wait between task polls.  The waits double from 0.5 s up
-# to this, so a task that finishes just after a poll is found within 5 s.
+# The longest single wait between task polls.
 _MAX_POLL_DELAY_SECONDS: Final = 5.0
 
-# The upload's connect timeout.  Shorter than the client-wide 30 s, so a host
-# that drops packets still gets several attempts within the send budget.
+# Shorter than the client-wide timeout, so a host that drops packets still gets
+# several attempts within the send budget.
 _UPLOAD_CONNECT_SECONDS: Final = 10.0
 
 # The upload's read timeout: a floor, a rate per MiB of the PDF and a cap.
-# paperless-ngx answers the upload only after it has parsed the body, read the
-# file into memory and written it to its scratch directory, so a large PDF on a
-# slow disk takes longer to answer.  The cap matches paperless-ngx's default
-# task timeout.
+# paperless-ngx answers only after it has written the whole file to its scratch
+# directory, so a large PDF on a slow disk answers late.  The cap matches
+# paperless-ngx's default task timeout.
 _UPLOAD_READ_FLOOR_SECONDS: Final = 30.0
 _UPLOAD_READ_SECONDS_PER_MIB: Final = 1.0
 _UPLOAD_READ_CAP_SECONDS: Final = 300.0
@@ -179,8 +162,8 @@ def _upload_timeout(size_bytes: int) -> httpx2.Timeout:
         size_bytes: The size of the PDF being uploaded.
 
     Returns:
-        A 10 s connect timeout and a read timeout of 30 s plus 1 s per MiB,
-        capped at 300 s; writes and the pool keep the client-wide 30 s.
+        The upload connect timeout, a read timeout that grows with the size up
+        to its cap, and the client-wide timeout for writes and the pool.
 
     """
     read = min(
@@ -214,22 +197,13 @@ def _extract_task(payload: object, task_id: str) -> dict[str, object] | None:
     """
     Return the task with id ``task_id`` from either paperless-ngx response shape.
 
-    API v9 answers ``GET /api/tasks/`` with a bare list; v10 paginates it
-    into ``{"count", "next", "previous", "results"}``.  paperless-ngx filters
-    the list by ``?task_id=`` on the server, so the answer normally holds our
-    task or nothing.  An entry for any other task -- which a proxy that drops
-    the query string would produce -- says nothing about our document, so
-    only an entry whose ``task_id`` equals ours is chosen, wherever it sits.
-
-    Args:
-        payload: The decoded JSON body of a 200 response.
-        task_id: The id paperless-ngx answered the upload with.
+    API v9 answers with a bare list and v10 with a page whose ``results``
+    holds it.  A proxy that drops ``?task_id=`` returns other tasks, so only
+    an entry whose ``task_id`` equals ours is chosen.
 
     Returns:
-        Our task dict, or None when the response did not carry it.  None is
-        **not** an error: a task is not always visible immediately after the
-        upload that created it, so the caller must keep polling inside its
-        deadline rather than raise.
+        Our task, or None.  None is not an error: a new task is not always
+        visible yet, so the caller keeps polling until its deadline.
 
     """
     if isinstance(payload, dict):
@@ -247,9 +221,8 @@ class _PollTransient:
     """
     A task poll answer that says "ask again later", not "this failed".
 
-    A 5xx is usually a reverse proxy in front of a paperless-ngx that is
-    restarting, and a 429 is a rate limit; either can clear within the
-    poll's deadline.
+    A 5xx (usually a proxy in front of a restarting paperless-ngx) or a 429
+    can clear within the poll's deadline.
 
     Attributes:
         description: The status and body on one bounded line, with the token
@@ -264,17 +237,7 @@ def _usable_count(page: dict[object, object]) -> int | None:
     """
     Return a paginated page's ``count``, or None when it cannot bound a fetch.
 
-    Only a non-negative integer is a count.  A missing or null value, a
-    string, a negative number and a bool (which Python treats as an int)
-    are all ignored.
-
-    Args:
-        page: The decoded body of one paginated metadata page.
-
-    Returns:
-        The total number of items the server says the collection holds, or
-        None.
-
+    Only a non-negative int that is not a bool is a count.
     """
     count = page.get("count")
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
@@ -286,21 +249,11 @@ def _metadata_items(value: object, prefix: str, page: int) -> list[dict[str, obj
     """
     Return one metadata page's items, checked to be a list of objects.
 
-    A ``results`` of ``null`` would otherwise raise a TypeError out of the
-    client, and a string or an object would be taken apart into its
-    characters or keys.
-
-    Args:
-        value: The page's items: its ``results``.
-        prefix: The message prefix naming the collection and base URL.
-        page: The page number, for the message.
-
-    Returns:
-        The items, each an object.
+    A ``null`` would otherwise raise a TypeError out of the client, and a
+    string or an object would be taken apart into characters or keys.
 
     Raises:
-        PaperlessError: ``<prefix>: page <N> did not hold a list of
-            objects``.
+        PaperlessError: ``value`` is not a list of objects.
 
     """
     if not isinstance(value, list):
@@ -317,18 +270,9 @@ def _metadata_items(value: object, prefix: str, page: int) -> list[dict[str, obj
 
 def _task_status(task: dict[str, object]) -> str:
     """
-    Return the task status in the v9 uppercase spelling.
+    Return the task status in the v9 uppercase spelling, or "" when absent.
 
-    API v10 spells the same statuses in lowercase (``success``, ``failure``,
-    ``revoked``), so every comparison in this module is made against the
-    normalised form.
-
-    Args:
-        task: A task dict from either API version.
-
-    Returns:
-        The uppercase status, or the empty string when absent.
-
+    API v10 spells the same statuses in lowercase.
     """
     return str(task.get("status", "")).upper()
 
@@ -337,18 +281,9 @@ def _failure_message(task: dict[str, object]) -> str:
     """
     Return the failure text paperless-ngx supplied, from whichever field has it.
 
-    API v9 carries a flat ``result`` string; v10 moved it into
-    ``result_data`` as ``error_message`` (with ``reason`` used for some
-    rejections).  There is no single field that works for both versions.
-
-    Args:
-        task: A task dict whose status is FAILURE or REVOKED.
-
-    Returns:
-        A non-empty string.  This value is recorded as the job's error, so
-        it must never be None or empty -- a failure with neither field still
-        needs something a reader can act on.
-
+    API v9 carries a flat ``result``; v10 has ``result_data.error_message``
+    (or ``reason`` for some rejections).  Never empty: it becomes the job's
+    error, which a reader must be able to act on.
     """
     result = task.get("result")
     if isinstance(result, str) and result:
@@ -366,31 +301,10 @@ def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
     """
     Say whether a failed task was paperless-ngx refusing a duplicate document.
 
-    The shapes differ by version: API v9 says ``Not consuming: It is a
-    duplicate of document #N``, paperless-ngx 2.0 to 2.20.15 says ``... It is
-    a duplicate of <title> (#id).`` (matched ignoring case, so a capitalised
-    ``Duplicate`` counts too), and API v10 carries only ``result_data`` =
-    ``{"duplicate_of": N, "duplicate_in_trash": bool}`` with no message at all.
-
-    A duplicate refusal is not a failure: paperless-ngx already holds the
-    file, so "scan it again" would be wrong advice.  ``poll_task`` returns it
-    as a ``TaskDuplicate`` instead of raising, and the job ends delivered,
-    with a warning naming the existing document.
-
-    Because a duplicate keeps no copy of the scan, a false match loses it
-    behind a job that reports success.  So only paperless-ngx's own shapes
-    count: a ``duplicate_of`` that names a document, or the refusal's own
-    wording (``_DUPLICATE_REFUSAL``).  A ``duplicate_of`` of null, or text
-    that merely contains "duplicate of", is an ordinary failure.
-
-    Args:
-        task: A task dict whose status is FAILURE or REVOKED.
-        message: The failure text ``_failure_message`` chose for it.
-
-    Returns:
-        True when ``result_data``'s ``duplicate_of`` is a document id, or the
-        text words a duplicate refusal the way paperless-ngx does.
-
+    API v10 carries only ``result_data.duplicate_of``; earlier versions word
+    it in ``message`` (``_DUPLICATE_REFUSAL``, matched ignoring case).  A
+    duplicate keeps no copy of the scan, so a false match would lose it
+    behind a job that reports success: only these exact shapes count.
     """
     data = task.get("result_data")
     if isinstance(data, dict) and _document_id(data.get("duplicate_of")) is not None:
@@ -402,18 +316,9 @@ def _document_id(value: object) -> int | None:
     """
     Read a document id from a field of a task payload.
 
-    The payload is third-party data, and the id ends up in the job's warning,
-    so only a plain positive number is taken.  A bool is refused although
-    Python counts it as an int: v10's ``duplicate_of: true`` is not
-    document #1.
-
-    Args:
-        value: The field's value.
-
-    Returns:
-        A positive int, from an int or from a string of one to eighteen
-        ASCII digits, or None for anything else.
-
+    Only a positive int or a string of ASCII digits is taken, since the id
+    reaches the job's warning.  A bool is refused: v10's
+    ``duplicate_of: true`` is not document #1.
     """
     if isinstance(value, bool):
         return None
@@ -430,20 +335,10 @@ def _duplicate_id_in_text(text: str) -> int | None:
     """
     Find the existing document's id in a duplicate refusal's text.
 
-    paperless-ngx 2.x says ``It is a duplicate of <title> (#N).``, and the
-    title is the user's own text, so it can hold a ``(#5)`` of its own.  The
-    id is therefore the **last** ``(#N)`` after the first "duplicate of",
-    which is what paperless-ngx's own greedy "duplicate of", any text, then
-    "(#N)" pattern takes.  It is found without such a pattern, whose
-    backtracking is quadratic, because the text is a server's, of any length.  After that comes v9's
-    ``duplicate of document #N``.
-
-    Args:
-        text: The whole failure text, token struck, before any cut.
-
-    Returns:
-        The id, or None when the text names none.
-
+    In ``It is a duplicate of <title> (#N).`` the title can hold a ``(#5)``
+    of its own, so the id is the last ``(#N)`` after "duplicate of", as
+    paperless-ngx's greedy pattern takes it.  That pattern is not used here:
+    its backtracking is quadratic on server text of any length.
     """
     start = _DUPLICATE_OF.search(text)
     if start is not None:
@@ -458,24 +353,9 @@ def _duplicate_of(task: dict[str, object], full_failure: str) -> TaskDuplicate:
     """
     Say which document a duplicate refusal names, and whether it is in the trash.
 
-    Each server shape is read in turn, the first to name an id winning:
-
-    1. API v10: ``result_data`` = ``{"duplicate_of": N, "duplicate_in_trash":
-       bool}``.
-    2. v9 on paperless-ngx 3.x: ``duplicate_documents[0]["id"]``; a
-       non-null ``deleted_at`` means it is in the trash.
-    3. v9 on 2.x: ``related_document``, a string of digits, which is null
-       when the document is in the trash; the text then ends "Note:
-       existing document is in the trash."
-    4. The failure text itself (``_duplicate_id_in_text``).
-
-    Args:
-        task: A task dict that ``_is_duplicate_failure`` recognised.
-        full_failure: Its whole failure text, token struck, before any cut.
-
-    Returns:
-        The duplicate, with ``document_id`` None when nothing names it.
-
+    The first shape to name an id wins: v10's ``result_data``, v9 on 3.x's
+    ``duplicate_documents``, v9 on 2.x's ``related_document`` (null when the
+    document is in the trash, which the text then says), then the text.
     """
     data = task.get("result_data")
     flagged = isinstance(data, dict) and data.get("duplicate_in_trash") is True
@@ -502,28 +382,11 @@ def _strike(text: str, token: str) -> str:
     """
     Strike the configured token out of text saneless did not write.
 
-    Library text and server text are not under saneless's control.  h11
-    refusing a header value quotes it whole, and a reverse proxy or auth
-    gateway may answer a refused request by quoting the ``Authorization``
-    header.  So every piece of such text the client shows or logs -- an
-    exception's text, a response body at any status, a task's failure text,
-    a redirect target -- goes through here first, before it is cut to length,
-    so no fragment of the token can survive the cut.
-
-    The token is struck both as configured and stripped, since a bytes repr
-    spells out edge whitespace and control characters and so no longer
-    contains the raw form.  The replacement is unanchored: a credential is
-    struck wherever it appears, and over-redacting a diagnostic line costs
-    nothing.  A token shorter than two characters is left alone, because
-    striking a single character would mangle the text and hide no secret.
-
-    Args:
-        text: Third-party text of any shape.
-        token: The configured ``paperless.token``.
-
-    Returns:
-        The text with every occurrence of the token replaced by ``***``.
-
+    h11 quotes a refused header value whole, and a proxy may quote the
+    ``Authorization`` header, so all such text passes through here before it
+    is cut to length, or a fragment of the token could survive the cut.  The
+    stripped token is struck too, since a bytes repr no longer contains the
+    raw form; a one-character token is left alone.
     """
     for secret in (token, token.strip()):
         if len(secret) >= 2:
@@ -535,20 +398,8 @@ def _one_line_reason(exc: BaseException, token: str) -> str:
     """
     Describe a failure cause as one line for a ``PaperlessError`` message.
 
-    A CLI or web message must be a single line, but httpx2's own text
-    for an ``HTTPStatusError`` is two: ``Server error '503 ...' for url
-    '...'`` followed by ``For more information check: <mdn url>``.  A status
-    error is therefore rendered as its status, reason phrase and the body
-    reduced to one bounded line by ``_render_error_body``; anything else is
-    ``describe``, which already collapses whitespace.
-
-    Args:
-        exc: The cause.
-        token: The configured token, struck out of the text by ``_strike``.
-
-    Returns:
-        A non-empty single line with the token struck out.
-
+    httpx2's own text for an ``HTTPStatusError`` is two lines, so a status
+    error is rendered from its status and body instead.
     """
     if isinstance(exc, httpx2.HTTPStatusError):
         response = exc.response
@@ -597,42 +448,12 @@ def _retry_decision(exc: httpx2.HTTPError) -> _RetryDecision:
     """
     Classify an httpx2 error: the one place the client decides what to do.
 
-    Every upload and metadata-fetch error goes through here, so a change of
-    policy for those is a change to this function alone.  An upload is not
-    idempotent, so the question it answers is whether the body can have
-    reached paperless-ngx:
-
-    * A refused or timed-out connection, no free pool slot, and a proxy that
-      refused the tunnel all fail before a byte of the request is sent.  A
-      body write that stalls past its timeout leaves the body incomplete, and
-      paperless-ngx cannot build a document from a truncated upload.  These
-      are safe to send again.
-    * Any answer at all -- a 5xx included, since a proxy's 502 or 504 can
-      follow a body paperless-ngx read in full -- and any failure while
-      reading the answer may come after the body arrived.  The HTTP library
-      does not report a failed body write: it goes on to read whatever the
-      server says, so a cut connection shows up as one of these.  None of
-      them is sent again.
-    * A 406 is paperless-ngx refusing the API version before it looks at the
-      request, so nothing was stored.
-
-    Two paths decide without it, because neither retries, copies or raises
-    anything a policy could change.  ``test_connection`` reports every
-    transport error as UNREACHABLE; the Paperless check reports an unset
-    ``paperless.url`` before it probes.  ``poll_task`` runs only after an
-    upload was accepted, and keeps asking through any request error until its
-    deadline, since failing then would invite a rescan and a duplicate.
-
-    A chain of ``isinstance`` tests on exception types, with a total fallback:
-    a new httpx2 subclass lands in the nearest arm above it, and anything
-    unforeseen is UNEXPECTED rather than retried.
-
-    Args:
-        exc: The error a request raised.
-
-    Returns:
-        The decision for it.
-
+    The question is whether the body can have reached paperless-ngx.  A
+    refused connection, no pool slot, a refused tunnel and a stalled body
+    write cannot have delivered it whole; any answer (a proxy's 5xx
+    included) or failure while reading one may follow a stored document.
+    The HTTP library reports a cut body write as a read failure, and
+    anything unforeseen is UNEXPECTED rather than retried.
     """
     if isinstance(exc, httpx2.HTTPStatusError):
         return _status_decision(exc.response)
@@ -659,18 +480,9 @@ def _refused_newest_version(response: httpx2.Response) -> bool:
     """
     Say whether ``response`` is a 406 to a request that asked for version 10.
 
-    Such a refusal means the announcement the client learned 10 from no longer
-    holds, so asking once more with 9 can succeed.  A 406 is decided from the
-    ``Accept`` header before the server reads anything else, so the request
-    stored nothing and asking again cannot duplicate a document.
-
-    Args:
-        response: An answer, whatever its status.
-
-    Returns:
-        True only for a 406 answering a request whose ``Accept`` named the
-        newest supported version.
-
+    The announcement 10 was learned from no longer holds, so asking again
+    with 9 can succeed.  A 406 is decided before the server reads anything
+    else, so asking again cannot duplicate a document.
     """
     return (
         response.status_code == httpx2.codes.NOT_ACCEPTABLE
@@ -713,15 +525,7 @@ def _is_visible_ascii(text: str) -> bool:
     """
     Say whether ``text`` is visible ASCII only, the rule the config load applies.
 
-    ``paperless.url`` and ``paperless.token`` must pass it to load at all, and
-    a header value or URL made only of these characters is one h11 sends.
-
-    Args:
-        text: A configured value.
-
-    Returns:
-        True when every character is in ``!`` to ``~``.
-
+    A header value or URL made only of these characters is one h11 sends.
     """
     return all("!" <= char <= "~" for char in text)
 
@@ -749,18 +553,11 @@ def _json_error_text(payload: object) -> str | None:
     """
     Pick the one message a reader needs out of a DRF error payload.
 
-    The shapes Django REST Framework produces are, in order of preference:
-    ``{"detail": "..."}`` (a string, or a list joined with spaces), a
-    field-error dict ``{"field": ["msg", ...]}`` (including
-    ``non_field_errors``) rendered as ``field: msg`` for its first field,
-    and a bare top-level list whose first string is used.
-
-    Args:
-        payload: The decoded JSON body.
+    Prefers ``detail``, then the first field error as ``field: msg``, then
+    the first string of a bare list.
 
     Returns:
-        The chosen text, or None when the payload matches no known shape
-        and the caller should fall back to the raw body.
+        The text, or None when no shape matches and the raw body is used.
 
     """
     text: str | None = None
@@ -785,28 +582,10 @@ def _render_error_body(response: httpx2.Response, token: str) -> str:
     """
     Reduce a Paperless error response body to one bounded line.
 
-    This is the single body renderer for the client: the upload 4xx and 5xx,
-    the task poll non-200 and the metadata fetch all use it.  A DRF JSON error
-    is reduced to its ``detail``, else its first field error, else the first
-    entry of a top-level list; anything else (an HTML proxy page, plain text)
-    is used as it stands.  In every case the token is struck out first, then
-    the whitespace is collapsed, so no newline, tab or other whitespace
-    control character from the upstream can forge an extra CLI line, and the
-    text is cut to ``_MAX_BODY_LINE_CHARS`` characters plus an ellipsis, so
-    the job store and the web status area cannot be flooded.  The full body,
-    with the token struck out too, is logged at DEBUG so it stays diagnosable.
-
-    Args:
-        response: The error response.
-        token: The configured token, struck out of the body by ``_strike``.
-
-    Returns:
-        A non-empty single line; ``(empty response body)`` when the body
-        carried nothing.
-
+    A DRF JSON error is reduced to its message; anything else is used as it
+    stands.  The token is struck before the cut, and the full body, struck
+    too, is logged at DEBUG with its controls written out as escapes.
     """
-    # Each control character is written out rather than dropped, so the body
-    # stays whole for diagnosis without reaching a terminal as live escapes.
     logger.debug(
         "Paperless error body (%s): %s",
         response.status_code,
@@ -829,19 +608,9 @@ def _without_userinfo(url: str) -> str:
     """
     Remove any ``user:password@`` from a URL before it is shown anywhere.
 
-    Deliberately textual rather than parsed, so it also covers a URL httpx2
-    rejects or reads differently (no scheme, a bad port), and deliberately
-    greedy: it cuts through the *last* ``@``, so a password holding a raw
-    ``@`` or ``/`` cannot leave a fragment behind.  The cost is that a base
-    URL whose path holds an ``@`` is shown shortened, which is display only;
-    a leaked credential cannot be taken back.
-
-    Args:
-        url: A configured or upstream-supplied URL.
-
-    Returns:
-        The URL with nothing left of its userinfo.
-
+    Textual, so it also covers a URL httpx2 cannot parse, and greedy to the
+    last ``@``, so a password holding ``@`` or ``/`` leaves no fragment.  A
+    path holding ``@`` is shown shortened: display only, unlike a leak.
     """
     return _USERINFO.sub(r"\1", url, count=1)
 
@@ -850,21 +619,9 @@ def _bounded_line(text: str) -> str:
     """
     Collapse ``text`` to one line, tame its controls and cut it to length.
 
-    Text from Paperless -- an error body, a redirect target, a task's failure
-    -- is recorded in the job store, printed on the terminal and logged, so
-    no newline in it may forge an extra line, no length of it may flood
-    either, and no control character may reach a terminal live.  ESC, BEL,
-    NUL and most C1 controls are not whitespace, so each is shown as its
-    escape instead.  The cut comes last, at ``_MAX_BODY_LINE_CHARS``, so it
-    bounds what is printed.
-
-    Args:
-        text: Upstream text of any shape.
-
-    Returns:
-        The text on one line with no control character in it, with an
-        ellipsis when it was cut; empty when it held nothing but whitespace.
-
+    Upstream text reaches the job store, the terminal and the log, so it must
+    not forge a line, flood them or carry a live control character.  The cut
+    comes last, so it bounds what is printed.
     """
     line = neutralise_controls(" ".join(text.split()))
     if len(line) > _MAX_BODY_LINE_CHARS:
@@ -876,19 +633,8 @@ def _status_text(response: httpx2.Response, token: str) -> str:
     """
     Render a response's status code and reason phrase for a message.
 
-    The reason phrase is upstream text like the body: HTTP allows any control
-    character in it but NUL, CR and LF, so it goes through ``_bounded_line``
-    before it reaches a message that is printed and logged.  A proxy or an
-    auth gateway can put what it was sent into it, the ``Authorization``
-    header included, so the token is struck out first, as it is from the body.
-
-    Args:
-        response: The response whose status line is reported.
-        token: The configured token, struck out of the reason by ``_strike``.
-
-    Returns:
-        ``"<code> <reason>"``, or only the code when the reason is empty.
-
+    The reason phrase is upstream text: HTTP allows control characters in it,
+    and a proxy can echo the ``Authorization`` header into it.
     """
     reason = _bounded_line(_strike(response.reason_phrase, token))
     return f"{response.status_code} {reason}".rstrip()
@@ -898,16 +644,7 @@ def _loggable_task_id(task_id: str) -> str:
     """
     Tame a paperless task id for a log line or an error message.
 
-    Only what saneless prints is changed: the raw id is still what the poll
-    sends back to paperless.
-
-    Args:
-        task_id: The id paperless answered the upload with.
-
-    Returns:
-        The id with control characters shown as escapes, cut to
-        ``_TASK_ID_LOG_LIMIT`` characters.
-
+    The poll still sends the raw id back to paperless.
     """
     return neutralise_bounded(task_id, _TASK_ID_LOG_LIMIT)
 
@@ -916,20 +653,8 @@ def _not_accepted_message(response: httpx2.Response, token: str) -> str:
     """
     Say why a non-2xx upload response that is not a server error is final.
 
-    A 4xx is Paperless rejecting the upload, with its own reason.  A
-    redirect is almost always ``paperless.url`` pointing at the wrong address
-    -- a plain ``http://`` URL behind a proxy that redirects to ``https://`` --
-    and retrying it cannot help, so it names where it was sent instead.
-    Anything else (a 1xx, or a 3xx with no target) is reported by its status.
-
-    Args:
-        response: The upload response ``raise_for_status`` refused.
-        token: The configured token, struck out of the body and the
-            redirect target by ``_strike``.
-
-    Returns:
-        A single line naming the status and what to check.
-
+    A redirect is almost always ``paperless.url`` naming ``http://`` behind a
+    proxy that redirects to ``https://``, so it names where it was sent.
     """
     status = _status_text(response, token)
     location = _bounded_line(
@@ -957,26 +682,13 @@ def _redirect_target(
     """
     Resolve and sanitise where a redirect answer points.
 
-    The Location header is upstream text, and a proxy can echo what it was
-    sent.  It is resolved against the request, so a path-only target names a
-    whole address, then cut of any userinfo, the token struck out, and taken
-    to one bounded line with its controls shown as escapes.  The token is
-    struck before the join as well, because the join percent-encodes some
-    characters and would hide a token holding them from the second strike.
-
-    httpx2's client already refuses a Location its URL parser rejects, as a
-    ``RemoteProtocolError``, so such a response never reaches the
-    connection test; one built by hand is shown as its own text, through the
-    same steps, rather than raising.
-
-    Args:
-        response: A 3xx response.
-        token: The configured token, struck out by ``_strike``.
+    The token is struck before the join as well as after, because the join
+    percent-encodes some characters and would hide the token from the second
+    strike.
 
     Returns:
-        The target as it may be logged or shown to the operator, empty when
-        the answer named none, and the resolved URL for comparison, or None
-        when there is none or it could not be parsed.
+        The target as it may be shown, empty when there is none, and the
+        resolved URL, or None when there is none or it does not parse.
 
     """
     raw = response.headers.get("location", "").strip()
@@ -1044,8 +756,6 @@ class FolderDelivery:
 
 
 # A plain union rather than a ``type`` statement, so ``isinstance`` accepts it.
-# Each class carries only its own destination, so no result can claim both, or
-# claim one without saying where; callers dispatch with ``match``.
 UploadResult = ApiDelivery | FolderDelivery
 
 
@@ -1082,8 +792,7 @@ class TaskDuplicate:
     in_trash: bool
 
 
-# How a consume task that finished without failing ended.  A plain union like
-# ``UploadResult``; callers dispatch with ``match``.
+# How a consume task that finished without failing ended.
 TaskOutcome = TaskFiled | TaskDuplicate
 
 
@@ -1092,10 +801,7 @@ class PaperlessTiming:
     """
     How long the client keeps trying, and the clock it measures that on.
 
-    One argument rather than four, so the client's constructor stays within
-    ruff's five-parameter limit.  The defaults are the production values;
-    a test replaces ``clock`` and ``sleep`` with a fake clock, so no wait is
-    real and a 60 s budget runs in no time.
+    The defaults are the production values; a test swaps in a fake clock.
 
     Attributes:
         send_budget: How many seconds an upload keeps retrying failures that
