@@ -8,10 +8,9 @@ the next.  These readers find a job, split it into steps, read a step's keys
 and collect the shell a workflow runs.  More than one test module derives its
 checks from the workflows, so the readers live here once.
 
-Import it as ``from tests.workflow_support import ...``; the bare
-``workflow_support`` form raises ``ModuleNotFoundError`` under pytest 9's
-importlib mode, for the same reason ``tests.conftest`` is imported by its
-package path.
+``tests/`` is a package, so pytest's default prepend mode imports it as
+``tests.*``, and the helper is imported by that package name.  Import it as
+``from tests.workflow_support import ...``.
 """
 
 from __future__ import annotations

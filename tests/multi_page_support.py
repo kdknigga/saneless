@@ -7,10 +7,9 @@ failed.  ``ScriptedPassCoordinator`` answers those questions from a list fixed
 in advance and keeps every prompt it was shown, so a test can say both what the
 operator answered and what the operator was asked.
 
-Import it as ``from tests.multi_page_support import ...``; the bare
-``multi_page_support`` form raises ``ModuleNotFoundError`` under pytest 9's
-importlib mode, for the same reason ``tests.conftest`` is imported by its
-package path.
+``tests/`` is a package, so pytest's default prepend mode imports it as
+``tests.*``, and the helper is imported by that package name.  Import it as
+``from tests.multi_page_support import ...``.
 """
 
 from __future__ import annotations

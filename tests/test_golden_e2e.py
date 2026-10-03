@@ -1,7 +1,7 @@
 """
-The golden end-to-end test: the right document, delivered once, reported truly.
+A scan delivers the right document once and reports the outcome truly.
 
-Every other end-to-end test checks that a job *finished*.  This one checks what
+A job that *finished* is not a job that delivered.  These tests check what
 was delivered and what the operator was told about it:
 
 - the right pages, byte for byte the ones the scanner spooled;
@@ -19,8 +19,8 @@ except the scanner hardware and paperless-ngx itself: the real app runs under
 ``PaperlessClient`` sends real multipart requests to an in-memory
 paperless-ngx.
 
-The harness lives in ``tests.golden_support`` so later end-to-end work can
-reuse it.
+The harness lives in ``tests.golden_support``, shared with the other
+end-to-end tests.
 """
 
 from __future__ import annotations
@@ -485,7 +485,7 @@ def _run_web(
 def test_web_upload_carries_the_operators_metadata_once(
     scenario: _Scenario, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One upload, carrying the title, tags and correspondent typed in the form."""
+    """A web scan uploads once, carrying the title, tags and correspondent typed."""
     run = _run_web(tmp_path, monkeypatch, scenario)
 
     assert len(run.recorder.uploads()) == 1
@@ -513,7 +513,7 @@ def test_web_pages_arrive_in_document_order(
 def test_web_polls_once_and_stores_the_outcome(
     scenario: _Scenario, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One poll for the issued task, a truthful row, and no scratch left over."""
+    """A web scan polls its task once, stores a truthful row, leaves no scratch."""
     run = _run_web(tmp_path, monkeypatch, scenario)
 
     assert run.recorder.issued == ["golden-task-1"]
@@ -818,7 +818,7 @@ def _warning_lines(stderr: str) -> list[str]:
 def test_cli_upload_carries_the_profile_metadata_once(
     scenario: _Scenario, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One upload, carrying the typed title and the profile's tags and correspondent."""
+    """A CLI scan uploads once, with the typed title and the profile's metadata."""
     run = _run_cli(tmp_path, monkeypatch, scenario)
 
     assert len(run.recorder.uploads()) == 1
@@ -1103,7 +1103,7 @@ def test_cli_all_blank_scan_keeps_a_pdf_and_exits_8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Every page judged blank: nothing uploaded, the pages kept as one PDF, exit 8.
+    A scan judged all blank uploads nothing, keeps the pages as one PDF, exits 8.
 
     The scanner feeds three blank sheets.  Empty-page detection removes all
     of them, which is its own failure rather than a scanner fault: the advice
@@ -1162,8 +1162,8 @@ def test_cli_coding_error_in_the_upload_exits_5_with_the_pdf_kept(
 
     The ``TypeError`` keeps its type all the way out, so the command exits 5
     and says ``Unexpected error (TypeError)``, and the assembled PDF is kept
-    and named on that line.  It used to be re-raised as a ``PaperlessError``
-    and exit 3, blaming a server that was never reached.
+    and named on that line.  Reported as a ``PaperlessError`` it would exit
+    3, blaming a server that was never reached.
     """
 
     def broken_upload(*_args: object, **_kwargs: object) -> NoReturn:
@@ -1223,7 +1223,7 @@ def test_cli_stale_tag_is_dropped_and_exits_7(
 def test_web_stale_tag_is_dropped_and_the_job_is_warned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The same ids through the form end the same way: DONE, warned, tag 3 only."""
+    """A stale tag ticked in the form is dropped: DONE, warned, tag 3 only."""
     run = _run_web(
         tmp_path,
         monkeypatch,

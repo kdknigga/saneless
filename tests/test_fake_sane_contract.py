@@ -1011,7 +1011,7 @@ class TestTheDoubleItself:
 
     def test_module_init_reports_the_version_libsane_1_0_32_returned(self) -> None:
         """
-        The double reports ``(16777248, 1, 0, 32)``, measured on libsane 1.0.32.
+        The double reports ``(16777248, 1, 0, 32)``, what libsane 1.0.32 returns.
 
         The dual-target row above checks the shape against whatever libsane is
         installed; this one pins the double's own value to a real release.

@@ -32,8 +32,9 @@ closed before the context manager returns.  Every handler catches ``OSError``
 and closes its connection in a ``finally``, because an unclosed socket or an
 exception escaping a thread is a test error under ``filterwarnings = ["error"]``.
 
-Import it as ``from tests.fake_saned import ...``; the bare ``fake_saned`` form
-raises ``ModuleNotFoundError`` under pytest 9's importlib mode.
+``tests/`` is a package, so pytest's default prepend mode imports it as
+``tests.*``, and the helper is imported by that package name.  Import it as
+``from tests.fake_saned import ...``.
 """
 
 from __future__ import annotations
@@ -400,7 +401,7 @@ def _bind(listener: socket.socket, port: int) -> None:
         listener.bind(("127.0.0.1", port))
     except OSError:
         # A failure and never a skip: a skip would silently drop the
-        # regression test on every machine that happens to run saned.
+        # test on every machine that happens to run saned.
         pytest.fail(
             f"127.0.0.1:{port} is already in use, so the fake saned cannot "
             f"listen there. libsane's net backend dials only port {port}; stop "
