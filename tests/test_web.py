@@ -3418,12 +3418,12 @@ def _profile_select_tag(page: str) -> str:
 
 
 class TestProfileSelectMarkup:
-    """UI-SPEC S4: the select's wiring and its live description slot."""
+    """The select's wiring and its live description slot."""
 
     def test_the_profile_select_carries_its_htmx_and_aria_wiring(
         self, client: TestClient
     ) -> None:
-        """The seven attributes S4 specifies, and the swap is never outerHTML."""
+        """The select carries its seven wiring attributes and never swaps outerHTML."""
         response = client.get("/")
 
         select = _profile_select_tag(response.text)
@@ -3509,7 +3509,7 @@ class TestProfileSelectMarkup:
         self, client: TestClient
     ) -> None:
         """
-        The description doubles as the control's help text (APPL-10).
+        The description doubles as the control's help text.
 
         The Multiple pages field sits between the profile and the title, and
         its help line belongs to its own checkbox, so the count stops where
@@ -3536,7 +3536,7 @@ class TestProfileSelectMarkup:
     def test_the_profile_select_still_submits_the_chosen_profile(
         self, client: TestClient
     ) -> None:
-        """Changing the option text did not change what the form posts."""
+        """The option text does not change what the form posts."""
         response = client.post(
             "/api/scan", data={"profile": "duplex", "title": "Select Submit"}
         )
@@ -3565,7 +3565,7 @@ _OVER_LONG_FILTER = "a" * 500
 
 # A filter value that would be an injected script if it were ever echoed.  It is
 # well under the cap, so it reaches the filter rather than the 422 path, which is
-# the case worth proving (T-30-74).
+# the case worth proving.
 _SCRIPT_FILTER = "<script>alert(1)</script>"
 
 
@@ -3649,12 +3649,11 @@ def _checkbox(markup: str, tag_id: int) -> str:
 
 class TestTagFilter:
     """
-    UI-SPEC S6: the server-side tag filter that can never drop a tick.
+    The server-side tag filter that can never drop a tick.
 
     Two hazards are designed out rather than guarded against, and these tests
-    are what hold the design in place: a filter swap must not lose a ticked tag
-    (A-5), and the filter text must never reach paperless-ngx or the page
-    (T-30-74, T-30-75).
+    are what hold the design in place: a filter swap must not lose a ticked
+    tag, and the filter text must never reach paperless-ngx or the page.
     """
 
     def test_tag_filter_absent_renders_every_tag_as_an_unchecked_checkbox(
@@ -3688,7 +3687,7 @@ class TestTagFilter:
     def test_tag_filter_renders_the_carried_selection_checked(
         self, client: TestClient
     ) -> None:
-        """A tag id the request carries comes back ticked (A-5)."""
+        """A tag id the request carries comes back ticked."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": "rec", "tags": [3]})
@@ -3699,7 +3698,7 @@ class TestTagFilter:
     def test_tag_filter_pins_a_selected_tag_the_filter_excludes(
         self, client: TestClient
     ) -> None:
-        """A tick outside the filter stays in the DOM, above the list (A-5)."""
+        """A tick outside the filter stays in the DOM, above the list."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": "rec", "tags": [2, 3]})
@@ -3721,7 +3720,7 @@ class TestTagFilter:
     def test_tag_filter_never_echoes_the_query_into_the_response(
         self, client: TestClient
     ) -> None:
-        """The filter is a filter, never a label: it is not rendered (T-30-74)."""
+        """The filter is a filter, never a label: it is not rendered."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": _SCRIPT_FILTER})
@@ -3744,7 +3743,7 @@ class TestTagFilter:
     def test_tag_filter_rejects_an_over_long_query_with_422(
         self, client: TestClient
     ) -> None:
-        """An unbounded filter is refused at the boundary (T-30-76)."""
+        """An unbounded filter is refused at the boundary."""
         _serve_tag_rows(client)
 
         response = client.get("/api/tags", params={"q": _OVER_LONG_FILTER})
@@ -3754,7 +3753,7 @@ class TestTagFilter:
     def test_tag_filter_issues_no_upstream_request_when_the_cache_is_warm(
         self, client: TestClient
     ) -> None:
-        """Filtering reads the cache; it is not a new fetch (T-30-75)."""
+        """Filtering reads the cache; it is not a new fetch."""
         app = _app(client)
         handler = _count_upstream(app)
         app.state.cache.set("tags", list(_TAG_ROWS))
@@ -3768,7 +3767,7 @@ class TestTagFilter:
     def test_tag_filter_never_forwards_the_query_to_paperless(
         self, client: TestClient
     ) -> None:
-        """A cold cache fetches the whole list and carries no ``q`` (T-30-75)."""
+        """A cold cache fetches the whole list and carries no ``q``."""
         app = _app(client)
         handler = _count_upstream(app)
         app.state.cache.invalidate("tags")
@@ -3825,7 +3824,7 @@ class TestTagFilter:
         self, client: TestClient
     ) -> None:
         """
-        The belt to the form-owner attribute's braces (A-6).
+        The belt to the form-owner attribute's braces.
 
         The filter input's HTML form owner is ``#tag-filter-form``, so a scan
         cannot carry ``q`` at all.  This covers the residual case -- a scripted
@@ -4097,7 +4096,7 @@ class TestStaleDefaultAndUnlistedRows:
         assert markup.count("<option") == 2
 
 
-# The profile defaults the D-29 regression tests drive, chosen so neither can
+# The profile defaults the hidden-control tests drive, chosen so neither can
 # be produced by accident: no fixture tag or correspondent uses these ids.
 _PROFILE_DEFAULT_TAGS = [41, 42]
 _PROFILE_DEFAULT_CORRESPONDENT = 43
@@ -4166,7 +4165,7 @@ def _simple_form_app(
 @pytest.mark.usefixtures("offline_paperless")
 class TestSimpleForm:
     """
-    D-28 and D-29: the owner can shrink the form without changing the scan.
+    The owner can shrink the form without changing the scan.
 
     Two separate claims, and the second is the one that could go wrong quietly.
     Hiding a control changes what a household member is asked; it must not
@@ -4242,7 +4241,7 @@ class TestSimpleForm:
     def test_simple_form_keeps_every_control_when_both_are_on(
         self, tmp_path: Path
     ) -> None:
-        """The default shape is the full form, so an upgrade changes nothing."""
+        """The default shape is the full form, with every control shown."""
         with TestClient(_simple_form_app(tmp_path)) as client:
             page = client.get("/").text
 
@@ -4259,7 +4258,7 @@ class TestSimpleForm:
     def test_simple_form_hides_by_absence_and_never_with_css(
         self, tmp_path: Path
     ) -> None:
-        """D-28: the controls are not rendered, not rendered-then-hidden."""
+        """The controls are not rendered, not rendered-then-hidden."""
         with TestClient(
             _simple_form_app(tmp_path, show_tags=False, show_correspondent=False)
         ) as client:
@@ -4272,7 +4271,7 @@ class TestSimpleForm:
     def test_simple_form_without_tags_still_applies_the_profile_default_tags(
         self, tmp_path: Path
     ) -> None:
-        """D-29: hiding the control changes the form, never the scan."""
+        """Hiding the control changes the form, never the scan."""
         with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
@@ -4284,7 +4283,7 @@ class TestSimpleForm:
     def test_simple_form_without_correspondent_still_applies_its_default(
         self, tmp_path: Path
     ) -> None:
-        """The correspondent half of the same claim (D-29)."""
+        """The correspondent half of the same claim."""
         with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
@@ -4313,7 +4312,7 @@ class TestSimpleForm:
             assert job_store.list_recent(limit=1)[0].tags == [7]
 
     def test_simple_form_tag_rows_are_a_thumb_sized_tap_target(self) -> None:
-        """D-30: the label is the target and it clears 44 px at a 16 px root."""
+        """The label is the target and it clears 44 px at a 16 px root."""
         assert _css_declarations(_TAG_OPTION_SELECTOR) == _TAG_OPTION_DECLARATIONS
         assert _css_declarations(".tag-list") == _TAG_LIST_DECLARATIONS
 
@@ -4386,7 +4385,7 @@ class TestProfileDefaultsFollowTheFormShape:
         assert len(calls) == 1
 
     def test_a_cleared_tag_list_submits_no_tags(self, tmp_path: Path) -> None:
-        """The review's named regression test: unticking every box means none."""
+        """Unticking every tag box on a shown control submits no tags."""
         with TestClient(_simple_form_app(tmp_path)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Cleared"}
@@ -4398,7 +4397,7 @@ class TestProfileDefaultsFollowTheFormShape:
     def test_a_hidden_tag_control_still_applies_the_profile_default(
         self, tmp_path: Path
     ) -> None:
-        """D-29's half: with no control on the page the profile answers."""
+        """With no tag control on the page, the profile's default tags apply."""
         with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Hidden"}
@@ -4421,7 +4420,7 @@ class TestProfileDefaultsFollowTheFormShape:
     def test_a_cleared_correspondent_submits_no_correspondent(
         self, tmp_path: Path
     ) -> None:
-        """The correspondent half of the same regression."""
+        """Choosing no correspondent on a shown control submits none."""
         with TestClient(_simple_form_app(tmp_path)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Cleared"}
@@ -4433,7 +4432,7 @@ class TestProfileDefaultsFollowTheFormShape:
     def test_a_hidden_correspondent_control_still_applies_the_default(
         self, tmp_path: Path
     ) -> None:
-        """The correspondent half of D-29."""
+        """With no correspondent control on the page, the profile's default applies."""
         with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Hidden"}
@@ -5120,7 +5119,7 @@ class TestProfileDefaultsArePreTicked:
     def test_profile_change_shows_a_stale_default_ticked_with_the_note(
         self, tmp_path: Path
     ) -> None:
-        """A default paperless-ngx no longer has is ticked, and says so."""
+        """A default missing from paperless-ngx is ticked, and says so."""
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             tags = client.get("/api/profiles/tags", params={"profile": "gone"}).text
             select = client.get(
@@ -5349,11 +5348,11 @@ class TestMetadataFollowsTheSubmittedProfile:
         self, tmp_path: Path
     ) -> None:
         """
-        The regression: ``other`` submitted with ``default``'s metadata.
+        Ticks marked for ``default`` give way when ``other`` is submitted.
 
-        This is what a restored Profile select or an unfinished swap sends,
-        and before the marker it filed ``default``'s tags and correspondent
-        under ``other`` with no warning.
+        This is what a restored Profile select or an unfinished swap sends;
+        without the markers, ``default``'s tags and correspondent would be
+        filed under ``other`` with no warning.
         """
         with TestClient(_pre_ticked_app(tmp_path)) as client:
             response = client.post(
@@ -5730,7 +5729,7 @@ def _load_page_and_lists(client: TestClient) -> str:
 
 class TestHiddenControlsCostNoMetadataFetch:
     """
-    IN-01: an appliance does not pay for data its markup leaves out.
+    An appliance does not pay for data its markup leaves out.
 
     On a cold metadata cache a page load costs one paperless-ngx round trip per
     optional control, and the flags the template branches on are the same flags
