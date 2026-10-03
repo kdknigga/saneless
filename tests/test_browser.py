@@ -1495,8 +1495,7 @@ _PROBE_CONTEXT_CONTRAST = (
     } else if (context === "card") {
         // Any <article> is Pico's secondary surface, which is the one a line
         // placed inside a card sits on -- the status strip's card and the Scan
-        // card are the same colour, so the first one serves for both. (It used
-        // to be the Scan card; #checks-card now precedes it.)
+        // card are the same colour, so the first one serves for both.
         document.querySelector("article").appendChild(probe);
     } else {
         const row = document.createElement("tr");
@@ -2189,7 +2188,7 @@ class TestDarkModeEngagement:
 _QUEUE_FULL_TEXT = (
     "✗ The scan queue is full. Wait for a scan to finish, then try again."
 )
-"""The slot's exact text for a 429: the error partial's cross plus the S3 copy."""
+"""The slot's exact text for a 429: the error partial's cross plus its copy."""
 
 _DEGRADED_TEXT = (
     "✗ Job history cannot be saved right now, so the scan was not started. "
