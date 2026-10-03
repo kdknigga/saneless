@@ -615,7 +615,7 @@ class TestReadOnlyMount:
 
         monkeypatch.setattr(os, "statvfs", statvfs)
 
-    def test_read_only_single_file_mount_is_the_d08_config_error(
+    def test_read_only_single_file_mount_tells_the_operator_to_mount_the_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A read-only file in a writable directory is its own mount: D-08."""
