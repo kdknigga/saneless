@@ -2228,14 +2228,13 @@ _CHECKS_TEMPLATE = _PACKAGE_DIR / "templates" / "partials" / "checks.html"
 # ordered list.  The strip's amber is the fallback amber, read through the
 # same custom property.  A new literal would be an unmeasured colour on a
 # LAN-visible page.
-_EXPECTED_HEX_LITERALS = ["#a16207", "#ca8a04", "#ca8a04"]
+_EXPECTED_HEX_LITERALS = ["#a16207", "#ca8a04"]
 
-# The three declarations the Pico coupling contract and tests/test_browser.py
+# The two declarations the Pico coupling contract and tests/test_browser.py
 # both pin.  Renaming the property or changing either value breaks the
 # vendored-asset contract, so they are asserted byte for byte.
 _FALLBACK_DECLARATIONS = [
     "--saneless-status-fallback: #a16207;",
-    "--saneless-status-fallback: #ca8a04;",
     "--saneless-status-fallback: #ca8a04;",
 ]
 
@@ -2728,7 +2727,7 @@ class TestStripStyles:
 
     def test_no_colour_literal_was_added(self) -> None:
         """
-        The stylesheet's hex literals are exactly the three fallback ambers.
+        The stylesheet's hex literals are exactly the light and dark fallback ambers.
 
         Every colour the strip renders is an existing token whose contrast is
         measured in both schemes, so no unmeasured colour reaches the page.
@@ -2736,7 +2735,7 @@ class TestStripStyles:
         assert _HEX_LITERAL.findall(_css()) == _EXPECTED_HEX_LITERALS
 
     def test_the_fallback_declarations_are_untouched(self) -> None:
-        """All three ``--saneless-status-fallback`` declarations, byte for byte."""
+        """Both ``--saneless-status-fallback`` declarations, byte for byte."""
         found = [
             line.strip()
             for line in _css().splitlines()
