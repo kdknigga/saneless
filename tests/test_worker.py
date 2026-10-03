@@ -6799,7 +6799,7 @@ class _CountedPassScanner(StubScannerBackend):
 
     Concrete rather than a ``MagicMock``, like every other fake here, and
     inheriting ``get_devices() -> []`` from ``StubScannerBackend`` so startup
-    profile generation (D-14) leaves these tests' settings alone.
+    profile generation leaves these tests' settings alone.
 
     Attributes:
         release_pass_b: Set by the test to let pass B return.
@@ -6905,13 +6905,13 @@ def _run_duplex_job(worker: ScanWorker, store: JobStore, title: str) -> Job:
 
 class TestFrontPages:
     """
-    ``ScanWorker.front_pages`` carries pass A's count out of a running job (D-33).
+    ``ScanWorker.front_pages`` carries pass A's count out of a running job.
 
     The status area renders from the job row, and the row has no column for
-    this: CONTEXT forbids a schema migration, and the number is wanted only
-    while one specific job is in ``SCANNING_REVERSE``.  So it lives on the
-    worker beside ``current_job_id``, is written by the pipeline's pass-count
-    callback, and is cleared however the job ends.
+    this: the number is wanted only while one specific job is in
+    ``SCANNING_REVERSE``, which does not justify a schema migration.  So it
+    lives on the worker beside ``current_job_id``, is written by the
+    pipeline's pass-count callback, and is cleared however the job ends.
     """
 
     def test_a_fresh_worker_reports_front_pages_as_none(
@@ -6962,7 +6962,7 @@ class TestFrontPages:
         mock_paperless: MagicMock,
         isolated_duplex_settings: Settings,
     ) -> None:
-        """D-33: SCANNING_REVERSE is exactly when the strip wants the number."""
+        """SCANNING_REVERSE is exactly when the strip wants the number."""
         scanner = _CountedPassScanner(fronts=4, backs=4)
         store = JobStore()
         worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
@@ -7135,7 +7135,7 @@ class _GatedProfileScanner(StubScannerBackend):
     """
     A scanner whose startup ``get_devices`` waits for the test to release it.
 
-    Startup profile generation is the worker thread's first act (D-14) and it
+    Startup profile generation is the worker thread's first act and it
     enters SANE twice, so it is the second place the gate has to be held.
     Holding enumeration open turns that into a state the test can observe.
 
@@ -7168,7 +7168,7 @@ class _GatedProfileScanner(StubScannerBackend):
 
 class TestScannerGate:
     """
-    ``ScanWorker.scanner_gate`` is real mutual exclusion on SANE (D-08).
+    ``ScanWorker.scanner_gate`` is real mutual exclusion on SANE.
 
     Nothing in ``scanner/sane_backend.py`` excludes two concurrent SANE calls:
     ``_refuse_if_wedged`` fires on a *stuck* read rather than a running one,
@@ -7176,7 +7176,7 @@ class TestScannerGate:
     ``current_job_id is None`` test has a genuine race -- read ``None``, enter
     ``get_devices()``, and the worker starts a job a microsecond later -- and
     on the ``net`` backend losing that race is a second RPC on the control
-    wire a scan is using, not merely a slow probe (Pitfall 2).
+    wire a scan is using, not merely a slow probe.
     """
 
     def test_scanner_gate_is_free_on_an_idle_worker(
@@ -7297,12 +7297,12 @@ class TestScannerGate:
         default_settings: Settings,
     ) -> None:
         """
-        D-14's first act enters SANE twice, so it is gated too.
+        Startup generation enters SANE twice, so it is gated too.
 
         ``_read_generated_profiles`` calls ``get_devices`` and then
         ``get_capabilities``; on the ``net`` backend the first is an RPC and
         the second opens the device.  A refresher probe landing in that window
-        would be exactly the concurrency Pitfall 2 describes.
+        would be a second RPC on the control wire the read is using.
         """
         scanner = _GatedProfileScanner()
         store = JobStore()
@@ -7847,15 +7847,14 @@ class TestScanningWaitsForTheGate:
 
 class TestProfileStorage:
     """
-    ``ScanWorker.profile_storage`` records what the startup persist did (A-2).
+    ``ScanWorker.profile_storage`` records what the startup persist did.
 
     ``_persist_generated_profiles`` returns ``None`` for two genuinely
     different situations -- no config file was loaded at all, and one was
-    loaded and could not be written -- and used to keep no record of which.
-    D-22's Profiles row has to tell a household member which happened, and a
-    fresh ``os.access()`` probe at check time cannot: Phase 27 D-09's
-    motivating failure is EBUSY on a single-file bind mount, where the
-    directory is writable and only the rename fails.
+    loaded and could not be written.  The Profiles row has to tell a
+    household member which happened, and a fresh ``os.access()`` probe at
+    check time cannot: on a single-file bind mount the directory is writable
+    and only the rename fails, with EBUSY.
     """
 
     @staticmethod
@@ -7934,7 +7933,7 @@ class TestProfileStorage:
         mock_scanner: MagicMock,
         worker_for: Callable[[JobStore], ScanWorker],
     ) -> None:
-        """D-17: nothing to write to is not the same as cannot write."""
+        """Nothing to write to is not the same as cannot write."""
         self._caps_scanner(mock_scanner)
         store = JobStore()
         worker = worker_for(store)
@@ -7960,7 +7959,7 @@ class TestProfileStorage:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D-18: a loaded file that will not take the write is the amber case."""
+        """A loaded file that will not take the write is the amber case."""
         self._caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
         config_file.write_text("# read-only\n")
@@ -8002,7 +8001,7 @@ class TestProfileStorage:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
-        WR-04's catch-all branch records the same outcome as the OSError one.
+        The catch-all branch records the same outcome as the OSError one.
 
         Two branches, one truth: whatever went wrong, a file was loaded and the
         profiles did not reach it.
@@ -8067,13 +8066,13 @@ class TestProfileStorage:
         tmp_path: Path,
     ) -> None:
         """
-        CR-01: the production shape reported a permanent falsehood.
+        Profiles loaded from a file that skip generation are reported persisted.
 
         An operator with a real config file holding profiles that are not the
-        bare default never reaches a branch that records the storage outcome --
-        ``_generate_startup_profiles`` returns at ``if not bare``. The seed said
-        no config file was in use, for the life of the process, on the one
-        deployment shape the compose file ships.
+        bare default never reaches the write -- ``_generate_startup_profiles``
+        returns at ``if not bare`` -- yet the profiles are on disk.  This is the
+        deployment shape the compose file ships, so a "no config file" answer
+        here would be wrong for the life of the process.
         """
         self._caps_scanner(mock_scanner)
         self._second_profile(default_settings)
@@ -8127,7 +8126,7 @@ class TestProfileStorage:
         tmp_path: Path,
     ) -> None:
         """
-        D-15: a SANE failure leaves the loaded profiles exactly where they were.
+        A SANE failure leaves the loaded profiles exactly where they were.
 
         The autouse fixture answers ``get_devices`` with ``[]``, so
         ``_read_generated_profiles`` returns ``None`` and generation gives up.
@@ -8181,11 +8180,11 @@ class TestProfileStorage:
         tmp_path: Path,
     ) -> None:
         """
-        D-02 is about the words, so assert the rendered row, not just the enum.
+        The rendered Profiles row is green for profiles held in a config file.
 
-        The amber row CR-01 produced told a household member to create a
-        configuration file they already had. Asserting the enum alone would not
-        have caught that the sentence was false.
+        The row's words are what a household member reads; an amber row here
+        would tell them to create a configuration file they already have, which
+        the enum alone cannot show.
         """
         self._caps_scanner(mock_scanner)
         self._second_profile(default_settings)
@@ -8356,9 +8355,9 @@ class TestProgressWriteFailures:
     A failed progress write to the job store never changes how a scan ends.
 
     The thumbnail and the active-state writes only tell observers how far a
-    scan has got.  A locked or failing job database during one of them used to
-    abort the run, file the store's error as a scanner fault and, outside the
-    pipeline's guard windows, delete the spooled pages.  Each test here runs
+    scan has got, so a locked or failing job database during one of them must
+    not abort the run, file the store's error as a scanner fault or delete the
+    spooled pages.  Each test here runs
     the real pipeline over a manual-duplex job, so the spool, the flip wait and
     the assembly are all real; only the scanner and Paperless are fakes.
     """
