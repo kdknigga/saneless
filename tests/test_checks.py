@@ -7048,7 +7048,7 @@ def _gate_sampling_context(
 
 
 # The scanner contexts whose rows differ, which is what makes them the ones a
-# gated-equals-ungated claim has to cover (R3-IN-01).  Each reaches a different
+# gated-equals-ungated claim has to cover.  Each reaches a different
 # branch of the scanner check, and each ends in a different row:
 #
 # - no python-sane, decided before anything is touched;
@@ -7177,11 +7177,9 @@ class TestScannerRowGuards:
         """
         ASVS V7 across every probe outcome and both wrong-device contexts.
 
-        The contexts cover every outcome the dialler can return -- refused,
-        timed out, healthy, rejected and unresolved -- and a configured device
-        whose id names a local USB scanner.  The host is ``scanbox.lan``, the
-        listed device's id is a ``net:`` one, and the configured one is an
-        ``epson2`` one; none of them may reach either field of the row.
+        The contexts cover every dialler outcome and a configured local USB
+        device.  Neither the host ``scanbox.lan``, the listed ``net:`` id nor
+        the configured ``epson2`` id may reach either field of the row.
 
         Args:
             tmp_path: The test's own directory.
@@ -7223,10 +7221,9 @@ class TestScannerRowGuards:
         """
         A host refusing this machine is never blamed on the scanner's power.
 
-        "Switched on and connected" was the advice the 2026-09-22 denial got,
-        and it sent the reader to the one part of the setup that was fine.
-        Every combination here must reach the refusal wording, so the property
-        cannot pass by never meeting the case it is about.
+        "Switched on and connected" would send the reader to the one part of
+        the setup that is fine.  Every combination reaches the refusal wording,
+        so the property cannot pass without meeting its case.
 
         Args:
             tmp_path: The test's own directory.
@@ -7257,11 +7254,11 @@ _SCAN_RUNNING_MESSAGE = "Not checked while a scan is running."
 
 
 class TestRunChecksUnderTheScannerGate:
-    """WR-03: the gate is held around the scanner check and around nothing else."""
+    """The gate is held around the scanner check and around nothing else."""
 
     def test_an_ungated_run_still_produces_every_row(self, tmp_path: Path) -> None:
         """
-        ``doctor`` passes no gate, and nothing about its run changes.
+        ``doctor`` passes no gate, and its run still produces every row.
 
         Args:
             tmp_path: The test's own directory.
@@ -7280,22 +7277,11 @@ class TestRunChecksUnderTheScannerGate:
         """
         Handing in a free gate changes the rows not at all, in any context.
 
-        ``_scanner_result``'s docstring names this test as the replacement for
-        the uniform-dispatch seam the gate split removed: the gated path no
-        longer routes through ``_dispatch``, so nothing mechanical keeps it and
-        ``saneless doctor``'s ungated ``_check_scanner`` in step -- this does.
-
-        Until R3-IN-02 it ran exactly one scenario, and it was the scenario
-        where the gate is irrelevant (R3-IN-01): a free gate, a backend that
-        answers, and no configured host.  Every context whose *row* differs was
-        untested, so a gated path that diverged on the no-python-sane row, on a
-        host that does not answer the pre-probe, or on an enumeration that
-        raises would have passed.  Every context in ``_GATED_CONTEXTS`` runs
-        here, including the refused, rejected, timed-out, unresolved and
-        wrong-device ones, and all of
-        them are reached without resolving a name or opening a socket -- the
-        dialler is stubbed in every variant, including the one that never
-        reaches it.
+        The gated path does not route through ``_dispatch``, so nothing
+        mechanical keeps it in step with ``saneless doctor``'s ungated
+        ``_check_scanner``; this test does.  It runs every context in
+        ``_GATED_CONTEXTS``, each of which ends in a different row, with the
+        dialler stubbed so no name is resolved and no socket opened.
 
         Args:
             tmp_path: The test's own directory.
@@ -7357,7 +7343,7 @@ class TestRunChecksUnderTheScannerGate:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        WR-03: a multi-second HTTP budget must not park a scan start.
+        A multi-second HTTP budget must not park a scan start.
 
         Args:
             tmp_path: The test's own directory.
@@ -7417,7 +7403,7 @@ class TestRunChecksUnderTheScannerGate:
         A wedged check must never leave the worker locked out of its scanner.
 
         What is broken here is the enumeration, because that is the region the
-        gate is held around: the pre-probe now runs before the acquire, so a
+        gate is held around: the pre-probe runs before the acquire, so a
         stand-in for the whole check would never reach the gate to leave it
         held.  A scanner is supplied for the same reason -- without one the
         pre-probe settles the row and the gate is never taken.
@@ -7473,18 +7459,13 @@ class TestRunChecksUnderTheScannerGate:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        R2-IN-03: name resolution must not be able to park a scan start.
+        Name resolution must not be able to park a scan start.
 
-        The pre-probe is not SANE work -- it is a DNS lookup and a TCP
-        handshake -- and its resolution step is outside every budget this
-        module states, because ``getaddrinfo`` takes no timeout.  Holding the
-        scanner gate across it means ``ScanWorker._scan_job`` can sit in
-        ``with self._scanner_gate:`` with the job row already written
-        ``SCANNING`` for as long as a broken resolver takes.
-
-        A host is configured on purpose: with none, ``_saned_hosts`` yields
-        nothing, the pre-probe never runs, and the case would pass vacuously
-        while proving nothing.
+        The pre-probe is a DNS lookup and a TCP handshake, not SANE work, and
+        ``getaddrinfo`` takes no timeout.  Held across it, the gate would keep
+        ``ScanWorker._scan_job`` waiting, its job row already ``SCANNING``, for
+        as long as a broken resolver takes.  A host is configured so the
+        pre-probe runs and the case cannot pass vacuously.
 
         Args:
             tmp_path: The test's own directory.
@@ -7620,17 +7601,13 @@ class TestRunChecksUnderTheScannerGate:
         self, tmp_path: Path
     ) -> None:
         """
-        R2-WR-02: losing the gate is not a scan, and the row must not say it is.
+        Losing the gate is not a scan, and the row must not say it is.
 
-        ``run_checks`` honours ``skip_scanner`` *before* it looks at the gate,
-        so by the time a non-blocking acquire fails a running scan has already
-        been excluded.  What holds the gate in that window today is
-        ``ScanWorker._read_generated_profiles``, the worker thread's first act
-        at startup, taken while ``_current_job_id`` is still ``None`` -- which
-        is exactly when the cold-start poll probes.
-
-        The row is asserted, not the constructor that built it: the sentence a
-        household member reads is the contract.
+        ``run_checks`` honours ``skip_scanner`` before it looks at the gate, so
+        a failed non-blocking acquire excludes a running scan.  What holds the
+        gate then is ``ScanWorker._read_generated_profiles`` at startup, while
+        ``_current_job_id`` is ``None``, which is when the cold-start poll
+        probes.  The row's sentence is asserted, because it is the contract.
 
         Args:
             tmp_path: The test's own directory.
@@ -7658,7 +7635,7 @@ class TestRunChecksUnderTheScannerGate:
         self, tmp_path: Path
     ) -> None:
         """
-        D-08's sentence is unchanged, and it stays the only row that says it.
+        A skipped scanner names the running scan, and no other row says it.
 
         Its companion above proves the two branches are distinguishable by
         message alone, which is what lets either surface be trusted.
@@ -8220,14 +8197,13 @@ class TestIsolatedListingWiring:
 
 class TestConfigurationRow:
     """
-    The row that names the cause the other five could only hint at (Phase 37).
+    The Configuration row names the cause the other five can only hint at.
 
-    Phase 37 D-03 gives the configuration file its own row rather than weaving
-    a sentence into three others.  D-05 is the contract: four states, one of
-    them green, and exactly two of them allowed to name a file.  Every message
-    and next step here is asserted in full, because 37-03's terminal surfaces
-    reuse these sentences verbatim and a paraphrase in one place would be a
-    second wording source.
+    The configuration file has its own row rather than a sentence woven into
+    three others: four states, one of them green, and exactly two of them
+    allowed to name a file.  Every message and next step is asserted in full,
+    because the terminal surfaces reuse these sentences verbatim and a
+    paraphrase in one place would be a second wording source.
     """
 
     def test_the_row_is_named_configuration(self) -> None:
@@ -8236,7 +8212,7 @@ class TestConfigurationRow:
 
     def test_a_loaded_file_is_green_and_names_nothing(self, tmp_path: Path) -> None:
         """
-        Phase 37 D-05, first case, and D-06: green shows no path.
+        A loaded file is green, and the green row shows no path.
 
         A path in the healthy row is noise to the reader the strip is for, and
         it is a host filesystem path on a page anyone on the LAN can load.
@@ -8253,7 +8229,7 @@ class TestConfigurationRow:
 
     def test_a_leftover_beside_a_loaded_file_is_amber(self, tmp_path: Path) -> None:
         """
-        Phase 37 D-05 second case and D-10: the right file loaded, so nothing failed.
+        A leftover beside the loaded file is amber: the right file loaded.
 
         It is still worth a row: the leftover is a trap for the next person to
         edit, who has no way to tell from the filesystem which file is live.
@@ -8280,7 +8256,7 @@ class TestConfigurationRow:
         self, tmp_path: Path
     ) -> None:
         """
-        Phase 37 D-05 third case, D-06 and D-07: amber, and no path on the strip.
+        No config file at all is amber, and the strip shows no path.
 
         Args:
             tmp_path: The test's own directory.
@@ -8301,7 +8277,7 @@ class TestConfigurationRow:
         self, tmp_path: Path
     ) -> None:
         """
-        Phase 37 D-05 fourth case: nothing the operator wrote was read.
+        A lone superseded file is red: nothing the operator wrote was read.
 
         Args:
             tmp_path: The test's own directory.
@@ -8324,12 +8300,11 @@ class TestConfigurationRow:
         self, tmp_path: Path
     ) -> None:
         """
-        The failure this phase exists to remove, checked against its own wording.
+        A legacy-named file in the third searched place gets a row naming it.
 
-        A container mounted its configuration into the third searched place
-        under the superseded name.  Four rows went red or amber that evening
-        and not one named the cause.  This asserts the row that now does, and
-        that it is read before the Paperless row it explains.
+        Without that row, a container that mounts its configuration there
+        under the superseded name sees four rows go red or amber and none name
+        the cause.  The row is read before the Paperless row it explains.
 
         Args:
             tmp_path: The test's own directory.
@@ -8352,7 +8327,7 @@ class TestConfigurationRow:
         self, tmp_path: Path
     ) -> None:
         """
-        Phase 37 D-17: the leftover may hold the only copy of the URL and token.
+        The leftover may hold the only copy of the URL and token.
 
         In the documented Docker layout ``auto-profiles`` writes the working
         directory's file, so after an upgrade the leftover in the third
@@ -8393,7 +8368,7 @@ class TestConfigurationRow:
         self, tmp_path: Path
     ) -> None:
         """
-        Phase 37 D-07: environment-only deployment is supported, so never red.
+        Environment-only deployment is supported, so a missing file is never red.
 
         And the Paperless row keeps its own verdict: saying whether paperless
         works is its job, and two rows reporting one fact is how a reader
@@ -8554,7 +8529,7 @@ class TestConfigurationRow:
 
     def test_the_terminal_form_names_the_absolute_path(self, tmp_path: Path) -> None:
         """
-        Phase 37 D-14: the no-path rule binds the LAN page, not the terminal.
+        The no-path rule binds the LAN page, not the terminal.
 
         One function, one set of sentences, and the only difference is how the
         file is spelled -- so the log, ``doctor`` and the strip cannot come to
@@ -8675,8 +8650,8 @@ class TestAbortedRun:
 
 
 # Every check next step that ends in a retry, paired with exactly what the
-# strip said before the retry ending became per-surface.  Each literal is
-# written out, so the strip's wording cannot drift while the source moves.
+# strip shows for it.  Each literal is written out, so the strip's wording
+# cannot drift while the source moves.
 _STRIP_WORDING: Final = (
     pytest.param(
         lambda: checks._CHECK_FAILED_NEXT_STEP,
@@ -8763,12 +8738,12 @@ _STRIP_WORDING: Final = (
 
 class TestStripWording:
     """
-    One row, two endings: the strip still reads exactly as it did.
+    One row, two endings: the strip reads exactly the pinned sentence.
 
     A retrying next step is stored with a placeholder and rendered for the
-    surface that shows it.  The strip's rendering must be byte-identical to
-    the sentence it carried before, and the stored step must not name the
-    web button, because ``saneless doctor`` prints the same row.
+    surface that shows it.  The strip's rendering is byte-identical to the
+    pinned sentence, and the stored step does not name the web button,
+    because ``saneless doctor`` prints the same row.
     """
 
     @pytest.mark.parametrize(("step", "today"), _STRIP_WORDING)
@@ -8776,11 +8751,11 @@ class TestStripWording:
         self, step: Callable[[], str], today: str
     ) -> None:
         """
-        The strip rendering is today's sentence, and the stored step is not.
+        The strip renders the pinned sentence; the stored step names no button.
 
         Args:
             step: Reads the stored next step from the module.
-            today: What the strip said before.
+            today: The exact sentence the strip shows.
 
         """
         stored = step()
@@ -8808,9 +8783,9 @@ class TestRefusalRows:
 
     ``saneless doctor`` builds its own Paperless client and scanner backend, and
     each can be refused for more than one reason.  Folding every refusal into one
-    row sent the reader to the wrong place: an unreadable TLS trust store read
-    as a wrong address, and a scanner library that would not start read as one
-    that was never installed.  The kind of refusal reaches the registry on the
+    row would send the reader to the wrong place: an unreadable TLS trust store
+    would read as a wrong address, and a scanner library that would not start as
+    one never installed.  The kind of refusal reaches the registry on the
     context, and each kind is its own row.
     """
 
@@ -8857,7 +8832,7 @@ class TestRefusalRows:
         self, tmp_path: Path
     ) -> None:
         """
-        A caller that says nothing about why keeps the row it always had.
+        A caller that says nothing about why gets the address row.
 
         Args:
             tmp_path: The test's own directory.
