@@ -5304,7 +5304,7 @@ class TestProfileLabelAndDescription:
         assert profile.label == "Feeder, double-sided"
         assert profile.description == "Scans both sides of every page using the feeder."
 
-    def test_a_config_written_before_this_phase_still_loads(
+    def test_a_profile_without_label_or_description_still_loads(
         self, tmp_config_dir: Path
     ) -> None:
         """
@@ -5314,7 +5314,7 @@ class TestProfileLabelAndDescription:
         dropdown renders ``label or name`` (Amendment A-3) so such a profile is
         never a blank option.
         """
-        config_file = tmp_config_dir / "pre_phase.toml"
+        config_file = tmp_config_dir / "unlabelled.toml"
         config_file.write_text(
             '[profiles.default]\nsource = "Flatbed"\n'
             "resolution = 300\nauto_generated = true\n"
