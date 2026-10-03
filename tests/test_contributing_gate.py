@@ -495,7 +495,7 @@ def test_seeded_table_missing_the_audit_row_is_reported() -> None:
 
 
 def test_seeded_table_with_a_stale_row_is_reported() -> None:
-    """A row whose command CI no longer runs is reported as stale."""
+    """A row naming a command CI does not run is reported as stale."""
     rows = [*_SEEDED_ROWS.values(), "| `ci.yml` | `lint` | `uv run ruff check .` |"]
     assert _table_offenders(_seeded_guide(rows=rows), SEEDED_GATES) == [
         "stale table row: ci.yml lint does not run `uv run ruff check .`"
