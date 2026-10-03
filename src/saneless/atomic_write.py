@@ -5,14 +5,6 @@ Durable, all-or-nothing replacement of a config file.
 file the operator owns. It writes the new text beside the real file, fsyncs
 it, and renames it into place, so a crash, a full disk, or a killed process
 leaves either the old file or the new one -- never a truncated config.
-It keeps the original's mode and owner (warning when the owner cannot be
-kept), and its extended attributes and POSIX ACL -- refusing the rewrite when
-one of those cannot be kept -- follows symlinks to the real file, but never to
-a file that does not exist yet, nor as root through a link another user made
-to a file that user does not own, and reports a single-file bind mount --
-which cannot be renamed over -- as a ``ConfigError`` naming the fix. A file
-it creates takes its directory's owner when permitted and stays 0600. Temp
-files left by a killed rewrite are swept on the next one.
 
 The module knows nothing about TOML: callers produce the text, this module
 only makes the write durable.
@@ -93,8 +85,7 @@ def is_read_only_mount(path: Path) -> bool:
     Report whether ``path`` lives on a filesystem mounted read-only.
 
     A failed ``statvfs`` answers False, so the ordinary checks that follow
-    decide what to report. Also serves ``auto-profiles``, which says why it
-    passed over a system config directory it could not write.
+    decide what to report.
 
     Args:
         path: An existing file or directory.
@@ -114,12 +105,7 @@ def _read_only_mount_error(target: Path) -> ConfigError | None:
     """
     Explain a read-only mount under an existing config file.
 
-    ``os.access`` answers False on a read-only filesystem even for root, so
-    without this check a legacy ``:ro`` mount was reported as "Permission
-    denied" and the operator went looking at file permissions. The read-only
-    flag belongs to a mount, so a read-only file whose directory is writable
-    is itself a mount point: a single-file bind mount, which cannot be
-    renamed over either.
+    Without it, ``os.access`` reports a read-only mount as "Permission denied".
 
     Args:
         target: The real, existing file about to be replaced.
@@ -153,8 +139,7 @@ def refused_mode_change(exc: OSError) -> bool:
     Report whether an ownership or mode change was refused, not broken.
 
     Serves every ``chown`` or ``chmod`` whose refusal must not fail an
-    otherwise-good write: the config rewrite here, and the consume-directory
-    copy, whose mode a filesystem without Unix modes cannot take.
+    otherwise-good write.
 
     Args:
         exc: The error ``fchown``, ``fchmod`` or ``chmod`` raised.
@@ -199,10 +184,8 @@ def _copy_xattrs(fd: int, target: Path) -> None:
     that cannot be copied is not skipped: dropping an ACL can widen who reads
     the file, so the rewrite is refused instead.
 
-    ``security.*`` labels are the exception, handled by ``_keep_label``: kept
-    when the kernel allows it, warned about when it refuses, because a
-    confined writer is refused a label that differs only in a way that grants
-    nothing. The IMA and EVM measurements are never copied.
+    ``security.*`` labels are the exception, handled by ``_keep_label``. The
+    IMA and EVM measurements are never copied.
 
     Args:
         fd: The open temp file, still owned by this process with mode 0600.
@@ -243,16 +226,10 @@ def _keep_label(fd: int, target: Path, name: str, value: bytes) -> None:
     """
     Give the temp file ``target``'s ``security.*`` label, when it differs.
 
-    A label the new file already carries is left alone. A differing one --
-    an SELinux type an admin set with ``chcon``, a Smack label -- is copied,
-    because falling back to the label a new file gets (the directory's default
-    under SELinux; under Smack the writer's own label, unless the directory
-    transmutes its own) can change who may read the file. When the kernel
-    refuses the copy the rewrite still goes ahead, with a WARNING naming the
-    file and the attribute but never the label: a container rewriting a
-    config its host user created is refused that user's label although the
-    two differ only in the SELinux user, which grants no access, and refusing
-    the rewrite would break that common case.
+    A new file's default label can change who may read it, so a differing one
+    is copied. A refusal only warns: a container rewriting a host user's
+    config is refused a label that differs only in the SELinux user, which
+    grants no access.
 
     Args:
         fd: The open temp file.
@@ -310,16 +287,11 @@ def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
     """
     Give the temp file the original's owner, group and permission bits.
 
-    A host-owned config must not become root-owned after a container rewrite,
-    or the operator needs sudo to edit it. Each change is made only when the
-    process is permitted and the filesystem supports it; a refusal is skipped
-    so it never fails a write that would otherwise succeed, but it is logged
-    at WARNING with the ids that could not be kept, because the file then
-    changes hands. When the owner cannot be set, the group alone
-    is still tried: a service user rewriting a ``root:saneless`` 0664 config
-    may keep the group it belongs to. chown comes BEFORE chmod because
-    chown(2) may clear the set-id bits the mode copy would otherwise
-    restore.
+    A refusal is skipped, never a failed write, and a lost owner or group is
+    logged at WARNING because the file then changes hands. When the owner
+    cannot be set the group alone is still tried, so a service user rewriting
+    a ``root:saneless`` 0664 config keeps the group. chown comes BEFORE chmod
+    because chown(2) may clear the set-id bits the mode copy restores.
 
     Args:
         fd: The open temp file.
@@ -370,17 +342,11 @@ def _sweep_stale_temps(target: Path) -> None:
     """
     Remove temp files a killed rewrite of ``target`` left beside it.
 
-    A SIGKILL or power loss between ``mkstemp`` and the rename skips the
-    ``finally`` that removes the temp, leaving a stray copy of the config --
-    possibly holding the Paperless token -- that nothing else cleans up.
-
-    Only this helper's own leftovers are removed: names that match exactly
-    what ``mkstemp`` produces for ``target`` (the ``.{name}.`` prefix, eight
-    characters from its alphabet, the ``.tmp`` suffix), that ``lstat`` shows
-    as a regular file -- never a symlink, which is neither removed nor
-    followed -- owned by this process's user, and older than
-    ``_STALE_TEMP_AGE_SECONDS``. Best effort: a failure to list or remove is
-    logged at DEBUG and never fails the rewrite.
+    A SIGKILL or power loss before the rename leaves a stray copy of the
+    config, possibly holding the Paperless token. Only exact ``mkstemp``
+    names for ``target`` that are regular files (never symlinks) owned by
+    this user and older than ``_STALE_TEMP_AGE_SECONDS`` are removed; a
+    failure is logged at DEBUG and never fails the rewrite.
 
     Args:
         target: The real file about to be replaced.
@@ -421,11 +387,7 @@ def _adopt_directory_owner(
     """
     Give a newly created file its directory's owner and group, when permitted.
 
-    A root ``docker compose exec`` writing a new config into the service's
-    config directory must leave a file the service can read. The mode is
-    never changed: the file keeps mkstemp's 0600, whoever owns it, because a
-    new config may hold the Paperless token. A refused change keeps this
-    process as the owner and is logged at DEBUG; the write goes ahead.
+    A root ``docker compose exec`` must leave a file the service can read.
 
     Args:
         fd: The open temp file, or a directory ``make_config_directory``
@@ -434,8 +396,7 @@ def _adopt_directory_owner(
         what: How the DEBUG line names what was not given away.
 
     Raises:
-        OSError: The ownership change failed for a reason other than a
-            refusal.
+        OSError: The change failed for a reason other than a refusal.
 
     """
     status = directory.stat()
@@ -459,22 +420,18 @@ def make_config_directory(directory: Path) -> None:
     """
     Create a config file's directory, each new level owned like its parent.
 
-    The rule a new config file follows, one level up. Root running with an
-    ordinary user's HOME (``sudo -E``, or a sudoers that keeps HOME) targets
-    that user's per-user file; a ``saneless`` directory it left root-only
-    would hide the file from the user, who could not even look inside, and
-    refuse the user's own later ``auto-profiles``. So every directory created
-    here, a missing ``~/.config`` included, takes its parent's owner and group
-    when this process may set them, and a refusal keeps this process as the
-    owner, logged at DEBUG.
+    Root running with an ordinary user's HOME (``sudo -E``) targets that
+    user's per-user file, and a root-only ``saneless`` directory would hide
+    it from the user. So every directory created here, a missing ``~/.config``
+    included, takes its parent's owner and group when this process may set
+    them; a refusal is logged at DEBUG.
 
     The directory itself is created 0700, because the file it will hold may
-    carry the Paperless token; a missing parent gets ``mkdir``'s default mode,
-    as ``mkdir -p`` gives it. Only a directory this call created is changed:
-    one that already exists, or that another process created first, is left
-    as it is. Each new directory is opened without following a symlink before
-    its owner is set, so a link swapped in after the ``mkdir`` is never
-    followed.
+    carry the Paperless token; a missing parent gets ``mkdir``'s default mode.
+    A directory that already exists, or that another process created first,
+    is left as it is. Each new directory is opened without following a
+    symlink before its owner is set, so a link swapped in after the
+    ``mkdir`` is never followed.
 
     Args:
         directory: The directory to create, absolute.
@@ -521,44 +478,33 @@ def replace_file_atomically(path: Path, text: str) -> Path:
       not depend on the locale and CRLF line endings are not translated.
     * An existing file's owner, group and permission bits are copied onto
       the temp file before any content is written, each when this process is
-      permitted to set it and the filesystem supports it, so the rewrite
-      neither changes who can edit the file nor widens who can read it. A
-      refused change is skipped, never a failed write; a lost owner or group
-      is logged at WARNING, because the file then changes hands.
+      permitted to set it and the filesystem supports it. A refused change is
+      skipped, never a failed write: a refused mode leaves mkstemp's 0600,
+      and a lost owner or group is logged at WARNING, because the file then
+      changes hands.
     * A **new** file takes its directory's owner and group when this process
       may set them, so a config root creates in the service's config
-      directory (a ``docker compose exec``) stays readable by the service. A
-      refused change keeps this process as the owner. Either way the file
-      keeps mkstemp's 0600, because a new config may hold the Paperless
-      token.
-    * An existing file's extended attributes -- its POSIX ACL included -- are
-      copied onto the temp file **first**, before the owner and mode.
-      Setting a ``user.*`` attribute needs write permission the writer may
-      lose once the original's owner and mode are applied; and ``fchmod`` on
-      a file with an ACL sets the ACL mask from the group bits, which on the
-      original already are its mask, so the owning group's own entry is kept
-      and is never handed the mask. Unlike a refused owner or mode, an
+      directory (a ``docker compose exec``) stays readable by the service.
+      Either way it keeps mkstemp's 0600, because a new config may hold the
+      Paperless token.
+    * An existing file's extended attributes, its POSIX ACL
+      (``system.posix_acl_access``) included, are copied onto the temp file
+      **first**, before the owner and mode: setting a ``user.*`` attribute
+      needs write permission the writer may lose once they are applied.
+      ``fchmod`` then sets the ACL mask from the group bits, which on the
+      original already are its mask. Unlike a refused owner or mode, an
       attribute that cannot be copied refuses the rewrite, because dropping
-      an ACL can widen who reads the file. A ``security.*`` LSM label is
-      copied when the new file's differs; a label the kernel refuses to set
-      is logged at WARNING and the rewrite goes ahead. IMA and EVM
+      an ACL can widen who reads the file. A ``security.*`` label the kernel
+      refuses is logged at WARNING and the rewrite goes ahead; IMA and EVM
       measurements are never copied.
-    * Before the temp file is made, leftovers of a killed earlier rewrite --
-      the exact mkstemp name for this file, a regular file this user owns,
-      older than ten minutes -- are removed; a younger one may belong to a
-      concurrent writer and is left alone.
+    * Leftovers of a killed earlier rewrite are removed first; a recent one
+      may belong to a concurrent writer and is left alone.
     * The temp file is fsynced **before** the rename; renaming unsynced data
       can leave a zero-length file after a crash.
     * A rename refused with EBUSY means the file is a single-file bind mount;
-      that is reported as a ``ConfigError`` naming the fix and citing the
-      published deployment guide, with no
-      non-atomic fallback. A read-only mount -- the legacy ``:ro``
-      single-file mount, or a read-only directory mount -- is reported the
-      same way before anything is written, rather than as EACCES.
-    * The rename is ``Path.replace``, the atomic, unconditionally
-      overwriting ``rename(2)``. The ``os`` module's function of the same
-      name is not called directly only because ruff's PTH105 forbids it and
-      this project does not permit per-line suppressions.
+      that is reported as a ``ConfigError`` naming the fix, with no
+      non-atomic fallback. A read-only mount is reported the same way before
+      anything is written, rather than as EACCES.
     * The temp file is removed on every failure path, including
       ``KeyboardInterrupt``.
     * The directory is then fsynced, best effort.
@@ -587,21 +533,17 @@ def replace_file_atomically(path: Path, text: str) -> Path:
             is removed.
 
     """
-    # Write through a symlink to the real file. The config path and its
-    # directory are operator-controlled, and the plain in-place write this
-    # helper replaces followed links too, so following one here is no
-    # regression.
+    # Write through a symlink to the real file: the config path and its
+    # directory are operator-controlled.
     target = path.resolve()
     try:
         original: os.stat_result | None = target.stat()
     except FileNotFoundError:
         original = None
     if original is None and path.is_symlink():
-        # That argument covers a file the operator already has. A link to
-        # nothing names a file no load ever read, and whoever can write the
-        # link's directory chose where it points: following it would create
-        # that file -- as root, anywhere -- and hand it to the far
-        # directory's owner.
+        # A link to nothing names a file no load ever read, and following it
+        # would create that file wherever the link's maker chose -- as root,
+        # anywhere.
         msg = (
             f"Cannot create {path}: it is a symlink to {target}, which does not "
             "exist; remove the link or create the file it points to first"
@@ -613,16 +555,10 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         and path.is_symlink()
         and path.lstat().st_uid not in {0, original.st_uid}
     ):
-        # The same reasoning reaches a link to a file that exists: root
-        # following it would replace any file that parses as TOML -- an
-        # empty one does -- keeping its owner and mode but not its contents.
-        # So root follows a link only when root made it, or when whoever
-        # made it owns the file and could have written it anyway: a dotfiles
-        # link keeps working, and so does a user's link in the compose
-        # ./config. Owning the link's directory is not enough, because a
-        # directory others may write through its group or an ACL lets them
-        # plant a link there too; the kernel's protected_symlinks rule judges
-        # a link by its owner for the same reason.
+        # Root following a planted link would replace any file that parses
+        # as TOML, so it follows one only when root made it or the link's
+        # maker owns the file. The link's owner is judged, not its
+        # directory's, as the kernel's protected_symlinks rule does.
         msg = (
             f"Cannot rewrite {path} as root: it is a symlink to {target}, and "
             "whoever made the link does not own that file; run this as the "
@@ -632,9 +568,8 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     if original is not None and (mount_error := _read_only_mount_error(target)):
         raise mount_error
     if original is not None and not os.access(target, os.W_OK):
-        # rename(2) needs only a writable directory, so without
-        # this check a chmod 0444 config would be silently replaced. Refusing
-        # keeps today's meaning of a read-only file ("cannot be written").
+        # rename(2) needs only a writable directory, so without this check
+        # a chmod 0444 config would be silently replaced.
         raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(target))
 
     _sweep_stale_temps(target)
@@ -649,10 +584,6 @@ def replace_file_atomically(path: Path, text: str) -> Path:
                 _copy_xattrs(handle.fileno(), target)
                 _copy_owner_and_mode(handle.fileno(), original)
             else:
-                # A new file takes its directory's owner, so one created by
-                # root in the service's config directory stays readable by
-                # the service; it keeps mkstemp's 0600 because it may hold
-                # the Paperless token.
                 _adopt_directory_owner(handle.fileno(), target.parent)
             handle.write(text.encode("utf-8"))
             handle.flush()
@@ -660,18 +591,16 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         try:
             tmp.replace(target)
         except OSError as exc:
-            # The kernel refuses to rename over a bind-mount point, which
-            # is what a config mounted as a single file is. There is no
-            # non-atomic fallback by decision: it would bring back the
-            # truncated-config risk this helper exists to remove.
+            # The kernel refuses to rename over a bind-mount point. A
+            # non-atomic fallback would risk the truncated config this
+            # helper exists to prevent.
             if exc.errno == errno.EBUSY:
                 raise ConfigError(_single_file_mount_message(target)) from exc
             raise
         replaced = True
     finally:
-        # A flag in ``finally`` rather than a blind ``except``: the temp file
-        # is removed on any exception, KeyboardInterrupt included, and the
-        # exception still propagates untouched.
+        # A flag in ``finally``, not an ``except``, so KeyboardInterrupt also
+        # removes the temp file and every exception propagates untouched.
         if not replaced:
             tmp.unlink(missing_ok=True)
 
