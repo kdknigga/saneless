@@ -2,7 +2,8 @@
 One faithful double for python-sane 2.9.2, shared by every test that needs one.
 
 A double that disagrees with the real library lets a defect earn a green test,
-so every test shares this one, and it is held to the library.  The specification is not this docstring: it is
+so every test shares this one, and it is held to the library.  The
+specification is not this docstring: it is
 ``tests/test_fake_sane_contract.py``, which runs each rule below against this
 double and against the real SANE ``test:0`` backend in the same parametrised
 row, so a rule the double gets wrong turns red there.  python-sane's own
