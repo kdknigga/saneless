@@ -1,5 +1,5 @@
 """
-Pinning tests for the vendored htmx and Pico assets (ROBU-09).
+Pinning tests for the vendored htmx and Pico assets.
 
 The UI must work on a LAN with no internet, so htmx and Pico are served from the
 package under ``/static/vendor/`` and ``base.html`` carries a SHA-384 ``integrity``
@@ -8,9 +8,9 @@ tests recompute every hash from the files on disk and fail before a browser ever
 sees a mismatch, and they compare both the files and the attributes with the
 upstream digests pinned here, so a wrong build cannot pin itself.
 
-They also hold the 23.1 Pico coupling contract: only ``pico.min.css`` 2.1.1 is
+They also hold the app's coupling to Pico: only ``pico.min.css`` 2.1.1 is
 vendored, ``pico.colors.css`` is never used, ``<html>`` carries no ``data-theme``,
-and the ``--saneless-status-fallback`` block in ``app.css`` stays intact.
+and ``app.css`` gives ``--saneless-status-fallback`` a light and a dark value.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ PICO_BYTES = 83319
 # @picocss/pico 2.1.1, computed from each tarball after checking the tarball
 # against the registry's own sha512 ``dist.integrity``.  Written here by hand,
 # never from the vendored files, so a wrong or tampered build fails even when
-# its integrity attribute was regenerated to match it (IN-04).
+# its integrity attribute was regenerated to match it.
 UPSTREAM_SRI: dict[str, str] = {
     "/static/vendor/htmx-2.0.10.min.js": (
         "sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V"
@@ -153,7 +153,7 @@ def _static_path(url: str) -> Path:
 
 
 def test_integrity_matches_vendored_bytes() -> None:
-    """Every integrity attribute in base.html equals sha384 of its file (ROBU-09)."""
+    """Every integrity attribute in base.html equals sha384 of its file."""
     pinned = [
         (attrs, attrs.get("integrity"))
         for _tag, attrs in _tags(BASE_HTML)
@@ -171,7 +171,7 @@ def test_integrity_matches_vendored_bytes() -> None:
 
 def test_vendored_files_and_integrity_match_the_upstream_builds() -> None:
     """
-    The files and base.html's integrity both equal the published digests (IN-04).
+    The files and base.html's integrity both equal the published digests.
 
     Matching each other is not enough: a wrong build with a regenerated
     integrity attribute would pass that check, so both are compared with the
@@ -218,7 +218,7 @@ def test_licence_notices_present() -> None:
 
 
 def test_no_pico_colors_anywhere() -> None:
-    """pico.colors.css is neither vendored nor referenced (23.1 coupling contract)."""
+    """pico.colors.css is neither vendored nor referenced; only pico.min.css is used."""
     for root in (STATIC_DIR, TEMPLATE_DIR):
         for path in root.rglob("*"):
             assert "pico.colors" not in path.name, f"{path} is a pico.colors file"
@@ -229,14 +229,20 @@ def test_no_pico_colors_anywhere() -> None:
 
 
 def test_html_tag_has_no_data_theme() -> None:
-    """The <html> tag in base.html carries no data-theme (23.1 coupling contract)."""
+    """The <html> tag carries no data-theme, so dark mode follows the OS preference."""
     html_tags = [attrs for tag, attrs in _tags(BASE_HTML) if tag == "html"]
     assert len(html_tags) == 1
     assert "data-theme" not in html_tags[0]
 
 
 def test_app_css_status_fallback_block_intact() -> None:
-    """app.css keeps the --saneless-status-fallback light/dark block (23.1)."""
+    """
+    app.css gives the fallback amber a light value and a dark-scheme value.
+
+    The light value sits on the top-level ``:root`` and the dark one on ``:root``
+    inside the ``prefers-color-scheme: dark`` query. No rule selects on
+    ``data-theme``, and nothing reads Pico's ``pico.colors`` palette tokens.
+    """
     rules = _stylesheet_rules(APP_CSS.read_text(encoding="utf-8"))
     light = [
         declarations
