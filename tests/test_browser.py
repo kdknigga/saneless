@@ -7558,7 +7558,7 @@ _TOKEN_UNSET_SLOT_TEXT = (
     "started. Put a real API token in the saneless config file, then restart "
     "saneless."
 )
-"""The slot's exact text for the refusal: the error partial's cross plus S8's copy."""
+"""The slot's exact text for the refusal: the error partial's cross, then the copy."""
 
 _TOKEN_UNSET_ROW_ERROR = "Not started: the paperless-ngx API token has not been set"
 """The job row's own error, written as the literal because it is locked copy."""
