@@ -109,7 +109,7 @@ DIRECTORY_MOUNT = "./config:/etc/saneless"
 ABSOLUTE_DIRECTORY_MOUNT = '"$(pwd)/config:/etc/saneless"'
 DIRECTORY_MOUNT_FORMS = (DIRECTORY_MOUNT, ABSOLUTE_DIRECTORY_MOUNT)
 
-# The one config filename saneless reads, and the one it used to read. The
+# The one config filename saneless reads, and the legacy one it does not. The
 # legacy name is assembled from named parts in an f-string rather than written
 # as a single literal, because the repository sweep guard forbids that literal
 # in every shipped file -- this one included -- and a literal here would make
@@ -2696,7 +2696,7 @@ README_TOML_BLOCK = re.compile(r"^```toml\n(?P<body>.*?)^```", re.MULTILINE | re
 
 
 def test_readme_scan_example_carries_a_title() -> None:
-    """Every ``saneless scan`` line in the README shows ``--title`` (DOCS-02)."""
+    """Every ``saneless scan`` line in the README shows ``--title``."""
     offenders = [
         f"{number}: {line.strip()}"
         for number, line in _numbered(README)
@@ -2741,7 +2741,7 @@ def test_readme_example_configs_leave_profile_generation_on(tmp_path: Path) -> N
 
 
 def test_every_readme_docs_link_resolves_to_a_page() -> None:
-    """Every README documentation deep link names a page that exists (DOCS-02)."""
+    """Every README documentation deep link names a page that exists."""
     offenders = [
         f"{number}: {match.group(0)}"
         for number, line in _numbered(README)
@@ -3141,7 +3141,7 @@ def test_the_pip_install_guard_tells_the_index_from_the_repository(
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the container build context (D-29, D-30, D-33, DLVR-06, DLVR-09)
+# The container build context
 # ---------------------------------------------------------------------------
 
 DOCKERIGNORE = REPO_ROOT / ".dockerignore"
@@ -3149,11 +3149,11 @@ GITIGNORE = REPO_ROOT / ".gitignore"
 
 # Path fragments that must never appear on a ``!`` re-include line. ``config``
 # and ``saneless.toml`` are where a live paperless-ngx token lives; ``tests``
-# and ``.planning`` are bulk the image has no use for, and ``.planning`` in
-# particular carries the phase audit artifacts. The legacy filename stays on
-# this list although saneless no longer reads it: a file left behind under the
-# old name still holds whatever token its owner put there, so it must never
-# reach the daemon either.
+# and the planning directory are bulk the image has no use for, and the
+# planning directory holds internal records. The legacy filename is on this
+# list although saneless does not read it: a file left under that name still
+# holds whatever token its owner put there, so it must never reach the daemon
+# either.
 FORBIDDEN_CONTEXT_PATHS = (
     ".env",
     ".git",
@@ -3181,8 +3181,8 @@ def _significant_lines(path: Path) -> list[tuple[int, str]]:
     Return ``(line number, stripped line)`` for non-blank, non-comment lines.
 
     Filtering comments out rather than matching raw text is what stops these
-    tests self-invalidating: a comment that quotes ``*.png`` to explain why the
-    glob was removed would otherwise read as the glob itself.
+    tests self-invalidating: a comment that quotes ``*.png`` to explain why
+    there is no such glob would otherwise read as the glob itself.
 
     Args:
         path: The file to read.
@@ -3200,7 +3200,7 @@ def _significant_lines(path: Path) -> list[tuple[int, str]]:
 
 def test_dockerignore_starts_with_a_deny_everything_line() -> None:
     """
-    ``.dockerignore``'s first meaningful line is exactly ``*`` (D-29, D-30).
+    ``.dockerignore``'s first meaningful line is exactly ``*``.
 
     The file is an allow-list: ``*`` excludes the whole working tree and each
     ``!`` line below re-includes one path the image build needs. That only
@@ -3222,11 +3222,10 @@ def test_dockerignore_starts_with_a_deny_everything_line() -> None:
 
 def test_dockerignore_never_reincludes_a_secret_or_test_path() -> None:
     """
-    No ``!`` line re-includes a config, a secret, ``.planning/`` or tests (D-30).
+    No ``!`` line re-includes a config, a secret, the planning directory or tests.
 
-    Nothing else in CI would notice the allow-list being weakened: there is no
-    docker-build-and-inspect step, and a leak is only visible by unpacking a
-    layer. This test is the guard.
+    A leaked file is visible only by unpacking an image layer, so the
+    allow-list itself is checked here, as text.
     """
     name = DOCKERIGNORE.relative_to(REPO_ROOT)
     offenders = [
@@ -3268,7 +3267,7 @@ def test_dockerignore_reincludes_everything_the_build_needs() -> None:
 
 def test_gitignore_has_no_blanket_png_glob() -> None:
     """
-    ``.gitignore`` no longer blanket-ignores every PNG in the tree (DLVR-09).
+    ``.gitignore`` does not blanket-ignore every PNG in the tree.
 
     A repository-wide ``*.png`` silently swallows an asset someone means to
     commit -- a documentation screenshot, a favicon -- and gives no signal at
@@ -3289,14 +3288,10 @@ def test_gitignore_has_no_blanket_png_glob() -> None:
 
 def test_gitignore_ignores_the_playwright_artifact_directory() -> None:
     """
-    ``/test-results/`` is ignored -- the one path the blanket glob covered.
+    ``/test-results/``, pytest-playwright's artifact directory, is ignored.
 
-    ``git check-ignore -v`` was run against every candidate PNG path in the
-    repository. ``site/``, ``.planning/ui-reviews/`` and ``.playwright-mcp/``
-    each have their own entry and survive the glob's removal; pytest-playwright's
-    default artifact directory had nothing but ``*.png`` behind it. It holds
-    failure videos and trace archives as well as screenshots, so the directory
-    is the correct replacement rather than a narrower glob.
+    It holds failure videos and trace archives as well as screenshots, so it
+    is ignored by path rather than by a PNG glob.
     """
     lines = {line for _, line in _significant_lines(GITIGNORE)}
     name = GITIGNORE.relative_to(REPO_ROOT)
@@ -3309,7 +3304,7 @@ def test_gitignore_ignores_the_playwright_artifact_directory() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the container image itself (D-25, D-27, D-28, D-29, DLVR-07)
+# The container image itself
 # ---------------------------------------------------------------------------
 
 DOCKERFILE = REPO_ROOT / "Dockerfile"
@@ -3332,7 +3327,7 @@ BUILD_INPUTS = ("pyproject.toml", "uv.lock", "README.md", "LICENSE")
 
 def test_dockerfile_pins_every_base_image_by_digest() -> None:
     """
-    Every ``FROM`` reference carries both a tag and a ``sha256`` digest (D-27).
+    Every ``FROM`` reference carries both a tag and a ``sha256`` digest.
 
     The digest is what makes the build reproducible: a tag can be repointed at
     new content between two builds of the same source. The **tag** has to stay
@@ -3369,9 +3364,8 @@ def test_dockerfile_gets_uv_from_a_named_from_stage() -> None:
     directives **only**, and deliberately excludes builder-stage references
     written as a ``COPY`` with a ``--from`` pointing at a registry image. A
     digest written straight onto such a line is invisible to it and would
-    never be updated -- the pin would look maintained and quietly rot.
-    Promoting uv to ``FROM ... AS uv`` costs one line and makes the third
-    digest pin real.
+    never be updated -- the pin would look maintained and quietly rot. A
+    ``FROM ... AS uv`` stage puts the uv pin where Dependabot reads it.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3398,17 +3392,15 @@ def test_dockerfile_gets_uv_from_a_named_from_stage() -> None:
 
 def test_dockerfile_copies_only_the_build_inputs() -> None:
     """
-    The builder stage copies named paths, never the whole working tree (D-29).
+    The builder stage copies named paths, never the whole working tree.
 
     ``uv sync --locked`` reads exactly these: the project metadata, the lock it
     verifies every artifact against, the two files the metadata names, and the
-    package sources.
-
-    This is the second of the two independent build-context gates, the first
-    being the ``.dockerignore`` allow-list. Copying the entire context sweeps
-    whatever the daemon was sent into a layer -- which, before this phase,
-    included a real ``saneless.toml`` holding a live paperless-ngx token. Naming
-    the inputs means a mistake in the allow-list alone cannot leak anything.
+    package sources. This is the second build-context gate after the
+    ``.dockerignore`` allow-list: copying the whole context would sweep
+    whatever the daemon was sent, a live ``saneless.toml`` included, into a
+    layer, so naming the inputs means a mistake in the allow-list alone cannot
+    leak anything.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3434,7 +3426,7 @@ def test_dockerfile_copies_only_the_build_inputs() -> None:
 
 def test_dockerfile_runs_as_a_non_root_user() -> None:
     """
-    The image ends on a ``USER`` that is not root (D-25, DLVR-07).
+    The image ends on a ``USER`` that is not root.
 
     A root process in the container reaches much further into a bind-mounted
     host directory, and into the kernel, than UID 1000 does. The account is
@@ -3469,22 +3461,15 @@ def test_dockerfile_runs_as_a_non_root_user() -> None:
 
 def test_dockerfile_chowns_the_data_dir_before_declaring_the_volume() -> None:
     """
-    The data directory is created and chowned **before** ``VOLUME`` (D-28).
+    The data directory is created and chowned **before** ``VOLUME``.
 
-    Whether a build step that changes data inside a declared volume path
-    *after* the ``VOLUME`` instruction survives depends on **which builder
-    ran**: Docker's own reference says the legacy builder discards those
-    changes and BuildKit keeps them. Ordering the ``mkdir`` and ``chown``
-    before ``VOLUME`` is the one arrangement that is correct under both. Get
-    it wrong and, on the builder that discards, a fresh named volume comes up
-    owned by root, the non-root process cannot write the job database, and
-    preserved scans have nowhere to go.
-
-    Asserting the order statically rather than test-driving it is deliberate,
-    for the same reason: buildah -- which is what ``docker`` is on the
-    maintainer's host -- was measured keeping the change even with the wrong
-    order, so a green local build is no evidence at all. This test does not
-    depend on which builder ran.
+    Docker's reference says the legacy builder discards changes made inside a
+    declared volume path after ``VOLUME`` and BuildKit keeps them, so this
+    order is the one that is correct under both. On a builder that discards,
+    a fresh named volume comes up owned by root and the non-root process
+    cannot write the job database or keep preserved scans. The order is
+    asserted statically because a builder that keeps the change, buildah
+    among them, passes a local build with the wrong order.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3530,7 +3515,7 @@ def test_dockerfile_makes_the_data_dir_owner_only_before_declaring_the_volume() 
 
 def test_dockerfile_sets_a_workdir_in_the_runtime_stage() -> None:
     """
-    The runtime stage anchors relative writes inside the durable volume (D-28).
+    The runtime stage anchors relative writes inside the durable volume.
 
     With no ``WORKDIR`` the working directory is ``/``, so a relative write
     lands in the container's own writable layer and is destroyed on the next
@@ -3562,8 +3547,8 @@ LOCKED_SYNC = "uv sync --locked"
 # path on a copy line; ``uv sync`` is the command itself.
 RUNTIME_BUILD_TOOLS = ("gcc", "libc6-dev", "libsane-dev", "/uv", "uv sync")
 
-# Tokens that must appear nowhere in the file's instructions. The HTTP client
-# existed only for the healthcheck, and the data-dir variable overrode an
+# Tokens that must appear nowhere in the file's instructions. An HTTP client
+# would serve only the healthcheck, and the data-dir variable overrides an
 # operator's own ``[output] data_dir``.
 FORBIDDEN_DOCKERFILE_TOKENS = ("curl", "SANELESS_OUTPUT__DATA_DIR")
 
@@ -3772,19 +3757,15 @@ def test_dockerfile_runtime_stage_receives_a_finished_locked_venv() -> None:
     """
     The runtime image is a finished venv on a curated base, and nothing more.
 
-    Every dependency byte is hash-checked by ``uv sync --locked`` in the
-    builder stage, python-sane's build backend included, and compilation
-    happens only there. The runtime stage copies the finished ``/opt/venv``
-    and carries no compiler, headers, uv, pip or HTTP client that a
-    ``docker exec`` could turn into an installer. It enables exactly the
-    ``net`` and ``escl`` SANE backends, because the stock list probes about
-    eighty and the first device enumeration paid for every one of them. It
-    sets ``XDG_STATE_HOME`` rather than the data-dir variable, so a mounted
-    ``saneless.toml``'s ``[output] data_dir`` takes effect, and its
-    healthcheck is a Python probe with a start period.
-
-    This reads the file. That the built image holds these properties is
-    proven separately, by building and running it.
+    ``uv sync --locked`` hash-checks every dependency byte in the builder
+    stage, python-sane's build backend included, and compiles only there. The
+    runtime stage copies the finished ``/opt/venv`` and carries no compiler,
+    headers, uv, pip or HTTP client a ``docker exec`` could turn into an
+    installer. It enables only the ``net`` and ``escl`` SANE backends, since
+    the stock list makes the first enumeration probe about eighty. It sets
+    ``XDG_STATE_HOME`` rather than the data-dir variable, so a mounted
+    ``[output] data_dir`` takes effect, and its healthcheck is a Python probe
+    with a start period. The built image is checked separately, by running it.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
@@ -3880,7 +3861,7 @@ def test_the_runtime_guard_reports_a_seeded_break(
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: one port everywhere, and the non-1000 operator (D-26, D-31, D-32)
+# One port everywhere, and the operator whose UID is not 1000
 # ---------------------------------------------------------------------------
 
 # A `-p` publish flag, with or without a bind address in front of it, and a
@@ -4027,14 +4008,12 @@ def _compose_service_image(lines: list[str], index: int) -> str:
 
 def test_the_example_config_does_not_ship_a_live_web_port() -> None:
     """
-    ``saneless.toml.example`` does not set ``web_port`` live (D-32).
+    ``saneless.toml.example`` does not set ``web_port`` live.
 
-    The example shipped ``web_port = 8081``, which is wrong for every Docker
-    reader: the image's ``EXPOSE`` and healthcheck are both 8080, so copying
-    the example into a mounted ``saneless.toml`` moved the server off the port
-    the healthcheck probes and the container went unhealthy with nothing on
-    screen to say why. The line joins the commented pair below it instead, so
-    it still documents the key without configuring anything.
+    The image's ``EXPOSE`` and healthcheck use one fixed port, so a live port
+    in the example, copied into a mounted ``saneless.toml``, moves the server
+    off the port the healthcheck probes, and the container goes unhealthy
+    with nothing on screen to say why. The key is documented in a comment.
     """
     name = TOML_EXAMPLE.relative_to(REPO_ROOT)
     offenders = [
@@ -4103,19 +4082,15 @@ def test_complete_example_loads_and_names_every_output_key(tmp_path: Path) -> No
 
 def test_every_documented_container_port_matches_the_model_default() -> None:
     """
-    Image, compose file and every doc page agree on one container port (D-31).
+    Image, compose file and every doc page agree on one container port.
 
-    The expectation is read off ``OutputConfig`` rather than written out here,
-    so changing the default cannot leave the image and the documentation
-    disagreeing without something going red. Only the *container* side of a
-    ``-p`` mapping is checked: remapping on the host is exactly what operators
-    are told to do when 8080 is taken.
-
-    A mapping counts only when the image it belongs to is this project's. The
-    compose how-to stands saneless next to paperless-ngx, whose own
-    ``"8000:8000"`` is correct and none of this contract's business, so each
-    mapping is attributed first -- to the enclosing compose service's image,
-    or to the shell command the flag appears in, continuations included.
+    The port is read from ``OutputConfig``, so changing the default cannot
+    leave the image and the docs disagreeing. Only the *container* side of a
+    ``-p`` mapping is checked, since remapping the host side is what operators
+    are told to do when the port is taken. A mapping counts only when it
+    belongs to this project's image -- found from the enclosing compose
+    service or the shell command, continuations included -- because
+    paperless-ngx's own ``"8000:8000"`` stands beside it in the compose how-to.
     """
     expected = str(OutputConfig.model_fields["web_port"].default)
     dockerfile_name = DOCKERFILE.relative_to(REPO_ROOT)
@@ -4170,7 +4145,7 @@ def test_every_documented_container_port_matches_the_model_default() -> None:
 
 def test_compose_carries_a_commented_user_override() -> None:
     """
-    The compose example ships the UID override commented out (D-26).
+    The compose example ships the UID override commented out.
 
     The image already runs as 1000:1000, which is what the operator's own
     ``./config`` directory is on a single-user Linux host, so the override is
@@ -4206,10 +4181,10 @@ def test_compose_carries_a_commented_user_override() -> None:
 
 def test_the_uid_is_documented_where_operators_will_look() -> None:
     """
-    Both Docker pages state the UID and give the ``chown`` command (D-26).
+    Both Docker pages state the UID and give the ``chown`` command.
 
     A bind mount does not inherit the image directory's ownership the way a
-    named volume does -- that was measured -- so an operator whose UID is not
+    named volume does, so an operator whose UID is not
     1000 has to fix the host directory themselves. This is handled with
     documentation rather than a runtime fix-up because any fix-up would have
     to start as root, which is the thing running as UID 1000 exists to stop.
@@ -4232,7 +4207,7 @@ def test_the_uid_is_documented_where_operators_will_look() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the deployment shapes and the one USB rule (D-47, D-48, DOCS-04)
+# The deployment shapes and the one USB rule
 # ---------------------------------------------------------------------------
 
 # The host device tree a container would have to be handed in order to reach a
@@ -4245,18 +4220,15 @@ CONTAINER_CAVEAT_WORDS = ("container", "saned")
 
 def test_no_doc_page_documents_usb_passthrough_into_a_container() -> None:
     """
-    No page or deployment file hands the host USB bus to a container (D-48).
+    No page or deployment file hands the host USB bus to a container.
 
-    PROJECT.md constrains this project to need no ``--privileged`` flag,
-    because USB device access is handled by the ``saned`` server rather than by
-    the saneless container. A container reaches a scanner over the network --
-    ``saned`` over SANE's own protocol, including a ``saned`` on its own host,
-    or an eSCL device directly -- and never over the USB bus.
-
-    Documenting a device mapping as an "advanced" option would add a fourth
-    deployment shape that contradicts that constraint, has never been tested
-    here, and hands the container raw device access it has no use for. It was
-    written once and deleted; this test is what stops it coming back.
+    saneless needs no ``--privileged`` flag, because USB device access belongs
+    to the ``saned`` server, not the saneless container. A container reaches a
+    scanner over the network -- ``saned`` over SANE's own protocol, including
+    one on its own host, or an eSCL device directly -- and never over the USB
+    bus. A device mapping offered as an "advanced" option would be an untested
+    fourth deployment shape that hands the container raw device access it has
+    no use for.
     """
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
@@ -4307,8 +4279,7 @@ def test_scanner_host_documentation_carries_the_container_caveat() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the setup chooser link and the no-auth note (D-47, D-50, DOCS-04,
-# DOCS-05)
+# The setup chooser link and the no-auth note
 # ---------------------------------------------------------------------------
 
 PREREQUISITES_HEADING = "## Prerequisites"
@@ -4316,9 +4287,8 @@ SETUP_CHOOSER_LINK_TARGET = "which-setup.md"
 
 MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\((?P<target>[^)\s]+)\)")
 
-# Either of the two places the trust posture is already written down. D-50
-# rejected a page of its own: a sentence that links to one of these is what
-# criterion 5 asks for, and a third partial copy is what it does not.
+# Either of the two places the trust posture is written out in full. An entry
+# page links to one of these rather than carrying a third, partial copy.
 TRUST_LINK_TARGETS = (
     DOCS_DIR / "how-to" / "deploy-docker-compose.md",
     DOCS_DIR / "reference" / "web-api.md",
@@ -4392,14 +4362,14 @@ def test_quick_start_prerequisites_link_to_the_setup_chooser() -> None:
     """
     The quick-start prerequisites send an unsure reader to the chooser first.
 
-    DOCS-04 puts the link here rather than further down on purpose. The three
+    The link sits here rather than further down because the three
     deployment shapes differ in whether a SANE daemon is needed and what the
     scanner host is set to, and a reader who guesses wrong does not find out
     until the device list comes back empty.
 
     The target's existence is read off the filesystem rather than hard-coded,
-    so renaming the page in a later phase surfaces here instead of becoming a
-    404 on the busiest page in the documentation.
+    so renaming the page fails here instead of becoming a 404 on the busiest
+    page in the documentation.
     """
     name = QUICK_START.relative_to(REPO_ROOT)
     section = _section_lines(QUICK_START, PREREQUISITES_HEADING)
@@ -4430,7 +4400,7 @@ def test_the_no_auth_note_appears_on_both_entry_surfaces() -> None:
     start and the Docker reference, rather than only on the API reference that
     a reader following either of them never opens.
 
-    D-50 rejected a page of its own for this. The assertion is therefore that
+    The posture has no page of its own, so the assertion is that
     each surface carries the sentence and a link that resolves to one of the
     two places the posture is already written out in full, not that it repeats
     the posture a third time.
@@ -4464,7 +4434,7 @@ def test_the_no_auth_note_appears_on_both_entry_surfaces() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the corrected examples (rows 30, 31) -- DOCS-01
+# Copyable examples: bind-mount paths and job ids
 # ---------------------------------------------------------------------------
 
 # The flag form of a bind mount, with the host side captured. The host side
@@ -4488,16 +4458,12 @@ def test_no_docker_run_example_uses_a_relative_host_path() -> None:
     """
     No ``-v``/``--volume`` flag in any example names a relative host path.
 
-    Docker Engine has historically rejected a host side that is not an absolute
-    path, so a block copied off one of these pages fails outright on a real
-    host rather than doing something subtly different (row 31). ``"$(pwd)/..."``
-    is the form that works, quoted so a directory whose name contains a space
-    is not re-split into two arguments.
-
-    Compose ``volumes:`` entries are a different syntax under different rules --
-    a path beginning with a dot is correct there, and is the mount Phase 27 D-09
-    requires -- so this looks only at the flag form and leaves YAML list items
-    alone.
+    Many Docker Engine releases reject a host side that is not an absolute
+    path, so a block copied off one of these pages can fail outright on a real
+    host. ``"$(pwd)/..."`` works everywhere, quoted so a directory whose name
+    contains a space is not split into two arguments. Compose ``volumes:``
+    entries follow other rules -- a path beginning with a dot is correct
+    there -- so only the flag form is checked.
     """
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
@@ -4517,10 +4483,9 @@ def test_the_job_json_example_shows_a_real_id_shape() -> None:
     The scripting guide's job JSON shows an id in the shape ids really have.
 
     ``saneless jobs --json`` echoes ``j.id`` straight out of the row, and a job
-    id is ``str(uuid.uuid4())`` -- see ``job.py``. The example used to show a
-    truncated eight-character string, so anything written against it (a script
-    that slices an id, a column sized to fit one, a fixture built to look like
-    one) was written against a shape the program never emits (row 30).
+    id is ``str(uuid.uuid4())`` -- see ``job.py``. A truncated example id
+    would have scripts, column widths and fixtures written against a shape
+    the program never emits.
     """
     text, name = _read(CLI_SCRIPTING)
     values = [match.group("value") for match in JSON_ID_FIELD.finditer(text)]
@@ -4533,10 +4498,10 @@ def test_the_job_json_example_shows_a_real_id_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: the deploy guide links rather than copies (row 32, DOCS-06)
+# The deploy guide links rather than copies
 # ---------------------------------------------------------------------------
 
-# The one setting the guide's half-a-service used to declare.
+# A setting only a copied paperless-ngx service declares.
 PAPERLESS_SERVICE_MARKER = "PAPERLESS_" + "SECRET_KEY"
 
 # An image line whose value names the other project.
@@ -4554,16 +4519,11 @@ def test_the_deploy_guide_does_not_ship_a_partial_paperless_stack() -> None:
     """
     The compose guide points at the other project's own file, never copies it.
 
-    The example used to define half a service for it: one setting, no message
-    broker, no database. The stack it described could not come up, so a reader
-    who followed the guide ended with a container that restarts forever and
-    nothing saying why.
-
-    Completing it was the other option and was rejected (D-49). A copy of
-    someone else's stack is a claim this project would have to keep true
-    forever, against requirements that change without notice -- the bundled
-    files currently ship Valkey as the broker, which is not what the copy
-    here would have said.
+    Half a paperless-ngx service -- one setting, no broker, no database --
+    cannot come up, so a reader following it gets a container that restarts
+    forever. A complete copy would be a claim this project has to keep true
+    against requirements that change without notice, such as which broker the
+    bundled files ship, so the guide links to the other project instead.
     """
     text, name = _read(DEPLOY_HOWTO)
     assert PAPERLESS_SERVICE_MARKER not in text, (
@@ -4587,7 +4547,7 @@ def test_the_deploy_guide_does_not_ship_a_partial_paperless_stack() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: nothing from the planning tree is published (row 34, DOCS-03)
+# Nothing from the planning tree is published
 # ---------------------------------------------------------------------------
 
 # Names that belong to the planning tree rather than to a reader.
@@ -4600,13 +4560,8 @@ def test_no_planning_artifact_is_published_under_docs() -> None:
 
     MkDocs builds and publishes every Markdown file under ``docs/`` whether or
     not the nav lists it, so a page absent from the nav is still served and
-    still search-indexed -- it is only unreachable by clicking. That gap is how
-    a v1.0 planning document, whose claims stopped matching the code releases
-    ago, ended up on the public site with nobody aware it was there (row 34).
-
-    The document itself was not wrong to exist; it is a record of what v1.0
-    intended. It was in the wrong tree, and it now lives beside the other
-    planning artifacts.
+    search-indexed, only unreachable by clicking. A planning record there
+    would reach the public site with claims that need not match the code.
     """
     offenders = [
         str(page.relative_to(REPO_ROOT))
@@ -4620,7 +4575,7 @@ def test_no_planning_artifact_is_published_under_docs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 31: what the final audit itself found (rows 4 and 10, DOCS-01)
+# The empty-page rule, documented keys and history labels
 # ---------------------------------------------------------------------------
 
 # The heading whose body carries the threshold-tuning advice and its example.
@@ -4820,8 +4775,8 @@ def test_every_timeout_key_a_page_names_is_an_output_field() -> None:
     Every ``*_timeout_seconds`` key a page names is an ``OutputConfig`` field.
 
     A config or environment that sets an unknown key fails to load, so a page
-    naming one hands the reader a setting that cannot load. A line that says
-    the key was renamed is the one place an old name may appear.
+    naming one hands the reader a setting that cannot load. A line with the
+    word "renamed" in it is the one place an old name may appear.
     """
     fields = set(OutputConfig.model_fields)
     offenders = [
@@ -4846,7 +4801,7 @@ def test_first_web_ui_scan_names_real_history_labels() -> None:
     the table and "Done" in the status line.  Naming the status area's word in
     the description of the table sends a reader looking for a string the table
     never renders.  Derived from ``JobState`` so a relabelling cannot leave
-    this passing (row 4).
+    this passing.
     """
     text, name = _read(FIRST_WEB_UI_SCAN)
     match = HISTORY_STATUS_WORDS.search(text)
@@ -4873,7 +4828,7 @@ def test_first_web_ui_scan_names_real_history_labels() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hook interpreter pin (tooling hygiene, found during the Phase 31 rehearsal)
+# Hook interpreter pin
 # ---------------------------------------------------------------------------
 
 PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
@@ -4903,8 +4858,8 @@ def test_hook_interpreter_is_pinned_to_the_project_python() -> None:
 
     ``check-ast`` and ``debug-statements`` parse this project's source with
     their own interpreter. Unpinned, prek builds each hook environment with
-    whichever Python it happens to locate -- environments at 3.12.4, 3.13.9 and
-    3.14.2 all existed on one machine at once. Anything below ruff's target
+    whichever Python it happens to locate, and one machine can hold several.
+    Anything below ruff's target
     rejects syntax ruff itself produces: PEP 758's bracketless
     ``except ValueError, TypeError:`` is a SyntaxError before 3.14, and
     ``ruff format`` writes exactly that at ``target-version = "py314"``.
@@ -4931,8 +4886,8 @@ def test_hook_interpreter_is_pinned_to_the_project_python() -> None:
 # The suppression ban, enforced instead of merely written down
 # ---------------------------------------------------------------------------
 
-# CLAUDE.md and CONTRIBUTING.md both forbid silencing a checker rather than
-# fixing what it found, but prose cannot fail a build. The guard below turns
+# CONTRIBUTING.md forbids silencing a checker rather than fixing what it
+# found, but prose cannot fail a build. The guard below turns
 # the rule into something falsifiable: it reads every tracked Python file and
 # reports any line carrying one of the six comment forms that do the
 # silencing. Those are, in words: the bare linter-suppression comment; the
@@ -4974,12 +4929,12 @@ SUPPRESSION_MARKERS = (
 
 def _shipped_python_files() -> list[str]:
     """
-    Return every tracked ``.py`` file outside ``.planning/``.
+    Return every tracked ``.py`` file outside the planning directory.
 
     The suffix filter is not an optimisation. ``_shipped_files`` also returns
-    Markdown and YAML, and the ban is stated in prose in CLAUDE.md, in
-    CONTRIBUTING.md and in the CI workflow; scanning those would make the
-    guard fail on the very documents that define the rule.
+    Markdown and YAML, and the ban is stated in prose in the contributor
+    documents and the CI workflow; scanning those would make the guard fail
+    on the very documents that define the rule.
 
     Returns:
         Repo-relative names of the tracked Python files in scope.
@@ -4992,8 +4947,8 @@ def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
     """
     No tracked Python file silences a checker instead of fixing what it found.
 
-    Scope follows ``git ls-files``, so a Python file added in a later phase is
-    covered without anyone remembering to extend a list. This file is in scope
+    Scope follows ``git ls-files``, so a new Python file is covered without
+    anyone remembering to extend a list. This file is in scope
     of its own scan, which is why the markers it looks for are assembled at
     runtime rather than written out.
     """
@@ -5027,8 +4982,8 @@ def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
 # ---------------------------------------------------------------------------
 
 _TC002_TARGET = "src/saneless/web/routes.py"
-# Generous, because the assertion is about the answer and not the latency. The
-# measured run is well under a second: it invokes the ruff executable in this
+# Generous, because the assertion is about the answer and not the latency. A
+# run takes well under a second: it invokes the ruff executable in this
 # environment directly, so there is no dependency resolution step in front of
 # it.
 _TC002_SECONDS = 120
@@ -5095,13 +5050,12 @@ def test_ruff_still_exempts_the_runtime_evaluated_route_annotations() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The declared floors against the versions uv.lock resolves (D-09, D-10, D-11)
+# The declared floors against the versions uv.lock resolves
 # ---------------------------------------------------------------------------
 
-# This is the one guard in this file that parses rather than matching plain
-# text, and the departure is deliberate. Everywhere else the contract is what
-# an operator copies, so a parser would assert something no reader ever sees.
-# ``uv.lock`` is the opposite: machine-generated TOML that nobody copies, and
+# This guard parses ``uv.lock`` rather than matching plain text. Where the
+# contract is what an operator copies, a parser would assert something no
+# reader ever sees. ``uv.lock`` is the opposite: machine-generated TOML that nobody copies, and
 # the failure that most needs catching here -- one declared name resolved into
 # two ``[[package]]`` entries split by an environment marker -- is invisible to
 # a line scanner, because both entries are well formed and neither is wrong on
@@ -5201,32 +5155,14 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
     """
     Every declared ``>=`` floor equals the version ``uv.lock`` resolves for it.
 
-    The container is no longer the surface at risk here -- its builder stage
-    runs ``uv sync --locked`` -- but the published wheel's metadata
-    carries these floors verbatim, so they are what a downstream installer
-    resolves against. A floor left below the locked
-    version therefore admits into a fresh install the very tree this project
-    upgraded away from, and nothing else in the repository would notice. The
-    rule is equality, not satisfaction, so the comparison is plain string
-    equality over the lock's ``version`` field and needs no PEP 440 parsing: a
-    post-release floor compares like any other string.
-
-    The check runs in both directions: every declared name is resolved by the
-    lock, and every floor equals what the lock resolved. One further
-    requirement makes the second half meaningful -- a declared name must have
-    exactly one ``[[package]]`` entry. A name absent from the lock fails, and a
-    name split across two entries by an environment marker fails with both
-    versions named, because which one a wheel install would land on is a
-    decision and not something a guard may guess.
-
-    Scope is ``[project].dependencies`` and every ``[dependency-groups]``
-    table. ``[tool.uv].constraint-dependencies`` is deliberately outside that scope:
-    it holds ceilings rather than floors, so there is no floor in it to compare
-    for equality, and the pattern above would reject its one entry as
-    uncomparable. That entry is covered instead by
-    ``test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it`` below. The
-    exclusion is stated here so no reader has to infer it from a regex that
-    happens not to match.
+    The image builds with ``uv sync --locked``, but the published wheel's
+    metadata carries these floors verbatim, so a floor below the locked
+    version admits an older tree into a fresh downstream install. Every
+    declared name has exactly one ``[[package]]`` entry whose version string
+    equals the floor; a name split across two entries by a marker fails with
+    both versions named. Scope is ``[project].dependencies`` and every
+    ``[dependency-groups]`` table; ``[tool.uv].constraint-dependencies`` holds
+    ceilings, not floors, and the anyio ceiling test below covers it.
     """
     locked = _locked_versions()
     offenders: list[str] = []
