@@ -68,12 +68,10 @@
               name itself, because a config whose profiles predate the label
               key carries none until auto-profiles --force is run.
            3. This select issues its own GET, but it declares no
-              disable-during-request attribute of its own, and the form's
-              existing hx-disinherit already covers the one the form declares,
-              so NO attribute is added to the form element above. The inheritance fix
-              stays exactly as written. (The attribute is named in prose rather
-              than quoted so a grep for it still counts only the places that
-              set it.)
+              hx-disabled-elt of its own, and the form's existing
+              hx-disinherit="hx-disabled-elt" already covers the one the form
+              declares, so NO attribute is added to the form element above.
+              The inheritance fix stays exactly as written.
 
            The slot doubles as this control's one line of help text;
            there is deliberately no second one.
@@ -234,8 +232,7 @@
         {% include "partials/scan_button.html" %}
         {# Why the button above is greyed out, as visible text in the reading
            order directly after it.  Not a title tooltip, and not
-           the ARIA disabled-state attribute -- named in prose here so a grep
-           forbidding it across these templates still returns nothing.  A
+           the ARIA disabled-state attribute, which no template uses.  A
            disabled button cannot be focused, so aria-describedby on it is
            never announced on focus and a tooltip is unreachable by keyboard
            and unreliable on touch; keeping the button focusable by swapping
@@ -330,15 +327,13 @@
        htmx handles its submit event and sends the same request the debounced
        input sends.
 
-       This is also the decisive advantage over the alternative, which was to
-       drop the filter field on the way out of the scan form with a parameter
-       filter on the form element.  That would have meant adding an attribute
-       to the scan form, and htmx attributes are inherited, so every attribute
-       added there has to be added to the hx-disinherit list as well or every
-       control inside the form picks it up.  Nothing is added to the scan form
-       element at all, so the fix above stays exactly as written (the attribute
-       names are in prose here so a grep for the places that set them still
-       counts only those).
+       This is also the decisive advantage over the alternative: dropping
+       the filter field on the way out of the scan form with hx-params on the
+       form element.  That would mean adding an attribute to the scan form,
+       and htmx attributes are inherited, so every attribute added there has
+       to be added to the hx-disinherit list as well or every control inside
+       the form picks it up.  Nothing is added to the scan form element at
+       all, so the fix above stays exactly as written.
 
        It goes with the fieldset above when the Tags block is off: a form whose
        only member is an input that is no longer rendered has nothing left to

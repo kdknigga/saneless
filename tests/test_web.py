@@ -16,8 +16,9 @@ import re
 import sqlite3
 import threading
 import time
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, override
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from saneless.job import Job
 
 import httpx2
+import jinja2.nodes
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -91,6 +93,7 @@ from saneless.web.security_headers import NO_STORE, SECURITY_HEADERS
 from saneless.web.throttle import PAPERLESS_TEST_WAIT_SECONDS
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, leaf_routes, load_the_lists
+from tests.template_support import template_start_tags
 
 # Every app built in this module, fixture or helper, talks to a Paperless client
 # whose requests fail inside the process: nothing reaches localhost:8000.
@@ -601,7 +604,7 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
 
     app.state.paperless.get_tags = blocking_get_tags
     app.state.cache.invalidate("tags")
-    slow = threading.Thread(target=lambda: client.get("/api/tags"))
+    slow = threading.Thread(target=lambda: client.get("/api/tags"), daemon=True)
     slow.start()
     try:
         assert entered.wait(5)
@@ -613,6 +616,7 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
     finally:
         gate.set()
         slow.join(5)
+    assert not slow.is_alive()
 
 
 def test_metadata_fetch_failure_says_the_list_is_unavailable(
@@ -710,7 +714,7 @@ def titled_client(
     auth = "test-token"
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token=auth),
+        paperless=PaperlessConfig(url="http://paperless.invalid", token=auth),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         profiles={"default": ProfileConfig(title="Receipt")},
     )
@@ -769,8 +773,45 @@ def test_status_polling(client: TestClient) -> None:
     assert 'id="status-area"' in response.text
 
 
+class _StatusAreaFinder(HTMLParser):
+    """Collect the attributes of every element whose id is ``status-area``."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.found: list[dict[str, str | None]] = []
+
+    @override
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if attributes.get("id") == "status-area":
+            self.found.append(attributes)
+
+
+def _status_area_attributes(markup: str) -> dict[str, str | None]:
+    """
+    Return the attributes of the one status area in rendered markup.
+
+    Args:
+        markup: A rendered page or status response.
+
+    Returns:
+        The status area's attributes, with HTML entities resolved.
+
+    """
+    finder = _StatusAreaFinder()
+    finder.feed(markup)
+    finder.close()
+    assert len(finder.found) == 1, markup
+    return finder.found[0]
+
+
 def test_status_polling_active_job(client: TestClient) -> None:
-    """Active job triggers hx-trigger polling attributes (UI-02)."""
+    """
+    An active job's status area polls the current-job URL once a second.
+
+    The poll carries only the token of the rendering it shows, and that token
+    is the real one: polling it while nothing changes is answered 204.
+    """
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Polling Test")
     job_store.update_state(job.id, JobState.SCANNING)
@@ -778,9 +819,18 @@ def test_status_polling_active_job(client: TestClient) -> None:
 
     response = client.get("/api/jobs/current/status")
     assert response.status_code == 200
-    # Active job states include polling attributes
-    has_polling = "hx-trigger" in response.text or "hx-get" in response.text
-    assert has_polling
+    area = _status_area_attributes(response.text)
+
+    assert area["hx-trigger"] == "every 1s"
+    poll = area["hx-get"]
+    assert poll is not None
+    parts = urlsplit(poll)
+    assert parts.path == "/api/jobs/current/status"
+    query = parse_qs(parts.query, keep_blank_values=True)
+    assert list(query) == ["seen"]
+    (seen,) = query["seen"]
+    assert re.fullmatch(r"[0-9a-f]{24}", seen), seen
+    assert client.get(poll).status_code == 204
 
 
 def test_flip_prompt(client: TestClient) -> None:
@@ -1244,18 +1294,6 @@ def test_paperless_test_error(client: TestClient) -> None:
     assert "boom" not in response.text
 
 
-def test_scan_button_disabled_during_active_job(client: TestClient) -> None:
-    """Scan button disabled during active job (UI-07)."""
-    job_store: JobStore = _app(client).state.job_store
-    job = job_store.create_job(profile="default", title="Active Job")
-    job_store.update_state(job.id, JobState.SCANNING)
-    _app(client).state.worker._current_job_id = job.id
-
-    response = client.get("/")
-    assert "disabled" in response.text
-    assert 'id="scan-btn"' in response.text
-
-
 def test_history_humanized_labels(client: TestClient) -> None:
     """Job history shows human-readable state labels instead of raw enum values (P12-01)."""
     job_store: JobStore = _app(client).state.job_store
@@ -1327,13 +1365,14 @@ def test_correspondent_placeholder(client: TestClient) -> None:
 
 def test_css_spacing_normalized() -> None:
     """CSS uses PicoCSS grid-aligned spacing with no !important overrides (P12-05)."""
-    css_path = (
-        Path(__file__).parent.parent / "src" / "saneless" / "web" / "static" / "app.css"
-    )
-    css_content = css_path.read_text()
-    assert "!important" not in css_content
-    assert "padding: 0.25rem" in css_content
-    assert "var(--pico-border-width)" in css_content
+    declarations = [
+        (prop, value)
+        for _selector, rule in _css_rules(_web_asset("static", "app.css"))
+        for prop, value in rule.items()
+    ]
+    assert not [pair for pair in declarations if "!important" in pair[1]]
+    assert _css_declarations(".refresh-btn")["padding"] == "0.25rem 0.5rem"
+    assert any("var(--pico-border-width)" in value for _prop, value in declarations)
 
 
 def test_paperless_test_500_sanitizes_exception(client: TestClient) -> None:
@@ -1551,10 +1590,12 @@ class TestAppComposition:
 # changed underneath every browser that already holds one.
 _OWNER_COOKIE = "saneless_owner"
 
-# ``secrets.token_urlsafe(32)`` is 32 random bytes in unpadded URL-safe base64,
-# which is always 43 characters.  Asserting the length is the only way this
-# suite can see the entropy behind the value it is handed.
-_MINIMUM_OWNER_COOKIE_LENGTH = 43
+# The random bytes behind a freshly minted owner token.
+_OWNER_TOKEN_BYTES = 32
+
+# What the spied mint hands back: distinctive, so the cookie can only equal it
+# if the route sent the minted value unchanged.
+_SPIED_OWNER_TOKEN = "spied-owner-token-value"
 
 # The owner cookie's lifetime, spelled out for the same reason as its name: a
 # year in seconds, so a browser keeps its ownership across restarts.
@@ -1787,15 +1828,27 @@ class TestOwnerCookie:
         assert recorded == {accepting_client.cookies[_OWNER_COOKIE]}
 
     def test_owner_cookie_carries_at_least_32_bytes_of_entropy(
-        self, accepting_client: TestClient
+        self, accepting_client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The mint is token_urlsafe(32), which is 43 characters (T-30-57)."""
+        """
+        A fresh owner cookie is the value of ``secrets.token_urlsafe(32)``.
+
+        The mint is spied rather than measured: a constant 43-character token
+        has the right length and no entropy at all.
+        """
+        requested: list[int | None] = []
+
+        def spy_token_urlsafe(nbytes: int | None = None) -> str:
+            requested.append(nbytes)
+            return _SPIED_OWNER_TOKEN
+
+        monkeypatch.setattr(routes_module.secrets, "token_urlsafe", spy_token_urlsafe)
         accepting_client.post(
             "/api/scan", data={"profile": "duplex", "title": "Entropy"}
         )
 
-        minted = accepting_client.cookies[_OWNER_COOKIE]
-        assert len(minted) >= _MINIMUM_OWNER_COOKIE_LENGTH
+        assert requested == [_OWNER_TOKEN_BYTES]
+        assert accepting_client.cookies[_OWNER_COOKIE] == _SPIED_OWNER_TOKEN
 
     @pytest.mark.parametrize("presented", ["", "   "], ids=["empty", "whitespace"])
     def test_owner_cookie_that_is_blank_is_replaced(
@@ -2666,11 +2719,16 @@ class TestQueueLine:
         Templates own no vocabulary (Pattern C); a page that assembled its own
         sentence would be a second place for the copy to drift.
         """
-        status = (
-            Path(app_module.__file__).parent / "templates" / "partials" / "status.html"
-        ).read_text(encoding="utf-8")
-        assert "busy_line(" not in status
-        assert "progress_label" not in status
+        tree = _template_tree("partials", "status.html")
+        called = {
+            node.node.name
+            for node in tree.find_all(jinja2.nodes.Call)
+            if isinstance(node.node, jinja2.nodes.Name)
+        }
+        named = {node.name for node in tree.find_all(jinja2.nodes.Name)}
+        assert "busy_line" in named
+        assert "busy_line" not in called
+        assert "progress_label" not in named
 
 
 def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) -> None:
@@ -3202,29 +3260,160 @@ class TestPageOpensOnDefault:
         assert job_store.list_recent(limit=1)[0].profile == "default"
 
 
-# The scan form element as it stood before plan 30-15, byte for byte.  The
-# profile select lives inside it and must add nothing to it: the form already
-# carries hx-disinherit="hx-disabled-elt", because an inherited hx-disabled-elt
-# would put the form's own child requests in charge of the Scan button's
-# disabled attribute (C-10).  The one line added since is ``method`` and
-# ``action``, which are not htmx attributes and which nothing inherits: they
-# keep a JavaScript-off submit's fields out of the URL.
-_SCAN_FORM_ELEMENT = """    <form hx-post="/api/scan"
-          method="post" action="/api/scan"
-          hx-target="#status-area"
-          hx-swap="outerHTML"
-          hx-disabled-elt="#scan-btn"
-          hx-disinherit="hx-disabled-elt">
-"""
+# The scan form's attributes.  The profile select lives inside the form and
+# adds nothing to it: the form carries hx-disinherit="hx-disabled-elt" because
+# an inherited hx-disabled-elt would put the form's own child requests in
+# charge of the Scan button's disabled attribute.  ``method`` and ``action``
+# are not htmx attributes and nothing inherits them: they keep a
+# JavaScript-off submit's fields out of the URL.
+_SCAN_FORM_ATTRIBUTES: dict[str, str | None] = {
+    "hx-post": "/api/scan",
+    "method": "post",
+    "action": "/api/scan",
+    "hx-target": "#status-area",
+    "hx-swap": "outerHTML",
+    "hx-disabled-elt": "#scan-btn",
+    "hx-disinherit": "hx-disabled-elt",
+}
 
-# How many six-digit colour literals app.css held before plan 30-15.  The
-# :empty rule hides an element; it introduces no colour of its own.
-_APP_CSS_COLOUR_LITERALS = 3
+_CSS_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_RULE = re.compile(r"([^{};]+)\{([^{}]*)\}")
+_HEX_COLOUR = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+_THEME_TOKEN = re.compile(r"var\(--(?:pico|saneless)-[a-z0-9-]+\)")
 
 
 def _web_asset(*parts: str) -> str:
     """Read one shipped template or static file, for the markup assertions."""
     return Path(app_module.__file__).parent.joinpath(*parts).read_text(encoding="utf-8")
+
+
+def _template_tree(*parts: str) -> jinja2.nodes.Template:
+    """Parse one shipped template, so a check reads its syntax and not its comments."""
+    return jinja2.Environment(autoescape=True).parse(_web_asset("templates", *parts))
+
+
+def _css_rules(css: str) -> list[tuple[str, dict[str, str]]]:
+    """
+    Return every innermost rule of a stylesheet with its declarations.
+
+    Comments are removed first, so a comment may name any selector, property or
+    value.  A rule inside an at-rule block is returned on its own, and each
+    selector has its whitespace collapsed to single spaces.
+
+    Args:
+        css: The stylesheet's text.
+
+    Returns:
+        Each rule's selector and its declarations, property to value, in order.
+
+    """
+    rules: list[tuple[str, dict[str, str]]] = []
+    for match in _CSS_RULE.finditer(_CSS_COMMENT.sub("", css)):
+        declarations: dict[str, str] = {}
+        for declaration in match.group(2).split(";"):
+            if declaration.strip():
+                prop, _, value = declaration.partition(":")
+                declarations[prop.strip()] = " ".join(value.split())
+        rules.append((" ".join(match.group(1).split()), declarations))
+    return rules
+
+
+def _css_declarations(selector: str) -> dict[str, str]:
+    """
+    Return the declarations of the one app.css rule with ``selector``.
+
+    Args:
+        selector: The rule's selector, whitespace collapsed to single spaces.
+
+    Returns:
+        The rule's declarations, property to value.
+
+    """
+    found = [
+        declarations
+        for rule, declarations in _css_rules(_web_asset("static", "app.css"))
+        if rule == selector
+    ]
+    assert len(found) == 1, f"expected exactly one {selector} rule, found {len(found)}"
+    return found[0]
+
+
+def _stylesheet_palette_problems(css: str) -> list[str]:
+    """
+    List every colour in a stylesheet that is not drawn from a theme token.
+
+    A hex literal may appear only as the whole value of a ``--saneless-*``
+    custom property, and every ``color`` or ``background-color`` declaration
+    must read a ``--pico-*`` or ``--saneless-*`` custom property.
+
+    Args:
+        css: The stylesheet's text.
+
+    Returns:
+        One line per offending declaration or stray literal; empty when clean.
+
+    """
+    problems: list[str] = []
+    declared_literals = 0
+    for selector, declarations in _css_rules(css):
+        for prop, value in declarations.items():
+            literals = _HEX_COLOUR.findall(value)
+            declared_literals += len(literals)
+            if literals and not (
+                prop.startswith("--saneless-") and _HEX_COLOUR.fullmatch(value)
+            ):
+                problems.append(f"{selector} {{ {prop}: {value} }}")
+            if prop in {"color", "background-color"} and not _THEME_TOKEN.fullmatch(
+                value
+            ):
+                problems.append(f"{selector} {{ {prop}: {value} }}")
+    stray = len(_HEX_COLOUR.findall(_CSS_COMMENT.sub("", css))) - declared_literals
+    if stray:
+        problems.append(f"{stray} hex literal(s) outside any declaration")
+    return problems
+
+
+def test_every_stylesheet_colour_is_a_theme_token() -> None:
+    """
+    Every colour app.css draws comes from a Pico or saneless custom property.
+
+    A hex literal is only ever the value of a ``--saneless-*`` property, so the
+    palette stays the theme's, and light and dark both follow it.
+    """
+    css = _web_asset("static", "app.css")
+    rules = _css_rules(css)
+
+    assert _stylesheet_palette_problems(css) == []
+    assert any(
+        prop.startswith("--saneless-") and _HEX_COLOUR.fullmatch(value)
+        for _selector, declarations in rules
+        for prop, value in declarations.items()
+    )
+    assert any("color" in declarations for _selector, declarations in rules)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        ".x { color: #123456; }",
+        ".x { background-color: red; }",
+        ".x { border: 1px solid #abc; }",
+        ":root { --pico-color: #abcdef; }",
+        ".x { color: var(--other-colour); }",
+        "#abcdef, .x { display: none; }",
+    ],
+    ids=[
+        "hex-color",
+        "named-background",
+        "hex-border",
+        "hex-pico-token",
+        "foreign-token",
+        "hex-outside-declaration",
+    ],
+)
+def test_the_palette_check_names_an_untokened_colour(rule: str) -> None:
+    """The palette check reports a colour that bypasses the theme tokens."""
+    assert _stylesheet_palette_problems(rule) != []
 
 
 def _profile_select_tag(page: str) -> str:
@@ -3310,11 +3499,15 @@ class TestProfileSelectMarkup:
     def test_the_profile_select_adds_no_attribute_to_the_scan_form(
         self, client: TestClient
     ) -> None:
-        """The C-10 fix is untouched and the select inherits nothing harmful."""
-        source = _web_asset("templates", "index.html")
+        """Only the scan form carries hx-disabled-elt, and the select inherits none."""
+        tags = template_start_tags(
+            Path(app_module.__file__).parent / "templates" / "index.html"
+        )
 
-        assert _SCAN_FORM_ELEMENT in source
-        assert source.count('hx-disabled-elt="') == 1
+        carriers = [attrs for _tag, attrs in tags if "hx-disabled-elt" in attrs]
+        forms = [attrs for tag, attrs in tags if tag == "form"]
+        assert carriers == [_SCAN_FORM_ATTRIBUTES]
+        assert _SCAN_FORM_ATTRIBUTES in forms
         assert "hx-disabled-elt" not in _profile_select_tag(client.get("/").text)
 
     def test_the_profile_select_has_exactly_one_help_line(
@@ -3334,13 +3527,16 @@ class TestProfileSelectMarkup:
         )[0]
         assert under_profile.count("<small") == 1
 
-    def test_the_profile_select_empty_slot_rule_is_the_only_new_css(self) -> None:
-        """One rule, hiding the slot; no new colour value (UI-SPEC S4)."""
-        css = _web_asset("static", "app.css")
+    def test_the_profile_description_slot_rule_only_hides_it_when_empty(self) -> None:
+        """One rule styles the slot, and all it does is hide the empty slot."""
+        selectors = [
+            selector
+            for selector, _declarations in _css_rules(_web_asset("static", "app.css"))
+            if "#profile-description" in selector
+        ]
 
-        assert "#profile-description:empty {\n    display: none;\n}" in css
-        assert css.count("#profile-description") == 1
-        assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOUR_LITERALS
+        assert selectors == ["#profile-description:empty"]
+        assert _css_declarations("#profile-description:empty") == {"display": "none"}
 
     def test_the_profile_select_still_submits_the_chosen_profile(
         self, client: TestClient
@@ -3851,8 +4047,10 @@ class TestStaleDefaultAndUnlistedRows:
     def test_stale_default_template_marks_nothing_safe(self) -> None:
         """Names and notes are autoescaped text; the partials mark none safe."""
         for name in ("tags.html", "correspondents.html"):
-            source = _web_asset("templates", "partials", name)
-            assert "|safe" not in source.replace(" ", ""), name
+            tree = _template_tree("partials", name)
+            filters = {node.name for node in tree.find_all(jinja2.nodes.Filter)}
+            assert "safe" not in filters, name
+            assert not list(tree.find_all(jinja2.nodes.MarkSafe)), name
 
     def test_stale_default_correspondent_known_selection_is_selected(
         self, client: TestClient
@@ -3909,30 +4107,24 @@ class TestStaleDefaultAndUnlistedRows:
 _PROFILE_DEFAULT_TAGS = [41, 42]
 _PROFILE_DEFAULT_CORRESPONDENT = 43
 
-# The two rules UI-SPEC S6 adds to app.css, property by property. Written out
-# here rather than matched loosely, because "the tap target is 44 px" is the
-# whole of D-30 and a rule that lost one declaration would still look right.
-# The Multiple pages checkbox shares the tag rows' rule rather than a copy.
-_TAG_OPTION_RULE = """label.tag-option,
-label.multi-page-option {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    min-height: 2.75rem;
-    margin-bottom: 0;
-    cursor: pointer;
-}"""
-
-_TAG_LIST_RULE = """.tag-list {
-    max-height: 17.5rem;
-    overflow-y: auto;
-    margin-bottom: var(--pico-spacing);
-}"""
-
-# How many six-digit colour literals app.css held before this plan. A touch
-# target is a size, not a colour, so the count may not move.
-_APP_CSS_COLOURS_BEFORE_30_16 = 3
+# The tap-target rules, declaration by declaration: "the tap target is 44 px"
+# is the whole point, and a rule that lost one declaration would still look
+# right.  The Multiple pages checkbox shares the tag rows' rule.
+_TAG_OPTION_SELECTOR = "label.tag-option, label.multi-page-option"
+_TAG_OPTION_DECLARATIONS = {
+    "display": "flex",
+    "align-items": "center",
+    "gap": "0.5rem",
+    "width": "100%",
+    "min-height": "2.75rem",
+    "margin-bottom": "0",
+    "cursor": "pointer",
+}
+_TAG_LIST_DECLARATIONS = {
+    "max-height": "17.5rem",
+    "overflow-y": "auto",
+    "margin-bottom": "var(--pico-spacing)",
+}
 
 
 def _simple_form_app(
@@ -3959,7 +4151,7 @@ def _simple_form_app(
     """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token=credential),
+        paperless=PaperlessConfig(url="http://paperless.invalid", token=credential),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
         profiles={
@@ -4127,10 +4319,8 @@ class TestSimpleForm:
 
     def test_simple_form_tag_rows_are_a_thumb_sized_tap_target(self) -> None:
         """D-30: the label is the target and it clears 44 px at a 16 px root."""
-        css = _web_asset("static", "app.css")
-
-        assert _TAG_OPTION_RULE in css
-        assert _TAG_LIST_RULE in css
+        assert _css_declarations(_TAG_OPTION_SELECTOR) == _TAG_OPTION_DECLARATIONS
+        assert _css_declarations(".tag-list") == _TAG_LIST_DECLARATIONS
 
     def test_simple_form_tap_target_rule_outweighs_pico_by_load_order(self) -> None:
         """
@@ -4140,16 +4330,14 @@ class TestSimpleForm:
         the tie is what makes this win -- and a tie only wins because app.css
         loads second.
         """
-        css = _web_asset("static", "app.css")
+        parts = [
+            part.strip()
+            for selector, _declarations in _css_rules(_web_asset("static", "app.css"))
+            for part in selector.split(",")
+            if "tag-option" in part
+        ]
 
-        assert "\n.tag-option {" not in css
-        assert css.count("label.tag-option,\nlabel.multi-page-option {") == 1
-
-    def test_simple_form_touch_targets_add_no_colour_to_the_stylesheet(self) -> None:
-        """A tap target is a size; the palette may not move (UI-SPEC S6)."""
-        css = _web_asset("static", "app.css")
-
-        assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOURS_BEFORE_30_16
+        assert parts == ["label.tag-option"]
 
 
 def _newest_job(client: TestClient) -> Job:
@@ -4350,7 +4538,7 @@ def _pre_ticked_app(
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(
-            url="http://localhost:8000", token="a-real-looking-token"
+            url="http://paperless.invalid", token="a-real-looking-token"
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_path),
@@ -5519,7 +5707,7 @@ def _counted_app(
     counter = _MetadataRequestCounter()
     credential = "a-real-looking-token"
     app.state.paperless = PaperlessClient(
-        url="http://localhost:8000",
+        url="http://paperless.invalid",
         token=credential,
         transport=httpx2.MockTransport(counter),
     )
