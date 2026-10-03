@@ -5,8 +5,6 @@ The cache takes its clock as a constructor parameter, so every assertion about
 the TTL here moves a float instead of waiting for one to pass, and the
 single-flight tests hold a fetch open on an Event rather than a pause.  Nothing
 in this file sleeps.
-
-Covers requirements: PLSS-05, ROBU-05.
 """
 
 from __future__ import annotations
@@ -91,7 +89,7 @@ def _raise(exc: Exception) -> _Rows:
 
 
 def test_cache_set_and_get() -> None:
-    """Cache stores and retrieves values by key (PLSS-05)."""
+    """Cache stores and retrieves values by key."""
     cache = MetadataCache(ttl=60, clock=_FakeClock())
     cache.set("tags", [{"id": 1, "name": "receipt"}])
     result = cache.get("tags")
@@ -111,7 +109,7 @@ def test_cache_ttl_expiry() -> None:
 
 
 def test_cache_invalidate() -> None:
-    """Explicit invalidation removes cached entry (PLSS-05)."""
+    """Explicit invalidation removes the cached entry."""
     cache = MetadataCache(ttl=60, clock=_FakeClock())
     cache.set("tags", [{"id": 1, "name": "receipt"}])
     cache.invalidate("tags")
@@ -128,7 +126,7 @@ def test_cache_invalidate_nonexistent() -> None:
 
 
 def test_cache_per_resource() -> None:
-    """Different resources have independent cache entries (PLSS-05)."""
+    """Different resources have independent cache entries."""
     cache = MetadataCache(ttl=60, clock=_FakeClock())
     cache.set("tags", [{"id": 1, "name": "receipt"}])
     cache.set("correspondents", [{"id": 1, "name": "ACME Corp"}])
@@ -139,7 +137,7 @@ def test_cache_per_resource() -> None:
 
 def test_get_or_fetch_single_flight() -> None:
     """
-    Concurrent misses for one key trigger a single fetch (ROBU-05).
+    Concurrent misses for one key trigger a single fetch.
 
     The fetch is held open until every thread has missed the fresh-value check
     at least once, so each of them had the chance to start a fetch of its own.
@@ -167,7 +165,9 @@ def test_get_or_fetch_single_flight() -> None:
         with results_lock:
             results.append(data)
 
-    threads = [threading.Thread(target=request) for _ in range(threads_count)]
+    threads = [
+        threading.Thread(target=request, daemon=True) for _ in range(threads_count)
+    ]
     for thread in threads:
         thread.start()
     try:
@@ -177,6 +177,9 @@ def test_get_or_fetch_single_flight() -> None:
         gate.set()
         for thread in threads:
             thread.join(_WAIT_SECONDS)
+    assert not any(thread.is_alive() for thread in threads), (
+        "a request thread hung behind the single-flight fetch"
+    )
 
     assert len(calls) == 1
     assert len(results) == threads_count
@@ -318,7 +321,9 @@ def test_waiters_behind_a_failing_fetch_return_at_once() -> None:
             with outcomes_lock:
                 outcomes.append(type(exc))
 
-    threads = [threading.Thread(target=request) for _ in range(threads_count)]
+    threads = [
+        threading.Thread(target=request, daemon=True) for _ in range(threads_count)
+    ]
     for thread in threads:
         thread.start()
     try:
@@ -328,6 +333,9 @@ def test_waiters_behind_a_failing_fetch_return_at_once() -> None:
         gate.set()
         for thread in threads:
             thread.join(_WAIT_SECONDS)
+    assert not any(thread.is_alive() for thread in threads), (
+        "a request thread hung behind the failing fetch"
+    )
 
     assert len(calls) == 1
     assert sorted(outcomes, key=lambda kind: kind.__name__) == [ConnectionError] + [
@@ -362,7 +370,7 @@ def test_a_waiter_gives_up_after_its_lock_timeout() -> None:
     def in_flight() -> None:
         results["in_flight"] = cache.get_or_fetch_list("tags", hung_fetch)
 
-    thread = threading.Thread(target=in_flight)
+    thread = threading.Thread(target=in_flight, daemon=True)
     thread.start()
     try:
         assert entered.wait(_WAIT_SECONDS)
@@ -372,6 +380,7 @@ def test_a_waiter_gives_up_after_its_lock_timeout() -> None:
     finally:
         release.set()
         thread.join(_WAIT_SECONDS)
+    assert not thread.is_alive(), "the in-flight fetch thread hung"
 
     assert second_calls == []
     assert results["in_flight"] == CachedList(rows, current=True)
@@ -427,15 +436,20 @@ def test_invalidate_during_an_in_flight_fetch_is_not_undone() -> None:
     def refresh() -> None:
         results["refresh"] = cache.get_or_fetch("tags", lambda: fresh)
 
-    first = threading.Thread(target=in_flight)
+    first = threading.Thread(target=in_flight, daemon=True)
     first.start()
-    assert entered.wait(_WAIT_SECONDS)
-    cache.invalidate("tags")
-    second = threading.Thread(target=refresh)
-    second.start()
-    release.set()
-    first.join(_WAIT_SECONDS)
-    second.join(_WAIT_SECONDS)
+    second = threading.Thread(target=refresh, daemon=True)
+    try:
+        assert entered.wait(_WAIT_SECONDS)
+        cache.invalidate("tags")
+        second.start()
+    finally:
+        release.set()
+        first.join(_WAIT_SECONDS)
+        if second.ident is not None:
+            second.join(_WAIT_SECONDS)
+    assert not first.is_alive(), "the stale in-flight fetch thread hung"
+    assert not second.is_alive(), "the refresh thread hung"
 
     assert results["in_flight"] is stale
     assert results["refresh"] is fresh
@@ -443,7 +457,7 @@ def test_invalidate_during_an_in_flight_fetch_is_not_undone() -> None:
 
 
 def test_get_or_fetch_returns_fresh_value_without_fetching() -> None:
-    """A fresh value is served from cache; an expired one is refetched (ROBU-05)."""
+    """A fresh value is served from cache; an expired one is refetched."""
     clock = _FakeClock()
     cache = MetadataCache(ttl=1, clock=clock)
     cached: _Rows = [{"id": 1, "name": "receipt"}]
@@ -747,7 +761,7 @@ def test_invalidate_racing_a_failed_refresh_is_not_overwritten(
     def in_flight() -> None:
         results["in_flight"] = cache.get_or_fetch("tags", slow_failing_fetch)
 
-    thread = threading.Thread(target=in_flight)
+    thread = threading.Thread(target=in_flight, daemon=True)
     with caplog.at_level(logging.WARNING, logger=_CACHE_LOGGER):
         thread.start()
         try:
@@ -756,6 +770,7 @@ def test_invalidate_racing_a_failed_refresh_is_not_overwritten(
         finally:
             release.set()
             thread.join(_WAIT_SECONDS)
+    assert not thread.is_alive(), "the failing in-flight fetch thread hung"
 
     assert results["in_flight"] is good
     assert cache.get("tags") is None

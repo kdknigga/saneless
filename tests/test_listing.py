@@ -1,21 +1,15 @@
 """
 Tests for ``saneless.scanner.listing``, the launcher every scanner listing uses.
 
-The launcher starts a short-lived child interpreter, hands it one JSON request
-line on stdin and waits for it under a hard deadline.  Whatever happens, the
-child is dead and reaped before the launcher returns or raises: a child that
-overruns the deadline is killed, and so is one still running when the wait is
-interrupted.  A child that dies from a signal is a crashed listing, one that
-runs out of time is a timed-out listing.  Both are ``ScanError`` subclasses,
-and each logs one WARNING naming nothing but the signal or the deadline.  A
-child that cannot be started, or whose output is not exactly the reply
-schema, is a listing that gave no answer, a third ``ScanError`` subclass.
+The launcher hands a short-lived child interpreter one JSON request line and
+waits under a hard deadline; the child is dead and reaped before the launcher
+returns or raises.  A signal death is a crashed listing, an overrun a
+timed-out one, and a child that cannot start or answers off-schema gave no
+answer: three ``ScanError`` subclasses, each logging one WARNING with nothing
+host-derived.  The child's environment drops every ``SANELESS_*`` variable.
 
-The child's environment is the parent's minus every ``SANELESS_*`` variable,
-with ``SANE_NET_HOSTS`` taken from the one derivation the scanner check uses.
-
-No test here touches libsane.  Each points the launcher at a stand-in child
-script written into ``tmp_path``, run exactly as the real child is run.
+No test here touches libsane: each runs a stand-in child script written into
+``tmp_path`` exactly as the real child is run.
 """
 
 from __future__ import annotations
@@ -30,7 +24,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import NoReturn
 
 import pytest
 
@@ -51,9 +45,7 @@ from saneless.scanner.listing import (
     child_environment,
     run_listing_child,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from tests.conftest import poll_until
 
 _LOGGER = "saneless.scanner.listing"
 _NET_ID = "net:scanbox.lan:test:0"
@@ -661,7 +653,6 @@ class TestDeadline:
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         A process the child started dies with it, rather than outliving it.
@@ -833,7 +824,6 @@ class TestAbort:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         The abort error comes within a second, with the child already gone.
@@ -921,7 +911,7 @@ class TestAbort:
     def test_a_fast_child_answers_unchanged_with_no_abort(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """With no abort at all, a child that answers is decoded as before."""
+        """With no abort at all, a child that answers is decoded."""
         _use_child(monkeypatch, tmp_path, _REPLY_CHILD)
 
         reply = run_listing_child(ListingRequest(), configured_host="", abort=None)
@@ -1179,7 +1169,7 @@ def test_the_deadline_is_thirty_seconds() -> None:
 
 
 def test_the_listing_failure_errors_are_distinct_scan_errors() -> None:
-    """Every existing ``except ScanError`` boundary still catches all four."""
+    """Every ``except ScanError`` boundary catches all four, each distinct."""
     failures = (
         ListingCrashedError,
         ListingTimedOutError,

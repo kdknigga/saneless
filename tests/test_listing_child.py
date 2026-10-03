@@ -1,19 +1,16 @@
 """
 Tests for ``saneless.scanner._listing_child``, the file every listing runs in.
 
-The child reads one JSON request line from stdin, naming at most one device to
-open and the number of seconds after which the kernel ends it.  It arms that
-alarm before it imports python-sane, initialises SANE, lists the scanners and,
-when the named device is not among them, opens and closes it.  It writes one
-JSON reply line to stdout and exits.  Every failure inside python-sane comes
-back as data in the reply, so the only ways the child ends without a reply are
-a signal or a request it cannot read.
+The child reads one JSON request naming at most one device and an alarm, arms
+the alarm before python-sane loads, lists the scanners, opens and closes the
+named device when it is unlisted, and writes one JSON reply line.  Every
+python-sane failure comes back as data, so only a signal or an unreadable
+request ends the child without a reply.
 
-The list-then-open decision is a plain function over a ``sane`` module, so
-these tests drive it with ``FakeSaneModule`` in this process and never start
-real libsane.  Two further tests pin the import boundary: the file imports only
-a short list of standard-library modules, and loading it pulls in nothing from
-``saneless`` and not python-sane.
+The list-then-open decision is driven in this process over
+``FakeSaneModule``, never real libsane.  The child imports only allowlisted
+standard-library modules, and loading it pulls in neither ``saneless`` nor
+python-sane.
 """
 
 from __future__ import annotations

@@ -1,10 +1,9 @@
 """
 Lifespan tests: crash recovery at startup and a guarded close at shutdown.
 
-Covers requirements: ROBU-06, ROBU-02.  Code review finding M-03; decisions
-D-13 (startup order: validate, recover, prune, start the worker) and D-09
-(close the store and the Paperless client only after the worker confirmed it
-stopped).
+Startup validates, recovers the rows a crash left, prunes, and only then
+starts the worker.  Shutdown closes the store and the Paperless client only
+after the threads that use them have confirmed they stopped.
 
 The store is file-backed throughout: ``create_app`` opens
 ``settings.output.db_path``, so a test seeds rows by opening its own
@@ -173,7 +172,7 @@ def _interrupted_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
-# --- Startup recovery (ROBU-06, D-13) ---------------------------------------
+# --- Startup recovery ---------------------------------------------------------
 
 
 def test_startup_fails_every_active_job_with_the_restart_reason(
@@ -197,7 +196,7 @@ def test_startup_fails_every_active_job_with_the_restart_reason(
 
 def test_recovered_row_is_what_the_status_area_shows(settings: Settings) -> None:
     """
-    The newest recovered row renders as a settled error, not a poll (T9).
+    The newest recovered row renders as a settled error, not a poll.
 
     The page reports it as the last scan -- a failure with the restart as
     its detail, and no alert -- since it ended before the page was loaded.
@@ -242,7 +241,7 @@ def test_recovery_runs_before_the_worker_starts(
 def test_startup_order_is_recover_then_prune_then_start(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Prune runs after crash recovery and before the worker starts (D-13)."""
+    """Prune runs after crash recovery and before the worker starts."""
     app = _build_app(settings)
     worker = app.state.worker
     store: JobStore = app.state.job_store
@@ -637,7 +636,7 @@ def test_a_refused_restart_of_an_uploading_job_is_worded_once_the_store_recovers
     )
 
 
-# --- Guarded close at shutdown (ROBU-06, D-07, D-09) -------------------------
+# --- Guarded close at shutdown ------------------------------------------------
 
 
 def test_shutdown_closes_resources_after_both_threads_stop(
@@ -646,7 +645,7 @@ def test_shutdown_closes_resources_after_both_threads_stop(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    Both threads confirm before anything closes (A-7).
+    Both threads confirm before anything closes.
 
     The refresher holds the same Paperless client the worker does and may be
     inside SANE, so the close sequence is owed *two* confirmed stops, not one.
@@ -711,21 +710,13 @@ def test_both_stop_events_are_set_before_either_join_begins(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Signalling both threads first is what lets an idle one exit before its join.
+    Both stop events are set before either join, so an idle thread exits early.
 
-    It is not what bounds the total -- the joins are sequential, and the shared
-    deadline is what keeps the worst case at one bound (WR-07, and
-    ``TestShutdownSharesOneJoinBudget`` below).  What the early signal buys is
-    asserted here instead, on the recorded order of the internal event sets and
-    joins rather than on elapsed time: a timing assertion would be a flake on a
-    loaded machine and would still not say *why* the shutdown was quick.
-
-    ``refresher.join`` usually does not appear at all.  By the time the worker's
-    bounded join returns, the refresher's one-second ``Event.wait`` has woken on
-    the event set before it and the thread has already exited, so ``stop()``
-    skips the join entirely.  That absence is the whole benefit, which is why
-    this asserts over the joins that happened rather than over a fixed
-    four-element list.
+    The shared deadline, not this order, bounds the total (see
+    ``TestShutdownSharesOneJoinBudget``).  The order is asserted on the
+    recorded event sets and joins, not on elapsed time.  ``refresher.join``
+    usually never appears: the refresher has already woken on its event and
+    exited by the time the worker's join returns, so ``stop()`` skips it.
     """
     app = _build_app(settings)
     worker = app.state.worker
@@ -833,7 +824,7 @@ def _recorded_refresher_budget(
 
 class TestShutdownSharesOneJoinBudget:
     """
-    One deadline is taken before either join, and the two joins spend it (WR-07).
+    One deadline is taken before either join, and the two joins spend it.
 
     Without this, two threads parked in an unbounded ``getaddrinfo`` cost
     ``2 * STOP_JOIN_SECONDS``, and a container stop grace period sized on the
@@ -860,10 +851,10 @@ class TestShutdownSharesOneJoinBudget:
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        The assertion that makes the doubling impossible.
+        A worker that spent the whole deadline leaves the refresher nothing.
 
-        A worker that spent the whole deadline leaves the refresher a poll,
-        not a second full bound.
+        The refresher gets a poll, not a second full bound, so the total
+        never doubles.
         """
         budget = _recorded_refresher_budget(
             settings, monkeypatch, worker_cost=STOP_JOIN_SECONDS
@@ -922,12 +913,12 @@ def test_the_refreshers_scan_fact_is_the_workers_own_job_id(
     settings: Settings,
 ) -> None:
     """
-    WR-04: the strip's words and its colour read the same fact.
+    The strip's words and its colour read the same fact.
 
     ``_checks_context`` renders ``scan_active`` from ``worker.current_job_id``,
-    and the refresher's scanner skip has to come from there too -- deriving it
-    from a failed lock acquisition is what let "not checked while a scan is
-    running" appear on an idle appliance.
+    and the refresher's scanner skip comes from there too.  Deriving it from a
+    failed lock acquisition would let "not checked while a scan is running"
+    appear on an idle appliance.
 
     Args:
         settings: The test's own configuration.
@@ -950,7 +941,7 @@ def test_startup_runs_no_check_probe(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Server start is never delayed by a probe (D-04, D-06).
+    Server start is never delayed by a probe.
 
     Nothing stamps a watcher across an empty lifespan, so the refresher's ticks
     return before reaching the network and the cache is still cold afterwards --
@@ -978,7 +969,7 @@ def test_shutdown_leaves_resources_open_when_the_refresher_does_not_stop(
     """
     A refresher still inside a probe closes nothing, even with the worker stopped.
 
-    This is Pitfall 1: ``paperless.close()`` under an in-flight probe raises
+    ``paperless.close()`` under an in-flight probe raises
     inside the refresher, and ``scanner.close()`` runs ``sane_exit()`` while a
     ``sane_get_devices`` call may be outstanding, which ``sane_backend`` names
     as a segfault risk.
@@ -1122,7 +1113,7 @@ def test_shutdown_leaves_resources_open_when_the_worker_does_not_stop(
         calls.append("job_store.close")
 
     # The worker is idle, so nothing should write at all; any write after
-    # stop() was asked would be the shutdown-time write D-07 forbids.
+    # stop() was asked would be a write at shutdown, which is forbidden.
     def spy_finish_job(*args: object, **kwargs: object) -> None:
         if stop_requested:
             calls.append("finish_job")
@@ -1176,7 +1167,7 @@ def test_shutdown_closes_the_scanner_after_the_store(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    The scanner is the third thing closed, after Paperless and the store (D-18).
+    The scanner is the third thing closed, after Paperless and the store.
 
     It goes last because it is the one whose close reaches process-global
     state: ``sane_exit`` closes every open handle, so it runs only once the
@@ -1397,8 +1388,8 @@ def test_shutdown_leaves_the_scanner_open_when_the_worker_does_not_stop(
     """
     A worker that did not stop may still be inside SANE, so nothing is closed.
 
-    This is the same rule D-09 already applies to the store and the Paperless
-    client, and it matters more here: ``sane_exit`` closes every open handle
+    The store and the Paperless client follow the same rule, and it matters
+    more here: ``sane_exit`` closes every open handle
     and runs holding the GIL, which is precisely what a thread still inside a
     read cannot survive.
     """
@@ -1475,13 +1466,13 @@ def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
         store.get_job(existing.id)
 
 
-# --- SANE is unreachable from a request path (HARD-05, D-19) -----------------
+# --- SANE is unreachable from a request path ----------------------------------
 
 # How every route the app exposes is called, so the proof below can drive all
 # of them.  A route the app serves and this map does not name fails the test
-# rather than being passed over in silence: that is what makes a route added
-# later covered on the day it lands, instead of quietly uncovered.  The reverse
-# holds too: an entry naming a route the app no longer serves fails the test,
+# rather than being passed over in silence, so a new route is covered on the
+# day it lands.  The reverse holds too: an entry naming a route the app does
+# not serve fails the test,
 # so a removed route cannot leave a stale entry behind, and a drive the router
 # turns away with a 404 or 405 fails it, so an entry whose method no longer
 # matches its route cannot pass without reaching the handler.
@@ -1491,18 +1482,18 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     "/api/paperless/test": {"method": "GET"},
     "/api/scan": {
         "method": "POST",
-        "data": {"profile": "default", "title": "D-19 proof"},
+        "data": {"profile": "default", "title": "unreachable-SANE proof"},
     },
     "/api/jobs/current/status": {"method": "GET"},
     # Driven with the literal template path, which names no row.  That is a
     # real request the route handles by design: an unknown id degrades to the
-    # current-or-most-recent rendering rather than a 404 (D-25), so no job has
+    # current-or-most-recent rendering rather than a 404, so no job has
     # to be staged for this proof to reach the handler.
     "/api/jobs/{job_id}/status": {"method": "GET"},
     # The strip is a cache read, so it enters no SANE call at all; the refresh
     # route is the one that does, which is exactly why this proof must drive it
     # -- it runs the scanner check through the same backend handle the worker
-    # uses, and it must not leave one outstanding at sane_exit() (D-18, A-7).
+    # uses, and it must not leave one outstanding at sane_exit().
     "/api/checks": {"method": "GET"},
     "/api/checks/refresh": {"method": "POST"},
     "/api/tags": {"method": "GET"},
@@ -1521,7 +1512,7 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     "/api/cache/invalidate": {"method": "POST", "params": {"resource": "tags"}},
     "/api/jobs/history": {"method": "GET"},
     # Answering a prompt no job is waiting at is a real request that the route
-    # handles by design (D-16), so the flip routes need no job to be driven.
+    # handles by design, so the flip routes need no job to be driven.
     "/api/flip/continue": {"method": "POST", "data": {"job_id": "no-such-job"}},
     "/api/flip/abort": {"method": "POST", "data": {"job_id": "no-such-job"}},
     # The same holds for a multi-page answer: it names no waiting job, so the
@@ -1541,10 +1532,10 @@ _ROUTE_SKIPS: dict[str, str] = {
     ),
 }
 
-# Every path the real app serves, measured rather than predicted.  Held here as
-# the phase's canonical set so the helper's own test compares against something
-# independent of the route map above, which the lifecycle proof already checks
-# the app against in both directions.
+# Every path the real app serves, measured rather than predicted.  Held here so
+# the helper's own test compares against something independent of the route
+# map above, which the lifecycle proof already checks the app against in both
+# directions.
 _LEAF_PATHS = frozenset(
     {
         "/",
@@ -1575,18 +1566,14 @@ _LEAF_PATHS = frozenset(
 
 def test_leaf_routes_flattens_the_included_router(settings: Settings) -> None:
     """
-    leaf_routes yields every leaf, the /static Mount included (DEP-05, D-03).
+    leaf_routes yields every leaf, the /static Mount included.
 
-    fastapi 0.141 represents an included router as one opaque wrapper object in
-    ``app.routes`` rather than splicing its routes in, so a plain
-    ``isinstance(route, APIRoute)`` filter over ``app.routes`` finds none of
-    them.  D-03 requires the helper to yield ``Mount`` objects as well as
-    ``APIRoute`` ones, because the served-against-map check below enumerates
-    ``Route | Mount`` and would otherwise report ``/static`` as stale.
-
-    The app is driven inside the lifespan so the job store it opened is closed
-    afterwards; ``create_app`` opens that store eagerly and only the lifespan
-    shutdown closes it.
+    fastapi represents an included router as one opaque wrapper object in
+    ``app.routes``, so a plain ``isinstance(route, APIRoute)`` filter finds
+    none of its routes.  The helper yields ``Mount`` objects as well, because
+    the served-against-map check enumerates ``Route | Mount`` and would
+    otherwise report ``/static`` as stale.  The app runs inside the lifespan
+    so the job store it opened is closed afterwards.
     """
     app = _build_app(settings)
     with TestClient(app):
@@ -1601,7 +1588,7 @@ def test_leaf_routes_flattens_the_included_router(settings: Settings) -> None:
             f"{len(api_routes)} of the leaves are APIRoute, not the 21 this "
             f"test pins; a route was added or removed, so update this literal"
         )
-        # D-03's whole point: the Mount survives the flattening.
+        # The Mount survives the flattening.
         mounts = [route for route in leaves if isinstance(route, Mount)]
         assert [mount.path for mount in mounts] == ["/static"]
 
@@ -1613,10 +1600,9 @@ def test_leaf_routes_refuses_to_report_no_routes() -> None:
     """
     An empty enumeration raises rather than silently emptying every caller.
 
-    D-02's choke point, tested directly rather than only through the five call
-    sites.  A helper that returned ``[]`` here would leave the cross-origin
-    coverage guard green while proving nothing about which routes the guard
-    actually covers, so the empty result has to be loud.
+    Every route enumeration goes through this helper.  One that returned
+    ``[]`` would leave the cross-origin coverage guard green while proving
+    nothing about which routes it covers, so the empty result is loud.
     """
     empty = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
 
@@ -1693,24 +1679,14 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    No request path reaches sane.init() or sane.exit() (HARD-05, D-19).
+    No request path reaches sane.init() or sane.exit().
 
-    Asserted behaviourally rather than by searching for the names: a route
-    that constructed a backend, or a handler that shut SANE down to recover
-    from something, would move these counters while passing any grep.  The app
-    is driven over a real ``SaneBackend`` -- the only backend that touches SANE
-    at all -- so the counters are the library's own view of what happened.
-
-    ``exit_while_blocked`` ties the proof to D-12/D-13: whatever the routes did,
-    ``sane_exit`` never ran with a read outstanding.
-
-    The worker thread does restart SANE, once at the top of every scan job, so
-    each ``init``/``exit`` call is recorded with the thread that made it: a
-    request path must make none, and the worker exactly one exit and one init
-    per job.
-
-    The route map is checked in both directions: every served route is named
-    in it, and every entry in it names a route the app serves.
+    The app runs over a real ``SaneBackend``, so the fake library's counters
+    see any route that built a backend or shut SANE down.  The worker restarts
+    SANE once per scan job, so each call is recorded with its thread: request
+    paths make none, the worker one exit and one init per job, and
+    ``sane_exit`` never runs with a read outstanding.  The route map is
+    checked in both directions against the routes the app serves.
     """
     fake = FakeSaneModule(
         devices=[("test:device:001", "TestVendor", "TestModel", "scanner")]
@@ -1729,7 +1705,7 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     app.state.paperless.get_correspondents = lambda *, timeout=None: []
     app.state.paperless.test_connection = lambda timeout=None: "connected"
     app.state.paperless.upload_document = lambda *_a, **_k: ApiDelivery(
-        task_id="d-19-proof"
+        task_id="unreachable-sane-proof"
     )
     app.state.paperless.poll_task = lambda *_a, **_k: TaskFiled(
         task={"status": "SUCCESS"}
