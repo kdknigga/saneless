@@ -104,7 +104,7 @@ class TestDefaultProfile:
     """Default profile validation."""
 
     def test_default_profile_required(self, tmp_config_dir: Path) -> None:
-        """Missing default profile raises a rendered ConfigError (D-10)."""
+        """Missing default profile raises a rendered ConfigError."""
         toml_content = """\
 [scanner]
 host = "192.168.1.50"
@@ -184,11 +184,11 @@ source = "Flatbed"
 
 class TestLoadedConfigPath:
     """
-    Settings record the config file that was actually loaded (D-16, M-04).
+    Settings record the config file that was actually loaded.
 
-    The worker used to re-derive a write target that ignored ``--config``; the
-    loaded path now travels with ``Settings`` so every consumer writes to the
-    file the operator's settings came from.
+    The loaded path travels with ``Settings``, so every consumer that writes
+    back writes to the file the operator's settings came from, ``--config``
+    included.
     """
 
     @pytest.fixture
@@ -205,14 +205,14 @@ class TestLoadedConfigPath:
         return tmp_path
 
     def test_explicit_path_is_recorded(self, tmp_path: Path) -> None:
-        """An explicit config path that exists is recorded as given (D-16)."""
+        """An explicit config path that exists is recorded as given."""
         config_file = tmp_path / "x.toml"
         config_file.write_text("[profiles.default]\n")
         settings = load_settings(str(config_file))
         assert settings.config_path == config_file
 
     def test_missing_config_explicit_path_is_an_error(self, tmp_path: Path) -> None:
-        """An explicit path that does not exist is a ConfigError naming it (CFG-02)."""
+        """An explicit path that does not exist is a ConfigError naming it."""
         missing = str(tmp_path / "absent.toml")
         with pytest.raises(ConfigError, match=r"absent\.toml") as exc_info:
             load_settings(missing)
@@ -233,7 +233,7 @@ class TestLoadedConfigPath:
     def test_home_search_path_is_recorded(
         self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A config found under the redirected HOME is recorded (D-16)."""
+        """A config found under the redirected HOME is recorded."""
         monkeypatch.delenv("XDG_CONFIG_HOME")
         home_config = empty_cwd_and_home / "home" / ".config" / "saneless"
         home_config.mkdir(parents=True)
@@ -243,7 +243,7 @@ class TestLoadedConfigPath:
         assert settings.config_path == expected
 
     def test_no_file_found_records_none(self, empty_cwd_and_home: Path) -> None:
-        """With no config file anywhere, config_path is None (D-16)."""
+        """With no config file anywhere, config_path is None."""
         settings = load_settings()
         assert settings.config_path is None
 
@@ -307,8 +307,8 @@ class TestLoadedConfigPath:
         A relative value with no file to anchor it gets a sentence, not a crash.
 
         With no file loaded, a relative path setting is pinned against the
-        working directory, and that directory is gone.  The raw
-        FileNotFoundError named no file and reached the "saneless bug" exit.
+        working directory, and that directory is gone. A raw FileNotFoundError
+        would name no file and reach the "saneless bug" exit.
         """
         monkeypatch.setenv("SANELESS_OUTPUT__DATA_DIR", "state")
         gone = empty_cwd_and_home / "gone"
@@ -337,18 +337,18 @@ class TestLoadedConfigPath:
         assert settings.config_path == config_file
 
     def test_toml_config_path_key_is_rejected(self, tmp_path: Path) -> None:
-        """A top-level TOML ``config_path`` key is an unknown section (D-16)."""
+        """A top-level TOML ``config_path`` key is an unknown section."""
         config_file = tmp_path / "forged.toml"
         config_file.write_text('config_path = "x"\n\n[profiles.default]\n')
         with pytest.raises(ConfigError, match="config_path"):
             load_settings(str(config_file))
 
     def test_directly_constructed_settings_have_no_config_path(self) -> None:
-        """``Settings()`` built directly was loaded from no file (D-16)."""
+        """``Settings()`` built directly records no loaded file."""
         assert Settings().config_path is None
 
     def test_config_search_paths_order(self) -> None:
-        """The search list is cwd, then the XDG config home, then /etc (D-16)."""
+        """The search list is cwd, then the XDG config home, then /etc."""
         assert config_mod.config_search_paths() == (
             Path("./saneless.toml"),
             config_mod.xdg_config_home() / "saneless" / "saneless.toml",
@@ -357,10 +357,10 @@ class TestLoadedConfigPath:
 
     def test_every_search_path_uses_the_one_config_filename(self) -> None:
         """
-        One blessed filename in all three locations (Phase 37 CFG-01, D-01).
+        Every search location uses the one config filename.
 
-        The tuple test above would still pass if a later edit reintroduced a
-        second spelling somewhere; this one cannot.
+        The order test above passes with a second spelling in one location;
+        this one does not.
         """
         assert config_mod.CONFIG_FILENAME == "saneless.toml"
         assert {p.name for p in config_mod.config_search_paths()} == {
@@ -370,7 +370,7 @@ class TestLoadedConfigPath:
     def test_config_search_paths_reads_home_at_call_time(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A HOME change after import is honoured by the search list (D-16)."""
+        """A HOME change after import is honoured by the search list."""
         monkeypatch.delenv("XDG_CONFIG_HOME")
         monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
         expected = (
@@ -411,9 +411,8 @@ _XDG_BASES = [
 
 class TestXdgBaseDirectories:
     """
-    Config discovery and state defaults follow the XDG base directories (CFG-03).
+    Config discovery and state defaults follow the XDG base directories.
 
-    The docs promised XDG behaviour the code did not have (M-20, doc row 27).
     Per the basedir spec, an unset or empty ``$XDG_CONFIG_HOME`` /
     ``$XDG_STATE_HOME`` means ``$HOME/.config`` / ``$HOME/.local/state``, and a
     relative value is invalid and ignored. Both are read at call time, so a
@@ -466,7 +465,7 @@ class TestXdgBaseDirectories:
         base: _XdgBase,
         value: str,
     ) -> None:
-        """An empty or relative value falls back, per the basedir spec (T-27-25)."""
+        """An empty or relative value falls back, per the basedir spec."""
         monkeypatch.setenv(base.variable, value)
         expected = (empty_cwd_and_home / "home").joinpath(*base.fallback)
         assert base.resolve() == expected
@@ -482,7 +481,7 @@ class TestXdgBaseDirectories:
     def test_config_under_xdg_config_home_is_loaded(
         self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A config under ``$XDG_CONFIG_HOME`` is found and recorded (CFG-03)."""
+        """A config under ``$XDG_CONFIG_HOME`` is found and recorded."""
         xdg_dir = empty_cwd_and_home / "xdg"
         monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_dir))
         config_dir = xdg_dir / "saneless"
@@ -497,11 +496,11 @@ class TestXdgBaseDirectories:
         self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        The state defaults are computed at instantiation, not import (Pitfall 3).
+        The state defaults are computed at instantiation, not import.
 
-        ``saneless.config`` was imported long before this test set the variable;
-        a ``Settings.output`` default built at import would still point at the
-        old location.
+        ``saneless.config`` is imported long before this test sets the
+        variable, so a ``Settings.output`` default built at import would point
+        at the location from before the change.
         """
         state = empty_cwd_and_home / "state"
         monkeypatch.setenv("XDG_STATE_HOME", str(state))
@@ -530,8 +529,8 @@ class TestUnresolvableHome:
     A process with no home directory gets a configuration error, not a traceback.
 
     A container user with no HOME and no passwd entry has nowhere for the XDG
-    defaults to live. ``Path.home()`` raised RuntimeError, which escaped the
-    loader as an unexpected error with a traceback and no hint of the fix.
+    defaults to live. ``Path.home()`` raises RuntimeError there, and the loader
+    turns it into an error that names the fix.
     """
 
     @pytest.fixture
@@ -679,13 +678,13 @@ def _refuse_opening(monkeypatch: pytest.MonkeyPatch, refused: Path) -> None:
 
 class TestInvalidToml:
     """
-    A config file that cannot be read or parsed is a ConfigError (D-12, EXC-01).
+    A config file that cannot be read or parsed is a ConfigError.
 
-    ``tomllib.TOMLDecodeError``, ``UnicodeDecodeError`` and ``OSError`` used to
-    escape ``load_settings`` raw, so the CLI's generic catch reported a bad file
-    as an unexpected failure (M-17). Each now becomes one line under the Phase
-    27 header, chained to its cause, and never carries file content: the
-    decode error's ``doc`` holds the whole file, token included (T-28-05).
+    ``tomllib.TOMLDecodeError``, ``UnicodeDecodeError`` and ``OSError`` each
+    become one line under the configuration-error header, chained to the
+    cause, so the CLI reports a bad file rather than an unexpected failure.
+    The line never carries file content: the decode error's ``doc`` holds the
+    whole file, token included.
     """
 
     @staticmethod
@@ -703,7 +702,7 @@ class TestInvalidToml:
         assert token not in str(err.__cause__)
 
     def test_invalid_toml(self, tmp_config_dir: Path) -> None:
-        """Malformed TOML raises ConfigError, not a raw ValueError (D-12)."""
+        """Malformed TOML raises ConfigError, not a raw ValueError."""
         bad_file = tmp_config_dir / "bad.toml"
         bad_file.write_text("this is not [valid toml\n===broken===")
         with pytest.raises(ConfigError):
@@ -712,7 +711,7 @@ class TestInvalidToml:
     def test_toml_syntax_error_names_file_line_and_column(
         self, tmp_config_dir: Path
     ) -> None:
-        """A syntax error is one ``line N, column M`` row under the header (D-12)."""
+        """A syntax error is one ``line N, column M`` row under the header."""
         bad_file = tmp_config_dir / "syntax.toml"
         err = _load_error(bad_file, "a = = 1\n")
         lines = str(err).splitlines()
@@ -722,7 +721,7 @@ class TestInvalidToml:
         assert isinstance(err.__cause__, tomllib.TOMLDecodeError)
 
     def test_toml_syntax_error_never_echoes_token(self, tmp_config_dir: Path) -> None:
-        """A token earlier in a broken file is absent from the error (T-28-05)."""
+        """A token earlier in a broken file is absent from the error."""
         token = "tok-SECRET-91fe"
         err = _load_error(
             tmp_config_dir / "secret_syntax.toml",
@@ -734,7 +733,7 @@ class TestInvalidToml:
     def test_toml_key_with_control_character_is_escaped(
         self, tmp_config_dir: Path
     ) -> None:
-        """A key path holding an escape character is never rendered raw (T-28-06)."""
+        """A key path holding an escape character is never rendered raw."""
         err = _load_error(
             tmp_config_dir / "control_syntax.toml",
             '["s\\u001b"]\n["s\\u001b"]\n',
@@ -745,7 +744,7 @@ class TestInvalidToml:
         assert isinstance(err.__cause__, tomllib.TOMLDecodeError)
 
     def test_non_utf8_config_file_is_config_error(self, tmp_config_dir: Path) -> None:
-        """A file that is not UTF-8 is one ``not valid UTF-8`` row (D-12)."""
+        """A file that is not UTF-8 is one ``not valid UTF-8`` row."""
         bad_file = tmp_config_dir / "latin1.toml"
         bad_file.write_bytes(b'title = "\xff"\n')
         with pytest.raises(ConfigError) as exc_info:
@@ -758,7 +757,7 @@ class TestInvalidToml:
     def test_non_utf8_config_file_never_echoes_token(
         self, tmp_config_dir: Path
     ) -> None:
-        """A token beside the undecodable byte is absent from the error (T-28-05)."""
+        """A token beside the undecodable byte is absent from the error."""
         token = "tok-SECRET-91fe"
         bad_file = tmp_config_dir / "secret_latin1.toml"
         bad_file.write_bytes(f'[paperless]\ntoken = "{token}"\n'.encode() + b"\xff\n")
@@ -769,7 +768,7 @@ class TestInvalidToml:
     def test_unreadable_config_file_is_config_error(
         self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A file that cannot be opened is one ``cannot read the file`` row (D-12)."""
+        """A file that cannot be opened is one ``cannot read the file`` row."""
         token = "tok-SECRET-91fe"
         bad_file = tmp_config_dir / "unreadable.toml"
         bad_file.write_text(f'[paperless]\ntoken = "{token}"\n')
@@ -803,7 +802,7 @@ class TestSettingsDefaults:
 
 class TestSecretToken:
     """
-    The Paperless token is a ``SecretStr`` (CFG-05, N-15).
+    The Paperless token is a ``SecretStr``.
 
     A settings object is formatted in reprs, tracebacks and dumps; none of
     those may carry the token. Only the ``PaperlessClient`` construction sites
@@ -835,11 +834,11 @@ class TestSecretToken:
 
 class TestLogLevelValidation:
     """
-    ``output.log_level`` accepts only the five standard names (CFG-04, M-21).
+    ``output.log_level`` accepts only the five standard names.
 
-    ``getattr(logging, name)`` used to accept garbage and crash on ``TRACE``;
-    the value is now validated at load, case-insensitively, with ``warn`` read
-    as ``WARNING``.
+    The value is validated at load, case-insensitively, with ``warn`` read as
+    ``WARNING``, so ``getattr(logging, name)`` never meets a name like
+    ``TRACE``.
     """
 
     @pytest.mark.parametrize(
@@ -876,7 +875,7 @@ class TestLogLevelValidation:
         assert OutputConfig().log_level == "INFO"
 
     def test_log_level_env_is_validated(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """An invalid ``SANELESS_OUTPUT__LOG_LEVEL`` fails at load (D-10)."""
+        """An invalid ``SANELESS_OUTPUT__LOG_LEVEL`` fails at load."""
         monkeypatch.setenv("SANELESS_OUTPUT__LOG_LEVEL", "TRACE")
         with pytest.raises(ConfigError, match="log_level"):
             load_settings()
@@ -932,7 +931,7 @@ class TestTomlStructureErrors:
             load_settings(config_path=str(config_file))
 
     def test_title_alias_works(self, tmp_config_dir: Path) -> None:
-        """The 'title' field in [profiles.default] maps to default_title (D-15)."""
+        """The 'title' field in [profiles.default] maps to default_title."""
         toml_content = '[profiles.default]\ntitle = "My Doc"\n'
         config_file = tmp_config_dir / "title_alias.toml"
         config_file.write_text(toml_content)
@@ -942,7 +941,7 @@ class TestTomlStructureErrors:
     def test_title_env_var_override(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Env var SANELESS_PROFILES__DEFAULT__TITLE sets default_title (D-15)."""
+        """Env var SANELESS_PROFILES__DEFAULT__TITLE sets default_title."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("SANELESS_PROFILES__DEFAULT__TITLE", "EnvTitle")
         settings = load_settings()
@@ -950,10 +949,10 @@ class TestTomlStructureErrors:
 
     def test_title_over_max_length_is_rejected(self) -> None:
         """
-        A profile title longer than TITLE_MAX_LENGTH fails validation (D-15).
+        A profile title longer than TITLE_MAX_LENGTH fails validation.
 
         The route's form bound only checks a typed title, so an unbounded
-        profile title would bypass ROBU-08.
+        profile title would bypass the title length limit.
         """
         with pytest.raises(ValidationError, match="title"):
             ProfileConfig(title="x" * (TITLE_MAX_LENGTH + 1))
@@ -1114,11 +1113,11 @@ def _field_line(section: str, field: str, model: type[BaseModel], value: object)
 
 class TestUnknownKeyRendering:
     """
-    Every validation error is rendered by its full ``loc`` (D-10, D-11, CFG-01).
+    Every validation error is rendered by its full ``loc``.
 
-    Nested models used to ignore unknown keys, so ``[paperless] tokne`` left the
-    token unset without a word (M-18). Each error is now one line under a
-    header naming the file, with a close-match suggestion and the valid keys.
+    Nested models refuse unknown keys, so ``[paperless] tokne`` cannot leave
+    the token unset without a word. Each error is one line under a header
+    naming the file, with a close-match suggestion and the valid keys.
     """
 
     def test_unknown_key_in_paperless_suggests_and_lists_valid_keys(
@@ -1167,14 +1166,14 @@ class TestUnknownKeyRendering:
     def test_unknown_key_with_control_character_is_escaped(
         self, tmp_config_dir: Path, toml_content: str, name: str
     ) -> None:
-        """A quoted key holding a newline is rendered escaped (T-27-11)."""
+        """A quoted key holding a newline is rendered escaped."""
         err = _load_error(tmp_config_dir / "control.toml", toml_content)
         message = str(err)
         assert name in message
         assert name.replace("\\n", "\n") not in message
 
     def test_wrong_section_key_names_owning_section(self, tmp_config_dir: Path) -> None:
-        """A key that belongs to another section says where it belongs (D-11)."""
+        """A key that belongs to another section says where it belongs."""
         err = _load_error(
             tmp_config_dir / "misplaced.toml",
             "[paperless]\nweb_port = 9\n\n[profiles.default]\n",
@@ -1186,7 +1185,7 @@ class TestUnknownKeyRendering:
     def test_wrong_section_top_level_key_names_owning_section(
         self, tmp_config_dir: Path
     ) -> None:
-        """A section key written at the top level says where it belongs (D-11)."""
+        """A section key written at the top level says where it belongs."""
         err = _load_error(
             tmp_config_dir / "top_level_key.toml",
             "web_port = 9\n\n[profiles.default]\n",
@@ -1202,7 +1201,7 @@ class TestUnknownKeyRendering:
     def test_wrong_section_capitalised_suggests_real_section(
         self, tmp_config_dir: Path
     ) -> None:
-        """``[Paperless]`` is a miscased section, not a profile (M-18, D-11)."""
+        """``[Paperless]`` is a miscased section, not a profile."""
         err = _load_error(
             tmp_config_dir / "capitalised.toml",
             '[Paperless]\nurl = "x"\n\n[profiles.default]\n',
@@ -1212,7 +1211,7 @@ class TestUnknownKeyRendering:
         assert "profiles.Paperless" not in message
 
     def test_renders_every_error_one_per_line(self, tmp_config_dir: Path) -> None:
-        """Unknown keys and type errors are all reported, one line each (D-10)."""
+        """Unknown keys and type errors are all reported, one line each."""
         err = _load_error(
             tmp_config_dir / "several.toml",
             """\
@@ -1237,7 +1236,7 @@ log_level = "TRACE"
         assert _field_line("output", "log_level", OutputConfig, "TRACE") in body
 
     def test_renders_every_error_with_list_index(self, tmp_config_dir: Path) -> None:
-        """An integer ``loc`` element is rendered as a list index (D-10)."""
+        """An integer ``loc`` element is rendered as a list index."""
         err = _load_error(
             tmp_config_dir / "tags.toml",
             '[profiles.default]\ndefault_tags = ["x"]\n',
@@ -1250,7 +1249,7 @@ log_level = "TRACE"
     def test_renders_every_error_header_without_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With no file loaded the header names defaults and environment (D-10)."""
+        """With no file loaded the header names defaults and environment."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
         monkeypatch.setenv("SANELESS_OUTPUT__WEB_PORT", "abc")
@@ -1277,9 +1276,9 @@ class TestTitleSpelling:
     """
     A profile's title key has one spelling: ``title``.
 
-    ``default_title`` is the field's name in code, not a config key. It used
-    to be accepted as a second spelling, so a table holding both loaded one
-    of them without a word about the other.
+    ``default_title`` is the field's name in code, not a config key. Accepting
+    it as a second spelling would let a table holding both load one of them
+    without a word about the other.
     """
 
     def test_default_title_alone_says_to_write_title(
@@ -1393,17 +1392,16 @@ class TestTitleSpelling:
 
 class TestTomlKeyCaseContract:
     """
-    TOML section and key names are matched byte-exactly (DEP-02, DEP-03, D-06).
+    TOML section and key names are matched byte-exactly.
 
-    pydantic-settings 2.15.0 made its file sources honour ``case_sensitive``,
-    which defaults to False, so a miscased top-level ``[Scanner]`` would bind
-    into ``scanner`` instead of being reported and the Phase 27 strictness
-    contract would weaken without a word. Nested keys were never folded; they
-    are pinned here so a later flip upstream cannot pass unnoticed.
+    pydantic-settings' file sources honour ``case_sensitive``, which defaults
+    to False, so without the loader's byte-exact source a miscased top-level
+    ``[Scanner]`` would bind into ``scanner`` instead of being reported. Nested
+    keys are covered too, so an upstream change to their folding is caught.
     """
 
     def test_miscased_section_is_reported_not_bound(self, tmp_config_dir: Path) -> None:
-        """``[Scanner]`` is an unknown section, never a bound ``scanner`` (D-06)."""
+        """``[Scanner]`` is an unknown section, never a bound ``scanner``."""
         err = _load_error(
             tmp_config_dir / "miscased_section.toml",
             '[Scanner]\nhost = "x"\n\n[profiles.default]\n',
@@ -1416,7 +1414,7 @@ class TestTomlKeyCaseContract:
         assert len(matching) == 1
 
     def test_miscased_nested_key_stays_unknown(self, tmp_config_dir: Path) -> None:
-        """``[paperless] Token`` is still matched case-sensitively (DEP-03)."""
+        """``[paperless] Token`` is matched case-sensitively."""
         err = _load_error(
             tmp_config_dir / "miscased_token.toml",
             '[paperless]\nToken = "x"\n\n[profiles.default]\n',
@@ -1431,7 +1429,7 @@ class TestTomlKeyCaseContract:
     def test_miscased_nested_key_with_underscore_stays_unknown(
         self, tmp_config_dir: Path
     ) -> None:
-        """``[output] Web_Port`` is still matched case-sensitively (DEP-03)."""
+        """``[output] Web_Port`` is matched case-sensitively."""
         err = _load_error(
             tmp_config_dir / "miscased_web_port.toml",
             "[output]\nWeb_Port = 9\n\n[profiles.default]\n",
@@ -1446,7 +1444,7 @@ class TestTomlKeyCaseContract:
     def test_miscased_section_still_suggests_the_real_section(
         self, tmp_config_dir: Path
     ) -> None:
-        """The ``[Paperless]`` close-match hint survives the upgrade (D-05)."""
+        """A miscased ``[Paperless]`` still gets the close-match hint."""
         err = _load_error(
             tmp_config_dir / "miscased_hint.toml",
             '[Paperless]\nurl = "x"\n\n[profiles.default]\n',
@@ -1457,7 +1455,7 @@ class TestTomlKeyCaseContract:
 
     def test_correctly_cased_section_still_loads(self, tmp_config_dir: Path) -> None:
         """
-        Positive control: the correct spelling still binds (D-06).
+        Positive control: the correct spelling binds.
 
         Without it this class could pass because every section errors.
         """
@@ -1469,7 +1467,7 @@ class TestTomlKeyCaseContract:
     def test_capitalised_profile_name_is_a_distinct_profile(
         self, tmp_config_dir: Path
     ) -> None:
-        """``[profiles.Default]`` is not the default profile (D-08)."""
+        """``[profiles.Default]`` is not the default profile."""
         err = _load_error(
             tmp_config_dir / "miscased_profile.toml",
             '[profiles.Default]\nsource = "ADF"\n',
