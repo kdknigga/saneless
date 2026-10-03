@@ -102,7 +102,7 @@ _CHILD_IMPORT_SECONDS = 30.0
 
 # Run in a fresh interpreter, so no earlier import in the test session can
 # have changed Pillow's limit first.  Prints the limit before and after
-# importing every module that used to change it as a side effect.
+# importing every imaging module saneless has.
 _IMPORT_CHECK = """
 import PIL.Image
 
@@ -248,10 +248,10 @@ def _verdict(image: Image.Image, *, threshold: float = THRESHOLD) -> str:
     return _REMOVE if blank else _KEEP
 
 
-# Every synthetic page and the verdict the review expects at ``THRESHOLD``:
-# sparse or faint content is kept, and blanks -- tinted, dusty or framed --
-# are removed.  The bright-paper cases are the pages the old mean/stddev rule
-# deleted; on the tinted paper the rest sit on, that rule kept every blank.
+# Every synthetic page and its verdict at ``THRESHOLD``: sparse or faint
+# content is kept, and blanks -- tinted, dusty or framed -- are removed.  The
+# bright-paper cases put that content on pure white paper, where a rule judging
+# the page's overall brightness would call it blank.
 _FIXTURE_VERDICTS: list[tuple[str, Callable[[], Image.Image], str]] = [
     ("footer-10mm", partial(footer_page_number, 10), _KEEP),
     ("footer-12.5mm", partial(footer_page_number, 12.5), _KEEP),
@@ -504,10 +504,10 @@ class TestFilterBlankPages:
 
 class TestTheShippedDefault:
     """
-    The review's pages, spooled for real and judged at ``ProfileConfig()``.
+    Real spooled pages judged at ``ProfileConfig()``'s threshold.
 
-    The page number and the pencil note are the pages the old rule deleted;
-    the typed line is the control; the framed blank is the blank a
+    The page number and the pencil note are sparse content the default must
+    keep; the typed line is the control; the framed blank is the blank a
     keep-when-unsure default must still remove.
     """
 
@@ -530,7 +530,7 @@ class TestTheShippedDefault:
 
 
 class TestThumbnailGeneration:
-    """Tests for generate_thumbnail, which still takes a page image."""
+    """``generate_thumbnail`` makes a small EXIF-free JPEG from a page image."""
 
     def test_the_thumbnail_carries_no_exif(self) -> None:
         """
@@ -668,7 +668,7 @@ class TestThresholdsHaveOneSource:
         assert parameter.default is inspect.Parameter.empty
 
     def test_the_old_rule_is_gone(self) -> None:
-        """Nothing is left of the mean/stddev rule for a caller to reach by mistake."""
+        """The module offers no mean/stddev blank-page function to call by mistake."""
         assert not hasattr(pages_module, "is_empty_page")
         assert not hasattr(pages_module, "filter_empty_pages")
 
@@ -699,13 +699,13 @@ class TestInkCoverage:
     def test_the_existing_content_fixture_is_kept(
         self, content_page_image: Image.Image
     ) -> None:
-        """The shared inked fixture stays content under the new rule."""
+        """The shared inked fixture is content."""
         assert _verdict(content_page_image) == _KEEP
 
     def test_the_existing_near_white_fixture_is_removed(
         self, empty_page_image: Image.Image
     ) -> None:
-        """The shared near-white fixture stays blank under the new rule."""
+        """The shared near-white fixture is blank."""
         assert _verdict(empty_page_image) == _REMOVE
 
     def test_every_coloured_adf_page_is_kept(

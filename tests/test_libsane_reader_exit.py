@@ -1,25 +1,14 @@
 """
-Tests that a failed libsane read cannot leave a process hung.
+A failed libsane read cannot leave a process hung.
 
-Some SANE backends -- the ``test`` backend among them -- read the scanner on a
-thread of their own, started by ``sane_start``, and stop it with an
-asynchronous ``pthread_cancel`` from ``sane_cancel``.  A thread cancelled that
-way can die at any instruction, including while it holds a lock inside the C
-library, and the lock is then never released:
-
-* the dynamic loader's lock, which a thread takes the first time any thread in
-  the process exits, to load the unwinder (``libgcc_s``).  The process then
-  hangs in its exit handlers, or at its next ``dlopen``.
-* a ``malloc`` arena lock.  The cancelled thread then deadlocks on itself as
-  it exits, and ``sane_cancel``, which joins it, never returns.
-
-saneless takes away both openings.  It loads the unwinder once at startup, on
-a throwaway thread, and when a read fails it waits for the threads that read
-started to finish before anything cancels it.
-
-Every test here runs its scan in a child process: a hang must cost a child,
-never the test run, and a process-wide lock left held must not be inherited
-by later tests.
+Some SANE backends, ``test`` among them, read on a thread started by
+``sane_start`` and stop it with an asynchronous ``pthread_cancel`` from
+``sane_cancel``.  A thread cancelled so can die at any instruction, holding the
+dynamic loader's lock, taken when the first thread exit loads ``libgcc_s``, or a
+``malloc`` arena lock, and the process then hangs at exit, at its next
+``dlopen`` or in ``sane_cancel``.  saneless loads the unwinder at startup and
+waits for a failed read's threads to end before anything cancels it.  Every scan
+here runs in a child process, so a hang or a lock left held costs only the child.
 """
 
 from __future__ import annotations
@@ -171,9 +160,8 @@ saneless.main()
 # One whole saneless run: a flatbed scan whose read fails, a later dlopen, as
 # a long-running server makes when it loads a module lazily, and an ordinary
 # interpreter exit.  Each stage announces itself, so a hang is placed.  The
-# flatbed path is the one measured here because its failed read hung the most
-# often: about one run in twenty, against about one in a hundred on the feeder
-# path, whose mechanism the deterministic test above covers as well.
+# flatbed path is the one looped here because a cancel that reaches a running
+# reader hangs it most often; the deterministic test above covers both paths.
 _LIFECYCLE_PROBE: Final = """\
 import ctypes
 import os
@@ -213,10 +201,10 @@ saneless.cli.cli = probe
 saneless.main()
 """
 
-# How many whole runs the hang loop makes, and how many at once.  Before the
-# fix about one run in twenty hung on the machine this was measured on, so a
-# hundred runs all finishing would have happened by chance less than one time
-# in a hundred.  Four at a time keeps the loop to about fifteen seconds.
+# How many whole runs the hang loop makes, and how many at once.  A cancel
+# that reaches a running reader hangs about one flatbed run in twenty, so a
+# hundred runs all finishing by chance is under one in a hundred.  Four at a
+# time keeps the loop to about fifteen seconds.
 _LIFECYCLE_RUNS: Final = 100
 _LIFECYCLE_PARALLEL: Final = 4
 
@@ -296,10 +284,10 @@ def test_no_cancel_reaches_a_reader_thread_that_is_still_running(
     """
     Every cancel after a failed read waits for the backend's reader to end.
 
-    The read is slowed so the reader thread outlives a cancel that does not
-    wait, which makes the check deterministic: before the fix, the cancel
-    python-sane's ``snap()`` makes (flatbed) or the feeder iterator's
-    finaliser makes (feeder) found it alive every time.
+    The read is slowed so the reader thread outlives any cancel that does not
+    wait, which makes the check deterministic for both the cancel
+    python-sane's ``snap()`` makes (flatbed) and the one the feeder
+    iterator's finaliser makes (feeder).
 
     Args:
         source: The source the scan reads, choosing the acquisition path.
@@ -362,9 +350,9 @@ def test_a_failed_read_never_leaves_saneless_hung(tmp_path: Path) -> None:
     """
     A hundred whole runs that end their scan with a failed read all finish.
 
-    This is the symptom itself, measured: each run scans, makes a later
-    ``dlopen`` and exits normally, and a run that does not finish in time
-    hung.  Every failed run is reported with the stage it stopped in.
+    Each run scans, makes a later ``dlopen`` and exits normally; a run that
+    does not finish in time hung, and is reported with the stage it stopped
+    in.
 
     Args:
         tmp_path: Holds each run's spool.
