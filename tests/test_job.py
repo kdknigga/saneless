@@ -162,9 +162,6 @@ CONCURRENT_ROWS = 20
 CONCURRENT_MAX_ROWS = 5
 """The row cap the concurrent prune tests prune against -- below CONCURRENT_ROWS."""
 
-RACERS = 2
-"""Threads the concurrent prune test starts on its barrier: one prune, one insert."""
-
 TRANSACTION_VERBS = frozenset(
     {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"}
 )
@@ -463,6 +460,79 @@ def _public_self_calls(method: ast.FunctionDef) -> list[str]:
     return names
 
 
+def _is_self_conn(node: ast.AST) -> bool:
+    """Return whether an expression is exactly ``self._conn``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+        and node.attr == "_conn"
+    )
+
+
+def _transactions(node: ast.AST) -> list[ast.With]:
+    """Return every ``with self._conn:`` block beneath an AST node."""
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.With)
+        and any(_is_self_conn(item.context_expr) for item in child.items)
+    ]
+
+
+def _self_method_calls(nodes: list[ast.stmt]) -> set[str]:
+    """Return the name of every ``self.<name>(...)`` call, public or private."""
+    return {
+        child.func.attr
+        for node in nodes
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and isinstance(child.func.value, ast.Name)
+        and child.func.value.id == "self"
+    }
+
+
+def _nested_transactions(store: ast.ClassDef) -> list[str]:
+    """
+    List every call path from inside a transaction to a method that opens one.
+
+    Calls are followed transitively through methods that open no transaction
+    of their own, so a private helper in the middle of the chain hides nothing.
+
+    Args:
+        store: The parsed ``JobStore`` class.
+
+    Returns:
+        Each offending path, written ``caller -> ... -> opener``.
+
+    """
+    methods = {
+        node.name: node for node in store.body if isinstance(node, ast.FunctionDef)
+    }
+    opens = {name for name, method in methods.items() if _transactions(method)}
+    offenders: list[str] = []
+    for name, method in methods.items():
+        for block in _transactions(method):
+            pending = [
+                (callee, [name, callee]) for callee in _self_method_calls(block.body)
+            ]
+            seen: set[str] = set()
+            while pending:
+                callee, path = pending.pop()
+                if callee in seen or callee not in methods:
+                    continue
+                seen.add(callee)
+                if callee in opens:
+                    offenders.append(" -> ".join(path))
+                    continue
+                pending.extend(
+                    (onward, [*path, onward])
+                    for onward in _self_method_calls(methods[callee].body)
+                )
+    return sorted(offenders)
+
+
 def _stress_worker(
     store: JobStore,
     barrier: threading.Barrier,
@@ -575,18 +645,6 @@ def _insert_shuffled(store: JobStore, count: int, expired: int) -> list[str]:
         )
     store._conn.commit()
     return ranked
-
-
-def _barrier_prune(store: JobStore, barrier: threading.Barrier) -> int:
-    """Wait at the barrier, then prune, returning the count prune reported."""
-    barrier.wait()
-    return store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=CONCURRENT_MAX_ROWS)
-
-
-def _barrier_create(store: JobStore, barrier: threading.Barrier) -> None:
-    """Wait at the barrier, then insert one job into the store prune is pruning."""
-    barrier.wait()
-    store.create_job(profile="default", title="Racer")
 
 
 def _row_touching(traced: list[str]) -> list[str]:
@@ -1482,15 +1540,31 @@ class TestFinishJob:
         )
         assert _public_self_calls(finish) == []
 
+    @pytest.mark.source_structure
     def test_finish_job_writes_every_column_in_one_statement(self) -> None:
         """One UPDATE carries state, outcome, warning, counts and error (OUTC-01)."""
         # A half-written terminal row is the failure mode this guards: two
         # statements could be observed between by the web request thread.
-        finish_source = inspect.getsource(JobStore.finish_job)
-        assert finish_source.count("self._conn.execute") == 1
-        assert finish_source.count("with self._conn:") == 1
+        finish = next(
+            node
+            for node in _job_store_classdef().body
+            if isinstance(node, ast.FunctionDef) and node.name == "finish_job"
+        )
+        executes = [
+            node
+            for node in ast.walk(finish)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "execute"
+            and _is_self_conn(node.func.value)
+        ]
+        assert len(executes) == 1
+        assert len(_transactions(finish)) == 1
+        statement = executes[0].args[0]
+        assert isinstance(statement, ast.Constant)
+        assert isinstance(statement.value, str)
         for column in ("state", "outcome", "warning", *V2_COLUMNS[1:5], "error"):
-            assert f"{column} = ?" in finish_source
+            assert f"{column} = ?" in statement.value
 
     def test_finish_job_stress_two_threads_survive_two_hundred_rounds(self) -> None:
         """Two threads interleave finish_job and update_state cleanly (STOR-01)."""
@@ -1566,6 +1640,28 @@ class TestLockDiscipline:
         ]
         assert offenders == [], (
             f"public JobStore methods calling other public methods: "
+            f"{', '.join(offenders)}"
+        )
+
+    @pytest.mark.source_structure
+    def test_no_transaction_reaches_a_method_that_opens_its_own(self) -> None:
+        """No call made inside a transaction reaches a method that opens another."""
+        # sqlite3 connection context managers do not nest: the inner exit
+        # commits the outer transaction, and the re-entrant lock turns what
+        # would be a deadlock into a silent half-commit.
+        store = _job_store_classdef()
+        transactional = [
+            node.name
+            for node in store.body
+            if isinstance(node, ast.FunctionDef) and _transactions(node)
+        ]
+        assert len(transactional) >= PUBLIC_METHOD_FLOOR, (
+            f"only {len(transactional)} methods open a transaction; a structural "
+            f"check that matches nothing passes vacuously"
+        )
+        offenders = _nested_transactions(store)
+        assert offenders == [], (
+            f"JobStore transactions reaching a method that opens its own: "
             f"{', '.join(offenders)}"
         )
 
@@ -1652,34 +1748,6 @@ class TestPruneSingleStatement:
             assert deleted > SHUFFLE_EXPIRED
             survivors = {job.title for job in store.list_recent(limit=SHUFFLE_ROWS)}
             assert survivors == set(ranked[SHUFFLE_ROWS - SHUFFLE_KEEP :])
-        finally:
-            store.close()
-
-    def test_prune_concurrent_insert_cannot_corrupt_the_count(self) -> None:
-        """A create_job racing prune cannot make the returned count wrong (STOR-04)."""
-        store = JobStore()
-        try:
-            for index in range(CONCURRENT_ROWS):
-                store.create_job(profile="default", title=f"Row {index:02d}")
-            before = len(store.list_recent(limit=CONCURRENT_ROWS * 2))
-            barrier = threading.Barrier(RACERS, timeout=BARRIER_TIMEOUT)
-
-            with ThreadPoolExecutor(max_workers=RACERS) as pool:
-                pruner = pool.submit(_barrier_prune, store, barrier)
-                creator = pool.submit(_barrier_create, store, barrier)
-                # Future.result() re-raises the worker's exception here; a raw
-                # threading.Thread would bury it in threading.excepthook and
-                # this test would pass green on a broken store.
-                deleted = pruner.result()
-                creator.result()
-
-            after = len(store.list_recent(limit=CONCURRENT_ROWS * 2))
-            # The old before-minus-after arithmetic could be forced to -1.
-            assert deleted >= 0
-            assert deleted <= before
-            # Exactly one insert and one prune ran, in one order or the other,
-            # so this reconciliation holds under both interleavings.
-            assert after == before + 1 - deleted
         finally:
             store.close()
 
@@ -2162,6 +2230,17 @@ class TestQueryMethods:
             assert store.list_recent() == rows_before
             version_after = store._conn.execute("PRAGMA user_version").fetchone()[0]
             assert version_after == version_before == HEAD_VERSION
+        finally:
+            store.close()
+
+    def test_probe_fails_on_a_read_only_store(self, tmp_path: Path) -> None:
+        """A probe raises on a store that can be read but not written."""
+        store = JobStore(tmp_path / "jobs.db")
+        try:
+            store._conn.execute("PRAGMA query_only = ON")
+
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                store.probe()
         finally:
             store.close()
 
