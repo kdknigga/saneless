@@ -597,7 +597,7 @@ class TestScanWorkerMultiPage:
     """The worker carries the multi-page choice in and each prompt out."""
 
     def test_the_default_options_are_a_single_pass(self) -> None:
-        """Submitting without options is the single-pass scan it always was."""
+        """Submitting without options is a single-pass scan."""
         assert ScanOptions() == DEFAULT_SCAN_OPTIONS
         assert DEFAULT_SCAN_OPTIONS.multi_page is False
 
