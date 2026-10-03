@@ -1,35 +1,25 @@
 """
-Tests for ``saneless doctor``, the CLI half of the shared check registry.
+``saneless doctor`` prints the shared check registry and gates on it.
 
-This file exists because ``doctor`` is the command surface of
-``saneless.checks``.  The index page shows the six checks to a household
-member; ``doctor`` prints the same six, from the same registry and in the same
-words, to a shell that can gate on them (APPL-01, D-02).  What each check
-*decides* is ``tests/test_checks.py``'s subject.  What this file asserts is the
-rendering and the exit code -- the two things that belong to the command.
+The index page and ``doctor`` render the same checks, from the same registry
+and in the same words, to a household member and to a shell.  What each check
+decides is the registry's own subject; these tests cover what belongs to the
+command: the rendering, the config resolution table and the exit code.
 
-Three rules get tests of their own, because each is easy to break and expensive
-to notice afterwards:
+Three rules are easy to break and expensive to notice:
 
-* **D-01** -- a ``WARN`` must not fail a scripted health gate.  ``doctor``
-  exits 2 (``ExitCode.CONFIG``) when any check fails and 0 for everything else.
-  No new ``ExitCode`` member is added: ``tests/test_deployment_config.py`` pins
-  the enum against the documented tables, so a sixth code would break two
-  doc-truth tests and Phase 28's D-07 table at once.
-* **Amendment A-1** -- ``doctor`` never calls ``require_sane()``.  A machine
-  with no python-sane is precisely the machine whose owner needs a diagnosis,
-  so the missing import is rendered as one ``FAIL`` row among six rather than
-  as a refusal to run at all.  ``scan``, ``devices``, ``serve`` and
-  ``auto-profiles`` all refuse; ``doctor`` is the one command that must not.
-* **APPL-01/D-14** -- a placeholder paperless-ngx token makes ``doctor`` exit
-  non-zero.  That one is exercised through the *real* registry rather than a
-  stub, so the wiring between the command and ``run_checks`` is genuinely
+* a ``WARN`` never fails a scripted health gate: ``doctor`` exits 2
+  (``ExitCode.CONFIG``) when any check fails and 0 for everything else;
+* ``doctor`` never calls ``require_sane()``: a machine with no python-sane is
+  the one whose owner most needs a diagnosis, so the missing import is one
+  ``FAIL`` row among the rest rather than a refusal to run;
+* a placeholder paperless-ngx token makes ``doctor`` exit non-zero, through
+  the real registry, so the wiring between the command and ``run_checks`` is
   under test at least once.
 
 The state-permutation tests stub ``saneless.cli.run_checks`` with hand-built
-results, for the same reason ``tests/test_cli.py`` stubs the scanner backend:
-arranging six real checks into a chosen set of states would test the registry,
-which already has 91 tests of its own.
+results: arranging real checks into a chosen set of states would test the
+registry rather than the command.
 """
 
 from __future__ import annotations
@@ -99,15 +89,16 @@ if TYPE_CHECKING:
     from saneless.scanner.base import DeviceCapabilities, DeviceSurvey
 
 # Every ExitCode member, written out rather than derived, so that adding a
-# member to the enum fails here as well as in the two doc-truth tests.  D-01
-# maps a red check onto the existing 2 and this is the assertion that says so.
+# member to the enum fails here as well as in the doc tests.  A red check maps
+# onto the existing 2, and this is the assertion that says so.
 # 9 and 10 belong to a scan: an upload that may already be in paperless-ngx,
 # and a full disk.  doctor exits with neither.
 _EXPECTED_EXIT_CODES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 129, 130, 141, 143}
 
-# Every call the CLI made to ``require_sane`` during one invocation.  Amendment
-# A-1 is an assertion about a call that must *not* happen, and a silent no-op
-# stand-in cannot tell no call from a call that did nothing.
+# Every call the CLI made to ``require_sane`` during one invocation.  That
+# ``doctor`` never calls it is an assertion about a call that must *not*
+# happen, and a silent no-op stand-in cannot tell no call from a call that did
+# nothing.
 _REQUIRE_SANE_CALLS: list[str] = []
 
 # A configured value ``is_placeholder_token`` accepts, bound to a name with no
@@ -333,7 +324,7 @@ def _make_settings(
     tmp_path: Path,
     token: str = _NOT_A_PLACEHOLDER,
     consume_dir: str = "",
-    url: str = "http://localhost:8000",
+    url: str = "http://paperless.invalid",
 ) -> Settings:
     """
     Build settings whose directories exist and are writable.
@@ -510,11 +501,10 @@ def _one_skipped_scanner() -> tuple[CheckResult, ...]:
     Build six rows of which the Scanner one was never probed.
 
     ``run_checks`` really can produce this -- ``_scanner_skipped`` and
-    ``_scanner_busy`` both do -- but no ``doctor`` invocation reaches it today,
+    ``_scanner_busy`` both do -- but no ``doctor`` invocation reaches it,
     because the command builds its context with ``skip_scanner`` defaulted and
-    passes no scanner gate.  The stub is therefore how this row gets in front
-    of the printer at all, which is exactly the half-wiring R3-WR-03 found:
-    until something rendered it, nothing noticed it rendered wrong.
+    passes no scanner gate.  The stub is how this row reaches the printer, so
+    a row the registry can build is never rendered unseen.
 
     Returns:
         Six rows in ``CheckKey`` order, the Scanner one skipped.
@@ -559,8 +549,8 @@ def _lines(output: str) -> list[str]:
     return [line for line in output.splitlines() if line.strip()]
 
 
-# The caption that separates the check rows from the config resolution table
-# (D-12).  Written out rather than imported so that respelling it in ``cli.py``
+# The caption that separates the check rows from the config resolution table.
+# Written out rather than imported so that respelling it in ``cli.py``
 # is a visible change here, the way the row wording is pinned in
 # ``tests/test_checks.py``.
 _TABLE_CAPTION = "Config files searched, in order:"
@@ -570,10 +560,8 @@ def _rows(output: str) -> list[str]:
     """
     Split off the check rows: everything printed before the resolution table.
 
-    The rows used to be the whole of ``doctor``'s output, so the assertions
-    that count them were written against every printed line.  They are scoped
-    here instead of loosened, because "one line per check and nothing else" is
-    still the contract for *that* section and the table is what follows it.
+    "One line per check and nothing else" is the contract for the rows
+    section, and the resolution table follows it.
 
     Args:
         output: The captured command output.
@@ -655,7 +643,7 @@ class TestDoctorHelp:
     def test_help_works_with_a_broken_config(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``--help`` never loads settings, so a broken file cannot break it (CFG-10)."""
+        """``--help`` never loads settings, so a broken file cannot break it."""
 
         def _explode(_config_path: str | None = None) -> Settings:
             msg = "Configuration error in /nope.toml: unreadable"
@@ -669,7 +657,7 @@ class TestDoctorHelp:
     def test_json_is_not_an_option(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """``--json`` does not ship, so click refuses it (research: no consumer)."""
+        """``doctor`` has no ``--json`` option, so click refuses it."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         result = runner.invoke(cli, ["doctor", "--json"])
         assert result.exit_code != 0
@@ -677,7 +665,7 @@ class TestDoctorHelp:
 
 
 class TestDoctorExitCodes:
-    """D-01's mapping, one test per state."""
+    """How each check state maps onto ``doctor``'s exit code, one test per state."""
 
     def test_every_check_ok_exits_zero(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -691,7 +679,7 @@ class TestDoctorExitCodes:
     def test_a_warning_does_not_fail_the_gate(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A WARN is a true statement about a deployment that still works (D-01)."""
+        """A WARN exits 0: it is true of a deployment that still works."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         # Six rows, Configuration included, so the stub mirrors what a real
         # run hands the printer rather than a registry one member short.
@@ -776,13 +764,10 @@ class TestDoctorExitCodes:
 
     def test_no_new_exit_code_member_was_added(self) -> None:
         """
-        ``doctor`` reuses 2 rather than growing the enum.
+        ``ExitCode`` holds exactly the documented codes; ``doctor`` has none of its own.
 
-        The two doc-truth tests at ``tests/test_deployment_config.py`` compare
-        the documented global tables against every member, so a code of
-        ``doctor``'s own would be a documentation change in three files, for a
-        command that reports a list and can only carry one code out of one
-        process anyway.
+        A red check exits with the existing 2, so the documented exit-code
+        tables cover every code ``doctor`` can return.
         """
         assert {int(code) for code in ExitCode} == _EXPECTED_EXIT_CODES
 
@@ -796,10 +781,8 @@ class TestDoctorOutput:
         """
         One line per check and nothing else above the table -- no header, no summary.
 
-        The rows section is still exactly the checks; the config resolution
-        table follows it, which is asserted here rather than left to the
-        table's own tests, so this cannot go on passing after the table stops
-        being printed at all.
+        The table's presence is asserted here too, so the row count cannot
+        pass on output that has lost the table.
         """
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
@@ -811,7 +794,7 @@ class TestDoctorOutput:
     def test_rows_are_printed_in_check_key_order(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Member order is the contract both surfaces render in (D-02)."""
+        """Rows print in ``CheckKey`` order, the order both surfaces render in."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
@@ -861,7 +844,11 @@ class TestDoctorOutput:
     def test_a_warn_row_is_followed_by_its_indented_next_step(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """APPL-04: a row nobody can act on is a row that only gets escalated."""
+        """
+        A WARN row is followed by its indented next step.
+
+        A row nobody can act on is a row that only gets escalated.
+        """
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         step = "Set a fallback folder in the saneless config."
         # Built from the enum rather than listed: a member added above
@@ -901,13 +888,13 @@ class TestDoctorOutput:
 
 class TestDoctorConfigResolutionTable:
     """
-    D-12: after the rows, where every config file the search looked at ended up.
+    After the rows, ``doctor`` lists where every searched config file ended up.
 
     The Configuration row says *which situation* the appliance is in, in the
     same words the status strip uses.  This table says *which files*, by
     absolute path, which the row may not carry: the strip is reachable by
     anyone on the LAN and ``doctor`` is not, and the resolved path is the half
-    an operator needs to act (D-14).
+    an operator needs to act.
 
     ``doctor`` is what gets run on a machine where the log is not to hand, so
     the table is printed on every run and not only when something is wrong --
@@ -1011,7 +998,7 @@ class TestDoctorConfigResolutionTable:
     def test_a_stale_only_search_lists_the_old_name_as_ignored(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """The 2026-09-22 failure, named: the file is there and nothing read it."""
+        """A lone superseded-name file is listed as ignored: it is there, unread."""
         candidates = _candidates(tmp_path)
         stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
         stale.write_text("# left behind\n")
@@ -1025,7 +1012,7 @@ class TestDoctorConfigResolutionTable:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        D-17's Docker shape: the new file loaded and the old one is still there.
+        The new file loaded and the old one beside it is listed as a leftover.
 
         It is a different sentence from the stale-only one because it is a
         different situation -- nothing is broken, and the old file may still
@@ -1129,7 +1116,7 @@ class TestDoctorConfigResolutionTable:
 
 class TestDoctorExitsOnTheConfigurationRow:
     """
-    D-05/D-07: the config situation decides the gate, like every other row.
+    The config situation decides the gate, like every other row.
 
     A lone superseded-name file is red because nothing the operator wrote was
     read; no file at all is amber because configuring saneless entirely through
@@ -1141,7 +1128,11 @@ class TestDoctorExitsOnTheConfigurationRow:
     def test_a_stale_only_config_exits_two_through_the_real_registry(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Unstubbed, so the wiring from the recording to the gate is under test."""
+        """
+        A lone superseded-name file exits 2 through the real registry.
+
+        Unstubbed, so the wiring from the recording to the gate is under test.
+        """
         candidates = _candidates(tmp_path)
         stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
         stale.write_text("# left behind\n")
@@ -1220,15 +1211,14 @@ class TestDoctorExitsOnTheConfigurationRow:
 
 class TestASkippedRowIsNotAPassingRow:
     """
-    R3-WR-03, the CLI half: ``[ OK ]`` is the token a reader scans for as "fine".
+    A skipped row never prints ``[ OK ]``, the token a reader scans for as "fine".
 
     ``_scanner_skipped`` and ``_scanner_busy`` return ``CheckState.OK`` with
-    ``skipped`` set, so a marker derived from the state alone prints
-    ``[ OK ] Scanner  Not checked while a scan is running.`` -- a captured
-    transcript that says a probe passed when none was taken.  The marker is
-    wired even though no current ``doctor`` invocation can produce the row,
-    because D-02's claim is that one registry feeds both surfaces and a surface
-    that would mis-render a row the registry can build is a latent divergence.
+    ``skipped`` set, so a marker derived from the state alone would print
+    ``[ OK ] Scanner  Not checked while a scan is running.`` -- a transcript
+    that says a probe passed when none was taken.  No ``doctor`` invocation
+    produces the row, but one registry feeds both surfaces, and a surface that
+    would mis-render a row the registry can build is a latent divergence.
     """
 
     @pytest.mark.parametrize("state", list(CheckState))
@@ -1280,8 +1270,8 @@ class TestASkippedRowIsNotAPassingRow:
         result = runner.invoke(cli, ["doctor"])
         lines = _rows(result.output)
         assert len(lines) == len(CheckKey)
-        # Found by key, not by position: the Scanner row stopped being the
-        # first one the day Configuration was inserted above it.
+        # Found by key, not by position, so a row inserted above Scanner
+        # cannot move the assertion onto another row.
         skipped = list(CheckKey).index(CheckKey.SCANNER)
         assert lines[skipped].startswith(f"{_SKIPPED_MARKER} ")
         assert not lines[skipped].startswith(_state_marker(CheckState.OK))
@@ -1295,12 +1285,11 @@ class TestASkippedRowIsNotAPassingRow:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        D-01: a probe nobody took is not a red appliance.
+        A probe nobody took is not a red appliance, so the gate stays green.
 
-        The state stays ``OK`` for exactly this reason, so wiring the marker
-        must not have moved the exit-code rule -- a scripted health gate that
-        went red for the duration of every scan is what the flag exists to
-        avoid.
+        The state stays ``OK`` for exactly this reason, whatever the marker
+        prints -- a scripted health gate that went red for the duration of
+        every scan is what the flag exists to avoid.
         """
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _one_skipped_scanner())
@@ -1326,7 +1315,7 @@ class TestDoctorUsesTheRealRegistry:
     def test_a_placeholder_token_exits_two_and_names_the_row(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """APPL-01/D-14: an unset token is a red appliance, with no HTTP request."""
+        """An unset token is a red appliance, reported with no HTTP request."""
         settings = _make_settings(tmp_path, token="changeme")
         runner = _patch_doctor(monkeypatch, settings)
         result = runner.invoke(cli, ["doctor"])
@@ -1347,7 +1336,7 @@ class TestDoctorUsesTheRealRegistry:
     def test_the_token_value_is_never_printed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """ASVS V7: a report that reads secrets must not print them."""
+        """The token's value never appears in the report that reads it."""
         secret = "super-secret-token-value"
         settings = _make_settings(tmp_path, token=secret)
         runner = _patch_doctor(monkeypatch, settings)
@@ -1390,12 +1379,12 @@ class TestDoctorUsesTheRealRegistry:
 
 
 class TestDoctorWithoutPythonSane:
-    """Amendment A-1: the machine that most needs a diagnosis still gets one."""
+    """``doctor`` prints every row on a machine without python-sane."""
 
     def test_doctor_never_calls_require_sane(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """``scan``'s first statement is exactly what ``doctor`` must not copy."""
+        """``doctor`` never calls ``require_sane``, which ``scan`` calls first."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
@@ -1428,12 +1417,12 @@ class TestDoctorWithoutPythonSane:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        ``SaneBackend`` reports the missing import as ``ConfigError``, not ``ImportError``.
+        A missing import reported as ``ConfigError`` is still one row among the rest.
 
         ``require_sane`` translates the ``ImportError`` into a ``ConfigError``
         before ``SaneBackend.__init__`` returns, so catching only ``ImportError``
         would let the guard print ``scan``'s refusal line and exit 2 with no
-        rows at all -- which is the exact behaviour Amendment A-1 forbids.
+        rows at all.
         """
 
         class _RefusingBackend:
@@ -1500,17 +1489,12 @@ class TestProfilesRowAgreement:
     """
     ``doctor`` and a started ``ScanWorker`` give the Profiles row one answer.
 
-    D-02 promises the two surfaces report the same checks in the same words,
-    and ``profile_storage`` is the one field ``checks.py`` is handed rather than
-    computing for itself. CR-01 was that field derived twice, with only one copy
-    correct: ``doctor`` printed ``[ OK ] Profiles  2 scan profiles configured.``
-    while the status strip printed a permanent amber "Generated in memory -- no
-    configuration file is in use, so they are lost on restart", for one machine,
-    at the same moment.
-
-    The rendered ``CheckResult`` is compared rather than the enum alone,
-    because the promise is about the words a household member reads. The enum
-    is compared too, so a failure says which half of the contract broke.
+    ``profile_storage`` is the one field ``checks.py`` is handed rather than
+    computing for itself, so two derivations of it could put a green row in
+    the terminal and an amber one on the status strip for the same machine.
+    The rendered ``CheckResult`` is compared, because the promise is about the
+    words a household member reads, and the enum too, so a failure says which
+    half of the contract broke.
     """
 
     @staticmethod
@@ -1542,7 +1526,7 @@ class TestProfilesRowAgreement:
                 context: What ``doctor`` built.
 
             Returns:
-                One OK result per check, so D-01's exit code stays 0.
+                One OK result per check, so the exit code stays 0.
 
             """
             captured.append(context)
@@ -1619,7 +1603,7 @@ class TestProfilesRowAgreement:
 
         The settings are taken out of the bare default, which is what every
         deployment looks like once ``saneless auto-profiles`` has written the
-        file once -- and the exact shape that made the strip lie.
+        file once.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -1651,7 +1635,7 @@ class TestProfilesRowAgreement:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        The row CR-01 got wrong, named rather than merely agreed upon.
+        A loaded config file is the green Profiles row on both surfaces.
 
         Two surfaces can agree and both be wrong, so the value itself is
         pinned: a config file is in use, and the row must say so.
@@ -1677,12 +1661,11 @@ class TestProfilesRowAgreement:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A third copy of the rule has nowhere to hide.
+        ``doctor`` derives the Profiles storage through the shared function.
 
         Agreement alone would still be satisfied by two hand-written
-        conditionals that happen to match today, which is exactly the shape
-        CR-01 grew out of. This asserts the call, so the rule can only be
-        changed in one place.
+        conditionals that happen to match, so this asserts the call, and the
+        rule can only be changed in one place.
         """
         settings = _make_settings(tmp_path)
         config_path = tmp_path / "saneless.toml"
@@ -1826,9 +1809,9 @@ class TestDoctorNamesEachConfigurationFault:
     """
     Each reason doctor could not build a client or a backend is its own row.
 
-    An unreadable TLS trust store used to read "not found at that URL", and a
-    scanner library that would not start read "not installed".  Both sent the
-    reader to fix something that was not broken.
+    An unreadable TLS trust store is not "not found at that URL", and a
+    scanner library that will not start is not "not installed": either wording
+    would send the reader to fix something that is not broken.
     """
 
     def test_an_unreadable_trust_store_is_named(

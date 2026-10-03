@@ -34,6 +34,7 @@ from pathlib import Path
 
 from packaging.version import Version
 
+from saneless.config import config_search_paths
 from tests.workflow_support import (
     WORKFLOW_DIR,
     job_block,
@@ -96,7 +97,7 @@ def _dockerfile_exec_form(instruction: str, text: str | None = None) -> list[str
     Return the exec-form list of the final stage's last ``instruction``.
 
     Args:
-        instruction: ``ENTRYPOINT`` or ``CMD``.
+        instruction: ``ENTRYPOINT``, ``CMD`` or ``VOLUME``.
         text: The Dockerfile's text; the repository's own when omitted.
 
     Returns:
@@ -330,8 +331,16 @@ def _attestation_caveat_offences(section: str, declared: str) -> list[str]:
     ]
 
 
-CONFIG_TARGET = "/etc/saneless"
-DATA_TARGET = "/var/lib/saneless"
+def _config_target() -> str:
+    """Return the system config directory, the last place the loader searches."""
+    return config_search_paths()[-1].parent.as_posix()
+
+
+def _data_target() -> str:
+    """Return the one directory the Dockerfile's final stage declares a VOLUME."""
+    volumes = _dockerfile_exec_form("VOLUME")
+    assert len(volumes) == 1, f"expected one VOLUME, the Dockerfile declares {volumes}"
+    return volumes[0]
 
 
 def _data_volume_offences(page_text: str) -> list[str]:
@@ -342,6 +351,8 @@ def _data_volume_offences(page_text: str) -> list[str]:
     one without a live mount at ``/var/lib/saneless`` loses the job database
     and ``failed/`` the next time compose recreates the container.
     """
+    config_target = _config_target()
+    data_target = _data_target()
     offences: list[str] = []
     for start, block in _compose_blocks(page_text):
         live = {
@@ -349,10 +360,10 @@ def _data_volume_offences(page_text: str) -> list[str]:
             for mount in map(_MOUNT.match, block)
             if mount is not None and not mount.group("comment")
         }
-        if CONFIG_TARGET in live and DATA_TARGET not in live:
+        if config_target in live and data_target not in live:
             offences.append(
-                f"docker.md:{start}: mounts {CONFIG_TARGET} but not the data "
-                f"volume at {DATA_TARGET}"
+                f"docker.md:{start}: mounts {config_target} but not the data "
+                f"volume at {data_target}"
             )
     return offences
 
@@ -461,22 +472,18 @@ def test_seeded_commented_mount_needs_a_declaration() -> None:
 
 def test_seeded_service_without_the_data_volume_is_reported() -> None:
     """A service mounting the config without the data volume is one offence."""
-    whole = """\
-```yaml
-services:
-  saneless:
-    volumes:
-      - ./config:/etc/saneless
-      - saneless-data:/var/lib/saneless
-```
-"""
+    data_mount = f"      - saneless-data:{_data_target()}\n"
+    whole = (
+        "```yaml\nservices:\n  saneless:\n    volumes:\n"
+        f"      - ./config:{_config_target()}\n{data_mount}```\n"
+    )
     assert _data_volume_offences(whole) == []
     commented = whole.replace("      - saneless-data", "      # - saneless-data")
-    without = whole.replace("      - saneless-data:/var/lib/saneless\n", "")
+    without = whole.replace(data_mount, "")
     for page in (commented, without):
         offences = _data_volume_offences(page)
         assert len(offences) == 1, offences
-        assert DATA_TARGET in offences[0]
+        assert _data_target() in offences[0]
 
 
 def test_seeded_attestation_caveat_offences() -> None:
@@ -528,7 +535,7 @@ def test_every_whole_service_example_mounts_the_data_volume() -> None:
 
 
 def test_the_attestation_caveat_fits_the_declared_version() -> None:
-    """The unattested-images caveat names the right tag, and only before 0.2.0."""
+    """The unattested-images caveat names the right tag, and only in a pre-release."""
     declared = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
         "version"
     ]

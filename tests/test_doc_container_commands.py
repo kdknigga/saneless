@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from saneless.checks import SANED_PORT
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
@@ -27,6 +29,8 @@ COMPOSE = REPO_ROOT / "docker-compose.yml"
 README = REPO_ROOT / "README.md"
 DOCS_DIR = REPO_ROOT / "docs"
 SCANNER_HOST_PAGE = DOCS_DIR / "how-to" / "scanner-host-discovery.md"
+# The section of the scanner-host page that holds the firewall advice.
+TROUBLESHOOTING_HEADING = re.compile(r"^## Troubleshooting\b.*$", re.MULTILINE)
 
 # The programs the image is known to ship. `ping` and `curl` are absent, and
 # the image smoke test asserts curl stays absent, so a doc command that execs
@@ -62,7 +66,7 @@ VALUE_FLAGS = frozenset(
 ADD_SERVICE_SANE = re.compile(r"--add-service=sane(?![\w-])")
 ADD_SERVICE_SANED = re.compile(r"--add-service=saned(?![\w-])")
 DATA_PORTRANGE = re.compile(r"\bdata_portrange\s*=\s*(?P<low>\d+)\s*-\s*(?P<high>\d+)")
-UFW_CONTROL_PORT = re.compile(r"\bufw allow 6566/tcp\b")
+UFW_CONTROL_PORT = re.compile(rf"\bufw allow {SANED_PORT}/tcp\b")
 UFW_RANGE = re.compile(r"\bufw allow (?P<low>\d+):(?P<high>\d+)/tcp\b")
 
 
@@ -185,6 +189,14 @@ def _exec_offenders(pages: Mapping[str, str], services: set[str]) -> list[str]:
     return offenders
 
 
+def _section(text: str, heading: re.Pattern[str]) -> str:
+    """Return the text under the first ``##`` heading ``heading`` matches."""
+    match = heading.search(text)
+    if match is None:
+        return ""
+    return text[match.end() :].split("\n## ", 1)[0]
+
+
 def _firewall_offenders(text: str) -> list[str]:
     """
     Report firewall advice that leaves saned's data connection closed.
@@ -205,7 +217,7 @@ def _firewall_offenders(text: str) -> list[str]:
     if not ranges:
         offenders.append("no `data_portrange = LOW - HIGH` for saned.conf")
     if not UFW_CONTROL_PORT.search(text):
-        offenders.append("no `ufw allow 6566/tcp`")
+        offenders.append(f"no `ufw allow {SANED_PORT}/tcp`")
     opened = {(m["low"], m["high"]) for m in UFW_RANGE.finditer(text)}
     offenders.extend(
         f"data_portrange {low} - {high} has no `ufw allow {low}:{high}/tcp`"
@@ -233,17 +245,20 @@ def test_container_commands_run_in_the_documented_deployment() -> None:
 
 def test_firewall_advice_opens_the_data_connection() -> None:
     """The scanner-host page opens both of saned's connections."""
-    offenders = _firewall_offenders(SCANNER_HOST_PAGE.read_text(encoding="utf-8"))
+    text = SCANNER_HOST_PAGE.read_text(encoding="utf-8")
+    section = _section(text, TROUBLESHOOTING_HEADING)
+    assert section, f"{SCANNER_HOST_PAGE.name} has no `## Troubleshooting` section"
+    offenders = _firewall_offenders(section)
     assert not offenders, "firewall advice leaves scans to time out:\n" + "\n".join(
         offenders
     )
 
 
-GOOD_FIREWALL = """\
+GOOD_FIREWALL = f"""\
 sudo firewall-cmd --permanent --add-service=sane
 sudo firewall-cmd --reload
 Set `data_portrange = 10000 - 10100` in `/etc/sane.d/saned.conf`, then:
-sudo ufw allow 6566/tcp
+sudo ufw allow {SANED_PORT}/tcp
 sudo ufw allow 10000:10100/tcp
 """
 
@@ -281,12 +296,16 @@ def test_seeded_firewall_check_reports_each_gap_once() -> None:
     """Each way the firewall advice can leave scans timing out is reported once."""
     seeds = {
         "saned service": GOOD_FIREWALL.replace("=sane\n", "=saned\n"),
-        "port only": GOOD_FIREWALL.replace("--add-service=sane", "--add-port=6566/tcp"),
+        "port only": GOOD_FIREWALL.replace(
+            "--add-service=sane", f"--add-port={SANED_PORT}/tcp"
+        ),
         "range mismatch": GOOD_FIREWALL.replace("10000:10100", "10000:10200"),
         "no portrange": GOOD_FIREWALL.replace(
             "`data_portrange = 10000 - 10100`", "a data port range"
         ).replace("sudo ufw allow 10000:10100/tcp\n", ""),
-        "no control port": GOOD_FIREWALL.replace("sudo ufw allow 6566/tcp\n", ""),
+        "no control port": GOOD_FIREWALL.replace(
+            f"sudo ufw allow {SANED_PORT}/tcp\n", ""
+        ),
     }
     for name, text in seeds.items():
         assert text != GOOD_FIREWALL, name
@@ -316,14 +335,8 @@ EXTRA_HOSTS_ENTRY = re.compile(
     re.MULTILINE,
 )
 ADD_HOST_FLAG = re.compile(r"--add-host(?:=|\s+)" + re.escape(HOST_GATEWAY) + r"(?!\S)")
-
-
-def _section(text: str, heading: re.Pattern[str]) -> str:
-    """Return the text under the first ``##`` heading ``heading`` matches."""
-    match = heading.search(text)
-    if match is None:
-        return ""
-    return text[match.end() :].split("\n## ", 1)[0]
+SANED_CONF = re.compile(r"\bsaned\.conf\b")
+NETWORK_INSPECT = re.compile(r"\bdocker network inspect\b")
 
 
 def _shape_two_offenders(section: str) -> list[str]:
@@ -348,9 +361,9 @@ def _shape_two_offenders(section: str) -> list[str]:
     runs = [command for _, command in _commands(section) if "docker run" in command]
     if not any(ADD_HOST_FLAG.search(command) for command in runs):
         offenders.append(f"no `docker run --add-host={HOST_GATEWAY}`")
-    if "saned.conf" not in section:
+    if not SANED_CONF.search(section):
         offenders.append("no `saned.conf` line allowing the container network")
-    if "docker network inspect" not in section:
+    if not NETWORK_INSPECT.search(section):
         offenders.append("no `docker network inspect` to find the subnet")
     return offenders
 

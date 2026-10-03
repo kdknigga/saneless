@@ -10,7 +10,7 @@ The checks below derive the expected list from the loader itself:
 ``config_search_paths()`` gives the files and their order, and the settings
 model gives the environment variable prefix and nesting delimiter. A path
 added, dropped or reordered in the code, or a prefix renamed, fails here
-rather than leaving a reader with a list that no longer matches what runs.
+rather than leaving a reader with a list that does not match what runs.
 Each checker returns its offences as strings, and a seeded bad section proves
 it can fail.
 """

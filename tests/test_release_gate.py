@@ -1,5 +1,5 @@
 """
-Release version gate tests.
+A release goes ahead only when the pushed tag names the declared version.
 
 A release is refused when the pushed tag and the version declared in
 ``pyproject.toml`` name different versions. The two are compared as parsed
