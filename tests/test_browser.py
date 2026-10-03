@@ -146,7 +146,7 @@ from saneless.web import cache as cache_module
 from saneless.web import routes as routes_module
 from saneless.web.app import TEMPLATE_DIR, create_app
 from saneless.worker import WorkerFlipCoordinator, WorkerPassCoordinator
-from tests.conftest import StubScannerBackend, poll_until, scan_batch
+from tests.conftest import StubScannerBackend, poll_until, scan_batch, wait_for_state
 
 # Every palette value these tests assert against, in one place. All of them are
 # valid only for Pico 2.1.1, the version vendored as
@@ -166,13 +166,13 @@ _AMBER = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
 """The app's fallback amber (#a16207 / #ca8a04, from app.css), as computed."""
 
 _ERROR_RED = {"light": "rgb(136, 57, 53)", "dark": "rgb(206, 126, 123)"}
-"""Pico's ``--pico-del-color`` behind ``.status-error``, per 26-UI-SPEC, as computed."""
+"""Pico's ``--pico-del-color`` behind ``.status-error``, as computed."""
 
 _MUTED = {"light": "rgb(100, 107, 121)", "dark": "rgb(123, 132, 149)"}
 """Pico's ``--pico-muted-color`` (#646b79 / #7b8495) behind ``.status-cancelled``."""
 
 _SUCCESS_GREEN = {"light": "rgb(29, 106, 84)", "dark": "rgb(98, 175, 154)"}
-"""Pico's ``--pico-ins-color`` behind ``.check-ok``, per 30-UI-SPEC, as computed."""
+"""Pico's ``--pico-ins-color`` behind ``.check-ok``, as computed."""
 
 # The status strip's three verdict colours, each pinned to the token 30-UI-SPEC
 # § Color says it reads. The amber is the existing _AMBER rather than a second
@@ -705,7 +705,6 @@ _JOB_FINISH_TIMEOUT = 30.0
 def scan_harness(
     browser_server: _BrowserServer,
     delivering_paperless: None,
-    wait_for_state: Callable[..., Job],
 ) -> Iterator[_ScanHarness]:
     """
     Let a test run real scans, then put the session-scoped server back to idle.
@@ -837,7 +836,6 @@ class TestTheCspGate:
         page: Page,
         browser_server_url: str,
         csp_violations: list[str],
-        poll_until: Callable[..., bool],
     ) -> None:
         """
         An inline style set from script is refused and recorded, exactly once.
@@ -1355,7 +1353,6 @@ class TestServerOwnedScanButton:
         self,
         page: Page,
         scan_harness: _ScanHarness,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A page opened mid-scan keeps Scan disabled after its lists refresh (B7).
@@ -2242,11 +2239,11 @@ _SLOT_MESSAGE = "#status-message p.status-error"
 """
 The slot's message paragraph, named rather than taken as the slot's first p.
 
-Phase 30 put a collapsed "Technical details" disclosure beside the message
-(APPL-04, UI-SPEC S2), so the slot's own text is no longer only the message and
-its paragraphs are no longer only one.  Everything asserting what the user reads
--- the exact text, the red, the left edge, the wrapped line count -- names this
-paragraph, so a later change to the disclosure cannot be measured by mistake.
+A collapsed "Technical details" disclosure sits beside the message, so the
+slot holds more than the message and more than one paragraph.  Everything
+asserting what the user reads -- the exact text, the red, the left edge, the
+wrapped line count -- names this paragraph, so a change to the disclosure
+cannot be measured by mistake.
 """
 
 _FILL_ATTEMPTS = 15
@@ -2705,7 +2702,7 @@ class TestPlainHttpLanOrigin:
         headers = lan_server.scan_headers[0]
         assert "sec-fetch-site" not in headers, (
             f"Chromium sent Sec-Fetch-Site={headers['sec-fetch-site']!r} to "
-            f"{lan_url}, so this test no longer exercises D-20 branch 2: the "
+            f"{lan_url}, so this test does not exercise the guard's Origin branch: the "
             "runner's address is being treated as potentially trustworthy"
         )
         assert headers.get("origin") == lan_url, headers
@@ -5071,7 +5068,7 @@ class TestProfileDefaultsPreselection:
 # ---------------------------------------------------------------------------
 
 _PAUSED_PREFIX = "Paused during scan \N{EM DASH} "
-"""The freshness line's prefix while a scan holds the scanner (D-08, UI-SPEC S1)."""
+"""The freshness line's prefix while a scan holds the scanner."""
 
 _SCANNER_PAUSED_MESSAGE = "Not checked while a scan is running."
 """The Scanner row's message for the same situation."""
@@ -6537,10 +6534,10 @@ class TestHistoryTableOnAPhone:
 
 
 _FRONT_PAGES = 12
-"""How many sheets pass A produces, so the busy line has UI-SPEC P7's number."""
+"""How many sheets pass A produces, so the busy line has a known front count."""
 
 _FRONT_COUNT_PREFIX = f"Front: {_FRONT_PAGES} pages \N{MIDDLE DOT} "
-"""The opening UI-SPEC P7 pins, separator included."""
+"""The busy line's opening, separator included."""
 
 
 class _ManualDuplexScanner(_BrowserTestScanner):
@@ -6622,7 +6619,6 @@ class TestManualDuplexFrontCountInChromium:
         self,
         page: Page,
         duplex_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         At ``SCANNING_REVERSE`` the busy line opens ``Front: 12 pages ·`` (P7).
@@ -6812,7 +6808,7 @@ class TestProfileDescriptionInChromium:
 
 
 _TIME_CELL_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} (\S+)$")
-"""UI-SPEC P15's Time cell shape, with the zone token captured for reuse."""
+"""The history Time cell's shape, with the zone token captured for reuse."""
 
 
 @pytest.mark.browser
@@ -6886,7 +6882,7 @@ before the worker records when the wait began, and either form carries this.
 """
 
 _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
-"""The question ``hx-confirm`` puts in the native dialog (D-27, UI-SPEC S5)."""
+"""The question ``hx-confirm`` puts in the native dialog."""
 
 # D-26 forbids a third way out of the flip prompt: no override, no take-over,
 # no force-continue. The absence IS the rendering, so it is asserted rather
@@ -6924,7 +6920,6 @@ def flip_server(
 def _drive_to_flip_prompt(
     page: Page,
     server: _BrowserServer,
-    wait_for_state: Callable[..., Job],
     title: str,
 ) -> str:
     """
@@ -6937,7 +6932,6 @@ def _drive_to_flip_prompt(
     Args:
         page: The browser page that submits, and so becomes the owner.
         server: The private server to submit to.
-        wait_for_state: The conftest waiter, polling the job store.
         title: The title to submit, so both browsers can be asked to agree.
 
     Returns:
@@ -7008,7 +7002,6 @@ class TestTwoBrowsersOneStack:
         browser: Browser,
         flip_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Two cookie jars, one prompt, and nothing else differs (P9, D-24, D-26).
@@ -7039,9 +7032,7 @@ class TestTwoBrowsersOneStack:
             owner_page = owner_ctx.new_page()
             viewer_page = viewer_ctx.new_page()
 
-            job_id = _drive_to_flip_prompt(
-                owner_page, server, wait_for_state, _FLIP_JOB_TITLE
-            )
+            job_id = _drive_to_flip_prompt(owner_page, server, _FLIP_JOB_TITLE)
             try:
                 # Both pages are (re)loaded from the same server state, so the
                 # only thing that differs between the two requests is the
@@ -7130,7 +7121,6 @@ class TestTwoBrowsersOneStack:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The owner's buttons are named by the job line; the pictures are silent.
@@ -7142,7 +7132,7 @@ class TestTwoBrowsersOneStack:
         lost.
         """
         server = flip_server
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, _FLIP_JOB_TITLE)
+        job_id = _drive_to_flip_prompt(page, server, _FLIP_JOB_TITLE)
         try:
             page.reload()
             status = page.locator("#status-area")
@@ -7160,7 +7150,7 @@ class TestTwoBrowsersOneStack:
             assert "Long edge (correct)" in snapshot, snapshot
             assert "Short edge (incorrect)" in snapshot, snapshot
         finally:
-            _end_the_flip(server, job_id, wait_for_state)
+            _end_the_flip(server, job_id)
 
     def test_non_owner_sees_the_way_forward_and_deadline(
         self,
@@ -7168,7 +7158,6 @@ class TestTwoBrowsersOneStack:
         browser: Browser,
         flip_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A second browser is told where the flip can be answered, and until when.
@@ -7180,7 +7169,7 @@ class TestTwoBrowsersOneStack:
         """
         server = flip_server
         worker = server.app.state.worker
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, _FLIP_JOB_TITLE)
+        job_id = _drive_to_flip_prompt(page, server, _FLIP_JOB_TITLE)
         blocked: list[str] = []
         seen: list[str] = []
         violations: list[str] = []
@@ -7213,7 +7202,7 @@ class TestTwoBrowsersOneStack:
             expect(page.locator("#flip-continue")).to_be_visible()
         finally:
             viewer_ctx.close()
-            _end_the_flip(server, job_id, wait_for_state)
+            _end_the_flip(server, job_id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
@@ -7224,7 +7213,6 @@ class TestTwoBrowsersOneStack:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The confirm is really raised, and dismissing it aborts nothing (P10).
@@ -7258,7 +7246,7 @@ class TestTwoBrowsersOneStack:
         page.on("dialog", _on_dialog)
         page.on("request", _on_request)
 
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, "Abort Me")
+        job_id = _drive_to_flip_prompt(page, server, "Abort Me")
         abort_button = page.locator("#status-area button[hx-post='/api/flip/abort']")
         expect(abort_button).to_be_visible()
 
@@ -7327,22 +7315,19 @@ class TestFlipPromptSurvivesPolls:
         return posted
 
     @staticmethod
-    def _settled_prompt(
-        page: Page, server: _BrowserServer, wait_for_state: Callable[..., Job]
-    ) -> str:
+    def _settled_prompt(page: Page, server: _BrowserServer) -> str:
         """
         Park a real scan at the flip prompt and wait until the page shows it.
 
         Args:
             page: The page that submits, and so owns the job.
             server: The private flip server.
-            wait_for_state: The conftest waiter, polling the job store.
 
         Returns:
             The id of the job waiting at the flip prompt.
 
         """
-        job_id = _drive_to_flip_prompt(page, server, wait_for_state, "Held Flip")
+        job_id = _drive_to_flip_prompt(page, server, "Held Flip")
         expect(page.locator("#flip-continue")).to_be_visible(timeout=10_000)
         # One completed poll after the prompt appeared, so the area on the page
         # is the one the unchanged polls will leave in place.
@@ -7350,9 +7335,7 @@ class TestFlipPromptSurvivesPolls:
         return job_id
 
     @staticmethod
-    def _finish(
-        server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
-    ) -> None:
+    def _finish(server: _BrowserServer, job_id: str) -> None:
         """
         Bring the job to an end before the server shuts down.
 
@@ -7362,7 +7345,6 @@ class TestFlipPromptSurvivesPolls:
         Args:
             server: The private flip server.
             job_id: The job to end.
-            wait_for_state: The conftest waiter, polling the job store.
 
         """
         job_store: JobStore = server.app.state.job_store
@@ -7373,21 +7355,19 @@ class TestFlipPromptSurvivesPolls:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Continue and Abort carry the ids focus is restored by."""
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             expect(page.locator("#flip-continue")).to_have_text("Continue")
             expect(page.locator("#flip-abort")).to_have_text("Abort scan")
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
     def test_focused_continue_survives_two_polls_and_enter_sends_the_post(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A keyboard-focused Continue keeps focus through two polls, and Enter works.
@@ -7396,7 +7376,7 @@ class TestFlipPromptSurvivesPolls:
         the keyboard reached, not a replacement that happens to share its id.
         """
         posted = self._record_continues(page)
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             page.focus("#flip-continue")
             page.locator("#flip-continue").evaluate(
@@ -7414,13 +7394,12 @@ class TestFlipPromptSurvivesPolls:
             assert answered.value.status == 200
             assert len(posted) == 1, posted
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
     def test_space_held_across_a_poll_sends_one_continue(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A Space press that straddles a poll activates Continue exactly once.
@@ -7429,7 +7408,7 @@ class TestFlipPromptSurvivesPolls:
         the button that saw the keydown is still there when the key comes up.
         """
         posted = self._record_continues(page)
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             page.focus("#flip-continue")
             page.keyboard.down("Space")
@@ -7439,17 +7418,16 @@ class TestFlipPromptSurvivesPolls:
 
             assert len(posted) == 1, posted
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
     def test_pointer_held_across_a_poll_sends_one_continue(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A mouse press held across a poll clicks Continue exactly once."""
         posted = self._record_continues(page)
-        job_id = self._settled_prompt(page, flip_server, wait_for_state)
+        job_id = self._settled_prompt(page, flip_server)
         try:
             # hover() scrolls the button into view and puts the pointer on its
             # centre; the press itself is the raw mouse, so it can be held.
@@ -7461,7 +7439,7 @@ class TestFlipPromptSurvivesPolls:
 
             assert len(posted) == 1, posted
         finally:
-            self._finish(flip_server, job_id, wait_for_state)
+            self._finish(flip_server, job_id)
 
 
 _OWNED_TITLE = "Owned By One Browser"
@@ -7650,7 +7628,6 @@ class TestSimplerFormInChromium:
         self,
         page: Page,
         simple_form_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         No tag markup anywhere, and a scan still files under the profile's tags (P14).
@@ -8171,7 +8148,6 @@ def _await_status_poll(page: Page) -> int:
 def _start_multi_page_scan(
     page: Page,
     server: _BrowserServer,
-    wait_for_state: Callable[..., Job],
     title: str,
 ) -> str:
     """
@@ -8183,7 +8159,6 @@ def _start_multi_page_scan(
     Args:
         page: The browser page that submits, and so becomes the owner.
         server: The private server to submit to.
-        wait_for_state: The conftest waiter, polling the job store.
         title: The title to submit.
 
     Returns:
@@ -8206,9 +8181,7 @@ def _start_multi_page_scan(
     return job_id
 
 
-def _abort_the_document(
-    server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
-) -> None:
+def _abort_the_document(server: _BrowserServer, job_id: str) -> None:
     """
     End a multi-page job a test left running, by answering Abort to its prompt.
 
@@ -8219,7 +8192,6 @@ def _abort_the_document(
     Args:
         server: The private server the job runs on.
         job_id: The job to end.
-        wait_for_state: The conftest waiter, polling the job store.
 
     """
     job_store: JobStore = server.app.state.job_store
@@ -8310,7 +8282,6 @@ class TestMultiPagePromptInTheBrowser:
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Tick, Scan, Scan next page, Finish document, and the document is uploaded.
@@ -8321,7 +8292,7 @@ class TestMultiPagePromptInTheBrowser:
         """
         server = multi_page_scan_server
         job_store: JobStore = server.app.state.job_store
-        job_id = _start_multi_page_scan(page, server, wait_for_state, _MULTI_PAGE_TITLE)
+        job_id = _start_multi_page_scan(page, server, _MULTI_PAGE_TITLE)
         try:
             prompt = page.locator("#status-area .pages-prompt")
             scan_btn = page.locator("#scan-btn")
@@ -8364,13 +8335,12 @@ class TestMultiPagePromptInTheBrowser:
             expect(scan_btn).to_be_enabled()
             expect(scan_btn).to_have_text("Scan")
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_abort_asks_first_and_does_nothing_when_the_answer_is_no(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Abort raises the native confirmation naming the kept page; "no" keeps it.
@@ -8398,7 +8368,7 @@ class TestMultiPagePromptInTheBrowser:
 
         page.on("dialog", _on_dialog)
         page.on("request", _on_request)
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Abort Pages")
+        job_id = _start_multi_page_scan(page, server, "Abort Pages")
         try:
             _await_status_poll(page)
             page.click("#mp-abort")
@@ -8427,7 +8397,7 @@ class TestMultiPagePromptInTheBrowser:
                 job_store, job_id, JobState.CANCELLED, timeout=_JOB_FINISH_TIMEOUT
             )
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_finish_is_disabled_with_its_reason_while_no_page_is_kept(
         self, page: Page, multi_page_scan_server: _BrowserServer
@@ -8469,7 +8439,6 @@ class TestMultiPagePromptInTheBrowser:
         browser: Browser,
         multi_page_scan_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Only the browser that started the scan is asked; anyone else is told.
@@ -8481,7 +8450,7 @@ class TestMultiPagePromptInTheBrowser:
         itself and is checked after it closes.
         """
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Not Yours")
+        job_id = _start_multi_page_scan(page, server, "Not Yours")
         blocked: list[str] = []
         seen: list[str] = []
         violations: list[str] = []
@@ -8507,7 +8476,7 @@ class TestMultiPagePromptInTheBrowser:
             expect(page.locator("#status-area .pages-prompt")).to_be_visible()
         finally:
             viewer_ctx.close()
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
@@ -8518,7 +8487,6 @@ class TestMultiPagePromptInTheBrowser:
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Four buttons fit a 320 px screen by wrapping, each a full touch target.
@@ -8528,7 +8496,7 @@ class TestMultiPagePromptInTheBrowser:
         """
         server = multi_page_scan_server
         page.set_viewport_size({"width": 320, "height": 640})
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Phone Pages")
+        job_id = _start_multi_page_scan(page, server, "Phone Pages")
         try:
             _await_status_poll(page)
             layout = page.evaluate(_MEASURE_PROMPT)
@@ -8546,13 +8514,12 @@ class TestMultiPagePromptInTheBrowser:
             rows = {round(button["top"]) for button in buttons}
             assert len(rows) > 1, f"the buttons did not wrap: {buttons}"
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_keyboard_focus_on_a_button_survives_the_status_poll(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A keyboard user keeps their place while the status area is polled.
@@ -8566,7 +8533,7 @@ class TestMultiPagePromptInTheBrowser:
         once, not retried.
         """
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Pages")
+        job_id = _start_multi_page_scan(page, server, "Focus Pages")
         try:
             _await_status_poll(page)
             page.locator("#mp-finish").focus()
@@ -8584,7 +8551,7 @@ class TestMultiPagePromptInTheBrowser:
             )
             assert page.evaluate("() => document.activeElement.id") == "mp-next"
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
 
 # Counts every write into the alert slot: a child added or removed, or text
@@ -8619,7 +8586,6 @@ class TestStatusPollLostContact:
         self,
         page: Page,
         scan_harness: _ScanHarness,
-        wait_for_state: Callable[..., Job],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
@@ -9248,9 +9214,7 @@ def _accept_the_confirmation(page: Page) -> None:
     page.once("dialog", _on_dialog)
 
 
-def _end_the_flip(
-    server: _BrowserServer, job_id: str, wait_for_state: Callable[..., Job]
-) -> None:
+def _end_the_flip(server: _BrowserServer, job_id: str) -> None:
     """
     Bring a flip job a test started to an end before the server shuts down.
 
@@ -9260,7 +9224,6 @@ def _end_the_flip(
     Args:
         server: The private flip server.
         job_id: The job to end.
-        wait_for_state: The conftest waiter, polling the job store.
 
     """
     job_store: JobStore = server.app.state.job_store
@@ -9310,7 +9273,6 @@ class TestFocusMap:
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         The flip prompt arriving through the poll puts focus on Continue.
@@ -9319,38 +9281,32 @@ class TestFocusMap:
         the new prompt moves it on to the button the operator needs next, and
         the unchanged polls after it leave it there.
         """
-        job_id = _drive_to_flip_prompt(
-            page, flip_server, wait_for_state, "Focus Prompt"
-        )
+        job_id = _drive_to_flip_prompt(page, flip_server, "Focus Prompt")
         try:
             expect(page.locator("#flip-continue")).to_be_focused(timeout=10_000)
             _await_status_poll(page)
             expect(page.locator("#flip-continue")).to_be_focused()
         finally:
-            _end_the_flip(flip_server, job_id, wait_for_state)
+            _end_the_flip(flip_server, job_id)
 
     def test_focus_map_flip_continue(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Continue, pressed with Enter, moves focus to the status area."""
-        job_id = _drive_to_flip_prompt(
-            page, flip_server, wait_for_state, "Focus Continue"
-        )
+        job_id = _drive_to_flip_prompt(page, flip_server, "Focus Continue")
         try:
             expect(page.locator("#flip-continue")).to_be_focused(timeout=10_000)
             page.keyboard.press("Enter")
             expect(page.locator("#status-area")).to_be_focused()
         finally:
-            _end_the_flip(flip_server, job_id, wait_for_state)
+            _end_the_flip(flip_server, job_id)
 
     def test_focus_map_flip_abort(
         self,
         page: Page,
         flip_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A confirmed Abort ends with focus on the Scan button.
@@ -9358,7 +9314,7 @@ class TestFocusMap:
         The response focuses the status area while the scan winds down, and
         the first poll whose Scan button is enabled moves focus onto it.
         """
-        job_id = _drive_to_flip_prompt(page, flip_server, wait_for_state, "Focus Abort")
+        job_id = _drive_to_flip_prompt(page, flip_server, "Focus Abort")
         try:
             expect(page.locator("#flip-abort")).to_be_visible(timeout=10_000)
             _accept_the_confirmation(page)
@@ -9369,13 +9325,12 @@ class TestFocusMap:
             expect(scan).to_be_focused()
             expect(page.locator("#status-area .status-cancelled")).to_be_visible()
         finally:
-            _end_the_flip(flip_server, job_id, wait_for_state)
+            _end_the_flip(flip_server, job_id)
 
     def test_focus_map_multi_page_scan_next_then_next_question(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         Scan next focuses the status area, then the next question's Scan next.
@@ -9384,7 +9339,7 @@ class TestFocusMap:
         seen before the next question arrives and takes it.
         """
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Next")
+        job_id = _start_multi_page_scan(page, server, "Focus Next")
         try:
             expect(page.locator("#mp-next")).to_be_focused(timeout=10_000)
             server.scanner.gate.clear()
@@ -9399,17 +9354,16 @@ class TestFocusMap:
             expect(page.locator("#mp-next")).to_be_focused()
         finally:
             server.scanner.gate.set()
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_focus_map_multi_page_finish(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """Finish moves focus to the status area, and it stays through Done."""
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Finish")
+        job_id = _start_multi_page_scan(page, server, "Focus Finish")
         try:
             page.locator("#mp-finish").focus()
             page.keyboard.press("Enter")
@@ -9418,17 +9372,16 @@ class TestFocusMap:
             expect(area.locator(".status-done")).to_be_visible(timeout=15_000)
             expect(area).to_be_focused()
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_focus_map_multi_page_abort(
         self,
         page: Page,
         multi_page_scan_server: _BrowserServer,
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """A confirmed Abort of the document ends with focus on the Scan button."""
         server = multi_page_scan_server
-        job_id = _start_multi_page_scan(page, server, wait_for_state, "Focus Drop")
+        job_id = _start_multi_page_scan(page, server, "Focus Drop")
         try:
             _accept_the_confirmation(page)
             page.locator("#mp-abort").focus()
@@ -9438,7 +9391,7 @@ class TestFocusMap:
             expect(scan).to_be_focused()
             expect(page.locator("#status-area .status-cancelled")).to_be_visible()
         finally:
-            _abort_the_document(server, job_id, wait_for_state)
+            _abort_the_document(server, job_id)
 
     def test_focus_map_non_owner_is_not_autofocused(
         self,
@@ -9446,7 +9399,6 @@ class TestFocusMap:
         browser: Browser,
         flip_server: _BrowserServer,
         egress_allowlist: list[str],
-        wait_for_state: Callable[..., Job],
     ) -> None:
         """
         A prompt appearing for somebody else's scan moves no focus of mine.
@@ -9492,7 +9444,7 @@ class TestFocusMap:
             viewer_ctx.close()
             server.scanner.gate.set()
             if job_id:
-                _end_the_flip(server, job_id, wait_for_state)
+                _end_the_flip(server, job_id)
             assert seen, "the hand-built context's gate handled no request"
             assert blocked == [], f"a page tried to reach the network: {blocked}"
             assert violations == [], (
