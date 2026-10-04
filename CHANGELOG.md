@@ -49,6 +49,11 @@ The first release, 0.2.0.
   `saneless.pipeline`), and the saned pre-probe lines from
   `saneless.scanner.saned_probe` (was `saneless.checks`).
 
+### Removed
+
+- `saneless.Settings` is no longer re-exported from the package, so importing
+  `saneless` does not load the settings stack; import it from `saneless.config`.
+
 ### Security
 
 - The web UI has no login, by design: it is an appliance for a trusted local
