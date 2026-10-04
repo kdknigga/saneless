@@ -1,22 +1,19 @@
 """
-SANE scanner backend implementation wrapping python-sane.
+SANE scanner backend, which runs python-sane only in child processes.
 
-Key safety measures:
-- sane.init() runs once behind a module-level guard, and the server
-  re-initialises SANE at the start of each job, because after a saned restart
-  the net backend's stale control connection fails every later open.  The
-  restart is refused while a read is stuck or any handle is open: sane_exit
-  closes open handles with a request that can wait forever on a vanished host.
-- Scanners are listed in a short-lived child process, never in this one.  See
+- A scan runs in a scan child (``scan_child``): one child per scan session,
+  restarted between passes when the job asks, and reaped before the call
+  that started it returns or raises.
+- Scanners are listed, opened for the health check and asked for their
+  options in a short-lived listing child.  See
   docs/explanation/decisions/0002-listing-in-a-child-process.md.
-- Device handles are closed by a context manager with cancel+close, except
-  while a read is still inside SANE, which allows no other call on the device.
-- Every blocking acquisition, fed or flatbed, runs on a daemon thread under
-  one per-page timeout.
+- So this process never loads libsane, and a backend that hangs or crashes
+  takes only its child with it.
 
-What is done with the device itself -- reading its options, choosing the
+What a child does with the device -- reading its options, choosing the
 source, configuring and framing the scan -- lives in ``scan_session``; the
-per-page timeout is worked out in ``page_budget``.
+per-page timeout is worked out in ``page_budget``.  The in-process
+acquisition helpers below are no longer used by ``SaneBackend``.
 """
 
 from __future__ import annotations
@@ -39,15 +36,14 @@ from saneless.exceptions import (
     describe,
     describe_text,
 )
+from saneless.scanner import scan_child
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
     DeviceSurvey,
-    PassCapReached,
     ScanBatch,
     ScannerBackend,
     ScanSettings,
-    classify_source,
 )
 from saneless.scanner.listing import (
     ChildError,
@@ -63,27 +59,18 @@ from saneless.scanner.net_hosts import (
 from saneless.scanner.options import _constraint
 from saneless.scanner.page_budget import (
     _PAGE_TIMEOUT_FLOOR_SECONDS,
-    _describe_page,
-    _page_budget_seconds,
     _page_label,
 )
+from saneless.scanner.scan_child import ScanChildSession
 from saneless.scanner.scan_session import (
     _FEEDER_EMPTY_MESSAGE,
     _MAX_ADF_PAGES,
-    _MAX_AUTO_FEEDER_PAGES,
     _MIN_PAGE_BYTES,
-    _apply_paper_size,
     _as_image,
     _await_backend_threads,
-    _configure_device,
     _ensure_sane,
     _native_thread_ids,
     _PageFraming,
-    _read_options,
-    _read_parameters,
-    _refuse_sixteen_bit,
-    _resolve_source,
-    _route,
     _validate_page_image,
 )
 from saneless.text_safety import neutralise_controls
@@ -101,6 +88,7 @@ if TYPE_CHECKING:
 
     from saneless.scanner.base import PageRecord, PageSink
     from saneless.scanner.listing import OptionEntry
+    from saneless.scanner.scan_child import ChildProcess
     from saneless.scanner.scan_session import SaneDevice
 
 
@@ -151,6 +139,17 @@ def _launch_listing(
     stand-in that answers from a fake python-sane module.
     """
     return run_listing_child(request, configured_host=configured_host, abort=abort)
+
+
+def _launch_scan_child(configured_host: str) -> ChildProcess:
+    """
+    Start one scan child for a scan session.
+
+    This is the one place this module starts a scan child, and it is looked
+    up at call time, so the test suite can replace it with a stand-in that
+    runs the child's own code in this process over a fake python-sane module.
+    """
+    return scan_child.start_scan_child(configured_host)
 
 
 def _listed_devices(reply: ListingReply) -> tuple[DeviceInfo, ...]:
@@ -1171,76 +1170,117 @@ def _snap_flatbed(
 
 class SaneBackend(ScannerBackend):
     """
-    Scanner backend wrapping python-sane.
+    Scanner backend over python-sane, which it only ever runs in children.
 
-    The first backend built in a process initialises SANE and later ones
-    reuse it; the server also restarts SANE at the start of each scan job
-    (``reinitialise``).  Scanners are listed, and the health check's open
-    made, in a short-lived child process, never in this one.  Handles this
-    process opens are cancelled and closed on every path unless a read on
-    the handle has not returned.
+    This process makes no python-sane call: a scan runs in a scan child, one
+    per scan session, and listing, open checks and capability reads each run
+    in a short-lived listing child.  A scan's child is reaped before the call
+    that started it returns or raises.
     """
 
     def __init__(self, host: str = "") -> None:
         """
-        Join this process's SANE, initialising it if nobody has yet.
+        Check that python-sane is installed, and keep the configured host.
+
+        Nothing is loaded and no child is started: the first child does that,
+        and reports a scanner library that cannot be loaded or started.
 
         Args:
-            host: Colon-separated sane-net hosts, applied at every
-                initialisation this backend makes (construction and each
-                ``reinitialise``) when ``SANE_NET_HOSTS`` is not already set to
-                a non-empty value, and handed to every listing child.  A
-                differing host arriving while SANE is already initialised is
-                reported as not used until the next initialisation.
+            host: Colon-separated sane-net hosts, the ``scanner.host``
+                setting, handed to every child.  A child's ``SANE_NET_HOSTS``
+                is derived from it, never copied from this process.
 
         Raises:
-            ConfigError: If python-sane is not installed (``require_sane``),
-                or is installed but cannot be loaded, as with a missing
-                ``libsane.so``.
-            ScanError: If ``sane.init()`` fails, chained to the SANE error.
+            ConfigError: If python-sane is not installed (``require_sane``).
 
         """
         require_sane()
-        # A listing child's SANE_NET_HOSTS is derived from this setting, never
-        # copied from this process's environment.
         self._host = host
-        _ensure_initialised(host)
+        self._session: ScanChildSession | None = None
+
+    def _start_scan_child(self) -> ChildProcess:
+        """Start one scan child for this backend's configured host."""
+        return _launch_scan_child(self._host)
+
+    @contextlib.contextmanager
+    def scan_session(
+        self,
+        *,
+        abort: threading.Event | None = None,
+        live: threading.Event | None = None,
+    ) -> Generator[None]:
+        """
+        Run every scan inside the block in one scan child.
+
+        The child starts at the first ``scan_pages`` call, serves each later
+        one, and is asked to exit -- and killed if it does not -- and reaped
+        when the block ends, whatever ends it.
+
+        Args:
+            abort: Set by another thread to stop the session part way; the
+                child is then cancelled, and killed if it does not stop
+                within the grace.
+            live: Set while the session's child exists, so a stopping server
+                can wait for it to be reaped.
+
+        Yields:
+            Nothing; ``scan_pages`` and ``reinitialise`` use the session.
+
+        Raises:
+            RuntimeError: If a session is already open on this backend.
+            ScanError: If the child had to be killed when the session ended,
+                and nothing else was being raised.
+
+        """
+        if self._session is not None:
+            msg = "A scan session is already open on this backend"
+            raise RuntimeError(msg)
+        session = ScanChildSession(self._start_scan_child, abort=abort, live=live)
+        self._session = session
+        try:
+            with session:
+                yield
+        finally:
+            self._session = None
 
     def close(self) -> None:
         """
-        Shut this process's SANE down, through the backend abstraction.
+        End a scan child that a session left running; never raises.
 
-        Process-level, not per-object: what is released is this process's
-        current ``sane_init``.  Never raises, because an exception at shutdown
-        would replace the error the operator needs to see.
+        A session ends its own child, so there is normally nothing to do.
+        An exception out of a close would replace the error the operator
+        needs to see, so a child that ends badly is logged instead.
         """
-        shutdown()
+        session = self._session
+        if session is None:
+            return
+        self._session = None
+        try:
+            session.close()
+        except Exception as error:
+            logger.warning("The scan session did not end cleanly: %s", error)
 
     def reinitialise(self) -> None:
         """
-        Restart this process's SANE before a scan job or a later pass, or refuse to.
+        Restart SANE in the session's scan child before a later pass.
 
-        Called under the scanner gate with no handle open, at the top of each
-        scan job and before each later pass of a multi-pass scan.  After a
-        saned restart the net backend never reconnects its stale control
-        connection, so every later open fails until SANE is restarted.
-
-        It refuses, before any SANE call, while a read has not returned or a
-        handle is open: ``sane_exit`` would close it, and on a vanished
-        ``net`` host each close waits with the gate held.
+        After a saned restart the net backend never reconnects its stale
+        control connection, so every later open fails until SANE is
+        restarted.  With no session, or no child yet, there is nothing to
+        restart: the next pass starts a fresh child, whose SANE starts fresh.
 
         Raises:
-            ScanError: If a read has not returned, if a handle is open, or if
-                ``sane.init()`` fails (chained to the SANE error; SANE is then
-                left uninitialised, so the next job tries again).
+            ScanError: If the child did not restart SANE: it failed, stopped
+                answering or died.  It is reaped, and the next pass starts a
+                fresh one.
+            ScanInterrupted: If the session's abort was set.
 
         """
-        _refuse_if_wedged("the scanner", "start a scan on")
-        if _handles_open():
-            raise ScanError(_HANDLE_OPEN_REFUSAL)
-        shutdown(log_level=logging.DEBUG)
-        _ensure_initialised(self._host, log_level=logging.DEBUG)
-        logger.info("SANE re-initialised before this scan")
+        session = self._session
+        if session is None:
+            logger.debug("No scan session is open, so SANE was not restarted")
+            return
+        session.restart()
 
     @contextlib.contextmanager
     def _open_device(self, device_id: str) -> Generator[SaneDevice]:
@@ -1311,8 +1351,6 @@ class SaneBackend(ScannerBackend):
         List the available scanning devices, in a short-lived child process.
 
         See docs/explanation/decisions/0002-listing-in-a-child-process.md.
-        It still refuses while a read is outstanding, before any child is
-        started, to keep one rule for every SANE entry point.
 
         Returns:
             List of DeviceInfo objects for each discovered device.
@@ -1324,14 +1362,11 @@ class SaneBackend(ScannerBackend):
                 could not be started.
             ConfigError: If the child could not import python-sane, with the
                 install hint.
-            ScanError: If a previous read has not returned, in which case no
-                child is started; if SANE would not initialise in the child;
-                or if SANE could not list the devices, with its message
-                normalised and its control characters escaped.
+            ScanError: If SANE would not initialise in the child, or could not
+                list the devices, with its message normalised and its control
+                characters escaped.
 
         """
-        # The refusal names the wedged device from its own record.
-        _refuse_if_wedged("the scanners", "list")
         reply = _launch_listing(ListingRequest(), configured_host=self._host)
         if reply.init_error is not None:
             raise _start_failure(reply.init_error)
@@ -1370,11 +1405,8 @@ class SaneBackend(ScannerBackend):
             ListingNoAnswerError: The listing child gave no usable answer, or
                 could not be started.
             ListingAbortedError: ``abort`` was set while the child ran.
-            ScanError: If a previous read has not returned, in which case no
-                child is started.
 
         """
-        _refuse_if_wedged("the scanners", "list")
         reply = _launch_listing(
             ListingRequest(open=open_if_unlisted or None),
             configured_host=self._host,
@@ -1413,9 +1445,9 @@ class SaneBackend(ScannerBackend):
             ListingTimedOutError: The listing child did not finish in time.
             ListingNoAnswerError: The listing child gave no usable answer, or
                 could not be started.
-            ScanError: If ``device_id`` is empty or a previous read has not
-                returned, in which case no child is started; or if the open
-                failed, naming the failure's class only.
+            ScanError: If ``device_id`` is empty, in which case no child is
+                started, or if the open failed, naming the failure's class
+                only.
 
         """
         if not device_id:
@@ -1515,15 +1547,16 @@ class SaneBackend(ScannerBackend):
         self, device_id: str, settings: ScanSettings, sink: PageSink
     ) -> ScanBatch:
         """
-        Acquire pages from scanner, handing each one to the sink.
+        Acquire pages in a scan child, handing each one to the sink.
 
-        Matches the requested source (refusing before anything is started
-        when none matches), sets the scan parameters, and acquires through
-        multi_scan() for a feeder pass or snap() for the flatbed.  No progress
-        callback is passed to snap(): a bad one segfaults the process.
-
-        Each page is validated, cropped and handed to ``sink`` as it arrives;
-        no list of images is held.  See
+        Inside ``scan_session`` the pass runs in the session's child; outside
+        one it runs in a child of its own, reaped before this returns or
+        raises.  The child matches the requested source (refusing before
+        anything is started when none matches), sets the scan parameters,
+        and feeds or snaps the pages, validating and cropping each one.
+        Each accepted page is handed to ``sink`` as it arrives and
+        acknowledged before the child reads another sheet, so no list of
+        images is held.  See
         docs/explanation/decisions/0005-page-sink-contract.md.
 
         Args:
@@ -1541,77 +1574,19 @@ class SaneBackend(ScannerBackend):
             pages and is not an error.
 
         Raises:
-            ScanError: If a previous read has not returned, in which case no
-                SANE call is made at all; if the requested source matches
-                none the device offers, or several; if a page times out; if a
-                flatbed scan returns a page that fails its integrity checks --
-                unlike a fed sheet, there is no next page to skip to -- or if
-                the sink could not take a page.
+            ScanError: If the requested source matches none the device
+                offers, or several; if a page times out; if a flatbed scan
+                returns a page that fails its integrity checks -- unlike a
+                fed sheet, there is no next page to skip to -- if the sink
+                could not take a page; or if the child stopped answering,
+                died or could not be started.
             FeederEmptyError: If the ADF feeder is empty.
+            ConfigError: If the child could not load python-sane.
+            ScanInterrupted: If the session's abort was set.
 
         """
-        _refuse_if_wedged(device_id, "scan from")
-        with self._open_device(device_id) as dev:
-            # Decisions after configuration use configured.options instead:
-            # assigning the source or the mode reloads the descriptors.
-            raw_options = _read_options(dev, device_id)
-
-            choice = _resolve_source(
-                raw_options,
-                settings.source,
-                resolve_feeder=settings.duplex == "manual",
-            )
-
-            configured = _configure_device(
-                dev, settings, choice, options=raw_options, device_id=device_id
-            )
-            actual_resolution = configured.resolution
-
-            # Before the paper size: whether the pass feeds decides how it
-            # can be applied without cutting an edge off the page.
-            use_adf = _route(choice, settings)
-
-            framing = _apply_paper_size(
-                dev,
-                configured.options,
-                settings,
-                use_adf=use_adf,
-                resolution=actual_resolution,
-            )
-
-            parameters = _read_parameters(dev, device_id)
-            _refuse_sixteen_bit(parameters, device_id)
-
-            # A source not named as a feeder (Auto sent through the feeder)
-            # may be a platen rescanned forever, so it gets the lower cap.
-            named_feeder = classify_source(choice.effective).uses_feeder
-            budget = _PageBudget(
-                timeout=_page_budget_seconds(parameters, actual_resolution),
-                max_pages=_MAX_ADF_PAGES if named_feeder else _MAX_AUTO_FEEDER_PAGES,
-                page=_describe_page(parameters, actual_resolution),
-            )
-
-            cap_reached: PassCapReached | None = None
-            if use_adf:
-                fed = self._scan_adf_pages(dev, sink, framing, budget)
-                records, pages_rejected = fed.records, fed.rejected
-                if fed.sheet_not_kept is not None:
-                    cap_reached = PassCapReached(
-                        cap=budget.max_pages,
-                        sheet_not_kept=fed.sheet_not_kept,
-                        auto_source=not named_feeder,
-                    )
-            else:
-                records = [_snap_flatbed(dev, device_id, sink, framing, budget)]
-                # Nothing was skipped: an unreadable sheet raised in there.
-                pages_rejected = 0
-
-        # Built after the device context has closed the handle.  An Auto that
-        # stood in for a flatbed is reported only when it fed.
-        return ScanBatch(
-            pages=tuple(records),
-            actual_resolution=actual_resolution,
-            pages_rejected=pages_rejected,
-            substituted_source=choice.substituted_from if use_adf else None,
-            cap_reached=cap_reached,
-        )
+        session = self._session
+        if session is not None:
+            return session.scan_pass(device_id, settings, sink)
+        with ScanChildSession(self._start_scan_child) as one_pass:
+            return one_pass.scan_pass(device_id, settings, sink)

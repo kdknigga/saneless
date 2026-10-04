@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import functools
 import html
+import io
 import ipaddress
 import json
 import logging
@@ -40,10 +41,12 @@ from saneless.config import (
 )
 from saneless.flip import FlipCoordinator
 from saneless.paperless import ApiDelivery, PaperlessClient, PaperlessTiming, TaskFiled
-from saneless.scanner import _listing_child
+from saneless.scanner import _listing_child, _scan_child
 from saneless.scanner import listing as listing_mod
 from saneless.scanner import sane_backend as sane_backend_mod
+from saneless.scanner import scan_child as scan_child_mod
 from saneless.scanner import scan_session as scan_session_mod
+from saneless.scanner._scan_child import ChildRuntime
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
 from saneless.scanner.listing import ListingReply
 from saneless.sigpipe import block_sigpipe
@@ -51,6 +54,7 @@ from saneless.thread_unwinder import load_thread_unwinder
 from saneless.vocabulary import FlipOutcome
 from saneless.web.services import Services
 from tests.fake_clock import FakeClock
+from tests.fake_sane import SCAN_CHILD_THREAD_NAME
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -70,6 +74,7 @@ if TYPE_CHECKING:
         ScanSettings,
     )
     from saneless.scanner.listing import ListingRequest
+    from saneless.scanner.scan_child import ChildProcess
     from saneless.vocabulary import JobState
 
 _POLL_INTERVAL = 0.02
@@ -94,6 +99,11 @@ _XDG_BASES = (
 # through the module's namespace because the seam is patched in whether or not
 # the backend defines it yet.
 _REAL_LAUNCH_LISTING = sane_backend_mod.__dict__.get("_launch_listing")
+
+# The same for the backend's scan-child launcher, and the loader of the
+# python-sane module the scan seam checks has been replaced.
+_REAL_LAUNCH_SCAN_CHILD = sane_backend_mod.__dict__.get("_launch_scan_child")
+_REAL_ENSURE_SANE = scan_session_mod._ensure_sane
 
 _NO_REAL_LIBSANE = (
     "the default suite must not start real libsane: patch scan_session.sane "
@@ -899,6 +909,291 @@ def stand_in_listing_child(
         script = tmp_path / "listing_child_stand_in.py"
         script.write_text(source)
         monkeypatch.setattr(listing_mod, "_CHILD_FILE", script)
+        return script
+
+    return use
+
+
+# How long an in-process scan child's main thread may take to end once its
+# commands have ended, before the test fails.  Generous: it only ever runs out
+# when the child code itself is stuck.
+_SEAM_CHILD_JOIN_SECONDS = 10.0
+
+# How long an in-process scan child waits, once its commands end mid-read, to
+# record the process exit the real child would make.
+_SEAM_CHILD_GRACE_SECONDS = 0.5
+
+
+def _no_alarm(seconds: int) -> int:
+    """Arm no alarm: a process alarm here would end the test run."""
+    _ = seconds
+    return 0
+
+
+class _SelfClosingCommands(io.FileIO):
+    """
+    The read end of a scan child's command pipe, closed once it ends.
+
+    The real child's command stream is closed when its process exits.  An
+    in-process child's control thread outlives ``main`` until saneless closes
+    the write end, so the read end is closed by the end of input it reads.
+    """
+
+    def readline(self, size: int | None = -1, /) -> bytes:
+        """
+        Read one line, and close the pipe at its end.
+
+        Returns:
+            The line, or ``b""`` at the end of input.
+
+        """
+        line = super().readline(size)
+        if not line:
+            self.close()
+        return line
+
+
+class _ThreadChild:
+    """
+    A ``ChildProcess`` whose process is the scan child's ``main`` on a thread.
+
+    The two channels are real pipes, so the session's framing, polling and
+    deadlines run as they do against a real child; only the process is
+    missing.  Its "exit" is ``main`` returning and closing its reply end, as
+    a real exit closes it.  ``pid`` is this process's own and is never
+    signalled: killing it means closing both of saneless's ends, which ends
+    the child's control thread and any write it is blocked in, and failing
+    the test if ``main`` still does not return.
+
+    Attributes:
+        exits: Every status the child asked its process to exit with.
+
+    """
+
+    def __init__(self) -> None:
+        """Start the child's main on its own thread."""
+        command_read, self._command_fd = os.pipe()
+        self._reply_fd, reply_write = os.pipe()
+        self.exits: list[int] = []
+        self._status: list[int] = []
+        self._closed: set[int] = set()
+        runtime = ChildRuntime(
+            arm_alarm=_no_alarm,
+            exit_process=self.exits.append,
+            grace_seconds=_SEAM_CHILD_GRACE_SECONDS,
+        )
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(_SelfClosingCommands(command_read, "rb"), reply_write, runtime),
+            name=SCAN_CHILD_THREAD_NAME,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(
+        self, commands: _SelfClosingCommands, reply_write: int, runtime: ChildRuntime
+    ) -> None:
+        """Run the child's main, then close its reply end as an exit would."""
+        try:
+            self._status.append(_scan_child.main(commands, reply_write, runtime))
+        finally:
+            os.close(reply_write)
+
+    @property
+    def pid(self) -> int:
+        """The id of the process the child runs in, which is this one."""
+        return os.getpid()
+
+    @property
+    def command_fd(self) -> int:
+        """The write end of the child's command pipe."""
+        return self._command_fd
+
+    @property
+    def reply_fd(self) -> int:
+        """The read end of the child's reply pipe."""
+        return self._reply_fd
+
+    def poll(self) -> int | None:
+        """
+        Return the child's status once ``main`` has returned.
+
+        Returns:
+            ``main``'s status, 1 if it raised, or ``None`` while it runs.
+
+        """
+        if self._thread.is_alive():
+            return None
+        return self._status[0] if self._status else 1
+
+    def wait(self, timeout: float) -> int | None:
+        """
+        Wait up to ``timeout`` seconds for ``main`` to return.
+
+        Returns:
+            Its status, or ``None`` while it still runs.
+
+        """
+        self._thread.join(timeout)
+        return self.poll()
+
+    def kill_and_reap(self) -> int:
+        """
+        End the child as a kill would, and fail the test if it does not end.
+
+        Returns:
+            ``-SIGKILL``, the status a killed child is reaped with.
+
+        Raises:
+            AssertionError: ``main`` was still running after its channels
+                were closed.
+
+        """
+        self.close()
+        self._thread.join(_SEAM_CHILD_JOIN_SECONDS)
+        if self._thread.is_alive():
+            msg = "the in-process scan child did not end when it was killed"
+            raise AssertionError(msg)
+        return -signal.SIGKILL
+
+    def close(self) -> None:
+        """Close saneless's ends of both pipes; idempotent."""
+        for fd in (self._command_fd, self._reply_fd):
+            if fd not in self._closed:
+                self._closed.add(fd)
+                os.close(fd)
+
+
+class ScanChildSeam:
+    """
+    What the in-process scan-child seam was asked for, in order.
+
+    Attributes:
+        launches: The configured host each scan child was started with.
+        children: The in-process children, in the order they started.
+
+    """
+
+    def __init__(self) -> None:
+        """Start with no children recorded."""
+        self.launches: list[str] = []
+        self.children: list[_ThreadChild] = []
+
+
+@pytest.fixture(autouse=True)
+def scan_child_seam(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> ScanChildSeam:
+    """
+    Run every scan child in this process, over the patched fake module.
+
+    The backend scans in a child process, and a child cannot see
+    ``monkeypatch.setattr(scan_session, "sane", FakeSaneModule())``: it
+    imports the real python-sane and scans through the real libsane.  Every
+    test that scans through a real ``SaneBackend`` over the fake -- directly,
+    or through the pipeline, the worker, the app or the CLI -- would
+    otherwise start real libsane.
+
+    So the backend's scan-child launcher is replaced here, suite-wide for
+    the reason ``listing_seam`` gives.  The replacement does not imitate the
+    child: it runs the child's own ``main`` on a thread, over two real pipes,
+    and hands the backend's real ``ScanChildSession`` a child object over
+    them.  The protocol, the parent's deadlines and error mapping, and the
+    child's pass over whatever is patched into ``scan_session.sane`` are all
+    the code a test exercises; only the process boundary is missing.  With
+    nothing patched it fails the test instead of scanning.
+
+    A test that needs a real child process requests ``real_scan_launcher``,
+    which puts the real launcher back and points it at a stand-in script.
+    Tests marked ``sane_hardware`` exist to drive real libsane, and are left
+    alone.
+
+    Args:
+        monkeypatch: Undoes the replacement after the test.
+        request: The test's request, to read its markers.
+
+    Returns:
+        The record of every scan child the seam started.
+
+    """
+    seam = ScanChildSeam()
+    if request.node.get_closest_marker("sane_hardware") is not None:
+        return seam
+
+    def launch_in_process(configured_host: str) -> ChildProcess:
+        seam.launches.append(configured_host)
+        # A test may break the library's loading instead of patching a fake
+        # in; the child then reports that, as the real one would.
+        library_patched = (
+            scan_session_mod.sane is not None
+            or scan_session_mod._ensure_sane is not _REAL_ENSURE_SANE
+        )
+        if not library_patched:
+            raise AssertionError(_NO_REAL_LIBSANE)
+        child = _ThreadChild()
+        seam.children.append(child)
+        return child
+
+    monkeypatch.setattr(
+        sane_backend_mod, "_launch_scan_child", launch_in_process, raising=False
+    )
+    return seam
+
+
+@pytest.fixture
+def real_scan_launcher(
+    scan_child_seam: ScanChildSeam, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Give the test the backend's real scan launcher, running a harmless stand-in.
+
+    The launcher then starts a real child process, but the script it runs
+    exits with status 3 at once, which the session reports as no answer.  A
+    test replaces it with its own script through ``stand_in_scan_child``.
+    The real child script is never the default, because it imports
+    python-sane and would scan through real libsane.
+
+    Args:
+        scan_child_seam: Requested so its replacement is in place to be undone.
+        monkeypatch: Restores the seam and the child script after the test.
+        tmp_path: Where the stand-in script is written.
+
+    """
+    _ = scan_child_seam  # ordering only: the seam must be patched before undoing it
+    if _REAL_LAUNCH_SCAN_CHILD is None:
+        pytest.fail(
+            "sane_backend has no _launch_scan_child to restore, so no test can "
+            "run a real scan child"
+        )
+    monkeypatch.setattr(sane_backend_mod, "_launch_scan_child", _REAL_LAUNCH_SCAN_CHILD)
+    stand_in = tmp_path / "scan_child_exits.py"
+    stand_in.write_text("import sys\n\nsys.exit(3)\n")
+    monkeypatch.setattr(scan_child_mod, "_CHILD_FILE", stand_in)
+
+
+@pytest.fixture
+def stand_in_scan_child(
+    real_scan_launcher: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Callable[[str], Path]:
+    """
+    Return a function that makes the real scan launcher run a script of the test's.
+
+    Args:
+        real_scan_launcher: Puts the real launcher back first.
+        monkeypatch: Restores the child script after the test.
+        tmp_path: Where the script is written.
+
+    Returns:
+        A function taking the script's source and returning its path, after
+        pointing the launcher at it.
+
+    """
+    _ = real_scan_launcher  # the real launcher, not the seam, runs the script
+
+    def use(source: str) -> Path:
+        script = tmp_path / "scan_child_stand_in.py"
+        script.write_text(source)
+        monkeypatch.setattr(scan_child_mod, "_CHILD_FILE", script)
         return script
 
     return use

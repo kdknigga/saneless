@@ -8,6 +8,7 @@ scan settings.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -526,27 +527,53 @@ class ScannerBackend(ABC):
 
         """
 
+    def scan_session(
+        self,
+        *,
+        abort: threading.Event | None = None,
+        live: threading.Event | None = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        """
+        Return a context manager that scopes one scan job.
+
+        Every ``scan_pages`` call made inside it belongs to the same job, so a
+        backend that scans through a helper process can keep one for the whole
+        job and release it when the job ends.  The default does nothing.
+
+        Args:
+            abort: Set by another thread to stop the job part way.
+            live: Set while the backend holds something that must be released
+                before the server stops, such as a running helper process.
+
+        Returns:
+            The context manager; it yields nothing.
+
+        """
+        _ = abort, live
+        return contextlib.nullcontext()
+
     def close(self) -> None:
         """
-        Release whatever this backend holds process-wide.
+        Release whatever this backend still holds.
 
-        The default does nothing; ``SaneBackend`` overrides it to run the
-        process-level SANE shutdown. An implementation logs a close failure
-        and never raises it, because an exception out of a close would replace
-        the error that ended the scan.
+        The default does nothing; ``SaneBackend`` overrides it to end a scan
+        child left running by a job that did not end its session.  An
+        implementation logs a close failure and never raises it, because an
+        exception out of a close would replace the error that ended the scan.
         """
         logger.debug("close() is a no-op for %s", type(self).__name__)
 
     def reinitialise(self) -> None:
         """
-        Restart whatever process-wide library this backend drives, before a job.
+        Restart the library this backend drives, before a later pass.
 
         Called at the top of each scan job, and again before every pass of a
         multi-page scan after the first, never with a device handle open.  The
         second pass of a manual-duplex scan does not call it.
 
         The default does nothing. ``SaneBackend`` overrides it to restart SANE
-        at each of those points, and refuses while a read is stuck or a handle
-        is open.
+        inside the job's scan child, so a later pass starts from a fresh
+        library; with no child running there is nothing to restart, because
+        the next pass starts a fresh child.
         """
         logger.debug("reinitialise() is a no-op for %s", type(self).__name__)

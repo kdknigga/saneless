@@ -179,6 +179,16 @@ _DEVICE_TUPLE = ("test:0", "TestVendor", "TestModel", "scanner")
 # The (major, minor, build) libsane 1.0.32 reports from sane_init.
 _SANE_VERSION = (1, 0, 32)
 
+# The name of the thread an in-process scan child runs its main code on.  A
+# SANE start or shutdown made there is the child's own, not this process's.
+SCAN_CHILD_THREAD_NAME = "saneless-scan-child"
+
+
+def _in_a_scan_child() -> bool:
+    """Tell whether the caller is an in-process scan child's main thread."""
+    return threading.current_thread().name == SCAN_CHILD_THREAD_NAME
+
+
 _GEOMETRY_OPTIONS = (
     ("tl-x", "Top-left x"),
     ("tl-y", "Top-left y"),
@@ -2357,9 +2367,12 @@ class FakeSaneModule:
 
         """
         self.init_call_count = 0
-        # A listing child's start, kept apart from this process's own.
+        # A listing or scan child's start, kept apart from this process's own.
         self.child_init_call_count = 0
         self.exit_call_count = 0
+        # Every SANE start and shutdown an in-process scan child made, in
+        # order, as "init" and "exit".
+        self.child_calls: list[str] = []
         # Counted for the same reason FakeSaneDev records its own calls: the
         # wedge refusal has to happen *before* any SANE traffic, and
         # "the call was never made" cannot be asserted on a return value.
@@ -2391,6 +2404,9 @@ class FakeSaneModule:
 
         The shape is python-sane's: the packed version code, then its major,
         minor and build.  The numbers are the ones libsane 1.0.32 returns.
+        A call from an in-process scan child is that child's own start, so it
+        is counted in ``child_init_call_count`` and ``child_calls``, never in
+        ``init_call_count``.
 
         Returns:
             ``(version_code, major, minor, build)``.
@@ -2399,9 +2415,13 @@ class FakeSaneModule:
             BaseException: The configured ``init_error``.
 
         """
-        self.init_call_count += 1
-        if self._init_error is not None:
-            raise self._init_error
+        if _in_a_scan_child():
+            self.child_calls.append("init")
+            self.init_in_child()
+        else:
+            self.init_call_count += 1
+            if self._init_error is not None:
+                raise self._init_error
         major, minor, build = _SANE_VERSION
         return (major << 24 | minor << 16 | build, major, minor, build)
 
@@ -2465,8 +2485,13 @@ class FakeSaneModule:
         ``sane_exit`` closes every handle that is still open **and** runs
         holding the GIL, so calling it while a read is outstanding is the same
         hazard as ``close()`` and then some.  ``exit_while_blocked`` records
-        it; ``exit_call_count`` counts every call, blocked or not.
+        it; ``exit_call_count`` counts every call, blocked or not.  A call
+        from an in-process scan child shuts that child's SANE down, so it is
+        recorded in ``child_calls`` only.
         """
+        if _in_a_scan_child():
+            self.child_calls.append("exit")
+            return
         if self._device.read_is_blocked():
             self.exit_while_blocked = True
         self.exit_call_count += 1
