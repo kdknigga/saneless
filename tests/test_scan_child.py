@@ -61,6 +61,8 @@ from saneless.vocabulary import (
 from tests.conftest import poll_until
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from PIL import Image
 
 _LOGGER = "saneless.scanner.scan_child"
@@ -358,6 +360,44 @@ def _shorten_deadlines(
     monkeypatch.setattr(page_budget, "_PAGE_TIMEOUT_CEILING_SECONDS", _SHORT_SECONDS)
 
 
+# Every stand-in child a test started, so one that a failing assertion left
+# running is killed and reaped after the test instead of outliving it.
+_STARTED: list[ChildProcess] = []
+
+
+@pytest.fixture(autouse=True)
+def _reap_stand_ins() -> Iterator[None]:
+    """
+    Kill and reap whatever stand-in child a test left running.
+
+    A passing test has already reaped its children, and says so; this only
+    keeps a test that failed part way from leaving a process and its pipes.
+
+    Yields:
+        Nothing.
+
+    """
+    yield
+    while _STARTED:
+        child = _STARTED.pop()
+        if child.poll() is None:
+            child.kill_and_reap()
+        child.close()
+
+
+def _start_stand_in() -> ChildProcess:
+    """
+    Start one child through the real launcher, and keep it for the cleanup.
+
+    Returns:
+        The child.
+
+    """
+    child = scan_child_mod.start_scan_child("")
+    _STARTED.append(child)
+    return child
+
+
 class _Starts:
     """A start factory that counts the children it started."""
 
@@ -367,7 +407,7 @@ class _Starts:
 
     def __call__(self) -> ChildProcess:
         """Start one child through the real launcher."""
-        child = scan_child_mod.start_scan_child("")
+        child = _start_stand_in()
         self.children.append(child)
         return child
 
@@ -600,7 +640,7 @@ def test_a_child_whose_kill_was_interrupted_is_still_reaped(
     live = threading.Event()
 
     def start() -> ChildProcess:
-        return _ReapInterruptedOnce(scan_child_mod.start_scan_child(""))
+        return _ReapInterruptedOnce(_start_stand_in())
 
     session = ScanChildSession(start, live=live)
 
@@ -1196,7 +1236,7 @@ def test_a_started_childs_reply_pipe_is_widened(
 ) -> None:
     """The reply pipe holds 1 MiB or more on saneless's end once the child starts."""
     _stand_in(monkeypatch, tmp_path)
-    child = scan_child_mod.start_scan_child("")
+    child = _start_stand_in()
     try:
         capacity = fcntl.fcntl(child.reply_fd, fcntl.F_GETPIPE_SZ)
     finally:
