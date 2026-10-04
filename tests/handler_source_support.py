@@ -6,7 +6,7 @@ they call live in modules beside it.  A check that parses only ``routes.py``
 would stop seeing a call the moment the code making it moved next door, and
 would then pass on nothing.  ``handler_family_tree`` parses every module in
 ``HANDLER_FAMILY`` and joins their bodies into one syntax tree, so a check
-asks its question of the handlers and everything they were split into at once.
+asks its question of the handlers and the code they call at once.
 
 Import it as ``from tests.handler_source_support import handler_family_tree``.
 """
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from saneless.web import (
+    job_view,
     metadata_view,
     owner,
     profile_view,
@@ -30,7 +31,7 @@ from saneless.web import (
 if TYPE_CHECKING:
     from types import ModuleType
 
-__all__ = ["HANDLER_FAMILY", "handler_family_tree"]
+__all__ = ["HANDLER_FAMILY", "NOT_IN_HANDLER_FAMILY", "handler_family_tree"]
 
 HANDLER_FAMILY: tuple[ModuleType, ...] = (
     routes,
@@ -40,8 +41,19 @@ HANDLER_FAMILY: tuple[ModuleType, ...] = (
     status_view,
     profile_view,
     scan_block,
+    job_view,
 )
-"""The routes module and every module split out of it, routes first."""
+"""The routes module and the modules holding the code its handlers call."""
+
+NOT_IN_HANDLER_FAMILY: dict[str, str] = {
+    "saneless.web.services": "the typed accessor itself, which holds no handler code",
+    "saneless.web.refresher": "the collaborator the probe runs in, which must probe",
+    "saneless.web.errors": (
+        "the exception handlers, whose catch-all logs an unhandled exception's "
+        "traceback on purpose"
+    ),
+}
+"""The ``saneless.web`` modules routes imports that the family leaves out, and why."""
 
 
 def handler_family_tree() -> ast.Module:

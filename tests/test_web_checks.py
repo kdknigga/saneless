@@ -79,7 +79,11 @@ from saneless.web.app import create_app
 from saneless.web.checks_cache import MIN_MANUAL_REFRESH_SECONDS, CheckCache
 from saneless.web.refresher import CheckRefresher
 from tests.conftest import StubScannerBackend, poll_until, services_of, stand_in
-from tests.handler_source_support import HANDLER_FAMILY, handler_family_tree
+from tests.handler_source_support import (
+    HANDLER_FAMILY,
+    NOT_IN_HANDLER_FAMILY,
+    handler_family_tree,
+)
 from tests.template_support import markup_start_tags, template_start_tags
 
 if TYPE_CHECKING:
@@ -2288,10 +2292,36 @@ class TestRouteShape:
             "saneless.web.status_view": "status_context",
             "saneless.web.profile_view": "profile_options",
             "saneless.web.scan_block": "block_for",
+            "saneless.web.job_view": "build_job_view",
         }
         assert {module.__name__ for module in HANDLER_FAMILY} == set(expected)
         missing = set(expected.values()) - defined
         assert not missing, missing
+
+    def test_the_family_holds_every_web_module_the_routes_import(self) -> None:
+        """
+        Every ``saneless.web`` module routes imports is in the family or excused.
+
+        Read from routes' own imports rather than kept by hand, so a module the
+        handlers start calling is walked by the checks above unless it is named,
+        with a reason, in ``NOT_IN_HANDLER_FAMILY``.
+        """
+        tree = ast.parse(Path(routes_module.__file__).read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "saneless.web":
+                imported.update(f"saneless.web.{alias.name}" for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "saneless.web."
+            ):
+                imported.add(str(node.module))
+        family = {module.__name__ for module in HANDLER_FAMILY} - {
+            routes_module.__name__
+        }
+        assert set(NOT_IN_HANDLER_FAMILY) <= imported, (
+            set(NOT_IN_HANDLER_FAMILY) - imported
+        )
+        assert imported - set(NOT_IN_HANDLER_FAMILY) == family
 
 
 # The stylesheet and the templates, located the way the app locates them so a
