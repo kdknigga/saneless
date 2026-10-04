@@ -600,7 +600,12 @@ def test_an_outlet_failure_mid_sheet_is_raised_as_it_was(
 def test_the_reading_handle_is_registered_around_each_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The handle is registered before each start and cleared after each read."""
+    """
+    The handle is registered only while ``start`` or ``snap`` runs.
+
+    It is released before each stage is reported, so no report is written
+    while another thread may be cancelling the handle.
+    """
     dev = FakeSaneDev(pages=1)
     _install(monkeypatch, dev)
     outlet = RecordingOutlet()
@@ -613,7 +618,9 @@ def test_the_reading_handle_is_registered_around_each_read(
         "configured",
         "start 1",
         "reading",
+        "reading done",
         "read 1",
+        "reading",
         "reading done",
         "page 1",
         "start 2",
@@ -623,9 +630,56 @@ def test_the_reading_handle_is_registered_around_each_read(
         "close",
     ]
     registered = [handle for handle in outlet.handles if handle is not None]
-    assert len(registered) == 2
+    assert len(registered) == 3
     assert all(isinstance(handle, FakeSaneHandle) for handle in registered)
-    assert registered[0] is registered[1]
+    assert all(handle is registered[0] for handle in registered)
+
+
+class _CancelOnReadRegister(RecordingOutlet):
+    """An outlet whose cancel arrives just as the handle is registered for a read."""
+
+    def reading(self, dev: SaneDevice | None) -> None:
+        """Record the handle, and request the cancel at its second registration."""
+        super().reading(dev)
+        if dev is not None and self.timeline.count("reading") == 2:
+            self.cancel = True
+
+
+def test_a_cancel_before_the_read_is_registered_cancels_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cancel that came while the read was reported cancels it before ``snap``.
+
+    The handle is released while the read is reported, so a cancel then
+    cannot reach it; the pass cancels the read ``start`` began itself, once
+    the handle is released again, and never waits on it.
+    """
+    dev = FakeSaneDev(pages=3)
+    _install(monkeypatch, dev)
+    outlet = _CancelOnReadRegister()
+    real_cancel = FakeSaneDev.cancel
+
+    def record_cancel(self: FakeSaneDev) -> None:
+        outlet.timeline.append("sane cancel")
+        real_cancel(self)
+
+    monkeypatch.setattr(FakeSaneDev, "cancel", record_cancel)
+
+    with pytest.raises(PassStopped):
+        run_pass(_DEVICE, _feeder(), outlet)
+
+    assert dev.calls.count("snap") == 0
+    assert outlet.timeline[3:10] == [
+        "start 1",
+        "reading",
+        "reading done",
+        "read 1",
+        "reading",
+        "reading done",
+        "sane cancel",
+    ]
+    assert dev.close_calls == 1
 
 
 @pytest.mark.parametrize("exit_fails", [False, True])

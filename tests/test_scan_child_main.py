@@ -535,6 +535,151 @@ def test_a_cancel_mid_read_cancels_the_handle_from_the_control_thread(
     assert fake.device.close_calls == 1
 
 
+class _WatchedLock:
+    """A lock that says when a thread has to wait for it."""
+
+    def __init__(self, waiting: threading.Event) -> None:
+        """
+        Make the lock.
+
+        Args:
+            waiting: Set once a thread finds the lock held and waits.
+
+        """
+        self._lock = threading.Lock()
+        self._waiting = waiting
+
+    def __enter__(self) -> Self:
+        """
+        Take the lock, noting a wait for it.
+
+        Returns:
+            The lock.
+
+        """
+        if not self._lock.acquire(blocking=False):
+            self._waiting.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Release the lock."""
+        self._lock.release()
+
+
+class _CancelDuringStart:
+    """
+    A control thread's cancel that lands during ``start``, and a watch on cancels.
+
+    ``start`` runs the control thread's cancel and returns once it is inside
+    ``cancel``, where it is held until the main thread either waits for the
+    handle lock or enters a cancel of its own.
+
+    Attributes:
+        main_moved: Set once the main thread waits for the handle lock or
+            enters a cancel.
+        in_control_cancel: Set once the control thread is inside ``cancel``.
+        overlaps: The threads inside ``cancel`` together, each time a second
+            entered.
+
+    """
+
+    def __init__(self, control: scan_child_main._Control) -> None:
+        """
+        Watch ``control``'s cancel; the test thread is the main thread.
+
+        Args:
+            control: The control thread's shared state, never started.
+
+        """
+        self.main_moved = threading.Event()
+        self.in_control_cancel = threading.Event()
+        self.overlaps: list[list[str]] = []
+        self._guard = threading.Lock()
+        self._inside: list[str] = []
+        self._main = threading.current_thread()
+        self._real_start, self._real_cancel = FakeSaneDev.start, FakeSaneDev.cancel
+        self.canceller = threading.Thread(target=control._cancel, name=_CONTROL_THREAD)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Patch ``start`` and ``cancel`` of every fake device."""
+
+        # Plain functions, so each is bound to the device it is called on.
+        def start(dev: FakeSaneDev) -> None:
+            self._start(dev)
+
+        def cancel(dev: FakeSaneDev) -> None:
+            self._cancel(dev)
+
+        monkeypatch.setattr(FakeSaneDev, "start", start)
+        monkeypatch.setattr(FakeSaneDev, "cancel", cancel)
+
+    def _start(self, dev: FakeSaneDev) -> None:
+        """Start, and have the control thread cancel the first start."""
+        self._real_start(dev)
+        if not self.in_control_cancel.is_set():
+            self.canceller.start()
+            assert self.in_control_cancel.wait(_JOIN_TIMEOUT_SECONDS)
+
+    def _cancel(self, dev: FakeSaneDev) -> None:
+        """Cancel, noting each overlap and holding the control thread's."""
+        mine = threading.current_thread().name
+        with self._guard:
+            self._inside.append(mine)
+            if len(self._inside) > 1:
+                self.overlaps.append(list(self._inside))
+        if threading.current_thread() is self._main:
+            self.main_moved.set()
+        else:
+            self.in_control_cancel.set()
+            self.main_moved.wait(_JOIN_TIMEOUT_SECONDS)
+        try:
+            self._real_cancel(dev)
+        finally:
+            with self._guard:
+                self._inside.remove(mine)
+
+
+def test_a_cancel_during_start_is_never_made_twice_at_once(
+    fake: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The pass's own cancel after ``start`` waits for the control thread's.
+
+    Two cancels of one handle at once can join one backend reader twice, so
+    the main thread must wait for the handle before it cancels the read
+    ``start`` began.
+    """
+    runtime = scan_child_main.ChildRuntime(
+        arm_alarm=lambda _seconds: 0,
+        exit_process=lambda _status: None,
+        grace_seconds=5.0,
+        ignore_sigpipe=lambda: None,
+    )
+    command_read, command_write = os.pipe()
+    reply_read, reply_write = os.pipe()
+    commands = os.fdopen(command_read, "rb", buffering=0)
+    control = scan_child_main._Control(commands, runtime)
+    watch = _CancelDuringStart(control)
+    monkeypatch.setattr(control, "_handle_lock", _WatchedLock(watch.main_moved))
+    watch.install(monkeypatch)
+    reply = scan_child_main._ReplyChannel(reply_write)
+    outlet = scan_child_main._ChildOutlet(reply, control, runtime)
+    try:
+        with pytest.raises(scan_session_mod.PassStopped):
+            scan_session_mod.run_pass(_DEVICE, _feeder(), outlet)
+        watch.canceller.join(_JOIN_TIMEOUT_SECONDS)
+    finally:
+        commands.close()
+        for fd in (command_write, reply_read, reply_write):
+            os.close(fd)
+
+    assert watch.in_control_cancel.is_set()
+    assert watch.overlaps == []
+    assert fake.device.calls.count("snap") == 0
+    assert fake.device.close_calls == 1
+
+
 def test_a_restart_sent_mid_read_never_shuts_sane_down_under_the_read(
     fake: FakeSaneModule, child: _ChildHarness
 ) -> None:
