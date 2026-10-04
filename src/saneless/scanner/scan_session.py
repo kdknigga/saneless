@@ -12,6 +12,7 @@ module never loads libsane.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import math
@@ -24,10 +25,11 @@ from typing import TYPE_CHECKING, Any, Final, Protocol, assert_never
 
 from PIL import Image
 
-from saneless.exceptions import ScanError, describe
+from saneless.exceptions import FeederEmptyError, ScanError, describe
 from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
 from saneless.scanner.base import (
     MAX_PAGES_PER_PASS,
+    PassCapReached,
     ScanSettings,
     SourceKind,
     classify_source,
@@ -42,18 +44,28 @@ from saneless.scanner.options import (
 from saneless.scanner.page_budget import _MM_PER_INCH, _ScanParameters
 from saneless.text_safety import neutralise_controls
 from saneless.vocabulary import (
+    ScanStage,
     ambiguous_source_error,
+    sane_init_failure_message,
     sixteen_bit_error,
     source_not_offered_error,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator, Iterator
     from types import ModuleType
 
     from saneless.vocabulary import PaperSize
 
-__all__ = ["GeometryUnit"]
+__all__ = [
+    "GeometryUnit",
+    "PageOutlet",
+    "PassOutcome",
+    "PassStopped",
+    "restart_library",
+    "run_pass",
+    "start_library",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +109,9 @@ _MAX_ADF_PAGES: int = MAX_PAGES_PER_PASS
 _MAX_AUTO_FEEDER_PAGES: Final = 50
 
 _FEEDER_EMPTY_MESSAGE = "No paper detected in feeder"
+
+# The one error python-sane's feeder iterator turns into the end of the feed.
+_END_OF_FEED: Final = "Document feeder out of documents"
 
 # The scan-area options as ``get_options()`` reports them, with hyphens, for
 # the presence lookup only.  Assignment uses the underscore spelling
@@ -1260,3 +1275,388 @@ class SaneDevice(Protocol):
     def multi_scan(self) -> Iterator[Image.Image]: ...
     def cancel(self) -> None: ...
     def close(self) -> None: ...
+
+
+class PageOutlet(Protocol):
+    """
+    Where one pass reports its progress and hands its accepted pages.
+
+    The pass talks to nothing else, so the scan child's pipe writer and an
+    in-process test double drive it alike.
+    """
+
+    def stage(self, stage: ScanStage, page: int | None) -> None:
+        """
+        Note the stage the pass is about to enter.
+
+        Args:
+            stage: The stage about to begin.
+            page: The one-based sheet it concerns, or None.
+
+        """
+
+    def configured(
+        self, parameters: _ScanParameters, *, resolution: int, use_adf: bool
+    ) -> None:
+        """
+        Note that the device is configured and the first sheet is next.
+
+        Args:
+            parameters: The scan parameters the device reports.
+            resolution: The resolution the device read back, in dpi.
+            use_adf: Whether the pass reads from the document feeder.
+
+        """
+
+    def page(self, image: Image.Image, *, number: int, dpi: int) -> bool:
+        """
+        Take one accepted, cropped page.
+
+        Args:
+            image: The page.
+            number: The one-based number of the sheet it came from.
+            dpi: The resolution to record it at.
+
+        Returns:
+            True once the page is spooled; False to stop the pass.
+
+        """
+        ...
+
+    def reading(self, dev: SaneDevice | None) -> None:
+        """
+        Note the handle a start or read is in progress on, or None after it.
+
+        Args:
+            dev: The handle, or None once the call has returned.
+
+        """
+
+    def cancel_requested(self) -> bool:
+        """
+        Report whether the pass has been asked to stop.
+
+        Returns:
+            True once a cancel was requested.
+
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class PassOutcome:
+    """
+    What one pass did, besides the pages it handed on.
+
+    Attributes:
+        resolution: The resolution the device read back, in whole dpi.
+        rejected: How many fed sheets failed their integrity checks.
+        substituted_source: The requested source, when the device's ``Auto``
+            stood in for it and fed; None otherwise.
+        cap_reached: The cap the pass stopped at, or None when the feed ended
+            on its own.
+
+    """
+
+    resolution: int
+    rejected: int
+    substituted_source: str | None
+    cap_reached: PassCapReached | None
+
+
+class PassStopped(Exception):
+    """The pass ended early on a stop or a cancel; the device is already closed."""
+
+
+def start_library() -> object:
+    """
+    Initialise SANE in this process.
+
+    Returns:
+        Whatever ``sane.init()`` returned.
+
+    Raises:
+        ScanError: If initialisation fails, chained to the SANE error.
+
+    """
+    try:
+        return _ensure_sane().init()
+    except Exception as exc:
+        # python-sane raises _sane.error, RuntimeError or AttributeError,
+        # with no shared base.
+        raise ScanError(sane_init_failure_message(describe(exc))) from exc
+
+
+def restart_library() -> object:
+    """
+    Restart SANE between passes: ``sane_exit``, then ``sane_init``.
+
+    A failing ``sane_exit`` is logged and the init still runs.
+
+    Returns:
+        Whatever ``sane.init()`` returned.
+
+    Raises:
+        ScanError: If initialisation fails, chained to the SANE error.
+
+    """
+    try:
+        _ensure_sane().exit()
+    except Exception:
+        logger.warning("Could not shut SANE down", exc_info=True)
+    return start_library()
+
+
+@contextlib.contextmanager
+def _opened(device_id: str, outlet: PageOutlet) -> Generator[SaneDevice]:
+    """
+    Open the device for one pass, and cancel and close it on every exit.
+
+    Raises:
+        ScanError: If the device cannot be opened, naming it and chained to
+            the SANE error.
+
+    """
+    outlet.stage(ScanStage.OPEN, None)
+    try:
+        dev: SaneDevice = _ensure_sane().open(device_id)
+    except Exception as exc:
+        open_msg = (
+            f"Could not open scanner {neutralise_controls(device_id)}: {describe(exc)}"
+        )
+        raise ScanError(open_msg) from exc
+    try:
+        yield dev
+    finally:
+        outlet.stage(ScanStage.CLOSE, None)
+        with contextlib.suppress(Exception):
+            dev.cancel()
+        try:
+            dev.close()
+        except Exception:
+            # Never raised: it would replace the pass's own result or error.
+            logger.warning(
+                "Could not close scanner %s",
+                neutralise_controls(device_id),
+                exc_info=True,
+            )
+
+
+def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image:
+    """
+    Start and read one sheet, as python-sane's feeder iterator would.
+
+    Raises:
+        PassStopped: If a cancel was requested while the sheet was read; a
+            cancelled ``snap()`` can return a truncated image, so it is
+            discarded.
+
+    """
+    before = _native_thread_ids()
+    try:
+        outlet.stage(ScanStage.START, number)
+        outlet.reading(dev)
+        dev.start()
+        outlet.stage(ScanStage.READ, number)
+        # No cancel from snap() on failure: the backend's reader may still run.
+        image = dev.snap(no_cancel=True)
+    except Exception as exc:
+        outlet.reading(None)
+        # An asynchronous cancel can kill a backend reader holding a C-library
+        # lock, which then hangs every later SANE call, so nothing cancels this
+        # handle until the reader this read started has ended.
+        _await_backend_threads(before)
+        if outlet.cancel_requested():
+            raise PassStopped from exc
+        raise
+    outlet.reading(None)
+    if outlet.cancel_requested():
+        _await_backend_threads(before)
+        raise PassStopped
+    return _as_image(image)
+
+
+@dataclass
+class _FeedTally:
+    """
+    What a feeder pass counted.
+
+    Attributes:
+        fed: Sheets fed and kept or skipped, not counting one past the cap.
+        rejected: Sheets skipped for failing their integrity checks.
+        sheet_not_kept: The sheet fed past the cap, or None.
+
+    """
+
+    fed: int = 0
+    rejected: int = 0
+    sheet_not_kept: int | None = None
+
+
+def _feed(
+    dev: SaneDevice,
+    outlet: PageOutlet,
+    framing: _PageFraming,
+    max_pages: int,
+) -> _FeedTally:
+    """
+    Read the feeder to its end or its cap, handing each accepted page on.
+
+    Sheet N+1 is started only once the outlet has answered for page N.
+
+    Raises:
+        FeederEmptyError: If no sheet was fed.
+        ScanError: If a sheet fails with anything but end-of-feed, or every
+            sheet fed was unreadable.
+        PassStopped: If the outlet answered stop or a cancel was requested.
+
+    """
+    tally = _FeedTally()
+    while True:
+        if outlet.cancel_requested():
+            raise PassStopped
+        number = tally.fed + 1
+        try:
+            image = _read_sheet(dev, outlet, number)
+        except PassStopped:
+            raise
+        except Exception as exc:
+            if str(exc) == _END_OF_FEED:
+                break
+            scan_error_msg = f"Scanner error on page {number}: {describe(exc)}"
+            raise ScanError(scan_error_msg) from exc
+
+        # Seen only on the sheet past the cap, which is discarded uncounted.
+        if tally.fed >= max_pages:
+            tally.sheet_not_kept = number
+            logger.warning(
+                "Stopped the feed at the %d-page cap: sheet %d was fed but not kept",
+                max_pages,
+                number,
+            )
+            break
+
+        tally.fed = number
+        if not _validate_page_image(image, number):
+            tally.rejected += 1
+            continue
+        if not outlet.page(framing.crop(image), number=number, dpi=framing.resolution):
+            raise PassStopped
+
+    if tally.fed == 0:
+        raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE)
+    if tally.rejected == tally.fed:
+        all_rejected_msg = (
+            f"All {tally.fed} page(s) fed were unreadable and were skipped "
+            f"(zero dimensions, or below {_MIN_PAGE_BYTES} bytes of image "
+            f"data); no usable page was produced"
+        )
+        raise ScanError(all_rejected_msg)
+    return tally
+
+
+def _snap_one(
+    dev: SaneDevice, device_id: str, outlet: PageOutlet, framing: _PageFraming
+) -> None:
+    """
+    Read the one flatbed page and hand it on.
+
+    Raises:
+        FeederEmptyError: If SANE reports the feeder out of documents.
+        ScanError: If the page is unreadable, or for any other failure,
+            naming the device and chained to the original.
+        PassStopped: If the outlet answered stop or a cancel was requested.
+
+    """
+    if outlet.cancel_requested():
+        raise PassStopped
+    try:
+        image = _read_sheet(dev, outlet, 1)
+    except PassStopped:
+        raise
+    except Exception as exc:
+        if str(exc) == _END_OF_FEED:
+            raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
+        snap_msg = f"Scanner error on {neutralise_controls(device_id)}: {describe(exc)}"
+        raise ScanError(snap_msg) from exc
+
+    # Fatal here rather than skipped: a flatbed has no next page.
+    if not _validate_page_image(image, 1):
+        unreadable_msg = (
+            "The scanner returned an unreadable page (zero dimensions, or "
+            f"below {_MIN_PAGE_BYTES} bytes of image data)"
+        )
+        raise ScanError(unreadable_msg)
+    if not outlet.page(framing.crop(image), number=1, dpi=framing.resolution):
+        raise PassStopped
+
+
+def run_pass(device_id: str, settings: ScanSettings, outlet: PageOutlet) -> PassOutcome:
+    """
+    Run one acquisition pass: open, configure, read, close.
+
+    Every page is validated and cropped here; only accepted pages reach the
+    outlet, one at a time, and the next sheet is read only after the outlet
+    has answered for the last.  The device is closed on every path.
+
+    Args:
+        device_id: SANE device identifier string.
+        settings: Scan settings (source, resolution, mode, paper size).
+        outlet: Where progress goes and accepted pages are handed.
+
+    Returns:
+        The resolution read back, the rejected-sheet count, the substituted
+        source and the cap state.
+
+    Raises:
+        ScanError: If the device cannot be opened or configured, the source
+            matches none or several, a sheet fails, or no usable page came.
+        FeederEmptyError: If the feeder or flatbed reports no document.
+        PassStopped: If the outlet answered stop or a cancel was requested.
+
+    """
+    with _opened(device_id, outlet) as dev:
+        outlet.stage(ScanStage.CONFIGURE, None)
+        raw_options = _read_options(dev, device_id)
+        choice = _resolve_source(
+            raw_options, settings.source, resolve_feeder=settings.duplex == "manual"
+        )
+        configured = _configure_device(
+            dev, settings, choice, options=raw_options, device_id=device_id
+        )
+        use_adf = _route(choice, settings)
+        framing = _apply_paper_size(
+            dev,
+            configured.options,
+            settings,
+            use_adf=use_adf,
+            resolution=configured.resolution,
+        )
+        parameters = _read_parameters(dev, device_id)
+        _refuse_sixteen_bit(parameters, device_id)
+        outlet.configured(parameters, resolution=configured.resolution, use_adf=use_adf)
+
+        cap_reached: PassCapReached | None = None
+        rejected = 0
+        if use_adf:
+            # A source not named as a feeder (Auto sent through the feeder)
+            # may be a platen rescanned forever, so it gets the lower cap.
+            named_feeder = classify_source(choice.effective).uses_feeder
+            max_pages = _MAX_ADF_PAGES if named_feeder else _MAX_AUTO_FEEDER_PAGES
+            tally = _feed(dev, outlet, framing, max_pages)
+            rejected = tally.rejected
+            if tally.sheet_not_kept is not None:
+                cap_reached = PassCapReached(
+                    cap=max_pages,
+                    sheet_not_kept=tally.sheet_not_kept,
+                    auto_source=not named_feeder,
+                )
+        else:
+            _snap_one(dev, device_id, outlet, framing)
+
+    return PassOutcome(
+        resolution=configured.resolution,
+        rejected=rejected,
+        substituted_source=choice.substituted_from if use_adf else None,
+        cap_reached=cap_reached,
+    )
