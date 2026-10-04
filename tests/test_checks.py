@@ -854,10 +854,10 @@ class TestProbeHostCap:
 
         ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
         unbounded ``getaddrinfo`` plus ``saned_probe.PROBE_CONNECT_SECONDS`` for
-        each, and that walk runs inside the ``POST /api/checks/refresh`` request thread.
-        The manual-refresh floor bounds the *rate* of those requests, not the
-        duration of one, so without a cap a forty-host setting is a request
-        that can take minutes.
+        each, on the check refresher's thread or in ``saneless doctor``.  The
+        manual-refresh floor bounds how often a probe starts, not how long one
+        takes, so without a cap a forty-host setting is a Scanner check that
+        can take minutes.
         """
         entries = saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
         assert len(entries) == saned_probe._MAX_PROBE_HOSTS

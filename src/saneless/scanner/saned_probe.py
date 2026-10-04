@@ -112,11 +112,11 @@ _ASCII_DIGITS: Final = frozenset(digits)
 # segment as a number, so a name may not look like one.
 _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 
-# How many distinct hosts one setting may put in front of the pre-probe.  The
-# probes run inside the ``POST /api/checks/refresh`` request thread, so this is
-# the only bound on how long one refresh takes; a fifth host loses the
-# pre-probe, not the check.  The configured ``net:`` device's own host is
-# probed on top of the cap.
+# How many distinct hosts one setting may put in front of the pre-probe.  Each
+# costs an unbounded ``getaddrinfo`` plus the connect and handshake budgets, on
+# the check refresher's thread or in ``saneless doctor``, so this bounds how
+# long one Scanner check takes; a fifth host loses the pre-probe, not the
+# check.  The configured ``net:`` device's own host is probed on top of the cap.
 _MAX_PROBE_HOSTS: Final = 4
 
 # How libsane's net backend starts every device id it names.  Opening such an
