@@ -1,42 +1,20 @@
 """
 The one health-check registry, and the words both surfaces use to show it.
 
-This is not a leaf module -- it needs ``Settings``, a scanner backend and a
-Paperless client to answer anything -- but it has a leaf's import rule all the
-same, and the rule is the point of the module.  ``saneless doctor`` and the web
-status strip are required to report the *same* checks in the *same* words, so
-this module must import **nothing from ``saneless.web`` and nothing from
-``saneless.cli``**.  If it imported either, it would belong to that
-surface, and the other one would end up building a web application to print a
-terminal table or importing Click to render a page.
+``saneless doctor`` and the web status strip must report the same checks in the
+same words, so this module imports nothing from ``saneless.web`` or
+``saneless.cli``.  Every dependency arrives on ``CheckContext`` instead, which
+is also what lets ``doctor`` report every row with no python-sane installed.
 
-Every dependency is injected instead: the settings, the scanner backend, the
-Paperless client and the worker's profile-storage outcome all arrive as
-parameters on ``CheckContext``.  That is also what lets ``doctor`` run on a
-machine with no python-sane at all -- it passes ``scanner=None`` and still
-reports every row.
+No message or next step carries a filesystem path, a URL, a token value or
+exception text (ASVS 4.0.3 V7.4), so the Paperless URL and the fallback folder
+are never named.  The one exception is the Configuration row's next step in the
+two superseded-name states: it names the file to rename in one of three fixed
+documented spellings, taken from the search position, never a resolved host
+path.
 
-ASVS 4.0.3 V7.4 applies to every string this module can render.  No message and
-no next
-step carries a filesystem path, a URL, a token value or exception text.  The
-Paperless URL says where paperless-ngx runs (a user name or password in it is
-refused when the config loads) and the fallback folder is a host path, both on
-a LAN-visible page, so both are deliberately omitted, exactly as the log
-file's path is.
-
-There is exactly one exception, and it is this narrow: the Configuration row's
-*next step*, in the two states where a file under the superseded name was
-found, names that file -- as one of three fixed documented spellings (``./``,
-``$XDG_CONFIG_HOME/saneless/`` or ``/etc/saneless/`` followed by the old
-name), never as a resolved host path.  Renaming that exact file is the fix, so
-a row that would not name it could not be acted on; and because the spelling
-comes from the search *position* rather than from the path, what reaches the
-page is a constant this module could have hard-coded.  Every other row, every
-message, and every other state stays under the rule above.
-
-``CheckResult.terminal_detail`` is outside the rule because it is never
-rendered on the page: only ``saneless doctor`` prints it, on the machine.  It
-carries where paperless-ngx redirected to, sanitised by ``paperless.py``.
+``CheckResult.terminal_detail`` is outside the rule: only ``saneless doctor``
+prints it, on the machine.
 """
 
 from __future__ import annotations
@@ -120,131 +98,42 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# The cold-start row, before any check has run.  It lives here rather
-# than in the template for the same reason the state glyphs do: templates own
-# no vocabulary.  U+00B7 is neutral -- it says "not yet", not "bad" -- and
-# U+2026 matches the spelling of the Scan button's "Scanning...".
+# The cold-start row, before any check has run; templates own no vocabulary.
+# U+00B7 says "not yet", not "bad".
 CHECKING_GLYPH: Final = "·"
 CHECKING_STATE_CLASS: Final = "check-checking"
 CHECKING_MESSAGE: Final = "Checking…"
-# The word that replaces the cold-start glyph for a screen reader.  The glyph
-# is ``aria-hidden``, so without this a listener would hear the row's name and
-# message with no marker at all where every other row has one.  It is a word
-# rather than the ellipsis for the same reason ``check_state_label`` says
-# "Failed" instead of "FAIL": the glyph's meaning has to survive as speech.
+# Spoken in place of the cold-start glyph, which is ``aria-hidden``.
 CHECKING_STATE_LABEL: Final = "Checking"
 
-# The word a screen reader hears in front of a row nothing looked at.  A
-# skipped row borrows the cold-start glyph and the cold-start
-# colour -- U+00B7 says "not yet", not "bad", and no new colour token is needed
-# -- but it deliberately does not borrow the cold-start *word*.
-# ``CHECKING_STATE_LABEL`` is "Checking", and a listener hearing "Checking:
-# Scanner. Not checked while a scan is running." is told a probe is running
-# when none is: a smaller version of the same lie the green tick told before
-# this constant existed.  It is a word rather than the glyph for the reason
-# ``CHECKING_STATE_LABEL`` is one -- the glyph is ``aria-hidden``, so the
-# marker's meaning only survives as speech if something spells it out.
+# Spoken in front of a skipped row.  A skipped row borrows the cold-start glyph
+# and colour but not ``CHECKING_STATE_LABEL``, which would tell a listener a
+# probe is running when none is.
 SKIPPED_STATE_LABEL: Final = "Not checked"
 
-# How many times the cold-start strip may ask for results before it stops
-# asking.  The poll's only other terminating condition is results
-# landing in the cache, so an appliance whose refresher thread has died -- or
-# one where the watch window and scanner-gate contention keep every tick from
-# storing -- leaves every open tab asking indefinitely, and this is a machine
-# meant to be left open on a tablet in a hallway.
-#
-# Measured in Chromium before the cap existed: a cold strip on a stopped
-# refresher issued 254 requests in six seconds -- 42 a second, eighty-five
-# times the "every 2s" the markup advertised.  htmx re-fires ``load`` on
-# content it has just swapped in and that body swapped in a copy of itself
-# carrying ``load, every 2s``, so the poll ran at the round-trip rate.  The
-# same measurement is why the polling body no longer carries ``load``: a cap
-# counted in attempts is only a cap in *time* if the interval is real, and at
-# 42 requests a second ten attempts would have been a quarter of a second.
-#
-# Ten attempts at the real two-second interval is about twenty seconds of
-# asking, which is roughly twenty refresher ticks (``TICK_SECONDS`` is 1 s).
-# That is *not* sized against the worst probe a cold start can cost, and the
-# arithmetic that once claimed it was -- two and a half times
-# ``saned_probe.PROBE_CONNECT_SECONDS`` plus
-# ``saned_probe.PROBE_READ_SECONDS``, so about 7 s -- is
-# disproved by three things this same module documents.
-# ``getaddrinfo`` is outside every budget here:
-# ``saned_probe.PROBE_CONNECT_SECONDS`` says
-# at length that an unreachable resolver costs whatever ``resolv.conf`` says,
-# and nothing bounds it.  The saned pre-probe pays that once per configured
-# host, up to ``saned_probe._MAX_PROBE_HOSTS`` of them.  And the ordinary
-# local-USB
-# deployment has no parseable host at all, so ``_scanner_preflight`` hands
-# over to enumeration without dialling anything and ``_scanner_enumeration``
-# starts a listing child, which a silently unreachable host holds until
-# ``LISTING_DEADLINE_SECONDS`` stops it.
-#
-# So what this cap means is narrower than it used to claim: ten attempts is the
-# bound for a chain with **nothing in flight**, which is the case it was always
-# really sized for -- a refresher thread that has died, and a tab left open in
-# front of it.  A chain that is waiting on a probe somebody demonstrably holds
-# is bounded by ``POLL_PROBE_ATTEMPT_CAP`` instead.  A healthy cold start
-# settles on its second request either way; this leaves it eight it will never
-# need.
+# How many times the cold-start strip asks before it stops: about twenty
+# seconds, the bound for a chain with nothing in flight, such as a refresher
+# thread that has died.  The polling body must not carry htmx's ``load``
+# trigger: htmx re-fires it on swapped-in content, so the poll would run at the
+# round-trip rate and the cap would bound nothing in time.
 POLL_ATTEMPT_CAP: Final = 10
 
-# How many times a strip may ask while a probe is demonstrably in flight --
-# that is, while some checker holds the refresher's single-flight lock.
-# Ninety attempts at the real two-second interval is about 180 s.  The saned
-# pre-probe costs at most ``saned_probe.PROBE_CONNECT_SECONDS`` plus
-# ``saned_probe.PROBE_HANDSHAKE_SECONDS`` -- 7 s -- for each of up to
-# ``saned_probe._MAX_PROBE_HOSTS``
-# setting entries and the configured ``net:`` device's own host, so 35 s, and
-# a *probed* host that could hang enumeration never reaches it: a configured
-# device is opened only once its own host has been probed, on the port libsane
-# opens it on, and did not time out.  A host the pre-probe cannot dial is
-# another matter -- ``_scanner_preflight`` lists which those are --
-# and the listing still dials it, so a dead one holds the listing child until
-# ``LISTING_DEADLINE_SECONDS``, 30 s, stops it, as a wedged local backend can.
-# That is one listing at most, never two: the open of an unlisted device runs
-# in the same child, and is refused when its host could not be probed on that
-# port.  35 s of probing, one 30 s listing and
-# ``saned_probe.PROBE_READ_SECONDS`` for
-# Paperless is about 70 s, which leaves the pre-probe's unbounded resolutions
-# the rest; the cap was sized when one listing could cost ~127 s on its own,
-# and is kept rather than shrunk because a tab asking a little longer loses
-# nothing.  Below it, a cold start on a wedged scanner stopped asking while
-# its first probe was still running and told a household member to press a
-# button that starts the thing already running.
-#
-# It is a second cap and not an exemption, and that is deliberate.
-# ``Lock.locked()`` stays true forever if the holder dies, and a thread that
-# died inside the lock is precisely the failure mode this area keeps hitting,
-# so an unbounded "keep asking while the lock is held" would reintroduce the
-# endless poll ``POLL_ATTEMPT_CAP`` exists to stop, through a narrower door.  A
-# refresher that died holding the lock therefore still makes the asking stop;
-# it just takes about
-# three minutes instead of twenty seconds.  That cost lands only on the tab
-# that was already waiting on a probe, never on the healthy-idle case.
+# How many times a strip asks while some checker holds the refresher's
+# single-flight lock: about 180 s, against roughly 70 s for probing every host,
+# one listing stopped at ``LISTING_DEADLINE_SECONDS`` and the Paperless read,
+# with the rest left for name resolution, which nothing bounds.  It is a second
+# cap rather than an exemption because ``Lock.locked()`` stays true forever if
+# the holder dies.
 POLL_PROBE_ATTEMPT_CAP: Final = 90
 
-# What the strip says once it has stopped asking.  It replaces the freshness
-# line, because there is no freshness to report -- nothing has ever been
-# checked -- and it lives here rather than in the template for the same reason
-# ``CHECKING_MESSAGE`` does: templates own no vocabulary.  It names the button
-# that is still on the page and nothing else: no path, no URL, no host and no
-# exception text, because this sentence is rendered on a page the whole LAN can
-# read.  Only the strip shows it, never ``saneless doctor``, so it names the
-# button directly instead of holding a retry placeholder.
+# Shown by the strip once it stops asking, in place of the freshness line.  It
+# names only the button on the page, never a path, URL, host or exception text,
+# because the page is LAN-visible; only the strip shows it, so it holds no
+# retry placeholder.
 POLL_GAVE_UP_LINE: Final = "The checks have not run yet. Press Check again to try now."
 
-# What the strip says instead, while it is still asking because a probe is
-# demonstrably in flight.  ``POLL_GAVE_UP_LINE`` points at the
-# ``Check again`` button, and beside a running probe that is advice that cannot
-# help: the click collapses into the probe already running.  So this sentence
-# says what is true -- the first check has not finished -- and sets an
-# expectation for how long that can take, in words a household member reads.
-# It was written when one listing could cost ~127 s; a listing now stops at
-# ``LISTING_DEADLINE_SECONDS``, so the sentence errs long, which for an
-# expectation is the safe direction.  Held to exactly
-# ``POLL_GAVE_UP_LINE``'s rule: no host, no address, no port, no path, no URL
-# and no exception text, because it renders on a page the whole LAN can read
+# Shown instead while a probe is in flight, where pressing Check again would
+# only join the running probe.  Held to ``POLL_GAVE_UP_LINE``'s disclosure rule
 # (ASVS 4.0.3 V7.4).
 POLL_STILL_CHECKING_LINE: Final = (
     "The first check is still running. This can take a couple of minutes "
@@ -265,21 +154,12 @@ _CHECK_FAILED_NEXT_STEP: Final = f"Restart saneless, then {RETRY_PLACEHOLDER}."
 
 class CheckState(StrEnum):
     """
-    How one health check came out: three states, and only three.
+    How one health check came out.
 
     ``OK`` is nothing to do.  ``WARN`` is a true statement about a deployment
-    that still works -- no fallback folder, profiles that live only in memory
-    -- and ``FAIL`` is something that stops scanning or filing.
-
-    The distinction is what ``saneless doctor``'s exit code is built on: it
-    exits non-zero on ``FAIL`` only.  A ``WARN`` must not fail a scripted
-    health gate, because an appliance that scans and files correctly is not
-    broken just because it could be tidier, and a gate that goes red for
-    tidiness is a gate people learn to ignore.
-
-    A fourth state would need an exit-code rule, a glyph, a colour class and a
-    screen-reader label, and every ``match`` here would stop type-checking
-    until it got them.  That is the intended cost.
+    that still works, such as no fallback folder, and ``FAIL`` is something
+    that stops scanning or filing.  ``saneless doctor`` exits non-zero on
+    ``FAIL`` only, so a scripted health gate never goes red for tidiness.
     """
 
     OK = "OK"
@@ -297,13 +177,9 @@ class CheckKey(StrEnum):
     renders them in member order, so there is no list of checks anywhere else
     to drift out of step with this one.
 
-    ``CONFIGURATION`` is first because member order is reading order, and it
-    is the row that can explain the others.  A missing or unreadable
-    configuration file turns the Paperless, Profiles and Fallback rows red or
-    amber at once, each of them reporting a symptom truthfully and none of
-    them naming the cause; a reader who meets the cause first has the other
-    rows explained before reaching them, and one who meets it last has already
-    drawn a wrong conclusion from each of them.
+    ``CONFIGURATION`` is first because member order is reading order, and a
+    missing configuration file turns the Paperless, Profiles and Fallback rows
+    red or amber without any of them naming the cause.
 
     Adding a member is therefore a deliberate act with a visible cost.  The
     ``match`` in ``check_name`` stops type-checking until the new key has a
@@ -316,9 +192,7 @@ class CheckKey(StrEnum):
     ``test_cold_start_renders_one_checking_row_per_check`` for the status
     strip.
 
-    ``DATA_DIR`` is the member name, and ``"Data folder"`` is what a household
-    member reads.  The member names are internal; only ``check_name`` is user
-    copy.
+    Member names are internal; only ``check_name`` is user copy.
     """
 
     CONFIGURATION = "CONFIGURATION"
@@ -334,41 +208,26 @@ class CheckResult:
     """
     One finished check, as both surfaces render it.
 
-    Frozen for the reason ``ScanBatch`` is frozen: this is a report of a probe
-    that has already happened, and nothing downstream has any business editing
-    it on the way to a page or a terminal.
-
     ``next_step`` is empty for every ``OK`` row and non-empty for every
-    ``WARN`` and ``FAIL`` row, because a red row that does not say what to do
-    about it is a red row a household member can only escalate.  A next step
-    that tells the reader to try again holds a retry placeholder from
-    ``saneless.vocabulary`` instead of the words, because the two surfaces
-    retry differently: the strip has a Check again button and ``saneless
-    doctor`` is run again.  Each surface renders it with ``render_check_step``.
+    ``WARN`` and ``FAIL`` row.  A next step that says to try again holds a
+    retry placeholder from ``saneless.vocabulary``, because the strip has a
+    Check again button and ``saneless doctor`` is run again; each surface
+    renders it with ``render_check_step``.
 
-    ``skipped`` is the "not checked while a scan is running" row.  It is a
-    separate flag rather than a fourth state because the row still has to carry
-    *some* state for its glyph, and "we did not look" is a fact about the
-    probe, not a verdict about the appliance.
+    ``skipped`` is a flag rather than a state because the row still needs a
+    state for its glyph, and "we did not look" is not a verdict.
 
     Attributes:
         key: Which ``CheckKey`` this is.
         state: How it came out.
         message: A developer-authored sentence.  Never a path, a URL, a token
-            or exception text (ASVS 4.0.3 V7.4).  The module docstring states the one
-            exception: the Configuration row's ``next_step``, in its two
-            superseded-name states, carries one of three fixed documented
-            spellings of the file to rename -- never a resolved host path, and
-            never in ``message``.
+            or exception text (ASVS 4.0.3 V7.4).
         next_step: What to do about it, for ``WARN`` and ``FAIL`` rows, with
             any retry still a placeholder.
         skipped: True when the probe was deliberately not run.
         terminal_detail: A line for ``saneless doctor`` only, or empty.  It
-            may name an address -- today it is where paperless-ngx redirected
-            to, already sanitised by ``paperless.py`` -- which is why the
-            status strip never renders it: the strip is visible to anyone on
-            the LAN, and the terminal is on the machine.  ``doctor`` passes it
-            through ``neutralise_controls`` before printing it.
+            may name an address, such as where paperless-ngx redirected to,
+            so the LAN-visible strip never renders it.
 
     """
 
@@ -415,34 +274,12 @@ class CheckContext:
     """
     Everything the checks need, handed in rather than reached for.
 
-    Every dependency is injected because the two surfaces build them
-    differently, and neither may be the one this module knows about.
-    The web app has a worker, a long-lived Paperless client and a scanner
-    backend it opened at startup; ``saneless doctor`` has none of those and
-    builds what it needs for one command.
-
-    ``scanner=None`` means no scanner backend could be built.  That is what
-    lets ``doctor`` report every row on such a machine instead of refusing
-    at ``require_sane()`` and reporting none -- the thing an operator most
-    needs a diagnostic for is the machine where the diagnostic would otherwise
-    not run.  ``scanner_refusal`` says why: python-sane is not installed, or
-    it is installed and the scanner library would not start.  The two need
-    different remedies, so they are different rows; a caller that does not
-    say gets the not-installed row.
-
-    ``paperless=None`` means no usable client could be built at all:
-    ``PaperlessClient.__init__`` refused, for a URL httpx2 will not parse or
-    that carries a user name or password, a token an HTTP header cannot
-    carry, or a TLS trust store it could not read.  ``paperless_refusal``
-    tells the trust store apart from the URL and token, because the remedy
-    for one is an environment variable and for the other a setting.  A caller
-    that does not say gets the "not found at that URL" row.
-
-    ``profile_storage`` is the outcome the worker recorded when it wrote the
-    generated profiles, not something re-derived here.  ``doctor`` derives its
-    own from whether a config file was loaded.  It has to be a record rather
-    than a fresh probe, because the two in-memory cases are indistinguishable
-    afterwards and the read-only one is the only one worth acting on.
+    The web app and ``saneless doctor`` build these differently, and this
+    module may know neither.  ``scanner=None`` and ``paperless=None`` mean none
+    could be built; a caller that gives no refusal gets the not-installed and
+    "not found at that URL" rows.  ``profile_storage`` is the outcome the
+    worker recorded, not a fresh probe, because the two in-memory cases cannot
+    be told apart afterwards.
 
     Attributes:
         settings: The loaded configuration.
@@ -477,10 +314,9 @@ def check_name(key: CheckKey) -> str:
     """
     Return the name column a reader sees for one check.
 
-    The name is a separate element from the message in both surfaces, which is
-    what lets ``connection_status_message``'s existing sentences drop into the
-    Paperless row verbatim with no string surgery and no capitalisation
-    collision.
+    The name is a separate element from the message, so
+    ``connection_status_message``'s sentences drop into the Paperless row
+    verbatim.
 
     Args:
         key: The check to name.
@@ -514,9 +350,8 @@ def check_state_label(state: CheckState) -> str:
     """
     Return the word a screen reader announces before a check row.
 
-    The glyph is ``aria-hidden`` and this is what replaces it, so these are
-    words rather than the member values: "Failed" is a sentence a listener
-    understands and "FAIL" is shouting.
+    The glyph is ``aria-hidden`` and this replaces it, so these are words a
+    listener understands rather than the member values.
 
     Args:
         state: The state to label.
@@ -544,10 +379,8 @@ def check_state_class(state: CheckState) -> str:
     """
     Return the CSS class that colours one check's glyph.
 
-    Templates own no vocabulary, so the mapping from a state to a class lives
-    here and never as a ``{% if state == 'FAIL' %}`` in a template.  Each class
-    is an alias over an existing colour token; none introduces a new colour
-    value.
+    Templates own no vocabulary, so the mapping lives here.  Each class is an
+    alias over an existing colour token.
 
     Args:
         state: The state to classify.
@@ -575,14 +408,9 @@ def check_state_glyph(state: CheckState) -> str:
     """
     Return the text-presentation glyph for one check's state.
 
-    U+2713 and U+2717 are already in use for ``Done`` and ``Error``, so the
-    strip borrows them rather than inventing a second visual language.
-
-    Every Unicode warning sign -- U+26A0, U+2757 -- renders with emoji
-    presentation on at least one shipping platform, so the warning glyph stays
-    a plain ASCII ``!``, which has text presentation everywhere and needs no
-    variation selector.
-
+    U+2713 and U+2717 are the glyphs ``Done`` and ``Error`` already use.  The
+    warning glyph is a plain ASCII ``!`` because every Unicode warning sign
+    renders as an emoji on at least one shipping platform.
     See docs/explanation/decisions/0013-text-presentation-glyphs.md.
 
     Args:
@@ -607,24 +435,17 @@ def check_state_glyph(state: CheckState) -> str:
     return glyph
 
 
-# The three lookups above answer "what does this *state* look like".  The three
-# below answer "what does this *row* look like", which is not the same question
-# whenever ``skipped`` is set, and it is the second question both surfaces
-# actually ask.  ``check_state_*`` stays exactly as it is: it is still the
-# state's own vocabulary, it is what these three delegate to, and
-# ``saneless doctor``'s ``_state_marker`` is its CLI counterpart.
+# The ``check_row_*`` lookups answer what a *row* looks like, which differs
+# from what its state looks like whenever ``skipped`` is set.
 
 
 def check_row_class(result: CheckResult) -> str:
     """
     Return the CSS class that colours one rendered row's glyph.
 
-    A skipped row is drawn in the neutral cold-start colour rather than in its
-    state's, because the state on a skipped row is not a verdict anybody
-    reached: it is ``CheckState.OK`` so that the row has *some* colour to draw
-    and so that a scripted health gate does not go red for a probe that was
-    deliberately not taken.  Colouring by it would paint an unprobed row
-    green, telling the reader that a probe passed when none ever ran.
+    A skipped row carries ``CheckState.OK`` so that a health gate does not go
+    red for a probe nobody took; colouring by it would paint the row green as
+    if a probe had passed.
 
     Args:
         result: The finished row about to be rendered.
@@ -643,10 +464,7 @@ def check_row_glyph(result: CheckResult) -> str:
     """
     Return the glyph one rendered row is marked with.
 
-    The skipped glyph is the cold-start one, U+00B7, and for the same reason it
-    is the cold-start one: it says "not yet", not "bad".  "We did not look" is
-    a fact about the probe, not a verdict about the appliance, and the green
-    tick is the one mark that must never stand in front of a sentence saying
+    A skipped row gets the cold-start glyph, never the green tick, because
     nothing was checked.
 
     Args:
@@ -666,11 +484,8 @@ def check_row_label(result: CheckResult) -> str:
     """
     Return the word a screen reader announces before one rendered row.
 
-    The glyph and the colour are borrowed from the cold-start trio; the word is
-    not.  ``CHECKING_STATE_LABEL`` would tell a listener a probe is running
-    when the whole point of the flag is that none was, so a skipped row gets
-    ``SKIPPED_STATE_LABEL`` instead -- the only way the neutral glyph's meaning
-    survives for somebody who cannot see it.
+    A skipped row borrows the cold-start glyph and colour but not
+    ``CHECKING_STATE_LABEL``, which would say a probe is running.
 
     Args:
         result: The finished row about to be rendered.
@@ -692,12 +507,8 @@ def worst_state(results: Iterable[CheckResult]) -> CheckState:
     ``FAIL`` beats ``WARN`` beats ``OK``, and an empty list is ``OK`` -- there
     is nothing to report, which is not the same as refusing to answer.
 
-    The collapse is a ``match`` over ``CheckState`` rather than ``max()`` over
-    the member values.  ``max()`` would happen to work today only because
-    ``"WARN"`` sorts after ``"OK"`` and ``"FAIL"`` sorts before both, which it
-    does not -- and even where alphabetical order accidentally matched the
-    severity order, it would be an ordering nobody chose and no type checker
-    would defend when a member is added.
+    It is a ``match`` rather than ``max()`` over the member values, because
+    alphabetical order is not severity order: ``"FAIL"`` sorts first.
 
     Args:
         results: The finished checks to collapse, in any order.
@@ -779,20 +590,16 @@ class _Enumeration:
 
     Attributes:
         devices: What the backend listed, in its order; empty when it listed
-            nothing, and also when listing raised -- the verdict does not need
-            to tell those two apart, because either way nothing usable was
-            seen.
+            nothing and also when listing raised.
         configured_opened: ``None`` when no open was attempted; otherwise
             whether a configured device that the backend did not list could
             be opened and closed again, which is what a scan does with it.
         open_withheld: True when the configured device was not listed and
             was deliberately not opened, because it is a ``net:`` device
             whose host the pre-probe could not dial.
-        failure: ``None`` when the listing ran to an end.  Otherwise the way
-            the listing child failed: it crashed, it was stopped at the
-            deadline, or it gave no usable answer.  Those are kept apart from
-            "listed nothing" because the row must say the check could not
-            see, not that nothing is there.
+        failure: ``None`` when the listing ran to an end, otherwise how the
+            listing child failed, kept apart from "listed nothing" because the
+            row must say the check could not see.
 
     """
 
@@ -811,9 +618,8 @@ def _hosts_subject(count: int, total: int) -> tuple[str, bool]:
         total: How many hosts were probed.
 
     Returns:
-        The subject of the row's sentence, and whether its verb is plural.
-        One probed host is "the scanner host"; several are counted, as in
-        "1 of 2 scanner hosts".
+        The sentence's subject, "the scanner host" or "1 of 2 scanner hosts",
+        and whether its verb is plural.
 
     """
     if total == 1:
@@ -869,35 +675,14 @@ def _host_problem_clause(
 
 def _host_problem_next_step(outcome: saned_probe.SanedOutcome) -> str:
     """
-    Return what to do about one probe outcome.
+    Return what to do about one probe outcome, or "" when there is nothing.
 
-    Each state was measured against a real saned: a host that was refusing
-    this machine, not listening, or not answering is picked up again by the
-    next Check, so pressing Check again is honest advice for all three.  So
-    is a name that did not resolve, when the fix is in DNS or the hosts file:
-    every listing runs in a fresh process whose scanner library resolves each
-    ``SANE_NET_HOSTS`` entry afresh (``sane_init`` calling ``add_device`` in
-    ``backend/net.c``).  A fix to a saneless setting is different, because
-    settings are read once, at start, so that half of the advice says to
-    restart saneless.
-
-    That next step names every place the name can have come from, because
-    the row cannot say which: ``[scanner] host``, a ``net:`` id in
-    ``[scanner] device`` (whose host is probed too), and ``SANE_NET_HOSTS``,
-    which wins over ``[scanner] host`` whenever it is exported and not empty
-    (``effective_sane_net_hosts``).  Naming only the config file would send
-    an operator with the variable exported to edit a setting that changes
-    nothing.  The variable is named; the host never is (ASVS 4.0.3 V7.4).
-
-    Args:
-        outcome: The outcome being reported.
-
-    Returns:
-        A next step, or the empty string when there is nothing to do.
-
-    Raises:
-        AssertionError: If the value is not a ``saned_probe.SanedOutcome`` member.
-
+    Measured against a real saned, the next Check sees a fixed host, and a
+    fixed DNS or hosts-file name too, because each listing's libsane resolves
+    ``SANE_NET_HOSTS`` afresh; settings are read once, so a setting fix needs a
+    restart.  The
+    unresolved step names every place the name can come from, because the row
+    cannot say which; it never names the host (ASVS 4.0.3 V7.4).
     """
     match outcome:
         case saned_probe.SanedOutcome.TIMED_OUT:
@@ -919,20 +704,11 @@ def _directory_accepts_a_write(path: Path) -> bool:
     """
     Say whether a directory will actually take a file, by putting one there.
 
-    This writes and removes a temporary file rather than asking
-    ``os.access``.  ``os.access`` answers a question about the directory's mode
-    bits, and the failure that matters here is not a mode bit: a
-    single-file bind mount where the directory is writable, ``os.access`` says
-    yes, and only the operation itself fails with EBUSY.  A check that asks a
-    different question to the one the appliance will ask at scan time is a
-    check that can be green while scanning is broken.
-
-    Args:
-        path: The directory to probe.
+    ``os.access`` reads mode bits, and says yes on a writable directory where
+    the write itself fails, such as EBUSY on a single-file bind mount.
 
     Returns:
-        True when a file was created and removed, False on any OSError --
-        missing, not a directory, read-only, out of space or busy.
+        True when a file was created and removed, False on any OSError.
 
     """
     try:
@@ -947,20 +723,11 @@ def _device_label(device: DeviceInfo) -> str:
     """
     Describe a device in the words on its lid, never by its SANE identifier.
 
-    ``DeviceInfo.name`` is the SANE device id, and for the ``net`` backend it
-    is ``net:<host>:<backend>:...`` -- a LAN address.  Putting it in a row
-    would publish that address to everyone who can load the index page, which
-    is the same reason the fallback row omits the folder path (ASVS 4.0.3 V7.4).
-    ``vendor`` and ``model`` are what the device calls itself and what is
-    printed on its lid, so they are what a household member can match against
-    the machine in front of them.
-
-    Args:
-        device: The device the backend reported.
+    A ``net`` backend id embeds the host, a LAN address the page must not
+    publish (ASVS 4.0.3 V7.4).
 
     Returns:
-        A bounded description, or the empty string when the backend reported
-        no vendor and no model.
+        A bounded vendor and model, or "" when the backend reported neither.
 
     """
     label = " ".join(f"{device.vendor} {device.model}".split())
@@ -973,24 +740,12 @@ def _stale_file_as_named(settings: Settings, *, absolute_paths: bool) -> str:
     """
     Spell the superseded-name file the row is about to tell someone to rename.
 
-    Two spellings of one file, one caller each.  The status strip gets the
-    documented spelling, because it is a page anyone on the LAN can load and
-    a search *position* maps to a constant string; ``saneless doctor`` and the
-    log get the absolute path, because they are read by the operator on the
-    machine, where the resolved path is the useful half and the disclosure
-    rule does not apply.
-
-    Args:
-        settings: The settings whose recorded search found the file.
-        absolute_paths: True for the terminal spelling.
-
-    Returns:
-        The file, spelled for the surface that asked.
+    The LAN-visible strip gets the documented spelling, a constant per search
+    position; ``saneless doctor`` and the log, read on the machine, get the
+    absolute path.
 
     Raises:
-        AssertionError: If the settings carry no recording.  Only a recorded
-            search can report a superseded-name state, so reaching this means
-            the state derivation and this function have come apart.
+        AssertionError: If the settings carry no recorded search.
 
     """
     discovery = settings.config_discovery
@@ -1009,22 +764,10 @@ def _config_file_as_named(
     """
     Spell a found config file the way the surface asking may show it.
 
-    The same two spellings as ``_stale_file_as_named``, for the same two
-    callers: the documented spelling for the LAN-visible strip, the absolute
-    path for ``saneless doctor`` and the log.
-
-    Args:
-        settings: The settings whose recorded search found the file.
-        path: A file the search found under the current name.
-        absolute_paths: True for the terminal spelling.
-
-    Returns:
-        The file, spelled for the surface that asked.
+    The same two spellings as ``_stale_file_as_named``.
 
     Raises:
-        AssertionError: If the settings carry no recording.  Only a recorded
-            search can find more than one file, so reaching this means the
-            state derivation and this function have come apart.
+        AssertionError: If the settings carry no recorded search.
 
     """
     discovery = settings.config_discovery
@@ -1042,14 +785,10 @@ def leftover_config_check(
     """
     Report an old-name file left beside a config file that did load.
 
-    Its own function because two states need it.  It is the Configuration
-    row when a leftover is the only thing wrong; and when a shadowed file
-    outranks it on that row, a terminal surface can still tell the operator
-    about the leftover in these same sentences, with no second copy of them.
-
-    Why the next step says move before it says delete: after an upgrade the
-    leftover can hold the only copy of the Paperless URL and token, and a
-    bare "delete it" would be advice to destroy the configuration.
+    Public so that a terminal surface can report the leftover in these same
+    sentences when a shadowed file outranks it on the Configuration row.  The
+    next step says move before delete, because after an upgrade the leftover
+    can hold the only copy of the Paperless URL and token.
 
     Args:
         settings: The settings in hand, carrying the search that built them.
@@ -1067,9 +806,6 @@ def leftover_config_check(
     return CheckResult(
         key=CheckKey.CONFIGURATION,
         state=CheckState.WARN,
-        # One literal, deliberately over the 88-column guide (E501 is off in
-        # this project): the sentence is pinned word for word, and a grep for
-        # it has to find it on one line.
         message=f"Using {CONFIG_FILENAME}; an old {LEGACY_CONFIG_FILENAME} is being ignored.",
         next_step=(
             f"Move anything you still need from {named} into the "
@@ -1105,8 +841,6 @@ def _shadowed_config_check(settings: Settings, *, absolute_paths: bool) -> Check
     )
     unread = " and ".join(others)
     if len(others) == 1:
-        # One literal per sentence, over the 88-column guide for the reason
-        # the leftover row gives.
         message = f"Using {used}; {unread} is also there and is not read."
         next_step = f"If that is not deliberate, move anything you still need from {unread} into {used}, then delete {unread} and restart saneless."
     else:
@@ -1126,42 +860,16 @@ def configuration_check(
     """
     Report which configuration file is in use, and whether an old one is not.
 
-    The row that exists because the other rows once went red or amber for one
-    missing file and not one of them named it.  Its outcomes come from
-    ``config_file_state``, which is the single derivation the startup log, the
-    status strip, ``saneless doctor`` and the one-shot commands all read, so
-    none of them can describe the same appliance differently.
+    The outcome comes from ``config_file_state``, the one derivation every
+    surface reads, and the terminal surfaces call this with
+    ``absolute_paths=True`` rather than re-authoring the sentences.
 
-    Public, and with a spelling switch, for that same reason.  The terminal
-    surfaces call it with ``absolute_paths=True`` and get *these* sentences
-    with the file spelled as a resolved path; nothing there re-authors the
-    wording, so a change here changes every surface at once.
-
-    Why a missing file is amber and never red: configuring saneless entirely
-    through environment variables is supported and documented, so a deployment
-    with no file may be working exactly as designed.  Whether paperless-ngx is
-    reachable is the Paperless row's question, and it already goes red on an
-    unset URL or token -- two rows reporting one fact is how a reader learns
-    to discount both.
-
-    Why a lone file under the superseded name is red: nothing the operator
-    wrote was read.  Every value they set is absent, the appliance is running
-    on defaults, and the file sitting in the searched directory is the reason.
-
-    Why the leftover next step says move before it says delete: after an
-    upgrade the leftover can hold the only copy of the Paperless URL and
-    token, and a bare "delete it" would be advice to destroy the
-    configuration.  Those sentences live in ``leftover_config_check``.
-
-    Why a shadowed file is amber and not red: more than one ``saneless.toml``
-    can be deliberate, such as a per-user file overriding the system one, so
-    nothing may have failed.  But only the first is read, and the one an
-    operator edits may be another, so the row names the file in use and every
-    file not read, and its next step allows for the override being meant.
-
-    Why both next steps end in a restart: the search is run once, at load, and
-    the outcome is recorded.  Renaming the file changes nothing until the
-    process reads it.
+    A missing file is amber, because configuring through environment variables
+    alone is supported, and the Paperless row already goes red on an unset URL
+    or token.  A lone superseded-name file is red, because nothing the operator
+    wrote was read.  A shadowed file is amber, because a per-user file
+    overriding the system one can be deliberate.  The search runs once, at
+    load, so every fix ends in a restart.
 
     Args:
         settings: The settings in hand, carrying the search that built them.
@@ -1195,7 +903,6 @@ def configuration_check(
             return CheckResult(
                 key=CheckKey.CONFIGURATION,
                 state=CheckState.WARN,
-                # One literal for the same reason as the row above.
                 message="No config file; running on defaults and environment variables.",
                 next_step=(
                     f"The saneless log lists every place it looked for {CONFIG_FILENAME}."
@@ -1206,7 +913,6 @@ def configuration_check(
             return CheckResult(
                 key=CheckKey.CONFIGURATION,
                 state=CheckState.FAIL,
-                # One literal for the same reason as the rows above.
                 message=f"No config file loaded: saneless now reads {CONFIG_FILENAME}, not {LEGACY_CONFIG_FILENAME}.",
                 next_step=(
                     f"Rename {named} to {CONFIG_FILENAME}, then restart saneless."
@@ -1218,47 +924,13 @@ def configuration_check(
 
 def _scanner_host_unanswered(probes: tuple[saned_probe.HostProbe, ...]) -> CheckResult:
     """
-    Build the row for a scanner host the check must not enumerate.
+    Build the amber row for a timed-out host the check must not enumerate.
 
-    This is the row for timed-out hosts -- a peer that accepted the
-    connection and then said nothing counts as timed out -- and only for
-    them: ``saned_probe.blocks_enumeration`` says why they are kept out of libsane.
-    With several hosts it reports the worst outcome among them, by
-    ``saned_probe.outcome_severity``, and how many of the hosts share it, so one dead
-    host beside a healthy one is still visible.
-
-    Amber, not red, and the distinction is the whole point.  What the
-    pre-probe observed is a fact about the *configured host*, not about the
-    appliance: ``SANE_NET_HOSTS`` **adds** net devices to what the dll backend
-    enumerates, it does not replace local backend enumeration (``SaneBackend``
-    only sets the variable), so "a configured sane-net host is dead" never
-    implied "there is no scanner".  A machine with a working USB scanner and a
-    switched-off network one scans perfectly, and a true statement about a
-    deployment that still works is amber -- the same shape as the
-    read-only-configuration Profiles row.  Reporting it red would break the
-    rule ``CheckState``'s own docstring states outright: a healthy appliance
-    must never go red.
-
-    The cost is recorded rather than hidden.  An appliance whose *only*
-    scanner is a timed-out network host reports amber, so ``saneless doctor``
-    exits 0 for it.  That is accepted: a scripted gate is keyed on red alone
-    by design, the row is still visible, it still names the scanner host as
-    the thing that is wrong, and it still carries the next step that fixes
-    it, so a human loses nothing.
-
-    Neither string names a host, its address or its port; the only thing
-    interpolated is a count.  A LAN address on a LAN-visible page is the same
-    class of disclosure as the SANE device id ``_device_label`` refuses to
-    print (ASVS 4.0.3 V7.4).
-
-    Args:
-        probes: What each configured host's probe found; at least one of them
-            blocks enumeration.
-
-    Returns:
-        The amber Scanner row, with ``skipped`` false -- the probe was run,
-        and what it found is the row.
-
+    Amber, because ``SANE_NET_HOSTS`` adds network devices to local
+    enumeration rather than replacing it, so a dead host does not mean no
+    scanner; an appliance whose only scanner is that host therefore passes
+    ``saneless doctor``.  The row reports the worst outcome and a count, never
+    a host (ASVS 4.0.3 V7.4).
     """
     clause, worst = _worst_host_clause(probes)
     return CheckResult(
@@ -1273,22 +945,8 @@ def _scanner_skipped() -> CheckResult:
     """
     Build the row shown while a scan is running.
 
-    The state is ``OK`` rather than ``WARN`` or ``FAIL``.  "We did not look" is
-    a fact about the probe, not a verdict about the appliance, and a scan in
-    flight is direct evidence the scanner was working moments ago; a scripted
-    health gate must not go red for the duration of every scan.  The state
-    stays ``OK`` precisely so that gate keeps passing -- ``worst_state`` and
-    ``saneless doctor``'s exit rule read it and nothing else.
-
-    The ``skipped`` flag, not the state, is what the two surfaces *render*, and
-    the functions that read it are named rather than implied so the claim is
-    checkable by grep: ``check_row_class``, ``check_row_glyph`` and
-    ``check_row_label`` in this module draw the web row, and ``_row_marker`` in
-    ``saneless.cli`` draws the ``doctor`` one.
-
-    Returns:
-        The neutral skipped Scanner row.
-
+    The state is ``OK`` so a scripted health gate does not go red for every
+    scan; the ``skipped`` flag is what the surfaces render.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1302,44 +960,10 @@ def _scanner_busy() -> CheckResult:
     """
     Build the row shown when something else held the scanner gate.
 
-    This exists separately from ``_scanner_skipped`` because the distinction is
-    the whole of the fix.  ``run_checks`` honours ``context.skip_scanner``
-    *before* the gate is consulted, so by the time a non-blocking acquire fails
-    a running scan has already been excluded: whatever holds the gate is not a
-    scan, and a row that says one is running is simply false.  Today there is
-    one known contender, and it is not hypothetical --
-    ``StartupProfiles`` takes the gate around ``get_devices`` and
-    ``get_capabilities`` as the worker thread's first act at startup
-    (``ScanWorker._run`` runs it before it takes its first job), while
-    ``_current_job_id`` is still ``None``
-    (``ScanWorker._process_job`` sets it).  The lifespan starts the worker
-    and then the refresher, so that window coincides exactly with the
-    cold-start poll -- which is how ``_scanner_skipped``'s sentence came to sit
-    beside a last-checked time on an appliance that had never scanned.
-
-    The state is ``OK`` for the same reason ``_scanner_skipped``'s is, restated
-    because it is easy to read as a bug: "we did not look" is a fact about the
-    probe, not a verdict about the appliance, and a scripted health gate keyed
-    on red must not fail because two threads wanted the scanner in the
-    same instant.  Keeping the state at ``OK`` is what holds that gate open.
-
-    The ``skipped`` flag is what discloses that nothing was checked, through
-    the same four functions ``_scanner_skipped``'s docstring names:
-    ``check_row_class``, ``check_row_glyph`` and ``check_row_label`` here, and
-    ``_row_marker`` in ``saneless.cli``.
-
-    There is deliberately **no** next step.  ``_scanner_skipped`` carries none
-    either, and for the same reason: the next probe fixes this by itself,
-    within one refresh interval, so telling a household member to do something
-    would be asking them to act on a condition that is already clearing.
-
-    The message names no scan, and it names no host, address, port, path or
-    exception either (ASVS 4.0.3 V7.4), which is the same omission
-    ``_scanner_host_unanswered`` makes on purpose.
-
-    Returns:
-        The neutral contention row, ``skipped`` true because no probe ran.
-
+    Not ``_scanner_skipped``: a running scan is excluded before the gate is
+    tried, so the holder is something else, such as ``StartupProfiles`` at
+    worker start.  ``OK`` for the same reason, with no next step because the
+    next probe clears it.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1352,9 +976,6 @@ def _scanner_busy() -> CheckResult:
 def _scanner_support_missing() -> CheckResult:
     """
     Build the "there is no python-sane on this machine" row.
-
-    Its own constructor because two callers need the same row and a row
-    written twice is a row that can drift.
 
     Returns:
         The red no-scanner-support row.
@@ -1372,10 +993,8 @@ def _scanner_would_not_start() -> CheckResult:
     """
     Build the "the scanner library is installed and would not start" row.
 
-    Not the not-installed row: python-sane imported, and ``sane.init()``
-    refused.  Installing scanner support again changes nothing, and the
-    reason is in the log, which is where the next step sends the reader.
-    The row names no backend, path or host, because the log has those.
+    python-sane imported and ``sane.init()`` refused, so reinstalling changes
+    nothing and the next step sends the reader to the log.
 
     Returns:
         The red scanner-support-would-not-start row.
@@ -1444,24 +1063,12 @@ def _scanner_ready_subject(
     enumeration: _Enumeration, configured_device: str
 ) -> str | None:
     """
-    Name the scanner a scan would use, if there is one it can use.
+    Name the scanner a scan would use, or ``None`` when there is none.
 
-    With ``scanner.device`` set the scan opens exactly that id, so the check
-    looks it up by exact name and labels the device it finds, whatever else
-    is listed and in whatever order.  A device the backend does not list but
-    that opened is usable too: SANE opens ids it never lists.  With the
-    setting empty the scan takes the first device listed, and so does this.
-
-    Args:
-        enumeration: What the gated half of the check saw.
-        configured_device: The configured ``scanner.device``, possibly empty.
-
-    Returns:
-        ``None`` when no usable scanner was seen.  Otherwise the words the
-        row uses for it: the device's label, "The configured scanner" for an
-        unlisted device that opened, or the empty string for a device that
-        reported no vendor and no model.
-
+    A set ``scanner.device`` is matched by exact id, and an unlisted one that
+    opened is usable too, because SANE opens ids it never lists.  An empty
+    setting takes the first device listed, as a scan does.  The name may be
+    "" for a device that reported no vendor and no model.
     """
     if configured_device:
         listed = next(
@@ -1488,15 +1095,10 @@ def _scanner_ready_row(
     """
     Build the row for a scanner that can be used.
 
-    A host problem still shows, in amber, because scanning works: the rule is
-    that a working appliance never goes red.  It is reported ahead of the
-    several-devices warning, because it is the one that is a failure.
-
-    The sentence has one "but", and a stopped scanner service is worded for
-    it on purpose.  ``_host_problem_clause`` says that outcome as "is on, but
-    its scanner service is not running", which is right as a sentence of its
-    own and reads as two "but"s after "is ready, but", so this row names the
-    service and counts the hosts instead.
+    A host problem shows in amber, because scanning works, and ahead of the
+    several-devices warning.  A stopped service is reworded here because
+    ``_host_problem_clause``'s "is on, but" would put two "but"s in one
+    sentence.
 
     Args:
         probes: What each configured host's probe found; none blocks
@@ -1523,10 +1125,9 @@ def _scanner_ready_row(
             next_step=_host_problem_next_step(worst),
         )
     if unchosen > 1:
-        # With no device configured, every scan goes to whichever device SANE
-        # lists first, and a scanner that appears on the LAN can take that
-        # place.  A warning, not a failure: scanning still works.  Count-only,
-        # because device ids are LAN addresses and this row is LAN-visible.
+        # With no device configured, a scanner that appears on the LAN can
+        # become the first one listed and take every scan.  Count-only,
+        # because device ids are LAN addresses.
         return CheckResult(
             key=CheckKey.SCANNER,
             state=CheckState.WARN,
@@ -1569,17 +1170,9 @@ def _scanner_configured_missing_row() -> CheckResult:
     """
     Build the red row for a configured scanner that was not found.
 
-    The next step covers both ways this happens.  A scanner that is off or
-    unplugged is seen by the next Check once it is back, because every
-    listing runs in a fresh process with a fresh scanner library, so that
-    half says press Check again.  If ``saneless devices`` does not list it
-    either, the configured id is wrong, and changing ``[scanner] device`` is a
-    settings edit, which is read once at start, so only that half says to
-    restart saneless.
-
-    Returns:
-        The red Scanner row.
-
+    Each listing runs in a fresh process, so a scanner switched back on is
+    seen by the next Check; a wrong ``[scanner] device`` is a setting, read
+    once, so only that half of the next step says to restart.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1593,20 +1186,9 @@ def _scanner_configured_unprobed_row() -> CheckResult:
     """
     Build the amber row for an unlisted ``net:`` device that was not opened.
 
-    The configured device is a ``net:`` device the backend did not list, and
-    its host is one the pre-probe cannot dial, so the check did not open it:
-    opening it would make libsane dial that host with no timeout.  Amber, not
-    red, because nothing was found wrong -- the device may well open for a
-    scan -- and the rule is that a working appliance never goes red.
-
-    The next step names both ways out.  A host in ``[scanner] host`` is one
-    SANE lists devices from, so the device becomes a listed one; a device
-    ``saneless devices`` lists is one the check can find.  Either is a config
-    edit, which needs a restart.  Neither names the host (ASVS 4.0.3 V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    Its host is one the pre-probe cannot dial, and opening the device would
+    make libsane dial it with no timeout.  Amber, because nothing was found
+    wrong; the next step never names the host (ASVS 4.0.3 V7.4).
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1620,20 +1202,9 @@ def _scanner_listing_crashed_row() -> CheckResult:
     """
     Build the amber row for a listing whose child process crashed.
 
-    The scanner library failed inside the listing child, so the check saw
-    nothing at all.  Amber, not red: a crash proves the listing failed, not
-    that scanning is impossible -- the next scan runs with its own fresh
-    library and may well work -- and the rule is that a working appliance
-    never goes red, so ``saneless doctor`` still exits 0 for it.  The child
-    is gone and the next listing starts another, so pressing Check again is
-    the whole of the advice.
-
-    Nothing is interpolated: the crash is not tied to any one host, and a host
-    or device id on this LAN-visible row would be a disclosure (ASVS 4.0.3 V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    Amber, because a crashed listing proves the check could not see, not that
+    scanning is impossible; the next listing starts a fresh child.  Nothing is
+    interpolated (ASVS 4.0.3 V7.4).
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1647,21 +1218,9 @@ def _scanner_listing_timed_out_row() -> CheckResult:
     """
     Build the amber row for a listing stopped at its deadline.
 
-    The listing child was still waiting when the deadline came, and was
-    stopped.  That is a peer somewhere that accepted a connection and then
-    said nothing, which may be the scanner itself or a scanner host the
-    pre-probe could not dial in advance.  Amber, not red, for the same reason
-    as the crash row: the check could not see, which is not proof that
-    scanning is impossible, and a working appliance never goes red.
-
-    The next step asks for the scanner, and its host if it has one, to be on
-    and reachable, and it deliberately avoids "switched on and connected",
-    the phrase no row reporting a rejection may use.  Nothing is interpolated,
-    for the same reason as the crash row (ASVS 4.0.3 V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    Some peer accepted a connection and said nothing; amber for the crash
+    row's reason.  The next step avoids "switched on and connected", the
+    phrase no row reporting a rejection may use.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1675,19 +1234,8 @@ def _scanner_listing_no_answer_row() -> CheckResult:
     """
     Build the amber row for a listing child that gave no usable answer.
 
-    The child could not be started, or it ended without a reply the check
-    could read, so the check saw nothing at all.  Amber, not red, for the
-    same reason as the crash row: the check could not see, which is not proof
-    that scanning is impossible, and a working appliance never goes red.
-    Whatever the child printed is in the log, and the next listing starts
-    another child, so pressing Check again is the whole of the advice.
-
-    Nothing is interpolated, for the same reason as the crash row (ASVS 4.0.3
-    V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    The child could not start or ended without a readable reply; amber for
+    the crash row's reason.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1701,10 +1249,8 @@ def _scanner_nothing_found_row(hosts: int) -> CheckResult:
     """
     Build the red row for no scanner at all, with every probed host healthy.
 
-    Both next steps end in pressing Check again.  Every listing runs in a
-    fresh process with a fresh scanner library, so a scanner that is switched
-    on, plugged in, or added to the scanner host is seen by the next Check,
-    with no restart; ``saneless devices`` would see no more than that.
+    Each listing runs in a fresh process, so the next Check sees a scanner
+    that has been switched on or plugged in, with no restart.
 
     Args:
         hosts: How many scanner hosts were probed, all of them healthy.
@@ -1739,24 +1285,10 @@ def _scanner_unusable_row(
     """
     Build the red row when no usable scanner was seen, naming the likeliest cause.
 
-    The more specific cause wins.  A configured ``net:`` device whose own
-    host had no scanner service running, was refusing this machine, or could
-    not be found by name is missing *because of* that host, so the row says
-    so.  A configured device that is not a ``net:`` device is simply not
-    found, even if some unrelated network host is also bad, because a network
-    host does not explain a local device's absence.  Only the own host's probe
-    on ``saned_probe.SANED_PORT`` is read, because that is the port libsane opened the
-    device on; a ``host:port`` setting's answer on another port does not
-    explain the device's absence.
-
-    Args:
-        probes: What each configured host's probe found; none blocks
-            enumeration.
-        configured_device: The configured ``scanner.device``, possibly empty.
-
-    Returns:
-        The red Scanner row.
-
+    A configured ``net:`` device is blamed on its own host's probe on
+    ``saned_probe.SANED_PORT``, the port libsane opens it on; any other
+    configured device is just not found, because an unrelated host does not
+    explain its absence.
     """
     if configured_device:
         entry = saned_probe.net_device_entry(configured_device)
@@ -1785,12 +1317,6 @@ def _scanner_listing_failure_row(failure: _ListingFailure) -> CheckResult:
     """
     Pick the amber row for the way a listing child failed.
 
-    A ``match`` ending in ``assert_never``, so a new way of failing stops
-    type-checking here until it has a row.
-
-    Args:
-        failure: How the listing child failed.
-
     Returns:
         The row for that failure.
 
@@ -1814,59 +1340,12 @@ def _scanner_verdict(
     """
     Decide the Scanner row from what the probes and the enumeration found.
 
-    Pure: no socket, no backend and no clock, so every row can be pinned by a
-    unit test.  The row goes red exactly when scanning cannot work.  While a
-    usable scanner is visible a host problem keeps the row amber, because a
-    working appliance never goes red.  With ``scanner.device`` set, the row is
-    about that device, found by its exact id; the first device listed stands
-    in only when the setting is empty, which is the device a scan would use.
-
-    Where two causes compete, the more specific one wins.  A configured
-    ``net:`` device whose own host had no scanner service running, was
-    refusing this machine, or could not be found by name reports that host's
-    problem, which explains the absence.  A configured device that is not a
-    ``net:`` device and is missing is reported as not found, whatever an
-    unrelated host is doing.  With nothing configured, a host problem is
-    reported ahead of the several-devices warning.  Several bad hosts are
-    reported by the worst outcome, with a count.
-
-    The next steps follow what actually clears each state, which was measured
-    against a real saned and agrees with sane-backends' source:
-
-    - Each listing runs in a fresh child process with a fresh scanner
-      library.  That library resolves every ``SANE_NET_HOSTS`` entry afresh
-      and opens a new control connection to every host (``sane_init`` calling
-      ``add_device``, then ``connect_dev``, in ``backend/net.c``), so a name
-      that becomes resolvable, a host that starts answering, and a host that
-      gains a scanner are all picked up on the next Check.  Those rows, and
-      the rows for a scanner that was not found, say press Check again.
-    - A restart is advised only where the fix is a change to saneless's own
-      settings, which are read once, at start: a host name corrected in a
-      setting, ``[scanner] device`` changed to a device ``saneless devices``
-      lists, and a configured ``net:`` device whose host cannot be probed.
-    - A refused host is enumerated, because a refused connect returns at
-      once inside libsane.  A timed-out host is not.
-
-    A host that must not be enumerated -- one that timed out -- gets the
-    same row the preflight returns for it, so the two can never disagree.
-    A listing that crashed, was stopped at its deadline or gave no usable
-    answer gets its own amber row next, ahead of anything the devices would
-    say, because the check could not see and that is not the same as seeing
-    nothing.
-
-    Rows interpolate counts and ``_device_label`` output only.  The
-    configured id and the listed device ids are compared, never rendered,
-    because they are LAN addresses on a LAN-visible page (ASVS 4.0.3 V7.4).
-
-    Args:
-        probes: What each configured host's probe found, in configured order;
-            empty when no host is configured.
-        enumeration: What the gated half of the check saw.
-        configured_device: The configured ``scanner.device``, possibly empty.
-
-    Returns:
-        Exactly one result for ``CheckKey.SCANNER``.
-
+    Pure, so every row can be pinned by a unit test.  The row goes red
+    exactly when scanning cannot work, and the more specific cause wins.
+    Next steps say press Check again wherever a fresh listing clears the
+    state, which each listing's own libsane does for names, hosts and
+    scanners (measured against a real saned); they say restart only for a
+    settings fix.  Device ids are compared, never rendered (ASVS 4.0.3 V7.4).
     """
     if any(saned_probe.blocks_enumeration(probe.outcome) for probe in probes):
         return _scanner_host_unanswered(probes)
@@ -1885,64 +1364,11 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     """
     Decide the scanner row without entering SANE, or hand over to enumeration.
 
-    This is everything the scanner check can settle before libsane is touched,
-    and it is a separate function so it can run with the worker's scanner gate
-    **free**.  Nothing here is SANE work: it is a settings read, name
-    resolution and the opening of the SANE network handshake.  That matters
-    because resolution is outside every budget this module states --
-    ``getaddrinfo`` takes no timeout, as
-    ``saned_probe.PROBE_CONNECT_SECONDS`` says at
-    length -- so a check holding the gate across it can park a
-    ``ScanWorker._scan_job`` whose job row already reads ``SCANNING`` for as
-    long as a broken resolver takes, and ``POST /api/checks/refresh`` can
-    re-arm that parking every couple of seconds.
-
-    The order inside it is the order ``_check_scanner`` always had.  A machine
-    with no python-sane is its own row and is decided without touching
-    anything.  Then every entry ``saned_probe.saned_hosts`` returns for the host
-    list
-    SANE will use is probed with ``saned_probe.probe_saned``, with no short circuit:
-    libsane dials every entry, so a dead second host holds the listing until
-    ``LISTING_DEADLINE_SECONDS`` however well the first one answers.  When
-    ``scanner.device`` is a ``net:`` id whose host none of those entries
-    covers on ``saned_probe.SANED_PORT``, that host is probed on
-    ``saned_probe.SANED_PORT`` too (``saned_probe.configured_device_probes``),
-    because the check may
-    open the device and opening it dials its host there.
-
-    What is *not* probed is stated rather than hidden, because libsane still
-    dials it inside the listing.  ``saned_probe.saned_hosts`` returns at most
-    ``saned_probe._MAX_PROBE_HOSTS`` entries and drops the ones it will not
-    guess at: an
-    IPv6 literal, a numeric shorthand, and the rest of a setting it refuses.
-    Hosts named only in ``net.conf`` are not read at all.  And a two-segment
-    ``host:port`` setting is probed as one host on that port, where libsane
-    dials ``host`` and the port number as two hosts, both on
-    ``saned_probe.SANED_PORT``
-    (a configured ``net:`` device on that host is the exception, as above).
-    Enumeration still runs beside such an entry, as it did before the
-    pre-probe existed, so a dead host there can still hold the listing until
-    ``LISTING_DEADLINE_SECONDS`` stops it; refusing to enumerate instead would turn
-    every working IPv6 or five-host setup permanently amber.
-
-    If any probed host timed out -- including one that accepted the
-    connection and said nothing -- the check ends right there with the amber
-    ``_scanner_host_unanswered`` row, and ``saned_probe.blocks_enumeration`` says why it
-    may not be enumerated.  Refused, rejected, unresolved and healthy hosts,
-    and a setting with no host to probe, go on to enumeration.
-
-    A stop ends the probing: each probe looks at ``context.abort`` before
-    it dials and while it waits for saned's reply, and an aborted probe
-    raises rather than becoming a row, because a host nobody finished asking
-    about has no outcome.
-
-    Args:
-        context: The injected dependencies and configuration.
-
-    Returns:
-        The row, when it can be decided here; otherwise what enumeration
-        needs, which is the backend, what each host's probe found, and
-        whether an unlisted configured device may be opened.
+    It runs with the scanner gate free, because ``getaddrinfo`` takes no
+    timeout and a gate held across it would park a scan job.  Every host
+    libsane will dial is probed, with no short circuit, because one dead host
+    holds the whole listing; hosts the probe cannot parse, such as IPv6
+    literals, are still enumerated, and a timed-out host ends the check here.
 
     Raises:
         saned_probe.PreProbeAbortedError: ``context.abort`` was set during a probe.
@@ -1987,62 +1413,11 @@ def _scanner_enumeration(
     """
     Ask the backend what it can see, which is the part that enters SANE.
 
-    This is the only region of the Scanner check that enters libsane, and it
-    runs under the scanner gate on the status strip; it decides nothing.  It
-    is one call, ``scanner.list_and_open``, which lists the devices and, only
-    when ``scanner.device`` is set and no listed device has exactly that id,
-    opens and closes that id once.  Both steps run inside the backend's
-    short-lived listing child, so a check never uses this process's libsane
-    and always sees a fresh control connection to every scanner host.  The
-    child is killed and reaped at ``LISTING_DEADLINE_SECONDS``, and the call
-    does not return, or raise, until it has been reaped.
-
-    The open exists because SANE opens ids it never lists.  An ``escl:`` URL
-    with no ``escl.conf`` entry is one, and a ``net:`` device on a host that
-    is not in ``SANE_NET_HOSTS`` is another: libsane's net backend adds that
-    host when the device is opened.  Opening the id is what a scan does first,
-    so an unlisted device that opens is one a scan can use, and reporting it
-    red would break the rule that a working appliance never goes red.  It is
-    attempted only in that absent case, never on every check, and also when
-    the listing itself failed, because a scan opens a configured id without
-    listing anything.
-
-    A child that crashed, that was stopped at its deadline, or that gave no
-    usable answer is not a listing that found nothing: each has its own row,
-    so each is recorded as what it was.  The launcher has already logged the
-    crash or the timeout, so nothing more is logged for them here; no answer
-    is logged by its class name.  Any other failure is logged by its class
-    name only and treated as an empty listing, with a configured id counted
-    as not opened.
-
-    It is never reached when the preflight stopped the check, and the
-    preflight probes a ``net:`` device's own host before this can open it, so
-    no *probed* host that timed out, or accepted the connection and then said
-    nothing, is listed or opened here (``saned_probe.blocks_enumeration``).  A refused
-    host is listed, and a device on it opened, because a refused connect
-    returns at once inside libsane.  A ``net:`` device whose host could not
-    be probed at all is not opened either (``may_open``): the call is asked
-    to open nothing.  The listing itself still dials every host libsane
-    knows of, including any the preflight could not probe;
-    ``_scanner_preflight`` lists which those are.
-
-    A listing stopped on ``abort`` is none of those: the caller is stopping,
-    so there is no row to give, and recording it as a failed listing would
-    log a warning and draw a scanner fault for a stop.  It propagates, and
-    ``run_checks`` ends the run there.  The launcher has already logged it,
-    at INFO.
-
-    Args:
-        scanner: The backend to ask.
-        configured_device: The configured ``scanner.device``, possibly empty.
-        may_open: Whether an unlisted configured device may be opened; False
-            for a ``net:`` device whose host the preflight could not probe.
-        abort: The caller's abort Event, handed to the listing, or ``None``.
-
-    Returns:
-        What was listed, whether an unlisted configured device opened or was
-        deliberately left unopened, and whether the listing crashed, ran out
-        of time or gave no usable answer.
+    One ``list_and_open`` call in a fresh listing child: it lists, and opens
+    a configured id only when it is not listed, because SANE opens ids it
+    never lists and a scan opens the id first.  A crashed, timed-out or
+    unanswered child is recorded as such, not as an empty listing; an abort
+    propagates, because a stop is not a scanner fault.
 
     Raises:
         ListingAbortedError: The listing was stopped on ``abort``.
@@ -2061,9 +1436,7 @@ def _scanner_enumeration(
         logger.warning("Scanner enumeration failed: %s", type(exc).__name__)
         return _Enumeration(devices=(), failure=_ListingFailure.NO_ANSWER)
     except Exception as exc:
-        # The backend raises ScanError, for instance while a read is stuck,
-        # but a backend is free to raise anything, so the boundary catches
-        # Exception.  Only the type name goes any further.
+        # A backend may raise anything; only the type name goes further.
         survey = DeviceSurvey(
             devices=(),
             list_error=type(exc).__name__,
@@ -2085,11 +1458,6 @@ def _enumeration_from(
     """
     Turn what the listing found into the verdict's plain record.
 
-    Args:
-        survey: What the backend's list-then-open found.
-        configured_device: The configured ``scanner.device``, possibly empty.
-        may_open: Whether an unlisted configured device could be opened.
-
     Returns:
         The listed devices, and for an unlisted configured device, whether it
         opened or was deliberately left unopened.
@@ -2102,9 +1470,7 @@ def _enumeration_from(
         return _Enumeration(devices=devices)
     if not may_open:
         return _Enumeration(devices=devices, open_withheld=True)
-    # ``None`` here would mean no open was attempted although the id is not
-    # listed, which the backend does only when its listing included it -- the
-    # branch above.  Anything but a confirmed open is therefore not opened.
+    # Anything but a confirmed open counts as not opened.
     return _Enumeration(
         devices=devices, configured_opened=survey.configured_opened is True
     )
@@ -2112,27 +1478,11 @@ def _enumeration_from(
 
 def _check_scanner(context: CheckContext) -> CheckResult:
     """
-    Report whether a scanner is there to scan with.
+    Report whether a scanner is there to scan with, without the scanner gate.
 
-    The ungated path: this is what ``_dispatch`` calls, and therefore what
-    ``saneless doctor`` runs.  It is three steps, in the same order the gated
-    ``_scanner_result`` runs them: the preflight, which may settle the row
-    before SANE is entered; the enumeration, which is the only step that
-    enters SANE; and the verdict, which decides the row from plain values.
-    Only the placement of the gate differs between the two functions.
-
-    An ``isinstance`` test against ``CheckResult`` rather than a truthiness
-    shortcut: the preflight returns either a finished row or what enumeration
-    needs, and both are frozen dataclasses and therefore always truthy.  The
-    ``isinstance`` test is also what lets both type checkers narrow ``pre``
-    without a cast.
-
-    Args:
-        context: The injected dependencies and configuration.
-
-    Returns:
-        Exactly one result for ``CheckKey.SCANNER``.
-
+    The same three steps as ``_scanner_result``, which differs only in where
+    it takes the gate.  ``pre`` is tested with ``isinstance`` because both of
+    its types are dataclasses and always truthy.
     """
     pre = _scanner_preflight(context)
     if isinstance(pre, CheckResult):
@@ -2153,14 +1503,9 @@ def _paperless_next_step(
     """
     Return what to do about one connection outcome.
 
-    The sentences are fixed user copy, and they pair with the messages
-    ``connection_status_message`` already owns -- this module authors the
-    remedy, never the diagnosis, so the two surfaces cannot disagree about
-    what happened even if they disagreed about what to do.
-
-    A redirect's next step never names where it pointed: that is upstream
-    text, and this row is shown on the LAN-visible status strip.  It says to
-    use ``https://`` only when the redirect changed nothing but the scheme.
+    This module authors the remedy; ``connection_status_message`` owns the
+    diagnosis.  A redirect's next step never names where it pointed, because
+    the row is LAN-visible.
 
     Args:
         status: The connection-test outcome.
@@ -2220,32 +1565,11 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     """
     Report whether scans can be filed, without spending thirty seconds on it.
 
-    The token is examined first and the probe is skipped entirely when it is a
-    placeholder: an unset token cannot succeed, so a request would only
-    tell paperless-ngx about it.  ``is_placeholder_token`` is the one predicate
-    ``doctor``, this check, the scan route and ``saneless scan`` share, so all
-    four agree on whether the appliance can upload.
-
-    An empty ``paperless.url`` is examined next and skips the probe too.  It
-    loads, so ``serve`` can start and show this row, but a request to it
-    fails inside httpx2 before anything is sent.  The probe would call that
-    MISCONFIGURED, which is true but names both settings; an address that
-    was never set gets its own, plainer row here.
-
-    A redirect's row names no address, because the strip is visible to
-    anyone on the LAN: only whether it was a plain switch to ``https://``
-    reaches the next step.  The sanitised target goes in ``terminal_detail``
-    instead, which ``saneless doctor`` prints and the strip never renders.
-
-    A ``None`` client means one could not be constructed, and
-    ``context.paperless_refusal`` says why.  ``PaperlessClient.__init__``
-    refuses a URL httpx2 will not parse or that carries a user name or
-    password, a token an HTTP header cannot carry, and a TLS trust store it
-    cannot read.  The first three are the configuration row that names
-    ``paperless.url`` and ``paperless.token``; the trust store is a row of its
-    own that names ``SSL_CERT_FILE`` and ``SSL_CERT_DIR``, because the settings
-    are not what is wrong.  A caller that does not say why keeps the "not
-    found at that URL" row.
+    A placeholder token or an empty ``paperless.url`` is reported without a
+    request, because neither can succeed; ``is_placeholder_token`` is the
+    predicate every surface shares.  A redirect's sanitised target goes only
+    in ``terminal_detail``.  A trust store that could not be read gets its own
+    row, because the settings are not what is wrong.
 
     Args:
         context: The injected dependencies and configuration.
@@ -2319,17 +1643,10 @@ def _check_profiles(context: CheckContext) -> CheckResult:
     """
     Report whether there are scan profiles and whether they will survive a restart.
 
-    Exactly one result comes out, and the precedence is fixed: no profiles at
-    all (red) beats a read-only config location (amber) beats no config file at
-    all (amber) beats a generated profile with no name (amber) beats the count.
-    The two amber rows are deliberately different sentences, because "saneless
-    has no file to save to" and "saneless has one and cannot write it" are
-    different facts and only the second is worth investigating.
-
-    The storage outcome is recorded by the worker rather than recomputed here.
-    A fresh ``os.access`` probe cannot substitute for it: the failure that
-    matters is a single-file bind mount, where the directory is writable and
-    only the rename fails.
+    No profiles is red; a read-only config location, no config file and an
+    unnamed generated profile are amber, in that order.  The storage outcome is
+    the worker's record, because ``os.access`` says yes on a single-file bind
+    mount where only the rename fails.
 
     Args:
         context: The injected dependencies and configuration.
@@ -2354,9 +1671,6 @@ def _check_profiles(context: CheckContext) -> CheckResult:
             return CheckResult(
                 key=CheckKey.PROFILES,
                 state=CheckState.WARN,
-                # One literal, deliberately over the 88-column guide (E501 is
-                # off in this project): the sentence is pinned word for word,
-                # and a grep for it has to find it on one line.
                 message="Generated in memory — the config location is read-only, so they are lost on restart.",
                 next_step=(
                     "Make the saneless config directory writable, "
@@ -2367,13 +1681,10 @@ def _check_profiles(context: CheckContext) -> CheckResult:
             return CheckResult(
                 key=CheckKey.PROFILES,
                 state=CheckState.WARN,
-                # One literal for the same reason as the sibling row above.
                 message="Generated in memory — no configuration file is in use, so they are lost on restart.",
                 next_step="Create a saneless config file so the profiles are saved.",
             )
         case ProfileStorage.PERSISTED:
-            # Saved to the config file and will survive a restart, so the only
-            # question left is whether they have names.
             pass
         case _:
             assert_never(context.profile_storage)
@@ -2399,14 +1710,9 @@ def _check_fallback(context: CheckContext) -> CheckResult:
     """
     Report whether a scan has somewhere to go when paperless-ngx is down.
 
-    An unset fallback folder is amber and never red.  The
-    appliance scans and files perfectly without one; what it cannot do is
-    survive paperless-ngx being down, and a red row for a deployment that works
-    is a row people learn to ignore.
-
-    The configured path is not in either sentence.  It is a host filesystem
-    path on a LAN-visible page, omitted for the same reason the log file's
-    path is.
+    An unset fallback folder is amber, because the appliance works without
+    one.  The configured path is never shown, because the page is
+    LAN-visible.
 
     Args:
         context: The injected dependencies and configuration.
@@ -2443,10 +1749,8 @@ def _check_fallback(context: CheckContext) -> CheckResult:
     )
 
 
-# The two settings the Data folder row judges, in the order it judges them.
-# The row names whichever is wrong by its key: a key is in the saneless config
-# file the reader will open, and a path would put a host filesystem path on a
-# LAN-visible page.
+# The Data folder row names a faulty setting by its key, never by its path,
+# because the page is LAN-visible.
 _DATA_DIR_KEY: Final = "output.data_dir"
 _TMP_DIR_KEY: Final = "output.tmp_dir"
 
@@ -2471,15 +1775,9 @@ def _folder_fault(path: Path) -> _FolderFault | None:
     """
     Judge a folder setting the way saneless will use it.
 
-    A folder that exists has to be a folder and take a write.  One that does
-    not exist yet is created when it is first needed, so it is judged by its
-    nearest existing ancestor, which is where creating it would fail: that has
-    to be a folder and take a write too.  Anything named by the setting -- a
-    file, or a dangling link -- counts as existing, because creating a folder
-    there would fail.
-
-    Args:
-        path: The configured folder.
+    A missing folder is created when first needed, so it is judged by its
+    nearest existing ancestor.  A file or a dangling link at the path counts
+    as existing, because creating a folder there would fail.
 
     Returns:
         None when saneless can use or create the folder, else what is wrong.
@@ -2506,9 +1804,8 @@ def _privacy_fault(path: Path) -> _FolderFault:
     """
     Say why ``check_private_dir`` refused a working folder, without its path.
 
-    The verdict is ``check_private_dir``'s, so the row refuses exactly what
-    start-up refuses.  Its message names the path, which the status strip must
-    not show, so the kind of problem is read back here for the row's words.
+    The verdict is ``check_private_dir``'s, so the row refuses what start-up
+    refuses, but its message names the path, so the problem is re-read here.
 
     Args:
         path: The working folder that was refused.
@@ -2544,17 +1841,8 @@ def _working_folder_fault(path: Path) -> _FolderFault | None:
     """
     Judge the working folder the way start-up does: private first, then usable.
 
-    An existing working folder must be a real folder this user owns that
-    nobody else can write to, because scans in progress are kept there.  A
-    missing one is created 0700 when it is first needed, so only where it
-    would be created is judged.
-
-    Args:
-        path: The configured working folder.
-
-    Returns:
-        None when saneless can use or create the folder, else what is wrong.
-
+    Scans in progress are kept there, so an existing one must be private; a
+    missing one is created 0700.
     """
     if os.path.lexists(path):
         try:
@@ -2623,27 +1911,9 @@ def _check_data_dir(context: CheckContext) -> CheckResult:
     """
     Report whether the data and working folders will work, as start-up asks.
 
-    Unlike the fallback folder these are not optional: the job store and the
-    preserved scans live in ``output.data_dir``, and every scan is built in
-    ``output.tmp_dir``.  Both are judged here, so the row asks the question
-    start-up asks and a fault in either is red:
-
-    - a folder that exists has to be a folder that takes a write;
-    - one that does not exist yet is fine when it can be created, judged by
-      its nearest existing ancestor, the way saneless will create it;
-    - an existing working folder must also be private, as
-      ``check_private_dir`` decides: not a symbolic link, owned by this user,
-      and not writable by anyone else.
-
-    The data folder is judged first, and the first setting that fails decides
-    the row, which names it by its key and never by its path.
-
-    Args:
-        context: The injected dependencies and configuration.
-
-    Returns:
-        Exactly one result for ``CheckKey.DATA_DIR``.
-
+    Unlike the fallback folder these are not optional, so a fault in either is
+    red.  The data folder is judged first, and the first faulty setting
+    decides the row.
     """
     output = context.settings.output
     data_fault = _folder_fault(output.data_dir)
@@ -2665,9 +1935,8 @@ def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
     """
     Run the one check a key names.
 
-    A total ``match`` rather than a dict of functions: a seventh ``CheckKey``
-    member stops this function type-checking until somebody decides what it
-    does, which a dict lookup with a fallback would not.
+    A total ``match`` rather than a dict, so a new ``CheckKey`` member stops
+    this type-checking until it has a check.
 
     Args:
         key: The check to run.
@@ -2704,27 +1973,11 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     """
     Run the scanner check, holding the worker's gate only around the listing.
 
-    This is the only check that takes the gate, because the device listing is
-    the only thing any check does inside libsane.  The preflight -- name
-    resolution and the saned handshake -- runs with the gate free, and a
-    preflight that settles the row never touches it.  The listing, and the
-    open of an unlisted configured device, run in the backend's listing child
-    inside one non-blocking hold, released in a ``finally`` only after the
-    child is reaped; the verdict runs after the release.  A gate already held
-    is reported as the neutral busy row, not waited on.
-
-    Holding the gate across resolution could park a scan whose job row already
-    reads ``SCANNING`` behind a broken resolver, waiting on it would queue the
-    probe behind a scan that runs for minutes, and releasing it while the child
-    is still inside libsane would let a scan in beside it.
-    ``test_a_gated_run_returns_what_an_ungated_run_returns`` holds this path to
-    the rows ``_check_scanner`` gives ``saneless doctor``.
-
+    The gate is tried without blocking, held only while the listing child
+    runs and released after it is reaped; a held gate gives the busy row.
+    Holding it across name resolution could park a scan behind a broken
+    resolver, and waiting on it would queue the probe behind a long scan.
     See docs/explanation/decisions/0003-scanner-gate-is-a-lock.md.
-
-    Args:
-        context: The injected dependencies and configuration.
-        scanner_gate: The worker's gate, tried without blocking.
 
     Returns:
         The scanner row, or the neutral busy row when the gate was not free.
@@ -2755,54 +2008,19 @@ def run_checks(
     Run every check once, in member order, and never raise.
 
     This is the function both surfaces call, and the tuple it returns is the
-    whole of what either of them may show.  It iterates ``CheckKey``, so
-    a check that exists for ``saneless doctor`` and not for the status strip is
-    not something either surface is able to express.
+    whole of what either of them may show.
 
-    ``skip_scanner`` is honoured here rather than inside the scanner check, and
-    it returns the paused row without entering the backend at all.  That is
-    correctness, not politeness: nothing in ``sane_backend.py`` mutually
-    excludes two SANE calls, so a status probe landing on the device mid-scan
-    is a second caller into the same C library while a read is outstanding,
-    which SANE does not allow.  It is honoured
-    *first*, before the gate is looked at: a caller that already knows a scan
-    is running has no reason to touch the gate at all.
+    ``skip_scanner`` is honoured first, before the gate, and never enters the
+    backend: SANE does not allow a second call into the library while a scan's
+    read is outstanding.  The gate is passed in, not held by the caller around
+    the whole run, so a scan start never waits on the Paperless check's HTTP
+    budget.
 
-    The gate is a parameter rather than something the caller holds around this
-    call, and that is deliberate.  Only ``_check_scanner`` enters
-    libsane.  ``_check_paperless`` carries a multi-second HTTP budget, and
-    ``_check_fallback`` and ``_check_data_dir`` each create and delete a real
-    file.  A caller that wrapped every check made the lock that exists to keep two
-    callers out of libsane into the lock a scan start waits on: ``ScanWorker``
-    would sit in ``with self._scanner_gate:`` with the job row already written
-    ``SCANNING`` while a health probe waited on a Paperless timeout.  Passing
-    the gate in lets the registry hold it for the one check that needs it.
-
-    The attempt on the gate is non-blocking and a failure produces the paused
-    row, which is the one move ``ScanWorker.scanner_gate`` documents as
-    permitted for a caller.  A blocking acquire would be wrong here for the
-    reason that docstring gives: the probe would queue behind a scan that can
-    run for minutes and then enter SANE with the freshness its own caller
-    assumed long gone.
-
-    A check that raises is caught and rendered as a red row with a
-    developer-constant message.  A registry that could raise would take the
-    whole strip down and with it the checks that passed, and the
-    exception text is exactly the thing that must not reach a LAN-visible page.
-    That handler covers the gated scanner branch too, and the gate is released
-    on the way out of it.
-
-    A caller that is stopping sets ``context.abort``.  The run then ends
-    before the next check, and a saned pre-probe or a scanner listing in
-    flight ends as aborted, which also ends the run there, so a stop never
-    waits out the Paperless check's budget after the scanner check was
-    stopped.  The Paperless probe itself is one HTTP request that cannot be
-    interrupted: a stop that lands during it waits for it, up to
-    ``saned_probe.PROBE_CONNECT_SECONDS`` plus
-    ``saned_probe.PROBE_READ_SECONDS``.  What is returned then is
-    only the rows of the checks that finished, which is the one case where
-    there is not one row per member: it exists only for a stopping caller,
-    and that caller stores none of it.
+    A check that raises becomes a red row with a developer-constant message,
+    because its exception text must not reach a LAN-visible page.  A set
+    ``context.abort`` ends the run before the next check, or as soon as an
+    in-flight probe or listing aborts; an in-flight Paperless request is not
+    interruptible.
 
     Args:
         context: The injected dependencies and configuration.
