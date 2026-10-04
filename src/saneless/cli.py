@@ -1325,19 +1325,15 @@ def _scan_title(title: str, profile: ProfileConfig, *, now: datetime) -> str:
 @click.pass_context
 def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> None:
     """Scan a document and upload to paperless-ngx."""
-    # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard. --help never
-    # reaches this body, so it needs no python-sane.
+    # Refuses before loading config or touching the device.
     require_sane()
     settings = _load_cli_settings(ctx)
-    # Before the scanner is opened, and before anything that can refuse the
-    # scan: the pages a killed scan left behind are recovered whether or not
-    # this one goes ahead.
+    # Before anything that can refuse the scan, so a killed scan's pages are
+    # recovered whether or not this one goes ahead.
     _recover_orphaned_workspaces(settings)
 
-    # Every refusal below is raised rather than printed, so the group guard
-    # logs it and ends it with a Try: line like any other failure; the first
-    # line is the message, printed as-is, and the exit code is 2.
+    # Every refusal below is raised, not printed, so the guard logs it and
+    # adds its Try: line.
     if profile not in settings.profiles:
         msg = f"Unknown profile: {profile}"
         raise ConfigError(msg, next_step=UNKNOWN_PROFILE_NEXT_STEP)
@@ -1345,24 +1341,14 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
     now = datetime.now(tz=UTC)
     resolved_title = _scan_title(title, settings.profiles[profile], now=now)
 
-    # Refused here, before the scanner is opened, because a scan that
-    # cannot upload is wasted paper. The refusal is unconditional -- a
-    # configured paperless.consume_dir fallback does not soften it, or `scan`,
-    # `doctor` and the web UI would disagree about whether the appliance can
-    # work. `devices`, `auto-profiles` and `jobs` are deliberately untouched:
-    # none of them talks to paperless-ngx.
+    # Refused before the scanner is opened, because a scan that cannot upload
+    # is wasted paper. A consume_dir fallback does not soften it, or `scan`,
+    # `doctor` and the web UI would disagree about whether the appliance works.
     #
-    # This is the second place cli.py unwraps the token; the PaperlessClient
-    # construction below is the other. The value goes to the predicate and
-    # nowhere else -- it is never logged, echoed or interpolated into the
-    # message, which is a developer constant (ASVS 4.0.3 V7.1). The line is built in the
-    # `<what saneless was doing>: <problem>` shape because ErrorCategory.CONFIG
-    # prints the exception as-is (_failure_line), so the "what saneless was
-    # doing" half has to be part of the message.
-    #
-    # An empty paperless.url is refused here for the same reason: the upload
-    # would fail for certain as a configuration error, and no consume-folder
-    # copy is made for it, so the stack would be fed for a PDF in failed/.
+    # The token goes to the predicate and nowhere else: it is never logged,
+    # echoed or interpolated into the message (ASVS 4.0.3 V7.1). The message
+    # carries its own "what saneless was doing" half, because a CONFIG error
+    # is printed as-is.
     unset = None
     if is_placeholder_token(settings.paperless.token.get_secret_value()):
         unset = _UNSET_CREDENTIAL_PROBLEM
@@ -1373,10 +1359,8 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
         raise ConfigError(msg)
 
     manual_duplex = settings.profiles[profile].duplex == "manual"
-    # Both multi-page refusals come before the backend exists, so no paper
-    # moves.  Manual duplex first: a terminal would not help there, so the
-    # operator is told the reason that would.  Off a terminal nobody can say
-    # whether there is another page, so cron or a pipe never drives the loop.
+    # Every refusal below comes before the backend exists, so no paper moves.
+    # Manual duplex first: a terminal would not help there.
     if multi_page and manual_duplex:
         raise ConfigError(
             multi_page_manual_duplex_refusal(profile),
@@ -1386,8 +1370,6 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
         raise ConfigError(
             MULTI_PAGE_NEEDS_TERMINAL, next_step=SCAN_FROM_A_TERMINAL_NEXT_STEP
         )
-    # Refused here, before the backend exists, so no paper moves: from cron or a
-    # pipe there is nobody to flip the stack, and pass A would be wasted.
     if manual_duplex and not _stdin_is_interactive():
         raise ConfigError(
             manual_duplex_needs_terminal_refusal(profile),
@@ -1395,11 +1377,8 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
         )
 
     scanner = SaneBackend(host=settings.scanner.host)
-    # click runs close callbacks when this command's Context leaves its `with`
-    # block: on success, on ctx.exit(), and while an exception propagates --
-    # all of them before the guarded group's error handlers choose an exit
-    # code. So SANE is already down by the time the error line is printed, and
-    # no early exit path can skip it.
+    # click runs close callbacks on every way out of this command, before the
+    # guard chooses an exit code, so SANE is down before the error line prints.
     ctx.call_on_close(scanner.close)
     paperless = PaperlessClient(
         settings.paperless.url,
@@ -1418,20 +1397,11 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
         request = build_pipeline_request(
             profile_name=profile,
             title=resolved_title,
-            # A uuid4, exactly as the worker supplies for a web job.  Without
-            # one, every CLI run composed {timestamp}-{title-slug}.pdf and
-            # rested on the timestamp alone -- while build_pdf_filename's whole
-            # collision argument is "uniqueness comes from the job id".  That is
-            # not cosmetic: preservation never replaces a file in failed/, so
-            # two same-second scans of the same title would share a name there,
-            # leaving the later PDF under a numbered name that no longer says
-            # which scan it was, and refusing the later page files outright.
-            # Four kinds of artefact land there, and every mid-scan fault can
-            # reach it.
+            # A uuid4, as for a web job: file names in failed/ are unique only
+            # through the job id, and preservation never replaces a file there.
             job_id=str(uuid4()),
-            # The command line has no tag or correspondent option, so neither
-            # control is answered and the profile's defaults apply -- the same
-            # rule, through the same function, as a web form nobody touched.
+            # No tag or correspondent option, so the profile's defaults apply,
+            # as on a web form nobody touched.
             metadata=resolve_scan_metadata(
                 settings.profiles[profile],
                 tags=None,
@@ -1440,10 +1410,9 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
             ),
             hooks=RequestHooks(
                 status_callback=status_callback,
-                # run_pipeline is synchronous, so the flip question is asked
-                # and read on this thread, where a signal ends its wait.
+                # run_pipeline is synchronous, so every question is asked and
+                # read on this thread, where a signal ends its wait.
                 flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
-                # So is every multi-page question.
                 multi_page=multi_page,
                 pass_coordinator=ClickPassCoordinator() if multi_page else None,
                 # The run sets it once its outcome is fixed, and from then on
@@ -1458,26 +1427,17 @@ def scan(ctx: click.Context, profile: str, title: str, *, multi_page: bool) -> N
             request,
         )
     finally:
-        # Failures reach the group guard, which prints one line and exits with
-        # its ExitCode; the client is closed either way.
         paperless.close()
 
-    # The outcome line, the stderr lines and the exit code are the CLI's whole
-    # report of a scan: nothing is written to the job store. A document that was
-    # delivered but degraded -- saved to the consume folder, or uploaded with a
-    # warning -- exits 6 or 7, so a script can tell it from a clean success and
-    # from a paperless failure (3), which it might retry by scanning again.
-    #
-    # Every closing line goes through a helper that survives a dead terminal:
-    # a hangup after delivery is deferred, and the lines it leaves nowhere to
-    # write must not replace that exit code with a crash.
+    # These lines and the exit code are the CLI's whole report of a scan;
+    # nothing goes to the job store. Every line goes through a helper that
+    # survives a dead terminal, because a hangup after delivery is deferred
+    # and must not replace the exit code with a crash.
     _echo_out(
         outcome_line(job_state_for(result.outcome), result.warning, resolved_title)
     )
-    # Removed pages are not kept anywhere, so naming them is how the operator
-    # learns which sheets to rescan if a real page was taken for a blank.  It
-    # goes to stdout beside the outcome and leaves the exit code alone: it is
-    # information about a success, not a warning.
+    # Removed pages are not kept anywhere, so the note names them for a rescan.
+    # It is information about a success, not a warning, so it goes to stdout.
     removed_note = removed_pages_note(result.removed_positions, result.pages_scanned)
     if removed_note is not None:
         _echo_out(removed_note)
@@ -1494,19 +1454,9 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
     """
     Print one device's capabilities, naming only what that device reported.
 
-    Extracted from ``devices`` so that rendering the resolution constraint in
-    whichever shape the device gave it does not push that command past ruff's
-    PLR0912 branch limit. The limit is respected rather than raised, and
-    nothing is suppressed.
-
-    Every line is printed only when there is something to put after its label.
-    A label followed by nothing is the symptom the operator actually saw on a
-    range-reporting device: it reads as "this scanner offers none",
-    when the truth was that saneless had not read what the scanner offered.
-
-    Args:
-        caps: The capabilities to render.
-
+    A line is printed only when there is something after its label: a bare
+    label reads as "this scanner offers none" when saneless had only not read
+    what it offered.
     """
     if caps.sources:
         sources = ", ".join(neutralise_controls(s) for s in caps.sources)
@@ -1514,9 +1464,8 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
     if caps.resolutions:
         click.echo(f"  Resolutions: {', '.join(str(r) for r in caps.resolutions)}")
     elif caps.resolution_range is not None:
-        # The device gave a span rather than an enumeration, so it is shown as
-        # a span. Expanding it into a list of plausible values would print
-        # saneless's own invention rather than the device's answer.
+        # Shown as the span the device gave: expanding it into a list would
+        # print saneless's invention rather than the device's answer.
         low, high, step = caps.resolution_range
         click.echo(f"  Resolution range: {low:g} to {high:g} dpi in steps of {step:g}")
     if caps.modes:
@@ -1533,17 +1482,8 @@ def _capabilities_dict(caps: DeviceCapabilities) -> dict[str, object]:
     Return one device's capabilities as the JSON object ``devices`` prints.
 
     This is the machine contract scripts read, so it carries exactly what
-    ``_echo_capabilities`` shows and nothing it does not: a key appears only
-    when the device reported something for it, and the resolution support
-    keeps whichever shape the device gave, a list or a min/max/step range
-    with the floats as reported.
-
-    Args:
-        caps: The capabilities to convert.
-
-    Returns:
-        The capabilities, keyed in the order the text mode prints them.
-
+    ``_echo_capabilities`` shows: a key appears only when the device reported
+    something for it, and the resolution support keeps the device's shape.
     """
     result: dict[str, object] = {}
     if caps.sources:
@@ -1566,18 +1506,9 @@ def _probe_capabilities(scanner: ScannerBackend, name: str) -> DeviceCapabilitie
     """
     Read one device's capabilities, or report why they could not be read.
 
-    Only a scanner error is caught: one device that will not answer must not
-    hide the others, so its reason is logged and printed as one stderr line
-    and the caller carries on. Anything else is a saneless bug and still
-    reaches the group guard.
-
-    Args:
-        scanner: The open backend.
-        name: The SANE device name to probe.
-
-    Returns:
-        The capabilities, or the one-line reason the probe failed.
-
+    Only a scanner error is caught, so one device that will not answer does
+    not hide the others: its reason is printed on stderr and returned.
+    Anything else reaches the group guard.
     """
     try:
         return scanner.get_capabilities(name)
@@ -1598,17 +1529,12 @@ def _echo_device_table(device_list: list[DeviceInfo]) -> None:
 
     Each value is escaped before it is cut, so the width is measured on what
     prints, and every row fits a terminal of 70 columns or more.
-
-    Args:
-        device_list: The devices SANE reported.
-
     """
     cols = shutil.get_terminal_size((80, 24)).columns
     vendor_w = _DEVICE_VENDOR_COL_WIDTH
     model_w = _DEVICE_MODEL_COL_WIDTH
     type_w = _DEVICE_TYPE_COL_WIDTH
-    # Three single spaces separate the four columns, so a row is never wider
-    # than the terminal once it has room for the Name column's floor.
+    # Three single spaces separate the four columns.
     name_w = max(_DEVICE_NAME_COL_FLOOR, cols - (vendor_w + model_w + type_w + 3))
     header = f"{'Name':<{name_w}} {'Vendor':<{vendor_w}} {'Model':<{model_w}} {'Type'}"
     click.echo(header)
@@ -1628,19 +1554,9 @@ def _devices_as_json(
     """
     Print the device list as one JSON document on stdout.
 
-    Without ``capabilities`` the document is the four keys it has always had,
-    in the same order, so scripts written against it see no change. With it,
-    each device also gets ``capabilities``, which is ``null`` alongside a
-    ``capabilities_error`` reason when that device's probe failed.
-
-    Args:
-        scanner: The open backend.
-        device_list: The devices SANE reported.
-        capabilities: Whether to probe and include each device's capabilities.
-
-    Returns:
-        The number of devices whose capabilities could not be read.
-
+    With ``capabilities`` each device also gets ``capabilities``, which is
+    ``null`` beside a ``capabilities_error`` reason when its probe failed.
+    Returns how many probes failed.
     """
     data: list[dict[str, object]] = [
         {
@@ -1671,14 +1587,7 @@ def _devices_as_text(
     """
     Print the device table, then each device's capabilities when asked.
 
-    Args:
-        scanner: The open backend.
-        device_list: The devices SANE reported.
-        capabilities: Whether to probe and print each device's capabilities.
-
-    Returns:
-        The number of devices whose capabilities could not be read.
-
+    Returns how many probes failed.
     """
     _echo_device_table(device_list)
     failed = 0
@@ -1709,9 +1618,6 @@ def _devices_as_text(
 @click.pass_context
 def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     """List available scanning devices."""
-    # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard. --help never
-    # reaches this body, so it needs no python-sane.
     require_sane()
     _settings = _load_cli_settings(ctx)
 
@@ -1726,9 +1632,7 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     device_list = scanner.get_devices()
 
     if not device_list:
-        # The empty JSON array is data, so it goes to stdout; the table mode's
-        # sentence is a status line like "Discovering scanners...", so it goes
-        # to stderr and an empty table leaves stdout empty.
+        # The empty JSON array is data, for stdout; the sentence is status.
         if as_json:
             click.echo("[]")
         else:
@@ -1737,9 +1641,7 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
 
     render = _devices_as_json if as_json else _devices_as_text
     failed = render(scanner, device_list, capabilities=capabilities)
-    # A device whose capabilities could not be read is reported where it
-    # stands and the others still print; the exit code then says a scanner
-    # read failed, once everything has been written.
+    # The exit code says a capability read failed, once everything is written.
     if failed:
         ctx.exit(ExitCode.SCAN)
 
@@ -1756,16 +1658,10 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
 def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     """List recent scan job history."""
     settings = _load_cli_settings(ctx)
-    # A read and nothing more: the history may belong to a running server, so
-    # the read neither creates the database or its folder nor upgrades an
-    # older schema under it, and run by anyone but the database's owner it
-    # creates no -wal or -shm file beside it either.  No database yet is an
-    # empty history; one that cannot be reached is an error.  The log file is
-    # outside that promise.  Like every one-shot command, this one has
-    # already set up the rotating log file above, and that may create
-    # data_dir and the log, or rotate the log into a fresh one, owned by
-    # whoever ran the command: root under sudo, in a data_dir the server
-    # shares.
+    # A read and nothing more, because the history may belong to a running
+    # server: no database, folder, schema upgrade or (for anyone but its owner)
+    # -wal or -shm file is created. The log file set up above is outside that
+    # promise, and under sudo it may be created or rotated owned by root.
     recent = read_recent_jobs(settings.output.db_path, limit)
     if as_json:
         click.echo(
@@ -1775,30 +1671,18 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                         "id": j.id,
                         "profile": j.profile,
                         "title": j.title,
-                        # Raw enum value, deliberately not humanised: this
-                        # is the machine contract and scripts compare
-                        # against "DONE" / "FALLBACK".
+                        # The JSON is the machine contract documented in
+                        # docs/how-to/cli-scripting.md: raw enum values and
+                        # UTC ISO-8601, never humanised or localised.
                         "state": j.state.value,
-                        # UTC ISO-8601, deliberately not localised: this is
-                        # a machine contract documented in
-                        # docs/how-to/cli-scripting.md, and local time is
-                        # for *user-facing* surfaces. The human table below
-                        # goes local; this does not.
                         "created_at": j.created_at.isoformat(),
                         "outcome": j.outcome.value if j.outcome else None,
                         "warning": j.warning,
-                        # The full stored text, host paths and the
-                        # paperless URL included: the web page shows only
-                        # a path-free sentence that points here. Added
-                        # after the other keys, so existing scripts are
-                        # unaffected.
+                        # The full stored text, host paths included: the web
+                        # page shows only a path-free sentence pointing here.
                         "error": j.error,
-                        # Added after the other keys, so existing scripts
-                        # are unaffected. NULL when never recorded, never
-                        # a zero. The positions are 1-based scanned page
-                        # numbers in document order, and are information
-                        # rather than a warning: a DONE that removed blank
-                        # backs keeps "warning": null.
+                        # null when never recorded, never a zero. Positions
+                        # are 1-based scanned page numbers in document order.
                         "pages_scanned": j.pages_scanned,
                         "pages_removed": j.pages_removed,
                         "pages_uploaded": j.pages_uploaded,
@@ -1828,15 +1712,12 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
         click.echo(header)
         click.echo("-" * min(len(header), cols))
         for j in recent:
-            # A stored title or profile can hold a control character, and
-            # this table goes to a terminal. It is escaped before
-            # truncating, so the width is measured on what prints.
+            # Escaped before truncating, so the width is measured on what
+            # prints.
             profile = _truncate(neutralise_controls(j.profile), profile_w)
             title = _truncate(neutralise_controls(j.title), title_w)
             click.echo(
-                # The one shared formatter the web history table reads, so
-                # the two surfaces cannot drift. Seconds are gone and
-                # the zone is named.
+                # The formatter the web history table reads too.
                 f"{local_time(j.created_at):<{ts_w}} "
                 f"{profile:<{profile_w}} "
                 f"{title:<{title_w}} "
@@ -1849,16 +1730,8 @@ def _bind_next_step(exc: OSError) -> str:
     Choose the advice for an address ``serve`` could not bind, from its errno.
 
     A port another program holds, a port this user may not take and an
-    address this machine does not have are three different fixes, and the
-    advice for one is wrong for the others.  Anything else names both
-    settings without guessing which of them is wrong.
-
-    Args:
-        exc: The error ``socket()``, ``bind()`` or ``listen()`` raised.
-
-    Returns:
-        The next step for the ``Try:`` line.
-
+    address this machine does not have are three different fixes.  Anything
+    else names both settings without guessing which is wrong.
     """
     match exc.errno:
         case errno.EADDRINUSE:
@@ -1875,30 +1748,17 @@ def _bind_listening_sockets(host: str, port: int) -> list[socket.socket]:
     """
     Bind and listen on every address ``serve`` was given, before uvicorn starts.
 
-    The sockets are bound here rather than by uvicorn so that the port
-    saneless reports is the port it holds: with port 0 the OS chooses one,
-    and there is no gap between checking a port and binding it for another
-    process to take it in. The host is resolved, and every address it
-    resolves to is bound, each once, the way uvicorn bound a name itself:
-    ``localhost`` usually resolves to ``::1`` first and ``127.0.0.1`` second,
-    and a reverse proxy pointed at either must reach saneless. An address
-    literal resolves to itself alone. With port 0 the port the OS chose for
-    the first address is reused for the rest, so one port serves them all.
-
+    Bound here rather than by uvicorn so that the port saneless reports is the
+    port it holds, with no gap between choosing a port and binding it.  Every
+    address the host resolves to is bound once -- ``localhost`` is usually
+    both ``::1`` and ``127.0.0.1``, and a proxy pointed at either must reach
+    saneless -- and with port 0 the OS's first choice is reused for the rest.
     If any address cannot be bound, the sockets already bound are closed and
-    ``serve`` fails, rather than starting on only part of what was asked.
-
-    Args:
-        host: The address or name to bind.
-        port: The port to bind; 0 asks the OS for a free one.
-
-    Returns:
-        The bound, listening sockets, in the resolver's order.
+    ``serve`` fails rather than start on part of what was asked.
 
     Raises:
         ConfigError: The host did not resolve or an address could not be
-            bound. That is a setup problem, so it exits 2 like any other
-            failure to start.
+            bound.
 
     """
     try:
@@ -1942,26 +1802,15 @@ def _bind_one(
     """
     Bind and listen on one resolved address.
 
-    The options match what uvicorn's own bind set. SO_REUSEADDR lets a
-    restart bind a port whose last connections are still closing. On IPv6,
-    IPV6_V6ONLY keeps ``::`` from also listening on IPv4 behind the
-    operator's back. Port sharing is never switched on, because it would let
-    a second process listen on the same port. ``listen()`` is called before
-    the socket is handed over, so a connection made while the app starts up
-    waits in the queue instead of being refused.
-
-    Args:
-        host: The address or name ``serve`` was given, for the message.
-        port: The port ``serve`` was given, for the message.
-        kind: The family, socket type and protocol the resolver gave.
-        sockaddr: The resolved address to bind.
-
-    Returns:
-        The bound, listening socket.
+    The options match uvicorn's own bind.  SO_REUSEADDR lets a restart bind
+    a port whose last connections are still closing; IPV6_V6ONLY keeps
+    ``::`` from also listening on IPv4; port sharing stays off, so no second
+    process can listen on the port.  ``listen()`` is called before the socket
+    is handed over, so a connection made during start-up waits in the queue.
+    ``host`` and ``port`` are only for the message.
 
     Raises:
-        ConfigError: The address could not be bound. The message names the
-            resolved address too when the host was a name.
+        ConfigError: The address could not be bound.
 
     """
     family, socktype, proto = kind
@@ -1996,48 +1845,35 @@ def _bind_one(
 @click.pass_context
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Start the web server."""
-    # The web stack is imported here rather than with the module, so that no
-    # other command pays for FastAPI, Starlette and uvicorn.
+    # Imported here, so that no other command pays for the web stack.
     from .web.app import create_app
     from .web.server import run_server
     from .web.services import Services
 
-    # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard. --help never
-    # reaches this body, so it needs no python-sane.
     require_sane()
-    # The one command that streams its logs: a service writes no file, so its
-    # records reach `docker logs` and journald instead. Every other command
-    # keeps the rotating file handler.
+    # A service writes no log file; its records reach `docker logs` and
+    # journald through stderr.
     settings = _load_cli_settings(ctx, stream_logs=True)
     actual_host = host or settings.output.web_host
-    # An explicit 0 is a request for an OS-chosen port, not a missing value,
-    # so only an absent flag falls back to the configured port.
+    # An explicit 0 asks for an OS-chosen port, so only an absent flag falls
+    # back to the configured port.
     actual_port = port if port is not None else settings.output.web_port
 
-    # The address is bound before SANE is initialised or the app is built, so
-    # a port that is taken fails at once, costing no SANE start-up and leaving
-    # no initialised backend behind that no lifespan would ever close.
+    # Bound before SANE is initialised, so a taken port fails at once and
+    # leaves no initialised backend that no lifespan would ever close.
     sockets = _bind_listening_sockets(actual_host, actual_port)
-    # Every path out of here closes every socket, whatever raises between the
-    # bind and the end of Server.run.
     try:
         # serve scans nothing itself, so SANE failing to initialise is a
-        # failure to start -- "can't start, fix your setup", exit 2 like a
-        # port that cannot be bound -- not exit 1, which means a scan failed.
+        # failure to start, ExitCode.CONFIG, not a failed scan.
         try:
             scanner = SaneBackend(host=settings.scanner.host)
         except ScanError as exc:
             msg = f"The web server could not start: {exc}"
             raise ConfigError(msg, next_step=SERVE_SANE_START_NEXT_STEP) from exc
-        # This backend outlives the command body once the server is up: the
-        # lifespan closes it after the worker confirms it stopped, which is
-        # the only point at which no thread can still be inside SANE, and it
-        # deliberately leaves it open when a thread is stuck. So serve never
-        # closes it after a successful start. Until the lifespan has taken it
-        # over, though, nobody else will: an app that could not be built
-        # (exit 3) or a server that never started (exit 2) would otherwise
-        # leave SANE initialised. The stack holds the close until then.
+        # Once the lifespan has started it owns the backend: it closes it after
+        # the worker stops, or leaves it open on purpose when a thread is
+        # stuck inside SANE. Until then serve owns it, and this stack closes it
+        # if the app cannot be built or the server never starts.
         with contextlib.ExitStack() as unowned:
             unowned.callback(scanner.close)
             # create_app closes the job store and Paperless client itself if
@@ -2052,8 +1888,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
                 if isinstance(found, Services) and found.lifecycle.started:
                     unowned.pop_all()
                 raise
-            # A normal return means the server ran, so its lifespan owned the
-            # backend and has already closed it, or kept it open on purpose.
+            # A normal return means the lifespan ran and owned the backend.
             unowned.pop_all()
     finally:
         for sock in sockets:
@@ -2067,13 +1902,7 @@ def _echo_write_result(
     Print what ``auto-profiles`` did to the config file, grouped by action.
 
     The group lines come from ``ProfileWriteResult.groups``, the same
-    vocabulary the worker's startup log uses. Added and Refreshed
-    groups are followed by one detail line per profile they wrote.
-
-    Args:
-        result: What the write did.
-        profiles: The generated profiles, for the detail lines.
-
+    vocabulary the worker's startup log uses.
     """
     path = result.path.resolve()
     groups = result.groups()
@@ -2102,20 +1931,11 @@ def _note_root_owned_config(path: Path, system: Path) -> None:
     """
     Say on stderr when a config file this command created belongs to root.
 
-    A new file takes its directory's owner, so root writing into a root-owned
-    ``/etc/saneless`` -- the usual bare-metal layout -- leaves the file root's,
-    mode 0600.  saneless running as an ordinary user would then find it on the
-    next start and fail to read it, so the operator is told which file to give
-    to that user.  With no writable system directory, root's file is instead
-    the per-user one under its own home, which no other user searches; a
-    ``chown`` there would fix nothing, so that note gives the moves that do.
-    A file owned by anyone else needs nothing, and a status that cannot be
+    A new file takes its directory's owner and mode 0600, so saneless running
+    as an ordinary user could not read a root-owned system file.  Root's
+    per-user file is under its own home, which no other user searches, so
+    that note gives other moves than a ``chown``.  A status that cannot be
     read is not worth failing a write that succeeded.
-
-    Args:
-        path: The file just created, absolute.
-        system: The system config file, absolute.
-
     """
     try:
         owner = path.stat().st_uid
@@ -2133,27 +1953,11 @@ def _new_config_target(settings: Settings) -> Path:
     """
     Choose where ``auto-profiles`` creates a config file when none was loaded.
 
-    The last documented location saneless may write, because the search reads
-    in order and stops at the first file: a new file in ``./`` -- which in the
-    container is the working directory ``/var/lib/saneless`` -- would outrank
-    ``/etc/saneless`` on the next start, and the command meant to help would
-    have built the shadowing trap itself.  So the system file is the target
-    when its directory already exists and this process may write it; that is
-    the directory the container's ``./config`` mount provides.  It must already
-    exist because saneless never creates a system directory, even as root.
-    Otherwise the per-user XDG file is the target, which nothing but the
-    working-directory file outranks.
-
-    The candidates are the ones the load searched, so this reads the same list
-    in the same order and cannot drift from it; settings built without a load
-    fall back to the search list itself.  Nothing is created here.
-
-    Args:
-        settings: The settings in hand, carrying the search that built them.
-
-    Returns:
-        The file to create, absolute.
-
+    Never ``./``: the search stops at the first file, so a new file there
+    would shadow ``/etc/saneless`` on the next start.  The system file is the
+    target when its directory already exists and is writable, since saneless
+    never creates a system directory; otherwise the per-user XDG file is.
+    The candidates are the ones the load searched, so they cannot drift.
     """
     system, user = _new_config_candidates(settings)
     if system.parent.is_dir() and os.access(system.parent, os.W_OK):
@@ -2165,13 +1969,8 @@ def _new_config_candidates(settings: Settings) -> tuple[Path, Path]:
     """
     Return the system and per-user config files ``auto-profiles`` may create.
 
-    Args:
-        settings: The settings in hand, carrying the search that built them.
-
-    Returns:
-        The last searched candidate (the system file) and the second (the
-        per-user XDG file), from the recorded search or else the search list.
-
+    They are the last and the second searched candidates, from the recorded
+    search or else the search list.
     """
     discovery = settings.config_discovery
     searched = discovery.searched if discovery is not None else ()
@@ -2184,19 +1983,10 @@ def _passed_over_system_dir(settings: Settings) -> str:
     Say why the system config directory was not the target, if it exists.
 
     ``os.access`` refuses a read-only mount and a directory owned by someone
-    else alike, and either sends ``auto-profiles`` to the per-user file. When
-    that write then fails, its message would name only a file the operator
-    never meant to use; this names the directory that was passed over and
-    which of the two it is, because their fixes differ -- remount it
-    read-write, or change its owner.
-
-    Args:
-        settings: The settings in hand, carrying the search that built them.
-
-    Returns:
-        `` (<dir> exists but ...)`` to append to the failure, or an empty
-        string when the directory does not exist or is writable.
-
+    else alike, and their fixes differ, so when the per-user write then
+    fails its message names the passed-over directory and which case it is.
+    Returns an aside to append, or "" when the directory is absent or
+    writable.
     """
     directory = _new_config_candidates(settings)[0].parent.absolute()
     if not directory.is_dir() or os.access(directory, os.W_OK):
@@ -2218,28 +2008,17 @@ def _passed_over_system_dir(settings: Settings) -> str:
 @click.pass_context
 def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     """Generate scan profiles from scanner capabilities."""
-    # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard. --help never
-    # reaches this body, so it needs no python-sane.
     require_sane()
-    # The warning is suppressed so that the refusal below can be the only
-    # thing said: both are the same sentence, and printing it twice teaches a
-    # reader that this output repeats itself.
+    # The refusal below is the warning's own sentence, so it is said once.
     settings = _load_cli_settings(ctx, warn_stale=False)
     if config_file_state(settings) is ConfigFileState.STALE_ONLY:
-        # This command is the only thing in saneless that creates a config
-        # file, and with nothing loaded its target is a saneless.toml in a
-        # searched directory -- which the next start loads.  Writing it now
-        # would not lose the old file's URL and token but would bury them: the
-        # search would stop at the new file, the red row telling the operator
-        # to rename the old one would drop to amber, and the appliance would
-        # keep running on defaults.  Refusing costs a rename; writing costs
-        # the evidence.  Exit 2 through the group guard, as a configuration
-        # error.
+        # A new saneless.toml would stop the next search before the old-name
+        # file, burying its URL and token and turning the red rename row amber
+        # while the appliance ran on defaults. Refusing costs only a rename.
         row = configuration_check(settings, absolute_paths=True)
         msg = f"{row.message} {row.next_step}"
-        # The row's own next step ends "restart saneless", which is right for
-        # the service it was written for; this command is run again instead.
+        # The row's next step says to restart saneless; here the command is
+        # run again instead.
         raise ConfigError(
             msg,
             next_step=(
@@ -2247,57 +2026,37 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
                 f"{CONFIG_FILENAME}, then run saneless auto-profiles again."
             ),
         )
-    # Not stale-only, so nothing is refused; an old file sitting beside the
-    # loaded one still gets said once, here rather than at load.
     _warn_stale_config(settings)
 
     scanner = SaneBackend(host=settings.scanner.host)
-    # This command ends by returning or by raising, the refusal to write the
-    # config file included; a close callback covers both.
     ctx.call_on_close(scanner.close)
     device_list = scanner.get_devices()
     if not device_list:
-        # A scanner condition, exit 1 through the guard, exactly as `scan`
-        # reports the same finding: an exit code means the same thing in every
-        # command.
+        # The same scanner failure `scan` reports for the same finding.
         msg = (
             "No scanner found: auto-detection found no devices. "
             "Check what SANE can see with `saneless devices`"
         )
         raise NoScannerFoundError(msg)
 
-    # Use configured device or first discovered device.  A discovered one is
-    # also pinned below, so later scans do not follow whichever scanner SANE
-    # lists first; a configured one, from the file or the environment, is
-    # already a choice and is not written again.
+    # A discovered device is pinned, so later scans do not follow whichever
+    # scanner SANE lists first; a configured one is not written again.
     pin = None if settings.scanner.device else device_list[0].name
     device_id = settings.scanner.device or device_list[0].name
     caps = scanner.get_capabilities(device_id)
     profiles = generate_profiles(caps, device_type_of(device_list, device_id))
 
-    # The file that was loaded (including an explicit --config). With no loaded
-    # file the target is the last documented location that is writable, never
-    # the working directory, whose file would outrank every other on the next
-    # start; _new_config_target has the reasoning.  Chosen before the write so
-    # a failure below can always name it, and the output names it absolutely
-    # so the operator sees where it went.
+    # Chosen before the write, so a failure below can always name it.
     config_path = settings.config_path or _new_config_target(settings)
-    # Asked before the write, which is what creates it; a rewrite keeps the
-    # owner the file already had, so only a created file can need the note.
+    # A rewrite keeps the file's owner, so only a created file can need the
+    # root-owned note.
     created = not config_path.exists()
-    # A ConfigError here (a single-file bind mount, a non-UTF-8 file, or
-    # merged text that would not parse) names the file and the fix; the group
-    # guard prints it as-is and exits 2, with no traceback.  An OSError --
-    # including a per-user directory that cannot be created, as in a container
-    # whose HOME does not exist -- ends the same way, naming the target.
+    # An OSError, such as a per-user directory a container without HOME
+    # cannot create, becomes a ConfigError naming the target.
     try:
-        # Only a new file's directory is created: the system target's
-        # directory exists by construction, so this is only ever the XDG
-        # ``saneless`` directory, made private because the file may later
-        # hold the Paperless token, and owned like its parent so root with a
-        # user's HOME leaves nothing in it that the user cannot reach.  The
-        # file itself is 0600 and takes its directory's owner, which the
-        # atomic writer sees to.
+        # Only ever the XDG ``saneless`` directory, since the system target's
+        # exists by construction; made private because the file may later hold
+        # the Paperless token.
         if settings.config_path is None and not config_path.parent.is_dir():
             make_config_directory(config_path.parent)
         result = write_profiles_to_config(
@@ -2320,25 +2079,10 @@ def _state_marker(state: CheckState) -> str:
     """
     Return the bracketed token ``doctor`` prints in front of one check row.
 
-    These are CLI affordances rather than vocabulary, which is why they are not
-    ``check_state_label``: that function answers "what does a screen reader
-    announce", and the answer there is ``"Failed"``, a word. Here the job is a
-    scannable left margin in a fixed-width terminal, so all three tokens are
-    the same width and a reader's eye finds the red rows without reading them.
-
-    A total ``match``, for the reason ``checks.py``'s four lookups are: a
-    fourth ``CheckState`` stops this function type-checking until somebody
-    decides what it looks like.
-
-    Args:
-        state: The state to mark.
-
-    Returns:
-        ``"[ OK ]"``, ``"[WARN]"`` or ``"[FAIL]"``.
-
-    Raises:
-        AssertionError: If the value is not a CheckState member.
-
+    Not ``check_state_label``, which is a word for a screen reader: these are
+    equal-width tokens, so the eye finds the red rows in the left margin.  A
+    total ``match``, so a new ``CheckState`` stops this type-checking until
+    somebody decides what it looks like.
     """
     match state:
         case CheckState.OK:
@@ -2352,21 +2096,10 @@ def _state_marker(state: CheckState) -> str:
     return marker
 
 
-# The token a row nobody probed prints instead of `[ OK ]`.
-#
-# No `doctor` invocation produces this marker today: the command builds its
-# CheckContext with `skip_scanner` at its default and passes no scanner gate,
-# so neither `_scanner_skipped` nor `_scanner_busy` is reachable from the CLI.
-# It exists anyway, and deliberately. The point of one check registry is that
-# it feeds both surfaces, so a surface that would mis-render a row the registry
-# can build is a divergence already present and merely unreached -- and
-# `CheckResult.skipped` was once left exactly that way, half-wired, rendered by
-# neither surface while two docstrings said it was rendered by both.
-# The first caller that passes `skip_scanner=True` should get a correct table,
-# not a bug report.
-#
-# Six characters, like the three state tokens, so `_MARKER_WIDTH` below does
-# not silently widen the name column for one row.
+# The token a row nobody probed prints instead of `[ OK ]`. `doctor` never
+# skips the scanner today, but one check registry feeds both surfaces, so the
+# CLI renders every row the registry can build. Six characters, like the state
+# tokens, so it does not widen the name column.
 _SKIPPED_MARKER: Final = "[SKIP]"
 
 
@@ -2374,39 +2107,19 @@ def _row_marker(result: CheckResult) -> str:
     """
     Return the token ``doctor`` prints in front of one finished row.
 
-    ``_state_marker`` answers "what does this state look like"; this answers
-    "what does this row look like", and the two differ whenever ``skipped`` is
-    set.  The flag is a fact about the probe and the state is a verdict about
-    the appliance: a skipped row carries ``CheckState.OK`` so that a scripted
-    health gate does not go red for a probe that was deliberately not taken,
-    which means marking it from the state alone prints the one token a reader
-    scans for as "fine" in front of a sentence saying nothing was checked.
-    ``checks.check_row_class`` and its two siblings make the same substitution
-    for the web strip, from the same flag.
-
-    Args:
-        result: The finished row about to be printed.
-
-    Returns:
-        ``_SKIPPED_MARKER`` when the probe was skipped, otherwise
-        ``_state_marker(result.state)``.
-
+    A skipped row carries ``CheckState.OK`` so a health gate does not go red
+    for a probe deliberately not taken, so marking it from the state alone
+    would print "fine" before a sentence saying nothing was checked.
+    ``checks.check_row_class`` and its siblings make the same substitution.
     """
     if result.skipped:
         return _SKIPPED_MARKER
     return _state_marker(result.state)
 
 
-# The column widths `saneless doctor` renders with, all derived rather than
-# written down, exactly as _STATUS_COL_WIDTH is and for the same reason: a new
-# CheckKey member with a longer name, or a CheckState member with a wider token,
-# must not be able to overflow an 80-column terminal without anyone noticing.
-# The indent puts a next step underneath the message it belongs to, so a row
-# and its remedy read as one item rather than two.
-#
-# The marker width counts `_SKIPPED_MARKER` alongside the state tokens rather
-# than relying on the markers happening to be the same length, so the
-# derivation stays correct if any one of them is ever respelled.
+# The column widths `saneless doctor` renders with, derived so a longer CheckKey
+# name or a wider marker cannot overflow the columns unnoticed. The indent puts
+# a next step under the message it belongs to.
 _MARKER_WIDTH = max(
     len(marker)
     for marker in (*(_state_marker(state) for state in CheckState), _SKIPPED_MARKER)
@@ -2414,13 +2127,9 @@ _MARKER_WIDTH = max(
 _NAME_COL_WIDTH = max(len(check_name(key)) for key in CheckKey)
 _NEXT_STEP_INDENT = " " * (_MARKER_WIDTH + 1 + _NAME_COL_WIDTH + 1)
 
-# The config resolution table's caption and its six verdicts, one per line.
-# "used", "not used" and "same file" are about the search -- the last is a
-# candidate that names a file already listed, such as ./saneless.toml when run
-# from inside the XDG directory; "ignored" and "leftover" are about a file under
-# the superseded name, and they differ because the two situations differ -- in
-# one nothing was loaded and the file is the reason, in the other something was
-# loaded and the file is merely still there.
+# The config resolution table's caption and its verdicts. "ignored" and
+# "leftover" are both an old-name file: with nothing loaded it is the reason,
+# with something loaded it is merely still there.
 _RESOLUTION_CAPTION: Final = "Config files searched, in order:"
 _RESOLUTION_LABELS: Final = (
     "used",
@@ -2430,28 +2139,14 @@ _RESOLUTION_LABELS: Final = (
     "ignored",
     "leftover",
 )
-# Derived, like the row widths above and for the same reason: respelling a
-# verdict must not be able to break the column silently.
 _RESOLUTION_LABEL_WIDTH: Final = max(len(label) for label in _RESOLUTION_LABELS)
-# Printed instead of an empty table. A caption with nothing under it reads as
-# output that failed halfway, rather than as "this process ran no search" --
-# which is what settings built directly, without a load, actually did.
+# Printed instead of an empty table, which would read as output that failed
+# halfway rather than as "this process ran no search".
 _RESOLUTION_NONE: Final = "  none recorded"
 
 
 def _resolution_line(label: str, path: Path, note: str = "") -> str:
-    """
-    Render one entry of the config resolution table.
-
-    Args:
-        label: One of ``_RESOLUTION_LABELS``.
-        path: The file this entry is about.
-        note: A parenthesised aside, or "" for none.
-
-    Returns:
-        The line, with the path at the same column whatever the label.
-
-    """
+    """Render one entry of the config resolution table, paths in one column."""
     return f"  {label:<{_RESOLUTION_LABEL_WIDTH}}  {absolute_or_as_spelled(path)}{note}"
 
 
@@ -2459,25 +2154,10 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
     """
     Say where every configuration file the search looked at ended up.
 
-    Absolute paths, which the status strip's rows may not carry: that page is
-    reachable by anyone on the LAN, and this is a terminal on the machine,
-    where the resolved path is the half an operator can act on.
-
-    The recording is read and nothing is stat-ed again.  A file created,
-    renamed or deleted since startup would make a fresh look describe a
-    program that is not running -- and the whole point of the table is to
-    explain the settings the process is holding.
-
-    Each candidate is ``used``, ``not used`` (an earlier file won), ``same
-    file`` (a file already listed, reached through another spelling) or ``not
-    found``; each superseded-name file is ``ignored`` or ``leftover``.
-
-    Args:
-        settings: The settings in hand, carrying the search that built them.
-
-    Returns:
-        One line per entry, or empty when no search was recorded.
-
+    Absolute paths, which the LAN-visible status strip may not carry.  The
+    recorded search is read and nothing is stat-ed again, so the table
+    explains the settings this process holds even if a file changed since.
+    Empty when no search was recorded.
     """
     discovery = settings.config_discovery
     if discovery is None:
@@ -2493,12 +2173,9 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
     lines = []
     listed: set[Path] = set()
     for candidate in discovery.searched:
-        # One file reached through a second candidate is listed once more,
-        # as itself: never "not used", which would claim a second file went
-        # unread, and never "not found", which would claim the path is empty.
-        # Two candidates can even be spelled alike (run from inside the XDG
-        # directory, ./saneless.toml is the XDG file), so a spelling already
-        # listed counts as well as a recorded alias.
+        # A file reached through a second candidate is "same file": never "not
+        # used" or "not found", which would claim a second file. Two candidates
+        # can even be spelled alike (./saneless.toml run from the XDG directory).
         if candidate in listed or (
             candidate in discovery.duplicates and candidate not in discovery.found
         ):
@@ -2522,10 +2199,7 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
         else:
             lines.append(_resolution_line("not found", candidate))
         listed.add(candidate)
-    # A superseded-name file beside a candidate. Which verdict it gets is the
-    # same distinction the Configuration row draws: with nothing loaded it is
-    # the reason there is no configuration, and with something loaded it is
-    # only still there.
+    # The same distinction the Configuration row draws.
     if discovery.loaded is None:
         label, note = "ignored", f" (old name; rename it to {CONFIG_FILENAME})"
     else:
@@ -2535,13 +2209,7 @@ def _config_resolution_lines(settings: Settings) -> list[str]:
 
 
 def _echo_config_resolution(settings: Settings) -> None:
-    """
-    Print the config resolution table under the check rows.
-
-    Args:
-        settings: The settings in hand.
-
-    """
+    """Print the config resolution table under the check rows."""
     click.echo("")
     click.echo(_RESOLUTION_CAPTION)
     for line in _config_resolution_lines(settings) or [_RESOLUTION_NONE]:
@@ -2554,35 +2222,17 @@ def _doctor_scanner(
     """
     Build a scanner backend for one ``doctor`` run, or say why there is none.
 
-    ``None`` is how ``CheckContext`` represents "no scanner backend", and
-    producing it here rather than letting the failure out is what lets
-    ``doctor`` report a machine without scanner support instead of refusing
-    to run on it.  Letting it out would also exit 1 -- a code ``doctor``'s
-    documented table does not list, for a command that scans nothing.
-
-    The three failure shapes are two different faults.  ``ImportError`` is
-    the bare missing module, and ``ConfigError`` is what ``require_sane`` --
-    which ``SaneBackend.__init__`` calls for itself -- raises once it has
-    translated that ``ImportError``: both mean python-sane is not installed,
-    and installing it is the remedy.  ``ScanError`` is ``sane.init()``
-    refusing: python-sane is there and the scanner library would not start,
-    which installing again does not fix.  That one is its own row, and its
-    reason is logged at WARNING, because the row sends the reader to the log
-    for it.
-
-    Args:
-        settings: The loaded configuration, for the sane-net host.
-
-    Returns:
-        A backend and None, or None and the reason none could be built.
-
+    Catching the failure lets ``doctor`` report a machine without scanner
+    support instead of refusing to run on it.  ``ImportError`` and the
+    ``ConfigError`` ``require_sane`` translates it into both mean python-sane
+    is not installed.  ``ScanError`` is ``sane.init()`` refusing, which
+    reinstalling does not fix, so it is its own row and its reason is logged
+    at WARNING for the row to point at.
     """
     try:
         return SaneBackend(host=settings.scanner.host), None
     except (ImportError, ConfigError) as exc:
-        # The type name only. The ConfigError's own message names the install
-        # hint and the ImportError names a shared object path, and neither
-        # adds anything to "not installed" for the person reading the log.
+        # The type name only: neither message adds to "not installed".
         logger.info("Scanner support unavailable: %s", type(exc).__name__)
         return None, ScannerRefusal.NOT_INSTALLED
     except ScanError as exc:
@@ -2596,27 +2246,13 @@ def _doctor_paperless(
     """
     Build a Paperless client for one ``doctor`` run, or say why there is none.
 
-    ``PaperlessClient.__init__`` refuses a URL httpx2 will not parse or that
-    carries a user name or password, a token an HTTP header cannot carry, and
-    a TLS trust store it cannot read.  Each is a ``PaperlessError``, which the
-    group guard would turn into exit 3: that would cost the operator the
-    other rows, and put a code in ``doctor``'s output that its
-    documented table does not list.  So each becomes the Paperless row
-    instead, and which row depends on the reason.  The trust store is caught
-    first, because its type is a ``PaperlessError`` too: its remedy is
-    ``SSL_CERT_FILE`` or ``SSL_CERT_DIR``, not a setting.  Everything else the
-    constructor refuses is ``paperless.url`` or ``paperless.token``.
-
-    The refusal is logged at WARNING with its message.  The constructor's
-    messages are built from the URL with its user name and password removed,
-    and never quote the token, so the line carries no secret.
-
-    Args:
-        settings: The loaded configuration.
-
-    Returns:
-        A client and None, or None and the reason none could be built.
-
+    The constructor's refusals -- a bad URL or token, an unreadable TLS trust
+    store -- become the Paperless row rather than reach the guard, which
+    would cost the other rows.  The trust store is caught first, because it
+    is a ``PaperlessError`` too but its remedy is ``SSL_CERT_FILE`` or
+    ``SSL_CERT_DIR``, not a setting.  The logged message carries no secret:
+    the constructor strips credentials from the URL and never quotes the
+    token.
     """
     try:
         client = PaperlessClient(
@@ -2633,42 +2269,22 @@ def _doctor_paperless(
     return client, None
 
 
-# This command deliberately does NOT call require_sane(), which is the first
-# statement of `scan`, `devices`, `serve` and `auto-profiles`. Those four cannot
-# do their job without a scanner, so refusing early is honest. `doctor`'s job is
-# to say what is wrong, and a machine with no python-sane is precisely the
-# machine whose owner needs that said: it still has a token, profiles, a
-# fallback folder and a data directory to be told about. The import failure is
-# caught in _doctor_scanner and rendered as one FAIL row among six instead of a
-# refusal to run at all.
-#
-# The output is two sections: the check rows, then a table of where every
-# configuration file the search looked at ended up. The rows say which
-# situation the appliance is in, in the words the status strip uses; the table
-# says which files, by absolute path, which the rows may not carry -- the strip
-# is a page anyone on the LAN can load and this is a terminal on the machine.
-# It is printed on every run and not only when something is wrong, because a
-# resolution that appears only on failure cannot be compared against a working
-# machine's, and comparing the two is how a configuration problem gets found.
-#
-# There is no --json, and this is a decision rather than an omission. Nothing in
-# the docs, the tests, the Dockerfile or the compose file would consume it, and
-# a container HEALTHCHECK that calls `doctor` -- the one caller that would have
-# wanted a machine shape -- is deliberately not offered. A JSON mode would be a
-# wire contract with no reader, and a wire contract is only free until the first
-# person parses it. The human-readable rows, the resolution table and the exit
-# code are the whole contract.
+# doctor deliberately does not call require_sane(): a machine with no
+# python-sane is the one whose owner most needs the other rows, so
+# _doctor_scanner renders the missing module as one FAIL row. The resolution
+# table is printed on every run, so a failing machine's can be compared with a
+# working one's. There is no --json: the rows, the table and the exit code are
+# the whole contract, and a JSON mode would be a wire contract with no reader.
 @cli.command()
 @click.pass_context
 def doctor(ctx: click.Context) -> None:
     """Check that saneless is ready to scan."""
-    # No directory gate: an unusable folder is a red Fallback or Data folder
-    # row here, not a refusal that prints no rows at all.
+    # No directory gate: an unusable folder is a red row, not a refusal.
     settings = _load_cli_settings(ctx, validate_dirs=False)
     scanner, scanner_refusal = _doctor_scanner(settings)
     if scanner is not None:
-        # Registered before the first SANE call, so a check that fails still
-        # leaves the process with SANE shut down.
+        # Registered before the first SANE call, so a failing check still
+        # leaves SANE shut down.
         ctx.call_on_close(scanner.close)
     paperless, paperless_refusal = _doctor_paperless(settings)
     try:
@@ -2679,11 +2295,8 @@ def doctor(ctx: click.Context) -> None:
                 paperless=paperless,
                 paperless_refusal=paperless_refusal,
                 scanner_refusal=scanner_refusal,
-                # A one-shot command attempts no persist, so this is the
-                # derivation it is entitled to; the function's docstring has
-                # the reasoning, including why it cannot report the third
-                # outcome. The status strip calls the same function, which is
-                # what keeps the two surfaces on one Profiles row.
+                # The status strip calls the same function, which keeps the
+                # two surfaces on one Profiles row.
                 profile_storage=profile_storage_for_loaded(settings),
             )
         )
@@ -2697,31 +2310,20 @@ def doctor(ctx: click.Context) -> None:
             f"{check_name(result.key):<{_NAME_COL_WIDTH}} {result.message}"
         )
         if result.terminal_detail:
-            # Terminal-only detail, such as where paperless-ngx redirected to.
-            # The strip never shows it; the text is upstream-derived, so its
-            # control characters are made harmless before they reach a tty.
+            # Terminal-only and upstream-derived, such as where paperless-ngx
+            # redirected to, so its control characters are escaped.
             detail = neutralise_controls(result.terminal_detail)
             click.echo(f"{_NEXT_STEP_INDENT}{detail}")
         if result.next_step:
-            # The row's retry is spelled for a terminal: there is no Check
-            # again button here, so it says to run this command again.
+            # Spelled for a terminal, which has no Check again button.
             step = render_check_step(result.next_step, CheckSurface.DOCTOR)
             click.echo(f"{_NEXT_STEP_INDENT}{step}")
 
     _echo_config_resolution(settings)
 
-    # Any failing check exits 2, and no new ExitCode member expresses it. The
-    # reasons, in order: the deployment-config tests
-    # test_cli_reference_global_exit_code_table_matches_exit_code_enum and
-    # test_troubleshooting_page_is_linked_and_covers_every_exit_code assert the
-    # documented global tables equal every member, so a new member is a
-    # documentation change in every documented table and a revision of the
-    # exit-code table; 2 already means "can't start, fix your setup", which is
-    # what every red check is saying; and `doctor` reports a list, so one
-    # process has one exit code to give and splitting a red Paperless row out
-    # to 3 would mean choosing which red row the shell gets to hear about. A
-    # WARN is deliberately not a failure -- an appliance that scans and files
-    # is not broken because it could be tidier, and a gate that goes red for
-    # tidiness gets ignored.
+    # Any failing check is ExitCode.CONFIG, "fix your setup", which is what
+    # every red row says; one process has one code, so no red row is singled
+    # out. A WARN is not a failure: a gate that goes red for tidiness gets
+    # ignored.
     if worst_state(results) is CheckState.FAIL:
         ctx.exit(ExitCode.CONFIG)

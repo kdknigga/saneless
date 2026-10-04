@@ -30,42 +30,16 @@ if TYPE_CHECKING:
 __all__ = ["StoppingServer", "run_server", "stop_the_refresher_early"]
 
 # How long, in whole seconds, a stopping web server waits for requests still
-# being answered before it cancels them.  uvicorn types the setting
-# ``int | None``, so it is an int.
-#
-# It is sized to the longest single call a request makes to paperless-ngx:
-# the connection test and each page of a tag or correspondent list are bounded
-# by a 2 s connect and a 5 s read, 7 s in all, so one such call that was under
-# way when the stop came ends inside the drain, and the lifespan does not
-# close the Paperless client under it.  Not every request fits.  A list
-# fetch of more than one page is one such call per page.  A request that
-# fetches both lists, as the scan form's lazy load (``GET /api/metadata``)
-# does, makes two such calls in a row, and each may first wait as long again
-# for another request's fetch of the same list.  A name lookup takes no
-# timeout at all.  Any of these can outlast the drain.  uvicorn then
-# cancels the request, but its worker thread keeps running, and so keeps the
-# process alive, after the lifespan has closed what that thread was using.
-#
-# An idle server has no request to wait for, so its stop is uvicorn's 0.1 s
-# poll and pause and the lifespan's one shared 5 s deadline for the scan worker
-# and the check refresher, inside Docker's default 10 s grace period.  A stop
-# that has to wait out a request to paperless-ngx can take this drain on top,
-# as can a stop while a stopped scan's pages are being preserved; the
-# documented 90 s stop grace period covers both.
+# being answered before it cancels them; uvicorn types it ``int | None``.  It
+# covers one paperless-ngx call (a 2 s connect and a 5 s read), so the lifespan
+# does not close the Paperless client under such a call; a multi-page list, a
+# metadata load or a name lookup can still outlast it.  The stop budget is in
+# docs/explanation/architecture.md.
 _GRACEFUL_SHUTDOWN_SECONDS: Final = 8
 
 
 def _socket_url(sock: socket.socket) -> str:
-    """
-    Return the URL a bound socket serves, with an IPv6 address bracketed.
-
-    Args:
-        sock: A bound socket.
-
-    Returns:
-        ``http://<address>:<port>``, bracketed so it pastes into a browser.
-
-    """
+    """Return the URL a bound socket serves, with an IPv6 address bracketed."""
     address, port = sock.getsockname()[:2]
     shown = f"[{address}]" if sock.family == socket.AF_INET6 else address
     return f"http://{shown}:{port}"
@@ -76,20 +50,15 @@ def stop_the_refresher_early(app: FastAPI) -> None:
     Tell the app's check refresher to stop, as soon as the server is told to.
 
     The lifespan stops the refresher too, but only after uvicorn's request
-    drain.  Told this early instead, the refresher starts no check after the
-    one it is in, and a check that cannot be cut short has the drain as well
-    as the lifespan's join to end in.  A refresher still running when that
-    join ends makes the lifespan leave the job store, the Paperless client and
+    drain; told this early, a check that cannot be cut short has the drain as
+    well as the lifespan's join to end in.  A refresher still running after
+    that join makes the lifespan leave the job store, the Paperless client and
     the scanner open.
 
-    It runs in a signal handler, on the main thread, and the lifespan stops the
-    refresher on that same thread, both at shutdown and after a start-up that
-    failed part way.  A handler that took the refresher's locks could land
-    while the lifespan's own stop holds one, and wait on it for ever.  So this
-    only notes the stop, one attribute store that takes no lock, and the
-    refresher acts on it from its own thread.  The lifespan's own stop is then
-    a second one, which is harmless.  An app with no services, as in a test,
-    is left alone.
+    It runs in a signal handler on the main thread, where the lifespan may
+    hold one of the refresher's locks, so it takes no lock: it only notes the
+    stop, and the refresher acts on it from its own thread.  An app with no
+    services, as in a test, is left alone.
 
     Args:
         app: The app being served.
@@ -146,23 +115,14 @@ def run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> No
 
     """
     urls = [_socket_url(sock) for sock in sockets]
-    # Printed, not logged: serve's log stream is stderr as well, so doing both
-    # put the same line there twice, and a log record alone would disappear
-    # at log_level WARNING. uvicorn announces no address of its own when it is
-    # handed sockets, so this is the only place the address is shown.
+    # Printed, not logged: a log record would disappear at log_level WARNING,
+    # and uvicorn announces no address of its own when handed sockets.
     for url in urls:
         click.echo(f"Serving on {url}", err=True)
 
-    # uvicorn follows the configured log_level, not -v: -v is saneless's own
-    # detail and must not turn on uvicorn's or httpx2's debug output. The
-    # validated log level lower-cases to a name uvicorn accepts.
-    #
-    # The config needs nothing extra for the streaming mode, and adding
-    # anything would break it: a None log config means uvicorn applies no
-    # dictConfig and attaches no handlers of its own, so uvicorn.error,
-    # uvicorn.access and uvicorn.asgi propagate to saneless's root handlers.
-    # Leaving the access log on therefore puts per-request lines, and
-    # uvicorn's own startup lines, on the same stream for free.
+    # uvicorn follows the configured log_level, not -v, which is saneless's own
+    # detail. A None log config attaches no uvicorn handlers, so its records
+    # propagate to saneless's root handlers on the same stream.
     server = StoppingServer(
         uvicorn.Config(
             app,
@@ -179,26 +139,13 @@ def run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> No
         server.should_exit = True
         stop_the_refresher_early(app)
 
-    # A running server stopped with SIGTERM is a normal stop, exit 0, whether
-    # or not it is PID 1. uvicorn installs its own handler while it runs, and
-    # on the way out restores the handler it found and raises the caught
-    # signal again into it. With the default handler that re-raise ends the
-    # process by the signal (exit 143 in a shell) everywhere except as PID 1,
-    # where the kernel ignores it. With this handler in place the re-raise is
-    # one more stop request to a server that has already stopped, and the
-    # command returns normally. It also covers a SIGTERM that lands before
-    # uvicorn has installed its own: the server stops instead of the signal
-    # being lost or ending the process mid-start-up. Like uvicorn's handler
-    # in StoppingServer, it tells the check refresher to stop as well. The
-    # previous handler is put back however the run ends. As in the CLI's
-    # interrupt handlers, a handler installed from outside Python
-    # (getsignal returns None) is left alone, since it could not be put back,
-    # and only the main thread may install one at all. Unlike there, a
-    # SIGTERM the command was started with ignored is replaced for the run:
-    # uvicorn replaces it with its own handler while it runs anyway, so a
-    # serve started that way still stops on SIGTERM, and this handler makes
-    # the moments before and after uvicorn's agree. The ignored disposition
-    # is what is put back.
+    # A SIGTERM is a normal stop, exit 0, whether or not this is PID 1. On the
+    # way out uvicorn re-raises the caught signal into the handler it found, and
+    # with the default handler that would end the process by the signal; this
+    # one makes it a no-op, and also stops a server SIGTERMed before uvicorn's
+    # handler is in. A handler from outside Python (getsignal returns None) is
+    # left alone, but an ignored SIGTERM is replaced for the run, as uvicorn's
+    # own handler replaces it anyway.
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     owns_sigterm = (
         previous_sigterm is not None
@@ -207,29 +154,23 @@ def run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> No
     if owns_sigterm:
         signal.signal(signal.SIGTERM, _stop_requested)
     try:
-        # On Ctrl-C uvicorn shuts down gracefully and then re-raises the
-        # signal it caught, which arrives here as KeyboardInterrupt. A running
-        # server being stopped is a normal stop, exit 0, so it is swallowed
-        # here; a Ctrl-C before this point -- while settings load or the app
-        # is built -- is not uvicorn's to handle and reaches the group guard,
-        # exit 130. The Ctrl-C itself reached StoppingServer.handle_exit,
-        # which told the check refresher before the drain; by the time the
-        # re-raise arrives here the lifespan has already stopped it.
+        # On Ctrl-C uvicorn shuts down gracefully and then re-raises the signal
+        # as KeyboardInterrupt; stopping a running server is a normal stop, so
+        # it is swallowed. A Ctrl-C before this point reaches the group guard
+        # as a cancel.
         with contextlib.suppress(KeyboardInterrupt):
             server.run(sockets=sockets)
     except SystemExit:
-        # uvicorn exits the process itself when start-up fails, with a code of
-        # its own choosing that collides with this CLI's table. A server that
-        # never started is this project's "could not start", handled below; a
-        # started server exiting is uvicorn's own decision and is left alone.
+        # uvicorn exits the process itself when start-up fails, with a code
+        # that collides with this CLI's table; a server that never started is
+        # handled below instead.
         if server.started:
             raise
     finally:
         if owns_sigterm and previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
-    # Server.run returns quietly when start-up fails, such as the app's
-    # lifespan raising; uvicorn has already logged why. Every command shares
-    # one exit table, so that is a failure to start: one line, exit 2.
+    # Server.run also returns quietly when start-up fails, such as the app's
+    # lifespan raising; uvicorn has already logged why.
     if not server.started:
         msg = (
             f"The web server could not start on {', '.join(urls)}; "
