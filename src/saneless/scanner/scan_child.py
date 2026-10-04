@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import fcntl
 import logging
 import math
 import os
@@ -53,6 +54,7 @@ from saneless.exceptions import (
 from saneless.scanner import child_launch, page_budget
 from saneless.scanner.base import PassCapReached, ScanBatch
 from saneless.scanner.scan_protocol import (
+    REPLY_PIPE_BYTES,
     ChildFailure,
     ChildGoneError,
     Configured,
@@ -277,7 +279,25 @@ def start_scan_child(configured_host: str) -> ChildProcess:
             name = errno.errorcode.get(exc.errno, f"error {exc.errno}")
         logger.warning("The scanning process could not be started: %s", name)
         raise ScanError(scan_child_not_started_error()) from exc
-    return _PopenChild(proc)
+    child = _PopenChild(proc)
+    _widen_reply_pipe(child.reply_fd)
+    return child
+
+
+def _widen_reply_pipe(fd: int) -> None:
+    """
+    Ask for a reply pipe of ``REPLY_PIPE_BYTES``, keeping the default if refused.
+
+    The kernel refuses a size above ``/proc/sys/fs/pipe-max-size``, or past
+    the user's pipe quota; the default size still carries every page, only
+    in more turns.
+
+    Args:
+        fd: saneless's end of the reply pipe.
+
+    """
+    with contextlib.suppress(OSError):
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, REPLY_PIPE_BYTES)
 
 
 class _DeadlineError(Exception):

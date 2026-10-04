@@ -50,6 +50,7 @@ __all__ = [
     "LOG_LEVELS",
     "MAX_HEADER_BYTES",
     "PAGE_BANDS",
+    "REPLY_PIPE_BYTES",
     "STAGES",
     "Bye",
     "ChildFailure",
@@ -78,6 +79,12 @@ LENGTH_PREFIX: Final = struct.Struct("!I")
 # The longest header accepted.  It is refused on the prefix alone, before its
 # body is read, so a child cannot make saneless buffer an unbounded message.
 MAX_HEADER_BYTES: Final = 65_536
+
+# The capacity saneless asks for on the reply pipe, once the child is started.
+# With the kernel's default of 64 KiB a grey A4 page at 300 dpi takes over a
+# hundred turns of the child writing and saneless reading; 1 MiB is the most an
+# unprivileged process may ask for under Linux's default ``pipe-max-size``.
+REPLY_PIPE_BYTES: Final = 1 << 20
 
 # The image modes a page may have, with their bytes per pixel.  python-sane
 # only produces these: one-bit lineart is expanded to 8-bit grey, and

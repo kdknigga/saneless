@@ -964,7 +964,7 @@ def test_a_started_childs_reply_pipe_is_widened(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The reply pipe holds 1 MiB or more on saneless's end once the child starts."""
-    files = _stand_in(monkeypatch, tmp_path)
+    _stand_in(monkeypatch, tmp_path)
     child = scan_child_mod.start_scan_child("")
     try:
         capacity = fcntl.fcntl(child.reply_fd, fcntl.F_GETPIPE_SZ)
@@ -973,7 +973,7 @@ def test_a_started_childs_reply_pipe_is_widened(
         child.close()
 
     assert capacity >= _WIDE_PIPE_BYTES
-    _assert_reaped(files.pid())
+    _assert_reaped(child.pid)
 
 
 def test_a_refused_pipe_size_keeps_the_default_and_the_pass_runs(
