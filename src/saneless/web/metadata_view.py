@@ -1,13 +1,10 @@
 """
 The paperless-ngx lists one page shows: the tag list and the correspondent select.
 
-Both lists come from paperless-ngx through the metadata cache, and every
-route that renders one -- the full page, the filter, both refreshes, the
-profile-change swaps, the lazy list load and its retry -- must fetch it with
-the same budget and show the same ticks the same way.  A ticked id the list
-no longer names, and a list that could not be loaded at all, are facts the
-page states rather than hides.  The contexts are built here, so the handlers
-only choose which one to render.
+Both lists come from paperless-ngx through the metadata cache, and every route
+that renders one must fetch it with the same budget and show the same ticks the
+same way.  A ticked id the list no longer names, and a list that could not be
+loaded at all, are facts the page states rather than hides.
 
 The lazy list load also re-renders the Scan button, so the job it is rendered
 from is read here too, from the status view, in a way that never fails.
@@ -65,33 +62,23 @@ REQUEST_FETCH_TIMEOUT: Final = httpx2.Timeout(
     PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS
 )
 """
-The budget for a list fetched to answer a request: 2 s to connect, 5 s to read.
+The budget for a list fetched to answer a request.
 
-A page or a click must never wait on the client's own 30 s per page.  On a cold
-cache with paperless-ngx slow or down that would hold the tag list, the
-correspondent select and a profile change open for half a minute or more, and
-the page is only told what the lists hold once they answer.  The status strip's
-probe already decides whether paperless-ngx is answering with these two
-numbers, so they are the codebase's one measure of "answering", and every list
-route fetches with them: the tag list and its filter, the correspondent
-options, both refreshes, both profile-change swaps, the lazy list load and
-the retry of a list that could not be loaded.  A list that does not answer
-within them is reported as not loaded, and is asked again once the cache's
-short memory of the failure has run out.
+A page or a click must never wait on the client's own longer timeout, which
+on a cold cache with paperless-ngx down would hold the lists and a profile
+change open for half a minute or more.  These are the numbers the status
+strip's probe uses to decide whether paperless-ngx is answering, so every list
+route fetches with them; a list that does not answer is reported as not loaded.
 """
 
 METADATA_RETRY_FLOOR_SECONDS: Final = 5
 """
 The shortest interval at which a list that could not be loaded asks again.
 
-The retry follows the cache's memory of a failure, which is never longer than
-``paperless_cache_ttl_seconds`` and is nothing at all with the cache disabled.
-Without a floor, a short or zero TTL would have every open page ask
-paperless-ngx for both lists about once a second for as long as it is down or
-refusing one of them: unauthenticated, unbounded upstream traffic, each request
-holding a worker thread for up to the connect budget.  Five seconds still lets
-a page left open recover soon after paperless-ngx is back.  Read at call time,
-not bound where it is used.
+Without a floor, a short or zero cache TTL would have every open page ask
+paperless-ngx for both lists about once a second while it is down:
+unauthenticated, unbounded upstream traffic, each request holding a worker
+thread.  Read at call time, not bound where it is used.
 """
 
 # The only metadata resources the cache holds.  A runtime alias, not a
@@ -104,29 +91,18 @@ def _lock_wait(timeout: httpx2.Timeout) -> float:
     """
     Say how long a request waits its turn to fetch, given its fetch budget.
 
-    A request queued behind another request's fetch of the same list waits at
-    most as long as that fetch may take to connect and read, then answers the
-    list unavailable.  Every list fetch made to answer a request has a budget,
-    so no request waits as long as it takes.
-
-    Args:
-        timeout: The request's fetch budget.
-
-    Returns:
-        The seconds to wait for the cache's per-key lock.
+    A request queued behind another's fetch of the same list waits at most as
+    long as that fetch may take, then answers the list unavailable.
 
     """
     return (timeout.connect or 0.0) + (timeout.read or 0.0)
 
 
-# How the web tier logs an exception from the Paperless client, here, in
-# routes.paperless_test and in web/cache.py: the client-exception rule.  A
-# PaperlessError or ConfigError is logged by its message, which the client
-# builds from fixed words, the credential-free display URL and a token-redacted
-# reason.  Anything else on those paths is logged by class name only and
-# without a traceback, because third-party exception text can carry a URL, a
-# header or a token.  Tracebacks remain only for failures of saneless's own
-# store and templates, which never receive a client exception.
+# How the web tier logs a Paperless client exception, here, in
+# routes.paperless_test and in web/cache.py.  A PaperlessError or ConfigError is
+# logged by its message, which the client builds free of credentials; anything
+# else by class name only and without a traceback, because third-party exception
+# text can carry a URL, a header or a token.
 def cached_list_or_none(
     cache: MetadataCache,
     paperless: PaperlessClient,
@@ -137,22 +113,12 @@ def cached_list_or_none(
     """
     Retrieve metadata from cache or paperless-ngx, or None when it is unknown.
 
-    The fetch goes through the cache's single-flight ``get_or_fetch_list``, so
-    concurrent requests for the same resource make one Paperless call.  When
-    a refresh fails, the cache serves the last list fetched successfully,
-    marked as not current; only when there has never been one does the error
-    reach this function, which logs its cause and answers None.  None and an
-    empty list are different facts: paperless-ngx that has no tags can prove a
-    ticked id gone, and one that could not be asked cannot.  Nor can the last
-    good copy, which predates anything created or deleted since.  The page
-    says which it is: an empty list is "no tags yet", None is "could not be
-    loaded".
-
-    The cache remembers a failure with no last good copy for a short while.
-    A request inside that window, or one that waited longer than its budget
-    for another request's fetch, gets ``MetadataUnavailableError`` without a
-    fetch, and answers None without logging: the failure was logged once,
-    when it happened.
+    The cache's single-flight ``get_or_fetch_list`` makes one Paperless call for
+    concurrent requests, and serves the last good list, marked not current, when
+    a refresh fails.  None and an empty list are different facts: an empty list
+    is "no tags yet", None is "could not be loaded".  A failure the cache still
+    remembers, or a wait past the budget, answers None without logging, because
+    the failure was logged once, when it happened.
 
     Args:
         cache: Metadata cache instance.
@@ -200,24 +166,9 @@ def _unnamed_rows(
     """
     Split the ticked ids the list does not name into stale and unlisted rows.
 
-    A list read from paperless-ngx just now that lacks an id proves it gone,
-    so that id is stale and its label says it will be skipped.  With no list
-    at all nothing is proved, so every ticked id is unlisted and labelled by
-    number alone.  Nor does the last good copy prove anything, served while
-    paperless-ngx cannot be reached: the scan will send the id unchecked, and
-    the id may be newer than the copy, so an id it lacks is unlisted too.
-    Either way the row stays ticked: the untouched submit has to carry what
-    the form shows, and the scan decides what to drop.
-
-    Args:
-        ticked: The ticked ids, in order and without repeats.
-        known_ids: The ids the list holds, or None when it is unknown.
-        proven: Whether the list is current, and so can prove an id gone.
-        stale_label: Labels an id a current list lacks.
-        unlisted_label: Labels an id nothing can prove gone.
-
-    Returns:
-        The stale rows and the unlisted rows, each ``{"id", "label"}``.
+    Only a current list proves a missing id gone (stale); with no list, or only
+    the last good copy, it is unlisted.  Either way the row stays ticked, so the
+    untouched submit carries what the form shows and the scan decides.
 
     """
     if known_ids is None:
@@ -291,27 +242,15 @@ def tag_list_context(
     """
     Build the tag checkbox list's context: the filtered list and pinned ticks.
 
-    Two lists, not one, and that is the whole design.  The filter
-    request carries the currently ticked ids with it -- ``hx-include`` over a
-    checkbox list gathers only the boxes that are checked -- so this function
-    can re-render every one of them ticked, and pin the ones the filter
-    excludes *above* the filtered list.  A tick therefore cannot leave the DOM,
-    and a tick that cannot leave the DOM cannot be silently dropped from the
-    next submit.  A tag that is both ticked and matched is rendered by the
-    filtered loop alone, so it appears once rather than twice.
+    The filter request carries the ticked ids, so every one is re-rendered
+    ticked and the ones the filter excludes are pinned above the list: a tick
+    cannot leave the DOM, so it cannot be dropped from the next submit.  A
+    ticked id the list does not name is pinned the same way, as a stale or
+    unlisted row.
 
-    A ticked id the list does not name is kept the same way, as a stale or an
-    unlisted row pinned first (see ``_unnamed_rows``).  That is what lets the
-    page open on a profile's default tags even when one of them has since
-    been deleted, or paperless-ngx cannot be reached.
-
-    ``q`` is a Python-side substring test over the already-cached list and
-    nothing else (ASVS 4.0.3 V5.1.1).  It is never interpolated into a paperless-ngx
-    query URL -- the cache holds the whole list, so there is nothing to ask
-    upstream and the filter costs no request at all -- and it is
-    deliberately absent from the context this returns, so it cannot be echoed
-    back into the page.  Its length is already bounded by the route's
-    ``max_length`` before this runs.
+    ``q`` is a Python-side substring test over the cached list (ASVS 4.0.3
+    V5.1.1): it never reaches a paperless-ngx query URL and is absent from the
+    returned context, so it cannot be echoed into the page.
 
     Args:
         svc: The app's services, for the metadata cache and Paperless client.
@@ -326,14 +265,9 @@ def tag_list_context(
         often it then asks again.
 
     """
-    # With ``[web] show_tags`` off the tag markup is never emitted, so
-    # a fetch here buys nothing and costs a paperless-ngx round trip on every
-    # cold-cache page load -- and the flag that would hide the list is the same
-    # flag that decides whether the data can ever be seen.  The guard sits in
-    # this function rather than in ``index`` so it covers every call site,
-    # including the filter, refresh and profile-change routes, which have the
-    # same reason to skip.  The key set is the normal path's, emptied (see
-    # ``no_tag_list``).
+    # With ``[web] show_tags`` off the tag markup is never emitted, so a fetch
+    # buys nothing.  The guard sits here rather than in ``index`` so it covers
+    # every call site.
     if not svc.settings.web.show_tags:
         return no_tag_list()
     cached = cached_list_or_none(svc.cache, svc.paperless, "tags", timeout=timeout)
@@ -411,11 +345,8 @@ def correspondent_options_context(
 
     """
     # With ``[web] show_correspondent`` off the select is never emitted, so a
-    # fetch buys nothing, and it is a token-bearing request for data nobody
-    # can be shown.  The guard sits here, as the tag list's does, so it covers
-    # every caller: the options, the refresh, the profile change and the
-    # lazy list load.  The keys are the normal path's, emptied (see
-    # ``no_correspondent_options``).
+    # fetch would be a token-bearing request for data nobody can be shown.  The
+    # guard sits here, as the tag list's does, so it covers every caller.
     if not svc.settings.web.show_correspondent:
         return no_correspondent_options(shown=False)
     cached = cached_list_or_none(
@@ -453,17 +384,10 @@ def metadata_retry_seconds(ttl: float) -> int:
     Say how often a list that could not be loaded asks again, in seconds.
 
     No sooner than the cache forgets the failure: the negative TTL, or the
-    cache's own TTL when that is shorter.  The retry replaces itself with
-    every answer, so it asks again this long after the last answer landed
-    (see ``partials/list_retry.html``).  The cache remembers a failure from
-    when the failed fetch ended, before that answer, so the next ask is past
-    the memory its own last fetch left, and asks paperless-ngx unless
-    another request asked meanwhile.  Rounded up to whole seconds for htmx's
-    trigger, and never under ``METADATA_RETRY_FLOOR_SECONDS``, so a short or
-    disabled cache cannot make every open page ask paperless-ngx once a
-    second.  A floor longer than the memory only leaves the next ask further
-    past it.  Both constants are read here, at call time, not bound when the
-    module loads.
+    cache's own TTL when that is shorter.  The retry counts from the last
+    answer, which lands after the failure was remembered, so the next ask is
+    past that memory.  Rounded up for htmx's trigger, never under
+    ``METADATA_RETRY_FLOOR_SECONDS``, and both constants are read at call time.
 
     Args:
         ttl: The configured ``paperless_cache_ttl_seconds``.
@@ -482,18 +406,11 @@ def metadata_scan_state(request: Request) -> tuple[JobView | None, bool]:
     """
     Read what the lazy list load's Scan button is rendered from, never failing.
 
-    The job comes from the same status context the page builds, for the job
-    this browser follows, so an active job still disables the button.  The
-    loader polls until it is answered, and a poll cannot usefully receive an
-    error: a store read that fails would be written into the alert slot on
-    every tick, with the lists that did load thrown away and Scan held for
-    good.  So a failure is logged and the button is rendered as though no
-    job were running, with the blocked verdict, which comes from the
-    settings alone, kept.  The status poll owns the job and corrects the
-    button once it can read the job again.  Until then the poll reads the
-    same failing store and answers with its lost-contact fallback, which
-    carries no Scan button, so a press in that window is left to
-    ``start_scan``, which refuses or queues it.
+    The job comes from the status context the page builds, so an active job
+    still disables the button.  The loader polls until answered, and an error
+    would land in the alert slot on every tick, so a failure is logged and the
+    button rendered as though no job ran, keeping the blocked verdict; the
+    status poll corrects it once the store reads again.
 
     Args:
         request: The incoming request.

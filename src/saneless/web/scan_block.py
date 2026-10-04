@@ -58,15 +58,11 @@ def block_for(settings: Settings) -> ScanBlock | None:
     """
     Decide whether paperless-ngx is configured well enough for a scan to start.
 
-    The one place the web layer decides it, so the Scan button, its reason
-    line and the route guard cannot disagree.  A placeholder token is named
-    first, then an empty ``paperless.url``, matching the status strip's
-    Paperless row.
-
-    This unwraps the configured token, and the value goes to the predicate
-    and nowhere else: it is never logged, rendered, echoed or put in the job
-    row, whose text names the problem and the file to edit and never the
-    secret (ASVS 4.0.3 V7.1.1).
+    The one place the web layer decides it, so the Scan button, its reason line
+    and the route guard cannot disagree.  A placeholder token is named before an
+    empty ``paperless.url``, as the status strip's Paperless row orders them.
+    The unwrapped token goes to the predicate only: it is never logged,
+    rendered, echoed or put in the job row (ASVS 4.0.3 V7.1.1).
 
     Args:
         settings: The settings the process started with.
@@ -86,10 +82,10 @@ def scan_is_blocked(settings: Settings) -> bool:
     """
     Say whether this appliance refuses every scan, from ``block_for``'s rule.
 
-    The one answer the app itself needs: ``create_app`` records it on
-    the app's state once, because the settings cannot change while the
-    process runs, and the error rendering reads it there, so a refused Scan
-    press on a blocked appliance never hands back an enabled button.
+    ``create_app`` records it once on the app's services, because the settings
+    cannot change while the process runs, and the error rendering reads it
+    there, so a refused Scan press on a blocked appliance never re-enables the
+    button.
 
     Args:
         settings: The settings the process started with.
