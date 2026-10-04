@@ -39,7 +39,6 @@ from saneless.checks import (
     CheckResult,
     CheckState,
     PaperlessRefusal,
-    ScannerRefusal,
     _scanner_busy,
     _scanner_skipped,
     check_name,
@@ -8907,41 +8906,25 @@ class TestRefusalRows:
         else:
             assert "Install" in row.next_step
 
-    @pytest.mark.parametrize(
-        "refusal",
-        [None, ScannerRefusal.NOT_INSTALLED],
-        ids=["no-reason", "not-installed"],
-    )
-    def test_a_missing_python_sane_is_still_not_installed(
-        self, tmp_path: Path, refusal: ScannerRefusal | None
-    ) -> None:
+    def test_a_missing_python_sane_is_still_not_installed(self, tmp_path: Path) -> None:
         """
         No scanner library at all keeps the install row.
 
         Args:
             tmp_path: The test's own directory.
-            refusal: What the caller said about the missing backend.
 
         """
-        context = replace(
-            _context(_settings(tmp_path), scanner=None), scanner_refusal=refusal
-        )
+        context = _context(_settings(tmp_path), scanner=None)
         row = _row(run_checks(context), CheckKey.SCANNER)
         assert row.message == "Scanner support is not installed on this machine."
 
     @pytest.mark.parametrize(
-        ("paperless_refusal", "scanner_refusal"),
-        [
-            (PaperlessRefusal.TRUST_STORE, ScannerRefusal.NOT_INSTALLED),
-            (PaperlessRefusal.CONFIGURATION, ScannerRefusal.NOT_INSTALLED),
-        ],
+        "paperless_refusal",
+        [PaperlessRefusal.TRUST_STORE, PaperlessRefusal.CONFIGURATION],
         ids=["trust-store", "configuration"],
     )
     def test_no_refusal_row_names_a_path(
-        self,
-        tmp_path: Path,
-        paperless_refusal: PaperlessRefusal,
-        scanner_refusal: ScannerRefusal,
+        self, tmp_path: Path, paperless_refusal: PaperlessRefusal
     ) -> None:
         """
         The rows are fixed copy, which the strip could show without a leak.
@@ -8949,13 +8932,11 @@ class TestRefusalRows:
         Args:
             tmp_path: The test's own directory.
             paperless_refusal: Why the client was not built.
-            scanner_refusal: Why the backend was not built.
 
         """
         context = replace(
             _context(_settings(tmp_path), scanner=None, paperless=None),
             paperless_refusal=paperless_refusal,
-            scanner_refusal=scanner_refusal,
         )
         results = run_checks(context)
         for key in (CheckKey.PAPERLESS, CheckKey.SCANNER):

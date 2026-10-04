@@ -82,7 +82,6 @@ __all__ = [
     "CheckResult",
     "CheckState",
     "PaperlessRefusal",
-    "ScannerRefusal",
     "check_name",
     "check_row_class",
     "check_row_glyph",
@@ -256,28 +255,16 @@ class PaperlessRefusal(StrEnum):
     CONFIGURATION = "CONFIGURATION"
 
 
-class ScannerRefusal(StrEnum):
-    """
-    Why a scanner backend could not be built, for the Scanner row.
-
-    ``NOT_INSTALLED`` is python-sane missing, which installing it fixes.
-    Building a backend starts no scanner library, so a library that is
-    installed and would not start is not a refusal: the listing child the
-    check runs reports it, in its survey's ``start_error``.
-    """
-
-    NOT_INSTALLED = "NOT_INSTALLED"
-
-
 @dataclass(frozen=True, slots=True)
 class CheckContext:
     """
     Everything the checks need, handed in rather than reached for.
 
     The web app and ``saneless doctor`` build these differently, and this
-    module may know neither.  ``scanner=None`` and ``paperless=None`` mean none
-    could be built; a caller that gives no refusal gets the not-installed and
-    "not found at that URL" rows.  ``profile_storage`` is the outcome the
+    module may know neither.  ``scanner=None`` means python-sane is not
+    installed, and gets the not-installed row; ``paperless=None`` means no
+    client could be built, and a caller that gives no refusal gets the "not
+    found at that URL" row.  ``profile_storage`` is the outcome the
     worker recorded, not a fresh probe, because the two in-memory cases cannot
     be told apart afterwards.
 
@@ -295,8 +282,6 @@ class CheckContext:
             checks once it is set.
         paperless_refusal: Why ``paperless`` is None, or None when the
             caller does not know or a client was built.
-        scanner_refusal: Why ``scanner`` is None, or None when the caller
-            does not know or a backend was built.
 
     """
 
@@ -307,7 +292,6 @@ class CheckContext:
     skip_scanner: bool = False
     abort: threading.Event | None = None
     paperless_refusal: PaperlessRefusal | None = None
-    scanner_refusal: ScannerRefusal | None = None
 
 
 def check_name(key: CheckKey) -> str:

@@ -48,7 +48,6 @@ from .checks import (
     CheckResult,
     CheckState,
     PaperlessRefusal,
-    ScannerRefusal,
     check_name,
     configuration_check,
     leftover_config_check,
@@ -2210,11 +2209,9 @@ def _echo_config_resolution(settings: Settings) -> None:
         click.echo(line)
 
 
-def _doctor_scanner(
-    settings: Settings,
-) -> tuple[ScannerBackend | None, ScannerRefusal | None]:
+def _doctor_scanner(settings: Settings) -> ScannerBackend | None:
     """
-    Build a scanner backend for one ``doctor`` run, or say why there is none.
+    Build a scanner backend for one ``doctor`` run, or None when there is none.
 
     Catching the failure lets ``doctor`` report a machine without scanner
     support instead of refusing to run on it.  ``ImportError`` and the
@@ -2225,11 +2222,11 @@ def _doctor_scanner(
     Scanner check runs, which logs the reason for the row to point at.
     """
     try:
-        return SaneBackend(host=settings.scanner.host), None
+        return SaneBackend(host=settings.scanner.host)
     except (ImportError, ConfigError) as exc:
         # The type name only: neither message adds to "not installed".
         logger.info("Scanner support unavailable: %s", type(exc).__name__)
-        return None, ScannerRefusal.NOT_INSTALLED
+        return None
 
 
 def _doctor_paperless(
@@ -2273,7 +2270,7 @@ def doctor(ctx: click.Context) -> None:
     """Check that saneless is ready to scan."""
     # No directory gate: an unusable folder is a red row, not a refusal.
     settings = _load_cli_settings(ctx, validate_dirs=False)
-    scanner, scanner_refusal = _doctor_scanner(settings)
+    scanner = _doctor_scanner(settings)
     if scanner is not None:
         # Registered before the checks run, so a failing check still ends
         # any scanner child the backend left running.
@@ -2286,7 +2283,6 @@ def doctor(ctx: click.Context) -> None:
                 scanner=scanner,
                 paperless=paperless,
                 paperless_refusal=paperless_refusal,
-                scanner_refusal=scanner_refusal,
                 # The status strip calls the same function, which keeps the
                 # two surfaces on one Profiles row.
                 profile_storage=profile_storage_for_loaded(settings),
