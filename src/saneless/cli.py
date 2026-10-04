@@ -172,14 +172,10 @@ logger = logging.getLogger(__name__)
 # is the backlog uvicorn itself listens with.
 _LISTEN_BACKLOG: Final = 2048
 
-# Width of the Status column in `saneless jobs`, derived rather than written
-# down: the humanised labels are longer than the raw enum values they replaced,
-# and a new JobState member must not be able to overflow an 80-column
-# terminal without anyone noticing. A DONE row that carries a warning is
-# labelled from the state and the warning together rather than by a state of
-# its own, so its label joins the max explicitly, and so do the labels of the
-# two failures that may already be in paperless-ngx, which come from the
-# category rather than the state.
+# Width of the Status column in `saneless jobs`, derived from every label a row
+# can show, so a new JobState member cannot overflow the column unnoticed. The
+# warned-upload and the two unconfirmed-upload labels come from the warning or
+# the category rather than the state, so they join the max explicitly.
 _STATUS_COL_WIDTH = max(
     *(len(state_label(state)) for state in JobState),
     len(WARNED_UPLOAD_LABEL),
@@ -189,19 +185,15 @@ _STATUS_COL_WIDTH = max(
 
 # Width of the Profile column in `saneless jobs`, and the floor the Title
 # column never shrinks below. At 80 columns the Timestamp, Profile and Status
-# columns and the three separators leave the Title exactly its floor; the
-# Profile column gave up its fifteenth character so the widest status label,
-# "Waiting: blank pages found", still fits without eating into the title.
+# columns and the three separators leave the Title exactly its floor.
 _PROFILE_COL_WIDTH: Final = 14
 _TITLE_COL_FLOOR: Final = 15
 
 # Widths of the fixed columns in `saneless devices`, and the floor the Name
-# column never shrinks below.  The Name column takes whatever the terminal has
-# left after them and the three separators, which at 80 columns is 30 -- room
-# for a typical network device name, the value a profile is set up with.  The
-# Type column is cut like the others: SANE's "multi-function peripheral" is 25
-# characters, and printed whole it pushed every row past 80.  ``--json`` gives
-# every value whole.
+# column never shrinks below.  The Name column takes what the terminal has left,
+# 30 at 80 columns: room for a typical network device name.  The Type column is
+# cut too, because SANE's 25-character "multi-function peripheral" would push a
+# row past 80; ``--json`` gives every value whole.
 _DEVICE_VENDOR_COL_WIDTH: Final = 15
 _DEVICE_MODEL_COL_WIDTH: Final = 20
 _DEVICE_TYPE_COL_WIDTH: Final = 12
@@ -209,18 +201,12 @@ _DEVICE_NAME_COL_FLOOR: Final = 20
 
 # The widest zone token ``%Z`` produces at a realistic offset: five characters,
 # the ``+0545`` shape the tz database falls back to where there is no
-# abbreviation. The only literal in the width below, and the one this host
-# cannot demonstrate on its own.
+# abbreviation. This host cannot demonstrate it on its own.
 _WIDEST_ZONE_TOKEN = len("+0545")
 
 # Width of the Timestamp column in `saneless jobs`, derived from a rendered
-# sample rather than written down, exactly as _STATUS_COL_WIDTH is. The date
-# and time half is fixed-width; only the zone token this host happens to report
-# varies, so the column reserves the widest realistic one instead of trusting
-# the three letters most of the world sees. A host whose token is wider still
-# wins the max(), so a zone abbreviation cannot silently truncate the column.
-# Comes to 22, which is what ts_w was before local time arrived -- the reserve
-# the seconds used to occupy is exactly the reserve the zone now needs.
+# sample. Only the zone token varies, so the column reserves the widest
+# realistic one; a host whose token is wider still wins the max().
 _TIME_COL_SAMPLE = local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC))
 _TIME_COL_WIDTH = max(
     len(_TIME_COL_SAMPLE),
@@ -243,10 +229,8 @@ _UNSET_CREDENTIAL_PROBLEM = UNSET_CREDENTIAL_CLAUSE
 _UNSET_ADDRESS_PROBLEM = "the paperless-ngx address in paperless.url has not been set"
 
 
-# Whether a human can answer a prompt here, behind a function of its own rather
-# than written inline: CliRunner is genuinely not a terminal, so the non-TTY
-# refusal test runs unpatched and the prompt test patches this one name.
-# Written as a bare sys.stdin.isatty() in scan, one of the two could not exist.
+# A function of its own so the prompt test patches this one name, while the
+# non-TTY refusal test runs unpatched against CliRunner, which is not a terminal.
 def _stdin_is_interactive() -> bool:
     """
     Whether stdin is a terminal a human can answer a prompt on.
@@ -258,39 +242,22 @@ def _stdin_is_interactive() -> bool:
     return stdin is not None and not stdin.closed and stdin.isatty()
 
 
-# The clock a prompt's deadline is read from, behind a function of its own for
-# the same reason as _stdin_is_interactive: a test patches this one name to
-# move time on without waiting for it.
+# A function of its own so a test patches this one name to move time on.
 def _monotonic() -> float:
-    """
-    Read the clock a prompt's deadline is measured on.
-
-    Returns:
-        ``time.monotonic()``.
-
-    """
+    """Read the clock a prompt's deadline is measured on."""
     return time.monotonic()
 
 
-# The one wait a terminal prompt makes, behind a function of its own so a test
-# patches this one name: CliRunner's stdin has no descriptor to wait on, and
-# everything after the wait -- the read, the parsing, end of input -- then runs
-# for real. Clamped at zero because select refuses a negative timeout.
+# The one wait a terminal prompt makes, a function of its own so a test patches
+# this one name: CliRunner's stdin has no descriptor to wait on, and the read
+# after the wait then runs for real. Clamped at zero because select refuses a
+# negative timeout.
 def _wait_readable(stream: TextIO, timeout: float) -> bool:
     """
-    Wait up to ``timeout`` seconds for a line, or end of input, on ``stream``.
+    Wait up to ``timeout`` seconds for ``stream`` to be readable.
 
-    Runs on the main thread, where a signal interrupts it: Ctrl-C raises
-    ``KeyboardInterrupt`` out of the wait, and SIGTERM or SIGHUP raises the
-    handler's ``ScanInterrupted``.
-
-    Args:
-        stream: The stream to wait on; it must have a file descriptor.
-        timeout: The longest to wait, in seconds.
-
-    Returns:
-        Whether ``stream`` can be read without blocking.
-
+    Runs on the main thread, where Ctrl-C raises ``KeyboardInterrupt`` out of
+    the wait, and SIGTERM or SIGHUP raises the handler's ``ScanInterrupted``.
     """
     ready, _, _ = select.select([stream.fileno()], [], [], max(0.0, timeout))
     return bool(ready)
@@ -316,24 +283,17 @@ class _Interruption:
     """
     Whether a SIGTERM or SIGHUP has reached the running command, and which.
 
-    Set by the signal handler, which runs on the main thread, and read after
-    end of input at a terminal prompt.  The received flag is a plain
-    attribute, taking no lock, and nothing waits on it.  The handler records
-    the signal and then raises, interrupting whatever the main thread was
-    doing; a lock taken there -- by the handler, or by the very call it
-    interrupted -- could be left held, and the next record or clear would
-    block forever.  The prompt waits for a signal by sleeping instead, which
-    the raising handler interrupts.
+    Set by the signal handler on the main thread, and read after end of input
+    at a terminal prompt.  It takes no lock: the handler raises out of
+    whatever the main thread was doing, so a lock held there could stay held
+    and the next record or clear would block forever.
 
-    ``settled`` is the scan's ``PipelineRequest.settled``: the run sets it once
-    its outcome is fixed, and the guard sets it as it starts reporting a
-    failure.  From then on a signal is recorded and deferred rather than
-    raised, because raising it could only undo what is already done -- abandon
-    a failure's pages half way into ``failed/``, or turn a delivered document
-    into an interruption.  The command finishes and exits with its own
-    outcome's code.  It is a lock-free ``Settled``, not an ``Event``: it is
-    set on the main thread, where the handler that reads it can interrupt the
-    very call that sets it.
+    ``settled`` is the scan's ``PipelineRequest.settled``, set once the run's
+    outcome is fixed or the guard starts reporting a failure.  From then on a
+    signal is recorded and deferred rather than raised, because raising could
+    only undo finished work, such as a failure's pages half moved into
+    ``failed/``.  It is a lock-free ``Settled``, not an ``Event``, for the
+    same reason the flag takes no lock.
     """
 
     def __init__(self) -> None:
@@ -379,19 +339,9 @@ def _interrupt_handler(signum: int, _frame: FrameType | None) -> None:
     """
     Turn SIGTERM or SIGHUP into ``ScanInterrupted`` on the main thread.
 
-    Both signals are ignored from here on, first of all, so a second one -- an
-    impatient supervisor, or a hangup following a stop -- cannot abandon the
-    preservation this one starts. The command's context puts the original
-    handlers back when it closes.
-
-    Once the command's outcome is settled (``_Interruption.settled``) the
-    signal is only recorded: the command is already delivering its result or
-    keeping a failure's pages, and it finishes that and exits as it would
-    have.
-
-    Args:
-        signum: The signal that arrived.
-        _frame: The interrupted frame; unused.
+    Both signals are ignored from here on, so a second one cannot abandon the
+    preservation this one starts.  Once the outcome is settled the signal is
+    only recorded, and the command exits as it would have.
 
     Raises:
         ScanInterrupted: Carrying ``signum``, unless the outcome is settled.
@@ -462,24 +412,11 @@ def _end_of_input(settle_abort: Callable[[], object], what: str) -> None:
     """
     Treat end of input at a prompt as a cancel, unless a hangup caused it.
 
-    A terminal that closes sends SIGHUP and end of input at nearly the same
-    moment, in no promised order.  The signal is an interruption, which keeps
-    the pages scanned; end of input on its own is the operator's cancel, which
-    keeps nothing.  So the prompt pauses ``_HANGUP_GRACE_SECONDS`` for a
-    signal first, and settles the cancel only if none came.  Every terminal
-    prompt shares this, so a hangup means the same thing at each of them.
-
-    The pause is a plain sleep, never a wait on a lock, on the main thread
-    where every terminal prompt reads.  The signal's handler raises
-    ``ScanInterrupted`` out of the sleep, and that propagates to the caller.
-    A signal recorded without raising -- the command's outcome was already
-    settled -- lets the sleep run to its end, and says to claim nothing and
-    leave the answer to that interruption.
-
-    Args:
-        settle_abort: Claims the prompt's cancel answer.
-        what: The prompt, as its log line names it.
-
+    The prompt pauses ``_HANGUP_GRACE_SECONDS`` for a signal first, and
+    calls ``settle_abort`` only if none came.  The pause is a plain sleep,
+    never a wait on a lock, so the handler's ``ScanInterrupted`` raises out
+    of it to the caller.  A signal recorded without raising lets the sleep
+    end and leaves the answer to that interruption.
     """
     time.sleep(_HANGUP_GRACE_SECONDS)
     if _INTERRUPTION.received():
@@ -515,17 +452,9 @@ def _read_line(question: str, deadline: float) -> str | None:
     """
     Ask ``question`` and read one line of answer, on the calling thread.
 
-    The question is printed, then the prompt waits for stdin to become
-    readable until ``deadline``, then reads one line.  A terminal in its
-    usual line mode hands over at most one line per read, so nothing typed is
-    left buffered where the next wait could not see it.
-
-    Args:
-        question: The whole question, suffix included.
-        deadline: The ``_monotonic`` reading the answer is due by.
-
-    Returns:
-        The line typed, newline included, or ``None`` at end of input.
+    A line is read only once stdin is readable.  A terminal in line mode hands
+    over at most one line per read, so nothing typed is left buffered where
+    the next wait could not see it.  Returns ``None`` at end of input.
 
     Raises:
         OSError: stdin is closed, or the terminal failed.
@@ -550,9 +479,8 @@ def _read_line(question: str, deadline: float) -> str | None:
     return line
 
 
-# The flip question as click.confirm(_FLIP_PROMPT, default=True) put it, and
-# click's own refusal of an answer that is neither yes nor no, so an operator
-# used to that prompt sees nothing new now that the CLI reads the line itself.
+# The flip question and the refusal of an answer that is neither yes nor no, in
+# click.confirm(_FLIP_PROMPT, default=True)'s own wording.
 _FLIP_QUESTION: Final = f"{_FLIP_PROMPT} [Y/n]: "
 _INVALID_YES_NO: Final = "Error: invalid input"
 
@@ -566,29 +494,20 @@ class ClickFlipCoordinator(FlipCoordinator):
     """
     The CLI flip coordinator: a terminal question with a bounded wait.
 
-    The question is asked and its answer read on the calling thread -- the
-    main thread, where Python delivers signals -- so every way of leaving it
-    ends the wait at once and nothing is left reading stdin afterwards.  A
-    line is read only once stdin is readable, and the wait for it ends at the
-    deadline, which answers ``TIMED_OUT``.
+    The question is asked and read on the calling thread -- the main thread,
+    where Python delivers signals -- so every way of leaving it ends the wait
+    at once and nothing is left reading stdin.  The deadline answers
+    ``TIMED_OUT``.
 
     A yes, or just Return, is ``CONTINUED``; a no is ``ABORTED``; anything
-    else is refused with click's own wording and the question asked again
-    for the time left.  End of input (Ctrl-D) and Ctrl-C are ``ABORTED`` too.
-    Those are an operator's abort -- a cancel -- so giving up at the terminal
-    and clicking Abort in the web UI end the job the same way.
+    else is refused and the question asked again for the time left.  End of
+    input and Ctrl-C are ``ABORTED`` too, the same cancel as the web UI's
+    Abort, unless a hangup caused the end of input (``_end_of_input``): a
+    SIGHUP or SIGTERM propagates out of this call as ``ScanInterrupted``.
 
-    The exception is end of input caused by a hangup: a terminal that closes
-    also sends SIGHUP, which is an interruption, not a cancel, and keeps the
-    fronts.  So end of input pauses for the signal first
-    (``_end_of_input``); if it comes, the handler's ``ScanInterrupted``
-    propagates out of the pause, and out of this call, untouched.  A SIGHUP
-    or SIGTERM that arrives while the question waits does the same.
-
-    A read that fails instead -- an I/O error from the terminal, undecodable
-    input, stdin closed -- also answers ``ABORTED`` at once, logged with its
-    traceback, but it records the exception as ``abort_cause``: nobody chose
-    to stop, so the scan is reported as failed (exit 1), not cancelled.
+    A read that fails -- an I/O error, undecodable input, stdin closed --
+    also answers ``ABORTED``, but records the exception as ``abort_cause``:
+    nobody chose to stop, so the scan is reported as failed, not cancelled.
     """
 
     def __init__(self) -> None:
@@ -628,10 +547,8 @@ class ClickFlipCoordinator(FlipCoordinator):
         except _PromptTimedOut:
             return FlipOutcome.TIMED_OUT
         except (OSError, ValueError) as exc:
-            # The read broke, or the line could not be decoded (ValueError
-            # covers UnicodeDecodeError), so the scan stops now: ABORTED
-            # rather than a fourth outcome, with the exception kept as
-            # abort_cause so the pipeline reports a failure, not a cancel.
+            # ValueError covers UnicodeDecodeError.  abort_cause makes the
+            # pipeline report a failure, not a cancel.
             logger.exception("Flip prompt failed; treating it as an abort")
             self._abort_cause = exc
             return FlipOutcome.ABORTED
@@ -711,14 +628,7 @@ def _pass_question(prompt: PassPrompt) -> str:
 
     A failed pass's error text comes from outside saneless -- a SANE status
     string, a wrapped OS error -- so its control characters are shown as
-    escapes here, at the terminal, as on every other failure line.
-
-    Args:
-        prompt: The open question.
-
-    Returns:
-        The question, ending ``": "`` as click.prompt ended it.
-
+    escapes, as on every other failure line.
     """
     shown = prompt
     if prompt.error is not None:
@@ -733,16 +643,8 @@ def _parse_pass_answer(prompt: PassPrompt, line: str) -> PassAnswer | None:
     Only the first character counts, in either case, and only a letter the
     prompt lists is accepted.  Anything else is refused with the letters on
     offer, and ``f`` while nothing is kept says why there is nothing to
-    finish.  A line with nothing on it at all is no answer and no mistake,
-    so it is passed over without a word.
-
-    Args:
-        prompt: The open question.
-        line: The line typed, newline included.
-
-    Returns:
-        The answer, or ``None`` when the question must be asked again.
-
+    finish.  An empty line is passed over without a word.  ``None`` means
+    the question must be asked again.
     """
     text = line.rstrip("\r\n")
     if not text:
@@ -763,36 +665,25 @@ class ClickPassCoordinator(PassCoordinator):
     """
     The CLI multi-page coordinator: a one-letter question with a bounded wait.
 
-    Each question is asked and its answer read on the calling thread -- the
-    main thread, where Python delivers signals -- so every way of leaving it
-    ends the wait at once and nothing is left reading stdin afterwards.  A
-    line is read only once stdin is readable, and the wait for it ends at the
-    question's deadline, ``timeout_seconds`` after it was asked, which
-    answers ``TIMED_OUT``.  A refused answer does not restart the clock.
+    Each question is asked and read on the calling thread, as the flip
+    question is, and its deadline is ``timeout_seconds`` after it was asked,
+    which answers ``TIMED_OUT``.  A refused answer does not restart the
+    clock.  Keys typed during the pass are thrown away before the question
+    shows (``_flush_typed_ahead``).
 
-    The question lists only the letters it accepts, and keys typed during the
-    pass are thrown away once, before it is shown (``_flush_typed_ahead``).
-    Ctrl-C is a cancel, with no confirmation however many pages are kept: it
-    raises out of the wait, which answers ``ABORT``, and a page is only ever
-    kept by choosing to finish.  End of input is a cancel too, unless a
-    hangup caused it (``_end_of_input``); a SIGHUP or SIGTERM that arrives
-    while the question waits raises the handler's ``ScanInterrupted``, which
-    propagates out of this call untouched.
+    Ctrl-C is an unconfirmed cancel, ``ABORT``: a page is only ever kept by
+    choosing to finish.  End of input is a cancel too, unless a hangup
+    caused it (``_end_of_input``); a SIGHUP or SIGTERM propagates out of
+    this call as ``ScanInterrupted``.
 
-    An ``a`` is confirmed first, No by default.  The confirmation holds the
-    clock for at most one more ``timeout_seconds``: the operator answering
-    "abort?" when the question's deadline passes must not have the document
-    finished and uploaded under them.  So the confirmation is due by the
-    question's deadline plus one more timeout.  A Yes aborts.  A No before
-    the question's deadline asks the question again for the time left; a No
-    after it, or no answer by the confirmation's own deadline, is not an
-    abort, and the expired wait answers ``TIMED_OUT``.
+    An ``a`` is confirmed first, No by default, and the confirmation holds
+    the clock for at most one more ``timeout_seconds``, so an operator
+    answering "abort?" as the deadline passes does not have the document
+    uploaded under them.  A No before the question's deadline asks again for
+    the time left; a No after it, or no answer, answers ``TIMED_OUT``.
 
-    A read that fails instead -- an I/O error from the terminal, undecodable
-    input, stdin closed -- answers ``ABORT`` at once, logged with its
-    traceback, and records the exception as ``abort_cause``: nobody chose to
-    stop, so the scan is reported as failed, not cancelled, and its pages
-    are kept.
+    A read that fails answers ``ABORT`` and records ``abort_cause``, so the
+    scan is reported as failed, not cancelled, and its pages are kept.
     """
 
     def __init__(self) -> None:
@@ -833,10 +724,8 @@ class ClickPassCoordinator(PassCoordinator):
         except _PromptTimedOut:
             return PassAnswer.TIMED_OUT
         except (OSError, ValueError) as exc:
-            # The read broke, or the line could not be decoded (ValueError
-            # covers UnicodeDecodeError), so the scan stops now: ABORT, with
-            # the exception kept as abort_cause so the run reports a failure
-            # that keeps its pages rather than a cancel.
+            # ValueError covers UnicodeDecodeError.  abort_cause makes the run
+            # report a failure that keeps its pages, not a cancel.
             logger.exception("Multi-page prompt failed; treating it as an abort")
             self._abort_cause = exc
             return PassAnswer.ABORT
@@ -874,13 +763,8 @@ class ClickPassCoordinator(PassCoordinator):
         """
         Ask whether to abort, holding the clock for at most one more timeout.
 
-        Args:
-            prompt: The open question.
-            deadline: The question's own deadline.
-
-        Returns:
-            ``ABORT`` for a Yes, ``None`` for a No, or the cancel end of input
-            stands for.
+        Returns ``ABORT`` for a Yes, ``None`` for a No, or what end of input
+        stands for.
 
         Raises:
             _PromptTimedOut: Nobody answered by the confirmation's deadline,
@@ -934,9 +818,9 @@ _CLICK_CONTROL_FLOW: tuple[type[Exception], ...] = (
 
 ``--help`` raises ``Exit``, EOF at a prompt raises ``Abort``, and a usage error
 is a ``ClickException``; click's ``main`` turns each into its own output and exit
-code. Held under a name so the guard's clause is
-one short, parenthesis-free ``except``: the multi-type spelling ruff formats to
-(PEP 758) does not parse on the older interpreter the pre-commit AST hooks run.
+code. Held under a name because the parenthesis-free multi-type ``except`` ruff
+formats to (PEP 758) does not parse on the older interpreter the pre-commit AST
+hooks run.
 """
 
 
@@ -951,13 +835,6 @@ def _logging_ready(ctx: click.Context) -> bool:
     Before that, an ERROR record has no handler but ``logging.lastResort``,
     which would print it -- traceback and all -- straight to stderr, so the
     guard must not log at all.
-
-    Args:
-        ctx: The group's context; its ``obj`` is shared with the subcommand's.
-
-    Returns:
-        True once logging is configured.
-
     """
     obj = ctx.obj
     return isinstance(obj, dict) and bool(obj.get("logging_configured"))
@@ -967,14 +844,8 @@ def _unexpected_line(exc: BaseException) -> str:
     """
     Render the one line an exception that is not a saneless type is reported as.
 
-    Args:
-        exc: The exception to report.
-
-    Returns:
-        ``Unexpected error (<Type>): <message>``, with no trailing hint.  The
-        message is ``failure_text``'s, so any note on the exception is part of
-        it.
-
+    The message is ``failure_text``'s, so any note on the exception is part of
+    it; no hint is appended.
     """
     return f"Unexpected error ({type(exc).__name__}): {failure_text(exc)}"
 
@@ -984,25 +855,12 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
     Render the one line a classified saneless failure is reported as.
 
     The prefixes are documented (``docs/how-to/set-up-adf-duplex.md`` quotes
-    them), so they are kept as they were before the guard existed. A
-    configuration error is printed as-is: the loader's renderer already wrote
-    its own ``Configuration error in <file>:`` header, and escapes the names
-    in its own lines.  Every other line has its control characters shown as
-    escapes, because its text can carry something from outside saneless,
-    such as a device name that LAN discovery reported.
-
-    Every message is rendered through ``failure_text`` rather than ``str``, so
-    a note attached with ``add_note`` -- where a failed scan's pages were
-    kept, for one -- is on the line too.  The configuration arm keeps the
-    loader's text as written and appends only the notes.
-
-    Args:
-        exc: The failure.
-        category: What ``classify_error`` made of it.
-
-    Returns:
-        The line to print on stderr.
-
+    them), so they must not change.  A configuration error keeps the loader's
+    text, which already has its header and escapes its own names, and appends
+    only the notes.  Every other line has its control characters escaped,
+    because it can carry text from outside saneless such as a device name.
+    Messages go through ``failure_text``, so an ``add_note`` note is on the
+    line too.
     """
     match category:
         case ErrorCategory.FEEDER | ErrorCategory.SCANNER:
@@ -1034,25 +892,11 @@ def _advice_line(exc: SanelessError, category: ErrorCategory) -> str:
     """
     Render the ``Try:`` line that follows a classified failure's line.
 
-    A raise site that knows the fix sets ``next_step`` on the error, and that
-    wins: it is advice for this error, where the category's fallback has to be
-    true for every error the category holds and so can only point at the
-    problem.  Every category keeps its fallback, so no classified failure
-    ends without a next step.
-
-    The next step is shown with its control characters as escapes, as the
-    failure line's text is: it is a constant at every raise site today, but
-    some carry a setting key or a file name, and a line on the operator's
-    terminal must stay one line whatever it holds.
-
-    Args:
-        exc: The failure.
-        category: The category whose fallback applies when ``exc`` carries no
-            next step of its own.
-
-    Returns:
-        ``Try: <next step>``.
-
+    A raise site's own ``next_step`` wins over the category's fallback, which
+    has to be true for every error in the category.  Every category has a
+    fallback, so no classified failure ends without a next step.  Control
+    characters are escaped, because a next step can carry a setting key or a
+    file name and the line must stay one line.
     """
     return neutralise_controls(f"Try: {exc.next_step or error_next_step(category)}")
 
@@ -1061,18 +905,10 @@ def _echo_err(text: str, *, nl: bool = True) -> None:
     """
     Write one line of a command's report to stderr, surviving a dead terminal.
 
-    The guard, and a scan's closing lines, report how a command ended, and the
-    exit code is the report a script reads.  A terminal that has gone away --
-    the dropped SSH session behind a SIGHUP -- answers every write with EIO,
-    and an ``OSError`` raised here would escape as a traceback, or reach the
-    guard as an unexpected error, instead of the code the command chose.  So a
-    failed write is logged here, and ``drain_dead_streams`` discards what it
-    left behind before the interpreter exits, so the exit code still stands.
-
-    Args:
-        text: The line to write.
-        nl: Whether to end it with a newline.
-
+    A terminal that has gone away -- the dropped SSH session behind a SIGHUP
+    -- answers every write with EIO, and an ``OSError`` escaping here would
+    replace the exit code the command chose.  So a failed write is only
+    logged, and ``drain_dead_streams`` discards what it left behind.
     """
     try:
         click.echo(text, err=True, nl=nl)
@@ -1085,13 +921,8 @@ def _echo_out(text: str) -> None:
     Write one line of a scan's report to stdout, surviving a dead terminal.
 
     The stdout twin of ``_echo_err``.  A hangup after delivery is deferred, so
-    the scan goes on to print its outcome to a terminal that is already gone;
-    the document is in paperless-ngx by then, and the exit code chosen from
-    the result must stand rather than become exit 5.
-
-    Args:
-        text: The line to write.
-
+    the scan prints its outcome to a terminal that is already gone, and the
+    exit code chosen from the result must stand rather than become exit 5.
     """
     try:
         click.echo(text)
@@ -1100,13 +931,7 @@ def _echo_out(text: str) -> None:
 
 
 def _drain_dead_stream(stream: TextIO | None) -> None:
-    """
-    Discard what a standard stream can no longer write, if it cannot.
-
-    Args:
-        stream: ``sys.stdout`` or ``sys.stderr``; ``None`` when there is none.
-
-    """
+    """Discard what ``sys.stdout`` or ``sys.stderr`` can no longer write."""
     if stream is None:
         return
     try:
@@ -1134,19 +959,14 @@ def drain_dead_streams() -> None:
     """
     Point a dead stdout or stderr at ``/dev/null`` before the interpreter exits.
 
-    A write that fails on a terminal that has gone away -- a hangup, or a
-    closed pipe -- leaves its bytes in the stream's buffer, and catching the
-    ``OSError`` does not remove them.  The interpreter flushes both streams
-    once more as it shuts down, that flush fails the same way, and CPython
-    then replaces the exit code the command chose with 120: a delivered scan
-    would stop exiting 0 and a hangup would stop exiting 129.  So each stream
-    that still cannot be flushed has its descriptor pointed at ``/dev/null``,
-    where the unwritten bytes, and anything written after them, go without
-    error.  A stream that flushes normally is left untouched.
+    A write that fails on a terminal that has gone away leaves its bytes in
+    the stream's buffer.  The interpreter's last flush at shutdown then fails
+    too, and CPython replaces the command's exit code with 120.  So each
+    stream that still cannot be flushed has its descriptor pointed at
+    ``/dev/null``; a stream that flushes normally is left untouched.
 
-    It is called once, as the console entry point returns, so it covers every
-    write the command made: the ``_echo_out`` and ``_echo_err`` lines, and the
-    progress lines whose failure the pipeline only logs.
+    Called once, as the console entry point returns, so it covers every write
+    the command made.
     """
     _drain_dead_stream(sys.stdout)
     _drain_dead_stream(sys.stderr)
@@ -1156,24 +976,12 @@ def _log_failure(ctx: click.Context, exc: Exception) -> None:
     """
     Log a classified failure, but only once logging is configured.
 
-    The message names the failure too: when the log fell back to stderr the
-    traceback is not rendered there, and the record must still say what went
-    wrong.  It is quoted with ``%r``, because it can carry text from outside
-    saneless and repr shows a control character in it as its escape.
-
-    The traceback goes with the record only when the log is a file.  ``serve``
-    streams its log to stderr, and that stream renders every traceback it is
-    given, so a port that is taken or a scanner library that would not start
-    -- a setup problem the failure line and its ``Try:`` line already explain
-    -- would print a stack of saneless's own frames above them.  A one-shot
-    command's log is a file nobody reads at the terminal, and there the
-    traceback is kept for whoever does.  An unexpected error (exit 5) is not
-    logged here: ``_report_unexpected`` keeps its traceback on both.
-
-    Args:
-        ctx: The group's context.
-        exc: The failure to log.
-
+    The message is quoted with ``%r``, because it can carry text from outside
+    saneless.  The traceback goes with the record only when the log is a
+    file: ``serve``'s stderr stream renders every traceback, which would
+    stack saneless's frames above a setup problem the failure and ``Try:``
+    lines already explain.  An unexpected error is logged by
+    ``_report_unexpected`` instead.
     """
     if not _logging_ready(ctx):
         return
@@ -1191,23 +999,11 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
     Report an exception that is not a saneless type as one stderr line.
 
     Once logging is configured the traceback goes to the log, and the line
-    points at the log file only when the file handler really attached
-    (``configure_logging``'s return value): a stderr fallback must not be called
-    a log file. That fallback never renders a traceback, so without ``-v`` the
-    line then says how to get one. Before logging is configured nothing is
-    logged; ``-v`` prints the traceback to stderr instead, and without it the
-    line says how to get one.
-
-    ``serve`` has neither a log file nor a traceback-free sink: its stream
-    renders the traceback the ``logger.error`` above just emitted, with or
-    without ``-v``. The hint is suppressed there rather than telling an operator
-    to restart a running service to see something already printed directly above
-    the line.
-
-    Args:
-        ctx: The group's context.
-        exc: The exception to report.
-
+    names the log file only when the file handler really attached; a stderr
+    fallback renders no traceback, so without ``-v`` the line says how to get
+    one.  Before logging is configured, ``-v`` prints the traceback to stderr
+    instead.  ``serve``'s stream already shows the traceback, so it gets no
+    hint.
     """
     obj = ctx.obj if isinstance(ctx.obj, dict) else {}
     line = _unexpected_line(exc)
@@ -1242,32 +1038,25 @@ class _GuardedGroup(click.Group):
        ``Exit`` and ``Abort`` subclass ``RuntimeError``, so a later
        ``except Exception`` would turn ``--help`` into exit 5.
     2. ``BrokenPipeError`` -- the reader of stdout went away, as under
-       ``saneless jobs | head`` -- is no failure and no bug: nothing is
-       printed, no traceback is kept, and the command exits 141 (128 plus
-       SIGPIPE), the shell's code for it.  It has to come before the last
-       clause, which would call it a saneless bug.  A scan never gets here:
-       its report survives a dead stdout so that its outcome's code stands.
-    3. ``ScanInterrupted`` -- a SIGHUP or SIGTERM to the command -- is an
-       interruption, not a cancel: nobody chose to stop, so the pages already
-       scanned were kept. One ``Interrupted:`` line and 128 plus the signal
-       number, 129 or 143. It is a ``BaseException``, so no later clause
-       would catch it. A signal that arrives once the outcome is settled --
-       delivered, or failed and being kept, or being reported here -- is
+       ``saneless jobs | head`` -- is no failure: nothing is printed and the
+       command exits ``ExitCode.BROKEN_PIPE``.  It must come before the last
+       clause, which would call it a saneless bug.
+    3. ``ScanInterrupted`` -- a SIGHUP or SIGTERM -- is an interruption, not
+       a cancel: the pages already scanned were kept, and the exit code is
+       128 plus the signal number.  It is a ``BaseException``, so no later
+       clause would catch it.  A signal after the outcome is settled is
        deferred instead, and the command exits with its own outcome's code.
-    4. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
-       failure: one line and exit 130.
+    4. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel:
+       ``ExitCode.CANCELLED``.
     5. ``StorageError`` -- a job database saneless cannot use -- is a setup
-       problem and exits 2. It is mapped here by type and sits before the
-       ``SanelessError`` clause because ``ErrorCategory`` is persisted on job
-       records, and ``classify_error`` deliberately keeps ``StorageError``
-       ``UNKNOWN`` rather than growing a category for it. Its message already
-       names the database path and the reason; its ``Try:`` line is the
-       configuration fallback unless the error carries its own next step.
+       problem, ``ExitCode.CONFIG``, mapped by type before the
+       ``SanelessError`` clause because ``classify_error`` keeps it
+       ``UNKNOWN``.  See docs/explanation/decisions/0008-no-storage-error-category.md.
     6. Any other ``SanelessError`` is classified once, by the same
        ``classify_error`` the web worker uses, so the CLI's exit code and the
        job's category cannot disagree.
     7. Anything else is not a saneless type: ``Unexpected error (<Type>)``,
-       exit 5, the traceback in the log.
+       ``ExitCode.UNEXPECTED``, the traceback in the log.
     """
 
     def invoke(self, ctx: click.Context) -> object:
@@ -1293,10 +1082,8 @@ class _GuardedGroup(click.Group):
         except _CLICK_CONTROL_FLOW:
             raise
         except BrokenPipeError:
-            # The reader of stdout went away -- `saneless jobs | head` once
-            # head has its lines.  Nothing failed, so nothing is printed and
-            # no traceback is kept; what the reader refused is discarded, so
-            # the interpreter's last flush raises nothing either.
+            # What the reader refused is discarded, so the interpreter's last
+            # flush raises nothing either.
             logger.info("The reader of saneless's output went away; stopping")
             _drain_dead_stream(sys.stdout)
             ctx.exit(ExitCode.BROKEN_PIPE)
@@ -1324,16 +1111,9 @@ class _GuardedGroup(click.Group):
                 _report_unexpected(ctx, exc)
             else:
                 _log_failure(ctx, exc)
-                # Two lines, and the first one is not ours to change. Line 1
-                # keeps its documented `<what saneless was doing>: <problem>`
-                # shape, printed unchanged, so a script parsing it and the
-                # doc-truth message-shape tests that pin it are both unaffected.
-                # Line 2 is the raise site's own fix when it knows one, else
-                # the category's fallback -- the same error_next_step string
-                # the web error page renders, which is why that copy is
-                # surface-neutral and true for every error in the category.
-                # The UNEXPECTED branch above gets no advice: its category is
-                # a guess about an exception saneless did not raise.
+                # Line 1 keeps its documented `<what saneless was doing>:
+                # <problem>` shape, which scripts parse.  The UNEXPECTED branch
+                # above gets no advice: its category is only a guess.
                 _echo_err(_failure_line(exc, category))
                 _echo_err(_advice_line(exc, category))
             ctx.exit(code)
@@ -1343,13 +1123,9 @@ class _GuardedGroup(click.Group):
 
 
 @click.group(cls=_GuardedGroup)
-# package_name makes click read the version from importlib.metadata, so
-# pyproject.toml stays its single source. No custom message is passed: the
-# default "%(prog)s, version %(version)s" is the whole contract, because
-# `saneless doctor` already reports the Python and platform detail a longer
-# block would duplicate. No short flag either -- `-v` below is already --verbose
-# on this group, and click would bind it to whichever option declared it last,
-# silently.
+# package_name reads the version from importlib.metadata, so pyproject.toml
+# stays its single source. No short flag: `-v` is --verbose on this group, and
+# click would silently bind it to whichever option declared it last.
 @click.version_option(package_name="saneless")
 @click.option(
     "--config",
@@ -1366,20 +1142,16 @@ class _GuardedGroup(click.Group):
 @click.pass_context
 def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
     """Saneless -- SANE scanner to paperless-ngx bridge."""
-    # Click runs this callback before a subcommand parses its own --help, and
-    # ctx.resilient_parsing is False there, so nothing may be loaded here: a
-    # broken config would otherwise break `saneless serve --help`.
-    # Each command loads through _load_cli_settings instead.
+    # Click runs this callback before a subcommand parses its own --help, so
+    # nothing may be loaded here: a broken config would break
+    # `saneless serve --help`.
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
     ctx.obj["verbose"] = verbose
-    # SIGTERM and SIGHUP become ScanInterrupted, which keeps the pages already
-    # scanned and exits 143 or 129 through the guard. Installing a handler
-    # loads nothing, so `--help` stays free of side effects; this group's
-    # context closes after the guard has chosen the exit code, which is when
-    # the original handlers go back, so none leaks into a caller that invoked
-    # the CLI in-process. serve is left to uvicorn, which installs its own
-    # handlers for a graceful shutdown.
+    # SIGTERM and SIGHUP become ScanInterrupted.  This context closes after the
+    # guard has chosen the exit code, which is when the original handlers go
+    # back, so none leaks into an in-process caller.  serve is left to uvicorn,
+    # which installs its own handlers for a graceful shutdown.
     if ctx.invoked_subcommand != "serve":
         ctx.call_on_close(_install_interrupt_handlers())
 
@@ -1397,27 +1169,13 @@ def _warn_stale_config(settings: Settings) -> None:
     """
     Say on stderr which config file is not being read, if one is not.
 
-    Two situations.  A file under the old name is being ignored; or a second
-    ``saneless.toml`` is sitting in a later searched directory, so the file an
-    operator edits may not be the one saneless reads.  The startup log already
-    says both, and on a service that is enough, because the records stream to
-    the same terminal the operator is watching.  A one-shot command writes its
-    log to ``log_file`` and is read afterwards if at all, so the person who
-    just ran ``saneless scan`` and got the defaults, or the other file's
-    settings, sees nothing at all -- the silent misconfiguration this warning
-    exists to prevent, in miniature.
-
-    The words are not written here.  ``configuration_check`` holds the one
-    copy of them, and the terminal spelling is the same sentence with the file
-    named by its absolute path, which a terminal may carry and the LAN-visible
-    status strip may not.  The row can show only one situation, and a shadowed
-    file outranks an old-name leftover there; the terminal has room for both,
-    and the leftover may hold the only copy of the Paperless URL and token, so
-    it gets its own line from ``leftover_config_check``.
-
-    Args:
-        settings: The settings in hand, carrying the search that built them.
-
+    Either a file under the old name is being ignored, or a second
+    ``saneless.toml`` in a later searched directory is shadowed.  A one-shot
+    command's log is a file read afterwards if at all, so without this line
+    the operator sees nothing.  ``configuration_check`` holds the one copy of
+    the words; the terminal may name absolute paths, which the LAN-visible
+    strip may not.  The row shows only one situation, so a leftover, which
+    may hold the only copy of the Paperless credentials, gets its own line.
     """
     state = config_file_state(settings)
     if state is ConfigFileState.LOADED_WITH_SHADOWED:
@@ -1444,44 +1202,19 @@ def _load_cli_settings(
     """
     Load and validate settings and configure logging, once per process.
 
-    Called by every command on first need rather than by the group callback, so
-    ``--help`` never touches the configuration. Nothing is caught here: every
-    failure reaches the group guard. Loading and directory validation raise
-    ``ConfigError`` for every problem with the file -- including a TOML syntax
-    error -- which the guard prints as rendered and exits 2; anything else is an
-    unexpected error, exit 5. An unwritable ``log_file`` is not a failure:
-    ``configure_logging`` warns on stderr, logs there instead, and the command
-    runs. ``load_settings`` and ``configure_logging`` are called by their
+    Called by every command on first need rather than by the group callback,
+    so ``--help`` never touches the configuration.  Nothing is caught here;
+    every failure reaches the group guard.  ``ctx.obj`` records ``log_file``
+    only if the file handler really attached, so the guard names the log file
+    truthfully.  The same settings object is returned on every call.
+    ``load_settings`` and ``configure_logging`` are called by their
     module-global names, which is where the tests patch them.
 
-    Once logging is configured, ``ctx.obj`` records it (``logging_configured``)
-    and records ``log_file`` only if the file handler really attached, so the
-    guard logs failures and names the log file truthfully. In the streaming
-    mode ``serve`` asks for, no file handler is attached at all, so
-    ``ctx.obj["log_file"]`` is always None there and nothing ever offers
-    "Full details in <log_file>" for a service that writes none.
-
-    Args:
-        ctx: The command's context; its ``obj`` carries ``config_path`` and
-            ``verbose`` from the group, and caches the loaded settings.
-        stream_logs: If True, configure the 12-factor service shape -- records
-            stream to stderr and no log file is written, so ``docker logs`` or
-            journald sees them and owns retention. Only ``serve`` passes it;
-            every one-shot command keeps the rotating file handler unchanged.
-        warn_stale: If False, do not print the superseded-name warning here.
-            Only ``auto-profiles`` passes it: that command refuses outright in
-            one of the two states, and the refusal and the warning are the
-            same sentence, so it decides for itself which one is printed.
-        validate_dirs: If False, skip ``validate_settings_dirs``.  Only
-            ``doctor`` passes it: a folder start-up would refuse is one of the
-            things it reports, and its Fallback and Data folder rows ask the
-            same questions that validation asks, so refusing first would
-            replace every row with one line.  Every other command keeps the
-            refusal, because it is about to use those folders.
-
-    Returns:
-        The loaded settings, the same object on every call.
-
+    ``stream_logs`` (``serve`` only) sends records to stderr and writes no log
+    file.  ``warn_stale=False`` (``auto-profiles`` only) leaves the
+    superseded-name warning to the command, whose refusal is the same
+    sentence.  ``validate_dirs=False`` (``doctor`` only) skips the folder
+    refusal, because doctor reports those folders row by row.
     """
     cached = ctx.obj.get("settings")
     if isinstance(cached, Settings):
@@ -1492,11 +1225,8 @@ def _load_cli_settings(
         validate_settings_dirs(settings)
     if not stream_logs:
         _make_log_home_private(settings)
-    # A service is handed no log file at all: configure_logging then attaches
-    # one stderr handler and returns False, so the line below records no
-    # log_file with no special case of its own. The rotation settings still go
-    # along and are simply unused -- they govern one-shot mode, which is what
-    # the configuration reference says and why no warning fires here.
+    # A service is handed no log file, so configure_logging attaches one stderr
+    # handler and returns False; the rotation settings then go unused.
     attached = configure_logging(
         None if stream_logs else settings.output.log_file,
         settings.output.log_level,
@@ -1512,12 +1242,8 @@ def _load_cli_settings(
 
     # Emitted only now, once the log file handler exists to receive it.
     warn_on_legacy_duplex_sources(settings)
-    # Which file and which environment keys, names only, once.
     log_config_sources(settings)
-    # A service's log is already on stderr, so the line above has reached the
-    # terminal and repeating it would be the same sentence twice per start.  A
-    # one-shot command's log is a file nobody is watching, so for it this is
-    # the only thing said in front of the person who ran it.
+    # A service's log is already on stderr, where the line above has said it.
     if warn_stale and not stream_logs:
         _warn_stale_config(settings)
 
@@ -1529,22 +1255,11 @@ def _make_log_home_private(settings: Settings) -> None:
     """
     Create ``data_dir`` owner-only before logging can create it with the umask.
 
-    The default log file lives in ``data_dir``, so the first one-shot command
-    on a new install -- often ``saneless doctor`` -- creates that directory
-    while setting up logging, before anything that would create it privately.
-    Every later call finds it existing and leaves its mode alone, so it has to
-    come out 0700 here. ``configure_logging`` makes only the log file's own
-    directory private; this covers a log file nested deeper inside
-    ``data_dir``. A log file elsewhere leaves ``data_dir`` to the commands
-    that use it.
-
-    A failure is left to ``configure_logging``, which meets the same error
-    creating the log directory and falls back to stderr with a warning
-    naming the log file.
-
-    Args:
-        settings: The loaded settings.
-
+    The first one-shot command on a new install creates ``data_dir`` while
+    setting up logging, and every later call leaves its mode alone, so it has
+    to come out 0700 here.  ``configure_logging`` makes only the log file's
+    own directory private.  A failure is left to ``configure_logging``, which
+    meets the same error and falls back to stderr with a warning.
     """
     output = settings.output
     if not output.log_file.is_relative_to(output.data_dir):
@@ -1557,20 +1272,11 @@ def _recover_orphaned_workspaces(settings: Settings) -> None:
     """
     Keep the pages a killed scan left in ``tmp_dir``, before this scan starts.
 
-    A CLI-only install has no server whose startup would recover a scan that
-    was SIGKILLed, OOM-killed or cut off by a power failure, so each
-    ``saneless scan`` sweeps first. Only workspaces whose lock is free are
-    taken, so a scan still running -- another ``saneless scan``, or a server
-    sharing this ``tmp_dir`` -- is never touched. A CLI scan has no job row:
-    the sweep's WARNING, naming where the pages went, is its whole report.
-
-    The sweep is housekeeping and never decides whether the scan runs: any
-    failure is logged with its traceback and the scan goes ahead.
-
-    Args:
-        settings: The loaded settings; ``tmp_dir``, ``failed_dir`` and
-            ``min_free_space_mb`` are read.
-
+    A CLI-only install has no server start-up to recover a killed scan, so
+    each ``saneless scan`` sweeps first.  Only workspaces whose lock is free
+    are taken, so a scan still running is never touched.  The sweep never
+    decides whether the scan runs: a failure is logged and the scan goes
+    ahead.
     """
     output = settings.output
     try:
@@ -1587,19 +1293,9 @@ def _scan_title(title: str, profile: ProfileConfig, *, now: datetime) -> str:
     """
     Resolve the title ``scan`` uploads under, refusing one paperless-ngx would cut.
 
-    The rule is the one the web form shares: typed, else the profile's title,
-    else "Scan <time>"; blank after stripping counts as not typed. A longer
-    title than paperless-ngx keeps whole is refused before the scanner exists,
-    never shortened. Only a typed title can be that long: a profile's title is
-    held to the same cap when the config loads.
-
-    Args:
-        title: The ``--title`` value, possibly empty.
-        profile: The chosen profile, for its title.
-        now: The time a "Scan <time>" title names.
-
-    Returns:
-        The resolved title, exactly as typed or configured.
+    The rule is the one the web form shares.  A title longer than
+    paperless-ngx keeps whole is refused before the scanner exists, never
+    shortened.
 
     Raises:
         click.BadParameter: If the title is longer than ``TITLE_MAX_LENGTH``,
