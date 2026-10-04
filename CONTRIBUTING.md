@@ -274,7 +274,8 @@ site.
   argument limit, values that travel together become one frozen dataclass; over the
   branch limit, a helper takes the branches it owns. A parameter object is not
   introduced only to satisfy the count: if the values do not belong together, split
-  the function instead.
+  the function instead. A FastAPI handler takes related form fields as one dataclass
+  through `Depends`.
 - `S101` bans `assert` in `src/`. Narrow an optional where the value is built, so the
   callee receives a record whose field is never `None`, or raise an explicit error.
 - `S608` matches `select ... from` anywhere in the literal text of an interpolated
@@ -282,12 +283,19 @@ site.
   named constant of its own, and every value is a bound parameter.
 - `S603` accepts a subprocess argv only when it is written out as a literal at the
   call. Variable parts reach the child through its environment, not through the argv.
-- `PTH105` forbids `os.replace`. Rename with `Path.replace`, which is the same atomic,
-  overwriting `rename(2)`.
+- The `PTH` rules ask for the `pathlib` equivalent of an `os` or `open()` call; use it
+  rather than suppress the rule. `PTH105` forbids `os.replace`: rename with
+  `Path.replace`, which is the same atomic, overwriting `rename(2)`.
+- The `FBT` rules reject a positional boolean parameter. Make it keyword-only, so a
+  call site never passes a bare `True`.
+- `PLW0603` rejects `global`. Module state that changes at run time lives in a small
+  record the module mutates in place, never in a name it rebinds.
 - `B008` rejects a call in a default argument, including FastAPI's `Query(...)` and
   `Form(...)`. Build the default once as a module-level constant and use that.
 - `B027` flags an empty, non-abstract method on an `ABC` as a probable unfinished
   override. A deliberate no-op default gets a real body, such as a DEBUG log line.
+- Python 3.14 accepts `except A, B:` without brackets. Use one clause only when the
+  exceptions mean the same thing to the caller; when they do not, write two clauses.
 - `E501` is off. The formatter keeps code at 88 columns, and a user-facing sentence
   that a test pins word for word stays one literal on one line, so a search finds it.
 
