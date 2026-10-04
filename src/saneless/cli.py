@@ -85,12 +85,11 @@ from .exceptions import (
     failure_text,
     note_text,
 )
+from .flip import FlipCoordinator, PassCoordinator
 from .job import CLI_JOBS_DEFAULT_LIMIT, read_recent_jobs
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import (
-    FlipCoordinator,
-    PassCoordinator,
     PipelineEvent,
     RequestHooks,
     Settled,

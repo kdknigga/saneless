@@ -38,8 +38,8 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.flip import FlipCoordinator
 from saneless.paperless import ApiDelivery, PaperlessClient, PaperlessTiming, TaskFiled
-from saneless.pipeline import FlipCoordinator
 from saneless.scanner import _listing_child
 from saneless.scanner import listing as listing_mod
 from saneless.scanner import sane_backend as sane_backend_mod

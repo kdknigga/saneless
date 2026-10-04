@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     from click.testing import Result
 
     from saneless.config import Settings
-    from saneless.pipeline import PassCoordinator
+    from saneless.flip import PassCoordinator
 
 _TITLE = "Stapled letter"
 

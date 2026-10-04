@@ -26,6 +26,7 @@ import pikepdf
 import pytest
 from PIL import Image, ImageColor, ImageDraw
 
+import saneless.flip as flip_module
 import saneless.pipeline as pipeline_module
 import saneless.preservation as preservation_module
 import saneless.scanner.sane_backend as sane_backend_mod
@@ -48,6 +49,7 @@ from saneless.exceptions import (
     failure_text,
     is_out_of_space,
 )
+from saneless.flip import FlipAnswerSlot, FlipCoordinator
 from saneless.pages import BlankFilterResult
 from saneless.paperless import (
     ApiDelivery,
@@ -65,8 +67,6 @@ from saneless.pipeline import (
     SCAN_LABEL_BACK,
     SCAN_LABEL_FRONT,
     DeviceMemory,
-    FlipAnswerSlot,
-    FlipCoordinator,
     PipelineEvent,
     PipelineRequest,
     RequestHooks,
@@ -1180,7 +1180,7 @@ class TestFlipAnswerSlot:
 
     def test_the_slot_is_public_api(self) -> None:
         """``FlipAnswerSlot`` is exported next to the coordinator contract."""
-        assert "FlipAnswerSlot" in pipeline_module.__all__
+        assert "FlipAnswerSlot" in flip_module.__all__
 
 
 class _FixedFlipCoordinator(FlipCoordinator):

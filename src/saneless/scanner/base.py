@@ -453,11 +453,11 @@ class PageSink(ABC):
     declares only the shape the two sides agree on.
 
     This is an ``ABC`` and not a ``typing.Protocol``, following the rule
-    already stated in ``pipeline.FlipCoordinator``'s docstring and observable
-    in the tree: ``Protocol`` describes shapes this project does not own
-    (``SaneDevice`` for python-sane's handle), while ``ABC`` defines seams the
-    project implements itself (``ScannerBackend``). A page sink is a seam this
-    project implements.
+    already stated in ``saneless.flip.FlipCoordinator``'s docstring and
+    observable in the tree: ``Protocol`` describes shapes this project does not
+    own (``SaneDevice`` for python-sane's handle), while ``ABC`` defines seams
+    the project implements itself (``ScannerBackend``). A page sink is a seam
+    this project implements.
 
     Two alternatives were rejected:
 

@@ -23,14 +23,11 @@ from .exceptions import (
     failure_text,
     note_text,
 )
+from .flip import AnswerSlot, FlipAnswerSlot, FlipCoordinator, PassCoordinator
 from .job import JobResult
 from .pipeline import (
     SCAN_LABEL_FRONT,
-    AnswerSlot,
     DeviceMemory,
-    FlipAnswerSlot,
-    FlipCoordinator,
-    PassCoordinator,
     PipelineEvent,
     RequestHooks,
     build_pipeline_request,

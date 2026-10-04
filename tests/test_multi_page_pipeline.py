@@ -31,6 +31,7 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
+import saneless.flip as flip_module
 import saneless.pipeline as pipeline_module
 from saneless.config import ProfileConfig
 from saneless.exceptions import (
@@ -46,12 +47,10 @@ from saneless.exceptions import (
     SpoolError,
     failure_text,
 )
+from saneless.flip import AnswerSlot, FlipAnswerSlot, PassCoordinator
 from saneless.pages import generate_thumbnail, is_blank
 from saneless.paperless import ApiDelivery, PaperlessClient, TaskFiled, UploadResult
 from saneless.pipeline import (
-    AnswerSlot,
-    FlipAnswerSlot,
-    PassCoordinator,
     PipelineEvent,
     PipelineRequest,
     _rejected_pages_warning,
@@ -228,8 +227,8 @@ class TestAnswerSlot:
 
     def test_the_slot_is_public_api(self) -> None:
         """``AnswerSlot`` is exported beside the flip slot."""
-        assert "AnswerSlot" in pipeline_module.__all__
-        assert "FlipAnswerSlot" in pipeline_module.__all__
+        assert "AnswerSlot" in flip_module.__all__
+        assert "FlipAnswerSlot" in flip_module.__all__
 
 
 class _AlwaysFinish(PassCoordinator):
@@ -272,7 +271,7 @@ class TestPassCoordinatorContract:
 
     def test_the_seam_is_public_api(self) -> None:
         """``PassCoordinator`` is exported beside ``FlipCoordinator``."""
-        assert "PassCoordinator" in pipeline_module.__all__
+        assert "PassCoordinator" in flip_module.__all__
 
 
 class TestMultiPageEventsAndRequest:

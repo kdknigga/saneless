@@ -23,8 +23,9 @@ from typing import TYPE_CHECKING, override
 
 import pytest
 
+from saneless.flip import AnswerSlot
 from saneless.job import ErrorCategory, Job, JobState, JobStore
-from saneless.pipeline import AnswerSlot, PipelineEvent, ScanResult
+from saneless.pipeline import PipelineEvent, ScanResult
 from saneless.vocabulary import (
     TERMINAL_STATES,
     PassAnswer,

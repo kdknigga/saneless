@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, override
 
 from saneless.config import ProfileConfig
-from saneless.pipeline import PassCoordinator
+from saneless.flip import PassCoordinator
 from saneless.vocabulary import PassAnswer
 from tests.conftest import build_settings
 
