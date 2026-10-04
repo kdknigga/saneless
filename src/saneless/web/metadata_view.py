@@ -249,7 +249,7 @@ def tag_list_context(
     unlisted row.
 
     ``q`` is a Python-side substring test over the cached list (ASVS 4.0.3
-    V5.1.1): it never reaches a paperless-ngx query URL and is absent from the
+    V5): it never reaches a paperless-ngx query URL and is absent from the
     returned context, so it cannot be echoed into the page.
 
     Args:
