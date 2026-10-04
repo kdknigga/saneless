@@ -1,9 +1,8 @@
 """
 Background worker thread consuming scan jobs from a queue.
 
-The ScanWorker runs a daemon thread that processes Job objects
-submitted via a queue.Queue, updating job state through the
-JobStore as the pipeline progresses.
+``ScanWorker`` runs one daemon thread that takes jobs off a bounded queue,
+runs the pipeline for each, and records its progress in the job store.
 """
 
 from __future__ import annotations
@@ -77,50 +76,39 @@ logger = logging.getLogger(__name__)
 
 # How long stop() waits for the worker thread before reporting it still alive.
 # Five seconds leaves room for uvicorn inside Docker's default 10 s SIGKILL
-# grace whenever no scan is being preserved (see PRESERVATION_JOIN_SECONDS).
-# Deliberately not configurable.  Read at call time, so tests can shorten it.
+# grace.  Read at call time, so tests can shorten it.
 STOP_JOIN_SECONDS: Final = 5.0
 
 # How much longer stop() waits, past STOP_JOIN_SECONDS, while the current job
-# is still keeping its pages in failed/.  Under Docker the tmp_dir
-# and the data volume are different filesystems, so that is a copy, and a large
-# pass can take longer than the ordinary join; a process that exits half way
-# loses the pages, because a recreated container discards /tmp.  Bounded, and
-# only spent while a preservation is in flight.  The shipped compose file's
-# stop_grace_period covers it and STOP_JOIN_SECONDS together.  Deliberately not
-# configurable.  Read at call time, so tests can shorten it.
+# is still keeping its pages in failed/, a copy across filesystems under Docker.
+# A process that exits half way loses them, because a recreated container
+# discards /tmp.  The shipped compose
+# file's stop_grace_period covers both waits.  Read at call time.
 PRESERVATION_JOIN_SECONDS: Final = 60.0
 
-# The idle loop's queue.get() timeout.  stop() does not rely on it -- the queue
-# shutdown wakes a blocked get() at once -- so it only sets how often an idle
-# worker gets a turn for housekeeping.  Read at call time.
+# The idle loop's queue.get() timeout: how often an idle worker gets a turn
+# for housekeeping.  stop() does not rely on it, because the queue shutdown
+# wakes a blocked get() at once.  Read at call time.
 _IDLE_TICK_SECONDS: Final = 5.0
 
-# How many unstarted jobs may wait behind the running one.  Not configurable:
-# a submit beyond it is reported as QUEUE_FULL rather than queued.
+# How many unstarted jobs may wait behind the running one; a submit beyond it
+# is reported as QUEUE_FULL.
 _QUEUE_DEPTH: Final = 10
 
 # How many loop-level failures in a row -- the loop's own job store writes, or
 # the idle prune, raising -- make the worker degraded.  A pipeline failure is
-# a job failure and never counts.  Three rides out one transient error
-# without calling the store broken.  Not configurable.
+# a job failure and never counts.
 _DEGRADED_AFTER: Final = 3
 
-# How many retries in a row the owed-write retry may fail before the worker
-# is degraded.  A clean job ends a streak before its own retry, so every
-# retry after the first of a streak is an idle tick's.  Kept apart from
-# _DEGRADED_AFTER's loop count: the guard already counted the failure behind
-# a guard debt, and a request-side owe_rejection debt was never counted, so a
-# streak of failed retries is its own evidence that the store is not
-# healing.  Three rides out a fault that heals within a tick or two, and at
-# the 5 s idle tick bounds a stuck row's silent window to about 15 s.  Not
-# configurable.  Read at call time, so tests can change it.
+# How many owed-write retries in a row may fail before the worker is degraded.
+# Counted apart from _DEGRADED_AFTER, which never sees a request-side debt, so
+# a streak of failed retries is its own evidence the store is not healing.
+# Read at call time, so tests can change it.
 _OWED_RETRY_DEGRADED_AFTER: Final = 3
 
-# How often an idle worker prunes job history.  Prune left the per-job
-# path so its failure can never fail a job; hourly keeps a long-running
-# appliance inside history_max_rows.  The startup prune is the lifespan's.  Not
-# configurable.  Read at call time, so tests can shorten it.
+# How often an idle worker prunes job history.  Pruning runs only when idle,
+# so its failure can never fail a job; the startup prune is the lifespan's.
+# Read at call time, so tests can shorten it.
 _PRUNE_INTERVAL_SECONDS: Final = 3600.0
 
 
@@ -132,9 +120,8 @@ class _OwedWrite:
     The owed value is the whole ``finish_job`` call, not just an error text:
     a success-path write that failed after Paperless accepted the document
     must be replayed as DONE or FALLBACK with its result, never turned into an
-    ERROR that invites a duplicate scan.  Value equality comes from the
-    dataclass, and freezing it means the owed value cannot change between the
-    flush's snapshot and its delete-if-unchanged compare.
+    ERROR that invites a duplicate scan.  Frozen, so the owed value cannot
+    change between the flush's snapshot and its delete-if-unchanged compare.
 
     Attributes:
         state: The terminal state to record.
@@ -158,12 +145,8 @@ class ScanOptions:
     """
     The per-scan choices a web request makes, carried to the job that runs it.
 
-    They travel on the queue beside the job, and are deliberately not a ``Job``
-    field or a job-table column, for the reason ``ScanWorker.front_pages`` is
-    not one: a choice made for one scan means nothing once that scan ends, and
-    a column would cost a schema migration of every existing job database.
-    Nor are they a profile setting: the same profile scans one sheet or a
-    whole document, and the operator decides which each time.
+    They travel on the queue beside the job and are not a job-table column: a
+    choice made for one scan means nothing once that scan ends.
 
     Attributes:
         multi_page: Whether the scan is a multi-page document: the operator is
@@ -209,15 +192,11 @@ class WorkerFlipCoordinator(FlipCoordinator):
     Abort double-clicked at the previous job's prompt, or a Continue sent
     during pass A, would otherwise pre-answer a prompt nobody has seen yet and
     abort the wrong job or start pass B on an unflipped stack.
-    ``FlipCoordinator`` itself is unchanged: arming is this class's detail,
-    not part of the contract the pipeline waits on, and not part of the
-    shared ``FlipAnswerSlot`` either.
 
     The claim itself -- first answer wins, and a waiter that wakes always finds
-    an answer -- is ``FlipAnswerSlot``'s, shared with the CLI coordinator so a
-    fix to it reaches both.  Arming is a one-way latch checked before
-    an offer: once set it is never cleared, so a signal that sees it set may
-    offer, and one that sees it unset is dropped, never deferred.
+    an answer -- is ``FlipAnswerSlot``'s, shared with the CLI coordinator.
+    Arming is a one-way latch checked before an offer: once set it is never
+    cleared, so a signal that sees it unset is dropped, never deferred.
 
     Args:
         job_id: The id of the job whose flip this coordinator answers.
@@ -243,11 +222,6 @@ class WorkerFlipCoordinator(FlipCoordinator):
     def armed_at(self) -> datetime | None:
         """
         When the flip wait began, in UTC, or ``None`` before the first ``arm()``.
-
-        Held in memory only, for the reason ``ScanWorker.front_pages`` is not a
-        ``Job`` column: the value matters for the length of one wait and is
-        meaningless once the job ends, and a restart fails every active job,
-        so there is nothing to persist.
 
         The first ``arm()`` happens when the job announces ``AWAITING_FLIP``,
         microseconds before ``wait_for_flip`` starts its clock, so a deadline
@@ -342,10 +316,6 @@ class WorkerFlipCoordinator(FlipCoordinator):
 
         """
         self.arm()
-        # One path for both endings.  If a signal answered, settle finds that
-        # answer already claimed and hands it back; if the wait expired,
-        # TIMED_OUT is offered and wins unless a signal claimed first after
-        # all.  Either way the result is the claimed answer, never a guess.
         self._slot.wait(timeout)
         return self._slot.settle(FlipOutcome.TIMED_OUT)
 
@@ -355,14 +325,7 @@ class WorkerFlipCoordinator(FlipCoordinator):
 
         Unlike the timeout's ``settle``, this honours ``armed``: a signal before
         the prompt exists is dropped here, and one after an answer is dropped by
-        the slot, leaving the answer untouched either way.
-
-        Args:
-            outcome: The answer the operator is offering.
-
-        Returns:
-            Whether ``outcome`` became the answer.
-
+        the slot.  Returns whether ``outcome`` became the answer.
         """
         if not self._armed.is_set():
             return False
@@ -381,23 +344,17 @@ class WorkerPassCoordinator(PassCoordinator):
     answer.
 
     An answer must name the prompt it answers by number, and must be one that
-    prompt offers.  That replaces the flip coordinator's arming latch, which
-    only works because a manual-duplex job asks its one question once.  A
-    multi-page job asks the same question with the same buttons again and
-    again, so a delayed double-click on "Scan next page" that arrived after the
-    next pass finished would otherwise answer the next prompt too, and start a
-    pass on a platen nobody has changed.  Membership of the offered set also
-    refuses a forged answer the page never showed, such as Finish on a
-    document with no pages.
+    prompt offers.  A multi-page job asks the same question again and again,
+    so a delayed double-click on "Scan next page" would otherwise answer the
+    next prompt too and start a pass on a platen nobody has changed.  The
+    offered set also refuses a forged answer the page never showed.
 
     The stopping latch is the worker's own stop flag, and it is sticky: once
     set, every ``ask`` returns ``INTERRUPTED`` at once without publishing a
-    prompt.  ``interrupt_for_shutdown`` only reaches a prompt that is open when
-    the stop lands; a stop that arrives mid-pass, or before this job had a
-    coordinator at all, must not leave the next prompt waiting its full
-    timeout while the server tries to exit.  The same latch is ``stopping``,
-    which the run reads before each later pass: an answer claimed just before
-    the stop is still returned, but the pass it asked for never starts.
+    prompt, so a stop that lands mid-pass never leaves the next prompt waiting
+    its full timeout.  The same latch is ``stopping``, which the run reads
+    before each later pass: an answer claimed just before the stop is still
+    returned, but the pass it asked for never starts.
 
     Args:
         job_id: The id of the job whose prompts this coordinator answers.
@@ -414,9 +371,6 @@ class WorkerPassCoordinator(PassCoordinator):
         self._lock = threading.Lock()
         self._prompt: PassPrompt | None = None
         self._slot: AnswerSlot[PassAnswer] | None = None
-        # When the latest prompt was published, in UTC.  In memory only, for
-        # the reason ScanWorker.front_pages is not a Job column: it matters
-        # for one question and a restart fails every active job.
         self._asked_at: datetime | None = None
         # Set once the run announces its next question, cleared when that
         # question is published: in between, the latest claim answers a
@@ -560,9 +514,6 @@ class WorkerPassCoordinator(PassCoordinator):
         # finds this slot or is seen here.
         if self._stopping.is_set():
             slot.offer(PassAnswer.INTERRUPTED)
-        # One path for both endings, as the flip wait has: an answered slot
-        # hands its answer back, and an expired one claims TIMED_OUT unless an
-        # answer beat it after all.
         slot.wait(prompt.timeout_seconds)
         return slot.settle(PassAnswer.TIMED_OUT)
 
@@ -627,13 +578,8 @@ def _announce_pass_wait(
 
     Called from the status callback before the waiting state is written, so
     ``WorkerPassCoordinator.acknowledged`` stops reporting the previous
-    question's answer before any poll can read the new state.
-
-    Args:
-        state: The state the run just announced.
-        coordinator: The running job's pass coordinator, or None when the job
-            is not a multi-page one.
-
+    question's answer before any poll can read the new state.  ``coordinator``
+    is ``None`` for a job that is not a multi-page one.
     """
     if coordinator is not None and state in PASS_WAIT_STATES:
         coordinator.announce_next_question()
