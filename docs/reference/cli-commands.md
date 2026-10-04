@@ -315,7 +315,7 @@ Once the addresses are bound, `serve` prints one `Serving on http://<address>:<p
 | Code | Meaning |
 |------|---------|
 | 0 | Clean shutdown, including Ctrl-C or SIGTERM once the web server is running |
-| 2 | Cannot start (port already in use, a host that does not resolve or an address that cannot be bound, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
+| 2 | Cannot start (port already in use, a host that does not resolve or an address that cannot be bound, web server failed to start, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
 | 3 | The TLS trust store named by `SSL_CERT_FILE` or `SSL_CERT_DIR` cannot be read |
 | 5 | Unexpected error (a saneless bug; the traceback is in the stream, not a file -- `serve` writes none) |
 | 130 | Cancelled (Ctrl-C before the web server has started) |

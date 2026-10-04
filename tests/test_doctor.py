@@ -25,6 +25,7 @@ registry rather than the command.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
@@ -70,7 +71,9 @@ from saneless.exceptions import (
 )
 from saneless.job import JobStore
 from saneless.paperless import ConnectionProbe, PaperlessClient
+from saneless.scanner import scan_session as scan_session_mod
 from saneless.scanner.base import DeviceInfo
+from saneless.scanner.sane_backend import SaneBackend
 from saneless.scanner.saned_probe import SanedOutcome
 from saneless.vocabulary import (
     ConnectionStatus,
@@ -80,10 +83,9 @@ from saneless.vocabulary import (
 )
 from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend
+from tests.fake_sane import FakeSaneError, FakeSaneModule
 
 if TYPE_CHECKING:
-    import threading
-
     import httpx2
 
     from saneless.scanner.base import DeviceCapabilities, DeviceSurvey
@@ -1821,7 +1823,8 @@ class TestDoctorNamesEachConfigurationFault:
 
     An unreadable TLS trust store is not "not found at that URL", and a
     scanner library that will not start is not "not installed": either wording
-    would send the reader to fix something that is not broken.
+    would send the reader to fix something that is not broken.  The scanner's
+    start failure is reported by the listing child that tried to start it.
     """
 
     def test_an_unreadable_trust_store_is_named(
@@ -1853,52 +1856,87 @@ class TestDoctorNamesEachConfigurationFault:
         assert "not found at that URL" not in result.output
         assert result.exit_code == ExitCode.CONFIG
 
-    def test_a_scanner_library_that_will_not_start_is_not_missing(
+    @pytest.mark.parametrize(
+        ("error", "message"),
+        [
+            (
+                FakeSaneError("Error during device I/O"),
+                "Scanner support could not be started.",
+            ),
+            (
+                ImportError("libsane.so.1: cannot open shared object file"),
+                "Scanner support is not installed on this machine.",
+            ),
+        ],
+        ids=["init", "import"],
+    )
+    def test_a_child_init_failure_shows_would_not_start(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
+        error: Exception,
+        message: str,
     ) -> None:
         """
-        ``sane.init()`` refusing is its own row, and the log keeps the reason.
+        The Scanner row reports what the listing child saw when SANE started.
+
+        Building the backend starts nothing, so a SANE that will not start is
+        found by the child the check runs, and both surfaces read its report:
+        ``doctor`` and the web path, which runs the same checks under the
+        scanner gate.  An import failure in the child is "not installed"; any
+        other start failure is its own row, whose next step points at the log
+        line the backend wrote with the reason.
 
         Args:
             monkeypatch: pytest's patcher.
             tmp_path: pytest's per-test directory.
             caplog: pytest's log capture.
+            error: What the child's SANE start raised.
+            message: The row that failure must give.
 
         """
-        reason = "Could not initialise SANE: Error during device I/O"
-
-        class _SaneWillNotStart:
-            """A backend class whose ``sane.init()`` fails."""
-
-            def __init__(self, host: str = "") -> None:
-                """Fail the way a libsane that will not initialise does."""
-                raise ScanError(reason)
-
-        runner = _patch_doctor(
-            monkeypatch, _make_settings(tmp_path), scanner_cls=_SaneWillNotStart
-        )
+        broken = FakeSaneModule(init_error=error)
+        monkeypatch.setattr(scan_session_mod, "sane", broken)
+        settings = _make_settings(tmp_path)
+        runner = _patch_doctor(monkeypatch, settings, scanner_cls=SaneBackend)
 
         with caplog.at_level("INFO"):
             result = runner.invoke(cli, ["doctor"])
 
         row, step = _row_and_step(result.output, CheckKey.SCANNER)
         assert row.startswith(_state_marker(CheckState.FAIL)), row
-        assert "Scanner support could not be started." in row
+        assert message in row, result.output
         assert step.startswith(_NEXT_STEP_INDENT)
-        assert "not installed" not in result.output
-        assert "Install saneless" not in step
-        assert "log" in step
         assert "Check again" not in result.output
         assert result.exit_code == ExitCode.CONFIG
+        if isinstance(error, FakeSaneError):
+            assert "not installed" not in result.output
+            assert "Install saneless" not in step
+            assert "log" in step
         warnings = [
             record.getMessage()
             for record in caplog.records
             if record.levelname == "WARNING"
         ]
-        assert any(reason in message for message in warnings), warnings
+        assert f"The scanner library could not be started: {error}" in warnings, (
+            warnings
+        )
+        # Building the backend made no SANE call in this process.
+        assert broken.init_call_count == 0
+
+        web = run_checks(
+            CheckContext(
+                settings=settings,
+                scanner=SaneBackend(),
+                paperless=None,
+                profile_storage=ProfileStorage.PERSISTED,
+            ),
+            scanner_gate=threading.Lock(),
+        )
+        web_row = next(found for found in web if found.key is CheckKey.SCANNER)
+        assert web_row.state is CheckState.FAIL
+        assert web_row.message == message
 
 
 _REDIRECT_TARGET = "https://paperless.example/"

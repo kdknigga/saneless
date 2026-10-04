@@ -261,13 +261,12 @@ class ScannerRefusal(StrEnum):
     Why a scanner backend could not be built, for the Scanner row.
 
     ``NOT_INSTALLED`` is python-sane missing, which installing it fixes.
-    ``START_FAILED`` is python-sane present and ``sane.init()`` refusing:
-    the scanner library is there and would not start, which reinstalling
-    does not fix and the log explains.
+    Building a backend starts no scanner library, so a library that is
+    installed and would not start is not a refusal: the listing child the
+    check runs reports it, in its survey's ``start_error``.
     """
 
     NOT_INSTALLED = "NOT_INSTALLED"
-    START_FAILED = "START_FAILED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,6 +583,12 @@ class _ListingFailure(StrEnum):
     NO_ANSWER = "no_answer"
 
 
+# The class names a listing child reports when python-sane could not be
+# imported there, which installing scanner support fixes.  Any other start
+# failure is a scanner library that is installed and would not start.
+_NOT_INSTALLED_START_ERRORS: Final = frozenset({"ImportError", "ModuleNotFoundError"})
+
+
 @dataclass(frozen=True, slots=True)
 class _Enumeration:
     """
@@ -601,6 +606,9 @@ class _Enumeration:
         failure: ``None`` when the listing ran to an end, otherwise how the
             listing child failed, kept apart from "listed nothing" because the
             row must say the check could not see.
+        start_error: The class name of the failure that kept the listing
+            child's scanner library from starting, or ``None`` when it
+            started.  It decides the row before anything the listing saw.
 
     """
 
@@ -608,6 +616,7 @@ class _Enumeration:
     configured_opened: bool | None = None
     open_withheld: bool = False
     failure: _ListingFailure | None = None
+    start_error: str | None = None
 
 
 def _hosts_subject(count: int, total: int) -> tuple[str, bool]:
@@ -994,8 +1003,9 @@ def _scanner_would_not_start() -> CheckResult:
     """
     Build the "the scanner library is installed and would not start" row.
 
-    python-sane imported and ``sane.init()`` refused, so reinstalling changes
-    nothing and the next step sends the reader to the log.
+    A scanner-library child imported python-sane and reported that SANE would
+    not initialise, so reinstalling changes nothing and the next step sends
+    the reader to the log line the backend wrote with the child's reason.
 
     Returns:
         The red scanner-support-would-not-start row.
@@ -1333,6 +1343,28 @@ def _scanner_listing_failure_row(failure: _ListingFailure) -> CheckResult:
             assert_never(failure)
 
 
+def _scanner_unseen_row(enumeration: _Enumeration) -> CheckResult | None:
+    """
+    Pick the row for a listing child that could not look, if it could not.
+
+    A child that failed is reported by how it failed.  A child whose scanner
+    library did not start is reported by why: an import failure is scanner
+    support that is not installed, and anything else is a library that is
+    installed and would not start.
+
+    Returns:
+        That row, or ``None`` when the child started and listed.
+
+    """
+    if enumeration.failure is not None:
+        return _scanner_listing_failure_row(enumeration.failure)
+    if enumeration.start_error is None:
+        return None
+    if enumeration.start_error in _NOT_INSTALLED_START_ERRORS:
+        return _scanner_support_missing()
+    return _scanner_would_not_start()
+
+
 def _scanner_verdict(
     probes: tuple[saned_probe.HostProbe, ...],
     enumeration: _Enumeration,
@@ -1350,8 +1382,9 @@ def _scanner_verdict(
     """
     if any(saned_probe.blocks_enumeration(probe.outcome) for probe in probes):
         return _scanner_host_unanswered(probes)
-    if enumeration.failure is not None:
-        return _scanner_listing_failure_row(enumeration.failure)
+    unseen = _scanner_unseen_row(enumeration)
+    if unseen is not None:
+        return unseen
     subject = _scanner_ready_subject(enumeration, configured_device)
     if subject is None and enumeration.open_withheld:
         return _scanner_configured_unprobed_row()
@@ -1377,8 +1410,6 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     """
     scanner = context.scanner
     if scanner is None:
-        if context.scanner_refusal is ScannerRefusal.START_FAILED:
-            return _scanner_would_not_start()
         return _scanner_support_missing()
     probes = tuple(
         saned_probe.HostProbe(
@@ -1443,6 +1474,11 @@ def _scanner_enumeration(
             list_error=type(exc).__name__,
             configured_opened=False if open_target else None,
         )
+    # A child whose scanner library did not start listed and opened nothing,
+    # and the backend has already logged why, so its row is the start
+    # failure's and the listing's own errors add nothing.
+    if survey.start_error is not None:
+        return _Enumeration(devices=(), start_error=survey.start_error)
     # The survey carries class names only, never an id or exception text: a
     # ``net:`` id is a LAN address, and the text of a SANE error usually
     # repeats it.

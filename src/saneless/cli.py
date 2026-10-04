@@ -111,7 +111,6 @@ from .vocabulary import (
     SERVE_BIND_NEXT_STEP,
     SERVE_PORT_IN_USE_NEXT_STEP,
     SERVE_PORT_NOT_ALLOWED_NEXT_STEP,
-    SERVE_SANE_START_NEXT_STEP,
     TITLE_MAX_LENGTH,
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
@@ -1857,21 +1856,18 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # back to the configured port.
     actual_port = port if port is not None else settings.output.web_port
 
-    # Bound before SANE is initialised, so a taken port fails at once and
-    # leaves no initialised backend that no lifespan would ever close.
+    # Bound before the backend is built, so a taken port fails at once and
+    # leaves no backend that no lifespan would ever close.
     sockets = _bind_listening_sockets(actual_host, actual_port)
     try:
-        # serve scans nothing itself, so SANE failing to initialise is a
-        # failure to start, ExitCode.CONFIG, not a failed scan.
-        try:
-            scanner = SaneBackend(host=settings.scanner.host)
-        except ScanError as exc:
-            msg = f"The web server could not start: {exc}"
-            raise ConfigError(msg, next_step=SERVE_SANE_START_NEXT_STEP) from exc
+        # Building the backend starts no SANE: a scanner library that will
+        # not start is reported by the first child, on the Scanner row, a
+        # capability read or the first scan, while the web page stays up.
+        scanner = SaneBackend(host=settings.scanner.host)
         # Once the lifespan has started it owns the backend: it closes it after
-        # the worker stops, or leaves it open on purpose when a thread is
-        # stuck inside SANE. Until then serve owns it, and this stack closes it
-        # if the app cannot be built or the server never starts.
+        # the worker stops, or leaves it open on purpose when a background
+        # thread would not stop. Until then serve owns it, and this stack
+        # closes it if the app cannot be built or the server never starts.
         with contextlib.ExitStack() as unowned:
             unowned.callback(scanner.close)
             # create_app closes the job store and Paperless client itself if
@@ -2223,9 +2219,10 @@ def _doctor_scanner(
     Catching the failure lets ``doctor`` report a machine without scanner
     support instead of refusing to run on it.  ``ImportError`` and the
     ``ConfigError`` ``require_sane`` translates it into both mean python-sane
-    is not installed.  ``ScanError`` is ``sane.init()`` refusing, which
-    reinstalling does not fix, so it is its own row and its reason is logged
-    at WARNING for the row to point at.
+    is not installed.  Construction only looks for python-sane and starts no
+    SANE, so it cannot raise ``ScanError``: a scanner library that is
+    installed and will not start is reported by the listing child the
+    Scanner check runs, which logs the reason for the row to point at.
     """
     try:
         return SaneBackend(host=settings.scanner.host), None
@@ -2233,9 +2230,6 @@ def _doctor_scanner(
         # The type name only: neither message adds to "not installed".
         logger.info("Scanner support unavailable: %s", type(exc).__name__)
         return None, ScannerRefusal.NOT_INSTALLED
-    except ScanError as exc:
-        logger.warning("Scanner support could not be started: %s", describe(exc))
-        return None, ScannerRefusal.START_FAILED
 
 
 def _doctor_paperless(
@@ -2281,8 +2275,8 @@ def doctor(ctx: click.Context) -> None:
     settings = _load_cli_settings(ctx, validate_dirs=False)
     scanner, scanner_refusal = _doctor_scanner(settings)
     if scanner is not None:
-        # Registered before the first SANE call, so a failing check still
-        # leaves SANE shut down.
+        # Registered before the checks run, so a failing check still ends
+        # any scanner child the backend left running.
         ctx.call_on_close(scanner.close)
     paperless, paperless_refusal = _doctor_paperless(settings)
     try:

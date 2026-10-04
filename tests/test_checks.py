@@ -8803,7 +8803,7 @@ class TestRefusalRows:
     each can be refused for more than one reason.  Folding every refusal into one
     row would send the reader to the wrong place: an unreadable TLS trust store
     would read as a wrong address, and a scanner library that would not start as
-    one never installed.  The kind of refusal reaches the registry on the
+    one never installed (that one is reported by the listing child that tried).  The kind of refusal reaches the registry on the
     context, and each kind is its own row.
     """
 
@@ -8862,27 +8862,50 @@ class TestRefusalRows:
         )
         assert row.message == connection_status_message(ConnectionStatus.NOT_FOUND)
 
-    def test_a_scanner_library_that_will_not_start_is_its_own_row(
-        self, tmp_path: Path
+    @pytest.mark.parametrize(
+        ("start_error", "message"),
+        [
+            ("FakeSaneError", "Scanner support could not be started."),
+            ("ScanError", "Scanner support could not be started."),
+            ("ImportError", "Scanner support is not installed on this machine."),
+            (
+                "ModuleNotFoundError",
+                "Scanner support is not installed on this machine.",
+            ),
+        ],
+        ids=["sane-error", "scan-error", "import", "module-not-found"],
+    )
+    def test_a_child_that_could_not_start_the_library_is_its_own_row(
+        self, tmp_path: Path, start_error: str, message: str
     ) -> None:
         """
-        A SANE that refused to start is not reported as one never installed.
+        A listing child's start failure decides the row, not the listing.
+
+        A library that would not start is not one never installed: only an
+        import failure in the child sends the reader to reinstall.  The
+        survey's empty listing must not be read as "no scanner found".
 
         Args:
             tmp_path: The test's own directory.
+            start_error: The class name the child reported.
+            message: The row that class name must give.
 
         """
-        context = replace(
-            _context(_settings(tmp_path), scanner=None),
-            scanner_refusal=ScannerRefusal.START_FAILED,
+        backend = _SurveyRecordingBackend(
+            DeviceSurvey(devices=(), start_error=start_error)
         )
-        row = _row(run_checks(context), CheckKey.SCANNER)
+        row = _row(
+            run_checks(_context(_settings(tmp_path), scanner=backend)), CheckKey.SCANNER
+        )
         assert row.state is CheckState.FAIL
-        assert row.message == "Scanner support could not be started."
-        assert "install" not in row.next_step.lower()
-        assert "log" in row.next_step
+        assert row.message == message
         doctor = render_check_step(row.next_step, CheckSurface.DOCTOR)
         assert "Check again" not in doctor
+        if message.endswith("started."):
+            assert "install" not in row.next_step.lower()
+            assert "log" in row.next_step
+        else:
+            assert "Install" in row.next_step
 
     @pytest.mark.parametrize(
         "refusal",
@@ -8909,7 +8932,7 @@ class TestRefusalRows:
     @pytest.mark.parametrize(
         ("paperless_refusal", "scanner_refusal"),
         [
-            (PaperlessRefusal.TRUST_STORE, ScannerRefusal.START_FAILED),
+            (PaperlessRefusal.TRUST_STORE, ScannerRefusal.NOT_INSTALLED),
             (PaperlessRefusal.CONFIGURATION, ScannerRefusal.NOT_INSTALLED),
         ],
         ids=["trust-store", "configuration"],

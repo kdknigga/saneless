@@ -120,7 +120,12 @@ from tests.conftest import (
     scan_batch,
     services_of,
 )
-from tests.fake_sane import UNNAMED_OPTION_ENTRIES, FakeSaneDev, FakeSaneModule
+from tests.fake_sane import (
+    UNNAMED_OPTION_ENTRIES,
+    FakeSaneDev,
+    FakeSaneError,
+    FakeSaneModule,
+)
 from tests.prompt_support import (
     FakeClock,
     broken_read,
@@ -4294,10 +4299,10 @@ class TestServeCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A port that is taken is found before SANE is touched.
+        A port that is taken is found before the backend is built.
 
-        Binding first means a setup mistake costs no SANE start-up, and leaves
-        no initialised backend behind that no lifespan will ever close.
+        Binding first means a setup mistake leaves no backend behind that no
+        lifespan will ever close.
         """
         scanner_cls, built = _closing_scanner()
         runs = _fake_server_run(monkeypatch)
@@ -4317,17 +4322,17 @@ class TestServeCommand:
         assert built == []
         assert runs == []
 
-    def test_serve_closes_the_sockets_when_sane_fails_to_initialise(
+    def test_serve_closes_the_sockets_when_the_backend_cannot_be_built(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """SANE failing after the bind still closes the bound socket: exit 2."""
+        """A backend refused after the bind still closes the bound socket: exit 2."""
 
         class FailingSaneBackend:
-            """A backend whose construction fails the way ``sane.init()`` does."""
+            """A backend whose construction finds python-sane gone."""
 
             def __init__(self, host: str = "") -> None:
-                msg = "Could not initialise SANE: Error during device I/O"
-                raise ScanError(msg)
+                msg = python_sane_missing_message("No module named 'sane'")
+                raise ConfigError(msg, next_step=PYTHON_SANE_INSTALL_NEXT_STEP)
 
         made = _record_sockets(monkeypatch)
         runs = _fake_server_run(monkeypatch)
@@ -4596,38 +4601,31 @@ class TestServeCommand:
         assert len(runs) == 1
         assert "Cancelled" not in result.output
 
-    def test_serve_sane_init_failure_exits_2_not_1(
+    def test_serve_starts_when_sane_will_not_initialise(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        SANE failing to initialise stops ``serve`` starting: exit 2, not 1.
+        A SANE that will not initialise does not stop ``serve`` starting.
 
-        ``serve`` scans nothing itself, so its setup failures share the
-        "can't start, fix your setup" code.
+        Building the backend starts no SANE in this process, so the failure
+        is the first scanner child's to report, on the Scanner row or in the
+        first scan, and the web page stays up to show it.
         """
         runs = _fake_server_run(monkeypatch)
-
-        class FailingSaneBackend:
-            """A backend whose construction fails the way ``sane.init()`` does."""
-
-            def __init__(self, host: str = "") -> None:
-                msg = "Could not initialise SANE: Error during device I/O"
-                raise ScanError(msg)
-
+        broken = FakeSaneModule(init_error=FakeSaneError("Error during device I/O"))
+        monkeypatch.setattr(scan_session_mod, "sane", broken)
         runner, _ = _patch_cli(
             monkeypatch,
             settings=self._loopback_settings(tmp_path),
-            scanner_cls=FailingSaneBackend,
+            scanner_cls=sane_backend.SaneBackend,
         )
 
         result = runner.invoke(cli, ["serve"])
 
-        assert result.exit_code == 2, result.output
-        assert _failure_lines(result) == [
-            "The web server could not start: Could not initialise SANE: "
-            "Error during device I/O"
-        ]
-        assert runs == []
+        assert result.exit_code == 0, result.output
+        assert len(runs) == 1
+        assert "could not start" not in result.output
+        assert broken.init_call_count == 0
 
     def test_serve_ctrl_c_before_the_server_starts_exits_130(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -7584,25 +7582,6 @@ def _site_port_in_use(
     return runner, ["serve", "--host", "127.0.0.1", "--port", str(port)]
 
 
-def _site_sane_will_not_start(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
-) -> tuple[CliRunner, list[str]]:
-    """``serve`` whose SANE backend raises as ``sane.init()`` failing does."""
-
-    class _UnstartableSane(StubScannerBackend):
-        """A backend whose construction fails the way a broken libsane does."""
-
-        def __init__(self, host: str = "") -> None:
-            """Fail as SaneBackend does when SANE cannot be initialised."""
-            msg = "SANE could not be initialised: Invalid argument"
-            raise ScanError(msg)
-
-    runner, _ = _patch_cli(
-        monkeypatch, settings=_make_settings(tmp_path), scanner_cls=_UnstartableSane
-    )
-    return runner, ["serve", "--host", "127.0.0.1", "--port", "0"]
-
-
 def _site_server_never_started(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _stack: contextlib.ExitStack
 ) -> tuple[CliRunner, list[str]]:
@@ -7760,13 +7739,6 @@ _RAISE_SITES: dict[str, _RaiseSite] = {
         "Cannot bind to 127.0.0.1:",
         "Stop the program that is using that port, or set output.web_port (or "
         "pass --port) to a free port, then start saneless serve again.",
-    ),
-    "SANE will not start": _RaiseSite(
-        _site_sane_will_not_start,
-        2,
-        "The web server could not start: SANE could not be initialised",
-        "Check the SANE setup on this machine and scanner.host (saneless "
-        "doctor shows what is wrong), then start saneless serve again.",
     ),
     "server never started": _RaiseSite(
         _site_server_never_started,
@@ -9057,3 +9029,41 @@ class TestJobsIntoAClosedPipe:
         log = log_file.read_text() if log_file.exists() else ""
         assert "Traceback" not in log, log
         assert "Unexpected error" not in log, log
+
+
+# Runs ``saneless.main()`` with the command line replaced by a no-op and the
+# unwinder loader replaced by a recorder, then prints what was recorded.  main
+# looks both up when it runs, so the replacements are the ones it calls.
+_MAIN_UNWINDER_PROBE = """\
+import json
+
+import saneless
+import saneless.cli
+import saneless.thread_unwinder
+
+calls = []
+saneless.thread_unwinder.load_thread_unwinder = lambda: calls.append("loaded")
+saneless.cli.cli = lambda: None
+saneless.main()
+print(json.dumps(calls))
+"""
+
+
+def test_main_does_not_load_the_thread_unwinder() -> None:
+    """
+    The saneless process prepares nothing for the scanner library.
+
+    Every SANE call runs in a scanner child, and each child loads the C
+    library's thread unwinder for its own backend threads, so ``main`` has no
+    reason to load it here.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", _MAIN_UNWINDER_PROBE],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == []

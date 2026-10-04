@@ -455,8 +455,8 @@ def pytest_configure() -> None:
     """
     Block SIGPIPE for the whole run, the way ``saneless.main()`` runs.
 
-    It also loads the C library's thread unwinder, the next thing
-    ``saneless.main()`` does, for the reason given at the call below.
+    It also loads the C library's thread unwinder, as each scanner-library
+    child does when it starts, for the reason given at the call below.
 
     The shipped program runs libsane only in child processes, but the
     ``[libsane]`` contract rows and the hardware tests drive it in this very
@@ -475,8 +475,8 @@ def pytest_configure() -> None:
     assert threading.current_thread() is threading.main_thread()
     assert threading.active_count() == 1, threading.enumerate()
     block_sigpipe()
-    # And the unwinder is loaded up front, as ``saneless.main()`` loads it
-    # next: otherwise the first libsane reader thread to end loads it, and a
+    # And the unwinder is loaded up front, as a scanner-library child loads
+    # it: otherwise the first libsane reader thread to end loads it, and a
     # cancel landing in that load leaves the loader's lock held, which hangs
     # the run in its exit handlers after the last test has passed.
     load_thread_unwinder()

@@ -178,12 +178,12 @@ Other causes of exit 2, each a line naming the problem and then a `Try:` line wi
   after every scan whether there is another page, so it is refused when stdin is not a terminal.
   It is refused for a `duplex = "manual"` profile too, because the two flows cannot be combined:
   scan without `--multi-page`, or choose another profile.
-- **`serve` cannot start.** The port is already in use, SANE could not be initialised, or the web
-  server failed to start. Stop whatever holds the port or pass `--port`; when SANE failed, the line
-  gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)); when the web server
-  itself failed, the cause is in the preceding log lines: `serve` streams its log to stderr
+- **`serve` cannot start.** The port is already in use, or the web server failed to start. Stop
+  whatever holds the port or pass `--port`; when the web server itself failed, the cause is in the
+  preceding log lines: `serve` streams its log to stderr
   rather than writing a file. `serve` logs these failures without a traceback: the line and its
-  `Try:` line say what to fix.
+  `Try:` line say what to fix. SANE that will not start does not stop `serve`: the Scanner row
+  reports it, and the log gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)).
 - **The working directory cannot be prepared.** The line names `tmp_dir` (in
   [`[output]`](../reference/configuration.md#output)) and the reason: the directory was removed or
   cannot be created, or the disk is full. Check that it exists, that saneless can write to it, and

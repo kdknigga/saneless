@@ -78,7 +78,6 @@ __all__ = [
     "SERVE_NEVER_STARTED_NEXT_STEP",
     "SERVE_PORT_IN_USE_NEXT_STEP",
     "SERVE_PORT_NOT_ALLOWED_NEXT_STEP",
-    "SERVE_SANE_START_NEXT_STEP",
     "TAGS_LOADING",
     "TAGS_UNAVAILABLE",
     "TAG_FILTER_LABEL",
@@ -3184,12 +3183,6 @@ SERVE_BIND_NEXT_STEP: Final = (
     "start saneless serve again."
 )
 """The next step for any other failure to bind, which names neither setting."""
-
-SERVE_SANE_START_NEXT_STEP: Final = (
-    "Check the SANE setup on this machine and scanner.host (saneless doctor "
-    "shows what is wrong), then start saneless serve again."
-)
-"""The next step for ``serve`` when the scanner library will not start."""
 
 SERVE_NEVER_STARTED_NEXT_STEP: Final = (
     "Fix the problem the log lines above name, then start saneless serve again."
