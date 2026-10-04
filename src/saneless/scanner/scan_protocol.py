@@ -9,7 +9,8 @@ id travels only inside ``scan``, never in argv, which any local user can read.
 The child answers on a private pipe.  Each message is a 4-byte big-endian
 length followed by that many bytes of an ASCII JSON object keyed by ``kind``.
 A ``page`` message is followed by exactly its ``nbytes`` of raw pixels, the
-bytes the child's ``image.tobytes()`` produced.  JSON lines alone would need
+bytes ``image.tobytes()`` gives for the page, which the child makes and writes
+in strips of whole rows.  JSON lines alone would need
 the pixels in base64, a third larger and a second copy; the length prefix lets
 them stay raw and be read in place with ``os.readv``.
 
@@ -50,6 +51,7 @@ __all__ = [
     "LOG_LEVELS",
     "MAX_HEADER_BYTES",
     "PAGE_BANDS",
+    "PAGE_STRIP_BYTES",
     "REPLY_PIPE_BYTES",
     "STAGES",
     "Bye",
@@ -85,6 +87,13 @@ MAX_HEADER_BYTES: Final = 65_536
 # hundred turns of the child writing and saneless reading; 1 MiB is the most an
 # unprivileged process may ask for under Linux's default ``pipe-max-size``.
 REPLY_PIPE_BYTES: Final = 1 << 20
+
+# About how many pixel bytes the child makes and writes at a time.  A page goes
+# out in strips of whole rows, so the child encodes the next strip while
+# saneless reads the last.  A quarter of the reply pipe: few writes per page,
+# and a strip small enough to stay in the processor's cache while it is
+# encoded and written.
+PAGE_STRIP_BYTES: Final = REPLY_PIPE_BYTES // 4
 
 # The image modes a page may have, with their bytes per pixel.  python-sane
 # only produces these: one-bit lineart is expanded to 8-bit grey, and

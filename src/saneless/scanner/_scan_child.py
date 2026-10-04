@@ -12,7 +12,8 @@ answers with length-prefixed frames; ``scan_protocol`` holds both formats.
 In brief: the child says ``ready`` once SANE is initialised, then serves
 commands until it is told to go.  A ``scan`` runs one pass and reports each
 stage it enters, the device's parameters (``configured``), every accepted page
-(a header, then the page's ``tobytes()`` pixels) and the pass's end
+(a header, then the page's ``tobytes()`` pixels, made and written in strips of
+whole rows) and the pass's end
 (``pass_done``).  After each page the child waits for ``spooled`` before it
 reads another sheet, or for ``stop`` or ``cancel``, which end the pass and the
 child.  ``restart`` restarts SANE (``restarted``); ``exit``, and ``stop`` or
@@ -23,7 +24,9 @@ other failure is a fatal ``error`` and the child ends.
 The reply channel is private: before anything else runs, the child moves the
 parent's stdout pipe to a descriptor of its own and points fd 1 at stderr, so
 a backend's C stdio cannot write into a frame.  One lock serialises every
-write to it.
+write to it.  A page whose pixels fail part way leaves the channel mid-page,
+where any later frame would be read as pixels, so nothing more is written to
+it.
 
 The C library's thread unwinder is loaded next, after the channel is private
 and before python-sane is imported, so no backend thread is ever the first to
@@ -76,6 +79,8 @@ from saneless.scanner._child_stdio import flush_standard_streams, take_reply_fd
 from saneless.scanner.base import ScanSettings
 from saneless.scanner.scan_protocol import (
     LOG_LEVELS,
+    PAGE_BANDS,
+    PAGE_STRIP_BYTES,
     Bye,
     ChildFailure,
     Configured,
@@ -99,7 +104,7 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
     from PIL import Image
 
@@ -179,7 +184,11 @@ class _OffSchemaError(Exception):
 
 
 class _ReplyClosedError(Exception):
-    """The reply channel would not take a write: saneless has gone."""
+    """
+    The reply channel would not take a write.
+
+    saneless has gone, or a page was cut short and the channel left mid-page.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,34 +231,62 @@ class _ReplyChannel:
         """
         self._fd = fd
         self._lock = threading.Lock()
+        self._torn = False
         self.forward_logs = forward_logs
 
-    def send(self, frame: Frame, payload: bytes | None = None) -> None:
+    def send(self, frame: Frame) -> None:
         """
-        Write one frame, and the bytes that follow it, as one unit.
+        Write one frame.
 
         Args:
             frame: The frame.
-            payload: A page's pixels, written straight after its header.
 
         Raises:
-            _ReplyClosedError: The pipe is closed.
+            _ReplyClosedError: The pipe is closed, or a page was cut short.
 
         """
         header = encode_frame(frame)
         with self._lock:
             self._write(header)
-            if payload is not None:
-                self._write(payload)
+
+    def send_page(self, header: PageHeader, strips: Iterable[bytes]) -> None:
+        """
+        Write a page's header, then its pixels strip by strip, as one unit.
+
+        Each strip is written as soon as it is made.  If making one fails, the
+        pixels already written leave saneless mid-page, so the channel takes
+        no more frames and the failure goes on.
+
+        Args:
+            header: The page's header.
+            strips: The page's pixels, in order, adding up to ``nbytes``.
+
+        Raises:
+            _ReplyClosedError: The pipe is closed, or a page was cut short.
+
+        """
+        data = encode_frame(header)
+        with self._lock:
+            self._write(data)
+            try:
+                for strip in strips:
+                    self._write(strip)
+            except _ReplyClosedError:
+                raise
+            except BaseException:
+                self._torn = True
+                raise
 
     def _write(self, data: bytes) -> None:
         """
         Write all of ``data``.
 
         Raises:
-            _ReplyClosedError: The pipe is closed.
+            _ReplyClosedError: The pipe is closed, or a page was cut short.
 
         """
+        if self._torn:
+            raise _ReplyClosedError
         view = memoryview(data)
         try:
             while view:
@@ -497,17 +534,16 @@ class _ChildOutlet:
 
         """
         self._runtime.arm_alarm(0)
-        pixels = image.tobytes()
+        nbytes, strips = _pixels(image)
         header = PageHeader(
             number=number,
             mode=image.mode,
             width=image.width,
             height=image.height,
             dpi=dpi,
-            nbytes=len(pixels),
+            nbytes=nbytes,
         )
-        self._reply.send(header, pixels)
-        del pixels
+        self._reply.send_page(header, strips)
         answer = self._control.next()
         if answer is ControlOp.SPOOLED:
             return True
@@ -534,6 +570,33 @@ class _ChildOutlet:
 
         """
         return self._control.cancelled.is_set()
+
+
+def _pixels(image: Image.Image) -> tuple[int, Iterator[bytes]]:
+    """
+    Size a page's raw pixels, and make them a strip at a time.
+
+    Each strip is ``tobytes()`` of a band of whole rows, about
+    ``PAGE_STRIP_BYTES`` long, top to bottom: together they are exactly the
+    bytes ``image.tobytes()`` gives, with no page-sized copy joined from
+    them.  A mode saneless does not take goes in one piece, and saneless
+    refuses its header.
+
+    Returns:
+        The byte count, and the strips, made only as they are taken.
+
+    """
+    bands = PAGE_BANDS.get(image.mode)
+    if bands is None:
+        pixels = image.tobytes()
+        return len(pixels), iter((pixels,))
+    width, height = image.size
+    rows = max(1, PAGE_STRIP_BYTES // max(1, width * bands))
+    strips = (
+        image.crop((0, top, width, min(height, top + rows))).tobytes()
+        for top in range(0, height, rows)
+    )
+    return width * height * bands, strips
 
 
 def _choice[T](raw: Mapping[str, str | int], name: str, choices: tuple[T, ...]) -> T:
@@ -781,7 +844,7 @@ def main(
     Returns:
         0 after ``bye``, or when saneless has gone; 1 after a fatal error
         frame; 2 after a command off the schema; 3 when a reply could not
-        be written because saneless had gone.
+        be written because saneless had gone or a page was cut short.
 
     """
     reply = _ReplyChannel(reply_fd, forward_logs=forward_logs)
