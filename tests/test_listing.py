@@ -468,8 +468,26 @@ class TestHappyPath:
         reply = run_listing_child(ListingRequest(open=_NET_ID), configured_host="")
 
         line = reply.devices[0][0]
-        assert line == '{"open": "net:scanbox.lan:test:0", "alarm": 35}'
-        assert json.loads(line) == {"open": _NET_ID, "alarm": 35}
+        assert line == (
+            '{"open": "net:scanbox.lan:test:0", "capabilities": null, "alarm": 35}'
+        )
+        assert json.loads(line) == {"open": _NET_ID, "capabilities": None, "alarm": 35}
+
+    def test_a_capabilities_request_line_names_the_device(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A capabilities request names its device on stdin, as an open does."""
+        _use_child(monkeypatch, tmp_path, _ECHO_REQUEST_CHILD)
+
+        reply = run_listing_child(
+            ListingRequest(capabilities=_NET_ID), configured_host=""
+        )
+
+        assert json.loads(reply.devices[0][0]) == {
+            "open": None,
+            "capabilities": _NET_ID,
+            "alarm": 35,
+        }
 
     def test_only_the_last_non_empty_line_is_the_reply(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -905,7 +923,7 @@ class TestAbort:
 
         assert len(started) > 1
         assert reply.devices[0][0] == (
-            '{"open": "net:scanbox.lan:test:0", "alarm": 35}\n'
+            '{"open": "net:scanbox.lan:test:0", "capabilities": null, "alarm": 35}\n'
         )
 
     def test_a_fast_child_answers_unchanged_with_no_abort(
@@ -967,8 +985,47 @@ class TestReplyDecoder:
                 id="open-error-with-opened-true",
             ),
             pytest.param(
-                b'{"devices": [], "open_error": {"type": "error", "message": "x"}}\n',
-                id="open-error-without-opened",
+                b'{"devices": [], "options": [["mode", "tuple", []]]}\n',
+                id="option-kind-unknown",
+            ),
+            pytest.param(
+                b'{"devices": [], "options": [["preview", "list", [true]]]}\n',
+                id="option-value-bool",
+            ),
+            pytest.param(
+                b'{"devices": [], "options": [["mode", "list"]]}\n',
+                id="option-two-items",
+            ),
+            pytest.param(
+                b'{"devices": [], "options": [[3, "none", []]]}\n',
+                id="option-name-not-a-string",
+            ),
+            pytest.param(
+                b'{"devices": [], "options": [["mode", "list", [null]]]}\n',
+                id="option-value-null",
+            ),
+            pytest.param(
+                b'{"devices": [], "options": [["mode", "none", [1]]]}\n',
+                id="unconstrained-option-with-values",
+            ),
+            pytest.param(b'{"devices": [], "options": {}}\n', id="options-not-a-list"),
+            pytest.param(
+                b'{"devices": [], "options": [], '
+                b'"options_error": {"type": "error", "message": "x"}}\n',
+                id="options-and-options-error",
+            ),
+            pytest.param(
+                b'{"devices": [], "options": [], "opened": true}\n',
+                id="options-beside-an-open",
+            ),
+            pytest.param(
+                b'{"devices": [], "options": [], '
+                b'"open_error": {"type": "error", "message": "x"}}\n',
+                id="options-beside-an-open-error",
+            ),
+            pytest.param(
+                b'{"devices": [], "init_error": {"type": "RuntimeError"}}\n',
+                id="init-error-without-message",
             ),
             pytest.param(b'{"devices": [["\xff", "v", "m", "t"]]}\n', id="bad-utf8"),
             pytest.param(b"[" * 100_000 + b"]" * 100_000 + b"\n", id="deep-nesting"),
@@ -1027,6 +1084,54 @@ class TestReplyDecoder:
 
         assert reply.opened is True
         assert reply.open_error is None
+
+    def test_a_capabilities_reply_decodes(self) -> None:
+        """Each option comes back as a name, a kind and a tuple of values."""
+        reply = ListingReply.from_stdout(
+            b'{"devices": [], "options": [["", "none", []], [null, "none", []], '
+            b'["mode", "list", ["Gray", "Color"]], ["depth", "list", [1, 8]], '
+            b'["resolution", "range", [1.0, 1200.0, 0.5]]]}\n'
+        )
+
+        assert reply.options == (
+            ("", "none", ()),
+            (None, "none", ()),
+            ("mode", "list", ("Gray", "Color")),
+            ("depth", "list", (1, 8)),
+            ("resolution", "range", (1.0, 1200.0, 0.5)),
+        )
+        assert reply.options_error is None
+        assert reply.open_error is None
+
+    def test_a_capabilities_open_error_decodes(self) -> None:
+        """A capabilities open that failed carries its error with no ``opened``."""
+        reply = ListingReply.from_stdout(
+            b'{"devices": [], "open_error": {"type": "error", "message": "x"}}\n'
+        )
+
+        assert reply.open_error == ChildError("error", "x")
+        assert reply.opened is None
+        assert reply.options is None
+
+    def test_an_options_error_decodes(self) -> None:
+        """Options that could not be read carry their error, and no options."""
+        reply = ListingReply.from_stdout(
+            b'{"devices": [], "options_error": {"type": "error", "message": "x"}}\n'
+        )
+
+        assert reply.options_error == ChildError("error", "x")
+        assert reply.options is None
+
+    def test_an_init_error_decodes_beside_the_list_error(self) -> None:
+        """A SANE that would not start is reported apart from the listing's error."""
+        reply = ListingReply.from_stdout(
+            b'{"devices": [], '
+            b'"list_error": {"type": "error", "message": "x"}, '
+            b'"init_error": {"type": "error", "message": "x"}}\n'
+        )
+
+        assert reply.init_error == ChildError("error", "x")
+        assert reply.list_error == ChildError("error", "x")
 
     def test_a_lone_surrogate_round_trips(self) -> None:
         """A device name with an undecodable byte comes back as the same str."""
@@ -1106,8 +1211,8 @@ class TestChildEnvironment:
         reply = run_listing_child(ListingRequest(), configured_host="")
 
         assert json.loads(reply.devices[0][0]) == [
-            "SANELESS_LISTING_CHILD",
-            "SANELESS_LISTING_PYTHON",
+            "SANELESS_CHILD_PYTHON",
+            "SANELESS_CHILD_SCRIPT",
         ]
 
     def test_the_child_runs_in_isolated_mode(
@@ -1141,7 +1246,7 @@ def test_the_child_argv_is_literal(
     assert started[0].args == (
         "/bin/sh",
         "-c",
-        'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
+        'exec "$SANELESS_CHILD_PYTHON" -I "$SANELESS_CHILD_SCRIPT"',
     )
 
 
