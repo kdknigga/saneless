@@ -69,7 +69,7 @@ from saneless.exceptions import (
     ListingTimedOutError,
     ScanError,
 )
-from saneless.paperless import PaperlessClient
+from saneless.paperless import PROBE_READ_SECONDS, PaperlessClient
 from saneless.scanner import listing, saned_probe
 from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceInfo, DeviceSurvey
@@ -77,7 +77,6 @@ from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.scanner.saned_probe import (
     PROBE_CONNECT_SECONDS,
-    PROBE_READ_SECONDS,
     SANED_PORT,
     saned_hosts,
 )

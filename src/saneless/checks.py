@@ -43,6 +43,7 @@ from saneless.exceptions import (
     ListingNoAnswerError,
     ListingTimedOutError,
 )
+from saneless.paperless import PROBE_READ_SECONDS
 from saneless.private_dirs import check_private_dir
 from saneless.scanner import saned_probe
 from saneless.scanner.base import DeviceSurvey
@@ -1621,7 +1622,7 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     else:
         probe = client.probe_connection(
             timeout=httpx2.Timeout(
-                saned_probe.PROBE_READ_SECONDS,
+                PROBE_READ_SECONDS,
                 connect=saned_probe.PROBE_CONNECT_SECONDS,
             )
         )

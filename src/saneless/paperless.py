@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 __all__ = [
+    "PROBE_READ_SECONDS",
     "ApiDelivery",
     "ConnectionProbe",
     "FolderDelivery",
@@ -148,6 +149,11 @@ _UPLOAD_READ_CAP_SECONDS: Final = 300.0
 # The client-wide timeout: metadata fetches, the connection test, task polls,
 # and the write and pool phases of an upload.
 _CLIENT_TIMEOUT_SECONDS: Final = 30.0
+
+# How long the connection probe waits for a response body once connected.  The
+# client-wide timeout is the right budget for an upload and the wrong one for a
+# health row, which must find an unplugged host in seconds.
+PROBE_READ_SECONDS: Final = 5.0
 
 # How every after-send failure ends, so the reader knows not to scan again
 # before checking paperless-ngx.

@@ -74,7 +74,12 @@ from saneless.exceptions import (
 )
 from saneless.job import Job, JobResult, JobStore
 from saneless.logging_config import configure_logging
-from saneless.paperless import ApiDelivery, TaskFiled, UploadResult
+from saneless.paperless import (
+    PROBE_READ_SECONDS,
+    ApiDelivery,
+    TaskFiled,
+    UploadResult,
+)
 from saneless.pipeline import PipelineEvent, PipelineRequest, ScanResult
 from saneless.scanner import sane_backend
 from saneless.scanner.base import (
@@ -83,7 +88,7 @@ from saneless.scanner.base import (
     ScanBatch,
     ScannerBackend,
 )
-from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
+from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS
 from saneless.vocabulary import (
     MULTI_PAGE_NEEDS_TERMINAL,
     UNCONFIRMED_FILING_LABEL,

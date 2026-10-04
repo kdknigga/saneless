@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 __all__ = [
     "PROBE_CONNECT_SECONDS",
     "PROBE_HANDSHAKE_SECONDS",
-    "PROBE_READ_SECONDS",
     "SANED_PORT",
     "HostProbe",
     "PreProbeAbortedError",
@@ -70,11 +69,6 @@ PROBE_HANDSHAKE_SECONDS: Final = 5.0
 # it looks at the caller's abort Event again.  The connect is not sliced; the
 # abort is looked at before each address.
 _ABORT_POLL_SECONDS: Final = 0.1
-
-# How long the Paperless probe waits for a response body once connected.  The
-# client's own default is a flat 30 s, which is the right budget for an upload
-# and the wrong one for a health row.  Read at call time.
-PROBE_READ_SECONDS: Final = 5.0
 
 # saned's registered port, IANA's ``sane-port``.  Read at call time.
 SANED_PORT: Final = 6566
