@@ -671,13 +671,15 @@ def test_a_cancel_during_start_is_never_made_twice_at_once(
     try:
         with pytest.raises(scan_session_mod.PassStopped):
             scan_session_mod.run_pass(_DEVICE, _feeder(), outlet)
-        watch.canceller.join(_JOIN_TIMEOUT_SECONDS)
     finally:
+        if watch.canceller.ident is not None:
+            watch.canceller.join(_JOIN_TIMEOUT_SECONDS)
         commands.close()
         for fd in (command_write, reply_read, reply_write):
             os.close(fd)
 
     assert watch.in_control_cancel.is_set()
+    assert not watch.canceller.is_alive()
     assert watch.overlaps == []
     assert fake.device.calls.count("snap") == 0
     assert fake.device.close_calls == 1
