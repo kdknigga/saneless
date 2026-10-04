@@ -1688,8 +1688,8 @@ def _scan_with_stdin_closed(
     """
     Run the real ``saneless scan`` in a process started with no stdin (``<&-``).
 
-    Every argv element is a literal and the per-run values travel in the
-    environment, which keeps the call on ruff's S603 allow-list.
+    A shell starts the child because ``<&-`` leaves descriptor 0 closed, which
+    no ``subprocess`` stdin setting does.
 
     Args:
         tmp_path: The test's scratch directory, for the config and every path
@@ -8913,8 +8913,6 @@ from saneless import main
 
 config = os.environ.pop("SANELESS_TEST_CONFIG")
 args = json.loads(os.environ.pop("SANELESS_TEST_ARGS"))
-os.environ.pop("SANELESS_TEST_PYTHON")
-os.environ.pop("SANELESS_TEST_SOURCE")
 sys.argv = ["saneless", "--config", config, "jobs", *args]
 sys.exit(main())
 """
@@ -8958,19 +8956,13 @@ class TestJobsIntoAClosedPipe:
         )
         env = {
             **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_SOURCE": _CLOSED_PIPE_CHILD,
             "SANELESS_TEST_CONFIG": str(config),
             "SANELESS_TEST_ARGS": json.dumps(
                 [*args, "--limit", str(_CLOSED_PIPE_JOBS + 2000)]
             ),
         }
         with subprocess.Popen(
-            [
-                "/bin/sh",
-                "-c",
-                'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE"',
-            ],
+            [sys.executable, "-c", _CLOSED_PIPE_CHILD],
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

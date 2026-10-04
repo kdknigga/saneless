@@ -16,7 +16,6 @@ import base64
 import inspect
 import io
 import logging
-import os
 import re
 import subprocess
 import sys
@@ -657,12 +656,7 @@ class TestLargeScanPixelLimit:
     def test_importing_the_imaging_modules_leaves_the_limit_alone(self) -> None:
         """A fresh interpreter keeps Pillow's default after every import."""
         result = subprocess.run(
-            ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
-            env={
-                **os.environ,
-                "SANELESS_TEST_PYTHON": sys.executable,
-                "SANELESS_TEST_CODE": _IMPORT_CHECK,
-            },
+            [sys.executable, "-c", _IMPORT_CHECK],
             capture_output=True,
             text=True,
             check=False,

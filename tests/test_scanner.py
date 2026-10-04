@@ -4319,18 +4319,8 @@ class TestStuckReadDoesNotBlockProcessExit:
         """
         child = tmp_path / "stuck_read.py"
         child.write_text(_STUCK_READ_CHILD, encoding="utf-8")
-        env = {
-            **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_CHILD": str(child),
-        }
-
-        # Every argv element is a literal and the per-run paths travel in the
-        # environment, quoted so they are never re-split, as in the
-        # child-process test in test_atomic_write.py.
         result = subprocess.run(
-            ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" "$SANELESS_TEST_CHILD"'],
-            env=env,
+            [sys.executable, str(child)],
             capture_output=True,
             text=True,
             check=False,

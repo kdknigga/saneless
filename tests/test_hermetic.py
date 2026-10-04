@@ -132,14 +132,11 @@ def test_hermetic_import_of_config_touches_no_temp_dir() -> None:
     default at import leaves it set. A fresh interpreter shows it still unset.
     """
     result = subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
-        env={
-            **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_CODE": (
-                "import tempfile, saneless.config; print(tempfile.tempdir)"
-            ),
-        },
+        [
+            sys.executable,
+            "-c",
+            "import tempfile, saneless.config; print(tempfile.tempdir)",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -397,24 +394,26 @@ def test_a_poisoned_environment_changes_no_verdict(tmp_path: Path) -> None:
     bundle.write_text("this is not a certificate\n", encoding="utf-8")
     result = subprocess.run(
         [
-            "/bin/sh",
-            "-c",
-            'exec "$SANELESS_TEST_PYTHON" -m pytest -p no:cacheprovider -q'
-            " tests/test_hermetic.py::test_session_fixtures_see_none_of_the_poisons"
-            " tests/test_config.py::TestConfigSources"
-            " tests/test_config.py::TestPaperlessTokenAndUrlAtLoad"
-            " tests/test_paperless.py::TestLoopbackClientSideProtocolErrors"
-            " tests/test_paperless.py::TestProbeConnection"
-            " tests/test_net_hosts.py"
-            " tests/test_checks.py::TestScannerCheck"
-            " tests/test_cli.py::TestServeCommand"
-            " tests/test_web.py::TestOwnerCookie"
-            " tests/test_golden_e2e.py::test_web_polls_once_and_stores_the_outcome",
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-q",
+            "tests/test_hermetic.py::test_session_fixtures_see_none_of_the_poisons",
+            "tests/test_config.py::TestConfigSources",
+            "tests/test_config.py::TestPaperlessTokenAndUrlAtLoad",
+            "tests/test_paperless.py::TestLoopbackClientSideProtocolErrors",
+            "tests/test_paperless.py::TestProbeConnection",
+            "tests/test_net_hosts.py",
+            "tests/test_checks.py::TestScannerCheck",
+            "tests/test_cli.py::TestServeCommand",
+            "tests/test_web.py::TestOwnerCookie",
+            "tests/test_golden_e2e.py::test_web_polls_once_and_stores_the_outcome",
         ],
         cwd=_REPOSITORY,
         env={
             **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
             "SSL_CERT_FILE": str(bundle),
             **_POISONS,
         },

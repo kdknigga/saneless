@@ -1243,10 +1243,9 @@ def _exit_code_on_dead_output(dead: int, source: str, tmp_path: Path) -> int:
     Run ``source`` in a child with stdout and stderr on ``dead``; its exit code.
 
     The hangup is ignored, as ``nohup`` or a shell's ``trap '' HUP`` would,
-    so the dead terminal is the only thing that goes wrong.  Every argv
-    element is a literal and the per-run values travel in the environment, as
-    ``tests.conftest.leave_killed_workspace`` does, which keeps the call on
-    ruff's S603 allow-list without a suppression.
+    so the dead terminal is the only thing that goes wrong.  A shell starts
+    the child because the ignored hangup has to be in place before the
+    interpreter runs.
 
     Args:
         dead: The descriptor from the ``dead_output`` fixture.

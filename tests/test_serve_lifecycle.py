@@ -92,9 +92,9 @@ signal.pause()
 # so nothing leaves the machine.  With a listing child named, the scanner's
 # list-then-open runs that child through the real launcher, under the abort
 # the status check hands it, as the real backend does.  The arguments travel
-# in the environment, so the argv below stays a literal, and are taken out of
-# it before the CLI starts, because saneless reads every SANELESS_ variable as
-# a setting and refuses one it does not know.
+# in the environment and are taken out of it before the CLI starts, because
+# saneless reads every SANELESS_ variable as a setting and refuses one it
+# does not know.
 _CHILD = """
 import os
 import sys
@@ -102,8 +102,6 @@ from pathlib import Path
 
 config = os.environ.pop("SANELESS_TEST_CONFIG")
 listing_child = os.environ.pop("SANELESS_TEST_LISTING_CHILD", "")
-os.environ.pop("SANELESS_TEST_PYTHON")
-os.environ.pop("SANELESS_TEST_SOURCE")
 
 from saneless import cli as cli_module
 from saneless import main
@@ -240,8 +238,6 @@ class _Spawner:
         )
         env: dict[str, str] = {
             **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_SOURCE": _CHILD,
             "SANELESS_TEST_CONFIG": str(config),
         }
         # No saned host from the developer's environment: the status check
@@ -254,11 +250,7 @@ class _Spawner:
             env["SANELESS_TEST_LISTING_CHILD"] = str(child)
             env[_PIDFILE_VARIABLE] = str(self.pidfile)
         proc = subprocess.Popen(
-            [
-                "/bin/sh",
-                "-c",
-                'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE"',
-            ],
+            [sys.executable, "-c", _CHILD],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

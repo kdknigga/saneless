@@ -94,9 +94,9 @@ duplex = "manual"
 
 # The real entry point, with only what a test cannot have replaced: the SANE
 # library check, the scanner and paperless-ngx.  The arguments travel in the
-# environment, so the argv below stays a literal, and are taken out of it
-# before the CLI starts, because saneless reads every SANELESS_ variable as a
-# setting and refuses one it does not know.
+# environment and are taken out of it before the CLI starts, because saneless
+# reads every SANELESS_ variable as a setting and refuses one it does not
+# know.
 _CHILD = """
 import json
 import os
@@ -106,8 +106,6 @@ config = os.environ.pop("SANELESS_TEST_CONFIG")
 args = json.loads(os.environ.pop("SANELESS_TEST_ARGS"))
 passes = json.loads(os.environ.pop("SANELESS_TEST_PASSES"))
 blank = json.loads(os.environ.pop("SANELESS_TEST_BLANK"))
-os.environ.pop("SANELESS_TEST_PYTHON")
-os.environ.pop("SANELESS_TEST_SOURCE")
 
 from saneless import cli as cli_module
 from saneless import main
@@ -269,9 +267,7 @@ def _spawn_scan(tmp_path: Path, scenario: _Scenario) -> _PtyRun:
     """
     Start ``saneless scan`` with stdin, stdout and stderr on one new terminal.
 
-    Every argv element is a literal and the per-run values travel in the
-    environment, as ``tests.conftest.leave_killed_workspace`` does, which keeps
-    the call on ruff's S603 allow-list without a suppression.
+    The per-run values travel in the environment, where the child reads them.
 
     Args:
         tmp_path: The test's scratch directory, for the config and every path
@@ -300,8 +296,6 @@ def _spawn_scan(tmp_path: Path, scenario: _Scenario) -> _PtyRun:
     )
     env = {
         **os.environ,
-        "SANELESS_TEST_PYTHON": sys.executable,
-        "SANELESS_TEST_SOURCE": _CHILD,
         "SANELESS_TEST_CONFIG": str(config),
         "SANELESS_TEST_ARGS": json.dumps(["scan", *scenario.args, "--title", _TITLE]),
         "SANELESS_TEST_PASSES": json.dumps(scenario.passes),
@@ -309,11 +303,7 @@ def _spawn_scan(tmp_path: Path, scenario: _Scenario) -> _PtyRun:
     }
     try:
         proc = subprocess.Popen(
-            [
-                "/bin/sh",
-                "-c",
-                'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE"',
-            ],
+            [sys.executable, "-c", _CHILD],
             stdin=slave,
             stdout=slave,
             stderr=slave,

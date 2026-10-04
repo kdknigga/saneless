@@ -145,14 +145,9 @@ def _run_against_loopback_saned(
         **os.environ,
         "SANE_CONFIG_DIR": str(config_dir),
         "SANE_NET_HOSTS": "127.0.0.1",
-        "SANELESS_TEST_PYTHON": sys.executable,
-        "SANELESS_TEST_CODE": code,
     }
-    # Every argv element is a literal and the interpreter and code travel in
-    # the environment, quoted so they are never re-split -- the shape the
-    # other child-process tests in this suite use.
     return subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
+        [sys.executable, "-c", code],
         env=env,
         capture_output=True,
         text=True,

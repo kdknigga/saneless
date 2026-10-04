@@ -170,11 +170,9 @@ def test_text_safety_is_a_leaf_that_imports_nothing_from_saneless() -> None:
     )
 
     result = subprocess.run(
-        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
+        [sys.executable, "-c", script],
         env={
             **os.environ,
-            "SANELESS_TEST_PYTHON": sys.executable,
-            "SANELESS_TEST_CODE": script,
             "SANELESS_TEST_MODULE": str(module_path),
         },
         capture_output=True,
