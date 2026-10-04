@@ -231,7 +231,8 @@ def test_a_libsane_read_resets_sigpipe_in_the_scan_child(
         status: The status the test backend ends its read with, or None for
             a read that succeeds.
         reset_at: Where the reset is first seen: once the read has returned,
-            or once the device is cancelled.
+            or once the device is cancelled, when it must not yet be seen
+            once the read has returned.
         tmp_path: Holds the SANE configuration, the stand-in and the mask.
         monkeypatch: Points the session at the recording child.
 
@@ -264,6 +265,9 @@ def test_a_libsane_read_resets_sigpipe_in_the_scan_child(
     )
     ignored = int(masks[reset_at], 16)
     assert not ignored & _SIGPIPE_BIT, f"child SigIgn after the {reset_at} {ignored:#x}"
+    if reset_at != "read":
+        before = int(masks["read"], 16)
+        assert before & _SIGPIPE_BIT, f"child SigIgn after the read {before:#x}"
 
 
 def _wait_readable(fd: int) -> None:

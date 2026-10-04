@@ -257,9 +257,9 @@ class _ReplyChannel:
     The private pipe to saneless, written under one lock.
 
     libsane sets SIGPIPE back to its default action inside SANE calls, after
-    a read that fails and after one that succeeds, so a write to a saneless
-    that has gone would kill the child before it could cancel and close the
-    device.  The channel therefore ignores SIGPIPE again before every frame
+    a read that succeeds and in the cancel after one that fails, so a write
+    to a saneless that has gone would kill the child before it could cancel
+    and close the device.  The channel therefore ignores SIGPIPE again before every frame
     it writes from the thread that made it, the one that runs ``main`` and
     makes every SANE call; only that thread may set a signal's action.  No
     other thread writes: the control thread sends nothing, and the log
