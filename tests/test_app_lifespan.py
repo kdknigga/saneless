@@ -30,7 +30,6 @@ from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
 
 import saneless.scanner.sane_backend as sane_backend_mod
-from saneless import checks
 from saneless import worker as worker_module
 from saneless.config import (
     OutputConfig,
@@ -43,6 +42,7 @@ from saneless.exceptions import ConfigError, PaperlessTrustStoreError
 from saneless.job import JobStore
 from saneless.paperless import ApiDelivery, TaskFiled
 from saneless.pipeline import PipelineRequest, ScanResult
+from saneless.scanner import saned_probe
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     RESTART_REASON,
@@ -1034,7 +1034,7 @@ def test_a_stop_during_a_silent_saned_pre_probe_still_closes_everything(
     open.  The handshake budget is raised far past the join so only the stop
     can end the wait, and the join is shortened so a broken stop fails fast.
     """
-    monkeypatch.setattr(checks, "PROBE_HANDSHAKE_SECONDS", 60.0)
+    monkeypatch.setattr(saned_probe, "PROBE_HANDSHAKE_SECONDS", 60.0)
     monkeypatch.setattr(app_module, "STOP_JOIN_SECONDS", 1.0)
     calls: list[str] = []
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as silent:

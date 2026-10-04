@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 
 import saneless
+from saneless import checks
+from saneless.scanner import saned_probe
 
 _PROBE_PATH = Path(saneless.__file__).parent / "scanner" / "saned_probe.py"
 
@@ -176,3 +178,14 @@ def test_importing_saned_probe_loads_no_sane_module() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "[]"
+
+
+def test_checks_keeps_no_copy_of_a_moved_name() -> None:
+    """
+    ``checks`` neither defines nor re-exports anything the probe module exports.
+
+    A copy or alias left behind would be a second patch target: a test that
+    patched it would change nothing the probe reads.
+    """
+    assert saned_probe.__all__
+    assert [name for name in saned_probe.__all__ if hasattr(checks, name)] == []

@@ -41,8 +41,6 @@ import saneless.config as config_module
 import saneless.job as job_module
 import saneless.vocabulary as vocabulary_module
 from saneless.checks import (
-    PROBE_CONNECT_SECONDS,
-    PROBE_READ_SECONDS,
     CheckKey,
     CheckResult,
     CheckState,
@@ -85,6 +83,7 @@ from saneless.scanner.base import (
     ScanBatch,
     ScannerBackend,
 )
+from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
 from saneless.vocabulary import (
     MULTI_PAGE_NEEDS_TERMINAL,
     UNCONFIRMED_FILING_LABEL,
