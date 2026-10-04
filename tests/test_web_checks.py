@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import importlib.util
 import inspect
 import logging
 import re
@@ -2212,6 +2213,30 @@ class TestFreshnessLine:
         )
 
 
+def _web_modules_imported(tree: ast.Module, package: str) -> set[str]:
+    """
+    Name every ``saneless.web`` module a module's source imports.
+
+    A relative import is resolved against ``package``, the importing module's
+    package, so ``from .throttle import X`` counts as ``saneless.web.throttle``
+    exactly as the absolute spelling does.  A name imported from the package
+    itself (``from saneless.web import services``) is taken as its submodule.
+    """
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = importlib.util.resolve_name(
+                "." * node.level + (node.module or ""), package
+            )
+            if module == "saneless.web":
+                imported.update(f"{module}.{alias.name}" for alias in node.names)
+            else:
+                imported.add(module)
+    return {name for name in imported if name.startswith("saneless.web.")}
+
+
 class TestRouteShape:
     """The structural promises the handlers themselves have to keep."""
 
@@ -2307,14 +2332,8 @@ class TestRouteShape:
         with a reason, in ``NOT_IN_HANDLER_FAMILY``.
         """
         tree = ast.parse(Path(routes_module.__file__).read_text(encoding="utf-8"))
-        imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "saneless.web":
-                imported.update(f"saneless.web.{alias.name}" for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-                "saneless.web."
-            ):
-                imported.add(str(node.module))
+        package = routes_module.__name__.rpartition(".")[0]
+        imported = _web_modules_imported(tree, package)
         family = {module.__name__ for module in HANDLER_FAMILY} - {
             routes_module.__name__
         }
