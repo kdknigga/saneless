@@ -10,7 +10,7 @@ Every dependency this repository uses is pinned to an immutable reference: SHA-p
 
 ## Decision
 
-Every Dependabot update entry carries a cooldown of at least seven days, for every ecosystem. A test enforces the seven-day floor on every entry, so a new entry added without the block fails. zizmor's workflow audit also reports a missing cooldown, but only for some ecosystems, so it is a second line, not the guard.
+Every Dependabot update entry carries a cooldown of at least seven days, for every ecosystem. A test enforces the seven-day floor on every entry, so a new entry added without the block fails. zizmor's audit also reports a missing or shorter cooldown, but its threshold is the tool's default and can change with an upgrade, so the test pins the floor in the repository.
 
 The invariant: no ecosystem's update proposals arrive less than seven days after the upstream release.
 
@@ -19,4 +19,4 @@ The invariant: no ecosystem's update proposals arrive less than seven days after
 - A compromised release has a week to be noticed and pulled upstream before it is proposed here.
 - Security fixes also arrive a week later, and an urgent one has to be bumped by hand.
 
-**Alternatives rejected:** no cooldown; a cooldown on only the ecosystems zizmor checks; relying on zizmor alone to enforce it.
+**Alternatives rejected:** no cooldown; relying on zizmor's default threshold alone.

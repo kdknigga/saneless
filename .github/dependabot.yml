@@ -3,9 +3,9 @@
 # .pre-commit-config.yaml, whose `# frozen: vX.Y.Z` comment Dependabot rewrites
 # together with the SHA.
 #
-# Every entry needs a seven-day cooldown. zizmor enforces that a cooldown is
-# present; a test in tests/test_deployment_config.py enforces the seven-day
-# floor for every ecosystem, so a new entry needs its own block.
+# Every entry needs a seven-day cooldown. zizmor reports a missing or shorter
+# one under its default threshold; a test in tests/test_deployment_config.py
+# pins the seven-day floor itself, so a new entry needs its own block.
 # See docs/explanation/decisions/0015-dependabot-cooldown.md.
 #
 # The docker ecosystem may also propose bumps to docker-compose.yml's

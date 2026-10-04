@@ -6214,10 +6214,10 @@ def test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr() -> None
     """
     Every ``updates:`` entry carries a cooldown of at least a week.
 
-    zizmor's ``dependabot-cooldown`` check is ecosystem-gated: it reports a
-    cooldown-less ``pip`` or ``github-actions`` entry but not a ``uv`` one, the
-    ecosystem carrying this project's Python pins. This guard is what backs
-    the settling period the file's header demands. Each entry is the window
+    zizmor's ``dependabot-cooldown`` audit reports the same thing today, but
+    its threshold is that tool's default and can change with an upgrade; this
+    guard pins the seven-day floor the file's header demands in the repository
+    itself. Each entry is the window
     up to the next one, because ``_significant_lines`` has already stripped
     the indentation that would otherwise delimit it.
     """
@@ -6255,8 +6255,7 @@ def test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr() -> None
         "a Dependabot entry can open a pull request before the release it "
         f"proposes has settled for {MINIMUM_COOLDOWN_DAYS} days. That window "
         "is the only thing between an upstream account compromised today and "
-        "a merge-ready bump today, and zizmor does not enforce it for every "
-        "ecosystem, so nothing else here would catch this:\n" + "\n".join(offenders)
+        "a merge-ready bump today:\n" + "\n".join(offenders)
     )
 
 
