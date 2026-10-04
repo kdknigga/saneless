@@ -924,47 +924,13 @@ def configuration_check(
 
 def _scanner_host_unanswered(probes: tuple[saned_probe.HostProbe, ...]) -> CheckResult:
     """
-    Build the row for a scanner host the check must not enumerate.
+    Build the amber row for a timed-out host the check must not enumerate.
 
-    This is the row for timed-out hosts -- a peer that accepted the
-    connection and then said nothing counts as timed out -- and only for
-    them: ``saned_probe.blocks_enumeration`` says why they are kept out of libsane.
-    With several hosts it reports the worst outcome among them, by
-    ``saned_probe.outcome_severity``, and how many of the hosts share it, so one dead
-    host beside a healthy one is still visible.
-
-    Amber, not red, and the distinction is the whole point.  What the
-    pre-probe observed is a fact about the *configured host*, not about the
-    appliance: ``SANE_NET_HOSTS`` **adds** net devices to what the dll backend
-    enumerates, it does not replace local backend enumeration (``SaneBackend``
-    only sets the variable), so "a configured sane-net host is dead" never
-    implied "there is no scanner".  A machine with a working USB scanner and a
-    switched-off network one scans perfectly, and a true statement about a
-    deployment that still works is amber -- the same shape as the
-    read-only-configuration Profiles row.  Reporting it red would break the
-    rule ``CheckState``'s own docstring states outright: a healthy appliance
-    must never go red.
-
-    The cost is recorded rather than hidden.  An appliance whose *only*
-    scanner is a timed-out network host reports amber, so ``saneless doctor``
-    exits 0 for it.  That is accepted: a scripted gate is keyed on red alone
-    by design, the row is still visible, it still names the scanner host as
-    the thing that is wrong, and it still carries the next step that fixes
-    it, so a human loses nothing.
-
-    Neither string names a host, its address or its port; the only thing
-    interpolated is a count.  A LAN address on a LAN-visible page is the same
-    class of disclosure as the SANE device id ``_device_label`` refuses to
-    print (ASVS 4.0.3 V7.4).
-
-    Args:
-        probes: What each configured host's probe found; at least one of them
-            blocks enumeration.
-
-    Returns:
-        The amber Scanner row, with ``skipped`` false -- the probe was run,
-        and what it found is the row.
-
+    Amber, because ``SANE_NET_HOSTS`` adds network devices to local
+    enumeration rather than replacing it, so a dead host does not mean no
+    scanner; an appliance whose only scanner is that host therefore passes
+    ``saneless doctor``.  The row reports the worst outcome and a count, never
+    a host (ASVS 4.0.3 V7.4).
     """
     clause, worst = _worst_host_clause(probes)
     return CheckResult(
@@ -979,22 +945,8 @@ def _scanner_skipped() -> CheckResult:
     """
     Build the row shown while a scan is running.
 
-    The state is ``OK`` rather than ``WARN`` or ``FAIL``.  "We did not look" is
-    a fact about the probe, not a verdict about the appliance, and a scan in
-    flight is direct evidence the scanner was working moments ago; a scripted
-    health gate must not go red for the duration of every scan.  The state
-    stays ``OK`` precisely so that gate keeps passing -- ``worst_state`` and
-    ``saneless doctor``'s exit rule read it and nothing else.
-
-    The ``skipped`` flag, not the state, is what the two surfaces *render*, and
-    the functions that read it are named rather than implied so the claim is
-    checkable by grep: ``check_row_class``, ``check_row_glyph`` and
-    ``check_row_label`` in this module draw the web row, and ``_row_marker`` in
-    ``saneless.cli`` draws the ``doctor`` one.
-
-    Returns:
-        The neutral skipped Scanner row.
-
+    The state is ``OK`` so a scripted health gate does not go red for every
+    scan; the ``skipped`` flag is what the surfaces render.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1008,44 +960,10 @@ def _scanner_busy() -> CheckResult:
     """
     Build the row shown when something else held the scanner gate.
 
-    This exists separately from ``_scanner_skipped`` because the distinction is
-    the whole of the fix.  ``run_checks`` honours ``context.skip_scanner``
-    *before* the gate is consulted, so by the time a non-blocking acquire fails
-    a running scan has already been excluded: whatever holds the gate is not a
-    scan, and a row that says one is running is simply false.  Today there is
-    one known contender, and it is not hypothetical --
-    ``StartupProfiles`` takes the gate around ``get_devices`` and
-    ``get_capabilities`` as the worker thread's first act at startup
-    (``ScanWorker._run`` runs it before it takes its first job), while
-    ``_current_job_id`` is still ``None``
-    (``ScanWorker._process_job`` sets it).  The lifespan starts the worker
-    and then the refresher, so that window coincides exactly with the
-    cold-start poll -- which is how ``_scanner_skipped``'s sentence came to sit
-    beside a last-checked time on an appliance that had never scanned.
-
-    The state is ``OK`` for the same reason ``_scanner_skipped``'s is, restated
-    because it is easy to read as a bug: "we did not look" is a fact about the
-    probe, not a verdict about the appliance, and a scripted health gate keyed
-    on red must not fail because two threads wanted the scanner in the
-    same instant.  Keeping the state at ``OK`` is what holds that gate open.
-
-    The ``skipped`` flag is what discloses that nothing was checked, through
-    the same four functions ``_scanner_skipped``'s docstring names:
-    ``check_row_class``, ``check_row_glyph`` and ``check_row_label`` here, and
-    ``_row_marker`` in ``saneless.cli``.
-
-    There is deliberately **no** next step.  ``_scanner_skipped`` carries none
-    either, and for the same reason: the next probe fixes this by itself,
-    within one refresh interval, so telling a household member to do something
-    would be asking them to act on a condition that is already clearing.
-
-    The message names no scan, and it names no host, address, port, path or
-    exception either (ASVS 4.0.3 V7.4), which is the same omission
-    ``_scanner_host_unanswered`` makes on purpose.
-
-    Returns:
-        The neutral contention row, ``skipped`` true because no probe ran.
-
+    Not ``_scanner_skipped``: a running scan is excluded before the gate is
+    tried, so the holder is something else, such as ``StartupProfiles`` at
+    worker start.  ``OK`` for the same reason, with no next step because the
+    next probe clears it.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1058,9 +976,6 @@ def _scanner_busy() -> CheckResult:
 def _scanner_support_missing() -> CheckResult:
     """
     Build the "there is no python-sane on this machine" row.
-
-    Its own constructor because two callers need the same row and a row
-    written twice is a row that can drift.
 
     Returns:
         The red no-scanner-support row.
@@ -1078,10 +993,8 @@ def _scanner_would_not_start() -> CheckResult:
     """
     Build the "the scanner library is installed and would not start" row.
 
-    Not the not-installed row: python-sane imported, and ``sane.init()``
-    refused.  Installing scanner support again changes nothing, and the
-    reason is in the log, which is where the next step sends the reader.
-    The row names no backend, path or host, because the log has those.
+    python-sane imported and ``sane.init()`` refused, so reinstalling changes
+    nothing and the next step sends the reader to the log.
 
     Returns:
         The red scanner-support-would-not-start row.
@@ -1150,24 +1063,12 @@ def _scanner_ready_subject(
     enumeration: _Enumeration, configured_device: str
 ) -> str | None:
     """
-    Name the scanner a scan would use, if there is one it can use.
+    Name the scanner a scan would use, or ``None`` when there is none.
 
-    With ``scanner.device`` set the scan opens exactly that id, so the check
-    looks it up by exact name and labels the device it finds, whatever else
-    is listed and in whatever order.  A device the backend does not list but
-    that opened is usable too: SANE opens ids it never lists.  With the
-    setting empty the scan takes the first device listed, and so does this.
-
-    Args:
-        enumeration: What the gated half of the check saw.
-        configured_device: The configured ``scanner.device``, possibly empty.
-
-    Returns:
-        ``None`` when no usable scanner was seen.  Otherwise the words the
-        row uses for it: the device's label, "The configured scanner" for an
-        unlisted device that opened, or the empty string for a device that
-        reported no vendor and no model.
-
+    A set ``scanner.device`` is matched by exact id, and an unlisted one that
+    opened is usable too, because SANE opens ids it never lists.  An empty
+    setting takes the first device listed, as a scan does.  The name may be
+    "" for a device that reported no vendor and no model.
     """
     if configured_device:
         listed = next(
@@ -1194,15 +1095,10 @@ def _scanner_ready_row(
     """
     Build the row for a scanner that can be used.
 
-    A host problem still shows, in amber, because scanning works: the rule is
-    that a working appliance never goes red.  It is reported ahead of the
-    several-devices warning, because it is the one that is a failure.
-
-    The sentence has one "but", and a stopped scanner service is worded for
-    it on purpose.  ``_host_problem_clause`` says that outcome as "is on, but
-    its scanner service is not running", which is right as a sentence of its
-    own and reads as two "but"s after "is ready, but", so this row names the
-    service and counts the hosts instead.
+    A host problem shows in amber, because scanning works, and ahead of the
+    several-devices warning.  A stopped service is reworded here because
+    ``_host_problem_clause``'s "is on, but" would put two "but"s in one
+    sentence.
 
     Args:
         probes: What each configured host's probe found; none blocks
@@ -1229,10 +1125,9 @@ def _scanner_ready_row(
             next_step=_host_problem_next_step(worst),
         )
     if unchosen > 1:
-        # With no device configured, every scan goes to whichever device SANE
-        # lists first, and a scanner that appears on the LAN can take that
-        # place.  A warning, not a failure: scanning still works.  Count-only,
-        # because device ids are LAN addresses and this row is LAN-visible.
+        # With no device configured, a scanner that appears on the LAN can
+        # become the first one listed and take every scan.  Count-only,
+        # because device ids are LAN addresses.
         return CheckResult(
             key=CheckKey.SCANNER,
             state=CheckState.WARN,
@@ -1275,17 +1170,9 @@ def _scanner_configured_missing_row() -> CheckResult:
     """
     Build the red row for a configured scanner that was not found.
 
-    The next step covers both ways this happens.  A scanner that is off or
-    unplugged is seen by the next Check once it is back, because every
-    listing runs in a fresh process with a fresh scanner library, so that
-    half says press Check again.  If ``saneless devices`` does not list it
-    either, the configured id is wrong, and changing ``[scanner] device`` is a
-    settings edit, which is read once at start, so only that half says to
-    restart saneless.
-
-    Returns:
-        The red Scanner row.
-
+    Each listing runs in a fresh process, so a scanner switched back on is
+    seen by the next Check; a wrong ``[scanner] device`` is a setting, read
+    once, so only that half of the next step says to restart.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1299,20 +1186,9 @@ def _scanner_configured_unprobed_row() -> CheckResult:
     """
     Build the amber row for an unlisted ``net:`` device that was not opened.
 
-    The configured device is a ``net:`` device the backend did not list, and
-    its host is one the pre-probe cannot dial, so the check did not open it:
-    opening it would make libsane dial that host with no timeout.  Amber, not
-    red, because nothing was found wrong -- the device may well open for a
-    scan -- and the rule is that a working appliance never goes red.
-
-    The next step names both ways out.  A host in ``[scanner] host`` is one
-    SANE lists devices from, so the device becomes a listed one; a device
-    ``saneless devices`` lists is one the check can find.  Either is a config
-    edit, which needs a restart.  Neither names the host (ASVS 4.0.3 V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    Its host is one the pre-probe cannot dial, and opening the device would
+    make libsane dial it with no timeout.  Amber, because nothing was found
+    wrong; the next step never names the host (ASVS 4.0.3 V7.4).
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1326,20 +1202,9 @@ def _scanner_listing_crashed_row() -> CheckResult:
     """
     Build the amber row for a listing whose child process crashed.
 
-    The scanner library failed inside the listing child, so the check saw
-    nothing at all.  Amber, not red: a crash proves the listing failed, not
-    that scanning is impossible -- the next scan runs with its own fresh
-    library and may well work -- and the rule is that a working appliance
-    never goes red, so ``saneless doctor`` still exits 0 for it.  The child
-    is gone and the next listing starts another, so pressing Check again is
-    the whole of the advice.
-
-    Nothing is interpolated: the crash is not tied to any one host, and a host
-    or device id on this LAN-visible row would be a disclosure (ASVS 4.0.3 V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    Amber, because a crashed listing proves the check could not see, not that
+    scanning is impossible; the next listing starts a fresh child.  Nothing is
+    interpolated (ASVS 4.0.3 V7.4).
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1353,21 +1218,9 @@ def _scanner_listing_timed_out_row() -> CheckResult:
     """
     Build the amber row for a listing stopped at its deadline.
 
-    The listing child was still waiting when the deadline came, and was
-    stopped.  That is a peer somewhere that accepted a connection and then
-    said nothing, which may be the scanner itself or a scanner host the
-    pre-probe could not dial in advance.  Amber, not red, for the same reason
-    as the crash row: the check could not see, which is not proof that
-    scanning is impossible, and a working appliance never goes red.
-
-    The next step asks for the scanner, and its host if it has one, to be on
-    and reachable, and it deliberately avoids "switched on and connected",
-    the phrase no row reporting a rejection may use.  Nothing is interpolated,
-    for the same reason as the crash row (ASVS 4.0.3 V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    Some peer accepted a connection and said nothing; amber for the crash
+    row's reason.  The next step avoids "switched on and connected", the
+    phrase no row reporting a rejection may use.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1381,19 +1234,8 @@ def _scanner_listing_no_answer_row() -> CheckResult:
     """
     Build the amber row for a listing child that gave no usable answer.
 
-    The child could not be started, or it ended without a reply the check
-    could read, so the check saw nothing at all.  Amber, not red, for the
-    same reason as the crash row: the check could not see, which is not proof
-    that scanning is impossible, and a working appliance never goes red.
-    Whatever the child printed is in the log, and the next listing starts
-    another child, so pressing Check again is the whole of the advice.
-
-    Nothing is interpolated, for the same reason as the crash row (ASVS 4.0.3
-    V7.4).
-
-    Returns:
-        The amber Scanner row.
-
+    The child could not start or ended without a readable reply; amber for
+    the crash row's reason.
     """
     return CheckResult(
         key=CheckKey.SCANNER,
@@ -1407,10 +1249,8 @@ def _scanner_nothing_found_row(hosts: int) -> CheckResult:
     """
     Build the red row for no scanner at all, with every probed host healthy.
 
-    Both next steps end in pressing Check again.  Every listing runs in a
-    fresh process with a fresh scanner library, so a scanner that is switched
-    on, plugged in, or added to the scanner host is seen by the next Check,
-    with no restart; ``saneless devices`` would see no more than that.
+    Each listing runs in a fresh process, so the next Check sees a scanner
+    that has been switched on or plugged in, with no restart.
 
     Args:
         hosts: How many scanner hosts were probed, all of them healthy.
@@ -1445,24 +1285,10 @@ def _scanner_unusable_row(
     """
     Build the red row when no usable scanner was seen, naming the likeliest cause.
 
-    The more specific cause wins.  A configured ``net:`` device whose own
-    host had no scanner service running, was refusing this machine, or could
-    not be found by name is missing *because of* that host, so the row says
-    so.  A configured device that is not a ``net:`` device is simply not
-    found, even if some unrelated network host is also bad, because a network
-    host does not explain a local device's absence.  Only the own host's probe
-    on ``saned_probe.SANED_PORT`` is read, because that is the port libsane opened the
-    device on; a ``host:port`` setting's answer on another port does not
-    explain the device's absence.
-
-    Args:
-        probes: What each configured host's probe found; none blocks
-            enumeration.
-        configured_device: The configured ``scanner.device``, possibly empty.
-
-    Returns:
-        The red Scanner row.
-
+    A configured ``net:`` device is blamed on its own host's probe on
+    ``saned_probe.SANED_PORT``, the port libsane opens it on; any other
+    configured device is just not found, because an unrelated host does not
+    explain its absence.
     """
     if configured_device:
         entry = saned_probe.net_device_entry(configured_device)
@@ -1491,12 +1317,6 @@ def _scanner_listing_failure_row(failure: _ListingFailure) -> CheckResult:
     """
     Pick the amber row for the way a listing child failed.
 
-    A ``match`` ending in ``assert_never``, so a new way of failing stops
-    type-checking here until it has a row.
-
-    Args:
-        failure: How the listing child failed.
-
     Returns:
         The row for that failure.
 
@@ -1520,59 +1340,12 @@ def _scanner_verdict(
     """
     Decide the Scanner row from what the probes and the enumeration found.
 
-    Pure: no socket, no backend and no clock, so every row can be pinned by a
-    unit test.  The row goes red exactly when scanning cannot work.  While a
-    usable scanner is visible a host problem keeps the row amber, because a
-    working appliance never goes red.  With ``scanner.device`` set, the row is
-    about that device, found by its exact id; the first device listed stands
-    in only when the setting is empty, which is the device a scan would use.
-
-    Where two causes compete, the more specific one wins.  A configured
-    ``net:`` device whose own host had no scanner service running, was
-    refusing this machine, or could not be found by name reports that host's
-    problem, which explains the absence.  A configured device that is not a
-    ``net:`` device and is missing is reported as not found, whatever an
-    unrelated host is doing.  With nothing configured, a host problem is
-    reported ahead of the several-devices warning.  Several bad hosts are
-    reported by the worst outcome, with a count.
-
-    The next steps follow what actually clears each state, which was measured
-    against a real saned and agrees with sane-backends' source:
-
-    - Each listing runs in a fresh child process with a fresh scanner
-      library.  That library resolves every ``SANE_NET_HOSTS`` entry afresh
-      and opens a new control connection to every host (``sane_init`` calling
-      ``add_device``, then ``connect_dev``, in ``backend/net.c``), so a name
-      that becomes resolvable, a host that starts answering, and a host that
-      gains a scanner are all picked up on the next Check.  Those rows, and
-      the rows for a scanner that was not found, say press Check again.
-    - A restart is advised only where the fix is a change to saneless's own
-      settings, which are read once, at start: a host name corrected in a
-      setting, ``[scanner] device`` changed to a device ``saneless devices``
-      lists, and a configured ``net:`` device whose host cannot be probed.
-    - A refused host is enumerated, because a refused connect returns at
-      once inside libsane.  A timed-out host is not.
-
-    A host that must not be enumerated -- one that timed out -- gets the
-    same row the preflight returns for it, so the two can never disagree.
-    A listing that crashed, was stopped at its deadline or gave no usable
-    answer gets its own amber row next, ahead of anything the devices would
-    say, because the check could not see and that is not the same as seeing
-    nothing.
-
-    Rows interpolate counts and ``_device_label`` output only.  The
-    configured id and the listed device ids are compared, never rendered,
-    because they are LAN addresses on a LAN-visible page (ASVS 4.0.3 V7.4).
-
-    Args:
-        probes: What each configured host's probe found, in configured order;
-            empty when no host is configured.
-        enumeration: What the gated half of the check saw.
-        configured_device: The configured ``scanner.device``, possibly empty.
-
-    Returns:
-        Exactly one result for ``CheckKey.SCANNER``.
-
+    Pure, so every row can be pinned by a unit test.  The row goes red
+    exactly when scanning cannot work, and the more specific cause wins.
+    Next steps say press Check again wherever a fresh listing clears the
+    state, which each listing's own libsane does for names, hosts and
+    scanners (measured against a real saned); they say restart only for a
+    settings fix.  Device ids are compared, never rendered (ASVS 4.0.3 V7.4).
     """
     if any(saned_probe.blocks_enumeration(probe.outcome) for probe in probes):
         return _scanner_host_unanswered(probes)
@@ -1591,64 +1364,11 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | _ScannerPreflight
     """
     Decide the scanner row without entering SANE, or hand over to enumeration.
 
-    This is everything the scanner check can settle before libsane is touched,
-    and it is a separate function so it can run with the worker's scanner gate
-    **free**.  Nothing here is SANE work: it is a settings read, name
-    resolution and the opening of the SANE network handshake.  That matters
-    because resolution is outside every budget this module states --
-    ``getaddrinfo`` takes no timeout, as
-    ``saned_probe.PROBE_CONNECT_SECONDS`` says at
-    length -- so a check holding the gate across it can park a
-    ``ScanWorker._scan_job`` whose job row already reads ``SCANNING`` for as
-    long as a broken resolver takes, and ``POST /api/checks/refresh`` can
-    re-arm that parking every couple of seconds.
-
-    The order inside it is the order ``_check_scanner`` always had.  A machine
-    with no python-sane is its own row and is decided without touching
-    anything.  Then every entry ``saned_probe.saned_hosts`` returns for the host
-    list
-    SANE will use is probed with ``saned_probe.probe_saned``, with no short circuit:
-    libsane dials every entry, so a dead second host holds the listing until
-    ``LISTING_DEADLINE_SECONDS`` however well the first one answers.  When
-    ``scanner.device`` is a ``net:`` id whose host none of those entries
-    covers on ``saned_probe.SANED_PORT``, that host is probed on
-    ``saned_probe.SANED_PORT`` too (``saned_probe.configured_device_probes``),
-    because the check may
-    open the device and opening it dials its host there.
-
-    What is *not* probed is stated rather than hidden, because libsane still
-    dials it inside the listing.  ``saned_probe.saned_hosts`` returns at most
-    ``saned_probe._MAX_PROBE_HOSTS`` entries and drops the ones it will not
-    guess at: an
-    IPv6 literal, a numeric shorthand, and the rest of a setting it refuses.
-    Hosts named only in ``net.conf`` are not read at all.  And a two-segment
-    ``host:port`` setting is probed as one host on that port, where libsane
-    dials ``host`` and the port number as two hosts, both on
-    ``saned_probe.SANED_PORT``
-    (a configured ``net:`` device on that host is the exception, as above).
-    Enumeration still runs beside such an entry, as it did before the
-    pre-probe existed, so a dead host there can still hold the listing until
-    ``LISTING_DEADLINE_SECONDS`` stops it; refusing to enumerate instead would turn
-    every working IPv6 or five-host setup permanently amber.
-
-    If any probed host timed out -- including one that accepted the
-    connection and said nothing -- the check ends right there with the amber
-    ``_scanner_host_unanswered`` row, and ``saned_probe.blocks_enumeration`` says why it
-    may not be enumerated.  Refused, rejected, unresolved and healthy hosts,
-    and a setting with no host to probe, go on to enumeration.
-
-    A stop ends the probing: each probe looks at ``context.abort`` before
-    it dials and while it waits for saned's reply, and an aborted probe
-    raises rather than becoming a row, because a host nobody finished asking
-    about has no outcome.
-
-    Args:
-        context: The injected dependencies and configuration.
-
-    Returns:
-        The row, when it can be decided here; otherwise what enumeration
-        needs, which is the backend, what each host's probe found, and
-        whether an unlisted configured device may be opened.
+    It runs with the scanner gate free, because ``getaddrinfo`` takes no
+    timeout and a gate held across it would park a scan job.  Every host
+    libsane will dial is probed, with no short circuit, because one dead host
+    holds the whole listing; hosts the probe cannot parse, such as IPv6
+    literals, are still enumerated, and a timed-out host ends the check here.
 
     Raises:
         saned_probe.PreProbeAbortedError: ``context.abort`` was set during a probe.
@@ -1693,62 +1413,11 @@ def _scanner_enumeration(
     """
     Ask the backend what it can see, which is the part that enters SANE.
 
-    This is the only region of the Scanner check that enters libsane, and it
-    runs under the scanner gate on the status strip; it decides nothing.  It
-    is one call, ``scanner.list_and_open``, which lists the devices and, only
-    when ``scanner.device`` is set and no listed device has exactly that id,
-    opens and closes that id once.  Both steps run inside the backend's
-    short-lived listing child, so a check never uses this process's libsane
-    and always sees a fresh control connection to every scanner host.  The
-    child is killed and reaped at ``LISTING_DEADLINE_SECONDS``, and the call
-    does not return, or raise, until it has been reaped.
-
-    The open exists because SANE opens ids it never lists.  An ``escl:`` URL
-    with no ``escl.conf`` entry is one, and a ``net:`` device on a host that
-    is not in ``SANE_NET_HOSTS`` is another: libsane's net backend adds that
-    host when the device is opened.  Opening the id is what a scan does first,
-    so an unlisted device that opens is one a scan can use, and reporting it
-    red would break the rule that a working appliance never goes red.  It is
-    attempted only in that absent case, never on every check, and also when
-    the listing itself failed, because a scan opens a configured id without
-    listing anything.
-
-    A child that crashed, that was stopped at its deadline, or that gave no
-    usable answer is not a listing that found nothing: each has its own row,
-    so each is recorded as what it was.  The launcher has already logged the
-    crash or the timeout, so nothing more is logged for them here; no answer
-    is logged by its class name.  Any other failure is logged by its class
-    name only and treated as an empty listing, with a configured id counted
-    as not opened.
-
-    It is never reached when the preflight stopped the check, and the
-    preflight probes a ``net:`` device's own host before this can open it, so
-    no *probed* host that timed out, or accepted the connection and then said
-    nothing, is listed or opened here (``saned_probe.blocks_enumeration``).  A refused
-    host is listed, and a device on it opened, because a refused connect
-    returns at once inside libsane.  A ``net:`` device whose host could not
-    be probed at all is not opened either (``may_open``): the call is asked
-    to open nothing.  The listing itself still dials every host libsane
-    knows of, including any the preflight could not probe;
-    ``_scanner_preflight`` lists which those are.
-
-    A listing stopped on ``abort`` is none of those: the caller is stopping,
-    so there is no row to give, and recording it as a failed listing would
-    log a warning and draw a scanner fault for a stop.  It propagates, and
-    ``run_checks`` ends the run there.  The launcher has already logged it,
-    at INFO.
-
-    Args:
-        scanner: The backend to ask.
-        configured_device: The configured ``scanner.device``, possibly empty.
-        may_open: Whether an unlisted configured device may be opened; False
-            for a ``net:`` device whose host the preflight could not probe.
-        abort: The caller's abort Event, handed to the listing, or ``None``.
-
-    Returns:
-        What was listed, whether an unlisted configured device opened or was
-        deliberately left unopened, and whether the listing crashed, ran out
-        of time or gave no usable answer.
+    One ``list_and_open`` call in a fresh listing child: it lists, and opens
+    a configured id only when it is not listed, because SANE opens ids it
+    never lists and a scan opens the id first.  A crashed, timed-out or
+    unanswered child is recorded as such, not as an empty listing; an abort
+    propagates, because a stop is not a scanner fault.
 
     Raises:
         ListingAbortedError: The listing was stopped on ``abort``.
@@ -1767,9 +1436,7 @@ def _scanner_enumeration(
         logger.warning("Scanner enumeration failed: %s", type(exc).__name__)
         return _Enumeration(devices=(), failure=_ListingFailure.NO_ANSWER)
     except Exception as exc:
-        # The backend raises ScanError, for instance while a read is stuck,
-        # but a backend is free to raise anything, so the boundary catches
-        # Exception.  Only the type name goes any further.
+        # A backend may raise anything; only the type name goes further.
         survey = DeviceSurvey(
             devices=(),
             list_error=type(exc).__name__,
@@ -1791,11 +1458,6 @@ def _enumeration_from(
     """
     Turn what the listing found into the verdict's plain record.
 
-    Args:
-        survey: What the backend's list-then-open found.
-        configured_device: The configured ``scanner.device``, possibly empty.
-        may_open: Whether an unlisted configured device could be opened.
-
     Returns:
         The listed devices, and for an unlisted configured device, whether it
         opened or was deliberately left unopened.
@@ -1808,9 +1470,7 @@ def _enumeration_from(
         return _Enumeration(devices=devices)
     if not may_open:
         return _Enumeration(devices=devices, open_withheld=True)
-    # ``None`` here would mean no open was attempted although the id is not
-    # listed, which the backend does only when its listing included it -- the
-    # branch above.  Anything but a confirmed open is therefore not opened.
+    # Anything but a confirmed open counts as not opened.
     return _Enumeration(
         devices=devices, configured_opened=survey.configured_opened is True
     )
@@ -1820,25 +1480,11 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     """
     Report whether a scanner is there to scan with.
 
-    The ungated path: this is what ``_dispatch`` calls, and therefore what
-    ``saneless doctor`` runs.  It is three steps, in the same order the gated
-    ``_scanner_result`` runs them: the preflight, which may settle the row
-    before SANE is entered; the enumeration, which is the only step that
-    enters SANE; and the verdict, which decides the row from plain values.
-    Only the placement of the gate differs between the two functions.
+    Report whether a scanner is there to scan with, without the scanner gate.
 
-    An ``isinstance`` test against ``CheckResult`` rather than a truthiness
-    shortcut: the preflight returns either a finished row or what enumeration
-    needs, and both are frozen dataclasses and therefore always truthy.  The
-    ``isinstance`` test is also what lets both type checkers narrow ``pre``
-    without a cast.
-
-    Args:
-        context: The injected dependencies and configuration.
-
-    Returns:
-        Exactly one result for ``CheckKey.SCANNER``.
-
+    The same three steps as ``_scanner_result``, which differs only in where
+    it takes the gate.  ``pre`` is tested with ``isinstance`` because both of
+    its types are dataclasses and always truthy.
     """
     pre = _scanner_preflight(context)
     if isinstance(pre, CheckResult):
