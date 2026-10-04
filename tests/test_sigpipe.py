@@ -150,8 +150,6 @@ with open({record!r}, "w", encoding="ascii") as record:
 # SANELESS_ prefix, so the child environment's strip keeps it.
 _SIGIGN_RECORDING_CHILD: Final = """\
 import os
-import signal
-import sys
 from pathlib import Path
 
 from saneless.scanner import _scan_child as child
@@ -183,21 +181,7 @@ def recording_report_quietly(outlet, stage):
 
 child.scan_session._snap_sheet = recording_snap_sheet
 child.scan_session._report_quietly = recording_report_quietly
-reply_fd = child.take_reply_fd()
-child.prepare_process()
-code = child.main(
-    sys.stdin.buffer,
-    reply_fd,
-    child.ChildRuntime(
-        arm_alarm=signal.alarm,
-        exit_process=os._exit,
-        grace_seconds=10.0,
-        ignore_sigpipe=child._ignore_sigpipe,
-    ),
-    forward_logs=True,
-)
-child.flush_standard_streams()
-os._exit(code)
+child.run_as_main()
 """
 
 

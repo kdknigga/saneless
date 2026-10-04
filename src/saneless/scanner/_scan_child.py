@@ -123,7 +123,13 @@ if TYPE_CHECKING:
     from saneless.scanner.scan_protocol import Frame
     from saneless.scanner.scan_session import SaneDevice
 
-__all__ = ["ChildRuntime", "install_log_forwarding", "main", "prepare_process"]
+__all__ = [
+    "ChildRuntime",
+    "install_log_forwarding",
+    "main",
+    "prepare_process",
+    "run_as_main",
+]
 
 _STAGE_ALARM_SECONDS: Final = 35
 """The alarm for a stage that is not a page: saneless's 30 s deadline, plus 5."""
@@ -1019,7 +1025,14 @@ def _note_unexpected(exc: BaseException) -> None:
         os.write(_STDERR_FD, line.encode("ascii", "replace"))
 
 
-if __name__ == "__main__":
+def run_as_main() -> None:
+    """
+    Run the child as its own process, and end the process when it is done.
+
+    The reply channel is made private and the process prepared before
+    ``main`` runs.  The process always ends with ``os._exit``, with the
+    status ``main`` returned, or 1 if anything escaped it.
+    """
     exit_status = _FAILED_STATUS
     try:
         reply_channel_fd = take_reply_fd()
@@ -1043,3 +1056,7 @@ if __name__ == "__main__":
         # sockets and USB handles.
         flush_standard_streams()
         os._exit(exit_status)
+
+
+if __name__ == "__main__":
+    run_as_main()
