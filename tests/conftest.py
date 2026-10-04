@@ -788,8 +788,9 @@ def listing_seam(
     So the backend's launcher is replaced here, suite-wide and not per module
     for the reason ``sane_process_state`` gives: a module that forgot would
     list through real libsane without anyone noticing.  The replacement runs
-    the child's own ``respond()`` over whatever is patched into
-    ``scan_session.sane``, and decodes the result with the launcher's own
+    the child's own ``init()`` and ``respond()`` over whatever is patched into
+    ``scan_session.sane``, answering a failed ``init()`` with the child's own
+    ``start_failure_reply()``, and decodes the result with the launcher's own
     decoder, so the child's logic and the reply schema are still what a test
     exercises.  With nothing patched it fails the test instead of listing.
 
@@ -821,9 +822,19 @@ def listing_seam(
         module = scan_session_mod.sane
         if module is None:
             raise AssertionError(_NO_REAL_LIBSANE)
-        reply = _listing_child.respond(
-            {"open": listing_request.open, "alarm": 0}, module
-        )
+        child_request: dict[str, object] = {
+            "open": listing_request.open,
+            "capabilities": listing_request.capabilities,
+            "alarm": 0,
+        }
+        # The child initialises its own SANE and reports a failure to start as
+        # data, from the same boundary, so the seam does the same.
+        try:
+            module.init()
+        except Exception as exc:
+            reply = _listing_child.start_failure_reply(child_request, exc)
+        else:
+            reply = _listing_child.respond(child_request, module)
         return ListingReply.from_stdout((json.dumps(reply) + "\n").encode())
 
     monkeypatch.setattr(

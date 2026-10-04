@@ -9,6 +9,7 @@ import gc
 import importlib
 import inspect
 import logging
+import operator
 import os
 import signal
 import subprocess
@@ -60,7 +61,11 @@ from saneless.scanner.sane_backend import SaneBackend
 from saneless.scanner.scan_session import GeometryUnit
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
-from saneless.vocabulary import scan_page_description
+from saneless.vocabulary import (
+    PYTHON_SANE_INSTALL_NEXT_STEP,
+    python_sane_missing_message,
+    scan_page_description,
+)
 from tests.conftest import (
     StubScannerBackend,
     images_of,
@@ -1734,6 +1739,15 @@ class TestSaneBackendScanPages:
             backend.scan_pages("test:device:001", settings, page_sink)
 
 
+# The child-backed reads that turn a child's start failure into an error.
+_CHILD_BACKED_READS = [
+    pytest.param(
+        operator.methodcaller("get_capabilities", "test:0"), id="capabilities"
+    ),
+    pytest.param(operator.methodcaller("get_devices"), id="devices"),
+]
+
+
 class TestSaneBackendGetCapabilities:
     """get_capabilities reports what the device offers, as it gave it."""
 
@@ -1797,6 +1811,148 @@ class TestSaneBackendGetCapabilities:
         caps = sane_backend.get_capabilities("test:device:001")
 
         assert caps.option_names == tuple(str(opt[1]) for opt in named)
+
+    def test_get_capabilities_asks_a_listing_child_and_opens_nothing_here(
+        self,
+        fake_sane_module: FakeSaneModule,
+        listing_seam: ListingSeam,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The capability read is a listing child's capabilities request.
+
+        The open, the option read and the close all happen in the child, so
+        this process's own open is never reached.
+        """
+        _ = fake_sane_module  # side-effect: patches the sane module
+
+        def open_in_this_process(*_args: object) -> NoReturn:
+            msg = "opened a device in this process"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(SaneBackend, "_open_device", open_in_this_process)
+        backend = SaneBackend(host="scanbox.lan")
+
+        caps = backend.get_capabilities(_NET_DEVICE)
+
+        assert listing_seam.calls[-1] == (
+            ListingRequest(capabilities=_NET_DEVICE),
+            "scanbox.lan",
+        )
+        assert "ADF Duplex" in caps.sources
+        assert caps.resolution_range == (1.0, 1200.0, 1.0)
+
+    def test_a_malformed_range_from_the_child_is_ignored_with_a_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A range the child reports with the wrong arity is not guessed at."""
+        caplog.set_level(logging.WARNING, logger=options_mod.__name__)
+
+        caps = _capabilities_for((1.0, 1200.0), monkeypatch)
+
+        assert caps.resolution_range is None
+        assert caps.resolutions == []
+        assert any(
+            "not a (minimum, maximum, step) triple" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.parametrize("read", _CHILD_BACKED_READS)
+    def test_a_sane_that_will_not_start_in_the_child_is_a_scan_error(
+        self,
+        read: Callable[[SaneBackend], object],
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A child whose ``sane.init()`` fails reports it as SANE not starting.
+
+        The backend is built while this process's SANE still starts, then the
+        child's fails: the start failure is the child's to report.
+        """
+        _ = fake_sane_module  # side-effect: patches the sane module
+        backend = SaneBackend()
+        failing = FakeSaneModule(
+            init_error=FakeSaneError("Error during\n device I/O\x1b[31m")
+        )
+        monkeypatch.setattr(scan_session_mod, "sane", failing)
+
+        with pytest.raises(ScanError) as exc_info:
+            read(backend)
+
+        assert not isinstance(exc_info.value, ConfigError)
+        assert str(exc_info.value) == (
+            "Could not initialise SANE: Error during device I/O\\x1b[31m"
+        )
+
+    @pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
+    @pytest.mark.parametrize("read", _CHILD_BACKED_READS)
+    def test_a_child_that_cannot_import_python_sane_gives_the_install_hint(
+        self,
+        read: Callable[[SaneBackend], object],
+        error_type: type[ImportError],
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A child that cannot load python-sane is today's install-hint error."""
+        _ = fake_sane_module  # side-effect: patches the sane module
+        backend = SaneBackend()
+        missing = FakeSaneModule(init_error=error_type("No module named 'sane'"))
+        monkeypatch.setattr(scan_session_mod, "sane", missing)
+
+        with pytest.raises(ConfigError) as exc_info:
+            read(backend)
+
+        assert str(exc_info.value) == python_sane_missing_message(
+            "No module named 'sane'"
+        )
+        assert exc_info.value.next_step == PYTHON_SANE_INSTALL_NEXT_STEP
+
+    @pytest.mark.parametrize(
+        "error",
+        [FakeSaneError("Error during device I/O"), ModuleNotFoundError("no sane")],
+        ids=["init", "import"],
+    )
+    def test_list_and_open_reports_the_start_failure_by_class(
+        self,
+        error: Exception,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        The Scanner check's survey names the class of a child's start failure.
+
+        It is logged once with its reason, which is a SANE status string or
+        an import error and names no device.
+        """
+        _ = fake_sane_module  # side-effect: patches the sane module
+        backend = SaneBackend()
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(init_error=error))
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+
+        survey = backend.list_and_open("")
+
+        assert survey.start_error == type(error).__name__
+        started = [
+            record.getMessage()
+            for record in caplog.records
+            if "could not be started" in record.getMessage()
+        ]
+        assert started == [
+            f"The scanner library could not be started: {error}",
+        ]
+
+    def test_list_and_open_reports_no_start_failure_for_a_sane_that_starts(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """A child whose SANE starts leaves the survey's start failure empty."""
+        _ = fake_sane_module  # side-effect: patches the sane module
+
+        survey = SaneBackend().list_and_open("")
+
+        assert survey.start_error is None
+        assert survey.devices
 
 
 # ---------------------------------------------------------------------------
@@ -3255,7 +3411,10 @@ class TestSaneBackendCancelSequence:
         second_pass_sink: SpooledPageSink,
     ) -> None:
         """
-        Every public entry point of a wedged backend refuses, touching nothing.
+        A wedged backend refuses to scan or list in this process, touching nothing.
+
+        A capability read is not refused: it runs in a listing child, whose
+        SANE is its own, so nothing it does can reach the stuck read.
 
         "No SANE call" is asserted as the device's own call log being
         byte-for-byte what it was, because the refusal has to happen before
@@ -3274,8 +3433,6 @@ class TestSaneBackendCancelSequence:
 
         with pytest.raises(ScanError, match="Restart saneless"):
             sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
-        with pytest.raises(ScanError, match="Restart saneless"):
-            sane_backend.get_capabilities(_TEST_DEVICE)
         with pytest.raises(ScanError, match="Restart saneless") as refusal:
             sane_backend.get_devices()
 
@@ -7571,7 +7728,12 @@ class TestSaneBoundary:
     def test_open_failure_in_get_capabilities_raises_scan_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """sane.open() failing names the device and chains the original."""
+        """
+        sane.open() failing names the device and keeps SANE's message.
+
+        The open runs in a listing child, so only the failure's text comes
+        back: there is no exception in this process to chain to.
+        """
         original = FakeSaneError("Invalid argument")
         monkeypatch.setattr(
             scan_session_mod, "sane", FakeSaneModule(open_error=original)
@@ -7585,7 +7747,6 @@ class TestSaneBoundary:
             str(exc_info.value)
             == "Could not open scanner epson2:libusb:001:004: Invalid argument"
         )
-        assert exc_info.value.__cause__ is original
 
     def test_open_failure_in_scan_pages_raises_scan_error(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
@@ -7858,7 +8019,12 @@ class TestSaneBoundary:
     def test_get_options_failure_in_get_capabilities_raises_scan_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """get_options() failing while reading capabilities names the device."""
+        """
+        get_options() failing while reading capabilities names the device.
+
+        The read runs in a listing child, so only the failure's text comes
+        back, with nothing in this process to chain to.
+        """
         original = FakeSaneError("Error during device I/O")
         dev = FakeSaneDev()
         dev.fail_call("get_options", original)
@@ -7870,7 +8036,6 @@ class TestSaneBoundary:
         assert str(exc_info.value) == (
             "Could not read options from test:0: Error during device I/O"
         )
-        assert exc_info.value.__cause__ is original
 
     # -- flatbed start / snap ------------------------------------------------
 
@@ -8013,8 +8178,28 @@ class TestDeviceIdsInScanErrorsAreNeutralised:
 
         self._assert_defused(exc_info.value)
 
+    def test_capabilities_open_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A capability read's failed open names the device with controls escaped."""
+        monkeypatch.setattr(
+            scan_session_mod,
+            "sane",
+            FakeSaneModule(open_error=FakeSaneError("Invalid\x1b[31m argument")),
+        )
+        backend = SaneBackend()
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_capabilities(_HOSTILE_DEVICE)
+
+        self._assert_defused(exc_info.value)
+        assert str(exc_info.value).startswith(
+            f"Could not open scanner {_SHOWN_DEVICE}: "
+        )
+
     def test_wedged_refusal(
-        self, fake_sane_module: FakeSaneModule, fake_device: FakeSaneDev
+        self,
+        fake_sane_module: FakeSaneModule,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
     ) -> None:
         """The wedge refusal names both devices with their controls escaped."""
         backend = SaneBackend()
@@ -8027,7 +8212,7 @@ class TestDeviceIdsInScanErrorsAreNeutralised:
         record.page_label = "Page 1"
 
         with pytest.raises(ScanError) as exc_info:
-            backend.get_capabilities(_HOSTILE_DEVICE)
+            backend.scan_pages(_HOSTILE_DEVICE, _flatbed_settings(), page_sink)
 
         self._assert_defused(exc_info.value)
         assert str(exc_info.value).count(_SHOWN_DEVICE) == 2
