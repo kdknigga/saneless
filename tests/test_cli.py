@@ -92,6 +92,7 @@ from saneless.scanner.base import (
 )
 from saneless.vocabulary import (
     MULTI_PAGE_NEEDS_TERMINAL,
+    PYTHON_SANE_INSTALL_NEXT_STEP,
     UNCONFIRMED_FILING_LABEL,
     UNCONFIRMED_SEND_LABEL,
     WARNED_UPLOAD_LABEL,
@@ -105,6 +106,7 @@ from saneless.vocabulary import (
     job_label,
     local_time,
     multi_page_manual_duplex_refusal,
+    python_sane_missing_message,
     state_label,
 )
 from saneless.web import app as app_module
@@ -2684,10 +2686,21 @@ def _block_sane_import(monkeypatch: pytest.MonkeyPatch) -> None:
 def _break_libsane(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the python-sane import fail the way a missing libsane.so does."""
 
-    def unloadable() -> None:
+    def unloadable() -> NoReturn:
         raise ImportError(_LIBSANE_MISSING)
 
     monkeypatch.setattr(sane_backend, "_ensure_sane", unloadable)
+    monkeypatch.setattr(scan_session_mod, "_ensure_sane", unloadable)
+
+
+# Each SANE command, with what it needs to reach the scanner backend: serve
+# binds an OS-chosen loopback port before it builds the backend.
+_SANE_COMMAND_LINES = [
+    pytest.param(["scan"], id="scan"),
+    pytest.param(["devices"], id="devices"),
+    pytest.param(["auto-profiles"], id="auto-profiles"),
+    pytest.param(["serve", "--host", "127.0.0.1", "--port", "0"], id="serve"),
+]
 
 
 class TestRequireSane:
@@ -2703,20 +2716,8 @@ class TestRequireSane:
     """
 
     @pytest.mark.parametrize("command", _SANE_COMMANDS)
-    @pytest.mark.parametrize(
-        ("break_sane", "reason"),
-        [
-            (_block_sane_import, "import of sane halted"),
-            (_break_libsane, "libsane.so.1"),
-        ],
-        ids=["module_missing", "libsane_missing"],
-    )
     def test_python_sane_unavailable_exits_2_before_anything_else(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        command: str,
-        break_sane: Callable[[pytest.MonkeyPatch], None],
-        reason: str,
+        self, monkeypatch: pytest.MonkeyPatch, command: str
     ) -> None:
         """One install-hint line and exit 2; no config load, no scanner."""
         runner, settings = _patch_cli(monkeypatch)
@@ -2736,7 +2737,7 @@ class TestRequireSane:
         monkeypatch.setattr("saneless.cli.load_settings", recording_load)
         monkeypatch.setattr("saneless.cli.SaneBackend", RecordingScanner)
         monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
-        break_sane(monkeypatch)
+        _block_sane_import(monkeypatch)
 
         result = runner.invoke(cli, [command])
 
@@ -2744,11 +2745,37 @@ class TestRequireSane:
         lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert "python-sane cannot be imported" in lines[0]
-        assert reason in lines[0]
+        assert "No module named 'sane'" in lines[0]
         assert "libsane-dev" in lines[0]
         assert "sane-backends-devel" in lines[0]
         assert "Traceback" not in result.output
         assert calls == []
+
+    @pytest.mark.parametrize("command_line", _SANE_COMMAND_LINES)
+    def test_an_unloadable_libsane_exits_2_when_the_backend_is_built(
+        self, monkeypatch: pytest.MonkeyPatch, command_line: list[str]
+    ) -> None:
+        """
+        A python-sane whose libsane will not load gives the same one line, exit 2.
+
+        Checking that python-sane is installed loads nothing, so the missing
+        ``libsane.so`` is found where the library is first loaded: building
+        the backend.
+        """
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+        _break_libsane(monkeypatch)
+
+        result = runner.invoke(cli, command_line)
+
+        assert result.exit_code == 2, result.output
+        # devices announces its discovery before it builds the backend.
+        lines = [
+            line for line in _failure_lines(result) if line != "Discovering scanners..."
+        ]
+        assert lines == [python_sane_missing_message(_LIBSANE_MISSING)], result.stderr
+        assert PYTHON_SANE_INSTALL_NEXT_STEP in result.stderr
+        assert "Traceback" not in result.output
 
     def test_jobs_needs_no_python_sane_on_a_fresh_install(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
