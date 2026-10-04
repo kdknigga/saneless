@@ -1043,7 +1043,8 @@ class JobStore:
             # in _row_to_job alone.
             row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
         job = self._row_to_job(row)
-        # %r: a newline in the untrusted title would forge a second log line.
+        # %r, not %s: a newline in the untrusted title would forge a second
+        # log line.
         logger.debug("Created job %s: %r", job.id, job.title)
         return job
 
