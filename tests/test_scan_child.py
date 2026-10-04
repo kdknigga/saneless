@@ -649,6 +649,38 @@ def test_a_child_whose_kill_was_interrupted_is_still_reaped(
 
     _assert_reaped(files.pid())
     assert not live.is_set()
+    assert session.children_killed == 1
+
+
+def test_close_after_an_interrupted_kill_counts_it_and_reports_no_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A child saneless killed is never reported as one that crashed.
+
+    A Ctrl-C lands between the kill and the reap, and the session is closed
+    next: the child is counted as killed once, and its close reports no
+    death from ``SIGKILL``, which was saneless's own.
+    """
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    _shorten_deadlines(monkeypatch)
+    files = _stand_in(monkeypatch, tmp_path)
+
+    def start() -> ChildProcess:
+        return _ReapInterruptedOnce(_start_stand_in())
+
+    session = ScanChildSession(start)
+    session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+    with pytest.raises(KeyboardInterrupt):
+        session._end_child()
+
+    session.close()
+
+    _assert_reaped(files.pid())
+    assert session.children_killed == 1
+    assert [record.getMessage() for record in caplog.records] == []
 
 
 def test_a_crash_names_the_signal_stage_and_page(
