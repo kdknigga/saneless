@@ -2,10 +2,12 @@
 The web app's collaborators, as one typed object read through ``services``.
 
 ``create_app`` builds a single ``Services`` and stores it on the application.
-Every handler, error handler and the server's stop hook reads it through
-``services(request)``, which narrows the type, so a misspelt collaborator or a
-wrong keyword passed to one is an error in both type checkers rather than an
-attribute that quietly does not exist.
+Every handler and error handler reads it through ``services(request)``, which
+narrows the type, so a misspelt collaborator or a wrong keyword passed to one is
+an error in both type checkers rather than an attribute that quietly does not
+exist.  Code that holds the app instead of a request, the server's stop hook
+and ``serve``, reads ``app.state.services`` itself and acts only on a
+``Services``, so it never raises.
 """
 
 from __future__ import annotations
