@@ -1,24 +1,13 @@
-{# The poll URL and its interval are built by one Python function,
-   status_view.poll_url, and handed in as poll_url and poll_interval; this template
-   composes no URL.  The URL follows the job this browser submitted, answered
-   or owns, so a second person's scan cannot take the status area over, and it
-   carries the token of what this rendering shows, so a poll that would render
-   the same thing is answered 204 and leaves the area -- and the focus inside
-   it -- in place.
+{# poll_url and poll_interval come from status_view.poll_url; this template
+   composes no URL.  The poll carries the token of what this rendering shows,
+   so an unchanged poll is answered 204 and focus inside the area stays put.
 
-   The negative tabindex is on every rendering, in every state: the area is where
-   focus goes after an action, and htmx restores focus by id only to an
-   element that can hold it.  autofocus is on it only in an action's response
-   (focus_status_area), never in a poll's or the page's: a poll that took focus
-   would pull it out of the Title box once a second while a scan runs.
-
-   The area is always rendered inside index.html's #status-live, the polite
-   region that speaks without a user action, and never carries that region
-   itself.  So no line in here is
-   marked aria-busy: a screen reader may hold back a busy subtree inside a live
-   region until it stops being busy, and "Scanning..." would then never be
-   heard.  A line the machine is working on carries class="busy-line" instead,
-   and app.css draws the spinner from that class. #}
+   tabindex="-1" is on every rendering because htmx restores focus by id only
+   to a focusable element.  autofocus is only on an action's response: on a
+   poll it would pull focus out of the Title box every second.  No line is
+   aria-busy, because a screen reader may hold back a busy subtree inside a
+   live region and "Scanning..." would never be heard; class="busy-line" draws
+   the spinner instead. #}
 <div id="status-area" tabindex="-1"{% if focus_status_area %} autofocus{% endif %}
      {% if job and job.is_active %}
      hx-get="{{ poll_url }}"
@@ -27,47 +16,15 @@
      {% endif %}>
   {% if job %}
     {% if job.is_busy %}
-      {# One server-built string, not a sentence composed here: templates own no
-         vocabulary, and a page that assembled its own copy would be a second
-         place for it to drift from the contract.  The line carries the queue
-         position, the manual-duplex front count, or the plain in-flight prose,
-         whichever applies. #}
+      {# Built on the server: templates compose no vocabulary. #}
       <p class="busy-line">{{ busy_line }}</p>
     {% elif job.state == JobState.AWAITING_FLIP %}
-      {# Three-way, in this order.
-
-         First, once this job's flip wait is answered, acknowledge the answer
-         instead of re-rendering buttons that look as though the click did nothing.
-
-         The second arm is the owner gate.  The decision is made
-         on the server and the two buttons are simply not emitted for anybody
-         else; hiding them with CSS would be an ASVS 4.0.3 V4.1 failure and is
-         forbidden.  The owner token gates two things, by two rules.  It gates
-         these controls through is_owner, where a NULL owner token means
-         unowned and the prompt renders for everyone, so a manual-duplex job in
-         flight across an upgrade is still answerable.  And, through the job
-         view this template is handed, it gates the title, thumbnail and
-         detail text, where a NULL owner token means nobody's: every browser
-         sees the generic title and no preview for such a job, even while it
-         may press Continue.  State and counts are the same for everyone.
-
-         There is deliberately no third control here and no second timer.
-         Somebody who closed the tab is the same case as somebody who walked away,
-         and the bounded manual-duplex flip timeout already resolves both.  The
-         absence IS the rendering, so it is asserted by test rather than left to a
-         reviewer's memory.
-
-         The last arm is the server's non_owner_line: what the scan waits
-         for, that it can be continued from the device that started it, and --
-         once the worker has recorded when the wait began -- when it stops.  It
-         names no title.  It deliberately ends in a full stop, without the
-         three periods that in-progress copy normally carries, and so do the
-         three multi-page waiting lines below: nothing is happening on this
-         viewer's behalf.  The style exception is locked and recorded here so a
-         later tidy-up does not "fix" any of the four.  It is a plain line with
-         no spinner, like the multi-page waiting line below: the job waits for
-         a person, not the machine.  The acknowledgement in the first arm is a
-         busy line, because the machine is about to act on the answer. #}
+      {# The controls are emitted only for the owner, or for anyone when the job
+         has no owner token; never hide them with CSS instead.  There is
+         deliberately no cancel control or second timer here: the flip timeout
+         already covers a closed tab.  non_owner_line and the waiting lines
+         below end in a full stop, not an ellipsis, on purpose: nothing is
+         happening on this viewer's behalf. #}
       {% if flip_answer %}
       <p class="busy-line">{{ flip_answer | flip_answer_label }}</p>
       {% elif is_owner %}
@@ -76,32 +33,10 @@
       <p>{{ non_owner_line }}</p>
       {% endif %}
     {% elif job.state in pass_wait_states %}
-      {# A multi-page document waiting on its operator.  Three arms, in the
-         same order as the flip branch above.
-
-         First, once the open question is answered, acknowledge the answer
-         instead of re-rendering buttons that look as though the click did
-         nothing.  That line is busy: the machine is about to act on it.
-
-         The second arm is the owner gate, decided on the server by the same
-         rule as the flip prompt: the owner, or anyone when the job recorded
-         no owner.  Nobody else is handed a prompt, so the buttons and the
-         scanner's error text are not emitted for them at all; hiding them
-         with CSS would be an ASVS 4.0.3 V4.1 failure and is forbidden.
-
-         Anyone else sees the server's non_owner_line: what the job waits on,
-         that it can be answered from the device that started it, and when it
-         stops waiting once that is known -- with no title, and ending in a
-         full stop under the locked style exception recorded above.
-
-         The owner, for the moment before the worker publishes the question,
-         sees the same server-built line the busy branch renders, which for a
-         waiting state is that state's progress wording: they are about to be
-         asked, so telling them to answer from another device would be wrong.
-
-         Neither line carries the busy-line class: the job waits for a person,
-         not the machine, and a spinner here is exactly what makes a waiting
-         scan look hung. #}
+      {# The same owner gate as the flip prompt.  Before the worker publishes
+         the question the owner sees busy_line, the state's progress wording,
+         not non_owner_line.  Neither waiting line is a busy-line: a spinner
+         makes a scan that waits for a person look hung. #}
       {% if pass_answer %}
       <p class="busy-line">{{ pass_answer | pass_answer_label }}</p>
       {% elif is_owner and pass_copy %}
@@ -112,31 +47,10 @@
       <p>{{ busy_line }}</p>
       {% endif %}
     {% elif job.state == JobState.DONE %}
-      {# The counts are a footnote to the outcome, so they read after it and
-         before the preview.
-
-         The guard is `counts` being None -- what the filter below returns when any
-         one of the three is NULL -- and NEVER a count's own truthiness.  Four of
-         the six terminal cases have NULL counts by construction: worker.py leaves
-         them NULL on error and on cancel, job.py on a refused submit, and no row
-         written before the count columns existed was ever backfilled.  A measured
-         0, by contrast, is a true measurement and renders as 0.
-
-         Counts on every terminal job therefore means every terminal job that
-         RECORDED counts: ERROR and CANCELLED rows have none to show, and that is
-         accepted, so a later reader need not chase a phantom.
-
-         An upload that carries a warning -- a sheet the scanner could not read,
-         say -- is not headed with the green tick: it reads in the fallback amber
-         with the warning beneath, so nobody throws away a stack that is missing
-         a page.  It is a degraded success, not a failure, so like the fallback
-         branch it is not announced as an alert.  The words come from the
-         outcome_line filter in both arms, never from this template.
-
-         The pages removed as blank follow the counts in the same muted style.
-         They are information, not a warning -- removed pages are not kept, so
-         the operator is told which to rescan -- and a DONE that removed blank
-         backs keeps its green tick. #}
+      {# Guard on counts being None, never on a count's truthiness: error,
+         cancel, a refused submit and rows older than the count columns leave
+         them NULL, while a measured 0 renders as 0.  A warned upload reads
+         amber and is not an alert: it is a degraded success. #}
       {% if job.warning %}
       <p class="status-fallback">&#9888; {{ job.state | outcome_line(job.warning, job.title) }}</p>
       <p class="status-fallback">{{ job.warning }}</p>
@@ -153,8 +67,6 @@
       {% if job.warning %}
       <p class="status-fallback">{{ job.warning }}</p>
       {% endif %}
-      {# After the warning as well as the outcome: the warning is about the
-         scan's fate, the counts are only about its size. #}
       {% set counts = job | page_counts %}
       {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
       {% set removed = job | removed_pages %}
@@ -165,40 +77,12 @@
       <p class="status-cancelled">&#8856; Cancelled: {{ job.title }}</p>
       {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% elif job.state == JobState.ERROR %}
-      {# Three things a reader of this branch will question, answered here.
-
-         The alert role moved from the <p> to a wrapping <div> so the alert
-         covers the next step as well as the sentence.  The next step is the most
-         actionable content on the page; leaving it outside the alert would mean
-         a screen-reader user never hears it.  The <details> stays OUTSIDE the
-         alert, so "Technical details" is not announced with the failure.
-
-         The specific message is relocated, not removed.  vocabulary.error_message's
-         own docstring warns that swapping the specific message for a category
-         sentence would be a regression, so job.error is still rendered -- inside
-         the disclosure.  The category sentence and the next step are *added*.
-
-         No host path reaches this page, and the log file path is deliberately
-         absent.  This page is visible to the whole LAN, so the disclosure
-         carries only job.error, the category and the job id -- and job.error
-         here is already path-free.  The job is a view built on the server:
-         for the browser that started the scan, its text names every host
-         directory and web address by the setting that holds it, so a kept
-         file reads failed/<file>.pdf, and any other absolute path reads
-         <path>; for everyone else it is a fixed
-         sentence saying where the full text is.
-
-         A NULL error_category is a row written before categories were
-         recorded.  It renders today's shape verbatim: substituting UNKNOWN would
-         print "Something went wrong." over a row that still holds a truthful
-         specific message.
-
-         A failure whose category is amber may already be in paperless-ngx.  It
-         reads in the fallback amber with the warning sign, and like a warned
-         upload it is not announced as an alert: red and an alert both say
-         "scan it again", which is the one thing its next step asks the reader
-         not to do before checking the document list.  The disclosure is the
-         same in both arms. #}
+      {# The alert wraps the next step as well as the sentence, so a screen
+         reader hears it; <details> stays outside, so "Technical details" is
+         not announced.  job.error comes from the job view, which has already
+         replaced every host path.  A NULL error_category is a row from before
+         categories and keeps the plain shape.  An amber category may already
+         be in paperless-ngx, so it is not an alert: red says "scan it again". #}
       {% if job.error_category %}
       {% if job.error_category | is_amber_category %}
       <p class="status-fallback">&#9888; {{ job.error_category | error_message }}</p>
@@ -224,19 +108,10 @@
       <img src="data:image/jpeg;base64,{{ job.thumbnail }}" alt="First page preview" class="thumbnail">
     {% endif %}
   {% else %}
-    {# No job to report.  The idle line is the server's: the blocked reason on
-       an appliance that cannot upload, so this area never invites a scan the
-       button refuses, and plain text even then -- the red reason already sits
-       under the button, and a red line here with no alert would read as a
-       live failure.
-
-       On the full page, a job that has ended arrives as last_job, never as
-       job, and is reported as the past: muted, whatever the outcome, with no
-       alert, no preview, no counts and no reload, so a fresh page never
-       presents an old result as news.  The glyph and the outcome word are in
-       the vocabulary's line, and the title in it is the job view's, so the
-       owner gate still decides it.  A failure with a category keeps its
-       disclosure, the one place the page shows a past failure's detail. #}
+    {# idle_line stays plain text even when it carries the blocked reason: the
+       red reason already sits under the button.  On the full page an ended
+       job arrives as last_job and is reported muted, as the past, so a fresh
+       page never presents an old result as news. #}
     <p>{{ idle_line }}</p>
     {% if last_job %}
     <p class="last-scan">{{ last_scan_line }}</p>

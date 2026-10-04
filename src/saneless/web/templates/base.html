@@ -4,22 +4,16 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
-    {# htmx drops 4xx/5xx bodies by default; this makes it swap them, so a
-       rejected request shows its message. htmx 2.0.10 merges meta config
-       shallowly, so all three entries are restated: a meta holding only the
-       [45].. entry would replace the array and stop every 2xx swap.
-       includeIndicatorStyles is off because htmx would otherwise inject a
-       style element, which the Content-Security-Policy refuses; no page
-       uses an .htmx-indicator, so that style would have nothing to style.
-       allowEval and allowScriptTags are off so that markup injected into a
-       response some day could not run code through htmx: no hx-on, js: value
-       or trigger filter is evaluated, and no swapped-in script element is
-       run. timeout abandons a stalled or half-open request after 20 s, so a
-       poll that never answers cannot hold its element forever; with no
-       application script the abandoned request fails silently and a polling
-       element asks again on its next tick. An element whose server budget is
-       longer raises the limit on itself with hx-request, never on a container,
-       which every element inside it would inherit. #}
+    {# htmx drops 4xx/5xx bodies by default; responseHandling swaps them so a
+       rejected request shows its message.  htmx 2.0.10 merges meta config
+       shallowly, so all three entries are restated: a lone [45].. entry would
+       replace the array and stop every 2xx swap.  includeIndicatorStyles is
+       off because the style element htmx would inject is refused by the
+       Content-Security-Policy.  allowEval and allowScriptTags are off so
+       injected markup cannot run code through htmx.  timeout abandons a
+       stalled request after 20 s; an element that needs longer raises it on
+       itself with hx-request, never on a container, which every element
+       inside would inherit. #}
     <meta name="htmx-config"
           content='{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}],"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"timeout":20000}'>
     <title>{% block title %}saneless{% endblock %}</title>
