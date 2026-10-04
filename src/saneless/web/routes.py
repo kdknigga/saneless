@@ -266,8 +266,8 @@ def _paperless_test_error(exc: BaseException) -> PaperlessTestAnswer:
 
     A failure while running the test is a failure inside saneless, so it is a
     server error rather than a bad gateway; an answer paperless-ngx gave is a
-    200.  Class name only, by the rule above
-    ``metadata_view.cached_list_or_none``.
+    200.  Class name only, even for the client's own errors: stricter than the
+    rule above ``metadata_view.cached_list_or_none``.
     """
     detail = type(exc).__name__
     logger.warning("Paperless connection test failed: %s", detail)

@@ -98,11 +98,11 @@ def _lock_wait(timeout: httpx2.Timeout) -> float:
     return (timeout.connect or 0.0) + (timeout.read or 0.0)
 
 
-# How the web tier logs a Paperless client exception, here, in
-# routes.paperless_test and in web/cache.py.  A PaperlessError or ConfigError is
-# logged by its message, which the client builds free of credentials; anything
-# else by class name only and without a traceback, because third-party exception
-# text can carry a URL, a header or a token.
+# How the web tier logs a Paperless client exception, here and in web/cache.py.
+# A PaperlessError or ConfigError is logged by its message, which the client
+# builds free of credentials; anything else by class name only and without a
+# traceback, because third-party exception text can carry a URL, a header or a
+# token.
 def cached_list_or_none(
     cache: MetadataCache,
     paperless: PaperlessClient,
