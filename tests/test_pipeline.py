@@ -136,6 +136,10 @@ if TYPE_CHECKING:
     from saneless.config import Settings
     from saneless.scanner.base import PageRecord, PageSink, ScanBatch, ScanSettings
 
+# The job id for a request whose test has no use for one of its own: a
+# fixed uuid4, the shape both entry points supply.
+_JOB_ID = "00000000-0000-4000-8000-000000000001"
+
 
 class TestRunPipeline:
     """Pipeline orchestration tests."""
@@ -147,7 +151,9 @@ class TestRunPipeline:
         default_settings: Settings,
     ) -> None:
         """A scan that assembles and uploads ends SUCCESS with no warning."""
-        request = PipelineRequest(profile_name="default", title="Happy Path Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Happy Path Doc", job_id=_JOB_ID
+        )
         result = run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -169,7 +175,9 @@ class TestRunPipeline:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = ScanError("Device not found")
 
-        request = PipelineRequest(profile_name="default", title="Scan Error Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Scan Error Doc", job_id=_JOB_ID
+        )
         with pytest.raises(ScanError, match="Device not found"):
             run_pipeline(
                 scanner=scanner,
@@ -193,7 +201,9 @@ class TestRunPipeline:
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
 
-        request = PipelineRequest(profile_name="default", title="Upload Error Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Upload Error Doc", job_id=_JOB_ID
+        )
         with pytest.raises(PaperlessError, match="Upload failed"):
             run_pipeline(
                 scanner=mock_scanner,
@@ -209,7 +219,9 @@ class TestRunPipeline:
         default_settings: Settings,
     ) -> None:
         """After successful run, tmp_dir has no leftover scan files."""
-        request = PipelineRequest(profile_name="default", title="Cleanup Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Cleanup Doc", job_id=_JOB_ID
+        )
         run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -230,7 +242,9 @@ class TestRunPipeline:
         scanner.scan_pages.side_effect = ScanError("Boom")
         paperless = MagicMock()
 
-        request = PipelineRequest(profile_name="default", title="Error Cleanup Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Error Cleanup Doc", job_id=_JOB_ID
+        )
         with pytest.raises(ScanError, match="Boom"):
             run_pipeline(
                 scanner=scanner,
@@ -255,7 +269,9 @@ class TestRunPipeline:
         )
         mock_paperless.poll_task.return_value = TaskFiled(task={"status": "SUCCESS"})
 
-        request = PipelineRequest(profile_name="default", title="Poll Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Poll Doc", job_id=_JOB_ID
+        )
         run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -279,6 +295,7 @@ class TestRunPipeline:
         request = PipelineRequest(
             profile_name="default",
             title="Status Doc",
+            job_id=_JOB_ID,
             status_callback=events.append,
         )
         run_pipeline(
@@ -606,7 +623,9 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Twelve Pages"),
+                request=PipelineRequest(
+                    profile_name="default", title="Twelve Pages", job_id=_JOB_ID
+                ),
             )
 
         assert result.outcome is ScanOutcome.SUCCESS
@@ -688,6 +707,7 @@ class TestPipelineThumbnail:
         request = PipelineRequest(
             profile_name="default",
             title="Thumb Test",
+            job_id=_JOB_ID,
             thumbnail_callback=thumb_results.append,
         )
         run_pipeline(
@@ -714,6 +734,7 @@ class TestPipelineThumbnail:
         request = PipelineRequest(
             profile_name="default",
             title="No Thumb Test",
+            job_id=_JOB_ID,
         )
         result = run_pipeline(
             scanner=mock_scanner,
@@ -749,7 +770,9 @@ class TestPipelineEmptyPageFilter:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="Filter Test")
+        request = PipelineRequest(
+            profile_name="default", title="Filter Test", job_id=_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -777,7 +800,9 @@ class TestPipelineEmptyPageFilter:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
-        request = PipelineRequest(profile_name="default", title="Threshold Test")
+        request = PipelineRequest(
+            profile_name="default", title="Threshold Test", job_id=_JOB_ID
+        )
 
         with patch("saneless.pipeline.filter_blank_pages", wraps=None) as mock_filter:
             # A side_effect, not a return_value: what comes back has to be the
@@ -812,7 +837,9 @@ class TestPipelineEmptyPageFilter:
             [_make_empty_image(), _make_empty_image()]
         )
 
-        request = PipelineRequest(profile_name="default", title="All Empty Test")
+        request = PipelineRequest(
+            profile_name="default", title="All Empty Test", job_id=_JOB_ID
+        )
         with pytest.raises(AllPagesBlankError) as excinfo:
             run_pipeline(
                 scanner=scanner,
@@ -885,6 +912,7 @@ def _run_through_assembly(
     request = PipelineRequest(
         profile_name="default",
         title=title,
+        job_id=_JOB_ID,
         flip_coordinator=AlwaysContinueFlipCoordinator(),
     )
     with patch("saneless.pipeline.assemble_pdf", wraps=assemble_pdf) as assemble:
@@ -1016,7 +1044,9 @@ class TestBlankPagesByInkCoverage:
             [_blank(), framed_blank(3, dpi=_SMALL_DPI)]
         )
 
-        request = PipelineRequest(profile_name="default", title="All Tinted Blank")
+        request = PipelineRequest(
+            profile_name="default", title="All Tinted Blank", job_id=_JOB_ID
+        )
         with pytest.raises(AllPagesBlankError):
             run_pipeline(
                 scanner=scanner,
@@ -1289,7 +1319,9 @@ class TestZeroPages:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([])
 
-        request = PipelineRequest(profile_name="default", title="Zero Pages")
+        request = PipelineRequest(
+            profile_name="default", title="Zero Pages", job_id=_JOB_ID
+        )
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
             pytest.raises(ScanError, match=r"^No pages were scanned$"),
@@ -1320,6 +1352,7 @@ class TestZeroPages:
         request = PipelineRequest(
             profile_name="default",
             title="Empty Pass A",
+            job_id=_JOB_ID,
             flip_coordinator=coordinator,
         )
         with pytest.raises(ScanError, match=r"^No pages were scanned$"):
@@ -1391,7 +1424,9 @@ class TestZeroPages:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_empty_image()])
 
-        request = PipelineRequest(profile_name="default", title="All Blank")
+        request = PipelineRequest(
+            profile_name="default", title="All Blank", job_id=_JOB_ID
+        )
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
             pytest.raises(AllPagesBlankError) as excinfo,
@@ -1422,7 +1457,9 @@ class TestZeroPages:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = FeederEmptyError("No paper detected in feeder")
 
-        request = PipelineRequest(profile_name="default", title="Feeder Empty")
+        request = PipelineRequest(
+            profile_name="default", title="Feeder Empty", job_id=_JOB_ID
+        )
         with pytest.raises(FeederEmptyError, match=r"^No paper detected in feeder$"):
             run_pipeline(
                 scanner=scanner,
@@ -1456,6 +1493,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Test",
+            job_id=_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1491,6 +1529,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Mismatch Test",
+            job_id=_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1549,6 +1588,7 @@ class TestManualDuplex:
             request=PipelineRequest(
                 profile_name="default",
                 title="Mismatch Fallback",
+                job_id=_JOB_ID,
                 flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
@@ -1585,6 +1625,7 @@ class TestManualDuplex:
             request=PipelineRequest(
                 profile_name="default",
                 title="Half Delivered",
+                job_id=_JOB_ID,
                 flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
@@ -1610,6 +1651,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Normal Duplex",
+            job_id=_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1648,6 +1690,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Filter Test",
+            job_id=_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -1685,6 +1728,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Thumb Test",
+            job_id=_JOB_ID,
             thumbnail_callback=thumb_results.append,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
@@ -1724,6 +1768,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Coordinator Wait Test",
+            job_id=_JOB_ID,
             status_callback=events.append,
             flip_coordinator=coordinator,
         )
@@ -1762,6 +1807,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Abort Test",
+            job_id=_JOB_ID,
             flip_coordinator=_FixedFlipCoordinator(FlipOutcome.ABORTED),
         )
 
@@ -2053,6 +2099,7 @@ class TestManualDuplexPassCounts:
         return PipelineRequest(
             profile_name="default",
             title="Pass Count Test",
+            job_id=_JOB_ID,
             status_callback=status_callback,
             pass_count_callback=pass_count_callback,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
@@ -2060,7 +2107,9 @@ class TestManualDuplexPassCounts:
 
     def test_pass_count_callback_defaults_to_none(self) -> None:
         """A request built without a pass-count observer has none."""
-        request = PipelineRequest(profile_name="default", title="No Counts")
+        request = PipelineRequest(
+            profile_name="default", title="No Counts", job_id=_JOB_ID
+        )
 
         assert request.pass_count_callback is None
 
@@ -2337,7 +2386,10 @@ class TestResolveDeviceChange:
                 paperless=mock_paperless,
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Memory", device_memory=memory
+                    profile_name="default",
+                    title="Memory",
+                    job_id=_JOB_ID,
+                    device_memory=memory,
                 ),
             )
 
@@ -2372,7 +2424,9 @@ class TestNoScannerFound:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Nothing"),
+                request=PipelineRequest(
+                    profile_name="default", title="Nothing", job_id=_JOB_ID
+                ),
             )
 
         assert failure_text(excinfo.value).startswith("No scanner found: ")
@@ -2390,7 +2444,9 @@ class TestNoScannerFound:
                 scanner=_scanner_listing(),
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Nothing"),
+                request=PipelineRequest(
+                    profile_name="default", title="Nothing", job_id=_JOB_ID
+                ),
             )
 
         category = classify_error(excinfo.value)
@@ -2431,7 +2487,9 @@ class TestDuplexStrategy:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="No Coordinator"),
+                request=PipelineRequest(
+                    profile_name="default", title="No Coordinator", job_id=_JOB_ID
+                ),
             )
 
         message = failure_text(excinfo.value)
@@ -2456,7 +2514,9 @@ class TestDuplexStrategy:
             scanner=scanner,
             paperless=mock_paperless,
             settings=default_settings,
-            request=PipelineRequest(profile_name="default", title="Looks Duplex"),
+            request=PipelineRequest(
+                profile_name="default", title="Looks Duplex", job_id=_JOB_ID
+            ),
         )
 
         assert scanner.scan_pages.call_count == 1
@@ -2480,6 +2540,7 @@ class TestDuplexStrategy:
             request=PipelineRequest(
                 profile_name="default",
                 title="Plain Feeder Duplex",
+                job_id=_JOB_ID,
                 flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
@@ -2611,6 +2672,7 @@ def _manual_duplex_over_the_fake(
         request=PipelineRequest(
             profile_name="default",
             title="Duplex over the shared fake",
+            job_id=_JOB_ID,
             status_callback=_reload_the_stack,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         ),
@@ -2670,6 +2732,7 @@ class TestManualDuplexOverTheSharedFake:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex over the shared fake",
+            job_id=_JOB_ID,
             status_callback=_reload_the_stack,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
@@ -2798,6 +2861,7 @@ class TestManualDuplexOverTheSharedFake:
         request = PipelineRequest(
             profile_name="default",
             title="No feeder",
+            job_id=_JOB_ID,
             status_callback=events.append,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
@@ -2841,7 +2905,9 @@ class TestExifStripped:
         scanner.scan_pages.side_effect = spooling([img])
 
         spooled: list[Image.Image] = []
-        request = PipelineRequest(profile_name="default", title="EXIF Test")
+        request = PipelineRequest(
+            profile_name="default", title="EXIF Test", job_id=_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.side_effect = _reading_the_pages(
@@ -2880,7 +2946,9 @@ class TestEmptyPageDetectionToggle:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="Toggle Test")
+        request = PipelineRequest(
+            profile_name="default", title="Toggle Test", job_id=_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -2914,6 +2982,7 @@ class TestFlatbedStillWorks:
         request = PipelineRequest(
             profile_name="default",
             title="Flatbed Test",
+            job_id=_JOB_ID,
             thumbnail_callback=thumb_results.append,
         )
 
@@ -3028,7 +3097,9 @@ class TestDiskSpaceCheck:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="No room"),
+                request=PipelineRequest(
+                    profile_name="default", title="No room", job_id=_JOB_ID
+                ),
             )
 
         message = failure_text(exc_info.value)
@@ -3087,7 +3158,9 @@ class TestDiskSpaceCheck:
                 scanner=MagicMock(spec=ScannerBackend),
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="No dir"),
+                request=PipelineRequest(
+                    profile_name="default", title="No dir", job_id=_JOB_ID
+                ),
             )
 
         next_step = exc_info.value.next_step
@@ -3134,7 +3207,9 @@ class TestDiskSpaceCheck:
                 scanner=scanner,
                 paperless=MagicMock(),
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="No room"),
+                request=PipelineRequest(
+                    profile_name="default", title="No room", job_id=_JOB_ID
+                ),
             )
 
         error = exc_info.value
@@ -3152,7 +3227,7 @@ class TestDiskSpaceCheck:
     ) -> None:
         """A missing ``tmp_dir`` is created 0700 even under umask 002."""
         tmp_dir = tmp_path / "scratch"
-        request = PipelineRequest(profile_name="default", title="t")
+        request = PipelineRequest(profile_name="default", title="t", job_id=_JOB_ID)
         old = os.umask(0o002)
         try:
             with _open_workspace(tmp_dir, 0, request) as workspace:
@@ -3181,7 +3256,7 @@ class TestDiskSpaceCheck:
         else:
             tmp_dir.mkdir()
             tmp_dir.chmod(0o777)
-        request = PipelineRequest(profile_name="default", title="t")
+        request = PipelineRequest(profile_name="default", title="t", job_id=_JOB_ID)
         with (
             pytest.raises(ConfigError) as exc_info,
             _open_workspace(tmp_dir, 0, request),
@@ -3255,7 +3330,9 @@ class TestFullDiskIsNotTheScanner:
                 scanner=SaneBackend(),
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Full disk"),
+                request=PipelineRequest(
+                    profile_name="default", title="Full disk", job_id=_JOB_ID
+                ),
             )
 
         error = exc_info.value
@@ -3285,6 +3362,7 @@ class TestPipelineEventEnum:
         request = PipelineRequest(
             profile_name="default",
             title="Enum Check",
+            job_id=_JOB_ID,
             status_callback=events.append,
         )
         run_pipeline(
@@ -3346,7 +3424,9 @@ class TestScanResultContract:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="Counts Test")
+        request = PipelineRequest(
+            profile_name="default", title="Counts Test", job_id=_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -3379,7 +3459,9 @@ class TestScanResultContract:
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(all_pages)
 
-        request = PipelineRequest(profile_name="default", title="No Filter Test")
+        request = PipelineRequest(
+            profile_name="default", title="No Filter Test", job_id=_JOB_ID
+        )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
             mock_assemble.return_value = tmp_path / "output.pdf"
@@ -3408,7 +3490,9 @@ class TestScanResultContract:
             path=tmp_path / "consume" / "doc.pdf"
         )
 
-        request = PipelineRequest(profile_name="default", title="Fallback Doc")
+        request = PipelineRequest(
+            profile_name="default", title="Fallback Doc", job_id=_JOB_ID
+        )
         result = run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
@@ -6032,7 +6116,9 @@ class TestDuplicateIsAWarnedDelivery:
             scanner=_one_page_scanner(),
             paperless=paperless,
             settings=default_settings,
-            request=PipelineRequest(profile_name="default", title="Twice"),
+            request=PipelineRequest(
+                profile_name="default", title="Twice", job_id=_JOB_ID
+            ),
         )
 
         assert result.outcome is ScanOutcome.SUCCESS
@@ -6059,7 +6145,9 @@ class TestDuplicateIsAWarnedDelivery:
             scanner=_one_page_scanner(),
             paperless=paperless,
             settings=default_settings,
-            request=PipelineRequest(profile_name="default", title="Trashed"),
+            request=PipelineRequest(
+                profile_name="default", title="Trashed", job_id=_JOB_ID
+            ),
         )
 
         assert result.outcome is ScanOutcome.SUCCESS
@@ -6077,7 +6165,9 @@ class TestDuplicateIsAWarnedDelivery:
             scanner=_one_page_scanner(),
             paperless=paperless,
             settings=default_settings,
-            request=PipelineRequest(profile_name="default", title="Once"),
+            request=PipelineRequest(
+                profile_name="default", title="Once", job_id=_JOB_ID
+            ),
         )
 
         assert result.outcome is ScanOutcome.SUCCESS
@@ -6303,7 +6393,9 @@ class TestTheDpiTheDeviceActuallyChose:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Clamped"),
+                request=PipelineRequest(
+                    profile_name="default", title="Clamped", job_id=_JOB_ID
+                ),
             )
 
         records = mock_assemble.call_args.args[0]
@@ -6488,6 +6580,7 @@ class TestTheDpiTheDeviceActuallyChose:
                 request=PipelineRequest(
                     profile_name="default",
                     title="Two Dpis",
+                    job_id=_JOB_ID,
                     flip_coordinator=AlwaysContinueFlipCoordinator(),
                 ),
             )
@@ -6532,7 +6625,9 @@ class TestRejectedPagesAreNotBlankPages:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Two Rejected"),
+                request=PipelineRequest(
+                    profile_name="default", title="Two Rejected", job_id=_JOB_ID
+                ),
             )
 
         assert result.pages_removed == 0
@@ -6561,7 +6656,9 @@ class TestRejectedPagesAreNotBlankPages:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="All Clean"),
+                request=PipelineRequest(
+                    profile_name="default", title="All Clean", job_id=_JOB_ID
+                ),
             )
 
         assert result.pages_removed == 0
@@ -6591,7 +6688,9 @@ class TestBatchFactWarnings:
                 scanner=scanner,
                 paperless=paperless,
                 settings=settings,
-                request=PipelineRequest(profile_name="default", title="Facts"),
+                request=PipelineRequest(
+                    profile_name="default", title="Facts", job_id=_JOB_ID
+                ),
             )
 
     def test_a_substitution_through_the_feeder_is_a_warned_done(
@@ -6716,7 +6815,9 @@ class TestBatchFactWarnings:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Capped"),
+                request=PipelineRequest(
+                    profile_name="default", title="Capped", job_id=_JOB_ID
+                ),
             )
 
         text = failure_text(excinfo.value)
@@ -6841,6 +6942,7 @@ class TestManualDuplexPassCap:
             request=PipelineRequest(
                 profile_name="default",
                 title="Capped Duplex",
+                job_id=_JOB_ID,
                 status_callback=events.append,
                 flip_coordinator=coordinator,
             ),
@@ -7111,7 +7213,10 @@ class TestTitleLogEscaping:
             raise RuntimeError(msg)
 
         request = PipelineRequest(
-            profile_name="default", title=title, pass_count_callback=exploding
+            profile_name="default",
+            title=title,
+            job_id=_JOB_ID,
+            pass_count_callback=exploding,
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
@@ -7138,6 +7243,7 @@ class TestTitleLogEscaping:
         return PipelineRequest(
             profile_name="default",
             title=cls.FORGING_TITLE,
+            job_id=_JOB_ID,
             flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
@@ -8312,6 +8418,7 @@ class TestStaleIdsAreDroppedBeforeScanning:
                 request=PipelineRequest(
                     profile_name="default",
                     title="Checked",
+                    job_id=_JOB_ID,
                     tags=[3, 9],
                     correspondent=12,
                     metadata_lookup=lookup,
@@ -8334,7 +8441,7 @@ class TestStaleIdsAreDroppedBeforeScanning:
                 paperless=paperless,
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Stale", tags=[3, 9]
+                    profile_name="default", title="Stale", job_id=_JOB_ID, tags=[3, 9]
                 ),
             )
         finally:
@@ -8366,7 +8473,10 @@ class TestStaleIdsAreDroppedBeforeScanning:
                 paperless=paperless,
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Stale", correspondent=12
+                    profile_name="default",
+                    title="Stale",
+                    job_id=_JOB_ID,
+                    correspondent=12,
                 ),
             )
         finally:
@@ -8391,7 +8501,9 @@ class TestStaleIdsAreDroppedBeforeScanning:
                 scanner=DistinctPageScanner(passes=_SIMPLEX_PASSES),
                 paperless=paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Bare"),
+                request=PipelineRequest(
+                    profile_name="default", title="Bare", job_id=_JOB_ID
+                ),
             )
         finally:
             paperless.close()
@@ -8414,6 +8526,7 @@ class TestStaleIdsAreDroppedBeforeScanning:
                 request=PipelineRequest(
                     profile_name="default",
                     title="Unchecked",
+                    job_id=_JOB_ID,
                     tags=[3, 9],
                     metadata_lookup=lookup,
                 ),

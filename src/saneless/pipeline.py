@@ -607,7 +607,7 @@ class Settled:
         return self._flag
 
 
-@dataclass
+@dataclass(kw_only=True)
 class PipelineRequest:
     """
     Parameters for a scan pipeline run.
@@ -616,19 +616,12 @@ class PipelineRequest:
     :func:`saneless.pdf.build_pdf_filename`, and is what makes two scans of the
     same title two distinct files rather than one overwriting the other. Both
     entry points supply a uuid4: the worker passes ``job.id``, and ``saneless
-    scan`` mints one for the run. The empty default exists only so the dozens
-    of tests that construct a request from a profile name and a title need not
-    invent one, and an empty value simply drops the segment -- which also
-    drops the uniqueness guarantee, so nothing in production may rely on it.
-
-    It is defaulted rather than required, and sits with the other defaulted
-    fields: moving it into the non-default block above would reorder the
-    dataclass and break positional construction.
+    scan`` mints one for the run.
     """
 
     profile_name: str
     title: str
-    job_id: str = ""
+    job_id: str
     tags: list[int] | None = None
     correspondent: int | None = None
     status_callback: Callable[[PipelineEvent], None] | None = None
@@ -658,8 +651,8 @@ class PipelineRequest:
     # of it, so neither kind of wait can be answered with the other's answers.
     pass_coordinator: PassCoordinator | None = None
     # The worker's record of the device its last auto-detection chose, so a
-    # change between jobs is logged.  Defaulted, like every field here, so the
-    # CLI -- one scan per process, nothing to compare with -- passes none.
+    # change between jobs is logged.  Defaulted so the CLI -- one scan per
+    # process, nothing to compare with -- passes none.
     device_memory: DeviceMemory | None = None
     # Set while a failed run's pages are being preserved, and cleared once
     # that is done, so a stopping server can wait for the pages to land in
