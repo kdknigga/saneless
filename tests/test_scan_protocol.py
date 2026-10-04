@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 from PIL import Image
+
 from saneless.scanner.scan_protocol import (
     LENGTH_PREFIX,
     MAX_HEADER_BYTES,
@@ -50,14 +51,14 @@ from saneless.scanner.scan_protocol import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator
 
     from saneless.scanner.scan_protocol import Frame
 
 # A4 at 300 dpi, the page the one-copy bound is measured on.
 _A4_300_DPI = (2480, 3508)
 # Generous enough for every page these tests send.
-_LARGE_CAP = 2 * Image.MAX_IMAGE_PIXELS
+_LARGE_CAP = 1 << 30
 # The cap the off-schema cases run under: a 10x10 page fits, 40x30 does not.
 _SMALL_CAP = 1000
 _ONE_COPY_BOUND = 1.2
@@ -79,7 +80,7 @@ def _stop() -> None:
 
 
 @contextlib.contextmanager
-def _pipe_carrying(*chunks: bytes) -> Iterator[int]:
+def _pipe_carrying(*chunks: bytes) -> Generator[int]:
     """
     Yield the read end of a pipe a helper thread fills with ``chunks``.
 
