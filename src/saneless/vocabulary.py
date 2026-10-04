@@ -359,7 +359,7 @@ class ProfileStorage(StrEnum):
 
     The worker makes exactly one attempt to persist generated profiles when it
     starts, and records the outcome here.  It has to be recorded rather than
-    recomputed because ``_persist_generated_profiles`` returns ``None`` for two
+    recomputed because ``StartupProfiles``'s write result is ``None`` for two
     genuinely different situations -- no config file was loaded at all, and a
     config file was loaded but could not be written -- and the status strip's
     Profiles row must tell a household member which one happened.  One is

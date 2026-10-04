@@ -243,7 +243,7 @@ class TestProfileStorage:
         """
         ProfileStorage names the three outcomes of the startup persist.
 
-        ``_persist_generated_profiles`` returns None for two genuinely
+        ``StartupProfiles``'s write result is None for two genuinely
         different situations -- no config file was loaded, and the file could
         not be written -- and the status strip's Profiles row has to tell them
         apart.  Compared as a set: declaration order is not a contract.

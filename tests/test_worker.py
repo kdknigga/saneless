@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw
 
 from saneless import auto_profiles as auto_profiles_module
 from saneless import preservation as preservation_module
+from saneless import startup_profiles as startup_profiles_module
 from saneless import worker as worker_module
 from saneless.auto_profiles import (
     ProfileWriteResult,
@@ -54,6 +55,7 @@ from saneless.job import (
 from saneless.paperless import ApiDelivery, UploadResult
 from saneless.pipeline import DeviceMemory, PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
+from saneless.startup_profiles import StartupProfiles
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     HIDDEN_PRESERVED_ERROR,
@@ -2782,6 +2784,19 @@ def _worker_records(
     ]
 
 
+def _startup_records(
+    caplog: pytest.LogCaptureFixture, level: int, text: str
+) -> list[logging.LogRecord]:
+    """Return the ``saneless.startup_profiles`` records at ``level`` with ``text``."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "saneless.startup_profiles"
+        and record.levelno == level
+        and text in record.getMessage()
+    ]
+
+
 @pytest.fixture(name="worker_for")
 def _worker_for_fixture(
     mock_scanner: MagicMock,
@@ -5118,7 +5133,7 @@ class TestStartupProfileGeneration:
         """
         A name the write did not persist keeps its loaded profile.
 
-        The worker never forces, so a flagged file profile is skipped as
+        Start-up generation never forces, so a flagged file profile is skipped as
         existing and an unflagged one as not generated; in both cases memory
         must match what a restart loads, not the generated profile.
         """
@@ -5135,7 +5150,9 @@ class TestStartupProfileGeneration:
             skipped_existing=("flatbed",),
         )
 
-        profiles = worker_module._profiles_after_persist(loaded, generated, result)
+        profiles = startup_profiles_module._profiles_after_persist(
+            loaded, generated, result
+        )
 
         assert profiles["default"] == loaded["default"]
         assert profiles["flatbed"] == loaded["flatbed"]
@@ -5150,7 +5167,7 @@ class TestStartupProfileGeneration:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The startup INFO line uses the CLI's group vocabulary."""
-        caplog.set_level(logging.INFO, logger="saneless.worker")
+        caplog.set_level(logging.INFO, logger="saneless.startup_profiles")
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
         config_file.write_text('[profiles.default]\nsource = "Flatbed"\n')
@@ -5161,7 +5178,7 @@ class TestStartupProfileGeneration:
         try:
             worker.start()
             generated = poll_until(
-                lambda: bool(_worker_records(caplog, logging.INFO, "Added: ")),
+                lambda: bool(_startup_records(caplog, logging.INFO, "Added: ")),
                 _STATE_BUDGET,
             )
         finally:
@@ -5169,7 +5186,7 @@ class TestStartupProfileGeneration:
             store.close()
 
         assert generated
-        records = _worker_records(caplog, logging.INFO, "Added: ")
+        records = _startup_records(caplog, logging.INFO, "Added: ")
         assert len(records) == 1
         message = records[0].getMessage()
         assert str(config_file.resolve()) in message
@@ -5191,7 +5208,7 @@ class TestStartupProfileGeneration:
         to any re-derived location -- ``./saneless.toml`` or the XDG path --
         would show up as a new file there.
         """
-        caplog.set_level(logging.INFO, logger="saneless.worker")
+        caplog.set_level(logging.INFO, logger="saneless.startup_profiles")
         self._mock_caps_scanner(mock_scanner)
         home = tmp_path / "home"
         home.mkdir()
@@ -5213,11 +5230,11 @@ class TestStartupProfileGeneration:
 
         assert generated
         assert sorted(tmp_path.rglob("*")) == before
-        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        records = _startup_records(caplog, logging.INFO, "no config file was loaded")
         assert len(records) == 1
         message = records[0].getMessage()
         assert "--config" in message
-        for path in worker_module.config_search_paths():
+        for path in startup_profiles_module.config_search_paths():
             assert str(path) in message
 
     def test_startup_generation_keeps_profiles_when_the_file_is_unwritable(
@@ -5258,7 +5275,9 @@ class TestStartupProfileGeneration:
 
         assert generated
         assert config_file.read_text() == "# read-only\n"
-        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        records = _startup_records(
+            caplog, logging.WARNING, "will not survive a restart"
+        )
         assert len(records) == 1
         message = records[0].getMessage()
         assert str(config_file) in message
@@ -5291,7 +5310,9 @@ class TestStartupProfileGeneration:
 
         assert generated
         assert config_file.read_text() == "profiles = 1\n"
-        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        records = _startup_records(
+            caplog, logging.WARNING, "will not survive a restart"
+        )
         assert len(records) == 1
         message = records[0].getMessage()
         assert str(config_file) in message
@@ -5338,7 +5359,9 @@ class TestStartupProfileGeneration:
         assert generated
         assert in_memory == expected["flatbed"]
         assert config_file.read_text() == "# mounted as a single file\n"
-        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        records = _startup_records(
+            caplog, logging.WARNING, "will not survive a restart"
+        )
         assert len(records) == 1
         assert "ConfigError" in records[0].getMessage()
         assert [path.name for path in tmp_path.iterdir()] == ["saneless.toml"]
@@ -5370,7 +5393,9 @@ class TestStartupProfileGeneration:
 
         assert generated
         assert config_file.read_bytes() == contents
-        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        records = _startup_records(
+            caplog, logging.WARNING, "will not survive a restart"
+        )
         assert len(records) == 1
         message = records[0].getMessage()
         assert "ConfigError" in message
@@ -5403,7 +5428,9 @@ class TestStartupProfileGeneration:
 
         assert generated
         assert config_file.read_bytes() == contents
-        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        records = _startup_records(
+            caplog, logging.WARNING, "will not survive a restart"
+        )
         assert len(records) == 1
         message = records[0].getMessage()
         assert "ConfigError" in message
@@ -5431,7 +5458,7 @@ class TestStartupProfileGeneration:
             raise TypeError(msg)
 
         monkeypatch.setattr(
-            "saneless.worker.write_profiles_to_config", _raise_unexpected
+            "saneless.startup_profiles.write_profiles_to_config", _raise_unexpected
         )
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
@@ -5454,7 +5481,9 @@ class TestStartupProfileGeneration:
         assert generated
         assert alive
         assert config_file.read_bytes() == contents
-        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        records = _startup_records(
+            caplog, logging.WARNING, "will not survive a restart"
+        )
         assert len(records) == 1
         assert exception_name in records[0].getMessage()
         assert not _worker_records(
@@ -5481,7 +5510,7 @@ class TestStartupProfileGeneration:
         try:
             worker.start()
             warned = poll_until(
-                lambda: bool(_worker_records(caplog, logging.WARNING, "ScanError")),
+                lambda: bool(_startup_records(caplog, logging.WARNING, "ScanError")),
                 _STATE_BUDGET,
             )
             names = worker.profile_names()
@@ -5512,7 +5541,7 @@ class TestStartupProfileGeneration:
             worker.start()
             warned = poll_until(
                 lambda: bool(
-                    _worker_records(caplog, logging.WARNING, "no scanners found")
+                    _startup_records(caplog, logging.WARNING, "no scanners found")
                 ),
                 _STATE_BUDGET,
             )
@@ -5659,51 +5688,45 @@ class TestStartupProfileGeneration:
 
 class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
     """
-    The worker's "no config file was loaded" line agrees with what the search found.
+    The start-up "no config file was loaded" line agrees with what the search found.
 
     The startup log, the Configuration row, ``doctor``'s table and the
     one-shot warning all describe the same search.  When it found only a
     stale file, this line names that file and the rename it needs --
     ``config.toml`` to ``saneless.toml`` -- rather than only saying to create one.
 
-    It is exercised through ``_persist_generated_profiles`` directly rather
-    than through a started worker, because the branch is reached before
+    It is exercised through ``StartupProfiles``'s persist step directly
+    rather than through a started worker, because the branch is reached before
     anything is written and starting a worker would only add timing.
     """
 
     @staticmethod
-    def _persist(
-        settings: Settings, scanner: MagicMock, paperless: MagicMock
-    ) -> ProfileWriteResult | None:
+    def _persist(settings: Settings, scanner: MagicMock) -> ProfileWriteResult | None:
         """
         Run the persist step over settings that loaded no file.
 
         Args:
-            settings: The settings the worker runs on.
-            scanner: The scanner the worker is built over.
-            paperless: The Paperless client the worker is built over.
+            settings: The settings the profiles are generated for.
+            scanner: The scanner the collaborator is built over.
 
         Returns:
             Whatever the persist step reported, which should be None.
 
         """
-        store = JobStore()
-        worker = ScanWorker(scanner, paperless, settings, store)
-        try:
-            return worker._persist_generated_profiles({"default": ProfileConfig()})
-        finally:
-            store.close()
+        startup = StartupProfiles(settings, scanner, threading.Lock())
+        result, storage = startup._persist({"default": ProfileConfig()})
+        assert storage is ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
+        return result
 
     def test_a_stale_only_search_names_the_ignored_file_and_the_new_name(
         self,
         mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A stale-only search names the ignored file and the name to rename it to."""
-        caplog.set_level(logging.INFO, logger="saneless.worker")
+        caplog.set_level(logging.INFO, logger="saneless.startup_profiles")
         directory = tmp_path / "etc"
         directory.mkdir()
         stale = directory / LEGACY_CONFIG_FILENAME
@@ -5712,9 +5735,9 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
             (directory / CONFIG_FILENAME,)
         )
 
-        assert self._persist(default_settings, mock_scanner, mock_paperless) is None
+        assert self._persist(default_settings, mock_scanner) is None
 
-        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        records = _startup_records(caplog, logging.INFO, "no config file was loaded")
         assert len(records) == 1
         message = records[0].getMessage()
         assert str(stale.absolute()) in message
@@ -5723,13 +5746,12 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
     def test_a_search_that_found_nothing_lists_what_it_looked_at(
         self,
         mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """With nothing stale, the message lists every path searched and no rename."""
-        caplog.set_level(logging.INFO, logger="saneless.worker")
+        caplog.set_level(logging.INFO, logger="saneless.startup_profiles")
         candidates = tuple(
             tmp_path / name / CONFIG_FILENAME for name in ("cwd", "xdg", "etc")
         )
@@ -5737,9 +5759,9 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
             candidate.parent.mkdir()
         default_settings._config_discovery = discover_config(candidates)
 
-        assert self._persist(default_settings, mock_scanner, mock_paperless) is None
+        assert self._persist(default_settings, mock_scanner) is None
 
-        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        records = _startup_records(caplog, logging.INFO, "no config file was loaded")
         assert len(records) == 1
         message = records[0].getMessage()
         for candidate in candidates:
@@ -5749,13 +5771,12 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
     def test_a_search_from_a_deleted_working_directory_lists_it_as_spelled(
         self,
         mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A candidate with no directory to anchor it is named, not made absolute."""
-        caplog.set_level(logging.INFO, logger="saneless.worker")
+        caplog.set_level(logging.INFO, logger="saneless.startup_profiles")
         later = tmp_path / "etc" / CONFIG_FILENAME
         later.parent.mkdir()
         gone = tmp_path / "gone"
@@ -5767,18 +5788,17 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
                 (Path(CONFIG_FILENAME), later)
             )
 
-            persisted = self._persist(default_settings, mock_scanner, mock_paperless)
+            persisted = self._persist(default_settings, mock_scanner)
 
         assert persisted is None
 
-        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        records = _startup_records(caplog, logging.INFO, "no config file was loaded")
         assert len(records) == 1
         assert f"create one of {CONFIG_FILENAME}, {later}" in records[0].getMessage()
 
     def test_neither_message_writes_a_file(
         self,
         mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -5800,7 +5820,7 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
             (directory / CONFIG_FILENAME,)
         )
 
-        assert self._persist(default_settings, mock_scanner, mock_paperless) is None
+        assert self._persist(default_settings, mock_scanner) is None
 
         assert stale.read_text() == "# left behind\n"
         assert not (directory / CONFIG_FILENAME).exists()
@@ -7259,7 +7279,7 @@ class TestScannerGate:
         """
         Startup generation enters SANE twice, so it is gated too.
 
-        ``_read_generated_profiles`` calls ``get_devices`` and then
+        ``StartupProfiles`` calls ``get_devices`` and then
         ``get_capabilities``; on the ``net`` backend the first is an RPC and
         the second opens the device.  A refresher probe landing in that window
         would be a second RPC on the control wire the read is using.
@@ -7809,7 +7829,7 @@ class TestProfileStorage:
     """
     ``ScanWorker.profile_storage`` records what the startup persist did.
 
-    ``_persist_generated_profiles`` returns ``None`` for two genuinely
+    ``StartupProfiles``'s write result is ``None`` for two genuinely
     different situations -- no config file was loaded at all, and one was
     loaded and could not be written.  The Profiles row has to tell a
     household member which happened, and a fresh ``os.access()`` probe at
@@ -7935,7 +7955,9 @@ class TestProfileStorage:
             """
             raise OSError(errno.EACCES, os.strerror(errno.EACCES))
 
-        monkeypatch.setattr(worker_module, "write_profiles_to_config", refusing)
+        monkeypatch.setattr(
+            startup_profiles_module, "write_profiles_to_config", refusing
+        )
 
         store = JobStore()
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -7982,7 +8004,9 @@ class TestProfileStorage:
             msg = "tomlkit refused the container"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(worker_module, "write_profiles_to_config", exploding)
+        monkeypatch.setattr(
+            startup_profiles_module, "write_profiles_to_config", exploding
+        )
 
         store = JobStore()
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -8029,7 +8053,7 @@ class TestProfileStorage:
         Profiles loaded from a file that skip generation are reported persisted.
 
         An operator with a real config file holding profiles that are not the
-        bare default never reaches the write -- ``_generate_startup_profiles``
+        bare default never reaches the write -- ``StartupProfiles.run``
         returns at ``if not bare`` -- yet the profiles are on disk.  This is the
         deployment shape the compose file ships, so a "no config file" answer
         here would be wrong for the life of the process.
@@ -8089,7 +8113,7 @@ class TestProfileStorage:
         A SANE failure leaves the loaded profiles exactly where they were.
 
         The autouse fixture answers ``get_devices`` with ``[]``, so
-        ``_read_generated_profiles`` returns ``None`` and generation gives up.
+        ``StartupProfiles`` reads no profiles and generation gives up.
         Nothing was written, but nothing moved either: the bare default came out
         of the config file and is still in it.
         """

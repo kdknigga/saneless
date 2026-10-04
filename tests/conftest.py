@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw
 from saneless import cli as cli_mod
 from saneless import config as config_mod
 from saneless import logging_config
-from saneless import worker as worker_mod
+from saneless import startup_profiles as startup_profiles_mod
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -967,7 +967,7 @@ def hermetic_env(
         working, user, _ = real_config_search_paths()
         return working, user, system_config
 
-    for module in (config_mod, cli_mod, worker_mod):
+    for module in (config_mod, cli_mod, startup_profiles_mod):
         monkeypatch.setattr(
             module, "config_search_paths", search_paths_without_the_system_file
         )
