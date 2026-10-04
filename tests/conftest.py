@@ -1045,7 +1045,7 @@ class ScanChildSeam:
 @pytest.fixture(autouse=True)
 def scan_child_seam(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
-) -> ScanChildSeam:
+) -> Iterator[ScanChildSeam]:
     """
     Run every scan child in this process, over the patched fake module.
 
@@ -1070,17 +1070,25 @@ def scan_child_seam(
     Tests marked ``sane_hardware`` exist to drive real libsane, and are left
     alone.
 
+    Every child the seam started must have ended by the end of the test, as
+    a real one must be reaped before the scanner gate is released: one still
+    running fails the test, after it is ended and its pipes are closed.
+
     Args:
         monkeypatch: Undoes the replacement after the test.
         request: The test's request, to read its markers.
 
-    Returns:
+    Yields:
         The record of every scan child the seam started.
+
+    Raises:
+        AssertionError: A child was still running when the test ended.
 
     """
     seam = ScanChildSeam()
     if request.node.get_closest_marker("sane_hardware") is not None:
-        return seam
+        yield seam
+        return
 
     def launch_in_process(configured_host: str) -> ChildProcess:
         seam.launches.append(configured_host)
@@ -1099,7 +1107,15 @@ def scan_child_seam(
     monkeypatch.setattr(
         sane_backend_mod, "_launch_scan_child", launch_in_process, raising=False
     )
-    return seam
+    yield seam
+    unreaped = [child for child in seam.children if child.poll() is None]
+    for child in seam.children:
+        if child in unreaped:
+            child.kill_and_reap()
+        child.close()
+    if unreaped:
+        msg = f"{len(unreaped)} scan child(ren) left running by the test"
+        raise AssertionError(msg)
 
 
 @pytest.fixture
