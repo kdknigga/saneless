@@ -53,6 +53,8 @@ The first release, 0.2.0.
 
 - `saneless.Settings` is no longer re-exported from the package, so importing
   `saneless` does not load the settings stack; import it from `saneless.config`.
+- `saneless.web` no longer re-exports `create_app`; import it from
+  `saneless.web.app`.
 
 ### Security
 
