@@ -4,12 +4,13 @@ A dead peer never kills saneless with SIGPIPE.
 libsane puts SIGPIPE back to its default action, behind Python's back, whenever
 a read ends with an error status, the end of every feeder batch included, and a
 write to a socket whose peer has gone would then end the process with no
-traceback.  saneless blocks the signal at startup, so such a write raises
-``BrokenPipeError``; the libsane test runs in a child started through
-``saneless.main()``, so the startup path is the real one and pytest is never left
-with SIGPIPE re-armed.  A blocked mask is inherited across fork and exec, so the
-listing test blocks SIGPIPE first, as a launching thread in saneless has it, and
-checks that the listing child starts with it unblocked.
+traceback.  saneless makes no libsane call itself: every scan runs in a scan
+child.  The libsane test runs a process that blocks SIGPIPE as saneless does,
+scans through a real scan child whose read fails, and then writes to a closed
+peer; it must get ``BrokenPipeError`` and must never have loaded python-sane.
+A blocked mask is inherited across fork and exec, so the listing and scan
+child tests block SIGPIPE first, as a launching thread in saneless has it, and
+check that the child starts with it unblocked.
 """
 
 from __future__ import annotations
@@ -22,9 +23,13 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from saneless.exceptions import ListingNoAnswerError
-from saneless.scanner import listing
+from saneless.exceptions import ListingNoAnswerError, ScanError
+from saneless.pipeline import _SPOOL_LABEL_A
+from saneless.scanner import listing, scan_child
+from saneless.scanner.base import ScanSettings
 from saneless.scanner.listing import ListingRequest
+from saneless.scanner.scan_child import ScanChildSession
+from saneless.spool import SpooledPageSink
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -32,63 +37,48 @@ if TYPE_CHECKING:
 _CHILD_TIMEOUT_SECONDS: Final = 30
 _SIGPIPE_BIT: Final = 1 << (signal.SIGPIPE - 1)
 
-# Runs a scan through real libsane that ends with the parametrised error
-# status, then writes to a socket whose peer is closed.  The probe stands in
-# for the CLI, so the process goes through saneless.main()'s real startup.
+# Blocks SIGPIPE as saneless does, runs one flatbed pass through a real scan
+# child whose read ends with the parametrised error status, then writes to a
+# socket whose peer is closed.  It reports that the read failed, how many
+# children had to be killed, whether python-sane was ever imported in this
+# process, and what the write did.
 _LIBSANE_PROBE: Final = """\
 import os
 import socket
+import sys
 
-import saneless
-import saneless.cli
+from saneless.sigpipe import block_sigpipe
 
-STATUS = os.environ["SANELESS_TEST_STATUS"]
+block_sigpipe()
 
+from saneless.exceptions import ScanError
+from saneless.pipeline import _SPOOL_LABEL_A
+from saneless.scanner import scan_child
+from saneless.scanner.base import ScanSettings
+from saneless.scanner.scan_child import ScanChildSession
+from saneless.spool import SpooledPageSink
+from saneless.spool import SpooledPageSink
 
-def _sigpipe_ignored():
-    with open("/proc/self/status", encoding="ascii") as status:
-        for line in status:
-            if line.startswith("SigIgn:"):
-                return bool(int(line.split()[1], 16) & (1 << 12))
-    raise RuntimeError("no SigIgn line")
-
-
-def probe():
-    import sane
-
-    from saneless.scanner import scan_session
-
-    sane.init()
-    device = sane.open("test:0")
-    try:
-        device.source = "Flatbed"
-        device.read_return_value = STATUS
-        # Read and cancel the way saneless does: the cancel waits for the
-        # backend's reader thread to end, so it cannot kill it holding a lock.
-        before = scan_session._native_thread_ids()
-        device.start()
-        try:
-            device.snap(no_cancel=True)
-        except Exception:  # the test backend's read error is the point
-            pass
-        scan_session._await_backend_threads(before)
-        device.cancel()
-        if not _sigpipe_ignored():
-            print("sigpipe-default", flush=True)
-    finally:
-        device.close()
-    a, b = socket.socketpair()
-    b.close()
-    try:
-        a.sendall(b"x")
-    except BrokenPipeError:
-        print("broken-pipe", flush=True)
-    finally:
-        a.close()
-
-
-saneless.cli.cli = probe
-saneless.main()
+sink = SpooledPageSink(os.environ["SANELESS_TEST_SPOOL"], _SPOOL_LABEL_A, 0)
+settings = ScanSettings(source="Flatbed", resolution=50, mode="Gray")
+session = ScanChildSession(lambda: scan_child.start_scan_child(""))
+try:
+    session.scan_pass("test:0", settings, sink)
+except ScanError:
+    print("read-failed", flush=True)
+finally:
+    session.close()
+print(f"children-killed {session.children_killed}", flush=True)
+if "sane" not in sys.modules:
+    print("no-sane", flush=True)
+a, b = socket.socketpair()
+b.close()
+try:
+    a.sendall(b"x")
+except BrokenPipeError:
+    print("broken-pipe", flush=True)
+finally:
+    a.close()
 """
 
 # A stand-in listing child that records its own blocked-signal mask in the
@@ -107,31 +97,54 @@ with open({record!r}, "w", encoding="ascii") as record:
 """
 
 
+# A stand-in scan child that records its own blocked-signal mask in the file
+# named by the format field, then exits without a frame.  saneless sends a
+# scan child nothing before it says ready, so it reads no command first.
+_SCAN_MASK_RECORDING_CHILD: Final = """\
+with open("/proc/self/status", encoding="ascii") as status:
+    for line in status:
+        if line.startswith("SigBlk:"):
+            mask = line.split()[1]
+            break
+with open({record!r}, "w", encoding="ascii") as record:
+    record.write(mask)
+"""
+
+
 @pytest.mark.sane_hardware
-@pytest.mark.usefixtures("sane_test_backend_config")
 @pytest.mark.parametrize(
     "status",
     ["SANE_STATUS_NO_DOCS", "SANE_STATUS_CANCELLED"],
     ids=["NO_DOCS", "CANCELLED"],
 )
 def test_a_failed_libsane_read_cannot_let_a_dead_peer_kill_saneless(
-    status: str,
+    status: str, tmp_path: Path
 ) -> None:
     """
-    A write to a closed peer after a failed read raises, not kills.
+    A write to a closed peer after a failed read in a scan child raises.
 
-    The child first confirms libsane really did put SIGPIPE back to its
-    default action, so the test cannot pass because libsane stopped doing so.
+    The read really fails in the child, the probe never loads python-sane
+    itself, and its write to a dead peer gets ``BrokenPipeError``.
 
     Args:
         status: The status the test backend ends its read with.
+        tmp_path: Holds the SANE configuration and the spool.
 
     """
+    config = tmp_path / "sane.d"
+    config.mkdir()
+    (config / "dll.conf").write_text("test\n", encoding="ascii")
+    (config / "test.conf").write_text(
+        f'read-status-code "{status}"\n', encoding="ascii"
+    )
+    spool = tmp_path / "spool"
+    spool.mkdir()
     result = subprocess.run(
-        [sys.executable, "-c", _LIBSANE_PROBE],
+        [sys.executable, "-I", "-c", _LIBSANE_PROBE],
         env={
             **os.environ,
-            "SANELESS_TEST_STATUS": status,
+            "SANE_CONFIG_DIR": str(config),
+            "SANELESS_TEST_SPOOL": str(spool),
         },
         capture_output=True,
         text=True,
@@ -143,8 +156,11 @@ def test_a_failed_libsane_read_cannot_let_a_dead_peer_kill_saneless(
     assert result.returncode == 0, (
         f"child returncode {result.returncode}, stderr: {result.stderr!r}"
     )
-    assert "sigpipe-default" in result.stdout, result.stdout
-    assert "broken-pipe" in result.stdout, result.stdout
+    lines = result.stdout.splitlines()
+    assert "read-failed" in lines, result.stdout
+    assert "children-killed 0" in lines, result.stdout
+    assert "no-sane" in lines, result.stdout
+    assert "broken-pipe" in lines, result.stdout
 
 
 def test_the_listing_child_does_not_inherit_a_blocked_sigpipe(
@@ -168,6 +184,44 @@ def test_the_listing_child_does_not_inherit_a_blocked_sigpipe(
     try:
         with pytest.raises(ListingNoAnswerError):
             listing.run_listing_child(ListingRequest(), configured_host="")
+        still_blocked = signal.SIGPIPE in signal.pthread_sigmask(
+            signal.SIG_BLOCK, set()
+        )
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+    child_mask = int(record.read_text(encoding="ascii"), 16)
+    assert not child_mask & _SIGPIPE_BIT, f"child SigBlk {child_mask:#x}"
+    assert still_blocked
+
+
+def test_the_scan_child_does_not_inherit_a_blocked_sigpipe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The scan child starts with SIGPIPE unblocked, and the caller keeps it.
+
+    Args:
+        monkeypatch: Points the launcher at the stand-in child.
+        tmp_path: Holds the stand-in child and the mask it records.
+
+    """
+    record = tmp_path / "sigblk"
+    child = tmp_path / "scan_mask_recording_child.py"
+    child.write_text(
+        _SCAN_MASK_RECORDING_CHILD.format(record=str(record)), encoding="utf-8"
+    )
+    monkeypatch.setattr(scan_child, "_CHILD_FILE", child)
+    settings = ScanSettings(source="Flatbed", resolution=50, mode="Gray")
+    sink = SpooledPageSink(tmp_path, _SPOOL_LABEL_A, 0)
+    session = ScanChildSession(lambda: scan_child.start_scan_child(""))
+
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGPIPE})
+    try:
+        with pytest.raises(ScanError):
+            session.scan_pass("test:0", settings, sink)
+        session.close()
         still_blocked = signal.SIGPIPE in signal.pthread_sigmask(
             signal.SIG_BLOCK, set()
         )
