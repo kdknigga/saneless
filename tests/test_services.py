@@ -9,6 +9,7 @@ does not exist.
 from __future__ import annotations
 
 import dataclasses
+import operator
 from typing import TYPE_CHECKING
 
 import pytest
@@ -77,6 +78,43 @@ def test_services_fields_are_fixed_but_the_lifecycle_flag_moves(
         assert found.lifecycle.started is False
         found.lifecycle.started = True
         assert services(_request_for(app)).lifecycle.started is True
+    finally:
+        app.state.services.job_store.close()
+        app.state.services.paperless.close()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "worker",
+        "job_store",
+        "settings",
+        "paperless",
+        "cache",
+        "checks",
+        "refresher",
+        "templates",
+        "invalidate_floors",
+        "paperless_test_result",
+        "status_token_key",
+        "scan_blocked",
+        "lifespan_started",
+    ],
+)
+def test_collaborators_are_not_also_kept_under_their_own_names(
+    default_settings: Settings, name: str
+) -> None:
+    """
+    The app state holds no collaborator beside ``services``.
+
+    A second copy under its own name would let a reader that missed the
+    typed path keep working against an object a test had swapped out of
+    ``services``; with no copy, such a reader fails at once.
+    """
+    app = create_app(default_settings, StubScannerBackend())
+    try:
+        with pytest.raises(AttributeError):
+            operator.attrgetter(f"state.{name}")(app)
     finally:
         app.state.services.job_store.close()
         app.state.services.paperless.close()
