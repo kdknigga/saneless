@@ -1,17 +1,18 @@
 """
 Keep SIGPIPE blocked, so a write to a vanished peer raises instead of killing.
 
-libsane puts SIGPIPE back to its default action, at the C level, after a scan
-read that ends with an error status -- as the end of every feeder batch does
--- while ``signal.getsignal`` still reports ``SIG_IGN``.  From then on a write
-to a peer that has gone, such as a paperless upload or a web client that hung
-up, would end the whole process silently.  A blocked SIGPIPE stays pending
-instead, and the write fails with EPIPE, raised as ``BrokenPipeError``.
+Python ignores SIGPIPE, but a C library can put it back to its default action
+at the C level while ``signal.getsignal`` still reports ``SIG_IGN``, as libsane
+does after a scan read that ends with an error status.  A write to a peer that
+has gone, such as a paperless upload or a web client that hung up, would then
+end the whole process silently.  A blocked SIGPIPE stays pending whatever the
+disposition, and the write fails with EPIPE, raised as ``BrokenPipeError``.
 
 The blocked mask belongs to a thread and is copied to every thread it starts,
 so it is set once in the main thread, before any other thread exists.  It also
 survives fork and exec, and ``subprocess`` resets only the disposition, not
-the mask, so a launch is wrapped in ``sigpipe_unblocked``.
+the mask, so every child is launched inside ``sigpipe_unblocked`` and starts
+with SIGPIPE unblocked.
 """
 
 from __future__ import annotations

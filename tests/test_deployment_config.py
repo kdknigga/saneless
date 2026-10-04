@@ -1350,9 +1350,9 @@ PAGE_TIMEOUT_FLOOR = f"{page_budget._PAGE_TIMEOUT_FLOOR_SECONDS:g}"
 # Substrings rather than whole sentences, deliberately: rewording the page for
 # clarity should not fail this test, but dropping a guarantee should. Each entry
 # is one thing an operator decides on -- how much RAM a long scan needs, what
-# `min_free_space_mb` is for, whether a hung scanner can be waited out or has to
-# be restarted -- so an assertion firing here means the page stopped answering a
-# question someone actually asks it.
+# `min_free_space_mb` is for, how long a hung scanner can hold a scan and
+# whether saneless must be restarted after one -- so an assertion firing here
+# means the page stopped answering a question someone actually asks it.
 ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "roughly one decoded page is held in memory while scanning",
@@ -1376,30 +1376,29 @@ ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("cancel", "before closing"),
     ),
     (
-        "a read that never returns does not block shutdown",
-        ("daemon", "docker stop"),
+        "a scanner that stops answering does not hold saneless open",
+        ("freezes nothing", "docker stop"),
     ),
     (
-        "a wedged scanner refuses the next scan and asks for a restart",
-        ("refused", "restart saneless"),
+        "after a kill the next scan starts a fresh child, with no restart",
+        ("fresh child", "No restart is needed"),
     ),
     (
-        "only page reads and the cancel after a timeout run under a bound",
-        ("page reads", "under a bound"),
+        "every scanner call runs in the scan's child under a deadline saneless keeps",
+        ("Every scanner call", "child process", "deadline saneless keeps"),
     ),
     (
-        "opening the device, setting options and closing it run on the job's "
-        "thread without a bound",
-        ("opening the device", "without a bound"),
+        "opening the device, setting options and closing it get 30 seconds each",
+        ("opening the device", "30 seconds each"),
     ),
     (
-        "reading the scan parameters runs without a bound",
+        "reading the scan parameters runs under a deadline too",
         ("scan parameters",),
     ),
     (
-        "python-sane holds the GIL during those calls, so a hung one freezes the "
-        "whole process and cannot be abandoned",
-        ("global interpreter lock", "/health", "cannot be abandoned"),
+        "a cancel ends the scanner's use within the ten-second grace plus reaping, "
+        "on every backend",
+        ("ten-second grace", "reap", "every backend", "hp3500"),
     ),
     (
         "listing scanners runs in a separate process with its own deadline",

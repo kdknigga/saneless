@@ -111,7 +111,9 @@ What the common cases mean:
     A dropped network link mid-page is one cause, but not the only one: a slow USB or Wi-Fi link,
   or a high resolution the scanner is slow to deliver, can reach the limit too. Check the link
   first; if pages at a high resolution keep timing out, lower the profile's `resolution`. Any
-  sheets scanned before it are preserved as above.
+  sheets scanned before it are preserved as above. When the scanner did not answer the cancel
+  either, the line ends `; the scanner did not answer the cancel either, so saneless stopped it`:
+  saneless stopped the scan's process after ten seconds, as below.
 - **The scanner has no source named the one in the profile.** The line names the profile's
   source and every source the scanner offers, for example:
 
@@ -132,18 +134,21 @@ What the common cases mean:
   the profile.` saneless sets the scanner to 8 bits per sample wherever the scanner allows it,
   so this appears only when the profile's `mode` can be scanned at 16 bits alone. The scan is
   refused before any page. Set the profile's `mode` to an 8-bit one.
-- **saneless says to restart it.** After a page times out, saneless cancels the read and waits for
-  the scanner to acknowledge. When it never does, the device cannot be reused safely, so the next
-  scan is refused before saneless touches the scanner at all, with a line ending:
+- **The scanner stopped answering; saneless stopped it.** Every scan runs in a process of its
+  own, and saneless gives each step other than a page's read 30 seconds: starting the scanner
+  library, opening the scanner, setting up the scan, closing it, restarting the library between
+  passes, and finishing. A step that runs past that ends the process at once, and the line names
+  the step, for example:
 
     ```
-    The scan will be possible again as soon as the scanner releases it. Restart saneless if it does not.
+    The scanner stopped answering while opening the scanner; saneless stopped it
     ```
 
-    That wording is literal. A hang that clears itself -- a network scanner that comes back, a
-    driver that finally returns -- releases the device on its own and the next scan works with no
-    restart. If the message keeps appearing, check the link to the scanner first, because the read
-    cannot return while that is down, and then restart saneless.
+    The pages scanned before it are preserved as above. Nothing else needs doing before the next
+  scan: it starts a fresh process with a fresh connection to the scanner, and fails the same way
+  if the scanner is still not answering. Check the link to the scanner first -- a network scanner
+  that went away, a `saned` host that restarted or stopped, a USB cable -- then power-cycle the
+  scanner if it keeps happening at the same step.
 
 To check that saneless can see the scanner at all, run:
 

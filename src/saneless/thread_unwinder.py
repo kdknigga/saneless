@@ -1,5 +1,5 @@
 """
-Load the C library's thread unwinder once, at startup, on a throwaway thread.
+Load the C library's thread unwinder in a scanner-library child, on a throwaway thread.
 
 glibc ``dlopen``s the unwinder (``libgcc_s``) the first time a thread ends
 through ``pthread_exit`` or is cancelled, holding the dynamic loader's lock.
@@ -8,8 +8,9 @@ Some SANE backends stop their reader thread with an *asynchronous*
 kill it inside the ``dlopen`` with the lock held, and the process hangs the
 next time anything loads a library, or at exit.
 
-Ending one thread of our own before any backend runs makes glibc load and keep
-the unwinder there and then.  The thread is made through the C library
+Each child process that loads python-sane calls this at its start, before
+python-sane is imported.  Ending one thread of our own before any backend runs
+makes glibc load and keep the unwinder there and then.  The thread is made through the C library
 directly, because a Python thread returns from its start routine instead of
 calling ``pthread_exit`` and would load nothing.  Other C libraries load no
 unwinder at thread exit, so this is a no-op anywhere but glibc on Linux.
@@ -48,7 +49,7 @@ def load_thread_unwinder() -> None:
     """
     End one native thread through ``pthread_exit``, so glibc loads its unwinder.
 
-    Called from the main thread at startup, before SANE is initialised.
+    Called from a scanner-library child's main thread, before python-sane loads.
     Safe to call more than once. A failure is logged at debug level and
     otherwise ignored: the process works without it, with the hang left
     possible.

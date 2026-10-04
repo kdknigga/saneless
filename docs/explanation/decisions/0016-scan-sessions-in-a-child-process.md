@@ -21,7 +21,7 @@ The invariant: no libsane call is made in the saneless process, and a scan's chi
 ## Consequences
 
 - A cancel or a server stop ends the scanner's use within the 10 s grace plus reaping on every backend, the asynchronous-cancel ones and snapscan and plustek included, because the kill does not depend on what the backend does.
-- A child that stops answering is reported as "The scanner stopped answering while reading page 3; saneless stopped it", through the ordinary scan error, and the pages already received are kept as after a page timeout. The next job starts a fresh child; there is no state that refuses later scans.
+- A child that overruns a stage is reported through the ordinary scan error, naming the stage, for example "The scanner stopped answering while opening the scanner; saneless stopped it"; a page past its budget gets the page timeout's own line. The pages already received are kept as after any page timeout. The next job starts a fresh child; there is no state that refuses later scans.
 - A crash in libsane while scanning fails the job, not the server.
 - Each job pays a child start of 54 to 61 ms before its first page, most of it the interpreter, the standard library and Pillow.
 - Throughput on a 50-page feeder scan of the SANE test backend, A4 at 300 dpi, median of three runs: Color takes 10.26 s against 9.305 s in-process (1.103 times as long), Gray 2.60 s against 2.345 s (1.109 times). The extra time per page is the pixels' copy into strips and through the pipe, and, for Color, Pillow's own unpack of RGB into its four-byte pixels when the page is wrapped.

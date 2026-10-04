@@ -227,14 +227,16 @@ sends SIGTERM, waits for the container's grace period, and then kills it.
 What a stop keeps depends on where the scan is. A manual duplex job waiting
 at the flip prompt is interrupted at once and keeps its front sides as a
 `(fronts)` PDF in `failed/`, and the job records that the server restarted and
-names the file. One still in pass A does the same when pass A finishes, if
-that is within 5 seconds of the stop. saneless waits up to 5 seconds for the
-scan worker to finish, and up to 60 seconds more only while it is writing
-pages into `failed/`.
+names the file. A scan still reading pages -- pass A, pass B or a
+single-pass scan -- is stopped too: saneless asks the scanner's process to
+cancel, kills it if it has not ended within 10 seconds, and keeps the pages
+already received in `failed/`. saneless waits up to 5 seconds for the scan
+worker to finish, up to 12 seconds more while a scan's process is being
+stopped, and up to 60 seconds more only while it is writing pages into
+`failed/`.
 
-A scan busy with anything else when those 5 seconds run out -- pass A still
-feeding, pass B, a single-pass scan, assembly or the upload -- is not
-interrupted. saneless exits under it, and its pages stay in the container's
+A job busy with anything else when those waits run out -- assembly or the
+upload -- is not interrupted. saneless exits under it, and its pages stay in the container's
 `/tmp`. The next start of the same container, after `docker compose restart`
 or `docker compose stop` and `start`, recovers them into `failed/`, but
 `docker compose up -d` recreates the container and they are lost. Let a scan
