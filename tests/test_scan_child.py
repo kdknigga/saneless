@@ -1088,6 +1088,33 @@ def test_the_childs_log_lines_are_logged_under_their_own_logger(
     assert forwarded == [("saneless.scanner.scan_session", logging.WARNING)]
 
 
+def test_a_childs_log_line_cannot_choose_a_logger_or_forge_a_record(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A logger the child's code does not use is not created here.
+
+    The record goes under this module's logger instead, its control
+    characters escaped and its later lines indented, so it cannot pass for a
+    record of saneless's own.
+    """
+    caplog.set_level(logging.DEBUG)
+    invented = "saneless.invented.by.the.child"
+
+    scan_child_mod._emit(
+        scan_protocol.LogLine(
+            level=logging.WARNING,
+            logger=invented,
+            message="first\nERROR saneless: forged\x1b[31m",
+        )
+    )
+
+    assert invented not in logging.Logger.manager.loggerDict
+    assert [(record.name, record.getMessage()) for record in caplog.records] == [
+        (_LOGGER, "first\n    ERROR saneless: forged\\x1b[31m")
+    ]
+
+
 def test_a_child_that_cannot_be_started_is_a_scan_error(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

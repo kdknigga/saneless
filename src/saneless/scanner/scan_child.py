@@ -52,6 +52,7 @@ from saneless.exceptions import (
 from saneless.scanner import child_launch, page_budget
 from saneless.scanner.base import PassCapReached, ScanBatch
 from saneless.scanner.scan_protocol import (
+    CHILD_LOGGERS,
     REPLY_PIPE_BYTES,
     ChildFailure,
     ChildGoneError,
@@ -328,9 +329,24 @@ _OUTCOMES: Final = (
 )
 
 
+# Each line after a record's first, such as a traceback's, is indented by
+# this, so no text from the child can pass for a log record of its own.
+_CONTINUATION: Final = "\n    "
+
+
 def _emit(line: LogLine) -> None:
-    """Log one of the child's records under its own logger and level."""
-    logging.getLogger(line.logger).log(line.level, "%s", line.message)
+    """
+    Log one of the child's records at its level, with its text made safe.
+
+    A logger the child's code uses keeps its name; any other is logged under
+    this module's, so a child never makes saneless create a logger.  Control
+    characters are escaped, and each later line is indented.
+    """
+    name = line.logger if line.logger in CHILD_LOGGERS else __name__
+    text = _CONTINUATION.join(
+        neutralise_controls(part) for part in line.message.split("\n")
+    )
+    logging.getLogger(name).log(line.level, "%s", text)
 
 
 class ScanChildSession:

@@ -33,6 +33,7 @@ from saneless.exceptions import ScanError
 from saneless.scanner import page_budget, scan_child
 from saneless.scanner.base import PassCapReached, ScanSettings
 from saneless.scanner.scan_protocol import (
+    CHILD_LOGGERS,
     Bye,
     ChildFailure,
     Configured,
@@ -888,6 +889,38 @@ def test_loading_the_child_imports_no_sane_and_no_ctypes() -> None:
     )
 
     assert output == "[]"
+
+
+def test_every_logger_the_child_creates_keeps_its_name_in_saneless() -> None:
+    """
+    The loggers the child's code creates are all ones saneless logs under.
+
+    saneless emits any other name under one fixed logger; a module the child
+    loads that logs under a new name would otherwise lose its name there.
+    """
+    output = _run_isolated(
+        """
+        import importlib.util
+        import logging
+        import os
+        import sys
+
+        spec = importlib.util.spec_from_file_location(
+            "scan_child_probe", os.environ["SANELESS_TEST_MODULE"]
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        import saneless.thread_unwinder
+
+        names = logging.Logger.manager.loggerDict
+        print(" ".join(sorted(name for name in names if name.startswith("saneless"))))
+        """
+    )
+
+    created = set(output.split())
+    assert "saneless.scanner.scan_session" in created
+    assert created <= CHILD_LOGGERS
 
 
 def test_the_child_alarms_outlast_the_parents_deadlines() -> None:

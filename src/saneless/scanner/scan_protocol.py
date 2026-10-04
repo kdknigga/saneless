@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
 __all__ = [
+    "CHILD_LOGGERS",
     "LENGTH_PREFIX",
     "LOG_LEVELS",
     "MAX_HEADER_BYTES",
@@ -116,6 +117,21 @@ STAGES: Final = frozenset(
         "close",
         "restart",
         "exit",
+    }
+)
+
+# The loggers the scan child's own code logs under.  saneless emits a child's
+# record under its own name only when it is one of these, so a child cannot
+# make saneless create a logger of its choosing.
+CHILD_LOGGERS: Final = frozenset(
+    {
+        "saneless",
+        "saneless.pages",
+        "saneless.scanner",
+        "saneless.scanner.base",
+        "saneless.scanner.options",
+        "saneless.scanner.scan_session",
+        "saneless.thread_unwinder",
     }
 )
 
