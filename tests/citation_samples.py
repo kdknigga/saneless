@@ -32,8 +32,9 @@ import re
 # file named with a line number after a colon, the name of the assistant
 # instructions file, and a phase referred to without its number: line numbers
 # drift, and the other two cannot be looked up by a reader of the shipped tree
-# either. It also rejects some domain prose ("phase 2", "the next phase");
-# reword it ("the second pass", "the following step"). It is a net for the
+# either. It also rejects some domain prose ("phase 2", "the next phase", and
+# ACME's "HTTP-01 challenge", which the HTTP family matches); reword it ("the
+# second pass", "the following step", "the HTTP challenge"). It is a net for the
 # common shapes, not a proof; review catches what it misses. The
 # no-planning-citations hook in .pre-commit-config.yaml carries the same
 # pattern, and a test in tests/test_deployment_config.py keeps the two
