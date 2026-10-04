@@ -293,8 +293,8 @@ class ReadBlockMode(StrEnum):
     # status that is neither GOOD nor EOF does.
     RAISE = "raise"
     # cancel() does not release the gate at all: the scanner never answers.
-    # Only release_read() ends this one, which is how a test drives the
-    # backend's wedge and then its recovery.
+    # Only release_read() ends this one, which is how a test drives a read
+    # that outlives its cancel.
     NEVER = "never"
 
 
@@ -1349,8 +1349,7 @@ class FakeSaneDev:
 
         ``cancel()`` releases it only in the two modes that model a scanner
         which answered.  This is the other way a blocked read ends: the late
-        answer that arrives after the backend has already given up on it, and
-        the one that lets a test watch a wedged backend recover.
+        answer that arrives after the reader has already given up on it.
         """
         self.__dict__["read_gate"].set()
 
@@ -2373,8 +2372,7 @@ class FakeSaneModule:
         # Every SANE start and shutdown an in-process scan child made, in
         # order, as "init" and "exit".
         self.child_calls: list[str] = []
-        # Counted for the same reason FakeSaneDev records its own calls: the
-        # wedge refusal has to happen *before* any SANE traffic, and
+        # Counted for the same reason FakeSaneDev records its own calls:
         # "the call was never made" cannot be asserted on a return value.
         self.get_devices_call_count = 0
         self.exit_while_blocked = False

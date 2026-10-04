@@ -2690,7 +2690,6 @@ def _break_libsane(monkeypatch: pytest.MonkeyPatch) -> None:
     def unloadable() -> NoReturn:
         raise ImportError(_LIBSANE_MISSING)
 
-    monkeypatch.setattr(sane_backend, "_ensure_sane", unloadable)
     monkeypatch.setattr(scan_session_mod, "_ensure_sane", unloadable)
 
 

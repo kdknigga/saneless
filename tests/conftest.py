@@ -693,8 +693,7 @@ def libsane_in_this_process() -> object:
     tests, drive python-sane here on purpose, so they need SANE started in
     this process.  ``sane_init`` is process-global and backends accumulate
     across restarts, so it is started once and left running for the rest of
-    the run; the suite's reset never shuts it down, because the in-process
-    init guard it resets does not record this start.
+    the run.
 
     Returns:
         What ``sane.init()`` returned.
@@ -704,92 +703,6 @@ def libsane_in_this_process() -> object:
         if not _THIS_PROCESS_SANE:
             _THIS_PROCESS_SANE.append(scan_session_mod._ensure_sane().init())
         return _THIS_PROCESS_SANE[0]
-
-
-def reset_sane_process_state() -> None:
-    """
-    Return SANE to "never initialised, not wedged" for the next test.
-
-    ``_INIT`` and ``_WEDGE`` are process-global by design: the
-    first ``SaneBackend`` built in a process initialises SANE and every later
-    one deliberately does not, and a read that never came back refuses the
-    next scan on a *different* backend object.  Both are exactly the kind of
-    state a test cannot be trusted to leave behind, so the suite resets them
-    around every test rather than asking each module to remember.
-
-    The reset goes through the public ``shutdown()`` and not into the guard's
-    own fields, because "after a shutdown a later init is allowed" is the
-    behaviour the backend promises; reaching past it would let that promise
-    rot while the tests kept passing.
-
-    ``shutdown()`` has one documented refusal: it leaves the guard armed when a
-    read is still recorded as outstanding, because ``sane_exit()`` closes every
-    open handle and SANE forbids that while an operation is in flight.  A test
-    that wedged the backend and did not release it would therefore strand
-    ``_INIT.done`` at ``True`` -- the very leak this helper exists to stop --
-    so that one case is finished off by hand, and pointedly *without* calling
-    ``sane_exit()``, which would be unsafe for the same reason ``shutdown()``
-    declined to.
-
-    The open-handle record is cleared on every path, because a test that wedged
-    a handle and did not release it leaves that handle counted, which would
-    refuse every later test's ``reinitialise()``.  Its cancel record and any
-    iterator parked on it go too: a parked iterator would otherwise outlive
-    its test, and a recorded cancel could match a later handle given the same
-    ``id()``.
-    """
-    sane_backend_mod.shutdown()
-    handles = sane_backend_mod._OPEN_HANDLES
-    handles.handles.clear()
-    handles.cancelled.clear()
-    handles.parked.clear()
-    if not sane_backend_mod._INIT.done:
-        return
-    record = sane_backend_mod._WEDGE
-    record.stuck = False
-    record.done = None
-    record.device = None
-    record.device_id = ""
-    record.page_label = ""
-    record.settling = False
-    record.outstanding = set()
-    sane_backend_mod._restore_sane_net_hosts()
-    sane_backend_mod._INIT.done = False
-    sane_backend_mod._INIT.host = ""
-    sane_backend_mod._INIT.effective = ""
-    sane_backend_mod._INIT.version = None
-
-
-@pytest.fixture(autouse=True)
-def sane_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """
-    Give every test in the suite an uninitialised, unwedged SANE.
-
-    This is suite-wide and not module-wide on purpose.  The guard is process
-    state, so a single module that builds a real ``SaneBackend`` over a fake
-    ``sane`` and does not reset it suppresses ``sane.init()`` for every later
-    test in the same process -- including the ones that then make real SANE
-    calls against a library that was never initialised.  A module-local fixture
-    fixes only the module that remembers to add one; this cannot be forgotten
-    by construction.
-
-    ``monkeypatch`` is requested, and not used, purely for its ordering.  It is
-    the fixture every module patches ``scan_session.sane`` through, and a
-    fixture that requests it is torn down before its ``undo`` runs -- so the
-    final reset still finds the fake in place rather than the real library that
-    the undo restores.
-
-    Args:
-        monkeypatch: Requested for teardown ordering only.
-
-    Yields:
-        Nothing; the reset runs on both sides of the test.
-
-    """
-    _ = monkeypatch  # ordering only: tear down before the sane-module undo
-    reset_sane_process_state()
-    yield
-    reset_sane_process_state()
 
 
 class ListingSeam:
@@ -824,9 +737,10 @@ def listing_seam(
     app, the worker, the CLI or the health checks -- would otherwise start
     real libsane, and see its devices rather than the fake's.
 
-    So the backend's launcher is replaced here, suite-wide and not per module
-    for the reason ``sane_process_state`` gives: a module that forgot would
-    list through real libsane without anyone noticing.  The replacement runs
+    So the backend's launcher is replaced here, suite-wide and not per module:
+    a module-local fixture fixes only the module that remembers to add one,
+    and a module that forgot would list through real libsane without anyone
+    noticing.  The replacement runs
     the child's own ``init()`` and ``respond()`` over whatever is patched into
     ``scan_session.sane``, answering a failed ``init()`` with the child's own
     ``start_failure_reply()``, and decodes the result with the launcher's own
