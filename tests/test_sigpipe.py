@@ -17,7 +17,10 @@ the child starts with it unblocked.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -27,17 +30,37 @@ import pytest
 
 from saneless.exceptions import ListingNoAnswerError, ScanError
 from saneless.pipeline import _SPOOL_LABEL_A
-from saneless.scanner import listing, scan_child
+from saneless.scanner import _scan_child, child_launch, listing, scan_child
 from saneless.scanner.base import ScanSettings
 from saneless.scanner.listing import ListingRequest
 from saneless.scanner.scan_child import ScanChildSession
+from saneless.scanner.scan_protocol import (
+    ChildFailure,
+    ControlOp,
+    LogLine,
+    PassDone,
+    Ready,
+    ScanCommand,
+    encode_command,
+    read_frame,
+)
 from saneless.spool import SpooledPageSink
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from saneless.scanner.scan_protocol import Frame
+
 _CHILD_TIMEOUT_SECONDS: Final = 30
 _SIGPIPE_BIT: Final = 1 << (signal.SIGPIPE - 1)
+_MAX_PIXELS: Final = 1 << 30
+_FLATBED_SCAN: Final = ScanCommand(
+    device="test:0",
+    settings=dataclasses.asdict(
+        ScanSettings(source="Flatbed", resolution=50, mode="Gray")
+    ),
+    log_level=logging.INFO,
+)
 
 # Blocks SIGPIPE as saneless does, runs one flatbed pass through a real scan
 # child whose read ends with the parametrised error status, then writes to a
@@ -113,7 +136,7 @@ with open({record!r}, "w", encoding="ascii") as record:
 
 
 # The real scan child, run as it is, except that each pass also records the
-# child's ignored-signal mask, once the pass has ended, in the file
+# child's ignored-signal mask, as libsane leaves it at the pass's end, in the file
 # SCAN_TEST_SIGIGN names.  The variable has no SANELESS_ prefix, so the child
 # environment's strip keeps it.
 _SIGIGN_RECORDING_CHILD: Final = """\
@@ -124,12 +147,12 @@ from pathlib import Path
 
 from saneless.scanner import _scan_child as child
 
-real_scan = child._scan
+real_run_pass = child.scan_session.run_pass
 
 
-def recording_scan(*args):
+def recording_run_pass(*args):
     try:
-        return real_scan(*args)
+        return real_run_pass(*args)
     finally:
         with open("/proc/self/status", encoding="ascii") as status:
             for line in status:
@@ -137,7 +160,7 @@ def recording_scan(*args):
                     Path(os.environ["SCAN_TEST_SIGIGN"]).write_text(line.split()[1])
 
 
-child._scan = recording_scan
+child.scan_session.run_pass = recording_run_pass
 reply_fd = child.take_reply_fd()
 child.prepare_process()
 code = child.main(
@@ -207,6 +230,89 @@ def test_a_failed_libsane_read_resets_sigpipe_in_the_scan_child(
     assert killed == 0
     ignored = int(record.read_text(encoding="ascii"), 16)
     assert not ignored & _SIGPIPE_BIT, f"child SigIgn {ignored:#x}"
+
+
+def _wait_readable(fd: int) -> None:
+    """
+    Block until ``fd`` is readable, failing the test after a while.
+
+    Raises:
+        AssertionError: Nothing arrived in time.
+
+    """
+    readable, _, _ = select.select([fd], [], [], _CHILD_TIMEOUT_SECONDS)
+    if not readable:
+        msg = "the scan child sent nothing in time"
+        raise AssertionError(msg)
+
+
+def _frame(fd: int) -> Frame:
+    """
+    Read the scan child's next frame other than a log record.
+
+    Returns:
+        The frame.
+
+    """
+    while True:
+        frame = read_frame(fd, lambda: _wait_readable(fd), max_pixels=_MAX_PIXELS)
+        if not isinstance(frame, LogLine):
+            return frame
+
+
+@pytest.mark.sane_hardware
+@pytest.mark.parametrize(
+    "next_command",
+    [ControlOp.EXIT, _FLATBED_SCAN],
+    ids=["exit", "scan"],
+)
+def test_a_scan_child_whose_read_failed_survives_a_closed_reply_pipe(
+    next_command: ControlOp | ScanCommand,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    After a failed read, a write to a closed reply pipe ends the child cleanly.
+
+    libsane has put SIGPIPE back to its default action by the pass's end, so
+    unless the child ignores it again, its next write to a saneless that has
+    gone kills it with SIGPIPE before its own cleanup can run.  It must
+    instead see the write fail and end with the status for a closed reply
+    channel.  Its stdin stays open, so the end of commands cannot be what
+    ends it.
+
+    Args:
+        next_command: The command whose first reply meets the closed pipe.
+        tmp_path: Holds the SANE configuration.
+        monkeypatch: Points SANE at the configuration.
+
+    """
+    config = _failing_read_config(tmp_path, "SANE_STATUS_NO_DOCS")
+    monkeypatch.setenv("SANE_CONFIG_DIR", str(config))
+    proc = child_launch.start_child(scan_child._CHILD_FILE, "")
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    try:
+        reply_fd = proc.stdout.fileno()
+        assert _frame(reply_fd) == Ready()
+        proc.stdin.write(encode_command(_FLATBED_SCAN))
+        proc.stdin.flush()
+        frame = _frame(reply_fd)
+        while not isinstance(frame, ChildFailure | PassDone):
+            frame = _frame(reply_fd)
+        proc.stdout.close()
+        proc.stdin.write(encode_command(next_command))
+        proc.stdin.flush()
+        returncode = proc.wait(_CHILD_TIMEOUT_SECONDS)
+    finally:
+        child_launch.kill_and_reap(proc)
+        proc.stdin.close()
+        proc.stdout.close()
+
+    assert isinstance(frame, ChildFailure), frame
+    assert not frame.fatal, frame
+    assert returncode != -signal.SIGPIPE, "the scan child was killed by SIGPIPE"
+    assert returncode == _scan_child._PARENT_GONE_STATUS
 
 
 @pytest.mark.sane_hardware
