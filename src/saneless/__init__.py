@@ -1,7 +1,5 @@
 """Saneless -- SANE scanner to paperless-ngx bridge."""
 
-from saneless.config import Settings
-
 
 def main() -> None:
     """
@@ -34,4 +32,4 @@ def main() -> None:
         drain_dead_streams()
 
 
-__all__ = ["Settings", "main"]
+__all__ = ["main"]

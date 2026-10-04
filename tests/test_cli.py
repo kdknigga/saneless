@@ -102,6 +102,7 @@ from saneless.vocabulary import (
     state_label,
 )
 from saneless.web import app as app_module
+from saneless.web import server as server_module
 from saneless.web.app import create_app
 from tests.conftest import (
     StubScannerBackend,
@@ -3782,7 +3783,7 @@ class TestServeCommand:
         def fake_create_app(*_args: object, **_kwargs: object) -> object:
             return object()
 
-        monkeypatch.setattr("saneless.cli.create_app", fake_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", fake_create_app)
 
     @staticmethod
     def _refusing_create_app(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3791,7 +3792,7 @@ class TestServeCommand:
         def failing_create_app(*_args: object, **_kwargs: object) -> FastAPI:
             return FastAPI(lifespan=_refusing_lifespan)
 
-        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", failing_create_app)
 
     def test_serve_binds_the_configured_defaults(
         self, monkeypatch: pytest.MonkeyPatch
@@ -3896,7 +3897,7 @@ class TestServeCommand:
         monkeypatch.setattr(uvicorn.Server, "run", stopped_run)
         sock = socket.create_server(("127.0.0.1", 0))
         try:
-            cli_module._run_server(app, [sock], "WARNING")
+            server_module.run_server(app, [sock], "WARNING")
             assert not held.paperless_entered.is_set()
             assert closes.calls == [
                 "paperless.close",
@@ -3940,7 +3941,7 @@ class TestServeCommand:
         monkeypatch.setattr(uvicorn.Server, "run", signalled_run)
         sock = socket.create_server(("127.0.0.1", 0))
         try:
-            cli_module._run_server(app, [sock], "WARNING")
+            server_module.run_server(app, [sock], "WARNING")
             assert should_exit == [True]
             assert asked == ["note_stop"]
         finally:
@@ -3977,7 +3978,7 @@ class TestServeCommand:
         previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
         sock = socket.create_server(("127.0.0.1", 0))
         try:
-            cli_module._run_server(app, [sock], "WARNING")
+            server_module.run_server(app, [sock], "WARNING")
             assert should_exit == [True]
             assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
         finally:
@@ -4014,7 +4015,7 @@ class TestServeCommand:
         refresher: CheckRefresher = app.state.refresher
         # serve's own config: no log_config, so uvicorn rewires no loggers
         # for the rest of the session.
-        server = cli_module._StoppingServer(uvicorn.Config(app, log_config=None), app)
+        server = server_module.StoppingServer(uvicorn.Config(app, log_config=None), app)
         server.should_exit = stopping
         stop_event = refresher._stopping
         real_set = threading.Event.set
@@ -4215,7 +4216,7 @@ class TestServeCommand:
 
         made = _record_sockets(monkeypatch)
         self._stub_create_app(monkeypatch)
-        monkeypatch.setattr("saneless.cli.uvicorn.Config", failing_config)
+        monkeypatch.setattr("saneless.web.server.uvicorn.Config", failing_config)
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
@@ -4473,9 +4474,9 @@ class TestServeCommand:
         process itself when start-up fails, with a code that is this project's
         Paperless code, so a caller would be told the wrong cause.
 
-        The lifespan refuses through a patched ``saneless.cli.create_app``: an
+        The lifespan refuses through a patched ``saneless.web.app.create_app``: an
         unwritable configured directory would be refused by the settings
-        pre-flight, exit 2, before ``_run_server`` is reached, and prove nothing.
+        pre-flight, exit 2, before ``run_server`` is reached, and prove nothing.
         It reaches real uvicorn, so it runs on ``_invoke_on_a_worker_thread``.
         """
         self._refusing_create_app(monkeypatch)
@@ -4576,7 +4577,7 @@ class TestServeCommand:
         def interrupted_create_app(*_args: object, **_kwargs: object) -> object:
             raise KeyboardInterrupt
 
-        monkeypatch.setattr("saneless.cli.create_app", interrupted_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", interrupted_create_app)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
@@ -4595,7 +4596,7 @@ class TestServeCommand:
             msg = "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
             raise PaperlessError(msg)
 
-        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
+        monkeypatch.setattr("saneless.web.app.create_app", failing_create_app)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
@@ -7129,7 +7130,7 @@ class TestEntryPointsCloseTheBackend:
         """
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
-        monkeypatch.setattr("saneless.cli.create_app", lambda *_args: object())
+        monkeypatch.setattr("saneless.web.app.create_app", lambda *_args: object())
         _fake_server_run(monkeypatch)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
@@ -7153,7 +7154,7 @@ class TestEntryPointsCloseTheBackend:
             msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
             raise PaperlessTrustStoreError(msg)
 
-        monkeypatch.setattr("saneless.cli.create_app", unreadable_trust_store)
+        monkeypatch.setattr("saneless.web.app.create_app", unreadable_trust_store)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
 
@@ -7191,14 +7192,14 @@ class TestEntryPointsCloseTheBackend:
         """
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
-        real_create_app = cli_module.create_app
+        real_create_app = app_module.create_app
 
         def taken_over(settings: Settings, scanner: ScannerBackend) -> FastAPI:
             app = real_create_app(settings, scanner)
             app.state.lifespan_started = True
             return app
 
-        monkeypatch.setattr("saneless.cli.create_app", taken_over)
+        monkeypatch.setattr("saneless.web.app.create_app", taken_over)
         _fake_server_run(monkeypatch, started=False)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
@@ -7226,7 +7227,7 @@ class TestEntryPointsCloseTheBackend:
             msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
             raise PaperlessTrustStoreError(msg)
 
-        monkeypatch.setattr("saneless.cli.create_app", unreadable_trust_store)
+        monkeypatch.setattr("saneless.web.app.create_app", unreadable_trust_store)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
 

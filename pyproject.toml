@@ -218,6 +218,7 @@ exclude = [".planning/**/*.md"]
     "S607",  # git and ruff are resolved on PATH with shutil.which
 ]
 "src/saneless/__init__.py" = ["PLC0415"]
+"src/saneless/cli.py" = ["PLC0415"]  # serve imports the web stack when it runs, so no other command loads it
 "src/saneless/config.py" = ["S104"]
 # identifiers come from the module's column tuple; every value is a bound parameter
 "src/saneless/job.py" = ["S608"]

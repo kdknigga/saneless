@@ -801,9 +801,9 @@ _MEMORY_PAGE_HEIGHT = 1200
 _MEMORY_SMALL_PAGES = 4
 _MEMORY_LARGE_PAGES = 16
 _RGB_BANDS = 3
-# ru_maxrss is reported in kilobytes on Linux (getrusage(2)); every other
-# figure in this test is in bytes, so the conversion happens exactly once.
-_RU_MAXRSS_UNIT_BYTES = 1024
+# VmHWM is reported in kilobytes (proc(5)); every other figure in this test is
+# in bytes, so the conversion happens exactly once.
+_VMHWM_UNIT_BYTES = 1024
 # A bounded wait, not a sleep.  Each run takes a few seconds, so 20 s is
 # slack rather than a limit, and two of them still leave the test far inside
 # pytest-timeout's 60 s.
@@ -811,7 +811,6 @@ _MEMORY_CHILD_TIMEOUT_SECONDS = 20
 
 _MEMORY_CHILD_SOURCE = """\
 import os
-import resource
 from pathlib import Path
 
 import pikepdf
@@ -841,7 +840,10 @@ pdf_path = assemble_pdf(records, workspace / "out", "memory.pdf", title="memory"
 with pikepdf.open(pdf_path) as pdf:
     assembled_pages = len(pdf.pages)
 
-peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+status = Path("/proc/self/status").read_text(encoding="ascii")
+peak = next(
+    int(line.split()[1]) for line in status.splitlines() if line.startswith("VmHWM:")
+)
 print(f"pages={assembled_pages} peak_kib={peak}")
 """
 
@@ -891,11 +893,13 @@ class TestAssemblyMemory:
         """
         Assembling four times as many pages does not cost four times the RAM.
 
-        Peak ``ru_maxrss`` is read in a child process.  ``tracemalloc`` cannot
-        see Pillow's pixels, which are malloc'd in C, and in-process
-        measurement has no honest peak once an earlier test has grown the
-        heap.  An assembly that holds every page until it finishes, as a
-        single convert does, grows past the budget.
+        The child's peak resident memory, ``VmHWM``, is read in the child.
+        ``tracemalloc`` cannot see Pillow's pixels, which are malloc'd in C,
+        and in-process measurement has no honest peak once an earlier test has
+        grown the heap.  ``ru_maxrss`` is no better: it keeps the parent's
+        resident peak across the exec, so a light child reports the test
+        runner's peak instead of its own.  An assembly that holds every page
+        until it finishes, as a single convert does, grows past the budget.
         """
         script = tmp_path / "measure_assembly_memory.py"
         script.write_text(_MEMORY_CHILD_SOURCE, encoding="utf-8")
@@ -913,7 +917,7 @@ class TestAssemblyMemory:
         decoded_page_bytes = _MEMORY_PAGE_WIDTH * _MEMORY_PAGE_HEIGHT * _RGB_BANDS
         extra_pages = _MEMORY_LARGE_PAGES - _MEMORY_SMALL_PAGES
         budget_bytes = decoded_page_bytes * extra_pages // 2
-        growth_bytes = (large["peak_kib"] - small["peak_kib"]) * _RU_MAXRSS_UNIT_BYTES
+        growth_bytes = (large["peak_kib"] - small["peak_kib"]) * _VMHWM_UNIT_BYTES
 
         assert growth_bytes < budget_bytes, (
             f"peak grew {growth_bytes} bytes over {extra_pages} extra pages, "

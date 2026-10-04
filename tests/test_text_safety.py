@@ -150,8 +150,8 @@ def test_text_safety_is_a_leaf_that_imports_nothing_from_saneless() -> None:
 
     ``scanner/base.py`` imports it, so any import back into the package would
     risk a cycle. The module is loaded from its file under a private name in
-    a fresh interpreter, because importing it as ``saneless.text_safety``
-    would run the package ``__init__``, which imports the configuration.
+    a fresh interpreter, so ``sys.modules`` shows only what the module itself
+    imports, not the packages a dotted import would load on the way.
     """
     module_path = Path(saneless.__file__).parent / "text_safety.py"
     script = textwrap.dedent(
