@@ -216,9 +216,11 @@ lint or a red unit test.
 
 The `slow` marker labels a test that takes tens of seconds: the loop in
 `tests/test_libsane_reader_exit.py` that starts 1200 real scan-child processes, 300
-runs of four, to show a failed libsane read never leaves one needing a kill. It is also `sane_hardware`, so CI
-runs it in that step; nothing deselects `slow` by default. Add `-m "not slow"` for a
-quicker local run.
+runs of four, to show a failed libsane read never leaves one needing a kill. Measured,
+it takes about 11 seconds on 16 CPUs, about 30 on four (a hosted CI runner's share) and
+about a minute on two, well inside the `test` job's 15 minutes. It is also
+`sane_hardware`, so CI runs it in that step; nothing deselects `slow` by default. Add
+`-m "not slow"` for a quicker local run.
 
 A test that hangs is not allowed to hang the run: `pytest-timeout` is configured in
 `pyproject.toml` with `timeout = 60` and `timeout_method = "signal"` for local runs, so
