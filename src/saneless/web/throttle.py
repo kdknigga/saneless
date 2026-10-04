@@ -1,13 +1,10 @@
 """
 Rate floors for the web endpoints that reach paperless-ngx or probe on demand.
 
-The endpoints protected here are unauthenticated by design on a LAN, and
-``CrossOriginGuard`` allows a request carrying neither ``Sec-Fetch-Site`` nor
-``Origin`` -- which is what ``curl`` in a loop sends.  Without a floor, each
-call is one more token-bearing request to paperless-ngx, so a loop is an
-unbounded amount of upstream traffic.  The protection is decided here, once,
-so every such endpoint gets the same one rather than a timestamp dict of its
-own:
+The endpoints protected here are unauthenticated by design on a LAN, and a
+scripted client passes ``CrossOriginGuard``, so without a floor a loop is
+unbounded token-bearing traffic to paperless-ngx.  Every such endpoint uses
+one of these two rather than a timestamp dict of its own:
 
 - :class:`MinimumInterval` grants at most one call per interval and refuses
   the rest.  ``CheckCache``'s manual-refresh floor and each
@@ -32,26 +29,15 @@ __all__ = [
     "SingleFlightResult",
 ]
 
-# The shortest gap between two honoured calls to anything on a floor.  Two
-# seconds is below the interval a human clicks at -- nobody presses Check or a
-# refresh button twice in the same two seconds and expects two different
-# answers -- and far above the rate at which a scripted loop is a problem,
-# which is the only case this exists for.  It does not break the Refresh
-# button's promise either: that promise is "do not make somebody wait out a
-# 30 s TTL after plugging the scanner back in", and a 2 s floor leaves it
-# intact.  Deliberately not configurable, and read at call time, so a test can
-# shorten it.
+# The shortest gap between two honoured calls to anything on a floor: below
+# the interval a human clicks at, far above a scripted loop's rate.  Read at
+# call time, so a test can shorten it.
 MIN_MANUAL_REFRESH_SECONDS: Final = 2.0
 
 # How long the first connection test's followers wait for the in-flight one.
-# It only applies before any result exists -- once per process -- and it is
-# bounded on both sides.  It has to outlast the probe it waits on, which the
-# route runs on the status probe's budget of 2 s to connect and 5 s to read,
-# so a follower shares that answer rather than time out just before it lands.
-# And it has to stay below the 10 s an idle server is given to stop, so no
-# request waiting here holds a shutdown open.  A leader slower than this (a
-# connect and a trickling read both near their budgets) leaves the follower a
-# TimeoutError, which the route answers as 503 with Retry-After.
+# It must outlast the probe's connect and read budgets, so a follower shares
+# that answer, and stay below the idle server's stop grace period, so no waiting
+# request holds a shutdown open.
 PAPERLESS_TEST_WAIT_SECONDS: Final = 8.0
 
 
@@ -74,24 +60,19 @@ class MinimumInterval:
     def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         """Initialize a floor that has granted nothing yet."""
         self._clock = clock
-        # Guards every read and every rebind of self._last_claim, and nothing
-        # else.  The read-and-rebind has to be one step for two request
-        # threads arriving together to get one grant between them.
+        # Guards self._last_claim only; its read-and-rebind is one step, so two
+        # request threads arriving together get one grant between them.
         self._lock = threading.Lock()
-        # When a claim was last granted, or None for "never".  None rather
-        # than 0.0: time.monotonic() on Linux counts from boot, so 0.0 would
-        # sit inside the interval and refuse the first call on a freshly
-        # booted appliance -- the one call that certainly deserves to run.
+        # None, not 0.0: time.monotonic() on Linux counts from boot, so 0.0
+        # would refuse the first call on a freshly booted appliance.
         self._last_claim: float | None = None
 
     def claim(self, min_interval: float = MIN_MANUAL_REFRESH_SECONDS) -> float | None:
         """
         Say whether the protected call may run now, and record that it did.
 
-        A refusal changes no state.  That matters: if a refusal stamped, a
-        caller hammering the endpoint just inside the interval would hold the
-        floor shut for ever, and the household member standing at the
-        appliance would never get their call through.
+        A refusal changes no state, so a caller hammering just inside the
+        interval cannot hold the floor shut.
 
         Args:
             min_interval: The shortest gap between two grants, in seconds.
@@ -99,13 +80,7 @@ class MinimumInterval:
         Returns:
             The stamp this grant recorded, which the caller may hand to
             :meth:`release` to give the grant back, or ``None`` when it is too
-            soon.
-
-            The truthiness of that value is not the contract: callers test
-            against ``None``.  A stamp is a ``time.monotonic()`` reading, and
-            on Linux that counts from boot, so 0.0 is a reading a grant can
-            really record and it is falsey.  A caller branching on truthiness
-            would read the first call after a boot as a refusal.
+            soon.  Test against ``None``: a grant can really record 0.0.
 
         """
         now = self._clock()
@@ -120,13 +95,9 @@ class MinimumInterval:
         """
         Give a granted claim back, because the work it paid for never happened.
 
-        The clear is a compare-and-clear, so a caller can only ever give back
-        its own grant: the claim is cleared when ``stamp`` is still the
-        recorded one and left alone when it is not, so a release arriving
-        *after* somebody else's grant is a no-op rather than a hole in the
-        floor.  A retry, a second caller or a handler that grew a second
-        release cannot lower a floor whose whole job is to bound what an
-        unauthenticated LAN endpoint can make the appliance do.
+        A compare-and-clear: the claim is cleared only while ``stamp`` is still
+        the recorded one, so a release after somebody else's grant cannot open
+        a hole in the floor.
 
         Args:
             stamp: The value :meth:`claim` returned for the grant being given
@@ -152,20 +123,14 @@ class SingleFlightResult[T]:
     computing.  Past that, the first caller to arrive computes -- it is the
     leader -- and every caller that arrives while it does is a follower.
 
-    **A follower with a previous result does not wait.**  The web handlers are
-    plain ``def`` and each one holds one of anyio's 40 worker threads for as
-    long as it runs, so a follower blocked on the leader holds one too.
-    Against an unreachable paperless-ngx the leader takes the client's full
-    timeout, and a loop of callers blocked behind it would exhaust the pool
-    and stall every other route, ``/health`` included.  So the follower is
-    answered the last result at once, stale by at most one probe.
+    **A follower with a previous result does not wait.**  Each plain ``def``
+    handler holds one of anyio's 40 worker threads while it runs, so followers
+    blocked behind a leader stuck on an unreachable paperless-ngx would exhaust
+    the pool and stall every route, ``/health`` included.
 
-    Only before any result exists does a follower wait, because it has
-    nothing else to say.  That is once per process, and the wait is bounded
-    by ``wait_bound``: a follower that outlasts it gets a ``TimeoutError``.
-    At most ``max_waiters`` followers wait at a time, and one more gets the
-    ``TimeoutError`` at once, so a burst of callers straight after a restart
-    cannot hold the thread pool for the length of the bound either.
+    Only before any result exists does a follower wait, bounded by
+    ``wait_bound``, and at most ``max_waiters`` wait at once; the rest get a
+    ``TimeoutError``.
 
     ``compute`` must not raise: an outcome worth sharing, failure included, is
     a value.  If it raises regardless, nothing is stored, the exception
@@ -200,11 +165,8 @@ class SingleFlightResult[T]:
         # Guards every read and every rebind of self._last and of
         # self._waiters, and nothing else; never a compute.
         self._state_lock = threading.Lock()
-        # How many followers are waiting for a leader right now.
         self._waiters = 0
-        # The last result and the monotonic reading it was stored at, as one
-        # tuple rebound whole, so a reader never pairs a value with another
-        # value's stamp.
+        # Rebound whole, so a reader never pairs a value with another's stamp.
         self._last: tuple[T, float] | None = None
 
     def get(self, compute: Callable[[], T]) -> T:

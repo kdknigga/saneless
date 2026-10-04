@@ -4,36 +4,19 @@ One rendering rule for every error the web layer produces.
 Route-raised ``HTTPException``s, the router's and ``StaticFiles``' 404 and 405,
 request validation failures and any unhandled exception all end in
 ``render_error``.  An htmx request gets the error partial, retargeted into the
-page's ``#status-message`` slot so an error never lands in the element the
-request was aimed at -- with one exemption, the polling status strip, whose
-failure has to land on itself to end the poll (``CHECKS_POLL_TARGET_ID``).
-That exemption is for the strip fetching itself, so it is keyed on the method
-as well as the target: a GET aimed at the strip is its poll or its
-terminal-state reload, while a POST aimed at it is the ``Check again`` button,
-whose failure goes to the slot like any other click's.  Any other request gets
-``{"status": "error", "detail": <message>}`` with the same status code, and a
-429 carries ``Retry-After`` on both branches.
+page's ``#status-message`` slot, except the status strip fetching itself
+(``CHECKS_POLL_TARGET_ID``); any other request gets ``{"status": "error",
+"detail": <message>}``.  A scan form a browser posted by itself, with
+JavaScript off, gets a whole page instead (``BrowserNavigationRefused``).
 
-One refusal is answered outside ``render_error``: a scan form a browser posted
-by itself, with JavaScript off, gets a whole page (``BrowserNavigationRefused``),
-because a browser shows a navigation's answer as the page and JSON would be
-shown as text.
+Every message is a ``RequestRejection`` vocabulary constant, and the only
+request input a body carries is the neutralised, bounded ``Host`` of a 421.
+Log lines carry only the method and path, formatted with ``%r`` so a control
+character cannot forge a log line.
 
-Every message is a ``RequestRejection`` vocabulary constant.  No exception
-text reaches a response body from here, and only one piece of request input
-does: the refused ``Host`` of a 421, which ``host_guard`` neutralises and cuts
-to 255 characters before handing it over, and which is shown beside the fixed
-sentence rather than inside it, autoescaped in the htmx fragment.  The only
-request input a log line carries is the method and path, formatted with ``%r``
-so a control character in them is escaped and cannot forge a log line, as in
-``cross_origin``.
-
-The catch-all handler logs the traceback with ``exc_info``.  Starlette's
-``ServerErrorMiddleware`` re-raises after the handler's response is sent, so
-uvicorn logs the same traceback a second time as "Exception in ASGI
-application".  That duplicate is accepted: the alternative is a middleware that
-swallows exceptions, which would leave the application without a real
-catch-all handler.
+Starlette re-raises after the catch-all handler's response is sent, so uvicorn
+logs its traceback a second time; that duplicate is accepted, because avoiding
+it would need a middleware that swallows exceptions.
 """
 
 from __future__ import annotations
@@ -80,50 +63,22 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# How long a client is told to wait after a 429.  A scan takes tens of seconds,
-# so a shorter hint would only invite a retry that is rejected again.
+# A scan takes tens of seconds, so a shorter hint would only invite a retry
+# that is rejected again.
 RETRY_AFTER_SECONDS: Final = 30
 
-# The one element whose error response must land on itself.  htmx sends the
-# target element's id in the ``HX-Target`` request header with no leading
-# ``#``, so this is compared against that header verbatim; it is the id
-# ``partials/checks.html`` gives its swap target, and a test asserts the two
-# agree.
-#
-# Of the elements in this application that poll, only the status strip needs
-# this exemption; the routes of every other polling element never raise into
-# this handler -- the status area, whose poll routes catch their own failures and render a
-# backing-off fallback; the lazy list load; and a list's retry (see
-# ``get_metadata`` and ``probe_metadata``).  An armed htmx poll is ended by
-# exactly two things: the element leaving the DOM
-# (``ct()`` re-arms only while ``se(e)``, i.e. while the element is still
-# attached) or an HTTP 286.  Removing an attribute does not end it -- the loop
-# never re-reads ``hx-trigger``.  Retargeting the strip's own failure into
-# ``#status-message`` therefore left ``#checks-body`` on the page with its
-# ``every 2s`` trigger intact, polling for the life of the tab and overwriting
-# the error slot, ``#status-message``, every two seconds.  Exempting this one id is what lets
-# the failure be swapped by the polling element's own ``hx-target="this"
-# hx-swap="outerHTML"``, which detaches it and ends the chain.
-#
-# The id alone does not identify the poll.  ``Check again`` in the same partial
-# is ``hx-post="/api/checks/refresh" hx-target="#checks-body"``, so its click
-# arrives carrying the same header, and exempting it too meant a failing click
-# wrote the error body over the strip -- every row and the only button that
-# could bring them back, gone for the life of the tab.  So the
-# exemption also requires a GET (``_is_the_strip_fetching_itself``): the
-# strip's poll and its terminal-state reload are both ``GET /api/checks``, the
-# strip asking for its own body, and the one POST aimed at the strip is the
-# button, an action whose failure belongs in the slot with every other click's.
+# The id of the one element whose error must land on itself, compared with the
+# ``HX-Target`` header verbatim; the routes of every other polling element catch
+# their own failures.  An armed htmx poll ends only when its element leaves the
+# DOM or on an HTTP 286, so a retargeted strip failure would leave the strip
+# polling for the life of the tab.
 CHECKS_POLL_TARGET_ID: Final = "checks-body"
 
-# The press a refused submit hands focus back to, by method and path.
 _SCAN_SUBMIT: Final = ("POST", "/api/scan")
 
-# The refusals of a Scan press that do not hand focus back to the Scan button.
-# They refuse on an appliance that cannot upload, where the button is disabled
-# by design, and a disabled button cannot take focus: there is nothing to
-# return it to, and re-rendering the button enabled would offer a press the
-# route is certain to refuse.
+# Refusals that do not hand focus back to the Scan button: the button is
+# disabled by design on an appliance that cannot upload, and re-rendering it
+# enabled would offer a press the route is certain to refuse.
 _BLOCKED_SCAN_REJECTIONS: Final = frozenset(
     {RequestRejection.TOKEN_UNSET, RequestRejection.URL_UNSET}
 )
@@ -138,8 +93,7 @@ _SERVER_ERROR_FLOOR = 500
 _TITLE_LOC = ("body", "title")
 _TOO_LONG_TYPE = "string_too_long"
 # The error type the scan route's title validator raises for a control
-# character, which the validation handler here maps to its own rejection.
-# Defined once, here, and imported by the route that raises it.
+# character; the route imports it from here.
 TITLE_CONTROL_TYPE: Final = "title_control_character"
 
 
@@ -187,15 +141,7 @@ class RequestRejected(HTTPException):
         Args:
             rejection: The vocabulary member to render.
             job_id: The id of the job row the refused attempt wrote, or None
-                when it wrote none.  This one argument carries what used to be
-                two: the rendered error reloads Job History exactly when a row
-                was written, so a separate ``refresh_history`` flag was a
-                second degree of freedom that production never used
-                independently and that a reader had to check could not
-                disagree with the id.  The id is also one of only two
-                technical facts the error slot may carry: it is the row
-                the user will find in Job History a moment later, never an
-                arbitrary request value.
+                when it wrote none.  Job History reloads exactly when it is set.
 
         """
         super().__init__(
@@ -210,13 +156,9 @@ class BrowserNavigationRefused(Exception):
     """
     A browser posted the scan form as a navigation, so no scan is started.
 
-    That happens only when JavaScript is off, or htmx failed to load: the page
-    submits the form itself through htmx, which says so in its headers.  A
-    browser posting on its own shows whatever comes back as a whole page, so
-    this is answered with a page of its own (``no_script.html``) and never
-    through ``render_error``, whose answer to a request that is not htmx's is
-    JSON.  It carries nothing, because the page echoes nothing the request
-    sent.
+    That happens only when JavaScript is off or htmx failed to load.  A browser
+    shows a navigation's answer as the page, so this is answered with
+    ``no_script.html`` and never through ``render_error``, which would send JSON.
     """
 
 
@@ -252,21 +194,9 @@ def _is_the_strip_fetching_itself(request: Request) -> bool:
     """
     Say whether this request is the status strip asking for its own body.
 
-    That is the one request whose error must be swapped over the element it
-    was aimed at rather than retargeted, because it is the one element that
-    polls (see ``CHECKS_POLL_TARGET_ID``).  Two things identify it and both are
-    needed.  The target header names the strip, and the method is GET: the
-    strip's poll and its terminal-state reload both fetch ``/api/checks``,
-    while the only other request aimed at the strip is the ``Check again``
-    button's POST, which is an action and not a fetch, and whose failure is
-    reported the way every other click's is.
-
-    Args:
-        request: The request being answered.
-
-    Returns:
-        True for a GET whose ``HX-Target`` is ``CHECKS_POLL_TARGET_ID``.
-
+    True for a GET whose ``HX-Target`` is ``CHECKS_POLL_TARGET_ID``.  The
+    method is part of the key because the ``Check again`` button's POST targets
+    the same id, and a click's failure must go to the slot, not over the strip.
     """
     return (
         request.method == "GET"
@@ -285,52 +215,21 @@ def render_error(
     """
     Render an error response for either an htmx or a plain request.
 
-    The htmx body offers a short "Technical details" disclosure carrying the
-    status code and, when the refused attempt wrote a job row, that row's id.
-    Those two are the whole permitted vocabulary of the slot, with one
-    exception: a 421 also names the Host it refused, so the operator knows
-    which name to add to ``[web] allowed_hosts``.  That Host arrives already
-    neutralised and bounded, and the template escapes it.  Otherwise
-    exception text, request input and the log path must never reach the slot
-    (ASVS 4.0.3 V7.4.1), and a uniform affordance that sometimes lied about having
-    detail would be worse than one that says what it has.
+    The htmx body's "Technical details" carry only the status code, the job
+    row the refused attempt wrote, and a 421's refused Host; exception text,
+    other request input and the log path never reach it (ASVS 4.0.3 V7.4.1).
+    Every response carries ``SECURITY_HEADERS`` and ``NO_STORE``, because the
+    catch-all 500 is sent outside the ``SecurityHeaders`` middleware.
 
-    Every response built here carries ``SECURITY_HEADERS`` and ``NO_STORE``:
-    an error is never worth caching.  Most would get them from the
-    ``SecurityHeaders`` middleware anyway, but the catch-all 500
-    is sent by Starlette's ``ServerErrorMiddleware``, outside all of the
-    application's middleware, so this is the only place that can give it them.
+    The strip fetching itself gets no ``HX-Retarget``: htmx 2.0.10 applies that
+    header before choosing what to swap, so a retargeted failure left the strip
+    polling.  ``base.html``'s ``{"code":"[45]..","swap":true,"error":true}``
+    rule is what makes the exempt error body swap at all.
 
-    Whether Job History reloads is decided here rather than in the template, so
-    the partial keeps no rule of its own: it reloads exactly when a row was
-    written, which is exactly when there is an id to name.
-
-    One request is exempt from the retarget: a GET whose ``HX-Target`` is
-    ``CHECKS_POLL_TARGET_ID`` -- the strip fetching itself -- gets its error
-    body with no ``HX-Retarget`` and no ``HX-Reswap``, so the status strip's
-    own failure replaces the status strip.  The method is part of the key
-    because the ``Check again`` button targets the same id, and a click's
-    failure must not take the strip with it.  Two facts
-    make the exemption the fix.  htmx 2.0.10 applies
-    ``HX-Retarget`` to the response's target *before* it decides what to swap,
-    so the header did not merely redirect the error -- it also spared
-    ``#checks-body``, which kept its ``every 2s`` trigger and kept polling,
-    overwriting the error slot, ``#status-message``, every two seconds.
-    And ``base.html``'s ``{"code":"[45]..","swap":true,"error":true}`` rule is
-    what makes an error body swap at all, so it is load-bearing here: without
-    it the exempt response would be discarded and the poll would survive.
-
-    A refused Scan press -- an htmx ``POST /api/scan`` -- returns focus to the
-    Scan button.  The press disabled the button for the request, which
-    dropped focus to the page body, so the error carries the button
-    out-of-band, enabled and with ``autofocus``; the next status rendering
-    re-renders its true state.  Focus is never moved into ``#status-message``:
-    the slot is the page's alert region and speaks the error from where it
-    is.  A blocked appliance is the exception, as its button is disabled by
-    design: neither the refusals in ``_BLOCKED_SCAN_REJECTIONS`` nor any
-    refusal decided before the block (an unknown profile, a title the
-    validator throws out) carries the button there, so a forced press never
-    gets it back enabled.  No other request's error carries the button.
+    A refused Scan press carries the Scan button out-of-band, enabled and with
+    ``autofocus``, because the press disabled it and dropped focus; focus never
+    moves into ``#status-message``.  A blocked appliance never gets the button
+    back enabled.
 
     Args:
         request: The request being answered.
@@ -348,10 +247,8 @@ def render_error(
         to be swapped by the target's own rule; otherwise the JSON error shape.
 
     """
-    # The security headers first, because the 500 for an unhandled exception
-    # is sent past every middleware the application adds, the one that sets
-    # them included.  That middleware sets rather than appends, so any other
-    # error still carries each header once.
+    # The middleware sets rather than appends, so an error it also passes
+    # through still carries each header once.
     headers: dict[str, str] = dict((*SECURITY_HEADERS, NO_STORE))
     headers.update(extra_headers or {})
     if status_code == _TOO_MANY_REQUESTS:
@@ -465,14 +362,9 @@ async def _browser_navigation_refused(request: Request, exc: Exception) -> Respo
     """
     Answer a scan form a browser posted by itself with the refusal page.
 
-    The page is built here rather than by ``render_error``: that function
-    answers anything but an htmx request with JSON, and a browser showing a
-    navigation's answer would show the JSON as text.  Everything else
-    ``render_error`` guarantees still holds.  Every word comes from the
-    vocabulary and none from the request (ASVS 4.0.3 V7.4.1), and the response carries
-    ``SECURITY_HEADERS`` and ``NO_STORE`` itself.  It is a 400, because the
-    request is one this route does not serve, and nothing was started or
-    recorded.
+    Every word comes from the vocabulary and none from the request
+    (ASVS 4.0.3 V7.4.1), and the response carries ``SECURITY_HEADERS`` and
+    ``NO_STORE`` itself.  Nothing was started or recorded.
     """
     if not isinstance(exc, BrowserNavigationRefused):
         return await _unhandled_exception(request, exc)
@@ -494,9 +386,7 @@ def install_error_handlers(app: FastAPI) -> None:
     """
     Register the handlers that answer every error the web layer produces.
 
-    Three send their error through ``render_error``.  The fourth answers a
-    scan form posted by a browser with JavaScript off with a page of its own,
-    which is the one error a person sees as a whole page.
+    All but ``BrowserNavigationRefused`` render through ``render_error``.
 
     Args:
         app: The application to register the handlers on.

@@ -30,12 +30,9 @@ browsers omit ``:80`` and ``:443`` from both ``Origin`` and ``Host``.  Unlike
 Go, hosts are compared case-insensitively, because a non-browser client may
 send a mixed-case ``Host``.
 
-Also unlike Go, an empty value counts as present.  Go treats an empty
-``Sec-Fetch-Site`` or ``Origin`` as absent and allows the request; here an
-empty ``Sec-Fetch-Site`` is not ``same-origin`` or ``none``, and an empty
-``Origin`` names no host, so both are rejected.  No browser sends either header
-empty, so this fails closed on purpose: a request that sends one is refused
-rather than waved through as if it came from curl.
+Also unlike Go, an empty ``Sec-Fetch-Site`` or ``Origin`` counts as present
+and is rejected.  No browser sends either header empty, so this fails closed
+rather than waving the request through as if it came from curl.
 
 This check does not look at whether ``Host`` names saneless at all; that is
 ``host_guard``'s job, and it runs first.
@@ -69,15 +66,8 @@ def _origin_matches_host(origin: str, headers: Headers) -> bool:
     """
     Return whether an ``Origin`` names the host the request was sent to.
 
-    Args:
-        origin: The raw ``Origin`` header value.
-        headers: The request headers, read for ``Host`` and
-            ``X-Forwarded-Host``.
-
-    Returns:
-        True when Origin's host[:port] is non-empty and equals ``Host`` or an
-        ``X-Forwarded-Host`` entry, ignoring case.
-
+    True when Origin's host[:port] is non-empty and equals ``Host`` or an
+    ``X-Forwarded-Host`` entry, ignoring case.
     """
     origin_host = urlsplit(origin).netloc.lower()
     candidates = {headers.get("host", "").lower()}
@@ -123,10 +113,6 @@ class CrossOriginGuard:
     state-changing route added later is covered without a per-route
     dependency.
 
-    An empty ``Sec-Fetch-Site`` or ``Origin`` is rejected, where Go's
-    ``CrossOriginProtection`` would treat it as absent and allow it; the
-    difference fails closed on purpose.
-
     It is a plain ASGI class rather than ``BaseHTTPMiddleware``, which does
     not propagate ``contextvars`` changes and wraps streaming responses.
 
@@ -160,8 +146,8 @@ class CrossOriginGuard:
             request = Request(scope)
             headers = request.headers
             if is_cross_origin_request(request.method, headers):
-                # %r keeps the attacker-chosen path and header values on one
-                # escaped line; a percent-encoded newline in the path is decoded.
+                # %r keeps the attacker-chosen values on one escaped line, even
+                # a newline percent-decoded from the path.
                 logger.warning(
                     "Blocked cross-site %s %r: "
                     "Origin=%r Host=%r X-Forwarded-Host=%r Sec-Fetch-Site=%r",

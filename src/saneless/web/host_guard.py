@@ -21,15 +21,11 @@ A Host is trusted when, ignoring case, the port and one trailing dot, it is:
 ``allowed_hosts`` adds to the defaults and never replaces them, so adding a
 name can never lock anyone out of ``http://<lan-ip>:8080``.
 
-Only ``Host`` decides.  ``X-Forwarded-Host`` is never trusted: a rebinding
-page cannot set it on a simple request, but a client that can set it could
-name anything, so trusting it would let any value through.  It is read for one
-thing only.  A reverse proxy that replaces ``Host`` with its upstream's name,
-nginx's default, sends a name saneless always answers to, such as
-``saneless:8080``, and so turns the check off for every request through it
-without a single refusal to show for it.  When a trusted ``Host`` arrives
-beside an ``X-Forwarded-Host`` naming a different host, the guard logs one
-WARNING saying so, and answers the request as before.
+Only ``Host`` decides; ``X-Forwarded-Host`` is never trusted, because a
+client that can set it could name anything.  It is read only to warn: a reverse
+proxy that replaces ``Host`` with its upstream's name, nginx's default, silently
+turns this check off, so a trusted ``Host`` beside a different
+``X-Forwarded-Host`` is logged.
 
 A well-formed Host that is not trusted gets 421 Misdirected Request, with a
 sentence naming the key to set and the refused Host beside it.  A missing,
@@ -77,11 +73,9 @@ the port can send a made-up ``X-Forwarded-Host``, and a once-only report it
 spent would hide a real misconfigured proxy added later until a restart.
 """
 
-# A host name (letters, digits, dots, hyphens and the underscore Docker
-# Compose service names may carry), or an IPv6 literal in brackets, then an
-# optional port.  The port may be empty, as RFC 3986 allows ("localhost:"),
-# and it is ignored either way.  Matched against the lower-cased value, so a Host
-# that fails it cannot carry markup, whitespace or a control character.
+# A host name (with the underscore Docker Compose service names may carry) or a
+# bracketed IPv6 literal, then an optional port, which RFC 3986 lets be empty.
+# A Host that fails it cannot carry markup, whitespace or a control character.
 _HOST_PATTERN: Final = re.compile(
     r"(?P<name>[a-z0-9._-]+|\[[a-f0-9]*:[a-f0-9.:]+\])(?::[0-9]*)?"
 )
@@ -202,15 +196,8 @@ def _replaced_host(host: str, forwarded: Sequence[str]) -> str | None:
     """
     Return the name a proxy forwarded when it differs from ``Host``.
 
-    Args:
-        host: The request's one ``Host`` value, already found well-formed.
-        forwarded: Every ``X-Forwarded-Host`` value the request carried.
-
-    Returns:
-        The first ``X-Forwarded-Host`` entry, the one the first proxy saw,
-        when it is a well-formed host naming another host than ``host``;
-        else None.  Ports are ignored, as the Host check ignores them.
-
+    Only the first ``X-Forwarded-Host`` entry, the one the first proxy saw,
+    is compared, and ports are ignored, as the Host check ignores them.
     """
     if not forwarded:
         return None
@@ -296,10 +283,9 @@ class HostGuard:
         """
         Log a WARNING when a request looks as if a proxy replaced ``Host``.
 
-        At most once per ``REPLACED_HOST_REPORT_SECONDS``, so a misconfigured
-        proxy costs one log line an hour rather than one per request.  The
-        line is worded as an observation, because any client can send the
-        header that triggers it.  The request itself is not affected.
+        At most once per ``REPLACED_HOST_REPORT_SECONDS``.  The line is
+        worded as an observation, because any client can send the header that
+        triggers it.
 
         Args:
             scope: The ASGI connection scope of a request with a trusted Host.
