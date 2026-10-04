@@ -5,24 +5,11 @@ on:
   push:
     branches: [master]
   pull_request:
-  # `release.yml` calls this workflow, so the release gate and the CI gate are
-  # one definition of green and can never drift apart: a release can only
-  # publish what has passed exactly the checks a pull request must pass. Four
-  # consequences worth knowing before you edit anything below:
-  #
-  #   * `concurrency.group` interpolates `github.workflow`, which under a
-  #     reusable call is the CALLER's workflow name -- a release run groups as
-  #     `Release-refs/tags/vX.Y.Z`, not `CI-...`. `cancel-in-progress` tests
-  #     `github.event_name == 'pull_request'`, which is false there, so a
-  #     release run is never cancelled by this block.
-  #   * The `browser` job becomes part of the release gate, costing one
-  #     Chromium and Firefox download per release. That cost is deliberate:
-  #     a release must not ship a web UI whose browser tests were never run.
-  #   * The `docker` job becomes part of the release gate too, so no image
-  #     or package is published until this commit's image has been built and
-  #     has passed the smoke checks.
-  #   * This workflow reads no secrets, so no caller ever needs
-  #     `secrets: inherit`. Keep it that way.
+  # `release.yml` calls this workflow, so a release publishes only what has
+  # passed exactly the checks a pull request must pass, the browser and docker
+  # jobs included. Under that call `github.workflow` is the caller's name and
+  # the event is not `pull_request`, so a release run is never cancelled below.
+  # This workflow reads no secrets, so no caller needs `secrets: inherit`.
   workflow_call:
 
 permissions:
@@ -33,15 +20,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Every job declares its own token scope rather than inheriting the
-  # workflow-level block. A called workflow's `GITHUB_TOKEN` scope can only be
-  # the same as or more restrictive than the calling job's, so the callee has
-  # to state what it needs explicitly for the reusable call to resolve.
-  #
-  # Every checkout disables credential persistence, so no job leaves a usable
-  # token in `.git/config` for a later step (or an uploaded artifact) to pick
-  # up. Checkout still produces a full `.git`, so the naming guard's
-  # `git ls-files` sweep keeps working in CI -- only the credential goes away.
+  # Every job declares its own token scope: a called workflow's scope can only
+  # narrow the caller's, so the reusable call resolves only if each job states
+  # what it needs. Every checkout disables credential persistence, so no token
+  # is left in `.git/config` for a later step or artifact.
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -58,47 +40,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
-      # .pre-commit-config.yaml is the single definition of the gate, and this
-      # job runs it rather than restating it: no checker is called by name
-      # below, so the hooks a contributor runs locally and the checks CI runs
-      # cannot drift apart.
-      #
-      # The commit stage runs the file-modifying fixers (the ruff fixer and
-      # formatter, end-of-file, trailing-whitespace and the rest) over the
-      # whole tree. On a clean checkout they change nothing; if any would
-      # change a file, prek fails the job and prints the diff. The same stage
-      # runs the src/ type checks, the workflow audit and the read-only checks.
-      # One hook is inert here: check-added-large-files looks only at files
-      # staged as new, and a CI checkout stages nothing, so it passes without
-      # looking. It guards a local commit, not this job.
-      #
-      # The pre-push stage runs the full type checks (ty over the project,
-      # pyrefly over src, tests and scripts), the no-fix lint and format
-      # checks, and the deployment-config tests.
-      #
-      # Every hook runs: nothing is skipped by id, no `SKIP=` is set, and a
-      # failure fails the step. prek fetches a matching CPython for the hook
-      # environments if the runner has none.
+      # .pre-commit-config.yaml is the one definition of the gate; no checker
+      # is called by name here, so local hooks and CI cannot drift apart. A
+      # fixer that would change a file fails the job and prints the diff.
+      # check-added-large-files is inert here: a CI checkout stages nothing.
       - run: uv run prek run --all-files --show-diff-on-failure
       - run: uv run prek run --stage pre-push --all-files --show-diff-on-failure
-      # The advisory gate, bare and blocking for the same reason the hook
-      # stages above are: a lockfile with a known vulnerability in it should
-      # not pass review, so the run fails rather than reports. No severity
-      # floor, no `continue-on-error`, no flag that drops a finding -- a test in
-      # tests/test_deployment_config.py enforces that last one.
+      # The advisory gate is blocking: a known vulnerability in the lockfile
+      # fails the run. tests/test_deployment_config.py rejects `--ignore` (and
+      # so `--ignore-until-fixed`) and `continue-on-error`; it does not check
+      # scope flags, so keep `--no-dev` and `--no-group` off by hand, because a
+      # compromised dev tool runs with a developer's credentials.
       #
-      # `--preview-features audit-command` silences a stderr warning that the
-      # subcommand is experimental. It does not enable it: `uv audit` runs
-      # unflagged on the pinned uv, and the flag only keeps the CI log clean.
-      #
-      # The default scope already covers the dev group, so no `--no-dev`: a
-      # compromised dev tool runs on a developer's machine with their
-      # credentials, which is not the lesser risk.
-      #
-      # CI only, with no prek hook. Unlike the workflow audit this reaches the
-      # OSV API over the network, so it fails the criteria the hook config
-      # states for a commit-stage check -- it cannot be fast, offline or
-      # guaranteed to finish.
+      # `--preview-features audit-command` only silences the experimental
+      # warning. The audit reaches the OSV API, so it is a CI step, not a hook.
       - run: uv audit --preview-features audit-command
 
   test:
@@ -117,33 +72,23 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
-      # pytest runs with HOME at a fresh empty directory, so a test that reads
-      # or writes the real home fails here instead of passing on whatever the
-      # runner happens to hold -- the suite must never touch a real ~/.config
-      # or ~/.local/state. Only pytest sees the empty HOME: uv resolves its
-      # cache and managed Python before `env` runs, under the real one.
+      # pytest runs with an empty HOME, so a test that touches the real
+      # ~/.config or ~/.local/state fails here. uv resolves its cache before
+      # `env` runs, under the real HOME.
       #
-      # Every pytest step here switches pytest-timeout to its thread method,
-      # overriding the ini option on the command line. On a timeout the
-      # thread method prints every thread's stack and then terminates the
-      # whole pytest process, so a hang in CI shows where each thread was
-      # stuck, at the cost of the rest of the run: later tests never run and
-      # session teardown never happens. The signal method that pyproject.toml
-      # sets for local runs fails only the stuck test and keeps going, but it
-      # interrupts only the main thread and prints only its stack.
+      # The thread timeout method prints every thread's stack on a hang, then
+      # ends the whole run; pyproject.toml's signal method, for local runs,
+      # fails only the stuck test but shows only the main thread.
       - name: Test with an empty HOME
         run: uv run env HOME="$(mktemp -d)" pytest -o timeout_method=thread -m "not browser and not sane_hardware"
-      # Drives the real SANE `test` backend. It ships with the SANE runtime
-      # pulled in transitively by the headers installed above, so this step
-      # needs no extra apt package. Empty HOME for the same reason as above.
+      # The SANE `test` backend ships with the runtime the headers above pull
+      # in, so this step needs no extra apt package.
       - name: SANE test backend with an empty HOME
         run: uv run env HOME="$(mktemp -d)" pytest -o timeout_method=thread -m sane_hardware
 
-  # The browser tests run offline behind an in-test egress gate (every page is
-  # routed, and any request not addressed to the local test server fails the
-  # test), so this job needs no CDN, and a UI that tried to load a script or
-  # font from one would fail here rather than in a user's offline browser.
-  # Downloading the browsers is its only network use.
+  # The browser tests fail any request not addressed to the local test server,
+  # so a UI that loads a script or font from a CDN fails here rather than in a
+  # user's offline browser.
   browser:
     name: browser
     runs-on: ubuntu-latest
@@ -160,29 +105,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
-      # Installed under the real HOME, into ~/.cache/ms-playwright. Firefox is
-      # for the reload test: it restores a ticked checkbox on reload where
-      # Chromium does not, so only Firefox can show the Multiple pages box
-      # starts unticked on every page load.
+      # Firefox is for the reload test: only Firefox restores a ticked checkbox
+      # on reload, so only it can show the Multiple pages box starts unticked.
       - run: uv run playwright install --with-deps chromium firefox
-      # Empty HOME for the same reason as the test job. Playwright looks for
-      # its browsers under HOME, so the step names the real registry
-      # explicitly: the shell expands `$HOME` before `env` replaces it, so
-      # the path is the one the install step above wrote the browsers to.
+      # Playwright looks for its browsers under HOME; the shell expands `$HOME`
+      # before `env` replaces it, so this names where the step above put them.
       - name: Browser tests with an empty HOME
         run: uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -o timeout_method=thread -m browser
 
-  # Every pull request builds the image and runs it, so a Dockerfile that
-  # cannot build (one missing libsane-dev, say) or an image that misbehaves is
-  # red before merge. Because release.yml calls this workflow, publishing waits
-  # for this job as well. The checks live in scripts/smoke_image.py rather
-  # than in inline YAML, so every caller runs the same ones.
-  #
-  # The image is loaded into the runner's engine and never pushed. The GHA
-  # layer cache it writes is scoped to the ref that ran it; in a release run
-  # that is the tag, so publish-docker's rebuild of the same commit reuses
-  # these smoke-tested layers. setup-buildx provides the docker-container
-  # driver, which that cache needs.
+  # Every pull request builds and smoke-tests the image, and publishing waits
+  # for this job. The image is never pushed. Its GHA layer cache is scoped to
+  # the ref, so in a release run publish-docker reuses these smoke-tested
+  # layers; that cache needs setup-buildx's docker-container driver.
   docker:
     name: docker
     runs-on: ubuntu-latest
@@ -200,7 +134,6 @@ jobs:
           tags: saneless:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      # uv supplies the project's Python for the script. The runner's system
-      # python3 is older than the syntax the formatter writes.
+      # The runner's system python3 is older than the syntax the script uses.
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv run --no-project python scripts/smoke_image.py saneless:ci

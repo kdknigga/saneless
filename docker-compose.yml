@@ -1,87 +1,62 @@
 # Saneless Docker Compose deployment example
 #
-# Configuration options:
-#   - Volume mount: the ./config directory, mounted read-write at /etc/saneless,
-#     holds saneless.toml. That file is the one place for the paperless-ngx
-#     token; see the environment: block below for why.
-#   - Environment variables: use SANELESS_ prefix with __ nested delimiter
-#     (e.g., SANELESS_PAPERLESS__URL, SANELESS_PAPERLESS__TOKEN). Anything set
-#     here overrides saneless.toml, which is why this file sets none of them.
-#   - Consume directory: optionally mount a host directory for paperless-ngx
-#     file-based ingestion as a fallback to API upload
+# ./config, mounted read-write at /etc/saneless, holds saneless.toml, the one
+# place for the paperless-ngx URL and token. SANELESS_ environment variables
+# (SANELESS_PAPERLESS__URL and so on) override that file, which is why this
+# file sets none of them.
 
 services:
   saneless:
     image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
-    # The container port is fixed at 8080. output.web_port is a bare-metal
-    # setting and does not move it; if 8080 is taken on the host, change the
-    # LEFT half here -- "8888:8080" -- and leave the right half alone.
+    # The container port is fixed at 8080; output.web_port does not move it. If
+    # 8080 is taken on the host, change the LEFT half -- "8888:8080".
     ports:
       - "8080:8080"
-    # The image already runs as UID/GID 1000, so on a single-user Linux host --
-    # where ./config is 1000:1000 because you created it -- this needs no
-    # action and stays commented. Uncomment and edit it only if your own UID
-    # differs, or instead run `sudo chown -R 1000:1000 ./config` once (giving
-    # files to another UID needs root). Either way the ./config mount below
-    # has to stay writable: saneless rewrites profiles by renaming a temp file
-    # over saneless.toml, and it cannot do that in a directory it cannot write.
-    # A literal, not "${UID}:${GID}" -- compose does not populate UID unless
-    # your shell exports it, and the silent fallback is a container that fails
-    # to start for no visible reason.
+    # The image runs as UID/GID 1000, so on a single-user Linux host this stays
+    # commented. If your UID differs, uncomment and edit it, or run
+    # `sudo chown -R 1000:1000 ./config` once. A literal, not "${UID}:${GID}":
+    # compose leaves UID empty unless your shell exports it, and the container
+    # then fails to start for no visible reason.
     # user: "1000:1000"
     volumes:
-      # ./config holds saneless.toml. Mount the directory, not the file, and
-      # keep it writable: saneless rewrites profiles by writing a temp file
-      # beside saneless.toml and renaming it over the original, and a
-      # single-file bind mount makes that rename fail with EBUSY.
-      # If saneless.toml is missing, saneless starts with defaults plus
-      # environment variables and the server does not create it;
-      # `saneless auto-profiles` creates it here (mode 0600).
+      # Mount the directory, not the file, and keep it writable: saneless
+      # rewrites profiles by renaming a temp file over saneless.toml, and a
+      # single-file bind mount makes that rename fail with EBUSY. The server
+      # does not create a missing saneless.toml; `saneless auto-profiles` does.
       # See: https://github.com/kdknigga/saneless#configuration
       - ./config:/etc/saneless
-      # Durable state: job database and preserved scans. /tmp/saneless-1000
-      # (the default tmp_dir, $TMPDIR/saneless-<uid>) is deliberately NOT
-      # mounted -- it is disposable scratch space.
+      # Durable state: job database and preserved scans. The scratch tmp_dir
+      # under /tmp is deliberately not mounted.
       - saneless-data:/var/lib/saneless
-      # Consume-directory fallback, optional. When the paperless-ngx API cannot
-      # be reached at all, saneless drops the assembled PDF here instead of
-      # failing the scan, and paperless-ngx ingests it once it is back. Mount
-      # the directory paperless-ngx consumes (its PAPERLESS_CONSUMPTION_DIR),
-      # and set paperless.consume_dir in saneless.toml to the container path on
-      # the right -- the mount on its own does nothing.
+      # Optional consume-directory fallback: when the paperless-ngx API cannot
+      # be reached, saneless drops the PDF here for paperless-ngx to ingest.
+      # Mount its PAPERLESS_CONSUMPTION_DIR and set paperless.consume_dir in
+      # saneless.toml to the container path on the right -- the mount on its
+      # own does nothing.
       # - /srv/paperless/consume:/consume
     environment:
       # A container's clock reports UTC, so without this every timestamp
-      # saneless shows -- the job history, the saneless jobs table, the
-      # paperless-ngx document title -- is UTC. Set your own zone.
+      # saneless shows is UTC. Set your own zone.
       - TZ=America/Chicago
-      # The paperless-ngx connection is commented out ON PURPOSE.
-      # ./config/saneless.toml is the one place for the URL and the token. A
-      # variable set here OVERRIDES that file silently: saneless would use this
-      # value and ignore the token you edited into saneless.toml, and the
-      # status strip would stay red with nothing on screen to say why.
+      # Commented out ON PURPOSE: ./config/saneless.toml is the one place for
+      # the URL and the token. A variable set here OVERRIDES that file
+      # silently, and the status strip stays red with nothing to say why.
       # - SANELESS_PAPERLESS__URL=http://paperless:8000
       # - SANELESS_PAPERLESS__TOKEN=your-api-token-here
-      # REQUIRED: uncomment and set this to the machine running saned. A
-      # container reaches scanners only over the SANE network protocol, so
-      # saneless finds none without it -- even a USB scanner plugged into this
-      # Docker host. For a saned on this host, set it to host.docker.internal
+      # REQUIRED: set this to the machine running saned. A container reaches
+      # scanners only over the SANE network protocol, even a USB scanner on
+      # this Docker host. For a saned on this host, use host.docker.internal
       # and add  extra_hosts: ["host.docker.internal:host-gateway"]  to the
       # service.
       # - SANELESS_SCANNER__HOST=192.168.1.50
       # Multiple hosts use colons: SANELESS_SCANNER__HOST=192.168.1.50:192.168.1.51
     restart: unless-stopped
-    # How long Docker waits after SIGTERM before it kills saneless. A manual
-    # duplex scan waiting at the flip prompt is stopped at once and keeps its
-    # fronts by copying them into failed/ on the data volume, and a multi-page
-    # scan waiting for its next page keeps the pages it has the same way;
-    # neither uploads anything. saneless waits up to 5 s for the scan worker,
-    # and up to 60 s more while that copy runs; a
-    # scan busy with anything else is not interrupted, and its pages stay in
-    # /tmp for the next start of this same container. /tmp and the data volume are different
-    # filesystems, so it really is a copy, and Docker's default 10 s grace
-    # would kill it half way. `docker compose up -d` recreates the container
-    # and discards /tmp, so the next start cannot recover a half-copied scan.
+    # On SIGTERM, a scan waiting at the flip prompt or for its next page keeps
+    # its pages by copying them from /tmp into failed/ on the data volume.
+    # saneless waits up to 5 s for the scan worker and up to 60 s more for that
+    # copy; Docker's default 10 s grace would kill it half way. A scan busy
+    # with anything else keeps its pages in /tmp for the next start of this
+    # same container, which `docker compose up -d` does not give it.
     stop_grace_period: 90s
 
 volumes:
