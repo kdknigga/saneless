@@ -37,7 +37,6 @@ from saneless.checks import (
     CheckKey,
     CheckResult,
     CheckState,
-    _SanedOutcome,
     check_name,
     configuration_check,
     run_checks,
@@ -72,6 +71,7 @@ from saneless.exceptions import (
 from saneless.job import JobStore
 from saneless.paperless import ConnectionProbe, PaperlessClient
 from saneless.scanner.base import DeviceInfo
+from saneless.scanner.saned_probe import SanedOutcome
 from saneless.vocabulary import (
     ConnectionStatus,
     ExitCode,
@@ -2083,7 +2083,7 @@ class TestAnUnansweredScannerHostIsAWarning:
             connect_timeout: float,
             handshake_timeout: float,
             abort: threading.Event | None = None,
-        ) -> _SanedOutcome:
+        ) -> SanedOutcome:
             """
             Report every host as one that never answered.
 
@@ -2099,9 +2099,9 @@ class TestAnUnansweredScannerHostIsAWarning:
 
             """
             probed.append(f"{host}:{port}")
-            return _SanedOutcome.TIMED_OUT
+            return SanedOutcome.TIMED_OUT
 
-        monkeypatch.setattr("saneless.checks._probe_saned", _silent)
+        monkeypatch.setattr("saneless.scanner.saned_probe.probe_saned", _silent)
         runner = _patch_doctor(monkeypatch, settings)
 
         result = runner.invoke(cli, ["doctor"])

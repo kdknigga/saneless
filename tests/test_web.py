@@ -37,8 +37,6 @@ from fastapi.testclient import TestClient
 
 from saneless.auto_profiles import generate_profiles, source_to_slug
 from saneless.checks import (
-    PROBE_CONNECT_SECONDS,
-    PROBE_READ_SECONDS,
     check_name,
     check_row_class,
     check_row_glyph,
@@ -55,6 +53,7 @@ from saneless.config import (
 from saneless.job import JobState, JobStore
 from saneless.paperless import PaperlessClient
 from saneless.scanner.base import DeviceCapabilities
+from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
 from saneless.vocabulary import (
     CORRESPONDENTS_LOADING,
     CORRESPONDENTS_UNAVAILABLE,

@@ -34,16 +34,12 @@ import pytest
 
 from saneless import checks
 from saneless.checks import (
-    PROBE_CONNECT_SECONDS,
-    PROBE_READ_SECONDS,
-    SANED_PORT,
     CheckContext,
     CheckKey,
     CheckResult,
     CheckState,
     PaperlessRefusal,
     ScannerRefusal,
-    _saned_hosts,
     _scanner_busy,
     _scanner_skipped,
     check_name,
@@ -74,11 +70,17 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.paperless import PaperlessClient
-from saneless.scanner import listing
+from saneless.scanner import listing, saned_probe
 from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceInfo, DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import SaneBackend
+from saneless.scanner.saned_probe import (
+    PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
+    SANED_PORT,
+    saned_hosts,
+)
 from saneless.vocabulary import (
     CheckSurface,
     ConnectionStatus,
@@ -161,7 +163,7 @@ def _a_file_in(folder: Path) -> Path:
 
 # The real saned probe, kept before any test replaces it, so the probe's own
 # tests can still reach it by name.
-_REAL_PROBE_SANED: Final = checks._probe_saned
+_REAL_PROBE_SANED: Final = saned_probe.probe_saned
 
 # The host the configured device ``_settings()`` writes lives on.
 _DEVICE_HOST: Final = "scanbox.lan"
@@ -191,12 +193,12 @@ def _the_configured_device_host_answers(monkeypatch: pytest.MonkeyPatch) -> None
         connect_timeout: float,
         handshake_timeout: float,
         abort: threading.Event | None = None,
-    ) -> checks._SanedOutcome:
+    ) -> saned_probe.SanedOutcome:
         if host == _DEVICE_HOST:
-            return checks._SanedOutcome.HEALTHY
+            return saned_probe.SanedOutcome.HEALTHY
         return _REAL_PROBE_SANED(host, port, connect_timeout, handshake_timeout, abort)
 
-    monkeypatch.setattr(checks, "_probe_saned", _probe)
+    monkeypatch.setattr(saned_probe, "probe_saned", _probe)
 
 
 @pytest.fixture
@@ -531,26 +533,26 @@ class TestSanedHostParsing:
 
     def test_no_host_yields_no_entries(self) -> None:
         """A USB deployment has nothing to pre-probe."""
-        assert _saned_hosts("") == ()
+        assert saned_hosts("") == ()
 
     def test_a_single_host_uses_the_default_port(self) -> None:
         """One bare name is one host on saned's registered port."""
-        assert _saned_hosts("scanbox") == (("scanbox", SANED_PORT),)
+        assert saned_hosts("scanbox") == (("scanbox", SANED_PORT),)
 
     def test_two_names_are_two_hosts(self) -> None:
         """``host-a:host-b`` is sane-net's multi-host spelling, not host:port."""
-        assert _saned_hosts("host-a:host-b") == (
+        assert saned_hosts("host-a:host-b") == (
             ("host-a", SANED_PORT),
             ("host-b", SANED_PORT),
         )
 
     def test_a_trailing_port_is_a_port(self) -> None:
         """``host-a:6566`` is one host on an explicit port."""
-        assert _saned_hosts("host-a:6566") == (("host-a", 6566),)
+        assert saned_hosts("host-a:6566") == (("host-a", 6566),)
 
     def test_a_non_default_trailing_port_is_still_a_port(self) -> None:
         """The port rule is about the shape of the segment, not its value."""
-        assert _saned_hosts("host-a:7000") == (("host-a", 7000),)
+        assert saned_hosts("host-a:7000") == (("host-a", 7000),)
 
     def test_three_segments_holding_a_number_are_refused(self) -> None:
         """
@@ -564,7 +566,7 @@ class TestSanedHostParsing:
         fallback: no entries means no probe, and the scanner check calls
         ``get_devices()`` directly.
         """
-        assert _saned_hosts("host-a:6566:host-b") == ()
+        assert saned_hosts("host-a:6566:host-b") == ()
 
     def test_an_out_of_range_port_is_dropped_rather_than_dialled(self) -> None:
         """
@@ -578,7 +580,7 @@ class TestSanedHostParsing:
         connections to an address nobody configured; dropping the segment
         avoids them.
         """
-        assert _saned_hosts("host-a:99999") == (("host-a", SANED_PORT),)
+        assert saned_hosts("host-a:99999") == (("host-a", SANED_PORT),)
 
     def test_an_expanded_ipv6_literal_produces_no_entries_to_probe(self) -> None:
         """
@@ -589,7 +591,7 @@ class TestSanedHostParsing:
         host entries.  The stdlib's ``ipaddress`` is asked first, and it
         recognises both spellings.
         """
-        assert _saned_hosts("2001:db8:0:0:0:0:0:1") == ()
+        assert saned_hosts("2001:db8:0:0:0:0:0:1") == ()
 
     def test_a_bracketed_expanded_ipv6_literal_produces_no_entries(self) -> None:
         """
@@ -601,7 +603,7 @@ class TestSanedHostParsing:
         name and the more-than-two-segment guard refuses the setting.  Both
         halves of the defence are load-bearing.
         """
-        assert _saned_hosts("[2001:db8:0:0:0:0:0:1]:6566") == ()
+        assert saned_hosts("[2001:db8:0:0:0:0:0:1]:6566") == ()
 
     def test_a_zone_suffixed_ipv6_literal_produces_no_entries(self) -> None:
         """
@@ -610,7 +612,7 @@ class TestSanedHostParsing:
         ``ipaddress.ip_address`` accepts scoped literals, so ``fe80::1%eth0``
         parses as version 6 with no help from this module.
         """
-        assert _saned_hosts("fe80::1%eth0") == ()
+        assert saned_hosts("fe80::1%eth0") == ()
 
     def test_a_bare_zero_produces_no_entries_to_probe(self) -> None:
         """
@@ -623,7 +625,7 @@ class TestSanedHostParsing:
         host "reachable" off any unrelated local process that happens to
         listen on 6566.
         """
-        assert _saned_hosts("0") == ()
+        assert saned_hosts("0") == ()
 
     def test_a_bare_number_is_not_a_host_name(self) -> None:
         """
@@ -634,7 +636,7 @@ class TestSanedHostParsing:
         all-digit rejection is a security rule and not a cosmetic one: half an
         IPv6 literal resolves to a routable address nobody typed.
         """
-        assert _saned_hosts("2001") == ()
+        assert saned_hosts("2001") == ()
 
     def test_a_bare_out_of_range_number_produces_no_entries(self) -> None:
         """
@@ -642,11 +644,11 @@ class TestSanedHostParsing:
 
         glibc answers ``getaddrinfo('99999', 6566)`` with ``0.1.134.159:6566``.
         """
-        assert _saned_hosts("99999") == ()
+        assert saned_hosts("99999") == ()
 
     def test_blank_segments_are_dropped(self) -> None:
         """A stray or doubled colon contributes no host to probe."""
-        assert _saned_hosts(" : host-a : ") == (("host-a", SANED_PORT),)
+        assert saned_hosts(" : host-a : ") == (("host-a", SANED_PORT),)
 
     def test_a_bare_ipv6_literal_produces_no_entries_to_probe(self) -> None:
         """
@@ -658,7 +660,7 @@ class TestSanedHostParsing:
         fails and, through the pre-probe's short circuit, a healthy
         appliance goes red.
         """
-        assert _saned_hosts("fe80::1") == ()
+        assert saned_hosts("fe80::1") == ()
 
     def test_a_bracketed_ipv6_literal_produces_no_entries_to_probe(self) -> None:
         """
@@ -668,27 +670,27 @@ class TestSanedHostParsing:
         ("6566", 6566))`` -- three names no resolver can answer, and three
         connect budgets spent to learn nothing.
         """
-        assert _saned_hosts("[fe80::1]:6566") == ()
+        assert saned_hosts("[fe80::1]:6566") == ()
 
     def test_the_ipv6_loopback_produces_no_entries_to_probe(self) -> None:
         """``::1`` is refused rather than read as the host name ``1``."""
-        assert _saned_hosts("::1") == ()
+        assert saned_hosts("::1") == ()
 
     def test_a_dotted_name_is_still_one_host_on_the_default_port(self) -> None:
         """The refusal does not touch the unambiguous single-entry reading."""
-        assert _saned_hosts("scanner.local") == (("scanner.local", SANED_PORT),)
+        assert saned_hosts("scanner.local") == (("scanner.local", SANED_PORT),)
 
     def test_a_dotted_name_with_a_trailing_port_is_still_one_entry(self) -> None:
         """The refusal does not touch the unambiguous ``host:port`` reading."""
-        assert _saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
+        assert saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
 
     def test_two_short_names_are_still_two_hosts(self) -> None:
         """``a:b`` keeps the documented two-host reading."""
-        assert _saned_hosts("a:b") == (("a", SANED_PORT), ("b", SANED_PORT))
+        assert saned_hosts("a:b") == (("a", SANED_PORT), ("b", SANED_PORT))
 
     def test_three_plausible_segments_are_still_three_hosts(self) -> None:
         """Every segment of ``a:b:c`` is a plausible host name, so all are kept."""
-        assert _saned_hosts("a:b:c") == (
+        assert saned_hosts("a:b:c") == (
             ("a", SANED_PORT),
             ("b", SANED_PORT),
             ("c", SANED_PORT),
@@ -700,11 +702,11 @@ class TestSanedHostParsing:
 
         The refusal is aimed at the colon, not at address literals in general.
         """
-        assert _saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
+        assert saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
 
     def test_two_ipv4_literals_are_two_hosts(self) -> None:
         """Two IPv4 literals read as sane-net's two-host list, unchanged."""
-        assert _saned_hosts("192.0.2.10:192.0.2.11") == (
+        assert saned_hosts("192.0.2.10:192.0.2.11") == (
             ("192.0.2.10", SANED_PORT),
             ("192.0.2.11", SANED_PORT),
         )
@@ -717,7 +719,7 @@ class TestSanedHostParsing:
         one, and glibc resolves it to ``0.1.134.159``, so it is not kept as a
         host name either: that would dial an address nobody configured.
         """
-        assert _saned_hosts("scanner.local:99999") == (("scanner.local", SANED_PORT),)
+        assert saned_hosts("scanner.local:99999") == (("scanner.local", SANED_PORT),)
 
 
 class TestUnicodeDigitPorts:
@@ -734,7 +736,7 @@ class TestUnicodeDigitPorts:
         doctor`` would exit 2 on a working appliance.  The segment reads like
         any unparseable port: the host is kept alone, as with ``host:99999``.
         """
-        assert _saned_hosts("host:²") == (("host", SANED_PORT),)
+        assert saned_hosts("host:²") == (("host", SANED_PORT),)
 
     def test_a_circled_one_port_does_not_raise(self) -> None:
         """
@@ -744,7 +746,7 @@ class TestUnicodeDigitPorts:
         character ``str.isdigit()`` accepts and ``int()`` refuses can reach
         ``int()``" rather than one code point.
         """
-        assert _saned_hosts("host:①") == (("host", SANED_PORT),)
+        assert saned_hosts("host:①") == (("host", SANED_PORT),)
 
     def test_an_arabic_indic_port_is_never_read_as_a_number(self) -> None:
         """
@@ -753,18 +755,18 @@ class TestUnicodeDigitPorts:
         ``int()`` accepts non-ASCII decimals, so a gate built on it would read
         Arabic-Indic 1234 as port 1234 -- a number libsane's C-side parsing
         would never derive from that string, the divergence
-        ``_saned_host_setting`` exists to prevent.  1234 rather than 6566 keeps
+        ``saned_probe.saned_host_setting`` exists to prevent.  1234 rather than 6566 keeps
         the wrong answer and the right answer different tuples.
         """
-        assert _saned_hosts("host:١٢٣٤") == (("host", SANED_PORT),)
+        assert saned_hosts("host:١٢٣٤") == (("host", SANED_PORT),)
 
     def test_an_ascii_port_is_untouched(self) -> None:
         """An ASCII-decimal port reads as that number."""
-        assert _saned_hosts("host:6566") == (("host", 6566),)
+        assert saned_hosts("host:6566") == (("host", 6566),)
 
     def test_the_lowest_ascii_port_is_untouched(self) -> None:
         """A one-character ASCII port still parses, so the gate is not a length rule."""
-        assert _saned_hosts("host:1") == (("host", 1),)
+        assert saned_hosts("host:1") == (("host", 1),)
 
 
 class TestNumericAddressShorthand:
@@ -789,7 +791,7 @@ class TestNumericAddressShorthand:
             setting: One numeric spelling glibc accepts as an address.
 
         """
-        assert _saned_hosts(setting) == ()
+        assert saned_hosts(setting) == ()
 
     def test_a_mistyped_port_does_not_invent_a_loopback_entry(self) -> None:
         """
@@ -798,11 +800,11 @@ class TestNumericAddressShorthand:
         The operator never typed an address here.  Kept, the stray ``0.0``
         segment would be a second entry that dials loopback.
         """
-        assert _saned_hosts("host:0.0") == (("host", SANED_PORT),)
+        assert saned_hosts("host:0.0") == (("host", SANED_PORT),)
 
     def test_a_legal_dotted_quad_is_still_dialled(self) -> None:
         """A static-IP scanner keeps its pre-probe and its ~127 s saving."""
-        assert _saned_hosts("192.0.2.10") == (("192.0.2.10", SANED_PORT),)
+        assert saned_hosts("192.0.2.10") == (("192.0.2.10", SANED_PORT),)
 
     @pytest.mark.parametrize("setting", ["0.0.0.0", "0.0.0.0:6566"])
     def test_the_unspecified_address_is_never_dialled(self, setting: str) -> None:
@@ -818,17 +820,17 @@ class TestNumericAddressShorthand:
             setting: The unspecified address, bare and with an explicit port.
 
         """
-        assert _saned_hosts(setting) == ()
+        assert saned_hosts(setting) == ()
 
     def test_a_stray_character_in_a_port_does_not_add_a_loopback_dial(
         self,
     ) -> None:
         """``scanbox:0.0.0.0`` is one host, not a host and the unspecified address."""
-        assert _saned_hosts("scanbox:0.0.0.0") == (("scanbox", SANED_PORT),)
+        assert saned_hosts("scanbox:0.0.0.0") == (("scanbox", SANED_PORT),)
 
     def test_a_legal_dotted_quad_with_a_port_is_still_dialled(self) -> None:
         """The wider refusal does not touch the ``host:port`` reading either."""
-        assert _saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
+        assert saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
 
     def test_a_name_containing_an_x_is_not_mistaken_for_a_hex_literal(self) -> None:
         """
@@ -838,7 +840,7 @@ class TestNumericAddressShorthand:
         not the presence of the letter somewhere in the segment, so an ordinary
         appliance name survives.
         """
-        assert _saned_hosts("box-x1.lan") == (("box-x1.lan", SANED_PORT),)
+        assert saned_hosts("box-x1.lan") == (("box-x1.lan", SANED_PORT),)
 
 
 class TestProbeHostCap:
@@ -846,7 +848,7 @@ class TestProbeHostCap:
 
     def test_a_long_host_list_is_capped(self) -> None:
         """
-        Forty configured segments yield ``_MAX_PROBE_HOSTS`` entries.
+        Forty configured segments yield ``saned_probe._MAX_PROBE_HOSTS`` entries.
 
         ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
         unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` for each, and
@@ -855,8 +857,8 @@ class TestProbeHostCap:
         duration of one, so without a cap a forty-host setting is a request
         that can take minutes.
         """
-        entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
-        assert len(entries) == checks._MAX_PROBE_HOSTS
+        entries = saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
+        assert len(entries) == saned_probe._MAX_PROBE_HOSTS
 
     def test_the_capped_list_keeps_the_first_entries_in_configured_order(self) -> None:
         """
@@ -866,7 +868,7 @@ class TestProbeHostCap:
         through to ``get_devices()``, which still dials the tail, so the tail
         loses the pre-probe's protection, not only its latency saving.
         """
-        entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
+        entries = saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
         assert entries[0] == ("h1", SANED_PORT)
         assert all(host != "h40" for host, _port in entries)
 
@@ -878,11 +880,11 @@ class TestProbeHostCap:
         host bounds nothing and learns nothing.  Counting repeats against it
         would leave a distinct host unprobed -- one libsane still dials.
         """
-        assert _saned_hosts("a:a:a:a:b") == (("a", SANED_PORT), ("b", SANED_PORT))
+        assert saned_hosts("a:a:a:a:b") == (("a", SANED_PORT), ("b", SANED_PORT))
 
     def test_a_short_host_list_is_unchanged_entry_for_entry(self) -> None:
         """A setting under the cap is not touched by it."""
-        assert _saned_hosts("a:b:c") == (
+        assert saned_hosts("a:b:c") == (
             ("a", SANED_PORT),
             ("b", SANED_PORT),
             ("c", SANED_PORT),
@@ -890,11 +892,11 @@ class TestProbeHostCap:
 
     def test_the_host_port_reading_is_unaffected_by_the_cap(self) -> None:
         """``host:port`` returns a single entry, so no cap can bite it."""
-        assert _saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
+        assert saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
 
 
 class TestTheParserDocstringIsTrue:
-    """One test per sentence of ``_saned_hosts``' documented contract."""
+    """One test per sentence of ``saned_hosts``' documented contract."""
 
     def test_a_stray_colon_after_a_port_refuses_the_setting(self) -> None:
         """
@@ -906,11 +908,11 @@ class TestTheParserDocstringIsTrue:
         safe direction: it costs the pre-probe's latency saving and never
         produces a wrong verdict.
         """
-        assert _saned_hosts("localhost:6566:") == ()
+        assert saned_hosts("localhost:6566:") == ()
 
     def test_a_stray_colon_before_a_port_refuses_the_setting(self) -> None:
         """``:localhost:6566`` is refused for the same reason as its mirror."""
-        assert _saned_hosts(":localhost:6566") == ()
+        assert saned_hosts(":localhost:6566") == ()
 
     def test_a_leading_zero_port_is_read_as_decimal(self) -> None:
         """
@@ -921,20 +923,22 @@ class TestTheParserDocstringIsTrue:
         guarantees about a port segment, and this case pins the reading rather
         than the agreement.
         """
-        assert _saned_hosts("host:065") == (("host", 65),)
+        assert saned_hosts("host:065") == (("host", 65),)
 
     def test_a_root_dot_fully_qualified_name_yields_no_entries(self) -> None:
         """
         ``scanner.local.`` is legal DNS and is still refused.
 
-        ``_looks_like_a_host_name``'s trailing-dot rule rejects it, so the name
+        ``saned_probe._looks_like_a_host_name``'s trailing-dot rule rejects it, so the name
         loses its pre-probe.  Widening the accept surface for a spelling no
         config example uses buys nothing; the cost is one latency saving.
         """
-        assert _saned_hosts("scanner.local.") == ()
+        assert saned_hosts("scanner.local.") == ()
 
 
-def _probe(host: str = "scanbox.lan", port: int = SANED_PORT) -> checks._SanedOutcome:
+def _probe(
+    host: str = "scanbox.lan", port: int = SANED_PORT
+) -> saned_probe.SanedOutcome:
     """
     Run the saned probe with both of its budgets shortened for the suite.
 
@@ -970,11 +974,11 @@ class TestSanedProbe:
         """
         with fake_saned(SanedBehaviour.CLOSE) as fake:
             outcome = _probe("127.0.0.1", fake.port)
-        assert outcome is checks._SanedOutcome.REJECTED
+        assert outcome is saned_probe.SanedOutcome.REJECTED
 
     def test_a_closed_port_is_refused(self) -> None:
         """Nothing listening is REFUSED, and the probe raises nothing."""
-        assert _probe("127.0.0.1", _closed_port()) is checks._SanedOutcome.REFUSED
+        assert _probe("127.0.0.1", _closed_port()) is saned_probe.SanedOutcome.REFUSED
 
     def test_a_healthy_saned_hears_one_init_and_one_exit(self) -> None:
         """
@@ -987,7 +991,7 @@ class TestSanedProbe:
         """
         with fake_saned(SanedBehaviour.HEALTHY) as fake:
             outcome = _probe("127.0.0.1", fake.port)
-        assert outcome is checks._SanedOutcome.HEALTHY
+        assert outcome is saned_probe.SanedOutcome.HEALTHY
         assert b"".join(fake.received) == INIT_REQUEST + EXIT_REQUEST
         assert len(INIT_REQUEST) == 21
 
@@ -995,7 +999,7 @@ class TestSanedProbe:
         """A reply carrying a failure status is REJECTED, not HEALTHY."""
         with fake_saned(SanedBehaviour.BAD_STATUS) as fake:
             outcome = _probe("127.0.0.1", fake.port)
-        assert outcome is checks._SanedOutcome.REJECTED
+        assert outcome is saned_probe.SanedOutcome.REJECTED
 
     def test_a_version_libsane_would_refuse_is_rejected(self) -> None:
         """
@@ -1007,7 +1011,7 @@ class TestSanedProbe:
         """
         with fake_saned(SanedBehaviour.BAD_VERSION) as fake:
             outcome = _probe("127.0.0.1", fake.port)
-        assert outcome is checks._SanedOutcome.REJECTED
+        assert outcome is saned_probe.SanedOutcome.REJECTED
 
     def test_a_peer_that_keeps_sending_is_read_only_eight_bytes(self) -> None:
         """
@@ -1021,7 +1025,7 @@ class TestSanedProbe:
             started = monotonic()
             outcome = _probe("127.0.0.1", fake.port)
             elapsed = monotonic() - started
-        assert outcome is checks._SanedOutcome.HEALTHY
+        assert outcome is saned_probe.SanedOutcome.HEALTHY
         assert elapsed < _PROBE_BUDGET
 
     def test_a_peer_that_accepts_and_says_nothing_times_out(
@@ -1042,7 +1046,7 @@ class TestSanedProbe:
         started = monotonic()
         outcome = _probe("127.0.0.1", listening_port)
         elapsed = monotonic() - started
-        assert outcome is checks._SanedOutcome.TIMED_OUT
+        assert outcome is saned_probe.SanedOutcome.TIMED_OUT
         assert elapsed < 3 * _PROBE_BUDGET
 
     def test_a_name_that_does_not_resolve_is_unresolved(
@@ -1064,7 +1068,7 @@ class TestSanedProbe:
             raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
 
         monkeypatch.setattr(socket, "getaddrinfo", _fail)
-        assert _probe("scanbox.lan") is checks._SanedOutcome.UNRESOLVED
+        assert _probe("scanbox.lan") is saned_probe.SanedOutcome.UNRESOLVED
 
     def test_an_empty_resolver_answer_is_unresolved(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1077,7 +1081,7 @@ class TestSanedProbe:
 
         """
         monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [])
-        assert _probe("scanbox.lan") is checks._SanedOutcome.UNRESOLVED
+        assert _probe("scanbox.lan") is saned_probe.SanedOutcome.UNRESOLVED
 
     def test_the_registered_port_is_used(self) -> None:
         """The saned port is 6566, IANA's ``sane-port`` in ``/etc/services``."""
@@ -1090,8 +1094,8 @@ class TestSanedProbe:
         A working saned on a scanner host with slow DNS must not read as timed
         out, which it would if one short budget covered connect and reply.
         """
-        assert checks.PROBE_HANDSHAKE_SECONDS == 5.0
-        assert "PROBE_HANDSHAKE_SECONDS" in checks.__all__
+        assert saned_probe.PROBE_HANDSHAKE_SECONDS == 5.0
+        assert "PROBE_HANDSHAKE_SECONDS" in saned_probe.__all__
 
     def test_no_probe_log_line_names_the_host_the_port_or_the_error(
         self,
@@ -1112,7 +1116,7 @@ class TestSanedProbe:
             listening_port: A loopback port the fixture is listening on.
 
         """
-        caplog.set_level(logging.DEBUG, logger="saneless.checks")
+        caplog.set_level(logging.DEBUG, logger="saneless.scanner.saned_probe")
         ports = [listening_port]
         for behaviour in SanedBehaviour:
             with fake_saned(behaviour) as fake:
@@ -1168,7 +1172,7 @@ class _SpendingClock:
 
     def __call__(self) -> float:
         """
-        Read the clock, the way ``checks.monotonic`` is read.
+        Read the clock, the way ``saned_probe.monotonic`` is read.
 
         Returns:
             The current reading, in seconds.
@@ -1426,7 +1430,7 @@ def _install_probe_recorder(
         monkeypatch: pytest's attribute patcher.
         connectable: The sockaddrs whose ``connect`` succeeds.
         clock: A scripted clock each dial moves forward, substituted for
-            ``checks.monotonic``.  Omitted, the real clock is left in place and
+            ``saned_probe.monotonic``.  Omitted, the real clock is left in place and
             no dial costs anything.
         peer: How the far end behaves once connected, and which addresses
             time out.  Omitted, a connected peer answers with a valid reply.
@@ -1441,7 +1445,7 @@ def _install_probe_recorder(
     )
     monkeypatch.setattr(socket, "socket", recorder.socket)
     if clock is not None:
-        monkeypatch.setattr(checks, "monotonic", clock)
+        monkeypatch.setattr(saned_probe, "monotonic", clock)
     return recorder
 
 
@@ -1451,7 +1455,7 @@ def _install_a_clock_that_jumps(
     """
     Substitute the probe's monotonic clock with a scripted one.
 
-    The deadline is read from ``checks.monotonic``, imported by bare name
+    The deadline is read from ``saned_probe.monotonic``, imported by bare name
     precisely so it can be replaced here without touching ``time`` globally.
     Each call takes the next scripted reading and the last one repeats, so a
     script can jump the clock past the deadline without any test sleeping.
@@ -1467,7 +1471,7 @@ def _install_a_clock_that_jumps(
     def _monotonic() -> float:
         return remaining.pop(0) if remaining else final
 
-    monkeypatch.setattr(checks, "monotonic", _monotonic)
+    monkeypatch.setattr(saned_probe, "monotonic", _monotonic)
 
 
 class TestSanedHandshake:
@@ -1494,7 +1498,7 @@ class TestSanedHandshake:
             connectable=[answering],
             peer=_PeerScript(reply=_VALID_REPLY + b"\xff" * 64, recv_chunk=3),
         )
-        assert _probe() is checks._SanedOutcome.HEALTHY
+        assert _probe() is saned_probe.SanedOutcome.HEALTHY
         already = 0
         for asked, served in zip(
             recorder.recv_sizes, recorder.recv_served, strict=True
@@ -1517,7 +1521,7 @@ class TestSanedHandshake:
         recorder = _install_probe_recorder(
             monkeypatch, connectable=[answering], peer=_PeerScript(recv_chunk=1)
         )
-        assert _probe() is checks._SanedOutcome.HEALTHY
+        assert _probe() is saned_probe.SanedOutcome.HEALTHY
         read_events = [e for e in recorder.events if e in {"settimeout", "recv"}]
         assert read_events.count("recv") == 8
         for earlier, later in pairwise(read_events):
@@ -1536,7 +1540,7 @@ class TestSanedHandshake:
         """
         answering = _THREE_ADDRESSES[0][4]
         recorder = _install_probe_recorder(monkeypatch, connectable=[answering])
-        assert _probe() is checks._SanedOutcome.HEALTHY
+        assert _probe() is saned_probe.SanedOutcome.HEALTHY
         assert recorder.sent == [INIT_REQUEST, EXIT_REQUEST]
 
     @pytest.mark.parametrize(
@@ -1582,7 +1586,7 @@ class TestSanedHandshake:
             connectable=[answering],
             peer=_PeerScript(reply=reply, send_error=send_error, recv_error=recv_error),
         )
-        assert _probe() is checks._SanedOutcome.REJECTED
+        assert _probe() is saned_probe.SanedOutcome.REJECTED
         assert EXIT_REQUEST not in recorder.sent
 
     def test_a_read_that_times_out_is_timed_out(
@@ -1605,7 +1609,7 @@ class TestSanedHandshake:
             connectable=[answering],
             peer=_PeerScript(recv_error=TimeoutError()),
         )
-        assert _probe() is checks._SanedOutcome.TIMED_OUT
+        assert _probe() is saned_probe.SanedOutcome.TIMED_OUT
 
     def test_a_stop_ends_the_wait_for_a_silent_reply(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1629,23 +1633,23 @@ class TestSanedHandshake:
             peer=_PeerScript(recv_error=TimeoutError()),
         )
         abort = threading.Event()
-        real_handshake = checks._handshake
+        real_handshake = saned_probe._handshake
 
         def _stop_then_handshake(
             sock: socket.socket,
             deadline: float,
             handshake_abort: threading.Event | None,
-        ) -> checks._SanedOutcome:
+        ) -> saned_probe.SanedOutcome:
             abort.set()
             return real_handshake(sock, deadline, handshake_abort)
 
-        monkeypatch.setattr(checks, "_handshake", _stop_then_handshake)
+        monkeypatch.setattr(saned_probe, "_handshake", _stop_then_handshake)
 
-        with pytest.raises(checks._PreProbeAbortedError):
+        with pytest.raises(saned_probe.PreProbeAbortedError):
             _REAL_PROBE_SANED("scanbox.lan", SANED_PORT, 60.0, 60.0, abort)
 
         assert recorder.events.count("recv") == 1
-        assert recorder.timeouts[-1] <= checks._ABORT_POLL_SECONDS
+        assert recorder.timeouts[-1] <= saned_probe._ABORT_POLL_SECONDS
         assert "exit" in recorder.events
 
     def test_a_probe_stopped_before_it_starts_dials_nothing(
@@ -1662,7 +1666,7 @@ class TestSanedHandshake:
         abort = threading.Event()
         abort.set()
 
-        with pytest.raises(checks._PreProbeAbortedError):
+        with pytest.raises(saned_probe.PreProbeAbortedError):
             _REAL_PROBE_SANED("scanbox.lan", SANED_PORT, 60.0, 60.0, abort)
 
         assert recorder.constructions == []
@@ -1683,7 +1687,7 @@ class TestSanedHandshake:
             connectable=[first, second],
             peer=_PeerScript(recv_error=ConnectionResetError()),
         )
-        assert _probe() is checks._SanedOutcome.REJECTED
+        assert _probe() is saned_probe.SanedOutcome.REJECTED
         assert recorder.addresses == [first]
 
 
@@ -1708,11 +1712,11 @@ class TestSanedProbeBound:
 
         """
         spent = _install_probe_recorder(monkeypatch, clock=_SpendingClock(spend=1.0))
-        assert _probe() is checks._SanedOutcome.TIMED_OUT
+        assert _probe() is saned_probe.SanedOutcome.TIMED_OUT
         assert sum(spent.timeouts) <= _PROBE_BUDGET, spent.timeouts
 
         partial = _install_probe_recorder(monkeypatch, clock=_SpendingClock(spend=0.25))
-        assert _probe() is checks._SanedOutcome.REFUSED
+        assert _probe() is saned_probe.SanedOutcome.REFUSED
         assert len(partial.constructions) == 3
         assert all(timeout > 0 for timeout in partial.timeouts), partial.timeouts
         assert all(earlier > later for earlier, later in pairwise(partial.timeouts)), (
@@ -1777,7 +1781,7 @@ class TestSanedProbeBound:
         """
         answering = _THREE_ADDRESSES[1][4]
         recorder = _install_probe_recorder(monkeypatch, connectable=[answering])
-        assert _probe() is checks._SanedOutcome.HEALTHY
+        assert _probe() is saned_probe.SanedOutcome.HEALTHY
         assert recorder.addresses == [_THREE_ADDRESSES[0][4], answering]
         assert recorder.sent == [INIT_REQUEST, EXIT_REQUEST]
 
@@ -1796,7 +1800,7 @@ class TestSanedProbeBound:
         """
         recorder = _install_probe_recorder(monkeypatch)
         _install_a_clock_that_jumps(monkeypatch, [0.0, 0.0, 99.0])
-        assert _probe() is checks._SanedOutcome.TIMED_OUT
+        assert _probe() is saned_probe.SanedOutcome.TIMED_OUT
         assert len(recorder.constructions) == 1
 
     def test_a_resolver_that_returns_nothing_is_unresolved(
@@ -1817,7 +1821,7 @@ class TestSanedProbeBound:
         recorder = _ProbeRecorder()
         monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [])
         monkeypatch.setattr(socket, "socket", recorder.socket)
-        assert _probe() is checks._SanedOutcome.UNRESOLVED
+        assert _probe() is saned_probe.SanedOutcome.UNRESOLVED
         assert recorder.constructions == []
 
     def test_a_resolver_that_raises_is_unresolved(
@@ -1839,7 +1843,7 @@ class TestSanedProbeBound:
             raise socket.gaierror(msg)
 
         monkeypatch.setattr(socket, "getaddrinfo", _fail)
-        assert _probe("scanbox.invalid") is checks._SanedOutcome.UNRESOLVED
+        assert _probe("scanbox.invalid") is saned_probe.SanedOutcome.UNRESOLVED
 
     def test_every_address_refusing_is_refused(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1852,7 +1856,7 @@ class TestSanedProbeBound:
 
         """
         recorder = _install_probe_recorder(monkeypatch)
-        assert _probe() is checks._SanedOutcome.REFUSED
+        assert _probe() is saned_probe.SanedOutcome.REFUSED
         assert len(recorder.addresses) == 3
 
     def test_one_address_timing_out_makes_the_host_timed_out(
@@ -1873,7 +1877,7 @@ class TestSanedProbeBound:
         recorder = _install_probe_recorder(
             monkeypatch, peer=_PeerScript(timeout_addresses=frozenset([silent]))
         )
-        assert _probe() is checks._SanedOutcome.TIMED_OUT
+        assert _probe() is saned_probe.SanedOutcome.TIMED_OUT
         assert len(recorder.addresses) == 3
 
     @pytest.mark.parametrize(
@@ -1906,7 +1910,7 @@ class TestSanedProbeBound:
         recorder = _install_probe_recorder(
             monkeypatch, peer=_PeerScript(connect_errors=((local_only, code),))
         )
-        assert _probe() is checks._SanedOutcome.REFUSED
+        assert _probe() is saned_probe.SanedOutcome.REFUSED
         assert len(recorder.addresses) == 3
 
     def test_an_unreachable_host_still_counts_as_not_answering(
@@ -1928,7 +1932,7 @@ class TestSanedProbeBound:
             monkeypatch,
             peer=_PeerScript(connect_errors=((unreachable, errno.EHOSTUNREACH),)),
         )
-        assert _probe() is checks._SanedOutcome.TIMED_OUT
+        assert _probe() is saned_probe.SanedOutcome.TIMED_OUT
 
     def test_a_host_no_address_of_which_can_be_dialled_is_timed_out(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1951,7 +1955,7 @@ class TestSanedProbeBound:
                 )
             ),
         )
-        assert _probe() is checks._SanedOutcome.TIMED_OUT
+        assert _probe() is saned_probe.SanedOutcome.TIMED_OUT
 
     def test_the_handshake_gets_its_own_budget_after_the_connect(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1971,7 +1975,7 @@ class TestSanedProbeBound:
         _install_probe_recorder(
             monkeypatch, connectable=[answering], clock=_SpendingClock(spend=1.0)
         )
-        assert _probe() is checks._SanedOutcome.HEALTHY
+        assert _probe() is saned_probe.SanedOutcome.HEALTHY
 
 
 _SURFACE_PACKAGES: Final = ("saneless.web", "saneless.cli")
@@ -2675,9 +2679,9 @@ def _without_allowed_spellings(text: str) -> str:
 def _recording_dialler(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    outcome: checks._SanedOutcome = checks._SanedOutcome.HEALTHY,
-    outcomes: Mapping[str, checks._SanedOutcome] | None = None,
-    port_outcomes: Mapping[tuple[str, int], checks._SanedOutcome] | None = None,
+    outcome: saned_probe.SanedOutcome = saned_probe.SanedOutcome.HEALTHY,
+    outcomes: Mapping[str, saned_probe.SanedOutcome] | None = None,
+    port_outcomes: Mapping[tuple[str, int], saned_probe.SanedOutcome] | None = None,
 ) -> list[tuple[str, int]]:
     """
     Replace the saned probe with one that records what it was asked for.
@@ -2708,11 +2712,11 @@ def _recording_dialler(
         _connect_timeout: float,
         _handshake_timeout: float,
         _abort: threading.Event | None = None,
-    ) -> checks._SanedOutcome:
+    ) -> saned_probe.SanedOutcome:
         dialled.append((host, port))
         return per_address.get((host, port), per_host.get(host, outcome))
 
-    monkeypatch.setattr(checks, "_probe_saned", _probe_stub)
+    monkeypatch.setattr(saned_probe, "probe_saned", _probe_stub)
     return dialled
 
 
@@ -2949,7 +2953,7 @@ class TestScannerCheck:
             surface: Which of the two surfaces runs the check.
 
         """
-        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REJECTED)
+        _recording_dialler(monkeypatch, outcome=saned_probe.SanedOutcome.REJECTED)
         backend = _CountingBackend()
         settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
         row = _scanner_row_on(surface, _context(settings, scanner=backend))
@@ -2974,7 +2978,7 @@ class TestScannerCheck:
             surface: Which of the two surfaces runs the check.
 
         """
-        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REJECTED)
+        _recording_dialler(monkeypatch, outcome=saned_probe.SanedOutcome.REJECTED)
         backend = _CountingBackend([_device()])
         settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
         row = _scanner_row_on(surface, _context(settings, scanner=backend))
@@ -2997,7 +3001,7 @@ class TestScannerCheck:
             surface: Which of the two surfaces runs the check.
 
         """
-        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.UNRESOLVED)
+        _recording_dialler(monkeypatch, outcome=saned_probe.SanedOutcome.UNRESOLVED)
         backend = _CountingBackend()
         settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
         row = _scanner_row_on(surface, _context(settings, scanner=backend))
@@ -3026,7 +3030,7 @@ class TestScannerCheck:
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "env-scanbox.lan")
         dialled = _recording_dialler(
-            monkeypatch, outcome=checks._SanedOutcome.UNRESOLVED
+            monkeypatch, outcome=saned_probe.SanedOutcome.UNRESOLVED
         )
         settings = _with_device(_settings(tmp_path, host="cfg-scanbox.lan"), "")
         row = _scanner_row_on(surface, _context(settings, scanner=_CountingBackend()))
@@ -3056,7 +3060,7 @@ class TestScannerCheck:
             surface: Which of the two surfaces runs the check.
 
         """
-        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT)
+        _recording_dialler(monkeypatch, outcome=saned_probe.SanedOutcome.TIMED_OUT)
         backend = _CountingBackend()
         settings = _with_device(
             _settings(tmp_path, host="scanbox.lan"), _LOCAL_DEVICE_ID
@@ -3083,7 +3087,7 @@ class TestScannerCheck:
             surface: Which of the two surfaces runs the check.
 
         """
-        _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REFUSED)
+        _recording_dialler(monkeypatch, outcome=saned_probe.SanedOutcome.REFUSED)
         backend = _CountingBackend()
         settings = _with_device(
             _settings(tmp_path, host="scanbox.lan"), _LOCAL_DEVICE_ID
@@ -3130,7 +3134,7 @@ class TestScannerCheck:
         """
         host, expected_dials = setting
         dialled = _recording_dialler(
-            monkeypatch, outcomes={"scanbox.lan": checks._SanedOutcome.TIMED_OUT}
+            monkeypatch, outcomes={"scanbox.lan": saned_probe.SanedOutcome.TIMED_OUT}
         )
         backend = _CountingBackend()
         settings = _settings(tmp_path, host=host)
@@ -3181,7 +3185,7 @@ class TestScannerCheck:
         """
         host, expected_dials = setting
         dialled = _recording_dialler(
-            monkeypatch, outcomes={"scanbox.lan": checks._SanedOutcome.REFUSED}
+            monkeypatch, outcomes={"scanbox.lan": saned_probe.SanedOutcome.REFUSED}
         )
         backend = _CountingBackend()
         settings = _settings(tmp_path, host=host)
@@ -3221,15 +3225,15 @@ class TestScannerCheck:
     @pytest.mark.parametrize(
         ("outcome", "entered"),
         [
-            pytest.param(checks._SanedOutcome.REFUSED, 1, id="refused"),
-            pytest.param(checks._SanedOutcome.TIMED_OUT, 0, id="timed-out"),
+            pytest.param(saned_probe.SanedOutcome.REFUSED, 1, id="refused"),
+            pytest.param(saned_probe.SanedOutcome.TIMED_OUT, 0, id="timed-out"),
         ],
     )
     def test_a_configured_net_device_is_probed_on_the_port_libsane_dials(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        outcome: checks._SanedOutcome,
+        outcome: saned_probe.SanedOutcome,
         entered: int,
         surface: str,
     ) -> None:
@@ -3535,8 +3539,8 @@ class TestScannerCheck:
             listening_port: A loopback port that listens and never answers.
 
         """
-        monkeypatch.setattr(checks, "PROBE_CONNECT_SECONDS", _PROBE_BUDGET)
-        monkeypatch.setattr(checks, "PROBE_HANDSHAKE_SECONDS", _PROBE_BUDGET)
+        monkeypatch.setattr(saned_probe, "PROBE_CONNECT_SECONDS", _PROBE_BUDGET)
+        monkeypatch.setattr(saned_probe, "PROBE_HANDSHAKE_SECONDS", _PROBE_BUDGET)
         backend = _CountingBackend([_device()])
         settings = _with_device(
             _settings(tmp_path, host=f"127.0.0.1:{listening_port}"), ""
@@ -3581,8 +3585,8 @@ class TestScannerCheck:
         _recording_dialler(
             monkeypatch,
             outcomes={
-                "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
-                "scanbox-b.lan": checks._SanedOutcome.TIMED_OUT,
+                "scanbox-a.lan": saned_probe.SanedOutcome.HEALTHY,
+                "scanbox-b.lan": saned_probe.SanedOutcome.TIMED_OUT,
             },
         )
         backend = _CountingBackend([_device()])
@@ -3594,17 +3598,17 @@ class TestScannerCheck:
     @pytest.mark.parametrize(
         "outcome",
         [
-            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
-            pytest.param(checks._SanedOutcome.REJECTED, id="rejected"),
-            pytest.param(checks._SanedOutcome.UNRESOLVED, id="unresolved"),
-            pytest.param(checks._SanedOutcome.HEALTHY, id="healthy"),
+            pytest.param(saned_probe.SanedOutcome.REFUSED, id="refused"),
+            pytest.param(saned_probe.SanedOutcome.REJECTED, id="rejected"),
+            pytest.param(saned_probe.SanedOutcome.UNRESOLVED, id="unresolved"),
+            pytest.param(saned_probe.SanedOutcome.HEALTHY, id="healthy"),
         ],
     )
     def test_hosts_that_cannot_hang_libsane_are_enumerated(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        outcome: checks._SanedOutcome,
+        outcome: saned_probe.SanedOutcome,
     ) -> None:
         """
         Refused, rejected, unresolved and healthy hosts go on to ``get_devices()``.
@@ -3749,7 +3753,7 @@ class TestScannerCheck:
         if environment is not None:
             monkeypatch.setenv("SANE_NET_HOSTS", environment)
         settings = _settings(tmp_path, host="cfg-host")
-        assert checks._saned_host_setting(settings) == effective_sane_net_hosts(
+        assert saned_probe.saned_host_setting(settings) == effective_sane_net_hosts(
             "cfg-host"
         )
 
@@ -3758,15 +3762,15 @@ class TestScannerCheck:
         [
             pytest.param(
                 "scanbox.lan",
-                {"scanbox.lan": checks._SanedOutcome.TIMED_OUT},
+                {"scanbox.lan": saned_probe.SanedOutcome.TIMED_OUT},
                 (_TIMED_OUT_MESSAGE, _TIMED_OUT_NEXT_STEP),
                 id="one-timed-out",
             ),
             pytest.param(
                 _TWO_HOSTS,
                 {
-                    "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
-                    "scanbox-b.lan": checks._SanedOutcome.TIMED_OUT,
+                    "scanbox-a.lan": saned_probe.SanedOutcome.HEALTHY,
+                    "scanbox-b.lan": saned_probe.SanedOutcome.TIMED_OUT,
                 },
                 (
                     "1 of 2 scanner hosts is not answering, "
@@ -3778,8 +3782,8 @@ class TestScannerCheck:
             pytest.param(
                 _TWO_HOSTS,
                 {
-                    "scanbox-a.lan": checks._SanedOutcome.REFUSED,
-                    "scanbox-b.lan": checks._SanedOutcome.TIMED_OUT,
+                    "scanbox-a.lan": saned_probe.SanedOutcome.REFUSED,
+                    "scanbox-b.lan": saned_probe.SanedOutcome.TIMED_OUT,
                 },
                 (
                     "1 of 2 scanner hosts is not answering, "
@@ -3795,7 +3799,7 @@ class TestScannerCheck:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         host: str,
-        outcomes: dict[str, checks._SanedOutcome],
+        outcomes: dict[str, saned_probe.SanedOutcome],
         expected: tuple[str, str],
     ) -> None:
         """
@@ -3827,15 +3831,15 @@ class TestScannerCheck:
         [
             pytest.param(
                 "scanbox.lan",
-                {"scanbox.lan": checks._SanedOutcome.REFUSED},
+                {"scanbox.lan": saned_probe.SanedOutcome.REFUSED},
                 "the scanner host",
                 id="one-refused",
             ),
             pytest.param(
                 _TWO_HOSTS,
                 {
-                    "scanbox-a.lan": checks._SanedOutcome.HEALTHY,
-                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                    "scanbox-a.lan": saned_probe.SanedOutcome.HEALTHY,
+                    "scanbox-b.lan": saned_probe.SanedOutcome.REFUSED,
                 },
                 "1 of 2 scanner hosts",
                 id="healthy-and-refused",
@@ -3843,8 +3847,8 @@ class TestScannerCheck:
             pytest.param(
                 _TWO_HOSTS,
                 {
-                    "scanbox-a.lan": checks._SanedOutcome.REFUSED,
-                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                    "scanbox-a.lan": saned_probe.SanedOutcome.REFUSED,
+                    "scanbox-b.lan": saned_probe.SanedOutcome.REFUSED,
                 },
                 "2 of 2 scanner hosts",
                 id="both-refused",
@@ -3852,8 +3856,8 @@ class TestScannerCheck:
             pytest.param(
                 _TWO_HOSTS,
                 {
-                    "scanbox-a.lan": checks._SanedOutcome.REJECTED,
-                    "scanbox-b.lan": checks._SanedOutcome.REFUSED,
+                    "scanbox-a.lan": saned_probe.SanedOutcome.REJECTED,
+                    "scanbox-b.lan": saned_probe.SanedOutcome.REFUSED,
                 },
                 "1 of 2 scanner hosts",
                 id="rejected-and-refused",
@@ -3865,7 +3869,7 @@ class TestScannerCheck:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         host: str,
-        outcomes: dict[str, checks._SanedOutcome],
+        outcomes: dict[str, saned_probe.SanedOutcome],
         hosts_subject: str,
     ) -> None:
         """
@@ -3912,7 +3916,10 @@ class TestScannerCheck:
 
         """
         rows = []
-        for outcome in (checks._SanedOutcome.TIMED_OUT, checks._SanedOutcome.REFUSED):
+        for outcome in (
+            saned_probe.SanedOutcome.TIMED_OUT,
+            saned_probe.SanedOutcome.REFUSED,
+        ):
             _recording_dialler(monkeypatch, outcome=outcome)
             settings = _with_device(_settings(tmp_path, host="scanbox.lan"), "")
             rows.append(
@@ -3965,7 +3972,7 @@ class TestScannerCheck:
         produces: a ``ValueError`` from it would reach ``run_checks``' generic
         handler, turn the run FAIL and make ``saneless doctor`` exit 2 on a
         working appliance.  The setting goes in ``SANE_NET_HOSTS``, which
-        ``_saned_host_setting`` prefers and a container operator would use.
+        ``saned_probe.saned_host_setting`` prefers and a container operator would use.
 
         Args:
             tmp_path: The test's own directory.
@@ -3987,8 +3994,8 @@ class TestScannerCheck:
     @pytest.mark.parametrize(
         "outcome",
         [
-            pytest.param(checks._SanedOutcome.TIMED_OUT, id="timed-out"),
-            pytest.param(checks._SanedOutcome.REFUSED, id="refused"),
+            pytest.param(saned_probe.SanedOutcome.TIMED_OUT, id="timed-out"),
+            pytest.param(saned_probe.SanedOutcome.REFUSED, id="refused"),
         ],
     )
     @pytest.mark.parametrize(
@@ -4005,7 +4012,7 @@ class TestScannerCheck:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         hosts: tuple[str | None, str],
-        outcome: checks._SanedOutcome,
+        outcome: saned_probe.SanedOutcome,
     ) -> None:
         """
         A LAN address never reaches a LAN-visible page through this row.
@@ -4218,11 +4225,11 @@ class TestScannerCheckMultipleDevices:
         assert row.message == "Brother ADS-2700W is ready."
 
 
-_HEALTHY: Final = checks._SanedOutcome.HEALTHY
-_REJECTED: Final = checks._SanedOutcome.REJECTED
-_UNRESOLVED: Final = checks._SanedOutcome.UNRESOLVED
-_REFUSED: Final = checks._SanedOutcome.REFUSED
-_TIMED_OUT: Final = checks._SanedOutcome.TIMED_OUT
+_HEALTHY: Final = saned_probe.SanedOutcome.HEALTHY
+_REJECTED: Final = saned_probe.SanedOutcome.REJECTED
+_UNRESOLVED: Final = saned_probe.SanedOutcome.UNRESOLVED
+_REFUSED: Final = saned_probe.SanedOutcome.REFUSED
+_TIMED_OUT: Final = saned_probe.SanedOutcome.TIMED_OUT
 
 _REJECTED_NEXT: Final = (
     "Add this machine to saned.conf on the scanner host, then press Check again."
@@ -4274,8 +4281,8 @@ _UNLISTED_ESCL_ID: Final = "escl:http://10.0.0.5:80"
 
 
 def _hp(
-    host: str, outcome: checks._SanedOutcome, port: int = SANED_PORT
-) -> checks._HostProbe:
+    host: str, outcome: saned_probe.SanedOutcome, port: int = SANED_PORT
+) -> saned_probe.HostProbe:
     """
     Build what one configured host's probe found.
 
@@ -4288,7 +4295,7 @@ def _hp(
         The probe result the verdict reads.
 
     """
-    return checks._HostProbe(host, outcome, port)
+    return saned_probe.HostProbe(host, outcome, port)
 
 
 def _unlabelled_device() -> DeviceInfo:
@@ -4326,7 +4333,7 @@ class _VerdictCase:
 
     """
 
-    probes: tuple[checks._HostProbe, ...]
+    probes: tuple[saned_probe.HostProbe, ...]
     devices: tuple[DeviceInfo, ...]
     configured: str
     opened: bool | None
@@ -5029,7 +5036,7 @@ class TestScannerVerdict:
         ],
     )
     def test_a_ready_row_says_but_once(
-        self, probes: tuple[checks._HostProbe, ...], message: str
+        self, probes: tuple[saned_probe.HostProbe, ...], message: str
     ) -> None:
         """
         A usable scanner beside a host problem is one sentence with one "but".
@@ -5159,7 +5166,7 @@ class TestScannerVerdict:
         ],
     )
     def test_only_a_timed_out_host_keeps_the_check_out_of_libsane(
-        self, outcome: checks._SanedOutcome, *, blocks: bool
+        self, outcome: saned_probe.SanedOutcome, *, blocks: bool
     ) -> None:
         """
         Every outcome but a silent host returns at once inside libsane.
@@ -5169,7 +5176,7 @@ class TestScannerVerdict:
             blocks: Whether that outcome keeps the check out of libsane.
 
         """
-        assert checks._blocks_enumeration(outcome) is blocks
+        assert saned_probe.blocks_enumeration(outcome) is blocks
 
     def test_an_enumeration_records_no_open_by_default(self) -> None:
         """No open was attempted unless the caller says one was."""
@@ -5204,7 +5211,7 @@ class TestScannerVerdict:
             expected: The host entry, or ``None`` for an id that names none.
 
         """
-        assert checks._net_device_entry(device_id) == expected
+        assert saned_probe.net_device_entry(device_id) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -5322,8 +5329,8 @@ def _short_probe_budgets(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch: pytest's attribute patcher.
 
     """
-    monkeypatch.setattr(checks, "PROBE_CONNECT_SECONDS", _PROBE_BUDGET)
-    monkeypatch.setattr(checks, "PROBE_HANDSHAKE_SECONDS", _PROBE_BUDGET)
+    monkeypatch.setattr(saned_probe, "PROBE_CONNECT_SECONDS", _PROBE_BUDGET)
+    monkeypatch.setattr(saned_probe, "PROBE_HANDSHAKE_SECONDS", _PROBE_BUDGET)
 
 
 @pytest.mark.usefixtures("_short_probe_budgets")
@@ -5505,7 +5512,7 @@ class TestScannerCheckAgainstAFakeSaned:
         """
         caplog.set_level(logging.DEBUG)
         port = _closed_port()
-        monkeypatch.setattr(checks, "SANED_PORT", port)
+        monkeypatch.setattr(saned_probe, "SANED_PORT", port)
         settings = _with_device(
             _healthy_settings(tmp_path, host=""), "net:127.0.0.1:brother5:bus0;dev1"
         )
@@ -5667,7 +5674,7 @@ class TestScannerCheckAgainstAFakeSaned:
             socket.socket(socket.AF_INET, socket.SOCK_STREAM) as refusing,
         ):
             refusing.bind(("127.0.0.2", fake.port))
-            monkeypatch.setattr(checks, "SANED_PORT", fake.port)
+            monkeypatch.setattr(saned_probe, "SANED_PORT", fake.port)
             settings = _with_device(
                 _healthy_settings(tmp_path, host="127.0.0.1:127.0.0.2"), ""
             )
@@ -6972,7 +6979,10 @@ class _GateSamplingOpenBackend(_GateSamplingBackend):
 
 
 def _gate_sampling_dialler(
-    monkeypatch: pytest.MonkeyPatch, probe: _GateProbe, *, outcome: checks._SanedOutcome
+    monkeypatch: pytest.MonkeyPatch,
+    probe: _GateProbe,
+    *,
+    outcome: saned_probe.SanedOutcome,
 ) -> list[tuple[str, int]]:
     """
     Replace the saned dialler with one that samples the gate before answering.
@@ -6998,12 +7008,12 @@ def _gate_sampling_dialler(
         _connect_timeout: float,
         _handshake_timeout: float,
         _abort: threading.Event | None = None,
-    ) -> checks._SanedOutcome:
+    ) -> saned_probe.SanedOutcome:
         dialled.append((host, port))
         probe.sample("pre-probe")
         return outcome
 
-    monkeypatch.setattr(checks, "_probe_saned", _probe_stub)
+    monkeypatch.setattr(saned_probe, "probe_saned", _probe_stub)
     return dialled
 
 
@@ -7084,12 +7094,12 @@ _GATED_CONTEXTS = (
 # What the stubbed dialler answers in each context; any context not named here
 # is answered as healthy.  ``no-python-sane`` never reaches the dialler, and it
 # is given the outcome that would stop the check if it did.
-_GATED_DIALLER_OUTCOMES: Final[Mapping[str, checks._SanedOutcome]] = {
-    "no-python-sane": checks._SanedOutcome.TIMED_OUT,
-    "refused": checks._SanedOutcome.REFUSED,
-    "timed-out": checks._SanedOutcome.TIMED_OUT,
-    "rejected": checks._SanedOutcome.REJECTED,
-    "unresolved": checks._SanedOutcome.UNRESOLVED,
+_GATED_DIALLER_OUTCOMES: Final[Mapping[str, saned_probe.SanedOutcome]] = {
+    "no-python-sane": saned_probe.SanedOutcome.TIMED_OUT,
+    "refused": saned_probe.SanedOutcome.REFUSED,
+    "timed-out": saned_probe.SanedOutcome.TIMED_OUT,
+    "rejected": saned_probe.SanedOutcome.REJECTED,
+    "unresolved": saned_probe.SanedOutcome.UNRESOLVED,
 }
 
 
@@ -7213,7 +7223,7 @@ class TestScannerRowGuards:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        outcomes: dict[str, checks._SanedOutcome],
+        outcomes: dict[str, saned_probe.SanedOutcome],
         devices: list[DeviceInfo],
         surface: str,
     ) -> None:
@@ -7474,7 +7484,7 @@ class TestRunChecksUnderTheScannerGate:
         gate = _RecordingLock()
         probe = _GateProbe(gate)
         dialled = _gate_sampling_dialler(
-            monkeypatch, probe, outcome=checks._SanedOutcome.HEALTHY
+            monkeypatch, probe, outcome=saned_probe.SanedOutcome.HEALTHY
         )
         backend = _GateSamplingBackend(probe, [_device()])
         results = run_checks(
@@ -7504,7 +7514,9 @@ class TestRunChecksUnderTheScannerGate:
         """
         gate = _RecordingLock()
         probe = _GateProbe(gate)
-        _gate_sampling_dialler(monkeypatch, probe, outcome=checks._SanedOutcome.HEALTHY)
+        _gate_sampling_dialler(
+            monkeypatch, probe, outcome=saned_probe.SanedOutcome.HEALTHY
+        )
         backend = _GateSamplingOpenBackend(probe, [_device()])
         settings = _with_device(_settings(tmp_path, host="scanbox"), _LOCAL_DEVICE_ID)
         results = run_checks(
@@ -7536,7 +7548,7 @@ class TestRunChecksUnderTheScannerGate:
         gate = _RecordingLock()
         backend = _CountingBackend([_device()])
         dialled = _recording_dialler(
-            monkeypatch, outcome=checks._SanedOutcome.TIMED_OUT
+            monkeypatch, outcome=saned_probe.SanedOutcome.TIMED_OUT
         )
         results = run_checks(
             _context(_settings(tmp_path, host=_DEVICE_HOST), scanner=backend),
@@ -7564,7 +7576,9 @@ class TestRunChecksUnderTheScannerGate:
         """
         gate = _RecordingLock()
         backend = _CountingBackend([_device()])
-        dialled = _recording_dialler(monkeypatch, outcome=checks._SanedOutcome.REFUSED)
+        dialled = _recording_dialler(
+            monkeypatch, outcome=saned_probe.SanedOutcome.REFUSED
+        )
         results = run_checks(
             _context(_settings(tmp_path, host=_DEVICE_HOST), scanner=backend),
             scanner_gate=cast("threading.Lock", gate),
@@ -8658,19 +8672,19 @@ _STRIP_WORDING: Final = (
         id="check-failed",
     ),
     pytest.param(
-        lambda: checks._host_problem_next_step(checks._SanedOutcome.TIMED_OUT),
+        lambda: checks._host_problem_next_step(saned_probe.SanedOutcome.TIMED_OUT),
         "Check the scanner host is switched on and on the network, "
         "then press Check again.",
         id="saned-timed-out",
     ),
     pytest.param(
-        lambda: checks._host_problem_next_step(checks._SanedOutcome.REFUSED),
+        lambda: checks._host_problem_next_step(saned_probe.SanedOutcome.REFUSED),
         "Start saned on the scanner host, or check it is listening on the "
         "network, then press Check again.",
         id="saned-refused",
     ),
     pytest.param(
-        lambda: checks._host_problem_next_step(checks._SanedOutcome.UNRESOLVED),
+        lambda: checks._host_problem_next_step(saned_probe.SanedOutcome.UNRESOLVED),
         "Check the host name in [scanner] host or [scanner] device, or in "
         "SANE_NET_HOSTS if that is set. If you fixed the name in DNS or the "
         "hosts file, press Check again; if you changed a setting, restart "
@@ -8678,7 +8692,7 @@ _STRIP_WORDING: Final = (
         id="saned-unresolved",
     ),
     pytest.param(
-        lambda: checks._host_problem_next_step(checks._SanedOutcome.REJECTED),
+        lambda: checks._host_problem_next_step(saned_probe.SanedOutcome.REJECTED),
         "Add this machine to saned.conf on the scanner host, then press Check again.",
         id="saned-rejected",
     ),

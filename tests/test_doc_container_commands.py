@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from saneless.checks import SANED_PORT
+from saneless.scanner.saned_probe import SANED_PORT
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
