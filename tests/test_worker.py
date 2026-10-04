@@ -97,7 +97,7 @@ from tests.test_scan_child import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator
     from unittest.mock import MagicMock
 
     from saneless.pipeline import PipelineRequest
@@ -8534,7 +8534,7 @@ class _SlowToStopScanner(StubScannerBackend):
     @contextlib.contextmanager
     def _session(
         self, abort: threading.Event | None, live: threading.Event | None
-    ) -> Iterator[None]:
+    ) -> Generator[None]:
         """
         Hold the session open, with ``live`` set when the double says so.
 

@@ -33,6 +33,7 @@ from .pipeline import (
     run_pipeline,
 )
 from .scan_metadata import ScanMetadata
+from .scanner import scan_child
 from .startup_profiles import StartupProfiles
 from .vocabulary import (
     ACTIVE_STATES,
@@ -70,6 +71,7 @@ __all__ = [
     "ScanWorker",
     "WorkerFlipCoordinator",
     "WorkerPassCoordinator",
+    "scan_child_join_seconds",
 ]
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,24 @@ STOP_JOIN_SECONDS: Final = 5.0
 # discards /tmp.  The shipped compose
 # file's stop_grace_period covers both waits.  Read at call time.
 PRESERVATION_JOIN_SECONDS: Final = 60.0
+
+# How much longer than the scan child's cancel grace stop() waits while a job
+# has a scan child: the time to kill a child that ignored the cancel, reap it
+# and let the job's pages be handed to preservation.  The grace itself is
+# read from scan_child at call time, so the two stay in step.
+_CHILD_REAP_MARGIN_SECONDS: Final = 2.0
+
+
+def scan_child_join_seconds() -> float:
+    """
+    Say how much longer stop() waits while the current job has a scan child.
+
+    Returns:
+        The scan child's cancel grace, read now, plus the reaping margin.
+
+    """
+    return scan_child.CANCEL_GRACE_SECONDS + _CHILD_REAP_MARGIN_SECONDS
+
 
 # The idle loop's queue.get() timeout: how often an idle worker gets a turn
 # for housekeeping.  stop() does not rely on it, because the queue shutdown
@@ -691,6 +711,11 @@ class ScanWorker:
         # to decide whether to wait longer, so an Event.  One per worker,
         # cleared as each job starts.
         self._preserving = threading.Event()
+        # Set by the scanner backend, on the worker thread, while the current
+        # job has a scan child running, and read by stop() on the lifespan's
+        # thread to decide whether to wait for that child to be stopped and
+        # reaped.  One per worker; the backend clears it after every reap.
+        self._scan_child_live = threading.Event()
 
     def start(self) -> None:
         """Start the worker thread."""
@@ -799,8 +824,10 @@ class ScanWorker:
 
         Stopping sets a flag and shuts the queue down; it never enqueues
         anything, so a full queue cannot hold it.  Jobs still queued are
-        abandoned on purpose, and so is a scan inside a SANE read: their rows
-        stay active and the next startup's recovery fails them.  An open flip
+        abandoned on purpose: their rows stay active and the next startup's
+        recovery fails them.  The flag is the running scan's abort, so a scan
+        inside a page read is cancelled through its scan child, which is
+        killed if it does not stop within the cancel grace.  An open flip
         wait is answered with ``INTERRUPTED``, and one not yet reached is
         pre-answered, so a manual-duplex job lets the thread go as soon as it
         is at the prompt.  A multi-page prompt is answered the same way,
@@ -809,12 +836,15 @@ class ScanWorker:
         records the restart.
 
         The join is bounded by ``STOP_JOIN_SECONDS``.  If the thread is still
-        running then because the job is keeping its pages -- under Docker a
-        copy from ``/tmp`` to the data volume, which a large pass can make
-        slow -- the join is extended once, by up to
-        ``PRESERVATION_JOIN_SECONDS``, so the process does not exit half way
-        through the copy.  A thread busy with anything else, such as a scan
-        inside a SANE read, gets no extension.
+        running then while the job has a scan child, the join is extended by
+        up to the scan child's cancel grace plus a reaping margin, so the
+        child is cancelled or killed, and reaped, before the server exits.
+        If the thread is still running after that because the job is keeping
+        its pages -- under Docker a copy from ``/tmp`` to the data volume,
+        which a large pass can make slow -- the join is extended once more,
+        by up to ``PRESERVATION_JOIN_SECONDS``, so the process does not exit
+        half way through the copy.  A thread busy with anything else gets no
+        extension.
 
         When this returns ``False`` the thread is still running and may still
         write to the job store, so the caller must leave the store and the
@@ -843,6 +873,13 @@ class ScanWorker:
             pass_coordinator.interrupt_for_shutdown()
         if self._thread.is_alive():
             self._thread.join(timeout=STOP_JOIN_SECONDS)
+        if self._thread.is_alive() and self._scan_child_live.is_set():
+            child_wait = scan_child_join_seconds()
+            logger.info(
+                "Waiting up to %s s more while the scan's child process is stopped",
+                child_wait,
+            )
+            self._thread.join(timeout=child_wait)
         if self._thread.is_alive() and self._preserving.is_set():
             logger.info(
                 "Waiting up to %s s more while a stopped scan's pages are kept",
@@ -1881,22 +1918,21 @@ class ScanWorker:
                 pass_coordinator=pass_coordinator,
                 device_memory=self._device_memory,
                 preserving=self._preserving,
+                abort=self._stopping,
+                scan_child_live=self._scan_child_live,
                 metadata_lookup=self._metadata_lookup,
             ),
         )
         try:
             # The gate covers the whole pipeline call, the flip wait included:
             # a manual-duplex job spends most of its life there with the device
-            # open.  The release happens before the except blocks run.
+            # open.  The release happens before the except blocks run, and
+            # after the job's scan child has been reaped.
             #
-            # Each job restarts SANE first: after a saned restart the net
-            # backend keeps using the dropped control connection, and every
-            # later open fails until SANE is restarted (backend/net.c,
-            # sane_open).  Under the gate no handle of this process is open:
-            # the previous job closed its handles before releasing it.
+            # Each job's scan child starts SANE afresh, so a saned restart
+            # between jobs needs no restart here.
             with self._scanner_gate:
                 self._refuse_to_start_while_stopping()
-                self._scanner.reinitialise()
                 result = run_pipeline(
                     self._scanner,
                     self._paperless,

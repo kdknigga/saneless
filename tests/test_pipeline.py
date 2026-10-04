@@ -138,7 +138,7 @@ from tests.multi_page_support import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
     from types import ModuleType
     from typing import BinaryIO
 
@@ -8614,7 +8614,7 @@ class _SessionSpanScanner(DistinctPageScanner):
         return self._logged_session()
 
     @contextlib.contextmanager
-    def _logged_session(self) -> Iterator[None]:
+    def _logged_session(self) -> Generator[None]:
         """
         Log the session's entry, then its exit however the block ends.
 

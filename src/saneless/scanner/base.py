@@ -567,9 +567,9 @@ class ScannerBackend(ABC):
         """
         Restart the library this backend drives, before a later pass.
 
-        Called at the top of each scan job, and again before every pass of a
-        multi-page scan after the first, never with a device handle open.  The
-        second pass of a manual-duplex scan does not call it.
+        Called before every pass of a multi-page scan after the first, inside
+        the job's scan session and never with a device handle open.  The second
+        pass of a manual-duplex scan does not call it.
 
         The default does nothing. ``SaneBackend`` overrides it to restart SANE
         inside the job's scan child, so a later pass starts from a fresh
