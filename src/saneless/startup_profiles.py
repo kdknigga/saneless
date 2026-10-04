@@ -49,23 +49,11 @@ def _profiles_after_persist(
     """
     Choose the profiles to use in memory, matching what a restart will load.
 
-    ``write_profiles_to_config`` never touches a same-name profile without
-    ``auto_generated = true``, and start-up generation never forces, so a flagged one
-    is skipped too.  A file that spells out a bare ``[profiles.default]``
-    therefore keeps it.  Swapping the generated ``default`` into memory anyway
-    would give this run one ``default`` and every later run another.
-
-    Args:
-        loaded: The bare default profile set the settings were loaded with.
-        generated: The profiles generated from the scanner.
-        result: What the write did to the config file, or ``None`` when
-            nothing was persisted and the generated set is for this run only.
-
-    Returns:
-        A new dict: the generated set when nothing was persisted, otherwise
-        each generated profile that was persisted, with the loaded profile
-        kept for every name the write did not persist.
-
+    With no ``result`` the generated set is used for this run only.
+    Otherwise each name takes the generated profile if the write persisted
+    it, and the loaded one if not: the write keeps a same-name profile the
+    file already defines, and using the generated one anyway would give this
+    run one ``default`` and every later run another.
     """
     if result is None:
         return dict(generated)
@@ -85,11 +73,8 @@ class StartupProfiles:
     """
     Generate profiles from the scanner once, and say where they are kept.
 
-    Every dependency is injected: the settings the profiles are generated for
-    and written through, the scanner backend they are read from, and the
-    scanner gate the read holds.  It holds no worker state; :meth:`run`
-    returns the profiles to apply and the storage outcome, and the worker
-    records both.
+    It holds no worker state: :meth:`run` returns the profiles to apply and
+    the storage outcome, and the worker records both.
 
     Args:
         settings: The application settings, read for the configured device,
@@ -136,9 +121,7 @@ class StartupProfiles:
         are used in memory too (WARNING).  Nothing is ever written to a path
         worked out afresh here.
 
-        Memory matches what the file will load after a restart.  When the file
-        already defines ``default``, the write keeps it, so the loaded
-        ``default`` is kept in memory too rather than the generated one.
+        Memory matches what the file will load after a restart.
 
         Args:
             loaded: The profiles the settings currently hold.
@@ -151,15 +134,12 @@ class StartupProfiles:
 
         """
         if not bare:
-            # Nothing was generated, so nothing was persisted -- but the
-            # profiles in hand came from the loaded file, and the Profiles row
-            # must not tell a household member they are in memory and lost on
-            # restart when they are in the file they just edited.
+            # The profiles in hand came from the loaded file, so the Profiles
+            # row must not call them in-memory.
             return None, profile_storage_for_loaded(self._settings)
         profiles = self._read()
         if profiles is None:
-            # A SANE failure during generation leaves the loaded profiles in
-            # place; they are no more in-memory than they were a moment ago.
+            # The loaded profiles stay, stored wherever they were before.
             return None, profile_storage_for_loaded(self._settings)
         result, storage = self._persist(profiles)
         return _profiles_after_persist(loaded, profiles, result), storage
@@ -174,29 +154,12 @@ class StartupProfiles:
 
         """
         try:
-            # Gated for the same reason _scan_job is, and it is a real second
-            # entry into SANE rather than a precaution.  get_devices() lists in
-            # a short-lived child process that holds the gate for its whole
-            # life, so the gate still keeps a probe from overlapping it; and
-            # get_capabilities() opens the device in this process and reads its
-            # option list.  Held across both, because a probe slipping between
-            # them is inside SANE just as surely as one during either.
+            # Both calls enter SANE, so the gate is held across them and the
+            # gap between them.  This runs once, before any job, so the gate is
+            # never already held by this thread and SANE needs no restart.
             #
-            # No restart of SANE here, unlike the top of every job: this runs
-            # once, before any job, on the SANE the backend's constructor has
-            # only just started, so there is no stale connection to clear.
-            #
-            # No re-entrancy hazard: this runs once, as the worker thread's
-            # first act, strictly before any job -- so the gate is never
-            # already held by this thread when it arrives here.
-            #
-            # That same fact makes this the health checks' one known gate
-            # contender with no scan anywhere in sight: _current_job_id is
-            # still None here, and the lifespan starts the refresher right
-            # after the worker, so this window is exactly the cold-start poll's
-            # window.  A check that loses this gate has therefore *not* lost it
-            # to a scan and must not report one -- which is why checks.py has
-            # _scanner_busy() beside _scanner_skipped().
+            # A health check that loses the gate here has not lost it to a scan,
+            # so the checks report the scanner busy, not a scan running.
             with self._scanner_gate:
                 devices = self._scanner.get_devices()
                 if not devices:
@@ -208,9 +171,7 @@ class StartupProfiles:
                 caps = self._scanner.get_capabilities(device_id)
             return generate_profiles(caps, device_type_of(devices, device_id))
         except Exception as exc:
-            # The exception class is named, never interpreted.  The old
-            # message blamed the network for every failure, a parse error
-            # included, and sent operators after faults that were not there.
+            # The exception class is named, never interpreted.
             logger.warning(
                 "Auto-profiles: could not read scanner capabilities (%s); keeping "
                 "the bare default profile. Restart saneless or run "
@@ -224,20 +185,10 @@ class StartupProfiles:
         """
         Say why the generated profiles were not written, naming the real reason.
 
-        Two situations end up here and they want different sentences.  Usually
-        nothing was found and the fix is to create a file, so the message
-        lists the places that were looked at.  But a file under the superseded
-        name sitting in one of those directories is also "nothing loaded", and
-        telling that operator to create a file -- while naming the very
-        directory the file they already wrote is in, without mentioning it --
-        is how one appliance came to report four symptoms and no cause.
-
-        The state comes from ``config_file_state``, the same derivation the
-        startup log, the Configuration row, ``doctor`` and the CLI read, so
-        this message cannot come to disagree with them.  Nothing is written
-        and the superseded-name file is only named: a rename is the operator's
-        to make, and doing it for them would be this process deciding which of
-        two files holds the configuration.
+        A file under the superseded name is named, not renamed: which of two
+        files holds the configuration is the operator's call.  Otherwise the
+        message lists the places that were searched.  The state comes from
+        ``config_file_state``, so this agrees with every other report of it.
         """
         discovery = self._settings.config_discovery
         if (
@@ -253,9 +204,8 @@ class StartupProfiles:
                 CONFIG_FILENAME,
             )
             return
-        # The recorded search when there is one, so the list is what this
-        # process actually looked at rather than what a fresh call would
-        # return; settings built directly carry no recording and fall back.
+        # The recorded search is what this process actually looked at;
+        # settings built directly carry none and fall back.
         searched = (
             tuple(absolute_or_as_spelled(path) for path in discovery.searched)
             if discovery is not None
@@ -306,10 +256,8 @@ class StartupProfiles:
             )
             return None, ProfileStorage.IN_MEMORY_UNWRITABLE
         except Exception as exc:
-            # Anything else -- a tomlkit container error, say; a parse or UTF-8
-            # failure is already a ConfigError -- must not throw away the
-            # generated profiles either.  Unexpected, so the traceback is
-            # logged too; the exception class is named, never interpreted.
+            # Anything else must not throw away the generated profiles either.
+            # Unexpected, so the traceback is logged too.
             logger.warning(
                 "Auto-profiles: could not write %s (%s); the generated "
                 "profiles are used for this run only and will not survive a "
@@ -318,9 +266,6 @@ class StartupProfiles:
                 type(exc).__name__,
                 exc_info=True,
             )
-            # The same outcome as the branch above, and deliberately so: two
-            # causes, one fact.  A file was loaded, and the profiles did not
-            # reach it.  The row says that; the log says why.
             return None, ProfileStorage.IN_MEMORY_UNWRITABLE
         logger.info(
             "Auto-profiles: %s: %s",

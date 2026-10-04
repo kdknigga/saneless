@@ -1,9 +1,8 @@
 """
 Background worker thread consuming scan jobs from a queue.
 
-The ScanWorker runs a daemon thread that processes Job objects
-submitted via a queue.Queue, updating job state through the
-JobStore as the pipeline progresses.
+``ScanWorker`` runs one daemon thread that takes jobs off a bounded queue,
+runs the pipeline for each, and records its progress in the job store.
 """
 
 from __future__ import annotations
@@ -77,50 +76,39 @@ logger = logging.getLogger(__name__)
 
 # How long stop() waits for the worker thread before reporting it still alive.
 # Five seconds leaves room for uvicorn inside Docker's default 10 s SIGKILL
-# grace whenever no scan is being preserved (see PRESERVATION_JOIN_SECONDS).
-# Deliberately not configurable.  Read at call time, so tests can shorten it.
+# grace.  Read at call time, so tests can shorten it.
 STOP_JOIN_SECONDS: Final = 5.0
 
 # How much longer stop() waits, past STOP_JOIN_SECONDS, while the current job
-# is still keeping its pages in failed/.  Under Docker the tmp_dir
-# and the data volume are different filesystems, so that is a copy, and a large
-# pass can take longer than the ordinary join; a process that exits half way
-# loses the pages, because a recreated container discards /tmp.  Bounded, and
-# only spent while a preservation is in flight.  The shipped compose file's
-# stop_grace_period covers it and STOP_JOIN_SECONDS together.  Deliberately not
-# configurable.  Read at call time, so tests can shorten it.
+# is still keeping its pages in failed/, a copy across filesystems under Docker.
+# A process that exits half way loses them, because a recreated container
+# discards /tmp.  The shipped compose
+# file's stop_grace_period covers both waits.  Read at call time.
 PRESERVATION_JOIN_SECONDS: Final = 60.0
 
-# The idle loop's queue.get() timeout.  stop() does not rely on it -- the queue
-# shutdown wakes a blocked get() at once -- so it only sets how often an idle
-# worker gets a turn for housekeeping.  Read at call time.
+# The idle loop's queue.get() timeout: how often an idle worker gets a turn
+# for housekeeping.  stop() does not rely on it, because the queue shutdown
+# wakes a blocked get() at once.  Read at call time.
 _IDLE_TICK_SECONDS: Final = 5.0
 
-# How many unstarted jobs may wait behind the running one.  Not configurable:
-# a submit beyond it is reported as QUEUE_FULL rather than queued.
+# How many unstarted jobs may wait behind the running one; a submit beyond it
+# is reported as QUEUE_FULL.
 _QUEUE_DEPTH: Final = 10
 
 # How many loop-level failures in a row -- the loop's own job store writes, or
 # the idle prune, raising -- make the worker degraded.  A pipeline failure is
-# a job failure and never counts.  Three rides out one transient error
-# without calling the store broken.  Not configurable.
+# a job failure and never counts.
 _DEGRADED_AFTER: Final = 3
 
-# How many retries in a row the owed-write retry may fail before the worker
-# is degraded.  A clean job ends a streak before its own retry, so every
-# retry after the first of a streak is an idle tick's.  Kept apart from
-# _DEGRADED_AFTER's loop count: the guard already counted the failure behind
-# a guard debt, and a request-side owe_rejection debt was never counted, so a
-# streak of failed retries is its own evidence that the store is not
-# healing.  Three rides out a fault that heals within a tick or two, and at
-# the 5 s idle tick bounds a stuck row's silent window to about 15 s.  Not
-# configurable.  Read at call time, so tests can change it.
+# How many owed-write retries in a row may fail before the worker is degraded.
+# Counted apart from _DEGRADED_AFTER, which never sees a request-side debt, so
+# a streak of failed retries is its own evidence the store is not healing.
+# Read at call time, so tests can change it.
 _OWED_RETRY_DEGRADED_AFTER: Final = 3
 
-# How often an idle worker prunes job history.  Prune left the per-job
-# path so its failure can never fail a job; hourly keeps a long-running
-# appliance inside history_max_rows.  The startup prune is the lifespan's.  Not
-# configurable.  Read at call time, so tests can shorten it.
+# How often an idle worker prunes job history.  Pruning runs only when idle,
+# so its failure can never fail a job; the startup prune is the lifespan's.
+# Read at call time, so tests can shorten it.
 _PRUNE_INTERVAL_SECONDS: Final = 3600.0
 
 
@@ -132,9 +120,8 @@ class _OwedWrite:
     The owed value is the whole ``finish_job`` call, not just an error text:
     a success-path write that failed after Paperless accepted the document
     must be replayed as DONE or FALLBACK with its result, never turned into an
-    ERROR that invites a duplicate scan.  Value equality comes from the
-    dataclass, and freezing it means the owed value cannot change between the
-    flush's snapshot and its delete-if-unchanged compare.
+    ERROR that invites a duplicate scan.  Frozen, so the owed value cannot
+    change between the flush's snapshot and its delete-if-unchanged compare.
 
     Attributes:
         state: The terminal state to record.
@@ -158,12 +145,8 @@ class ScanOptions:
     """
     The per-scan choices a web request makes, carried to the job that runs it.
 
-    They travel on the queue beside the job, and are deliberately not a ``Job``
-    field or a job-table column, for the reason ``ScanWorker.front_pages`` is
-    not one: a choice made for one scan means nothing once that scan ends, and
-    a column would cost a schema migration of every existing job database.
-    Nor are they a profile setting: the same profile scans one sheet or a
-    whole document, and the operator decides which each time.
+    They travel on the queue beside the job and are not a job-table column: a
+    choice made for one scan means nothing once that scan ends.
 
     Attributes:
         multi_page: Whether the scan is a multi-page document: the operator is
@@ -209,15 +192,11 @@ class WorkerFlipCoordinator(FlipCoordinator):
     Abort double-clicked at the previous job's prompt, or a Continue sent
     during pass A, would otherwise pre-answer a prompt nobody has seen yet and
     abort the wrong job or start pass B on an unflipped stack.
-    ``FlipCoordinator`` itself is unchanged: arming is this class's detail,
-    not part of the contract the pipeline waits on, and not part of the
-    shared ``FlipAnswerSlot`` either.
 
     The claim itself -- first answer wins, and a waiter that wakes always finds
-    an answer -- is ``FlipAnswerSlot``'s, shared with the CLI coordinator so a
-    fix to it reaches both.  Arming is a one-way latch checked before
-    an offer: once set it is never cleared, so a signal that sees it set may
-    offer, and one that sees it unset is dropped, never deferred.
+    an answer -- is ``FlipAnswerSlot``'s, shared with the CLI coordinator.
+    Arming is a one-way latch checked before an offer: once set it is never
+    cleared, so a signal that sees it unset is dropped, never deferred.
 
     Args:
         job_id: The id of the job whose flip this coordinator answers.
@@ -243,11 +222,6 @@ class WorkerFlipCoordinator(FlipCoordinator):
     def armed_at(self) -> datetime | None:
         """
         When the flip wait began, in UTC, or ``None`` before the first ``arm()``.
-
-        Held in memory only, for the reason ``ScanWorker.front_pages`` is not a
-        ``Job`` column: the value matters for the length of one wait and is
-        meaningless once the job ends, and a restart fails every active job,
-        so there is nothing to persist.
 
         The first ``arm()`` happens when the job announces ``AWAITING_FLIP``,
         microseconds before ``wait_for_flip`` starts its clock, so a deadline
@@ -342,10 +316,6 @@ class WorkerFlipCoordinator(FlipCoordinator):
 
         """
         self.arm()
-        # One path for both endings.  If a signal answered, settle finds that
-        # answer already claimed and hands it back; if the wait expired,
-        # TIMED_OUT is offered and wins unless a signal claimed first after
-        # all.  Either way the result is the claimed answer, never a guess.
         self._slot.wait(timeout)
         return self._slot.settle(FlipOutcome.TIMED_OUT)
 
@@ -355,14 +325,7 @@ class WorkerFlipCoordinator(FlipCoordinator):
 
         Unlike the timeout's ``settle``, this honours ``armed``: a signal before
         the prompt exists is dropped here, and one after an answer is dropped by
-        the slot, leaving the answer untouched either way.
-
-        Args:
-            outcome: The answer the operator is offering.
-
-        Returns:
-            Whether ``outcome`` became the answer.
-
+        the slot.  Returns whether ``outcome`` became the answer.
         """
         if not self._armed.is_set():
             return False
@@ -381,23 +344,17 @@ class WorkerPassCoordinator(PassCoordinator):
     answer.
 
     An answer must name the prompt it answers by number, and must be one that
-    prompt offers.  That replaces the flip coordinator's arming latch, which
-    only works because a manual-duplex job asks its one question once.  A
-    multi-page job asks the same question with the same buttons again and
-    again, so a delayed double-click on "Scan next page" that arrived after the
-    next pass finished would otherwise answer the next prompt too, and start a
-    pass on a platen nobody has changed.  Membership of the offered set also
-    refuses a forged answer the page never showed, such as Finish on a
-    document with no pages.
+    prompt offers.  A multi-page job asks the same question again and again,
+    so a delayed double-click on "Scan next page" would otherwise answer the
+    next prompt too and start a pass on a platen nobody has changed.  The
+    offered set also refuses a forged answer the page never showed.
 
     The stopping latch is the worker's own stop flag, and it is sticky: once
     set, every ``ask`` returns ``INTERRUPTED`` at once without publishing a
-    prompt.  ``interrupt_for_shutdown`` only reaches a prompt that is open when
-    the stop lands; a stop that arrives mid-pass, or before this job had a
-    coordinator at all, must not leave the next prompt waiting its full
-    timeout while the server tries to exit.  The same latch is ``stopping``,
-    which the run reads before each later pass: an answer claimed just before
-    the stop is still returned, but the pass it asked for never starts.
+    prompt, so a stop that lands mid-pass never leaves the next prompt waiting
+    its full timeout.  The same latch is ``stopping``, which the run reads
+    before each later pass: an answer claimed just before the stop is still
+    returned, but the pass it asked for never starts.
 
     Args:
         job_id: The id of the job whose prompts this coordinator answers.
@@ -414,9 +371,6 @@ class WorkerPassCoordinator(PassCoordinator):
         self._lock = threading.Lock()
         self._prompt: PassPrompt | None = None
         self._slot: AnswerSlot[PassAnswer] | None = None
-        # When the latest prompt was published, in UTC.  In memory only, for
-        # the reason ScanWorker.front_pages is not a Job column: it matters
-        # for one question and a restart fails every active job.
         self._asked_at: datetime | None = None
         # Set once the run announces its next question, cleared when that
         # question is published: in between, the latest claim answers a
@@ -560,9 +514,6 @@ class WorkerPassCoordinator(PassCoordinator):
         # finds this slot or is seen here.
         if self._stopping.is_set():
             slot.offer(PassAnswer.INTERRUPTED)
-        # One path for both endings, as the flip wait has: an answered slot
-        # hands its answer back, and an expired one claims TIMED_OUT unless an
-        # answer beat it after all.
         slot.wait(prompt.timeout_seconds)
         return slot.settle(PassAnswer.TIMED_OUT)
 
@@ -627,13 +578,8 @@ def _announce_pass_wait(
 
     Called from the status callback before the waiting state is written, so
     ``WorkerPassCoordinator.acknowledged`` stops reporting the previous
-    question's answer before any poll can read the new state.
-
-    Args:
-        state: The state the run just announced.
-        coordinator: The running job's pass coordinator, or None when the job
-            is not a multi-page one.
-
+    question's answer before any poll can read the new state.  ``coordinator``
+    is ``None`` for a job that is not a multi-page one.
     """
     if coordinator is not None and state in PASS_WAIT_STATES:
         coordinator.announce_next_question()
@@ -687,42 +633,22 @@ class ScanWorker:
         # snapshot; every caller reads it once and checks its job id.
         self._pass_coordinator: WorkerPassCoordinator | None = None
         self._current_job_id: str | None = None
-        # Pass A's page count for the job in flight, written by the pipeline's
-        # pass-count callback on the worker thread and read by request threads
-        # rendering the status area.  Its own lock rather than
-        # _profiles_lock: they guard unrelated state and sharing one would make
-        # a status render wait behind a profile swap for no reason.
+        # Pass A's page count for the job in flight, written on the worker
+        # thread and read by request threads rendering the status area.  Its own
+        # lock, so a status render never waits behind a profile swap.
         self._front_pages_lock = threading.Lock()
         self._front_pages: int | None = None
-        # Held for the whole of a job's pipeline call, and for the whole of the
-        # startup capability read, so nothing else can be inside SANE at the
-        # same time.  It is needed because
-        # scanner/sane_backend.py provides no mutual exclusion of its own:
-        # _refuse_if_wedged fires on a read that is already *stuck* rather than
-        # one that is merely running, and _INIT_LOCK guards sane_init and
-        # sane_exit only.  On the net backend a status-strip probe landing
-        # mid-scan would therefore be a second RPC on the control wire the scan
-        # is using -- a lost sheet, not a slow page.
-        #
-        # The advisory alternative, "skip the scanner check while
-        # current_job_id is not None", was rejected: a reader can see None,
-        # enter get_devices(), and have a job start a microsecond later.
+        # Held for the whole of a job's pipeline call and of the startup
+        # capability read, so nothing else is inside SANE at the same time.  The
+        # SANE backend has no mutual exclusion of its own, and on the net backend
+        # a probe landing mid-scan is a second RPC on the scan's control wire.
+        # See docs/explanation/decisions/0003-scanner-gate-is-a-lock.md.
         self._scanner_gate = threading.Lock()
-        # What became of the one startup persist attempt.  Recorded rather
-        # than recomputed because StartupProfiles's write result is None for
-        # two different situations -- no config file was loaded, and one was
-        # loaded and could not be written -- and the Profiles row has to tell
-        # them apart.  A fresh os.access() probe at check time cannot
-        # substitute: the failure that matters is EBUSY on a single-file bind
-        # mount, where the directory is writable, os.access says yes, and only
-        # the rename fails.
-        #
-        # The default is an in-memory member, not PERSISTED: before any attempt
-        # nothing is on disk, and that is the one answer that could mislead.
-        #
-        # Written on the worker thread, read on request threads, and no lock:
-        # see the profile_storage property's docstring for why that is a
-        # decision rather than an omission.
+        # What became of the one startup persist attempt, recorded because it
+        # cannot be recomputed: os.access() says yes on a single-file bind
+        # mount, where only the rename fails with EBUSY.  The default is never
+        # PERSISTED, because before any attempt nothing is on disk.  Unlocked
+        # on purpose; see the profile_storage property.
         self._profile_storage: ProfileStorage = ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
@@ -730,23 +656,18 @@ class ScanWorker:
         # clean job's, with no landed retry, recovery or cleanly recorded job
         # in between.  Touched only by the worker thread.
         self._failed_owed_retries = 0
-        # Whether the current failure episode of the owed-write retry has
-        # been logged at WARNING.  Unlike the streak above, a clean job does
-        # not end an episode -- only a retry that lands, or recovery -- so a
-        # write that keeps failing on a busy queue is warned about once, not
-        # after every scan.  Touched only by the worker thread.
+        # Whether the current owed-write failure episode has been logged at
+        # WARNING.  Unlike the streak above, a clean job does not end an
+        # episode, so a busy queue warns once, not after every scan.  Touched
+        # only by the worker thread.
         self._owed_failure_warned = False
         # When the idle loop last pruned.  Starts now: the startup prune is the
         # lifespan's, so the first idle prune is an interval away.
         self._last_prune = time.monotonic()
         # Terminal job-row writes owed by id, each kept as the write it was
-        # meant to be: the loop's own terminal writes that failed, kept with
-        # their real outcome, failures even the loop guard could not write,
-        # and rejected submits whose REJECTED write failed in the request.
-        # Every idle tick and every clean job retries them, and a streak of
-        # failed retries degrades the worker.  Shared by the worker thread
-        # (the guard and the flush) and request threads (owe_rejection), so
-        # every read and write goes through _unrecorded_lock.
+        # meant to be, and retried on every idle tick and after every clean
+        # job.  Shared by the worker thread and request threads (owe_rejection),
+        # so every read and write goes through _unrecorded_lock.
         self._unrecorded_lock = threading.Lock()
         self._unrecorded_failures: dict[str, _OwedWrite] = {}
         # Set and cleared by the worker thread (and by mark_recovery_pending,
@@ -961,8 +882,6 @@ class ScanWorker:
             # Nobody is asked to feed paper into a job whose outcome
             # could not be recorded.
             return SubmitResult.DEGRADED
-        # Two except clauses rather than one bracketless PEP 758 clause: the
-        # two exceptions mean different things to the caller.
         try:
             self._queue.put_nowait(_Queued(job, options))
         except queue.Full:
@@ -1029,8 +948,7 @@ class ScanWorker:
         The coordinator is read once and compared on its own job id, the same
         snapshot rule as ``flip_answer``.  The deadline is the wait's start
         plus ``output.operator_wait_timeout_seconds``; see
-        ``WorkerFlipCoordinator.armed_at`` for why the start is held in memory
-        rather than on the job row, and why the deadline is conservative.
+        ``WorkerFlipCoordinator.armed_at`` for why it is never late.
 
         Args:
             job_id: The job whose deadline is wanted.
@@ -1212,14 +1130,6 @@ class ScanWorker:
         One snapshot, compared with the coordinator's own job id rather than
         with ``_current_job_id``, so a caller's check and its use cannot
         straddle a job boundary and reach the next job's prompt.
-
-        Args:
-            job_id: The job the caller means.
-
-        Returns:
-            The running multi-page job's coordinator when that job is
-            ``job_id``, otherwise ``None``.
-
         """
         coordinator = self._pass_coordinator
         if coordinator is None or coordinator.job_id != job_id:
@@ -1248,11 +1158,7 @@ class ScanWorker:
         does not exist yet or is about to be superseded by the row's own
         ``pages_scanned``.
 
-        Deliberately not a ``Job`` column.  A column would need a schema
-        migration of every existing job database, and the value would be a
-        poor column anyway -- it is meaningful for the length of one pass and
-        meaningless the instant the job ends, which is the opposite of what the
-        job table stores.
+        Not a ``Job`` column: the value means nothing once the job ends.
 
         Returns:
             The count, or ``None`` when no manual-duplex pass A has finished.
@@ -1301,12 +1207,11 @@ class ScanWorker:
 
         The contract for a caller is one move and one move only: probe with
         ``acquire(blocking=False)`` and, when that fails, **skip** the scanner
-        check and report it as unknown for this cycle.  Never block on it.  A
-        background refresher that waited here would queue behind a scan that
-        can legitimately run for minutes, and would then enter SANE at some
-        arbitrary later moment with the freshness its own caller assumed long
-        gone.  A caller that succeeds owns the scanner until it releases, so it
-        must use ``with`` or an equivalent ``try``/``finally``.
+        check and report the scanner busy for this cycle.  Never block on it:
+        a waiting refresher would queue behind a scan that can run for minutes
+        and enter SANE at some arbitrary later moment.  A caller that succeeds
+        owns the scanner until it releases, so it must use ``with`` or an
+        equivalent ``try``/``finally``.
 
         Returns:
             The gate itself, so the caller can make that non-blocking attempt.
@@ -1333,14 +1238,9 @@ class ScanWorker:
         loaded.  That is the same function ``saneless doctor`` calls, which is
         what keeps the strip and the command on one Profiles row.
 
-        Thread discipline, stated because the silence would otherwise read as
-        an oversight: the attribute behind this property is rebound only on the
-        worker thread, only during the single startup generation step, and is
-        then read unchanged by request threads for the life of the process.  A
-        single enum rebind is atomic under the GIL, so there is no torn read to
-        protect against, and it is deliberately left unlocked.  Its sibling
-        ``front_pages`` has a dedicated lock for the opposite reason: that
-        value is rewritten repeatedly while a job runs.
+        Deliberately unlocked: the attribute is rebound once, on the worker
+        thread during startup generation, and a single rebind cannot be read
+        torn.  ``front_pages`` has a lock because it changes while jobs run.
 
         Returns:
             The recorded outcome of the single startup persist attempt, or the
@@ -1390,26 +1290,10 @@ class ScanWorker:
         """
         Replace the configured profiles with a new dict, under the lock.
 
-        The mapping is rebound, never mutated in place.  A reader that took the
-        old dict without the lock -- ``run_pipeline`` on the worker thread, for
-        example -- keeps a consistent view of it, and no locked reader can
-        observe a dict part-way through an update.
-
-        This is the one place the profiles are rebound.
-
-        A set without ``default`` is refused.  Every scan that names no profile
-        resolves ``default``, so swapping such a set in would leave the
-        appliance unable to scan until it was restarted.  The refusal is
-        logged and answered rather than raised, because this runs on the
-        worker thread, where an exception would stop the loop that takes jobs.
-
-        Args:
-            profiles: The complete new set of profiles.
-
-        Returns:
-            Whether the profiles were replaced: ``False`` when the new set has
-            no ``default`` profile.
-
+        The one place the profiles are rebound, never mutated in place.  A set
+        without ``default``, which every unnamed scan resolves, is logged and
+        refused rather than raised: a raise would stop the loop that takes
+        jobs.  Returns whether the profiles were replaced.
         """
         replacement = dict(profiles)
         if "default" not in replacement:
@@ -1517,27 +1401,11 @@ class ScanWorker:
     @staticmethod
     def _failure_record(exc: Exception) -> tuple[str, ErrorCategory]:
         """
-        Choose the error text and category a failed job is recorded with.
+        Choose the error text and category a loop-level failure is recorded with.
 
-        Stopping alone is not a cause: a Paperless error, a jam or an
-        operator's Abort that happens inside the shutdown join window keeps
-        its own text and category.  A job the stop itself ended arrives as
-        ``ScanInterrupted``, never as an ``Exception``, so it cannot reach
-        here.
-
-        ``_best_effort_fail`` records a loop-level failure through this.  A
-        pipeline exception in ``_scan_job`` does not: that path tells its three
-        endings -- shutdown, cancel and failure -- apart itself, because a
-        cancel is written CANCELLED rather than ERROR.
-
-        Args:
-            exc: What ended the job.
-
-        Returns:
-            The exception's own text and its classified category.  The text
-            is ``failure_text``'s, so a note attached with ``add_note`` is
-            recorded with it.
-
+        Stopping alone is not a cause: a failure inside the shutdown join
+        window keeps its own text and category.  The text is
+        ``failure_text``'s, so a note attached with ``add_note`` is kept.
         """
         return failure_text(exc), classify_error(exc)
 
@@ -1629,18 +1497,9 @@ class ScanWorker:
         """
         Make one of the loop's own terminal writes, owing it if the store raises.
 
-        The write is owed before the exception propagates, so the guard in
-        ``_run`` retries this write -- not an ERROR built from the store's
-        exception -- and so does every clean job and idle tick after it.
-
-        Args:
-            job_id: The job row to write.
-            owed: The terminal write to make.
-
-        Raises:
-            Exception: Whatever the store raises; it stays a loop-level
-                failure.
-
+        The write is owed before the store's exception propagates, so the
+        guard in ``_run`` retries this write, not an ERROR built from that
+        exception, and so does every clean job and idle tick after it.
         """
         try:
             self._write_owed(job_id, owed)
@@ -1655,20 +1514,10 @@ class ScanWorker:
         """
         Record a job a server stop ended, worded by how far the run had got.
 
-        The text and category follow the last state the run announced: a stop
-        during the upload may have left the document in paperless-ngx, so
-        that row is the amber after-send category, and any earlier stop has
-        none.  The pipeline's note, when it kept pages, names where they went
-        and follows the restart text.
-
-        Args:
-            job_id: The job row to write.
-            exc: The interruption, carrying the pipeline's note, if any.
-            last: The last active state the run announced.
-
-        Raises:
-            Exception: Whatever the store raises, as ``_finish_or_owe`` does.
-
+        A stop during the upload may have left the document in paperless-ngx,
+        so ``last`` decides the text and category.  The pipeline's note, when
+        it kept pages, follows the restart text.  A store failure raises, as
+        ``_finish_or_owe`` does.
         """
         kept = note_text(exc)
         error = restart_error(last, kept or None)
@@ -1680,18 +1529,10 @@ class ScanWorker:
         """
         End a job that is handed the scanner gate after the server began to stop.
 
-        A stop can end a health check that was holding the gate, so a job
-        waiting for it may be handed it in the middle of shutdown.  Starting
-        the scan then would feed paper that the stop's bounded join walks away
-        from, so the job ends before it touches the scanner.  The interruption
-        is raised rather than written here: the gate is released before
-        ``_scan_job``'s handler writes the row, and since nothing has been
-        announced yet, the row gets the restart text for a job that never
-        reached the scanner.
-
-        Raises:
-            ScanInterrupted: When the server is stopping.
-
+        A stop can end a health check that held the gate, handing it to a
+        waiting job mid-shutdown, and scanning then would feed paper the stop's
+        bounded join walks away from.  Raised, not written, so the row is
+        written after the gate is released.
         """
         if self._stopping.is_set():
             msg = "The server stopped before the scan started"
@@ -1733,28 +1574,17 @@ class ScanWorker:
         """
         Retry owed writes on a worker that is not degraded, counting a failure.
 
-        It runs on every idle tick and after every clean job, so a busy queue
-        cannot starve the owed rows.
-
-        A failed retry is not a loop-level failure: the guard already counted
-        the failure behind a guard debt.  But ``_OWED_RETRY_DEGRADED_AFTER``
-        failed retries in a row degrade the worker, so a store that is not
-        healing reaches ``/health`` instead of only the logs.  A retry that
-        lands ends the streak, and so does a job whose store writes all
-        landed.  The first failure of an episode is logged at WARNING and the
-        rest at DEBUG; the episode, unlike the streak, outlasts a clean job and
-        ends only when a retry lands or the worker recovers, so a busy queue
-        does not log the same traceback after every scan.  A retry that writes
-        at least one row also ends the run of loop-level failures: the store
-        just accepted a write.  One that had nothing to write touched no store,
-        so it proves nothing and leaves the run alone.
+        A failed retry is not a loop-level failure, but
+        ``_OWED_RETRY_DEGRADED_AFTER`` in a row degrade the worker, so a store
+        that is not healing reaches ``/health``.  Only the first failure of an
+        episode is logged at WARNING.  A retry that writes at least one row
+        also ends the run of loop-level failures; one with nothing to write
+        touched no store and proves nothing.
         """
         try:
             written = self._flush_unrecorded_failures()
         except Exception:
             self._failed_owed_retries += 1
-            # The first failure of an episode is worth an operator's eye; the
-            # rest of the same episode would only repeat it.
             if not self._owed_failure_warned:
                 self._owed_failure_warned = True
                 logger.warning(
@@ -1786,28 +1616,11 @@ class ScanWorker:
         """
         Write the terminal rows the worker still owes, dropping each once written.
 
-        It runs on an idle tick (from ``_idle_housekeeping`` or
-        ``_try_recover``), after a clean job (from ``_run``), or once before
-        the thread exits.  None of these has a job current: after a job,
-        ``_process_job``'s ``finally`` has already cleared it, so an owed id
-        belongs to a job the loop already abandoned, or to a refused submit,
-        and is never the job in flight.  With nothing owed it returns without
-        touching the store.
-
-        The owed entries are snapshotted under ``_unrecorded_lock``, and every
-        store write runs outside it, so a request thread calling
-        :meth:`owe_rejection` never waits on the store.  An entry is dropped
-        only if it is unchanged since the snapshot; one owed after the
-        snapshot waits for the next retry.
-
-        Returns:
-            How many rows it wrote: zero when nothing was owed.
-
-        Raises:
-            Exception: Whatever the store raises.  Rows already written stay
-                written and are no longer owed; the rest wait for the next
-                retry.
-
+        It only runs with no job current, so an owed id is never the job in
+        flight.  The entries are snapshotted under ``_unrecorded_lock`` and
+        written outside it, so :meth:`owe_rejection` never waits on the store;
+        an entry is dropped only if unchanged since the snapshot.  Returns how
+        many rows it wrote; a store failure raises, leaving the rest owed.
         """
         with self._unrecorded_lock:
             owed_writes = list(self._unrecorded_failures.items())
@@ -1839,10 +1652,8 @@ class ScanWorker:
         recovery left behind.  The store chooses each restart text, and its
         category, by the state the row was left in.  Any raise leaves the
         worker degraded to try again next tick; it is not counted again, and
-        whatever was written stays written.
-        Clearing degraded also ends any owed-write streak and its warned
-        episode, so a returning fault needs a fresh streak and is warned about
-        again.
+        whatever was written stays written.  Clearing degraded also ends any
+        owed-write streak and its warned episode.
         """
         try:
             self._job_store.probe()
@@ -1887,8 +1698,7 @@ class ScanWorker:
         finally:
             # Cleared on every ending, a loop-level failure included, so a
             # raise from the terminal write cannot leave a stale current job
-            # or flip coordinator behind.  No prune here any more: it runs on
-            # the idle tick, where its failure cannot fail a job.
+            # or flip coordinator behind.
             self._flip_coordinator = None
             # Cleared with it, so a late click on a finished job's prompt
             # answers nothing, and never a later job's.
@@ -1905,20 +1715,9 @@ class ScanWorker:
         Write one active state a running job has reached, without raising.
 
         The write only tells observers how far the scan has got, so a store
-        error is logged at WARNING with its traceback and the scan carries on.
-        Every waiting state -- ``AWAITING_FLIP`` and the three multi-page
-        waits -- is tried twice: each renders its prompt from the row, so while
-        that write is missing nobody sees a prompt to answer.  If the second
-        attempt fails too, the wait still runs, and its timeout ends it the way
-        any unanswered prompt ends.
-
-        Args:
-            job_id: The running job's row.
-            state: The active state it has reached.
-
-        Returns:
-            Whether the write landed.
-
+        error is logged and the scan carries on.  A waiting state is tried
+        twice, because its prompt is rendered from the row; if both fail, the
+        wait's timeout ends it.  Returns whether the write landed.
         """
         attempts = 2 if state in WAITING_STATES else 1
         for attempt in range(1, attempts + 1):
@@ -1942,15 +1741,8 @@ class ScanWorker:
         """
         Keep the running job's front count, for the flip prompt to show.
 
-        The back count is ignored on purpose.  It arrives a moment before the
-        ScanResult that carries the run's real total, so storing it would
-        replace the number the operator is reading with one that is about to
-        be replaced again -- a flicker in place of information.
-
-        Args:
-            label: Which pass the count is for.
-            count: The pages that pass produced.
-
+        The back count is ignored on purpose: it arrives a moment before the
+        run's real total, so storing it would only make the number flicker.
         """
         if label != SCAN_LABEL_FRONT:
             return
@@ -2011,15 +1803,10 @@ class ScanWorker:
         )
         self._pass_coordinator = pass_coordinator
 
-        # Neither progress callback lets a store error out.  One raised inside
-        # run_pipeline would end the run -- filed as a scanner fault, and with
-        # the spooled pages deleted if it fell outside the pipeline's guard --
-        # over a write that only tells observers how far the scan has got.
-        #
-        # Nor is such a failure counted by _record_loop_failure.  That count
-        # measures the loop's own store failures; a progress write that fails
-        # is not one, and if the store really is down, the terminal write that
-        # follows fails and is counted there.
+        # Neither progress callback lets a store error out: one raised inside
+        # run_pipeline would end the run as a scanner fault over a write that
+        # only reports progress.  Nor does it count towards degraded; a store
+        # that is really down fails the terminal write, which is counted.
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
             try:
                 self._job_store.update_thumbnail(_jid, thumb)
@@ -2035,11 +1822,8 @@ class ScanWorker:
         # by the progress write below like every later state.
         persisted_state = JobState.PENDING
         # The last active state the run announced, whether or not its write
-        # landed.  A server stop words the row by it: an upload that had begun
-        # may already be in paperless-ngx, even when the UPLOADING write failed
-        # and the row still reads an earlier state.  PENDING until the first
-        # event, so a stop before the scan starts gets the restart text for a
-        # job that never reached the scanner.
+        # landed: a server stop words the row by it, because an upload that had
+        # begun may be in paperless-ngx even when the UPLOADING write failed.
         announced_state = JobState.PENDING
 
         def _status_cb(event: PipelineEvent, _jid: str = job.id) -> None:
@@ -2059,23 +1843,14 @@ class ScanWorker:
             if state is persisted_state:
                 # Already persisted; not a transition.
                 return
-            # Every active state, AWAITING_FLIP and SCANNING_REVERSE included,
-            # is simply persisted.  The row is the only thing observers read:
-            # the web UI re-reads it each poll, so nothing here needs signalling.
             if state is JobState.AWAITING_FLIP and coordinator is not None:
-                # Arm BEFORE persisting.  Any observer that reads AWAITING_FLIP
-                # from the store -- the status poll, which renders Continue and
-                # Abort -- must find the coordinator already armed; arming
-                # after the write would open a window in which a click on a
-                # freshly rendered Continue is dropped.  Pass A has already
-                # finished when AWAITING_FLIP is announced, so arming here
-                # cannot accept a click sent during pass A.
+                # Arm BEFORE persisting: a status poll that reads AWAITING_FLIP
+                # renders Continue, and a click on it must find the coordinator
+                # armed.  Pass A has already finished, so no pass-A click lands.
                 coordinator.arm()
                 if self._stopping.is_set():
-                    # stop() may have run before this job had a coordinator,
-                    # found nothing to answer, and returned to its join.
-                    # Interrupt now, or the wait would hold the thread for
-                    # operator_wait_timeout_seconds after shutdown began.
+                    # stop() may have run before this job had a coordinator;
+                    # without this the wait would outlast the shutdown join.
                     coordinator.interrupt_for_shutdown()
             # Only a write that landed advances persisted_state, so a state
             # whose write failed is tried again at the next event instead of
@@ -2109,26 +1884,15 @@ class ScanWorker:
             ),
         )
         try:
-            # The gate covers the whole pipeline call, which is the whole of
-            # this job's contact with the scanner -- both passes, the flip wait
-            # between them, and the assembly and upload that follow.  Wrapping
-            # only the scan_pages calls would leave the flip wait ungated, and
-            # a manual-duplex job spends most of its life there with the feeder
-            # loaded and the device open.
+            # The gate covers the whole pipeline call, the flip wait included:
+            # a manual-duplex job spends most of its life there with the device
+            # open.  The release happens before the except blocks run.
             #
-            # ``with`` rather than acquire/release, so every exit path -- a
-            # jam, an Abort, a shutdown, a Paperless failure -- hands the
-            # scanner back.  The release happens before the except block runs.
-            #
-            # Each job restarts SANE first, before its first listing or open.
-            # After a saned restart the net backend keeps using the control
-            # connection the server dropped, and every later open in this
-            # process fails until SANE is restarted (backend/net.c,
-            # sane_open).  The restart runs here, under the gate, where no
-            # handle of this process is open: the previous job closed its
-            # handles before it released the gate.  A restart refused because
-            # a read never returned raises ScanError into the except Exception
-            # below, and fails the job just as a refused scan does.
+            # Each job restarts SANE first: after a saned restart the net
+            # backend keeps using the dropped control connection, and every
+            # later open fails until SANE is restarted (backend/net.c,
+            # sane_open).  Under the gate no handle of this process is open:
+            # the previous job closed its handles before releasing it.
             with self._scanner_gate:
                 self._refuse_to_start_while_stopping()
                 self._scanner.reinitialise()
@@ -2139,29 +1903,16 @@ class ScanWorker:
                     request,
                 )
         except ScanInterrupted as exc:
-            # The server is stopping, and the pipeline has already kept what
-            # it had; its note says where.  Caught by name because it is a
-            # BaseException: escaping here would end the worker thread with
-            # the row still active.  Not a failure, so no ERROR line and no
-            # traceback, and not a cancel either: nobody chose to throw the
-            # scan away.  Like every ending below, this is the worker thread's
-            # own final write, so the rule against a shutdown-time write --
-            # about the lifespan writing over a running thread -- holds.
+            # Caught by name because it is a BaseException: escaping here
+            # would end the worker thread with the row still active.  Not a
+            # failure and not a cancel, so no ERROR line and no traceback.
             self._end_by_shutdown(job.id, exc, announced_state)
             return
         except Exception as exc:
-            # No result argument: outcome, warning and all three page counts
-            # stay NULL.  NULL means "never recorded"; 0 would claim a
-            # measurement a job that never reached the scanner did not make.
-            # If this write raises, the job ending could not be recorded, and
-            # that is the loop's failure; the write is owed first, so the
-            # pipeline's own ending is what lands later.
-            #
-            # Two endings, two branches.  A stop is not among them: it
-            # arrives as ScanInterrupted above, so a ScanCancelledError is
-            # always the operator's cancel, and a jam or an empty feeder
-            # raised after stop() claimed the flip is a failure with its own
-            # text, category and traceback.
+            # No result argument: the page counts stay NULL, "never recorded",
+            # where 0 would claim a measurement.  A stop arrives as
+            # ScanInterrupted above, so a ScanCancelledError is always the
+            # operator's cancel.
             if isinstance(exc, ScanCancelledError):
                 # The operator ended the scan.  Not a failure, so no category,
                 # no ERROR line and no traceback.
@@ -2179,19 +1930,14 @@ class ScanWorker:
                     job.id,
                     _OwedWrite(JobState.ERROR, error=error, category=category),
                 )
-                # Inside the except block, so the record carries the traceback
-                # the operator needs to find the cause.  The text is quoted
-                # with %r: it can come from outside saneless, and repr shows a
-                # control character in it as its escape.
+                # %r, because the text can come from outside saneless and repr
+                # escapes a control character in it.
                 kind = category.value.lower()
                 logger.exception("Job %s failed (%s): %r", job.id, kind, error)
             return
-        # The terminal state is derived from the outcome the pipeline returned,
-        # never assumed.  The mapping below is a match with assert_never, so a
-        # future third ScanOutcome member fails the type gate at edit time
-        # rather than falling silently into an else.  The upload has already
-        # happened, so a failed write is owed with this outcome and replayed
-        # as it is, never recorded as an ERROR that invites a rescan.
+        # The upload has already happened, so a failed write is owed with this
+        # outcome and replayed as it is, never recorded as an ERROR that
+        # invites a rescan.
         self._finish_or_owe(
             job.id,
             _OwedWrite(
