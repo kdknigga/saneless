@@ -521,6 +521,31 @@ def test_a_cancel_mid_read_cancels_the_handle_from_the_control_thread(
     assert fake.device.close_calls == 1
 
 
+def test_a_restart_sent_mid_read_never_shuts_sane_down_under_the_read(
+    fake: FakeSaneModule, child: _ChildHarness
+) -> None:
+    """
+    A ``restart`` that arrives while a read is blocked does not run then.
+
+    ``sane_exit`` closes every handle, so running it under an outstanding
+    read is the hazard; the child takes commands only between passes.
+    """
+    fake.device.block_read(ReadBlockMode.PARTIAL)
+    _ready(child)
+    child.send(_scan())
+    while child.frame() != StageFrame(stage="read", page=1):
+        pass
+    assert fake.device.read_started.wait(_REPLY_TIMEOUT_SECONDS)
+
+    child.send(ControlOp.RESTART)
+    child.send(ControlOp.CANCEL)
+
+    assert child.frames_until(Bye)[-1] == Bye()
+    assert child.join() == 0
+    assert fake.exit_while_blocked is False
+    assert fake.exit_call_count == 0
+
+
 def test_end_of_commands_while_idle_ends_main_without_an_exit(
     fake: FakeSaneModule, child: _ChildHarness
 ) -> None:

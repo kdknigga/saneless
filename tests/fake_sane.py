@@ -2483,13 +2483,13 @@ class FakeSaneModule:
         ``sane_exit`` closes every handle that is still open **and** runs
         holding the GIL, so calling it while a read is outstanding is the same
         hazard as ``close()`` and then some.  ``exit_while_blocked`` records
-        it; ``exit_call_count`` counts every call, blocked or not.  A call
-        from an in-process scan child shuts that child's SANE down, so it is
-        recorded in ``child_calls`` only.
+        it, whoever calls; ``exit_call_count`` counts every call, blocked or
+        not.  A call from an in-process scan child shuts that child's SANE
+        down, so it is counted in ``child_calls`` instead.
         """
+        if self._device.read_is_blocked():
+            self.exit_while_blocked = True
         if _in_a_scan_child():
             self.child_calls.append("exit")
             return
-        if self._device.read_is_blocked():
-            self.exit_while_blocked = True
         self.exit_call_count += 1
