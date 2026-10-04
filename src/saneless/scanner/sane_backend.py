@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib.util
 import logging
 import os
 import threading
@@ -105,37 +106,35 @@ if TYPE_CHECKING:
 
 def require_sane() -> None:
     """
-    Import python-sane, or fail at once with an install hint.
+    Check that python-sane is installed, or fail at once with an install hint.
 
     The SANE-using CLI commands run this first; it is never called at import,
-    so ``--help`` stays free of python-sane.  A missing package raises
-    ``ModuleNotFoundError`` and a missing ``libsane.so`` a plain
-    ``ImportError``; the message keeps the import's own reason to tell them
-    apart.
+    so ``--help`` stays free of python-sane.  It loads nothing: importing
+    python-sane loads libsane, which belongs in a child process, where a
+    misbehaving backend cannot take saneless down with it.  So it only asks
+    ``importlib.util.find_spec`` whether ``sane`` and its ``_sane`` extension
+    can be found.  A missing ``libsane.so`` is found later, where python-sane
+    is first loaded -- a child, or, while scanning still happens in this
+    process, building the backend -- and reported with the same words.
 
     Raises:
-        ConfigError: If python-sane cannot be imported, chained to the
-            ``ImportError``.
+        ConfigError: If ``sane`` or ``_sane`` cannot be found.
 
     """
-    try:
-        _ensure_sane()
-    except ImportError as exc:
-        msg = (
-            f"python-sane cannot be imported ({describe(exc)}). Install the SANE "
-            "development package (libsane-dev on Debian/Ubuntu, "
-            "sane-backends-devel on Fedora/RHEL) and reinstall saneless; see "
-            "Install on Bare Metal in the documentation"
-        )
-        # The configuration category's own advice cannot know that the fix is
-        # an install, and nothing in the config file brings the library back.
-        raise ConfigError(
-            msg,
-            next_step=(
-                "Install the SANE development package and reinstall saneless, "
-                "as the error says, then run the command again."
-            ),
-        ) from exc
+    for name in ("sane", "_sane"):
+        try:
+            spec = importlib.util.find_spec(name)
+        except ValueError:
+            # A module already in sys.modules with no spec is not python-sane.
+            spec = None
+        if spec is None:
+            # The configuration category's own advice cannot know that the
+            # fix is an install, and nothing in the config file brings the
+            # library back.
+            raise ConfigError(
+                python_sane_missing_message(f"No module named {name!r}"),
+                next_step=PYTHON_SANE_INSTALL_NEXT_STEP,
+            )
 
 
 def _launch_listing(
@@ -524,6 +523,8 @@ def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
         Whatever ``sane.init()`` returned for the current initialisation.
 
     Raises:
+        ConfigError: If python-sane cannot be loaded, with the install hint,
+            chained to the ``ImportError``.
         ScanError: If ``sane.init()`` fails, chained to the SANE error.
 
     """
@@ -555,7 +556,17 @@ def _ensure_initialised(host: str, *, log_level: int = logging.INFO) -> object:
                 exported,
             )
         try:
-            version = _ensure_sane().init()
+            sane_module = _ensure_sane()
+        except ImportError as exc:
+            # A python-sane that is installed but whose libsane will not load:
+            # require_sane cannot see this, since it loads nothing.
+            _restore_sane_net_hosts()
+            raise ConfigError(
+                python_sane_missing_message(describe(exc)),
+                next_step=PYTHON_SANE_INSTALL_NEXT_STEP,
+            ) from exc
+        try:
+            version = sane_module.init()
         except Exception as exc:
             # python-sane raises _sane.error, RuntimeError or AttributeError,
             # with no shared base, so the boundary catches Exception.
@@ -1183,7 +1194,9 @@ class SaneBackend(ScannerBackend):
                 reported as not used until the next initialisation.
 
         Raises:
-            ConfigError: If python-sane cannot be imported (``require_sane``).
+            ConfigError: If python-sane is not installed (``require_sane``),
+                or is installed but cannot be loaded, as with a missing
+                ``libsane.so``.
             ScanError: If ``sane.init()`` fails, chained to the SANE error.
 
         """

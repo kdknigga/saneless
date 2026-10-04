@@ -2769,9 +2769,11 @@ class TestRequireSane:
         result = runner.invoke(cli, command_line)
 
         assert result.exit_code == 2, result.output
-        lines = _failure_lines(result)
-        assert len(lines) == 1, result.stderr
-        assert lines[0].endswith(python_sane_missing_message(_LIBSANE_MISSING))
+        # devices announces its discovery before it builds the backend.
+        lines = [
+            line for line in _failure_lines(result) if line != "Discovering scanners..."
+        ]
+        assert lines == [python_sane_missing_message(_LIBSANE_MISSING)], result.stderr
         assert PYTHON_SANE_INSTALL_NEXT_STEP in result.stderr
         assert "Traceback" not in result.output
 
