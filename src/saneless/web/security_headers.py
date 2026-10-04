@@ -22,11 +22,10 @@ title.  A caching reverse proxy or shared cache that kept the owner's copy
 could hand it to anyone, so no dynamic response may be stored at all.  The
 files under ``/static/`` are the same for everyone and stay cacheable.
 
-The pages keep to the policy by construction: no template carries a ``style``
-attribute, a ``<style>`` element, an inline script, an event-handler attribute
-or an htmx expression that htmx would evaluate, and the only scripts and
-stylesheets are the vendored files under ``/static/``.  ``base.html`` turns
-htmx's own ``<style>`` injection, eval and script-tag processing off.
+The pages keep to the policy by construction: no template carries inline
+style, inline script, an event-handler attribute or an htmx expression, and
+``base.html`` turns htmx's own ``<style>`` injection, eval and script-tag
+processing off.
 """
 
 from __future__ import annotations
@@ -63,20 +62,12 @@ class SecurityHeaders:
     Pure ASGI middleware that sets ``SECURITY_HEADERS`` on every HTTP response.
 
     It also sets ``NO_STORE`` on every response whose path is not under
-    ``STATIC_PATH``.
+    ``STATIC_PATH``.  Each header is set, not appended, so a ``render_error``
+    response that already carries it still carries it once.
 
-    It is installed as the outermost of the application's own middleware, so
-    every route, every static file, the router's 404 and 405 and the refusals
-    of the Host and cross-site checks pass through it.
-
-    Each header is set, not appended, so a response that already carries it,
-    as every ``render_error`` response does, still carries it exactly once.
-
-    One response never reaches it: the 500 for an unhandled exception.
-    Starlette's ``ServerErrorMiddleware`` sits outside all of the
-    application's middleware and sends that response through its own outer
-    ``send``.  That is why ``render_error`` sets the same headers itself,
-    ``NO_STORE`` included.
+    The 500 for an unhandled exception never reaches it: Starlette's
+    ``ServerErrorMiddleware`` sends that response outside all of the
+    application's middleware, so ``render_error`` sets the same headers itself.
 
     It is a plain ASGI class rather than ``BaseHTTPMiddleware``, which does
     not propagate ``contextvars`` changes and wraps streaming responses.

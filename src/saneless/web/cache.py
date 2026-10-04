@@ -81,10 +81,8 @@ class MetadataCache:
     """
     In-memory cache with per-key TTL expiration and a last good copy per key.
 
-    Stores lists of metadata dicts (tags, correspondents) fetched from
-    paperless-ngx, expiring entries after a configurable number of seconds.
-    The last value stored for each key is also kept apart from the expiring
-    entry, so a refresh that fails can serve it instead of nothing.
+    The last value stored for each key is kept apart from the expiring entry,
+    so a refresh that fails can serve it instead of nothing.
 
     Args:
         ttl: Time-to-live in seconds for cached entries.
@@ -224,37 +222,18 @@ class MetadataCache:
         threadpool's concurrent requests do not stampede Paperless.
 
         A fetch caches its result only if no :meth:`invalidate` for the key ran
-        while it was in flight.  Otherwise the refresh that invalidated would
-        find the older fetch's pre-change data on its re-check, return it, and
-        keep it cached for another TTL.
+        while it was in flight, so a Refresh never gets older data back.
 
         When ``fetch`` raises and the key has a last good copy, that copy is
-        returned and kept for one more TTL, and one warning names the key and
-        the cause, without a traceback: the message of a Paperless client
-        error, or the class name of anything else.  The threads queued behind
-        the failed fetch find the re-armed entry, so an outage costs one
-        failed fetch and one log line per TTL rather than one per page load.
-        The re-arm obeys the same invalidate check as a successful fetch;
-        when an invalidate stops it, the copy is still returned but the
-        warning says the next request fetches again rather than promising
-        another TTL.  When there is no last good copy, the exception
-        propagates and no list is cached, but the failure is remembered for
-        ``min(ttl, NEGATIVE_TTL_SECONDS)``: until then every call, including
-        the threads queued behind the failed fetch, raises
-        :class:`MetadataUnavailableError` at once and logs nothing, so an
-        unreachable Paperless is asked once per window rather than once per
-        waiting thread.  :meth:`invalidate` forgets the failure, a zero TTL
-        never records one, and an invalidate during the failing fetch stops
-        it from being recorded.
+        returned, not current, and kept for one more TTL, with one warning
+        that carries no traceback, so an outage costs one failed fetch and one
+        log line per TTL.  With no last good copy the exception propagates,
+        and the failure is remembered for ``min(ttl, NEGATIVE_TTL_SECONDS)``,
+        during which every call raises :class:`MetadataUnavailableError` at
+        once, so an unreachable Paperless is asked once per window.
 
-        A caller that must answer within a budget passes ``lock_timeout``:
-        when another thread's fetch holds the key for longer than that, the
-        call raises :class:`MetadataUnavailableError` instead of waiting it
-        out, which bounds a fetch stuck resolving the host name.
-
-        The answer says which it is: a last good copy -- served now, or
-        re-armed by an earlier failure and still within its extra TTL -- is
-        not current, so a caller can refuse to treat it as proof.
+        ``lock_timeout`` bounds the wait behind another thread's fetch of the
+        same key, such as one stuck resolving the host name.
 
         Args:
             key: Cache key.
@@ -335,10 +314,8 @@ class MetadataCache:
         Remember that fetching ``key`` just failed with nothing to fall back on.
 
         Nothing is recorded when the cache is disabled, or when an
-        :meth:`invalidate` ran since ``generation`` was read: the Refresh that
-        invalidated asked for a fresh attempt, and a failure that predates it
-        must not refuse that attempt.  The negative TTL is read here, not
-        bound at import, so it can be changed at run time.
+        :meth:`invalidate` ran since ``generation`` was read: a failure that
+        predates a Refresh must not refuse the attempt it asked for.
 
         Args:
             key: Cache key whose fetch failed.
@@ -357,8 +334,7 @@ class MetadataCache:
         """
         Return the unexpired entry for ``key`` with whether it is current.
 
-        The lookup itself goes through :meth:`get`, so the TTL rule lives in
-        one place; the flag is read from the entry that list came from.
+        The lookup goes through :meth:`get`, so the TTL rule lives in one place.
 
         Args:
             key: Cache key.
@@ -380,17 +356,9 @@ class MetadataCache:
         """
         Keep the key's last good copy for one more TTL after a failed fetch.
 
-        Nothing is stored when an :meth:`invalidate` ran since ``generation``
-        was read, for the same reason a successful fetch would not store.
-
-        Args:
-            key: Cache key whose fetch failed.
-            generation: The key's generation when the fetch started.
-
-        Returns:
-            The last good copy, or None when the key has never had one, and
-            whether it was stored for another TTL.
-
+        Returns the copy, or None when the key never had one, and whether it
+        was stored again; it is not when an :meth:`invalidate` ran since
+        ``generation`` was read.
         """
         with self._locks_guard:
             stale = self._last_good.get(key)
@@ -421,16 +389,12 @@ class CachedMetadataLookup:
     """
     The id check's lookup for the web: the page's cache first, then the client.
 
-    A first look reads the list the tag and correspondent pickers were served
-    from, so a scan whose ids are all known costs no request.  A fresh look,
-    made only when an id seemed to be missing, goes to the client directly:
-    the cache's own fetch serves the last good copy when paperless-ngx is
-    down, and that copy would make an unreachable paperless-ngx look like
-    proof the id is still missing.  Every list the client returns is stored,
-    so the pickers see it too, unless the cache was invalidated while the
-    fetch was in flight: a Refresh that ran meanwhile stored a newer list, and
-    this older one must not replace it.  A failed fetch stores nothing and
-    answers None.
+    A first look reads the list the pickers were served from, so a scan whose
+    ids are all known costs no request.  A fresh look goes to the client
+    directly, because the cache would serve its last good copy while
+    paperless-ngx is down and make an unreachable server look like proof an
+    id is missing.  Every list the client returns is stored unless the cache
+    was invalidated meanwhile; a failed fetch stores nothing and answers None.
 
     Args:
         cache: The web tier's metadata cache.
