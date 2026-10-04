@@ -6,11 +6,11 @@ Accepted, 2026-10-03.
 
 ## Context
 
-A scan backend acquires pages one at a time, and a job can run to hundreds of pages. A backend that accumulated decoded pages put peak memory at 1395 MB for 48 pages. The backend also measures two facts the pipeline needs: the resolution the device settled on, and how many fed sheets failed their integrity checks. Where a page lands and what is measured about it are pipeline concerns, not backend ones.
+A scan backend acquires pages one at a time, and a job can run to hundreds of pages, so a backend that accumulated decoded pages would grow its peak memory with every page. The backend also measures two facts the pipeline needs: the resolution the device settled on, and how many fed sheets failed their integrity checks. Where a page lands and what is measured about it are pipeline concerns, not backend ones.
 
 ## Decision
 
-The backend's scan call takes a page sink, an abstract base class the pipeline implements, and returns a completed batch. For each accepted page the backend calls the sink exactly once, after the page passed its checks and was cropped, and retains nothing afterwards. The batch carries the records the sink returned, the resolution the device used, and the count of rejected sheets.
+The backend's scan call takes a page sink, the abstract base class `saneless.scanner.base.PageSink`, which the pipeline implements as `saneless.spool.SpooledPageSink`, and returns a completed batch. For each accepted page the backend calls the sink exactly once, after the page passed its checks and was cropped, and retains nothing afterwards. The batch carries the records the sink returned, the resolution the device used, and the count of rejected sheets.
 
 The invariant: the backend never holds more than one decoded page, and it never decides where a page is stored.
 
