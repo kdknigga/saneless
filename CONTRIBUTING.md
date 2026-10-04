@@ -252,8 +252,9 @@ decision keeps the invariant next to the line and ends that comment with the poi
 See docs/explanation/decisions/NNNN-slug.md.
 ```
 
-A test in `tests/test_deployment_config.py` fails on a pointer to a record that does
-not exist and on a record the index does not list.
+A test in `tests/test_deployment_config.py` fails on a pointer that is not the
+`NNNN-slug.md` shape, on a pointer to a record that does not exist and on a record
+the index does not list. The placeholder above passes in this file only.
 
 Two conventions the code follows without restating them at each site:
 
