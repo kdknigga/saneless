@@ -1,32 +1,14 @@
-{# Used by every htmx route that renders status: scan success, the status poll,
-   and flip continue/abort.  The status area is the swap target; the Scan button
-   rides along out-of-band so the server alone decides its state.
-   The #status-message clear is for a successful scan only: a poll or flip
-   response carrying it would erase a 429 shown mid-scan within a second.
-   The strip refresh is scan-only for exactly the same reason: the submit is the
-   one response that has news for it -- the scanner has just become busy, so
-   the strip's paused note is due immediately -- while a poll carrying it would
-   re-render the whole strip every second for no new information, and a flip answer
-   changes the job, not the appliance's health.
-   Every one of these responses sets terminal_reload, so a job that has just
-   ended reloads the history table and the strip; the full page does not set
-   it, because it has just rendered both.
+{# The #status-message clear and the strip refresh are for a scan submit
+   only: on a poll the clear would erase a 429 shown mid-scan, and the refresh
+   would re-render the strip every second.
 
-   Focus.  An action's response sets focus_status_area, and the status area
-   takes focus; a plain poll never sets it.  focus_scan is the Scan button's
-   pending request for focus after a claimed Abort, and the button takes it
-   once it is enabled.  When both apply in one response -- an Abort that
-   lands after the scan has already ended -- the Scan button must win, but
-   htmx focuses the main swap's autofocus after the out-of-band ones, so the
-   status area is told not to ask.  Whether the button is enabled is the
-   button partial's own verdict, imported rather than restated here.
+   When an Abort lands after the scan has ended the Scan button must take
+   focus, but htmx focuses the main swap's autofocus after the out-of-band
+   ones, so the status area is told not to ask.
 
-   The title element is top-level, first, and in every one of these
-   responses: htmx sets document.title from a title at the root of a swapped
-   response, and a 204 swaps nothing, so the tab follows each change the area
-   shows and keeps its title while nothing changes.  page_title names the
-   state and never the job's title, which the tab list and the browser
-   history would show to anybody. #}
+   The title is top-level and first because htmx sets document.title only
+   from a title at the response root.  page_title never names the job's title,
+   which the tab list and history would show to anybody. #}
 <title>{{ page_title }}</title>
 {% import "partials/scan_button.html" as scan_button_state with context %}
 {% set scan_takes_focus = focus_scan and not scan_button_state.scan_disabled %}

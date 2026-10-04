@@ -1,24 +1,8 @@
-{# Which profile's defaults a metadata control is showing, submitted with the
-   scan so the server can tell.  The tag list and the correspondent select each
-   follow the Profile select by their own request, so for a moment after a
-   change -- or for good, when that request fails -- they can still hold the
-   previous profile's defaults while the select names the new one.  A submit in
-   that window would otherwise file the new profile's scan with the old
-   profile's tags or correspondent.  start_scan compares this value with the
-   submitted profile and, when they differ, applies the submitted profile's
-   defaults instead of the values that belong to another one.
-
-   The page renders one per shown control, named by marker_id and marker_name.
-   It does not carry a profile there: the page's lists are still loading, with
-   no ticks and no choice, so it carries a reserved value that names no
-   profile, and a submit sent before the lists land -- a Scan a status poll
-   released early -- gets the submitted profile's defaults.  The lazy list
-   load's first answer and the profile-change responses render it again,
-   out-of-band with oob = true, naming the profile whose defaults they show, so
-   it changes in the same swap that replaces the control's defaults and never
-   before.  The filter and the refresh keep the ticks and the profile, so they
-   leave it alone.
-
-   Turning autocomplete off stops a browser that restores form state on reload
-   from bringing back a value the server did not render. #}
+{# Which profile's defaults the control is showing, so start_scan can apply
+   the submitted profile's defaults when a submit lands before the control
+   followed a profile change.  The page renders a reserved value naming no
+   profile until the lazy list load answers; it is re-rendered out of band
+   only in the swap that replaces the control's defaults, never before.
+   autocomplete is off so form restore cannot bring back a value the server
+   did not render. #}
 <input type="hidden" id="{{ marker_id }}" name="{{ marker_name }}" value="{{ marker_profile }}" autocomplete="off"{% if oob %} hx-swap-oob="true"{% endif %}>

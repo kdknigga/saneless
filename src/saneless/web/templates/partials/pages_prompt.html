@@ -1,48 +1,15 @@
-{# The open multi-page question, for the job's owner only; status.html decides
-   who gets here.  Every sentence is a field of pass_copy, built on the server
-   from the question itself: this template lays the words out and writes none
-   of its own.  A field a question does not use is empty, so the layout tests
-   for the field rather than for the question.
+{# Every sentence is a field of pass_copy; this template writes no words.
 
-   Every button has a fixed id, one per answer.  The status area is replaced
-   every second while the job waits, and htmx puts keyboard focus back after a
-   swap only on an element with the same id, so without these a keyboard user
-   would lose their place once a second.  Only one question renders at a time,
-   so each id is unique on the page.  Scan next's id is keyed on the question,
-   not the job row: the row can lag the open question when a progress write
-   fails, and the buttons are the question's.
-
-   The button row is a plain wrapping flex row, not Pico's button group: that
-   is a joined row that never wraps, and four buttons overflow a narrow phone.
-
-   Abort asks first, through the native browser confirmation, exactly as the
-   flip prompt's Abort does, and for the same reasons: it is focus-trapped,
-   keyboard-operable and announced by every screen reader, with no modal and
-   no script.  The confirmation attribute sits on the Abort BUTTON and nowhere
-   else.  It is inherited, so on a container it would make every button in the
-   row confirm, and scanning the next page of a twenty-page document is not a
-   decision that needs a dialog twenty times.  Nothing else here confirms.
-
-   The wording promises nothing the scan does not do: each consequence it names
-   is one the pipeline carries out.
-
-   A Finish the question does not offer -- nothing is kept yet -- keeps its
-   place in the row with the real disabled attribute, pointing at the visible
-   reason beneath the row, because a disabled button is not focusable and a
-   tooltip on it would never be read.  The server refuses a forged Finish on
-   its own; the attribute is a courtesy.
-
-   Nothing here is a disclosure widget: the once-a-second swap would close it
-   again on every poll.  Nothing here is marked busy either: the job is waiting
-   for a person.
-
-   The question's primary button takes focus when the question appears: Scan
-   next (Retry, on the failed-pass question) or Skip, whichever it offers --
-   every question offers exactly one of the two.  It moves focus only once for
-   the same reason the flip prompt's Continue does: an unchanged poll is
-   answered 204 and swaps nothing, so only the rendering of a new question
-   reaches the page.  The full page leaves it off (page_render), because a
-   page load moves no focus. #}
+   Each button has a fixed id, because the status area is replaced every
+   second and htmx restores focus only by id.  Scan next's id is keyed on the
+   question, not the job row, which can lag it.  The row is a wrapping flex
+   row, not Pico's button group, which never wraps.  hx-confirm sits on the
+   Abort button only: it is inherited, so on a container every button would
+   confirm.  A Finish the question does not offer stays in place, really
+   disabled, with its reason as visible text.  No disclosure widget: the
+   swap every second would close it.  autofocus moves focus only once, because
+   an unchanged poll is answered 204; the full page leaves it off
+   (page_render). #}
 {% set button_ids = {
   "NEXT": "mp-retry" if pass_prompt.wait == "RETRY" else "mp-next",
   "FINISH": "mp-finish",

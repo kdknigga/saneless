@@ -1,29 +1,8 @@
-{# The lazy list load's response: GET /api/metadata, asked by the hidden
-   loader on the page once it has rendered.  Only the server knows when both
-   lists are done, so one request fetches both and sends everything that
-   depends on them here.
-
-   The primary swap target is the loader itself, swapped outerHTML, and the
-   primary content is always nothing: the loader is removed.  A list that
-   could not be loaded carries its own hidden retry inside its rendering
-   (see partials/list_retry.html), so it asks again for exactly as long as
-   that rendering is on the page, whatever replaced the loader.
-
-   Everything else is out-of-band:
-   - the tag list, wrapper and all, and the correspondent select with the help
-     line under it, each only when the control is shown.  list_oob marks the
-     element that carries the id; the profile markers ride along inside the
-     same partials when follows_profile is set: whenever the load named a
-     profile that is still configured.
-   - the Scan button, from the one partial that renders it, fed from the
-     status context, so an active job or a blocked appliance still disables
-     it.  A failed list releases it exactly as a loaded one does.
-   - the hold reason, emptied to a byte-empty element so :empty hides it.
-     Not for a blocked appliance: its page renders the blocked reason alone,
-     so there is no hold line to empty, and an out-of-band element with no
-     target is an htmx error.
-
-   No title element: the lists change nothing the tab names. #}
+{# The loader is the primary target and the primary content is nothing: the
+   loader is removed and everything else arrives out of band.  The hold
+   reason is emptied byte-empty so :empty hides it, but not on a blocked
+   appliance, whose page has no hold line: an out-of-band element with no
+   target is an htmx error. #}
 {% if show_tags %}{% with list_oob = true %}{% include "partials/tags.html" %}{% endwith %}{% endif %}
 {% if show_correspondent %}{% with list_oob = true %}{% include "partials/correspondent_select.html" %}{% endwith %}{% endif %}
 {% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}

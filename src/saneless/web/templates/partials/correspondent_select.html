@@ -1,37 +1,12 @@
-{# The Correspondent select, the element itself: it is the swap target of its
-   own profile-change refresh, and an outerHTML swap replaces the element it is
-   aimed at, so the element carrying the id has to be rendered here -- the
-   shape the Multiple pages field and the tag list have for the same reason.
-   The select stays the element directly before its help line, so no wrapper
-   comes between them.
-
-   The select names its own hx-target and hx-swap, so it never inherits the
-   scan form's status-area target and nothing is added to the form element.
-   The include is mandatory on a GET, as it is for the tag filter: htmx does
-   not gather the enclosing form for one.  It carries the chosen profile, and
-   the response selects that profile's default correspondent, replacing the
-   earlier choice on purpose: the new profile's default is what an untouched
-   form now means.
-
-   The refresh button beside the label swaps this element's options
-   innerHTML and leaves the element, and these attributes, in place.
-
-   Turning autocomplete off is what stops a browser that restores form state
-   on reload from choosing something other than the server rendered: the page
-   opens on the profile's default.
-
-   The options come from partials/correspondents.html; this file composes no
-   prose.
-
-   The profile-change response alone also carries the select's profile marker
-   out-of-band (see partials/profile_marker.html), so the marker names the new
-   profile in the same swap that selects its default.  It comes first, and the
-   out-of-band help line comes after the select, so the select is the one
-   element left for the main swap.
-
-   The lazy list load (partials/metadata_response.html) sends the select
-   out-of-band too, because its own swap target is the loader, so it sets
-   list_oob.  The name is not oob, which the marker and the help line read. #}
+{# The select is its profile-change swap's outerHTML target, so it is rendered
+   here, and it stays the element directly before its help line with no
+   wrapper between them.  It names its own hx-target and hx-swap so it never
+   inherits the scan form's.  The answer replaces the choice with the new
+   profile's default on purpose.  autocomplete is off so a browser's form
+   restore cannot choose other than the server rendered.  The marker comes
+   first and the help line after the select, so the select is the one element
+   left for the main swap.  list_oob is not named oob, which the marker and the
+   help line read. #}
 {% if follows_profile %}{% with marker_id = "correspondent-profile", marker_name = "correspondent_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
 <select name="correspondent" id="correspondent-select"{% if list_oob %} hx-swap-oob="true"{% endif %}
         aria-describedby="correspondent-help"
@@ -43,9 +18,7 @@
         hx-swap="outerHTML">
     {% with help_elsewhere = true %}{% include "partials/correspondents.html" %}{% endwith %}
 </select>
-{# The help line follows the select out of band, from the same context, so it
-   says whether this list could be loaded.  The page renders it in place
-   instead (it sets help_elsewhere), directly after the select, and a hidden
-   control has none.  oob is scoped to this one include so the profile marker
-   above never reads it. #}
+{# Out of band, so the help line says whether this list could be loaded;
+   the page renders it in place instead (help_elsewhere).  oob is scoped to
+   this include so the profile marker above never reads it. #}
 {% if show_correspondent and not help_elsewhere %}{% with oob = true %}{% include "partials/correspondent_help.html" %}{% endwith %}{% endif %}
