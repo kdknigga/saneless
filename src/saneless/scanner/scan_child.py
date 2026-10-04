@@ -484,7 +484,8 @@ class ScanChildSession:
         Ask the child to exit, and reap it; kill it if it does not exit.
 
         It gets the stage deadline, or only the cancel grace once the abort
-        Event is set.  The child is reaped whatever happens.
+        Event is set, even part way through the wait.  The child is reaped
+        whatever happens.
 
         Raises:
             ScanError: The child had to be killed, or died from a signal.
@@ -493,9 +494,7 @@ class ScanChildSession:
         if self._child is None:
             return
         self._enter(ScanStage.EXIT)
-        stopping = self._abort is not None and self._abort.is_set()
-        seconds = CANCEL_GRACE_SECONDS if stopping else STAGE_DEADLINE_SECONDS
-        status = self._stop_child(ControlOp.EXIT, seconds)
+        status = self._stop_child(ControlOp.EXIT, STAGE_DEADLINE_SECONDS)
         if status is None:
             logger.warning(
                 "The scanning process did not exit when asked, so it was stopped"
@@ -503,6 +502,11 @@ class ScanChildSession:
             raise ScanError(scan_child_stopped_error(ScanStage.EXIT, None))
         if status < 0:
             raise self._crashed(-status, ScanStage.EXIT, None)
+        if status > 0:
+            logger.warning(
+                "The scanning process exited with status %d when asked to exit",
+                status,
+            )
 
     def _guarded[T](self, operation: Callable[[], T]) -> T:
         """
@@ -800,6 +804,10 @@ class ScanChildSession:
         """
         Block until the reply channel is readable, in short slices.
 
+        While a stopping child is waited for, the abort is not raised; it
+        cuts the wait to the cancel grace instead, so a server stop never
+        waits out a longer deadline.
+
         Raises:
             _AbortedError: The abort Event was set, and it is being watched.
             _DeadlineError: The current deadline passed.
@@ -809,8 +817,12 @@ class ScanChildSession:
         if poller is None:
             raise ChildGoneError(_GONE)
         while True:
-            if self._watch_abort and self._abort is not None and self._abort.is_set():
-                raise _AbortedError
+            if self._abort is not None and self._abort.is_set():
+                if self._watch_abort:
+                    raise _AbortedError
+                self._deadline = min(
+                    self._deadline, time.monotonic() + CANCEL_GRACE_SECONDS
+                )
             remaining = self._deadline - time.monotonic()
             if remaining <= 0:
                 raise _DeadlineError
@@ -902,9 +914,30 @@ class ScanChildSession:
             except ProtocolError:
                 self._in_sync = False
             except ChildGoneError:
-                return child.wait(max(0.0, self._deadline - time.monotonic()))
+                return self._wait_for_exit(child)
             except _DeadlineError:
                 return child.poll()
+
+    def _wait_for_exit(self, child: ChildProcess) -> int | None:
+        """
+        Wait, in short slices, for a child whose reply channel has closed.
+
+        An abort cuts the wait to the cancel grace, as it does while the
+        child's replies are drained.
+
+        Returns:
+            The child's exit status, or ``None`` if it is still running.
+
+        """
+        while True:
+            if self._abort is not None and self._abort.is_set():
+                self._deadline = min(
+                    self._deadline, time.monotonic() + CANCEL_GRACE_SECONDS
+                )
+            remaining = self._deadline - time.monotonic()
+            status = child.wait(max(0.0, min(_ABORT_POLL_SECONDS, remaining)))
+            if status is not None or remaining <= 0:
+                return status
 
     def _drain_frame(self, child: ChildProcess) -> None:
         """Read one frame from a stopping child, keeping only its log records."""

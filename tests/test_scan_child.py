@@ -266,7 +266,7 @@ while True:
         if HANG == "exit":
             hang("exit")
         send(protocol.Bye())
-        os._exit(0)
+        os._exit(int(env.get("SCAN_TEST_EXIT_STATUS", "0")))
 """
 
 
@@ -855,6 +855,63 @@ def test_an_abort_mid_read_returns_within_the_grace(
     assert ended - set_at[0] < 1.0
     assert "cancel" in files.ops()
     assert session.children_killed == killed
+
+
+# Longer than the cancel grace by far, so a close that waits it out instead of
+# the grace is plainly too slow; short enough that it still ends the test.
+_LONG_STAGE_SECONDS = 10.0
+
+
+def test_an_abort_during_close_cuts_the_wait_to_the_grace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A server stop that arrives while a child is asked to exit waits the grace.
+
+    ``close`` had already given the child the stage deadline; the abort cuts
+    it short, so the worker's stop is never held for a whole stage deadline.
+    """
+    monkeypatch.setattr(scan_child_mod, "STAGE_DEADLINE_SECONDS", _LONG_STAGE_SECONDS)
+    monkeypatch.setattr(scan_child_mod, "CANCEL_GRACE_SECONDS", _SHORT_SECONDS)
+    files = _stand_in(monkeypatch, tmp_path, SCAN_TEST_HANG_AT="exit")
+    abort = threading.Event()
+    session = ScanChildSession(_Starts(), abort=abort)
+    session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+    set_at: list[float] = []
+
+    def abort_once_exiting() -> None:
+        if poll_until(lambda: files.hung_at("exit"), _POLL_BUDGET_SECONDS):
+            set_at.append(time.monotonic())
+            abort.set()
+
+    helper = threading.Thread(target=abort_once_exiting, daemon=True)
+    helper.start()
+    with pytest.raises(ScanError) as failed:
+        session.close()
+    ended = time.monotonic()
+    helper.join(_POLL_BUDGET_SECONDS)
+
+    assert str(failed.value) == scan_child_stopped_error(ScanStage.EXIT, None)
+    assert set_at
+    assert ended - set_at[0] < _LONG_STAGE_SECONDS / 2
+    _assert_reaped(files.pid())
+
+
+def test_a_child_that_exits_with_a_status_on_close_is_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A child that answers ``exit`` but exits with a status is not let pass."""
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    files = _stand_in(monkeypatch, tmp_path, SCAN_TEST_EXIT_STATUS="4")
+    with ScanChildSession(_Starts()) as session:
+        session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+
+    assert _warnings(caplog) == [
+        "The scanning process exited with status 4 when asked to exit"
+    ]
+    _assert_reaped(files.pid())
 
 
 def _interrupt_main_thread_once(files: _StandIn) -> threading.Thread:
