@@ -639,7 +639,12 @@ class ScanChildSession:
         poller.register(child.reply_fd, select.POLLIN)
         self._poller = poller
         self._in_sync = True
-        if not isinstance(self._next_frame(), Ready):
+        frame = self._next_frame()
+        if isinstance(frame, ChildFailure):
+            # A scanner library that would not load or start is reported as
+            # what it is, not as a reply out of place.
+            raise _FailedError(frame)
+        if not isinstance(frame, Ready):
             raise ProtocolError(_OUT_OF_PLACE)
 
     def _receive_pass(self, sink: PageSink) -> ScanBatch:
