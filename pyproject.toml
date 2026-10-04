@@ -157,9 +157,9 @@ exclude = [".planning/**/*.md"]
     "S104", "S105", "S106",  # hardcoded test values are inherent to fixtures
     "S603",  # tests start their own interpreter and git with argument lists, never a shell string
 ]
-"src/saneless/__init__.py" = ["PLC0415"]
+"src/saneless/__init__.py" = ["PLC0415"]  # main imports the CLI only after blocking SIGPIPE and loading the thread unwinder
 "src/saneless/cli.py" = ["PLC0415"]  # serve imports the web stack when it runs, so no other command loads it
-"src/saneless/config.py" = ["S104"]
+"src/saneless/config.py" = ["S104"]  # the web UI listens on every interface by default, as a LAN appliance in a container
 # every interpolated fragment is a module constant (the column list, a run of "?"
 # placeholders or another SQL constant); every value is a bound parameter
 "src/saneless/job.py" = ["S608"]
