@@ -36,8 +36,6 @@ from saneless.checks import (
     POLL_GAVE_UP_LINE,
     POLL_PROBE_ATTEMPT_CAP,
     POLL_STILL_CHECKING_LINE,
-    PROBE_CONNECT_SECONDS,
-    PROBE_READ_SECONDS,
     CheckKey,
 )
 from saneless.config import PaperlessId, is_placeholder_token, resolve_job_title
@@ -45,6 +43,7 @@ from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
 from saneless.scan_metadata import metadata_ids, resolve_scan_metadata
 from saneless.scanner.base import SourceKind, classify_source
+from saneless.scanner.saned_probe import PROBE_CONNECT_SECONDS, PROBE_READ_SECONDS
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,

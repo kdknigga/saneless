@@ -251,7 +251,7 @@ class CheckRefresher:
         within a fraction of a second, its child killed and reaped by the
         refresher thread that started it.  A saned pre-probe stops waiting
         for saned's reply within a fraction of a second too, and a connect in
-        progress within what is left of ``PROBE_CONNECT_SECONDS``.  Without
+        progress within what is left of ``saned_probe.PROBE_CONNECT_SECONDS``.  Without
         that, a stop would wait out a listing for up to its whole deadline,
         or a silent saned host for its whole handshake budget, far past the
         few seconds an idle server is given to shut down.  This thread never
@@ -259,8 +259,8 @@ class CheckRefresher:
 
         Two waits cannot be cut short, and a stop that lands in one waits
         for it.  A name lookup takes no timeout at all.  The Paperless check
-        is one HTTP request of up to ``PROBE_CONNECT_SECONDS`` plus
-        ``PROBE_READ_SECONDS``, longer than the lifespan's shared join.
+        is one HTTP request of up to ``saned_probe.PROBE_CONNECT_SECONDS`` plus
+        ``saned_probe.PROBE_READ_SECONDS``, longer than the lifespan's shared join.
         ``serve`` therefore calls :meth:`note_stop` as soon as the server is
         told to stop, before uvicorn waits for the requests still being
         answered, and the lifespan calls this afterwards.  The run then ends
