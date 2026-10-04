@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Final
 from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
+    ListingNoAnswerError,
     ScanError,
     describe,
     describe_text,
@@ -47,7 +48,12 @@ from saneless.scanner.base import (
     ScanSettings,
     classify_source,
 )
-from saneless.scanner.listing import ListingReply, ListingRequest, run_listing_child
+from saneless.scanner.listing import (
+    ChildError,
+    ListingReply,
+    ListingRequest,
+    run_listing_child,
+)
 from saneless.scanner.net_hosts import (
     SANE_NET_HOSTS,
     effective_sane_net_hosts,
@@ -80,7 +86,12 @@ from saneless.scanner.scan_session import (
     _validate_page_image,
 )
 from saneless.text_safety import neutralise_controls
-from saneless.vocabulary import page_timeout_error
+from saneless.vocabulary import (
+    PYTHON_SANE_INSTALL_NEXT_STEP,
+    page_timeout_error,
+    python_sane_missing_message,
+    sane_init_failure_message,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -88,6 +99,7 @@ if TYPE_CHECKING:
     from PIL import Image
 
     from saneless.scanner.base import PageRecord, PageSink
+    from saneless.scanner.listing import OptionEntry
     from saneless.scanner.scan_session import SaneDevice
 
 
@@ -157,6 +169,78 @@ def _listed_devices(reply: ListingReply) -> tuple[DeviceInfo, ...]:
         DeviceInfo(name=name, vendor=vendor, model=model, device_type=device_type)
         for name, vendor, model, device_type in reply.devices
     )
+
+
+# The exceptions a child reports when python-sane itself could not be loaded,
+# as opposed to a SANE that loaded and would not initialise.
+_IMPORT_FAILURES: Final = frozenset({"ImportError", "ModuleNotFoundError"})
+
+
+def _child_reason(error: ChildError) -> str:
+    """
+    Normalise a child's failure text and escape its control characters.
+
+    libsane's text can repeat what a LAN peer sent, so it is defused before
+    it reaches any message.
+
+    Returns:
+        The one-line, defused reason.
+
+    """
+    return neutralise_controls(describe_text(error.message, error.type_name))
+
+
+def _start_failure(error: ChildError) -> ConfigError | ScanError:
+    """
+    Turn a child's report that the scanner library would not start into an error.
+
+    A python-sane the child could not import is the install problem
+    ``require_sane`` reports, with the same words; any other failure is SANE
+    refusing to initialise.
+
+    Args:
+        error: The child's ``init_error``.
+
+    Returns:
+        The error to raise.
+
+    """
+    reason = _child_reason(error)
+    if error.type_name in _IMPORT_FAILURES:
+        return ConfigError(
+            python_sane_missing_message(reason),
+            next_step=PYTHON_SANE_INSTALL_NEXT_STEP,
+        )
+    return ScanError(sane_init_failure_message(reason))
+
+
+def _option_tuples(options: tuple[OptionEntry, ...]) -> list[tuple]:
+    """
+    Rebuild SANE option tuples from a child's option entries.
+
+    Only the name (index 1) and the constraint (index 8) are filled: they are
+    all a capability read uses, and they sit where ``_constraint`` looks for
+    them.  A word list stays a list and a range a tuple, the shapes
+    python-sane gives.
+
+    Args:
+        options: The ``(name, kind, values)`` entries the child reported.
+
+    Returns:
+        One nine-element tuple per entry, in the device's order.
+
+    """
+    rebuilt: list[tuple] = []
+    for name, kind, values in options:
+        constraint: list | tuple | None
+        if kind == "list":
+            constraint = list(values)
+        elif kind == "range":
+            constraint = tuple(values)
+        else:
+            constraint = None
+        rebuilt.append((None, name, None, None, None, None, None, None, constraint))
+    return rebuilt
 
 
 # How long the timeout path waits for a cancelled read to come back before it
@@ -1225,14 +1309,19 @@ class SaneBackend(ScannerBackend):
             ListingTimedOutError: The listing child did not finish in time.
             ListingNoAnswerError: The listing child gave no usable answer, or
                 could not be started.
+            ConfigError: If the child could not import python-sane, with the
+                install hint.
             ScanError: If a previous read has not returned, in which case no
-                child is started; or if SANE could not list the devices, with
-                its message normalised and its control characters escaped.
+                child is started; if SANE would not initialise in the child;
+                or if SANE could not list the devices, with its message
+                normalised and its control characters escaped.
 
         """
         # The refusal names the wedged device from its own record.
         _refuse_if_wedged("the scanners", "list")
         reply = _launch_listing(ListingRequest(), configured_host=self._host)
+        if reply.init_error is not None:
+            raise _start_failure(reply.init_error)
         if reply.list_error is not None:
             # libsane's text can repeat what a LAN peer sent.
             reason = describe_text(reply.list_error.message, reply.list_error.type_name)
@@ -1250,6 +1339,8 @@ class SaneBackend(ScannerBackend):
         child opens the configured id only when its listing lacks it, then
         closes it at once.  The survey carries exception class names only,
         since a ``net:`` id is a LAN address and SANE's text can repeat it.
+        A scanner library that would not start in the child is named in the
+        survey's ``start_error`` and logged once with its reason.
 
         Args:
             open_if_unlisted: The configured device id, or ``""`` when none
@@ -1276,11 +1367,21 @@ class SaneBackend(ScannerBackend):
             configured_host=self._host,
             abort=abort,
         )
+        start_error = None
+        if reply.init_error is not None:
+            start_error = reply.init_error.type_name
+            # Safe to log: a SANE initialisation error is a status string, and
+            # an import error names a module; neither names a device.
+            logger.warning(
+                "The scanner library could not be started: %s",
+                _child_reason(reply.init_error),
+            )
         return DeviceSurvey(
             devices=_listed_devices(reply),
             list_error=reply.list_error.type_name if reply.list_error else None,
             configured_opened=reply.opened,
             open_error=reply.open_error.type_name if reply.open_error else None,
+            start_error=start_error,
         )
 
     def open_and_close(self, device_id: str) -> None:
@@ -1316,10 +1417,12 @@ class SaneBackend(ScannerBackend):
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """
-        Query device capabilities and available options.
+        Query device capabilities and available options, in a listing child.
 
-        Opens the device, reads its option list, and records what the device
-        reports for its source, resolution and mode options.
+        The child opens the device, reads its option list and closes it; this
+        process records what the device reports for its source, resolution
+        and mode options.  See
+        docs/explanation/decisions/0002-listing-in-a-child-process.md.
 
         Args:
             device_id: SANE device identifier string.
@@ -1331,28 +1434,54 @@ class SaneBackend(ScannerBackend):
             neither derived from the other.
 
         Raises:
-            ScanError: If a previous read has not returned, in which case no
-                SANE call is made at all.
+            ListingCrashedError: The listing child died from a signal.
+            ListingTimedOutError: The listing child did not finish in time.
+            ListingNoAnswerError: The listing child gave no usable answer, or
+                could not be started.
+            ConfigError: If the child could not import python-sane, with the
+                install hint.
+            ScanError: If SANE would not initialise in the child, or the
+                device could not be opened or report its options, naming the
+                device; the id and the reason have their control characters
+                escaped.
 
         """
-        _refuse_if_wedged(device_id, "read the capabilities of")
-        with self._open_device(device_id) as dev:
-            raw_options = _read_options(dev, device_id)
-            sources = _constraint(raw_options, "source").values or []
-            modes = _constraint(raw_options, "mode").values or []
-            resolution = _constraint(raw_options, "resolution")
-
-            return DeviceCapabilities(
-                sources=[str(s) for s in sources],
-                resolutions=[int(r) for r in resolution.values or []],
-                modes=[str(m) for m in modes],
-                # Option 0 is named '' and a group heading None; neither is an
-                # option anyone can set.
-                option_names=tuple(
-                    str(opt[1]) for opt in raw_options if len(opt) >= 2 and opt[1]
-                ),
-                resolution_range=resolution.span,
+        reply = _launch_listing(
+            ListingRequest(capabilities=device_id), configured_host=self._host
+        )
+        shown = neutralise_controls(device_id)
+        if reply.init_error is not None:
+            raise _start_failure(reply.init_error)
+        if reply.open_error is not None:
+            open_msg = (
+                f"Could not open scanner {shown}: {_child_reason(reply.open_error)}"
             )
+            raise ScanError(open_msg)
+        if reply.options_error is not None:
+            options_msg = (
+                f"Could not read options from {shown}: "
+                f"{_child_reason(reply.options_error)}"
+            )
+            raise ScanError(options_msg)
+        if reply.options is None:
+            no_options_msg = f"The scanner library returned no options for {shown}"
+            raise ListingNoAnswerError(no_options_msg)
+        raw_options = _option_tuples(reply.options)
+        sources = _constraint(raw_options, "source").values or []
+        modes = _constraint(raw_options, "mode").values or []
+        resolution = _constraint(raw_options, "resolution")
+
+        return DeviceCapabilities(
+            sources=[str(s) for s in sources],
+            resolutions=[int(r) for r in resolution.values or []],
+            modes=[str(m) for m in modes],
+            # Option 0 is named '' and a group heading None; neither is an
+            # option anyone can set.
+            option_names=tuple(
+                str(opt[1]) for opt in raw_options if len(opt) >= 2 and opt[1]
+            ),
+            resolution_range=resolution.span,
+        )
 
     def _scan_adf_pages(
         self,

@@ -37,6 +37,7 @@ from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
     ListingCrashedError,
+    ListingNoAnswerError,
     ListingTimedOutError,
     ScanError,
     ScanInterrupted,
@@ -1856,6 +1857,21 @@ class TestSaneBackendGetCapabilities:
             "not a (minimum, maximum, step) triple" in record.getMessage()
             for record in caplog.records
         )
+
+    def test_a_capabilities_reply_without_options_is_no_answer(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reply that names no options and no failure is not an empty device."""
+        _ = fake_sane_module  # side-effect: patches the sane module
+        backend = SaneBackend()
+
+        def reply_without_options(*_args: object, **_kwargs: object) -> ListingReply:
+            return ListingReply(devices=())
+
+        monkeypatch.setattr(sane_backend_mod, "_launch_listing", reply_without_options)
+
+        with pytest.raises(ListingNoAnswerError, match="returned no options"):
+            backend.get_capabilities("test:0")
 
     @pytest.mark.parametrize("read", _CHILD_BACKED_READS)
     def test_a_sane_that_will_not_start_in_the_child_is_a_scan_error(

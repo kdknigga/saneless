@@ -163,6 +163,8 @@ class DeviceSurvey:
             configured or the listing already included it.
         open_error: The class name of the exception the open raised, or
             ``None`` when it did not raise or was not attempted.
+        start_error: The class name of the failure that kept the scanner
+            library from starting, or ``None`` when it started.
 
     """
 
@@ -170,6 +172,7 @@ class DeviceSurvey:
     list_error: str | None = None
     configured_opened: bool | None = None
     open_error: str | None = None
+    start_error: str | None = None
 
 
 @dataclass(kw_only=True)
