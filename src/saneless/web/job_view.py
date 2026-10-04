@@ -116,7 +116,7 @@ class JobView:
 
     @property
     def is_active(self) -> bool:
-        """Whether this job is still in flight (not DONE or ERROR)."""
+        """Whether this job is still in flight (not in a terminal state)."""
         return self.state in ACTIVE_STATES
 
     @property
