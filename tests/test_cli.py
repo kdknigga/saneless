@@ -9031,21 +9031,20 @@ class TestJobsIntoAClosedPipe:
         assert "Unexpected error" not in log, log
 
 
-# Runs ``saneless.main()`` with the command line replaced by a no-op and the
-# unwinder loader replaced by a recorder, then prints what was recorded.  main
-# looks both up when it runs, so the replacements are the ones it calls.
+# Runs ``saneless.main()`` with the command line replaced by a no-op, then
+# prints which of the unwinder's module and ``ctypes``, which the unwinder
+# needs and nothing else in main imports, were ever imported.  Loading the
+# unwinder imports both, whether main calls the loader or binds it at import.
 _MAIN_UNWINDER_PROBE = """\
 import json
+import sys
 
 import saneless
 import saneless.cli
-import saneless.thread_unwinder
 
-calls = []
-saneless.thread_unwinder.load_thread_unwinder = lambda: calls.append("loaded")
 saneless.cli.cli = lambda: None
 saneless.main()
-print(json.dumps(calls))
+print(json.dumps(sorted(m for m in ("ctypes", "saneless.thread_unwinder") if m in sys.modules)))
 """
 
 
