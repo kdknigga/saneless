@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     from saneless.scanner.base import PageSink, ScanSettings
     from saneless.web.refresher import CheckRefresher
     from saneless.workspace import RecoveredWorkspace
+    from tests.conftest import ListingSeam, ScanChildSeam
 
 
 def _inked_page() -> Image.Image:
@@ -2693,13 +2694,12 @@ def _break_libsane(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scan_session_mod, "_ensure_sane", unloadable)
 
 
-# Each SANE command, with what it needs to reach the scanner backend: serve
-# binds an OS-chosen loopback port before it builds the backend.
-_SANE_COMMAND_LINES = [
+# The SANE commands that start a child before they finish, so a child is
+# where a libsane that will not load is found.
+_CHILD_REPORTED_COMMAND_LINES = [
     pytest.param(["scan"], id="scan"),
     pytest.param(["devices"], id="devices"),
     pytest.param(["auto-profiles"], id="auto-profiles"),
-    pytest.param(["serve", "--host", "127.0.0.1", "--port", "0"], id="serve"),
 ]
 
 
@@ -2751,16 +2751,16 @@ class TestRequireSane:
         assert "Traceback" not in result.output
         assert calls == []
 
-    @pytest.mark.parametrize("command_line", _SANE_COMMAND_LINES)
-    def test_an_unloadable_libsane_exits_2_when_the_backend_is_built(
+    @pytest.mark.parametrize("command_line", _CHILD_REPORTED_COMMAND_LINES)
+    def test_an_unloadable_libsane_exits_2_from_the_first_child(
         self, monkeypatch: pytest.MonkeyPatch, command_line: list[str]
     ) -> None:
         """
         A python-sane whose libsane will not load gives the same one line, exit 2.
 
-        Checking that python-sane is installed loads nothing, so the missing
-        ``libsane.so`` is found where the library is first loaded: building
-        the backend.
+        Checking that python-sane is installed loads nothing, and neither
+        does building the backend, so the missing ``libsane.so`` is found
+        where the library is first loaded: the first child, which reports it.
         """
         runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
         monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
@@ -2769,13 +2769,45 @@ class TestRequireSane:
         result = runner.invoke(cli, command_line)
 
         assert result.exit_code == 2, result.output
-        # devices announces its discovery before it builds the backend.
+        # devices announces its discovery before it asks a child.
         lines = [
             line for line in _failure_lines(result) if line != "Discovering scanners..."
         ]
         assert lines == [python_sane_missing_message(_LIBSANE_MISSING)], result.stderr
         assert PYTHON_SANE_INSTALL_NEXT_STEP in result.stderr
         assert "Traceback" not in result.output
+
+    def test_serve_starts_with_an_unloadable_libsane(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``serve`` builds its backend and goes on to build the app.
+
+        Building the backend loads nothing, so a libsane that will not load
+        no longer stops the server at start-up; the health checks, which run
+        in children, are where it shows.  The app factory is stopped here
+        with a start-up failure of its own, so nothing is served.
+        """
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
+        monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+        _break_libsane(monkeypatch)
+        reached: list[ScannerBackend] = []
+
+        def unreadable_trust_store(
+            _settings: Settings, scanner: ScannerBackend
+        ) -> NoReturn:
+            reached.append(scanner)
+            msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
+            raise PaperlessTrustStoreError(msg)
+
+        monkeypatch.setattr("saneless.web.app.create_app", unreadable_trust_store)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 3, result.output
+        assert len(reached) == 1
+        assert isinstance(reached[0], sane_backend.SaneBackend)
+        assert "python-sane cannot be imported" not in result.output
 
     def test_jobs_needs_no_python_sane_on_a_fresh_install(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -7241,23 +7273,33 @@ class TestEntryPointsCloseTheBackend:
         assert result.exit_code == 2, result.output
         assert [scanner.close_calls for scanner in built] == [0]
 
-    def test_serve_leaves_sane_uninitialised_after_a_failed_start(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_serve_builds_the_backend_without_starting_sane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        scan_child_seam: ScanChildSeam,
+        listing_seam: ListingSeam,
     ) -> None:
         """
-        A real backend's failed start leaves the process with SANE shut down.
+        Building the server's real backend starts SANE nowhere.
 
-        The app factory checks that SANE really was initialised when it ran,
-        so the final assertion is about a shutdown and not about a backend
-        that never started SANE at all.
+        No ``sane_init`` in this process and no child of either kind, by the
+        time the app factory runs; the factory then fails, so nothing is
+        served and the command exits as a start-up failure.
         """
         fake_sane = FakeSaneModule()
         monkeypatch.setattr(scan_session_mod, "sane", fake_sane)
         runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
-        initialised_when_built: list[bool] = []
+        when_built: list[tuple[int, int, int, int]] = []
 
         def unreadable_trust_store(*_args: object) -> NoReturn:
-            initialised_when_built.append(sane_backend._INIT.done)
+            when_built.append(
+                (
+                    fake_sane.init_call_count,
+                    fake_sane.child_init_call_count,
+                    len(scan_child_seam.launches),
+                    len(listing_seam.calls),
+                )
+            )
             msg = "The TLS trust store named by SSL_CERT_FILE could not be read"
             raise PaperlessTrustStoreError(msg)
 
@@ -7266,9 +7308,8 @@ class TestEntryPointsCloseTheBackend:
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
 
         assert result.exit_code == 3, result.output
-        assert initialised_when_built == [True]
-        assert sane_backend._INIT.done is False
-        assert fake_sane.exit_call_count == 1
+        assert when_built == [(0, 0, 0, 0)]
+        assert fake_sane.exit_call_count == 0
 
 
 # The five categories a SanelessError can carry through the guard to an exit

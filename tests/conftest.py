@@ -458,11 +458,13 @@ def pytest_configure() -> None:
     It also loads the C library's thread unwinder, the next thing
     ``saneless.main()`` does, for the reason given at the call below.
 
-    The suite drives libsane in this very process, as the shipped program
-    does, and libsane puts SIGPIPE back to its default action after a read
-    that ends with an error status.  ``saneless.main()`` blocks the signal
-    before anything else, but pytest never calls it, so without this a later
-    test's write to a closed socket would kill the whole run.
+    The shipped program runs libsane only in child processes, but the
+    ``[libsane]`` contract rows and the hardware tests drive it in this very
+    process on purpose (``libsane_in_this_process``), and libsane puts
+    SIGPIPE back to its default action after a read that ends with an error
+    status.  ``saneless.main()`` blocks the signal before anything else, but
+    pytest never calls it, so without this a later test's write to a closed
+    socket would kill the whole run.
 
     A hook rather than a session fixture, so it runs before any test starts:
     the mask belongs to a thread and is copied to the threads it starts, and
@@ -677,6 +679,33 @@ def sane_test_backend_config(
         yield
 
 
+# What ``sane.init()`` returned the one time this test process started SANE.
+_THIS_PROCESS_SANE: list[object] = []
+_THIS_PROCESS_SANE_LOCK = threading.Lock()
+
+
+def libsane_in_this_process() -> object:
+    """
+    Start real SANE in this test process, once, and return its version.
+
+    saneless itself never does this: it scans and lists in child processes.
+    The tests that compare the fake against real libsane, and the hardware
+    tests, drive python-sane here on purpose, so they need SANE started in
+    this process.  ``sane_init`` is process-global and backends accumulate
+    across restarts, so it is started once and left running for the rest of
+    the run; the suite's reset never shuts it down, because the in-process
+    init guard it resets does not record this start.
+
+    Returns:
+        What ``sane.init()`` returned.
+
+    """
+    with _THIS_PROCESS_SANE_LOCK:
+        if not _THIS_PROCESS_SANE:
+            _THIS_PROCESS_SANE.append(scan_session_mod._ensure_sane().init())
+        return _THIS_PROCESS_SANE[0]
+
+
 def reset_sane_process_state() -> None:
     """
     Return SANE to "never initialised, not wedged" for the next test.
@@ -802,7 +831,10 @@ def listing_seam(
     ``scan_session.sane``, answering a failed ``init()`` with the child's own
     ``start_failure_reply()``, and decodes the result with the launcher's own
     decoder, so the child's logic and the reply schema are still what a test
-    exercises.  With nothing patched it fails the test instead of listing.
+    exercises.  A test that breaks the loading of python-sane instead (by
+    replacing ``scan_session._ensure_sane``) gets the child's own report of
+    a failed start.  With nothing patched it fails the test instead of
+    listing.
 
     A test that needs a real child process requests ``real_listing_launcher``,
     which puts the real launcher back and points it at a stand-in script, so
@@ -829,14 +861,22 @@ def listing_seam(
     ) -> ListingReply:
         seam.calls.append((listing_request, configured_host))
         seam.aborts.append(abort)
-        module = scan_session_mod.sane
-        if module is None:
-            raise AssertionError(_NO_REAL_LIBSANE)
         child_request: dict[str, object] = {
             "open": listing_request.open,
             "capabilities": listing_request.capabilities,
             "alarm": 0,
         }
+        module = scan_session_mod.sane
+        if module is None:
+            # A test may break the library's loading instead of patching a
+            # fake in; the child reports a failed import as a failed start.
+            if scan_session_mod._ensure_sane is _REAL_ENSURE_SANE:
+                raise AssertionError(_NO_REAL_LIBSANE)
+            try:
+                module = scan_session_mod._ensure_sane()
+            except ImportError as exc:
+                reply = _listing_child.start_failure_reply(child_request, exc)
+                return ListingReply.from_stdout((json.dumps(reply) + "\n").encode())
         # The child initialises its own SANE and reports a failure to start as
         # data, from the same boundary, so the seam does the same.  The fake
         # counts a child's start apart from this process's own.

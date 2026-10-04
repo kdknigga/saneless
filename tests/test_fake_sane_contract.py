@@ -35,9 +35,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-import saneless.scanner.sane_backend as sane_backend_mod
 import saneless.scanner.scan_session as scan_session_mod
-from saneless.scanner.sane_backend import SaneBackend
+from tests.conftest import libsane_in_this_process
 from tests.fake_sane import (
     FakeSaneDev,
     FakeSaneError,
@@ -205,13 +204,14 @@ class _LibsaneTarget:
 
     def __init__(self) -> None:
         """
-        Initialise SANE the way saneless does, and remember the device state.
+        Start SANE in this test process, and remember the device state.
 
-        ``SaneBackend()`` initialises SANE through the process-wide guard, so
-        the version it records is the one a second ``sane.init()`` must never
-        be called to re-read.
+        saneless only runs libsane in children; these rows compare the fake
+        with libsane itself, so SANE is started here, once per process, and
+        the version that start returned is the one a second ``sane.init()``
+        must never be called to re-read.
         """
-        self._backend = SaneBackend()
+        self._version = libsane_in_this_process()
         self._sane = scan_session_mod._ensure_sane()
         self.error_type = self._sane._sane.error
         self._handles: list[SaneDevice] = []
@@ -236,13 +236,13 @@ class _LibsaneTarget:
 
     def init_version(self) -> object:
         """
-        Report what ``sane.init()`` returned when the backend initialised SANE.
+        Report what ``sane.init()`` returned when SANE was started here.
 
         Returns:
-            The value the init guard recorded.
+            The value ``libsane_in_this_process`` returned.
 
         """
-        return sane_backend_mod._INIT.version
+        return self._version
 
     def arrange_read(self, handle: SaneDevice, status: ReadStatus) -> None:
         """

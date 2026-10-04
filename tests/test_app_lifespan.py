@@ -29,7 +29,6 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
 
-import saneless.scanner.sane_backend as sane_backend_mod
 import saneless.scanner.scan_session as scan_session_mod
 from saneless import worker as worker_module
 from saneless.config import (
@@ -1641,93 +1640,26 @@ def test_leaf_routes_refuses_to_report_no_routes() -> None:
         leaf_routes(empty)
 
 
-class _SaneCallsByThread:
-    """
-    Record each SANE start and stop, and whether one given thread made it.
-
-    Wraps a fake module's ``init`` and ``exit`` in place, so the fake's own
-    counters keep counting every call.
-    """
-
-    def __init__(
-        self,
-        fake: FakeSaneModule,
-        thread: threading.Thread,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """
-        Start recording.
-
-        Args:
-            fake: The module double whose ``init`` and ``exit`` to wrap.
-            thread: The thread whose calls are told apart from the rest.
-            monkeypatch: Undoes the wrapping at the end of the test.
-
-        """
-        self._thread = thread
-        self._calls: list[tuple[str, bool]] = []
-        real_init = fake.init
-        real_exit = fake.exit
-
-        def recording_init() -> tuple[int, int, int, int]:
-            self._record("init")
-            return real_init()
-
-        def recording_exit() -> None:
-            self._record("exit")
-            real_exit()
-
-        monkeypatch.setattr(fake, "init", recording_init)
-        monkeypatch.setattr(fake, "exit", recording_exit)
-
-    def _record(self, name: str) -> None:
-        self._calls.append((name, threading.current_thread() is self._thread))
-
-    def on_thread(self) -> list[str]:
-        """
-        Name the calls the given thread made, in order.
-
-        Returns:
-            ``"init"`` or ``"exit"`` per call.
-
-        """
-        return [name for name, on in self._calls if on]
-
-    def elsewhere(self) -> list[str]:
-        """
-        Name the calls any other thread made, in order.
-
-        Returns:
-            ``"init"`` or ``"exit"`` per call.
-
-        """
-        return [name for name, on in self._calls if not on]
-
-
 def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    No request path reaches sane.init() or sane.exit().
+    Nothing in the server's process reaches sane.init() or sane.exit().
 
     The app runs over a real ``SaneBackend``, so the fake library's counters
-    see any route that built a backend or shut SANE down.  The worker restarts
-    SANE once per scan job, so each call is recorded with its thread: request
-    paths make none, the worker one exit and one init per job, and
-    ``sane_exit`` never runs with a read outstanding.  The route map is
-    checked in both directions against the routes the app serves.
+    see any route, job or shutdown that started or stopped SANE here.  A scan
+    job's SANE start belongs to its scan child, which the fake counts apart:
+    one start per job, and none in this process from start-up, any route,
+    any job or the shutdown.  The route map is checked in both directions
+    against the routes the app serves.
     """
     fake = FakeSaneModule(
         devices=[("test:device:001", "TestVendor", "TestModel", "scanner")]
     )
     monkeypatch.setattr(scan_session_mod, "sane", fake)
-    # This process may have initialised SANE in an earlier test; the guard is
-    # process-level by design, so the proof starts by re-arming it.
-    sane_backend_mod.shutdown()
-    fake.exit_call_count = 0
 
     scanner = SaneBackend()
-    assert fake.init_call_count == 1
+    assert fake.init_call_count == 0
 
     app = create_app(settings, scanner)
     monkeypatch.setattr(
@@ -1750,9 +1682,6 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
         lambda *_a, **_k: TaskFiled(task={"status": "SUCCESS"}),
     )
     store: JobStore = services_of(app).job_store
-    # Every SANE start and stop from here on, by thread.  The constructor's
-    # init above is already counted by the fake.
-    sane_calls = _SaneCallsByThread(fake, services_of(app).worker._thread, monkeypatch)
 
     # Size first, contents second: an empty enumeration satisfies every set
     # comparison below, so the count is what makes them mean anything.  The
@@ -1788,7 +1717,7 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     )
 
     with TestClient(app) as client:
-        assert fake.init_call_count == 1
+        assert fake.init_call_count == 0
         assert fake.exit_call_count == 0
 
         # What the loop below will actually drive, asserted before it runs:
@@ -1826,10 +1755,8 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
                 response.status_code,
             )
             # The claim is per route, not per run: a single count at the end
-            # could not say which handler had moved it.  A scan job the route
-            # submitted may be restarting SANE on the worker thread meanwhile,
-            # which is allowed; a call from any other thread is not.
-            assert sane_calls.elsewhere() == [], path
+            # could not say which handler had moved it.
+            assert (fake.init_call_count, fake.exit_call_count) == (0, 0), path
 
         # The submitted scan runs on the worker thread, so it is waited out
         # here rather than raced with the shutdown below: a worker that had
@@ -1839,18 +1766,16 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
         assert submitted, "POST /api/scan created no job, so nothing was proven"
         for job in submitted:
             wait_for_state(store, job.id, TERMINAL_STATES, timeout=15.0)
-        # And the submission really did reach the scanner -- from the worker
-        # thread, which is the only place the app is allowed to touch SANE
-        # from.  Without this the counters above would also be satisfied by a
-        # scan that never started.
+        # And the submission really did reach the scanner, through a scan
+        # child.  Without this the counters above would also be satisfied by
+        # a scan that never started.
         assert fake.device.calls
 
-    # The lifespan's shutdown is the one stop made off the worker thread, and
-    # the worker restarted SANE exactly once for each job it ran.
-    assert sane_calls.elsewhere() == ["exit"]
-    assert sane_calls.on_thread() == ["exit", "init"] * len(submitted)
-    assert fake.init_call_count == 1 + len(submitted)
-    assert fake.exit_call_count == 1 + len(submitted)
+    # Each job's scan child started its own SANE, once, and nothing in this
+    # process started or stopped SANE, the shutdown included.
+    assert fake.child_calls == ["init"] * len(submitted)
+    assert fake.init_call_count == 0
+    assert fake.exit_call_count == 0
     assert fake.exit_while_blocked is False
 
 
