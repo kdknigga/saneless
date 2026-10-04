@@ -180,7 +180,7 @@ def test_importing_saned_probe_loads_no_sane_module() -> None:
     assert result.stdout.strip() == "[]"
 
 
-def test_checks_keeps_no_copy_of_a_moved_name() -> None:
+def test_checks_defines_no_name_the_probe_exports() -> None:
     """
     ``checks`` neither defines nor re-exports anything the probe module exports.
 

@@ -974,6 +974,13 @@ def hermetic_env(
         )
 
 
+FIXED_JOB_ID = "00000000-0000-4000-8000-000000000001"
+"""The job id for a request whose test has no use for one of its own.
+
+A fixed uuid4, the shape both entry points supply.
+"""
+
+
 def build_settings(tmp_path: Path, **overrides: object) -> Settings:
     """
     Build Settings with test-safe defaults, every directory under ``tmp_path``.

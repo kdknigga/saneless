@@ -82,7 +82,7 @@ from saneless.vocabulary import (
     substituted_source_warning,
     timeout_finish_warning,
 )
-from tests.conftest import AlwaysContinueFlipCoordinator
+from tests.conftest import FIXED_JOB_ID, AlwaysContinueFlipCoordinator
 from tests.golden_support import DistinctPageScanner, embedded_streams, png_idat
 from tests.multi_page_support import (
     DUPLEX_PROFILE,
@@ -99,9 +99,6 @@ if TYPE_CHECKING:
     from saneless.pipeline import ScanResult
     from saneless.scanner.base import PageSink, ScanBatch
 
-# The job id for a request whose test has no use for one of its own: a
-# fixed uuid4, the shape both entry points supply.
-_JOB_ID = "00000000-0000-4000-8000-000000000001"
 
 # The free space a test sink insists on, in MB: small enough for any runner.
 _RESERVE_MB = 1
@@ -295,7 +292,7 @@ class TestMultiPageEventsAndRequest:
 
     def test_a_request_is_single_pass_by_default(self) -> None:
         """A request built without either field is a single-pass scan, no coordinator."""
-        request = PipelineRequest(profile_name="p", title="t", job_id=_JOB_ID)
+        request = PipelineRequest(profile_name="p", title="t", job_id=FIXED_JOB_ID)
         assert request.multi_page is False
         assert request.pass_coordinator is None
 

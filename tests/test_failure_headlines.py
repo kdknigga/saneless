@@ -75,6 +75,7 @@ from saneless.vocabulary import (
     job_label,
 )
 from tests.conftest import (
+    FIXED_JOB_ID,
     AlwaysContinueFlipCoordinator,
     build_settings,
     spooling,
@@ -93,9 +94,6 @@ _URL = "http://paperless:8000"
 _AUTH = "headline-token"
 _TASK_ID = "task-headline-1"
 _TITLE = "Headline Scan"
-# The job id for a request whose test has no use for one of its own: a
-# fixed uuid4, the shape both entry points supply.
-_JOB_ID = "00000000-0000-4000-8000-000000000001"
 # More than any disk this suite runs on, so the spool's per-page room check
 # reports a shortfall without patching the measurement.
 _IMPOSSIBLE_RESERVE_MB = 1_000_000_000
@@ -328,7 +326,7 @@ def _spool_write_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Except
 def _workspace_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Exception:
     """Open the job workspace in tmp_dir on a full disk."""
     monkeypatch.setattr("saneless.workspace.tempfile.mkdtemp", _out_of_space)
-    request = PipelineRequest(profile_name="default", title=_TITLE, job_id=_JOB_ID)
+    request = PipelineRequest(profile_name="default", title=_TITLE, job_id=FIXED_JOB_ID)
     with (
         pytest.raises(DiskSpaceError) as excinfo,
         _open_workspace(tmp_path / "work", 0, request),
@@ -340,7 +338,7 @@ def _workspace_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Exceptio
 def _tmp_dir_create_full(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Exception:
     """Create a missing tmp_dir on a full disk."""
     monkeypatch.setattr("saneless.private_dirs.make_private_dir", _out_of_space)
-    request = PipelineRequest(profile_name="default", title=_TITLE, job_id=_JOB_ID)
+    request = PipelineRequest(profile_name="default", title=_TITLE, job_id=FIXED_JOB_ID)
     with (
         pytest.raises(DiskSpaceError) as excinfo,
         _open_workspace(tmp_path / "work", 0, request),
@@ -390,7 +388,7 @@ def _no_scanner(tmp_path: Path, _monkeypatch: pytest.MonkeyPatch) -> Exception:
             paperless=MagicMock(spec=PaperlessClient),
             settings=settings,
             request=PipelineRequest(
-                profile_name="default", title=_TITLE, job_id=_JOB_ID
+                profile_name="default", title=_TITLE, job_id=FIXED_JOB_ID
             ),
         )
     scanner.scan_pages.assert_not_called()
@@ -776,7 +774,7 @@ def test_a_duplicate_is_a_warned_delivery(tmp_path: Path) -> None:
             paperless=client,
             settings=settings,
             request=PipelineRequest(
-                profile_name="default", title=_TITLE, job_id=_JOB_ID
+                profile_name="default", title=_TITLE, job_id=FIXED_JOB_ID
             ),
         )
     finally:
