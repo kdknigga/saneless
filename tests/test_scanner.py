@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, cast
 
@@ -7582,39 +7583,74 @@ class TestSaneBoundary:
 
     # -- require_sane -------------------------------------------------------
 
+    @pytest.mark.parametrize("module", ["sane", "_sane"])
     def test_require_sane_missing_module_raises_config_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, module: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A missing python-sane is a one-line ConfigError with the install hint."""
         monkeypatch.setattr(scan_session_mod, "sane", None)
-        monkeypatch.setitem(sys.modules, "sane", None)
+        monkeypatch.setitem(sys.modules, module, None)
 
         with pytest.raises(ConfigError) as exc_info:
             sane_backend_mod.require_sane()
 
         message = str(exc_info.value)
-        assert "python-sane" in message
-        assert "import of sane halted" in message
+        assert message == python_sane_missing_message(f"No module named {module!r}")
+        assert exc_info.value.next_step == PYTHON_SANE_INSTALL_NEXT_STEP
         assert "libsane-dev" in message
-        assert "sane-backends-devel" in message
-        assert "Install on Bare Metal" in message
         assert "\n" not in message
-        assert isinstance(exc_info.value.__cause__, ModuleNotFoundError)
 
-    def test_require_sane_missing_shared_library_raises_config_error(
+    def test_require_sane_counts_a_module_without_a_spec_as_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A plain ImportError (libsane.so missing) is translated the same way."""
+        """A ``sane`` in sys.modules with no spec cannot be python-sane."""
+        impostor = types.ModuleType("sane")
+        impostor.__spec__ = None
+        monkeypatch.setitem(sys.modules, "sane", impostor)
+
+        with pytest.raises(ConfigError) as exc_info:
+            sane_backend_mod.require_sane()
+
+        assert str(exc_info.value) == python_sane_missing_message(
+            "No module named 'sane'"
+        )
+
+    def test_require_sane_does_not_load_the_library(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An installed python-sane passes even when loading it would fail.
+
+        Loading python-sane loads libsane, which is a child's job; a missing
+        ``libsane.so`` is found when the backend is built instead.
+        """
+
+        def _load() -> NoReturn:
+            msg = "require_sane loaded python-sane"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(sane_backend_mod, "_ensure_sane", _load)
+        monkeypatch.setattr(scan_session_mod, "_ensure_sane", _load)
+
+        assert sane_backend_mod.require_sane() is None
+
+    def test_an_unloadable_libsane_is_reported_when_the_backend_is_built(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plain ImportError (libsane.so missing) is today's install hint."""
         original = ImportError(_LIBSANE_MISSING)
 
-        def _fail() -> None:
+        def _fail() -> NoReturn:
             raise original
 
         monkeypatch.setattr(sane_backend_mod, "_ensure_sane", _fail)
+        monkeypatch.setattr(scan_session_mod, "_ensure_sane", _fail)
 
-        with pytest.raises(ConfigError, match=r"libsane\.so\.1") as exc_info:
-            sane_backend_mod.require_sane()
+        with pytest.raises(ConfigError) as exc_info:
+            SaneBackend()
 
+        assert str(exc_info.value) == python_sane_missing_message(_LIBSANE_MISSING)
+        assert exc_info.value.next_step == PYTHON_SANE_INSTALL_NEXT_STEP
         assert exc_info.value.__cause__ is original
 
     def test_require_sane_next_step_says_install_not_reconfigure(
@@ -7628,11 +7664,7 @@ class TestSaneBoundary:
         does, so it carries it: nothing in the config file or a restart
         brings the library back.
         """
-
-        def _fail() -> None:
-            raise ImportError(_LIBSANE_MISSING)
-
-        monkeypatch.setattr(sane_backend_mod, "_ensure_sane", _fail)
+        monkeypatch.setitem(sys.modules, "sane", None)
 
         with pytest.raises(ConfigError) as exc_info:
             sane_backend_mod.require_sane()
@@ -8232,3 +8264,28 @@ class TestDeviceIdsInScanErrorsAreNeutralised:
 
         self._assert_defused(exc_info.value)
         assert str(exc_info.value).count(_SHOWN_DEVICE) == 2
+
+
+def test_require_sane_loads_nothing() -> None:
+    """
+    ``require_sane`` leaves python-sane and its extension unloaded.
+
+    Run in a fresh isolated interpreter, because this test process has very
+    likely loaded python-sane already, which would hide a load.
+    """
+    script = (
+        "import sys\n"
+        "from saneless.scanner.sane_backend import require_sane\n"
+        "require_sane()\n"
+        "print(sorted(m for m in ('sane', '_sane') if m in sys.modules))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"
