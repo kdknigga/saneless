@@ -10,7 +10,7 @@ A manual duplex scan stops at a flip prompt, and a multi-page scan asks question
 
 ## Decision
 
-`saneless.web.routes` gives the browser that submits a scan a random owner token in an HttpOnly, SameSite=Lax cookie with a one-year lifetime, renewed on every accepted submit, and records the token on the job. Only a request presenting the matching token may see that job's details or answer its prompts. The comparison is constant-time, and the token never appears in a log line or in the markup. A job with no recorded owner is anyone's.
+`saneless.web.owner` gives the browser that submits a scan a random owner token in an HttpOnly, SameSite=Lax cookie with a one-year lifetime, renewed on every accepted submit, and records the token on the job. Only a request presenting the matching token may see that job's details or answer its prompts. The comparison is constant-time, and the token never appears in a log line or in the markup. A job with no recorded owner is anyone's.
 
 The invariant: the token keeps a second person at the same appliance from answering a prompt for paper they did not load. It is not an authentication mechanism and grants nothing beyond that job.
 
