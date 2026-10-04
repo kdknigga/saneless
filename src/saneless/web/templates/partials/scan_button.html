@@ -1,10 +1,11 @@
 {# The only copy of the Scan button: index.html includes it inline and every
    status response includes it with oob = true, so the server alone decides
    its state.  Never include it inside partials/status.html, which the page
-   also includes: id="scan-btn" would be duplicated.  scan_disabled is a
-   top-level assignment so partials/status_response.html can import it rather
-   than restate the rule.  autofocus applies only when the button is enabled,
-   because a disabled button cannot take focus. #}
+   also includes: id="scan-btn", which the scan form's hx-disabled-elt names,
+   would be duplicated.  scan_disabled is a top-level assignment so
+   partials/status_response.html can import it rather than restate the rule.
+   autofocus applies only when the button is enabled, because a disabled
+   button cannot take focus. #}
 {% set scan_disabled = scan_blocked or (job and job.is_active) or lists_loading %}
 <button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
         {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% elif lists_loading %}aria-describedby="scan-hold-reason"{% endif %}

@@ -20,7 +20,9 @@
       <p class="busy-line">{{ busy_line }}</p>
     {% elif job.state == JobState.AWAITING_FLIP %}
       {# The controls are emitted only for the owner, or for anyone when the job
-         has no owner token; never hide them with CSS instead.  There is
+         has no owner token; never hide them with CSS instead.  The title gate
+         is the other way round: a job with no owner token is answerable by
+         anyone but shows its title to no one.  There is
          deliberately no cancel control or second timer here: the flip timeout
          already covers a closed tab.  non_owner_line and the waiting lines
          below end in a full stop, not an ellipsis, on purpose: nothing is

@@ -66,8 +66,9 @@
            hx-include is needed on a GET, where htmx gathers no form, and carries
            the current ticks so a filter or refresh never unticks anything.  The
            refresh button sits beside the legend, never inside it: everything in
-           a legend is part of the group's name.  With the config key off the
-           block is absent from the markup, not hidden by CSS. #}
+           a legend is part of the group's name, and keeps its id, which htmx
+           needs to put focus back on it after a swap.  With the config key off
+           the block is absent from the markup, not hidden by CSS. #}
         {% if show_tags %}
         <fieldset aria-describedby="tags-help">
             <legend>Tags</legend>
@@ -100,8 +101,9 @@
         {% endif %}
 
         {# The refresh button sits beside the label, never inside it: everything
-           in a label is part of the select's name.  The refresh includes the
-           current choice, so refreshing never changes it. #}
+           in a label is part of the select's name.  Its id is how htmx puts
+           focus back on it after a swap.  The refresh includes the current
+           choice, so refreshing never changes it. #}
         {% if show_correspondent %}
         <div class="field-heading">
             <label for="correspondent-select">Correspondent</label>
