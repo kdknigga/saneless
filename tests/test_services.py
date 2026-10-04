@@ -86,7 +86,7 @@ def test_services_fields_are_fixed_but_the_lifecycle_flag_moves(
 
 # Every collaborator, and the lifecycle flag, by the name the app state could
 # hold a stray copy under.
-_FORMER_STATE_NAMES = (
+_COLLABORATOR_NAMES = (
     "worker",
     "job_store",
     "settings",
@@ -103,7 +103,7 @@ _FORMER_STATE_NAMES = (
 )
 
 
-@pytest.mark.parametrize("name", _FORMER_STATE_NAMES)
+@pytest.mark.parametrize("name", _COLLABORATOR_NAMES)
 def test_collaborators_are_not_also_kept_under_their_own_names(
     default_settings: Settings, name: str
 ) -> None:
@@ -123,7 +123,7 @@ def test_collaborators_are_not_also_kept_under_their_own_names(
         app.state.services.paperless.close()
 
 
-@pytest.mark.parametrize("name", _FORMER_STATE_NAMES)
+@pytest.mark.parametrize("name", _COLLABORATOR_NAMES)
 def test_a_running_app_keeps_no_collaborator_under_its_own_name(
     default_settings: Settings, name: str
 ) -> None:
