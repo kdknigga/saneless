@@ -56,7 +56,7 @@ def _sigpipe_ignored():
 def probe():
     import sane
 
-    from saneless.scanner import sane_backend
+    from saneless.scanner import scan_session
 
     sane.init()
     device = sane.open("test:0")
@@ -65,13 +65,13 @@ def probe():
         device.read_return_value = STATUS
         # Read and cancel the way saneless does: the cancel waits for the
         # backend's reader thread to end, so it cannot kill it holding a lock.
-        before = sane_backend._native_thread_ids()
+        before = scan_session._native_thread_ids()
         device.start()
         try:
             device.snap(no_cancel=True)
         except Exception:  # the test backend's read error is the point
             pass
-        sane_backend._await_backend_threads(before)
+        scan_session._await_backend_threads(before)
         device.cancel()
         if not _sigpipe_ignored():
             print("sigpipe-default", flush=True)

@@ -77,7 +77,7 @@ import saneless
 import saneless.cli
 from saneless.exceptions import FeederEmptyError
 from saneless.pipeline import _SPOOL_LABEL_A
-from saneless.scanner import sane_backend
+from saneless.scanner import sane_backend, scan_session
 from saneless.scanner.base import ScanSettings
 from saneless.spool import SpooledPageSink
 
@@ -135,7 +135,7 @@ class WatchedSane:
 
 
 def probe():
-    sane_backend.sane = WatchedSane()
+    scan_session.sane = WatchedSane()
     backend = sane_backend.SaneBackend()
     setup = sane.open("test:0")
     setup.test_picture = "Solid black"

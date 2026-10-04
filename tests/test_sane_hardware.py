@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import saneless.scanner.sane_backend as sane_backend_mod
+import saneless.scanner.scan_session as scan_session_mod
 from saneless.exceptions import ScanError
 from saneless.pipeline import _SPOOL_LABEL_A
 from saneless.scanner.base import ScanSettings
@@ -347,7 +348,7 @@ class TestRealSaneDepth:
 
         """
         SaneBackend()  # the constructor runs sane.init()
-        sane = sane_backend_mod._ensure_sane()
+        sane = scan_session_mod._ensure_sane()
         handle = sane.open("test:0")
         try:
             for name, value in _DEFAULT_AREA:
@@ -390,17 +391,17 @@ class TestRealSaneDepth:
         initialised ``test:0`` reads its resolution back as a fraction of a
         dpi, and reports a one-pixel frame.
         """
-        handle = sane_backend_mod._ensure_sane().open("test:0")
+        handle = scan_session_mod._ensure_sane().open("test:0")
         try:
             handle.source = "Flatbed"
             handle.mode = "Gray"
             handle.resolution = 75
-            parameters = sane_backend_mod._read_parameters(handle, "test:0")
+            parameters = scan_session_mod._read_parameters(handle, "test:0")
 
             assert parameters.depth == 16
             assert (parameters.pixels_per_line, parameters.lines) == _EIGHT_BIT_PAGE
             with pytest.raises(ScanError) as raised:
-                sane_backend_mod._refuse_sixteen_bit(parameters, "test:0")
+                scan_session_mod._refuse_sixteen_bit(parameters, "test:0")
             assert "test:0" in str(raised.value)
         finally:
             handle.close()
@@ -431,7 +432,7 @@ class TestRealSaneCancelSequence:
         the call the frontend may make only once the read has returned.
         """
         SaneBackend()  # the constructor runs sane.init()
-        device = sane_backend_mod._ensure_sane().open("test:0")
+        device = scan_session_mod._ensure_sane().open("test:0")
         try:
             offered = {option[1] for option in device.get_options()}
             if not offered >= _READ_DELAY_OPTION_NAMES:

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import saneless.scanner.sane_backend as sane_backend_mod
+import saneless.scanner.scan_session as scan_session_mod
 from saneless.scanner.sane_backend import SaneBackend
 from tests.fake_sane import (
     FakeSaneDev,
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
 
     from PIL import Image
 
-    from saneless.scanner.sane_backend import SaneDevice
+    from saneless.scanner.scan_session import SaneDevice
 
 _DEVICE = "test:0"
 
@@ -179,15 +180,15 @@ def _cancel_only_once_the_reader_has_ended(handle: SaneDevice) -> None:
     started: list[frozenset[int] | None] = [None]
 
     def start() -> None:
-        started[0] = sane_backend_mod._native_thread_ids()
+        started[0] = scan_session_mod._native_thread_ids()
         real_start()
 
     def cancel() -> None:
-        sane_backend_mod._await_backend_threads(started[0])
+        scan_session_mod._await_backend_threads(started[0])
         real_cancel()
 
     def close() -> None:
-        sane_backend_mod._await_backend_threads(started[0])
+        scan_session_mod._await_backend_threads(started[0])
         real_close()
 
     # python-sane keeps any name that is not an option on the handle itself,
@@ -211,7 +212,7 @@ class _LibsaneTarget:
         be called to re-read.
         """
         self._backend = SaneBackend()
-        self._sane = sane_backend_mod._ensure_sane()
+        self._sane = scan_session_mod._ensure_sane()
         self.error_type = self._sane._sane.error
         self._handles: list[SaneDevice] = []
         handle = self._sane.open(_DEVICE)

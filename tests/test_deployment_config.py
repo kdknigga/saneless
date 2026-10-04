@@ -69,7 +69,7 @@ from saneless.pages import (
     is_blank,
 )
 from saneless.pipeline import MAX_DOCUMENT_PAGES, PipelineEvent
-from saneless.scanner import sane_backend
+from saneless.scanner import page_budget, scan_session
 from saneless.scanner.base import MAX_PAGES_PER_PASS, PageRecord
 from saneless.vocabulary import (
     HIDDEN_JOB_TITLE,
@@ -1342,7 +1342,7 @@ def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
 ARCHITECTURE_MEMORY_HEADING = "### Memory, disk and timeouts"
 # The per-page timeout floor as the page writes it, read from the backend
 # that enforces it.
-PAGE_TIMEOUT_FLOOR = f"{sane_backend._PAGE_TIMEOUT_FLOOR_SECONDS:g}"
+PAGE_TIMEOUT_FLOOR = f"{page_budget._PAGE_TIMEOUT_FLOOR_SECONDS:g}"
 
 # The claims the architecture page makes about memory, disk and timeouts, each
 # with the substrings that carry it.
@@ -1455,7 +1455,7 @@ def test_architecture_page_says_a_pass_cap_keeps_its_pages() -> None:
     for needle in (
         "fed but not kept",
         f"keeps at most {MAX_PAGES_PER_PASS} sheets, or "
-        f"{sane_backend._MAX_AUTO_FEEDER_PAGES} sheets for an Auto source",
+        f"{scan_session._MAX_AUTO_FEEDER_PAGES} sheets for an Auto source",
     ):
         assert _says(body, needle), (
             f"{name}: {ARCHITECTURE_FAILED_SCAN_HEADING!r} no longer says what "
