@@ -481,6 +481,9 @@ class ScanChildSession:
             ScanInterrupted: The abort Event was set.
 
         """
+        if self._kill_sent:
+            # saneless killed it already; an interrupt stopped the reap.
+            self._end_child()
         if self._child is None:
             logger.debug("No scan child is running, so none was restarted")
             return
@@ -682,7 +685,14 @@ class ScanChildSession:
         return ScanError(scan_child_crashed_error(stage, page, name))
 
     def _ensure_child(self) -> None:
-        """Start a child, and wait for it to be ready, unless one is running."""
+        """
+        Start a child, and wait for it to be ready, unless one is running.
+
+        A child saneless killed, whose reap an interrupt stopped, is not
+        running: it is reaped first, and a new one started.
+        """
+        if self._kill_sent:
+            self._end_child()
         if self._child is not None:
             return
         self._enter(ScanStage.STARTUP)
@@ -987,9 +997,9 @@ class ScanChildSession:
 
         The child is forgotten only once it is reaped: an interrupt during the
         kill or the reap leaves it in place, so the session's next end of the
-        child, or its close, kills and reaps it again.  The kill is counted
-        as it is sent, so a child an interrupted kill left to be reaped later
-        is still counted, once.
+        child, its next pass or restart, or its close, kills and reaps it
+        again.  The kill is counted as it is sent, so a child an interrupted
+        kill left to be reaped later is still counted, once.
         """
         child = self._child
         if child is None:
