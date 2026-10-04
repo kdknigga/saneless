@@ -51,11 +51,12 @@ _FEEDER: Final = "Automatic Document Feeder"
 _RESOLUTION: Final = 300
 _PAGE_SIZE: Final = "A4"
 _SHEETS_PER_PASS: Final = 10
+_PAGE_PIXELS: Final = (2480, 3507)
 
 _DLL_CONF: Final = "test\n"
 
 # An A4 scan window (210 x 297 mm); at 300 dpi the backend reports a
-# 2480 x 3507 pixel page.
+# 2480 x 3507 pixel page, which every run checks it was given.
 _TEST_CONF: Final = """\
 number_of_devices 2
 test-picture "Color pattern"
@@ -99,8 +100,8 @@ def _one_run(backend: SaneBackend, mode: str, passes: int, spool_root: Path) -> 
         The wall time of the run, in seconds.
 
     Raises:
-        BenchmarkError: A pass returned other than 10 pages, or the run other
-            than ``passes`` times 10.
+        BenchmarkError: A pass returned other than 10 pages or a page not
+            2480 x 3507 pixels, or the run other than ``passes`` times 10.
 
     """
     settings = ScanSettings(source=_FEEDER, resolution=_RESOLUTION, mode=mode)
@@ -120,6 +121,14 @@ def _one_run(backend: SaneBackend, mode: str, passes: int, spool_root: Path) -> 
                 msg = (
                     f"{mode} pass {index + 1} returned {len(batch.pages)} pages, "
                     f"expected {_SHEETS_PER_PASS}"
+                )
+                raise BenchmarkError(msg)
+            size = batch.pages[0].size
+            if size != _PAGE_PIXELS:
+                msg = (
+                    f"{mode} pass {index + 1} scanned {size[0]} x {size[1]} pixel "
+                    f"pages, expected {_PAGE_PIXELS[0]} x {_PAGE_PIXELS[1]}: is "
+                    "test.conf applied?"
                 )
                 raise BenchmarkError(msg)
             total += len(batch.pages)
@@ -196,8 +205,9 @@ def main(argv: list[str] | None = None) -> int:
         config_dir = root / "sane.d"
         config_dir.mkdir()
         _write_config(config_dir)
-        # Set before the backend is constructed: SANE initialises lazily, on
-        # the first SaneBackend, and reads its configuration then.
+        # Set before any scan: SANE reads its configuration when it starts,
+        # which is in each scanning child as it starts, and the child takes
+        # this process's environment.
         os.environ["SANE_CONFIG_DIR"] = str(config_dir)
         work = root / "spool"
         work.mkdir()

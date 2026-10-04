@@ -109,7 +109,7 @@ def _describe_page(parameters: _ScanParameters, resolution: int) -> str:
 
 def _page_label(page_num: int) -> str:
     """
-    Name one page, for its timeout message and its reader thread.
+    Name one page, for its timeout message and its log line.
 
     Args:
         page_num: Zero-based index of the page being acquired.

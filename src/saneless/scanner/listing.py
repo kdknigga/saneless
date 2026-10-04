@@ -5,7 +5,8 @@ libsane can kill the whole process while listing after a saned restart, and a
 listing can hang for minutes inside a blocking C call, so every listing runs
 in a child that has a deadline and is killed and reaped before the listing
 returns.  A capabilities read, which opens a device and reads its options,
-runs in the same child under the same deadline.  See docs/explanation/decisions/0002-listing-in-a-child-process.md.
+runs in the same child under the same deadline.  See
+docs/explanation/decisions/0002-listing-in-a-child-process.md.
 
 The child is started by ``child_launch.start_child``, which every SANE child
 shares.  The device id travels on stdin, never in argv, which any local user

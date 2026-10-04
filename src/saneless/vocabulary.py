@@ -212,8 +212,9 @@ its dimensions in ``saneless.paper_sizes.PAPER_SIZES_MM``.
 
 
 # The values of the members whose names end in "PASS".  Every StrEnum here but
-# ScanStage, whose values are the scan process's own words, has value == name, and these are named constants under CONTRIBUTING.md's
-# hard-coded-credential lint note.
+# ScanStage, whose values are the scan process's own words, has value == name,
+# and these are named constants under CONTRIBUTING.md's hard-coded-credential
+# lint note.
 _NEXT_WAIT_STATE_VALUE = "AWAITING_NEXT_PASS"
 _NEXT_WAIT_VALUE = "NEXT_PASS"
 
