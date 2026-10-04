@@ -1456,19 +1456,7 @@ def job_label(
 
 
 def _unconfirmed_label(category: _UnconfirmedCategory) -> str:
-    """
-    Return the history-row label for a failure that may be in paperless-ngx.
-
-    Args:
-        category: One of the two amber categories.
-
-    Returns:
-        ``UNCONFIRMED_SEND_LABEL`` or ``UNCONFIRMED_FILING_LABEL``.
-
-    Raises:
-        AssertionError: If the value is not one of the two amber categories.
-
-    """
+    """Return the history-row label for a failure that may be in paperless-ngx."""
     match category:
         case ErrorCategory.UNCONFIRMED_SEND:
             label = UNCONFIRMED_SEND_LABEL
@@ -1490,7 +1478,7 @@ def is_amber_category(category: ErrorCategory) -> TypeIs[_UnconfirmedCategory]:
     not deliver the scan, and is red.
 
     The match is exhaustive, so a new category has to choose its tone here.
-    A True answer also narrows the category to the two amber members, so a
+    A True answer also narrows the category to the amber members, so a
     caller can go on to pick the amber label or advice without a second list.
 
     Args:
@@ -1693,19 +1681,13 @@ def progress_label(state: JobState) -> str:
     Return the progress prose for a job state.
 
     This is the longer sentence the status area shows while a scan is running,
-    and the line the CLI echoes.  The six original in-flight strings are byte
-    identical to what shipped before -- including the literal three-period
-    spelling of the trailing ellipsis, which is three ASCII periods and not
-    U+2026.  ``SCANNING_REVERSE``'s prose is the exact line the CLI printed for
-    the second duplex pass before the state existed, so giving pass B its own
-    state changed no CLI output.  The three multi-page waits keep the same
-    ellipsis and each names what it is waiting on, so a job that is waiting
-    for a person never reads as a scan that is still running.
+    and the line the CLI echoes.  The trailing ellipsis is three ASCII periods,
+    not U+2026.  Each multi-page wait names what it is waiting on, so a job
+    that is waiting for a person never reads as a scan that is still running.
 
-    ``DONE``, ``ERROR``, ``FALLBACK`` and ``CANCELLED`` have no progress prose
-    in production: the status partial and the CLI both branch structurally for
-    the four terminal states.  Their arms exist so the lookup is total and a
-    future member cannot be forgotten; they have no production caller.
+    The terminal states have no progress prose in production: the status
+    partial and the CLI both branch on them before asking.  Their arms exist
+    so the lookup is total and a future member cannot be forgotten.
 
     Args:
         state: The job state to describe.
@@ -1776,8 +1758,7 @@ def busy_line(
     like a bug, so the last job in the queue is told it is ``next in line``.
 
     The trailing phrase in branch 2 is ``progress_label(SCANNING_REVERSE)``,
-    which has its own tests, and not the history table's ``state_label``, which
-    is a different owner with a different string.
+    not the history table's ``state_label``, which is a different string.
 
     ``queue_title`` is the only user data any string here carries.  It is
     returned as plain text, escaped by Jinja's autoescape at render time, and
@@ -1932,20 +1913,13 @@ def local_time(value: datetime) -> str:
     the caller, not a case to guess at.
 
     ``astimezone()`` with no argument converts to the process's local zone, so
-    ``TZ`` decides it, regardless of the zone the value arrived in.  That makes
-    ``TZ`` load-bearing: a container reports UTC unless it is set, which does
-    name a zone and helps nobody.  No ``zoneinfo`` import and no new config key
-    is involved -- the operator's ``TZ`` is the single source.
+    the operator's ``TZ`` decides it, whatever zone the value arrived in.  A
+    container reports UTC unless ``TZ`` is set.
 
     ``%Z`` renders as the empty string when the platform reports no zone
-    abbreviation, which leaves the separator before it dangling at the end of
-    the value.  ``resolve_job_title`` interpolates this result directly into
-    ``f"Scan {local_time(now)}"``, so an unstripped value would file a
-    paperless-ngx document whose title ends in a space -- an invisible
-    difference from every other host's titles, in an artefact that leaves the
-    appliance.  Hence the strip.  It is deliberately trailing-only: the space
-    between the date and the time is part of the format and stays, which is
-    why this is ``rstrip`` and not ``" ".join(value.split())``.
+    abbreviation, leaving a trailing space that ``resolve_job_title`` would
+    carry into a paperless-ngx title.  Only trailing space is stripped: the
+    space between the date and the time is part of the format.
 
     Args:
         value: A timezone-aware timestamp.
@@ -2107,10 +2081,9 @@ def page_counts(job: PageCounted) -> str | None:
 
     A NULL count renders nothing at all -- no element, no empty line -- and one
     NULL is enough to suppress the whole sentence, because a sentence naming
-    two of three counts invites the reader to wonder about the third.
-    This is the common path, not an edge: four of the six terminal cases have
-    no counts by construction (ERROR, CANCELLED, REJECTED and every row written
-    before the columns existed).
+    only some of the counts invites the reader to wonder about the rest.
+    This is the common path, not an edge: ERROR, CANCELLED and REJECTED rows,
+    and every row written before the columns existed, have no counts.
 
     A measured ``0`` is not a NULL and renders as ``0``.  A scan where nothing
     was blank really did remove 0 pages.  Consumers must therefore guard on
@@ -2120,11 +2093,11 @@ def page_counts(job: PageCounted) -> str | None:
     Only the first clause carries a noun, so only the first clause pluralises.
 
     Args:
-        job: Anything carrying the three page counts.
+        job: Anything carrying the page counts.
 
     Returns:
         ``"12 pages scanned, 2 blank removed, 10 uploaded"``, or None if any
-        of the three counts is NULL.
+        count is NULL.
 
     """
     scanned = job.pages_scanned
@@ -2370,7 +2343,7 @@ def non_owner_wait_line(state: JobState, *, deadline: datetime | None) -> str:
     document or ends the scan depending on the pages kept, which this line
     does not know.  "Stops waiting" is true either way.
 
-    The three multi-page waits open with their progress prose, less its
+    The multi-page waits open with their progress prose, less its
     ellipsis, so the waiting line and the progress line say the same thing.
 
     Args:
