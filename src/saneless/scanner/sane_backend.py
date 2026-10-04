@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import logging
+import math
 from typing import TYPE_CHECKING, Final
 
 from saneless.exceptions import (
@@ -44,7 +45,7 @@ from saneless.scanner.listing import (
     run_listing_child,
 )
 from saneless.scanner.net_hosts import exported_sane_net_hosts
-from saneless.scanner.options import _constraint
+from saneless.scanner.options import _constraint, _is_number
 from saneless.scanner.scan_child import ScanChildSession
 from saneless.text_safety import neutralise_controls
 from saneless.vocabulary import (
@@ -517,7 +518,13 @@ class SaneBackend(ScannerBackend):
 
         return DeviceCapabilities(
             sources=[str(s) for s in sources],
-            resolutions=[int(r) for r in resolution.values or []],
+            # Only finite numbers are resolutions: the child passes an odd
+            # member on as text, and NaN or infinity as they came.
+            resolutions=[
+                int(r)
+                for r in resolution.values or []
+                if _is_number(r) and math.isfinite(r)
+            ],
             modes=[str(m) for m in modes],
             # Option 0 is named '' and a group heading None; neither is an
             # option anyone can set.

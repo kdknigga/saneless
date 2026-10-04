@@ -8,6 +8,7 @@ import gc
 import importlib
 import inspect
 import logging
+import math
 import operator
 import os
 import subprocess
@@ -4477,6 +4478,21 @@ class TestResolutionConstraintShapes:
         # Whatever the device said, the two cannot both be populated and so
         # cannot disagree with each other.
         assert not (caps.resolutions and caps.resolution_range)
+
+    def test_a_word_list_keeps_only_its_finite_numbers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        NaN, infinity and text in a resolution list are dropped, not raised on.
+
+        The child passes an odd member on as text and a non-finite float as
+        it came; neither is a resolution, and neither may fail the read.
+        """
+        constraint = [75, math.nan, math.inf, "high", 300]
+
+        caps = _capabilities_for(constraint, monkeypatch)
+
+        assert caps.resolutions == [75, 300]
 
     def test_the_range_is_kept_as_the_device_reported_it(
         self, monkeypatch: pytest.MonkeyPatch
