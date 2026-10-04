@@ -8,9 +8,8 @@ parent can kill a child that runs too long.  A fresh interpreter runs its own
 fork of saneless would inherit.
 See docs/explanation/decisions/0002-listing-in-a-child-process.md.
 
-It imports only the standard library, and python-sane late and by name: never
-``saneless``, whose ``__init__`` costs about 130 ms, several times a local
-listing.
+It imports the standard library, saneless's stdlib-only reply-pipe helper,
+and python-sane late and by name.
 
 The request is one JSON line on stdin::
 
@@ -54,13 +53,14 @@ one.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import importlib
 import json
 import os
 import signal
 import sys
 from typing import TYPE_CHECKING, Final, Protocol, TextIO
+
+from saneless.scanner._child_stdio import flush_standard_streams, take_reply_fd
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -72,12 +72,6 @@ _BAD_REQUEST: Final = 2
 
 _DEVICE_FIELDS: Final = 4
 """How many fields a listed device has: name, vendor, model and type."""
-
-_STDOUT_FD: Final = 1
-"""The descriptor C code and Python's ``sys.stdout`` write to."""
-
-_STDERR_FD: Final = 2
-"""The descriptor the child inherits as saneless's stderr."""
 
 
 class SaneDevice(Protocol):
@@ -274,42 +268,11 @@ def _private_reply_channel() -> TextIO:
     """
     Take the parent's stdout pipe for the reply, and point fd 1 at stderr.
 
-    A closed stderr is first opened on ``/dev/null``: a free fd 2 would be the
-    lowest free descriptor, so the reply's copy would land on it and fd 1 would
-    point straight back at the reply's pipe.  That fd 2 stays inheritable, so
-    a helper program a backend starts does not take it with its first ``open``.
-
     Returns:
         A text stream on a new descriptor for the parent's pipe.
 
     """
-    try:
-        os.fstat(_STDERR_FD)
-    except OSError:
-        sink = os.open(os.devnull, os.O_WRONLY)
-        if sink == _STDERR_FD:
-            # os.open makes its descriptor close-on-exec, and only dup2 would
-            # have cleared that.  FD_CLOEXEC is the one descriptor flag.
-            fcntl.fcntl(_STDERR_FD, fcntl.F_SETFD, 0)
-        else:
-            os.dup2(sink, _STDERR_FD)
-            os.close(sink)
-    reply_fd = os.dup(_STDOUT_FD)
-    os.dup2(_STDERR_FD, _STDOUT_FD)
-    return os.fdopen(reply_fd, "w", encoding="ascii")
-
-
-def _flush_standard_streams() -> None:
-    """
-    Flush Python's stdout and stderr, as far as they can be flushed.
-
-    Either stream is None when the child started with its descriptor closed,
-    and a failed flush must not cost the reply that is already written.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        if stream is not None:
-            with contextlib.suppress(OSError, ValueError):
-                stream.flush()
+    return os.fdopen(take_reply_fd(), "w", encoding="ascii")
 
 
 if __name__ == "__main__":
@@ -318,5 +281,5 @@ if __name__ == "__main__":
     # The reply is on the pipe, so skip teardown, whose crash or hang would
     # turn a good listing into a failed one.  The kernel closes the sockets and
     # USB handles, and a saned sees EOF.
-    _flush_standard_streams()
+    flush_standard_streams()
     os._exit(status)

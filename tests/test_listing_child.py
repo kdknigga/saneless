@@ -9,8 +9,8 @@ request ends the child without a reply.
 
 The list-then-open decision is driven in this process over
 ``FakeSaneModule``, never real libsane.  The child imports only allowlisted
-standard-library modules, and loading it pulls in neither ``saneless`` nor
-python-sane.
+standard-library modules and saneless's stdlib-only reply-pipe helper, and
+loading it pulls in no python-sane.
 """
 
 from __future__ import annotations
@@ -46,7 +46,6 @@ _ALLOWED_IMPORTS = frozenset(
     {
         "__future__",
         "contextlib",
-        "fcntl",
         "importlib",
         "json",
         "os",
@@ -54,8 +53,17 @@ _ALLOWED_IMPORTS = frozenset(
         "sys",
         "typing",
         "collections.abc",
+        "saneless.scanner._child_stdio",
     }
 )
+
+# The saneless modules loading the child may pull in: the reply-pipe helper
+# and the two packages above it, whose ``__init__`` files import nothing.
+_SANELESS_MODULES_LOADED = [
+    "saneless",
+    "saneless.scanner",
+    "saneless.scanner._child_stdio",
+]
 
 
 class _DeviceIOError(Exception):
@@ -365,14 +373,15 @@ def test_main_rejects_a_malformed_request_without_touching_sane(
     assert fake.get_devices_call_count == 0
 
 
-def test_loading_the_child_imports_nothing_from_saneless_or_sane() -> None:
+def test_loading_the_child_loads_only_the_stdio_helper_and_no_sane() -> None:
     """
-    Loading the child file on its own pulls in no ``saneless`` module or sane.
+    Loading the child file pulls in no python-sane, and almost no saneless.
 
-    The child is run by path precisely so that it skips the package
-    ``__init__``, which loads the configuration layer and costs far more than
-    the listing itself.  Loading the file in a fresh interpreter under a private
-    name must not run ``main()`` either, so python-sane stays unimported.
+    The child runs in a bare interpreter, and every module it loads widens
+    what a tampered path could inject, so the only saneless modules it may
+    pull in are the stdlib-only reply-pipe helper and the import-free packages
+    above it.  Loading the file in a fresh interpreter under a private name
+    must not run ``main()`` either, so python-sane stays unimported.
     """
     script = textwrap.dedent(
         """
@@ -402,16 +411,16 @@ def test_loading_the_child_imports_nothing_from_saneless_or_sane() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "[]"
+    assert result.stdout.strip() == repr(_SANELESS_MODULES_LOADED)
 
 
 def test_the_child_imports_only_allowlisted_standard_library_modules() -> None:
     """
-    Every import in the child names an allowlisted standard-library module.
+    Every import in the child names an allowlisted module.
 
     The child runs in a bare interpreter, so anything it imported beyond this
-    list would either drag the package back in or widen what a tampered path
-    could inject.  python-sane is never imported statically: it is loaded by
+    list would either drag the package's heavy modules in or widen what a
+    tampered path could inject.  python-sane is never imported statically: it is loaded by
     name after the alarm is armed.
     """
     tree = ast.parse(_CHILD_PATH.read_text(encoding="utf-8"))

@@ -6,13 +6,9 @@ listing can hang for minutes inside a blocking C call, so every listing runs
 in a child that has a deadline and is killed and reaped before the listing
 returns.  See docs/explanation/decisions/0002-listing-in-a-child-process.md.
 
-The argv is the literal ``/bin/sh -c 'exec "$P" -I "$C"'``, with the two paths
-passed in the environment, because ruff's S603 accepts only a literal argv.
-``exec`` replaces the shell, so the child's PID is the interpreter's own and
-killing it leaves no grandchild.  ``-I`` ignores every ``PYTHON*`` variable,
-so python-sane must be importable from the interpreter's own site-packages,
-and the device id travels on stdin, never in argv, which any local user can
-read.
+The child is started by ``child_launch.start_child``, which every SANE child
+shares.  The device id travels on stdin, never in argv, which any local user
+can read.
 
 The child inherits stderr and points its own fd 1 at it, keeping the stdout
 pipe for the reply alone.  A backend's C stdio output reaches the log only
@@ -30,10 +26,8 @@ import errno
 import json
 import logging
 import math
-import os
 import signal
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,8 +39,12 @@ from saneless.exceptions import (
     ListingNoAnswerError,
     ListingTimedOutError,
 )
-from saneless.scanner.net_hosts import SANE_NET_HOSTS, effective_sane_net_hosts
-from saneless.sigpipe import sigpipe_unblocked
+from saneless.scanner.child_launch import (
+    child_environment,
+    kill_and_reap,
+    signal_name,
+    start_child,
+)
 
 if TYPE_CHECKING:
     import threading
@@ -87,16 +85,6 @@ _MAX_REPLY_BYTES: Final = 1_048_576
 # The script the child runs.  Read at call time, so tests can point the
 # launcher at a stand-in.
 _CHILD_FILE: Final = Path(__file__).with_name("_listing_child.py")
-
-# The two variables the child's literal argv expands.
-_PYTHON_VARIABLE: Final = "SANELESS_LISTING_PYTHON"
-_CHILD_VARIABLE: Final = "SANELESS_LISTING_CHILD"
-
-# The child's environment keeps everything SANE and its backends read (SANE
-# settings, locale, proxies, certificates) and drops saneless's own settings,
-# which include the Paperless token.  Matched ignoring case, because the
-# settings loader reads its variables ignoring case.
-_OWN_PREFIX: Final = "saneless_"
 
 _NO_ANSWER: Final = "The scanner library returned no answer while listing scanners"
 _NOT_STARTED: Final = "The scanner library could not be started to list scanners"
@@ -275,37 +263,6 @@ def _child_error(value: object) -> ChildError:
     return ChildError(type_name=type_name, message=message)
 
 
-def child_environment(configured_host: str) -> dict[str, str]:
-    """
-    Build the environment a listing child runs in.
-
-    It is this process's environment minus every ``SANELESS_*`` variable, in
-    any case, so no saneless setting or secret reaches the child.
-    ``SANE_NET_HOSTS`` is set from the same derivation the scanner check
-    probes, never copied from whatever this process's environment holds at
-    the moment, and removed when that derivation names no host.
-
-    Args:
-        configured_host: The ``scanner.host`` setting, possibly empty.
-
-    Returns:
-        The child's environment, before the launcher adds its own two
-        variables.
-
-    """
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.casefold().startswith(_OWN_PREFIX)
-    }
-    hosts = effective_sane_net_hosts(configured_host)
-    if hosts:
-        env[SANE_NET_HOSTS] = hosts
-    else:
-        env.pop(SANE_NET_HOSTS, None)
-    return env
-
-
 def run_listing_child(
     request: ListingRequest,
     *,
@@ -349,27 +306,9 @@ def run_listing_child(
 
     """
     deadline = LISTING_DEADLINE_SECONDS
-    env = child_environment(configured_host)
-    env[_PYTHON_VARIABLE] = sys.executable
-    env[_CHILD_VARIABLE] = str(_CHILD_FILE)
     line = request.to_line(math.ceil(deadline) + _ALARM_MARGIN_SECONDS)
     try:
-        # The child inherits this thread's signal mask, and must not start
-        # with SIGPIPE blocked the way saneless runs.
-        with sigpipe_unblocked():
-            proc = subprocess.Popen(
-                (
-                    "/bin/sh",
-                    "-c",
-                    'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
-                ),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=None,
-                env=env,
-                close_fds=True,
-                start_new_session=True,
-            )
+        proc = start_child(_CHILD_FILE, configured_host)
     except OSError as exc:
         # The fork or the exec failed, for instance under a process or memory
         # limit: nothing ran, so nothing could be seen.
@@ -427,15 +366,15 @@ def _wait_for_child(
         except subprocess.TimeoutExpired:
             payload = None
             if abort is not None and abort.is_set():
-                _kill_and_reap(proc)
+                kill_and_reap(proc)
                 raise _aborted() from None
             if time.monotonic() >= end:
-                _kill_and_reap(proc)
+                kill_and_reap(proc)
                 raise _timed_out(deadline) from None
         except BaseException:
             # A KeyboardInterrupt or ScanInterrupted: the child is stopped
             # here, before the caller's gate release runs.
-            _kill_and_reap(proc)
+            kill_and_reap(proc)
             raise
         else:
             return out
@@ -455,27 +394,6 @@ def _not_started(exc: OSError) -> ListingNoAnswerError:
         "The scanner library could not be started to list scanners: %s", name
     )
     return ListingNoAnswerError(_NOT_STARTED)
-
-
-def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
-    """
-    Kill the child and its process group, and wait for the child.
-
-    The child leads a process group of its own, so killing the group also
-    stops a helper program a backend started, or a fork of the child, that
-    would otherwise outlive it, still holding a device or the reply's pipe.
-    Only the child is waited for: the others are not this process's children.
-
-    Args:
-        proc: The child process.
-
-    """
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        # The group is already gone, or holds nothing this process may signal.
-        proc.kill()
-    proc.wait()
 
 
 def _timed_out(deadline: float) -> ListingTimedOutError:
@@ -529,10 +447,7 @@ def _crashed(signum: int) -> ListingCrashedError:
         The error for the caller to raise.
 
     """
-    try:
-        name = signal.Signals(signum).name
-    except ValueError:
-        name = f"signal {signum}"
+    name = signal_name(signum)
     logger.warning("The scanner library died while listing scanners: %s", name)
     message = f"The scanner library failed while listing scanners ({name})"
     return ListingCrashedError(message)

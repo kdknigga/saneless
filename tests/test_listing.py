@@ -1106,8 +1106,8 @@ class TestChildEnvironment:
         reply = run_listing_child(ListingRequest(), configured_host="")
 
         assert json.loads(reply.devices[0][0]) == [
-            "SANELESS_LISTING_CHILD",
-            "SANELESS_LISTING_PYTHON",
+            "SANELESS_CHILD_PYTHON",
+            "SANELESS_CHILD_SCRIPT",
         ]
 
     def test_the_child_runs_in_isolated_mode(
@@ -1141,7 +1141,7 @@ def test_the_child_argv_is_literal(
     assert started[0].args == (
         "/bin/sh",
         "-c",
-        'exec "$SANELESS_LISTING_PYTHON" -I "$SANELESS_LISTING_CHILD"',
+        'exec "$SANELESS_CHILD_PYTHON" -I "$SANELESS_CHILD_SCRIPT"',
     )
 
 
