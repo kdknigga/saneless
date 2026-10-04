@@ -664,7 +664,9 @@ def test_a_cancel_during_start_is_never_made_twice_at_once(
     watch = _CancelDuringStart(control)
     monkeypatch.setattr(control, "_handle_lock", _WatchedLock(watch.main_moved))
     watch.install(monkeypatch)
-    reply = scan_child_main._ReplyChannel(reply_write)
+    reply = scan_child_main._ReplyChannel(
+        reply_write, ignore_sigpipe=runtime.ignore_sigpipe
+    )
     outlet = scan_child_main._ChildOutlet(reply, control, runtime)
     try:
         with pytest.raises(scan_session_mod.PassStopped):
@@ -1042,7 +1044,7 @@ def test_a_log_record_becomes_a_log_line() -> None:
     """The forwarder sends a record as a log line, at its level and logger."""
     read_fd, write_fd = os.pipe()
     try:
-        reply = scan_child_main._ReplyChannel(write_fd)
+        reply = scan_child_main._ReplyChannel(write_fd, ignore_sigpipe=lambda: None)
         handler = scan_child_main._LogForwarder(reply)
         record = logging.LogRecord(
             "saneless.scanner.scan_session",
@@ -1091,7 +1093,9 @@ def test_a_log_record_of_any_text_fits_its_frame() -> None:
     text = "\N{GRINNING FACE}" * 8_000
     read_fd, write_fd = os.pipe()
     try:
-        handler = scan_child_main._LogForwarder(scan_child_main._ReplyChannel(write_fd))
+        handler = scan_child_main._LogForwarder(
+            scan_child_main._ReplyChannel(write_fd, ignore_sigpipe=lambda: None)
+        )
         record = logging.LogRecord(
             "saneless.scanner.scan_session",
             logging.INFO,
@@ -1125,7 +1129,9 @@ def test_a_record_that_cannot_be_sent_is_dropped_silently(
     read_fd, write_fd = os.pipe()
     os.close(read_fd)
     try:
-        handler = scan_child_main._LogForwarder(scan_child_main._ReplyChannel(write_fd))
+        handler = scan_child_main._LogForwarder(
+            scan_child_main._ReplyChannel(write_fd, ignore_sigpipe=lambda: None)
+        )
         record = logging.LogRecord(
             "saneless.scanner.scan_session",
             logging.WARNING,

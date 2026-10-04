@@ -252,10 +252,6 @@ def _ignore_sigpipe() -> None:
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 
-def _keep_sigpipe() -> None:
-    """Leave SIGPIPE as it is: the default for a channel no test watches."""
-
-
 class _ReplyChannel:
     """
     The private pipe to saneless, written under one lock.
@@ -282,17 +278,18 @@ class _ReplyChannel:
         self,
         fd: int,
         *,
+        ignore_sigpipe: Callable[[], object],
         forward_logs: bool = False,
-        ignore_sigpipe: Callable[[], object] = _keep_sigpipe,
     ) -> None:
         """
         Wrap the reply descriptor, for the calling thread to write.
 
         Args:
             fd: The descriptor; the caller keeps ownership.
-            forward_logs: Whether log records are to be forwarded.
             ignore_sigpipe: Sets SIGPIPE to be ignored again; called before
-                each frame the calling thread writes.
+                each frame the calling thread writes.  There is no default,
+                so no channel is made without one.
+            forward_logs: Whether log records are to be forwarded.
 
         """
         self._fd = fd
