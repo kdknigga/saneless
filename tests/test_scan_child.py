@@ -71,10 +71,22 @@ _SETTINGS = ScanSettings(source="ADF", resolution=150, mode="Gray")
 # budget's floor and ceiling, so the page budget is exactly this long too.
 _SHORT_SECONDS = 0.3
 
+# The start-up deadline every test but the start-up hang keeps.  Starting the
+# stand-in is starting an interpreter and Pillow, which a cold or loaded runner
+# can take well past the short deadline over; this bounds only a child that
+# never starts.
+_STARTUP_SECONDS = 10.0
+
+# How long reaping a killed child may take beyond the grace, as the libsane
+# loops allow.
+_REAP_ALLOWANCE_SECONDS = 2.0
+
 # Generous on purpose: a passing test finishes in well under a second.  These
 # bounds only turn "the session never gave up" into a failure instead of a
-# hung run.
-_ELAPSED_CEILING_SECONDS = 3.0
+# hung run.  The ceiling allows the stand-in its whole start-up deadline, and
+# is still well short of the real 30 s stage deadline a test that failed to
+# shorten its own would wait out.
+_ELAPSED_CEILING_SECONDS = _STARTUP_SECONDS + 3.0
 _POLL_BUDGET_SECONDS = 5.0
 
 # What the stand-in reports once it is configured, so a test can work out the
@@ -328,9 +340,18 @@ def _stand_in(
 
 
 def _shorten_deadlines(
-    monkeypatch: pytest.MonkeyPatch, *, grace: float = _SHORT_SECONDS
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    grace: float = _SHORT_SECONDS,
+    startup: float = _STARTUP_SECONDS,
 ) -> None:
-    """Patch every stage deadline, the page budget and the grace to be short."""
+    """
+    Patch the stage deadlines, the page budget and the grace to be short.
+
+    The start-up keeps a generous deadline unless the test is about it, so
+    the interpreter's own start never decides a test about another stage.
+    """
+    monkeypatch.setattr(scan_child_mod, "STARTUP_DEADLINE_SECONDS", startup)
     monkeypatch.setattr(scan_child_mod, "STAGE_DEADLINE_SECONDS", _SHORT_SECONDS)
     monkeypatch.setattr(scan_child_mod, "CANCEL_GRACE_SECONDS", grace)
     monkeypatch.setattr(page_budget, "_PAGE_TIMEOUT_FLOOR_SECONDS", _SHORT_SECONDS)
@@ -465,7 +486,10 @@ def test_a_child_that_hangs_is_killed_and_reaped(
     short way after the shortened deadline: the stage deadline, or the page
     budget plus the cancel grace.
     """
-    _shorten_deadlines(monkeypatch)
+    _shorten_deadlines(
+        monkeypatch,
+        startup=_SHORT_SECONDS if stage == "startup" else _STARTUP_SECONDS,
+    )
     files = _stand_in(monkeypatch, tmp_path, SCAN_TEST_HANG_AT=stage)
     starts = _Starts()
     sink = _RecordingSink(tmp_path)
@@ -852,7 +876,7 @@ def test_an_abort_mid_read_returns_within_the_grace(
     assert raised.value.signum is None
     _assert_reaped(files.pid())
     assert set_at
-    assert ended - set_at[0] < 1.0
+    assert ended - set_at[0] < _SHORT_SECONDS + _REAP_ALLOWANCE_SECONDS
     assert "cancel" in files.ops()
     assert session.children_killed == killed
 

@@ -9,8 +9,9 @@ docs/explanation/decisions/0016-scan-sessions-in-a-child-process.md.
 The child is started the way every SANE child is (``child_launch``), so the
 device id travels in the ``scan`` command on its stdin, never in argv.  This
 side owns every deadline, read at call time so tests can shorten them: the
-start-up, open, configure, close, restart and exit stages get
-``STAGE_DEADLINE_SECONDS`` each, the start and read of one page share the
+start-up gets ``STARTUP_DEADLINE_SECONDS``, the open, configure, close,
+restart and exit stages get ``STAGE_DEADLINE_SECONDS`` each, both 30 s, the
+start and read of one page share the
 page budget worked out from the parameters the child reports, and no
 deadline runs while the session is idle between passes.
 
@@ -95,6 +96,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CANCEL_GRACE_SECONDS",
     "STAGE_DEADLINE_SECONDS",
+    "STARTUP_DEADLINE_SECONDS",
     "ChildProcess",
     "ScanChildSession",
     "start_scan_child",
@@ -107,6 +109,12 @@ logger = logging.getLogger(__name__)
 # library and exiting.  The listing child's deadline, for the same kind of
 # work.  Read at call time, so tests can shorten it.
 STAGE_DEADLINE_SECONDS: Final = 30.0
+
+# How long a new child may take to start its interpreter and the scanner
+# library and say it is ready: the stage deadline's 30 s, kept apart so a test
+# that shortens the other stages does not also race the interpreter's start.
+# Read at call time.
+STARTUP_DEADLINE_SECONDS: Final = 30.0
 
 # How long a child asked to cancel or stop has to exit before it is killed.
 # Some backends only give up a read on their own cancel after ten seconds.
@@ -673,6 +681,7 @@ class ScanChildSession:
         if self._child is not None:
             return
         self._enter(ScanStage.STARTUP)
+        self._deadline = time.monotonic() + STARTUP_DEADLINE_SECONDS
         if self._abort is not None and self._abort.is_set():
             raise _AbortedError
         if self._live is not None:

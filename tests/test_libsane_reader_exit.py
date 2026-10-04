@@ -383,6 +383,7 @@ def test_no_scan_child_needs_killing_after_a_failed_read(
     config = _sane_config(tmp_path / "sane.d", _NO_DOCS_CONF)
     monkeypatch.setenv("SANE_CONFIG_DIR", str(config))
     monkeypatch.setattr(scan_child, "STAGE_DEADLINE_SECONDS", _LOOP_STAGE_SECONDS)
+    monkeypatch.setattr(scan_child, "STARTUP_DEADLINE_SECONDS", _LOOP_STAGE_SECONDS)
     monkeypatch.setattr(scan_child, "CANCEL_GRACE_SECONDS", _LOOP_GRACE_SECONDS)
     monkeypatch.setattr(page_budget, "_PAGE_TIMEOUT_FLOOR_SECONDS", _LOOP_PAGE_SECONDS)
     monkeypatch.setattr(

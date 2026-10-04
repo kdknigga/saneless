@@ -956,6 +956,7 @@ def test_the_child_alarms_outlast_the_parents_deadlines() -> None:
     own deadline and grace must always come first.
     """
     assert _STAGE >= scan_child.STAGE_DEADLINE_SECONDS + 5
+    assert _STAGE >= scan_child.STARTUP_DEADLINE_SECONDS + 5
     assert (
         _READ
         >= page_budget._PAGE_TIMEOUT_CEILING_SECONDS
