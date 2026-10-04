@@ -757,8 +757,8 @@ class TestUnicodeDigitPorts:
         ``int()`` accepts non-ASCII decimals, so a gate built on it would read
         Arabic-Indic 1234 as port 1234 -- a number libsane's C-side parsing
         would never derive from that string, the divergence
-        ``saned_probe.saned_host_setting`` exists to prevent.  1234 rather than 6566 keeps
-        the wrong answer and the right answer different tuples.
+        ``saned_probe.saned_host_setting`` exists to prevent.  1234 rather than
+        6566 keeps the wrong answer and the right answer different tuples.
         """
         assert saned_hosts("host:١٢٣٤") == (("host", SANED_PORT),)
 
@@ -931,9 +931,10 @@ class TestTheParserDocstringIsTrue:
         """
         ``scanner.local.`` is legal DNS and is still refused.
 
-        ``saned_probe._looks_like_a_host_name``'s trailing-dot rule rejects it, so the name
-        loses its pre-probe.  Widening the accept surface for a spelling no
-        config example uses buys nothing; the cost is one latency saving.
+        ``saned_probe._looks_like_a_host_name``'s trailing-dot rule rejects it,
+        so the name loses its pre-probe.  Widening the accept surface for a
+        spelling no config example uses buys nothing; the cost is one latency
+        saving.
         """
         assert saned_hosts("scanner.local.") == ()
 
