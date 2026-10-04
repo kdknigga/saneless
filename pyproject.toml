@@ -161,7 +161,8 @@ exclude = [".planning/**/*.md"]
 "src/saneless/__init__.py" = ["PLC0415"]
 "src/saneless/cli.py" = ["PLC0415"]  # serve imports the web stack when it runs, so no other command loads it
 "src/saneless/config.py" = ["S104"]
-# identifiers come from the module's column tuple; every value is a bound parameter
+# every interpolated fragment is a module constant (the column list, a run of "?"
+# placeholders or another SQL constant); every value is a bound parameter
 "src/saneless/job.py" = ["S608"]
 
 # Deliberately empty: its presence is the setting. Without it ty keeps

@@ -96,8 +96,9 @@ _COLUMNS: tuple[str, ...] = (
 
 Every ``SELECT`` and ``INSERT`` in this module derives its column list and
 placeholders from this tuple, so a column cannot be added to one statement and
-forgotten in another.  The statements interpolate identifiers only from this
-tuple; every value they carry is a bound ``?`` parameter.
+forgotten in another.  The statements interpolate only module-level constants:
+this column list, runs of ``?`` placeholders and other SQL constants.  Every
+value they carry is a bound ``?`` parameter.
 """
 
 _COLUMN_LIST = ", ".join(_COLUMNS)
