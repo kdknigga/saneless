@@ -174,18 +174,24 @@ written any other way is left to review.
 
 Comments and docstrings in `src/`, `scripts/`, `tests/`, the workflows under `.github/`
 and `.dockerignore` state their reasons in words and never cite planning IDs (decision,
-finding or requirement numbers, phase or plan numbers, planning file names), because the
-planning records do not ship with the product. For the same reason a comment cites a
-symbol, such as `paperless._without_userinfo`, and never a line number, a file that
-does not ship (the assistant-instructions file or the planning records) or an
-unnumbered reference to an earlier phase of work. The `no-planning-citations` hook
-fails a commit, merge or push that adds a planning ID, a file name followed by a colon
-and a line number, a reference to the assistant-instructions file or an unnumbered
-phase reference, in the shipped sources, the tests, the workflows, `.dockerignore` and
-the decision records under `docs/explanation/decisions/`, and a test in
-`tests/test_deployment_config.py` fails CI. The hook skips one file, `tests/citation_samples.py`, which holds the pattern
-and the sample identifiers the guard's own tests need; a test pins that it stays the
-only exclusion.
+finding, review or requirement numbers, phase or plan numbers, planning file names),
+because the planning records do not ship with the product. For the same reason a
+comment cites a symbol, such as `paperless._without_userinfo`, and never a line number,
+a file that does not ship (the assistant-instructions file or the planning records) or
+a phase of work it does not number, such as an earlier or a later one.
+
+The `no-planning-citations` hook is a net for the common shapes of those references,
+not a proof. It fails a commit, merge or push that adds, to the shipped sources, the
+tests, the workflows, `.dockerignore` or the decision records under
+`docs/explanation/decisions/`, any of these: an identifier of a shape the pattern in
+`tests/citation_samples.py` spells out; a numbered phase or plan; a Python, HTML, CSS
+or JavaScript file name followed by a colon and a line number; the planning directory
+or the assistant-instructions file by name; or a phase named only by a word such as
+this, earlier or next. A test in `tests/test_deployment_config.py` runs the same
+pattern over the same files in CI. Anything the pattern misses, such as a line number
+written out in words, is left to review. The hook skips one file,
+`tests/citation_samples.py`, which holds the pattern and the sample identifiers the
+guard's own tests need; a test pins that it stays the only exclusion.
 
 The `test` job deselects the `browser` marker because the `browser` job runs those
 Playwright tests, with Chromium and Firefox installed (`uv run playwright install
