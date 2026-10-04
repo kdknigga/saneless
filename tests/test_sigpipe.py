@@ -5,12 +5,14 @@ libsane puts SIGPIPE back to its default action, behind Python's back, whenever
 a read ends with an error status, the end of every feeder batch included, and a
 write to a socket whose peer has gone would then end the process with no
 traceback.  saneless makes no libsane call itself: every scan runs in a scan
-child.  The libsane test runs a process that blocks SIGPIPE as saneless does,
-scans through a real scan child whose read fails, and then writes to a closed
-peer; it must get ``BrokenPipeError`` and must never have loaded python-sane.
-A blocked mask is inherited across fork and exec, so the listing and scan
-child tests block SIGPIPE first, as a launching thread in saneless has it, and
-check that the child starts with it unblocked.
+child.  One libsane test confirms the reset still happens, in a real scan
+child whose read fails, so the hazard these tests guard against is real.
+Another runs a process that blocks SIGPIPE as saneless does, scans through a
+real scan child whose read fails, and then writes to a closed peer; it must
+get ``BrokenPipeError`` and must never have loaded python-sane.  A blocked
+mask is inherited across fork and exec, so the listing and scan child tests
+block SIGPIPE first, as a launching thread in saneless has it, and check that
+the child starts with it unblocked.
 """
 
 from __future__ import annotations
@@ -111,24 +113,51 @@ with open({record!r}, "w", encoding="ascii") as record:
 """
 
 
-@pytest.mark.sane_hardware
-@pytest.mark.parametrize(
-    "status",
-    ["SANE_STATUS_NO_DOCS", "SANE_STATUS_CANCELLED"],
-    ids=["NO_DOCS", "CANCELLED"],
+# The real scan child, run as it is, except that each pass also records the
+# child's ignored-signal mask, once the pass has ended, in the file
+# SCAN_TEST_SIGIGN names.  The variable has no SANELESS_ prefix, so the child
+# environment's strip keeps it.
+_SIGIGN_RECORDING_CHILD: Final = """\
+import os
+import signal
+import sys
+from pathlib import Path
+
+from saneless.scanner import _scan_child as child
+
+real_scan = child._scan
+
+
+def recording_scan(*args):
+    try:
+        return real_scan(*args)
+    finally:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("SigIgn:"):
+                    Path(os.environ["SCAN_TEST_SIGIGN"]).write_text(line.split()[1])
+
+
+child._scan = recording_scan
+reply_fd = child.take_reply_fd()
+child.prepare_process()
+code = child.main(
+    sys.stdin.buffer,
+    reply_fd,
+    child.ChildRuntime(arm_alarm=signal.alarm, exit_process=os._exit, grace_seconds=10.0),
+    forward_logs=True,
 )
-def test_a_failed_libsane_read_cannot_let_a_dead_peer_kill_saneless(
-    status: str, tmp_path: Path
-) -> None:
+child.flush_standard_streams()
+os._exit(code)
+"""
+
+
+def _failing_read_config(tmp_path: Path, status: str) -> Path:
     """
-    A write to a closed peer after a failed read in a scan child raises.
+    Write a SANE configuration whose test backend ends every read with ``status``.
 
-    The read really fails in the child, the probe never loads python-sane
-    itself, and its write to a dead peer gets ``BrokenPipeError``.
-
-    Args:
-        status: The status the test backend ends its read with.
-        tmp_path: Holds the SANE configuration and the spool.
+    Returns:
+        The configuration directory, for ``SANE_CONFIG_DIR``.
 
     """
     config = tmp_path / "sane.d"
@@ -137,6 +166,72 @@ def test_a_failed_libsane_read_cannot_let_a_dead_peer_kill_saneless(
     (config / "test.conf").write_text(
         f'read-status-code "{status}"\n', encoding="ascii"
     )
+    return config
+
+
+@pytest.mark.sane_hardware
+@pytest.mark.parametrize(
+    "status",
+    ["SANE_STATUS_NO_DOCS", "SANE_STATUS_CANCELLED"],
+    ids=["NO_DOCS", "CANCELLED"],
+)
+def test_a_failed_libsane_read_resets_sigpipe_in_the_scan_child(
+    status: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A read that fails in a real scan child leaves SIGPIPE no longer ignored.
+
+    This is the hazard itself: if libsane stopped resetting SIGPIPE, the
+    reason to keep it out of saneless would be gone, and this test says so.
+
+    Args:
+        status: The status the test backend ends its read with.
+        tmp_path: Holds the SANE configuration, the stand-in and the mask.
+        monkeypatch: Points the session at the recording child.
+
+    """
+    config = _failing_read_config(tmp_path, status)
+    record = tmp_path / "sigign"
+    child_file = tmp_path / "sigign_recording_child.py"
+    child_file.write_text(_SIGIGN_RECORDING_CHILD, encoding="utf-8")
+    monkeypatch.setattr(scan_child, "_CHILD_FILE", child_file)
+    monkeypatch.setenv("SANE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("SCAN_TEST_SIGIGN", str(record))
+    settings = ScanSettings(source="Flatbed", resolution=50, mode="Gray")
+    sink = SpooledPageSink(tmp_path, _SPOOL_LABEL_A, 0)
+
+    with ScanChildSession(lambda: scan_child.start_scan_child("")) as session:
+        with pytest.raises(ScanError):
+            session.scan_pass("test:0", settings, sink)
+        killed = session.children_killed
+
+    assert killed == 0
+    ignored = int(record.read_text(encoding="ascii"), 16)
+    assert not ignored & _SIGPIPE_BIT, f"child SigIgn {ignored:#x}"
+
+
+@pytest.mark.sane_hardware
+@pytest.mark.parametrize(
+    "status",
+    ["SANE_STATUS_NO_DOCS", "SANE_STATUS_CANCELLED"],
+    ids=["NO_DOCS", "CANCELLED"],
+)
+def test_a_scan_whose_read_failed_leaves_saneless_free_of_python_sane(
+    status: str, tmp_path: Path
+) -> None:
+    """
+    After a failed read in a scan child, saneless has no python-sane loaded.
+
+    The read really fails in the child, the probe never loads python-sane
+    itself, and its write to a dead peer, with SIGPIPE blocked as saneless
+    blocks it, gets ``BrokenPipeError``.
+
+    Args:
+        status: The status the test backend ends its read with.
+        tmp_path: Holds the SANE configuration and the spool.
+
+    """
+    config = _failing_read_config(tmp_path, status)
     spool = tmp_path / "spool"
     spool.mkdir()
     result = subprocess.run(
