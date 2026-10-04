@@ -182,16 +182,17 @@ a phase of work it does not number, such as an earlier or a later one.
 
 The `no-planning-citations` hook is a net for the common shapes of those references,
 not a proof. It fails a commit, merge or push that adds, to the shipped sources, the
-tests, the workflows, `.dockerignore` or the decision records under
-`docs/explanation/decisions/`, any of these: an identifier of a shape the pattern in
-`tests/citation_samples.py` spells out; a numbered phase or plan; a Python, HTML, CSS
-or JavaScript file name followed by a colon and a line number; the planning directory
-or the assistant-instructions file by name; or a phase named only by a word such as
-this, earlier or next. A test in `tests/test_deployment_config.py` runs the same
-pattern over the same files in CI. Anything the pattern misses, such as a line number
-written out in words, is left to review. The hook skips one file,
-`tests/citation_samples.py`, which holds the pattern and the sample identifiers the
-guard's own tests need; a test pins that it stays the only exclusion.
+tests, the workflows, `.dockerignore`, the decision records under
+`docs/explanation/decisions/`, this file, the `Dockerfile` or `docker-compose.yml`,
+any of these: an identifier of a shape the pattern in `tests/citation_samples.py`
+spells out; a numbered phase or plan; a Python, HTML, CSS or JavaScript file name
+followed by a colon and a line number; the planning directory or the
+assistant-instructions file by name; or a phase named only by a word such as this,
+earlier or next. A test in `tests/test_deployment_config.py` runs the same pattern
+over the same files in CI. Anything the pattern misses, such as a line number written
+out in words, is left to review. The hook skips one file, `tests/citation_samples.py`,
+which holds the pattern and the sample identifiers the guard's own tests need; a test
+pins that it stays the only exclusion.
 
 The `test` job deselects the `browser` marker because the `browser` job runs those
 Playwright tests, with Chromium and Firefox installed (`uv run playwright install

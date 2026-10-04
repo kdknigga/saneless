@@ -2532,16 +2532,21 @@ def test_no_shipped_file_references_the_old_owner() -> None:
 # guard and the hook both skip, because it has to spell the identifiers out.
 #
 # The directories and files the guard reads: the package itself, the release
-# scripts the workflows run, the tests, the workflows, .dockerignore and the
-# decision records. The decision records are in scope because they ship with
-# the documentation and are written in the same voice as the comments that
-# point at them; the rest of docs/ is not. The hook's ``files:`` pattern below
-# says the same thing in regex form, and a test keeps the two in step.
+# scripts the workflows run, the tests, the workflows, .dockerignore, the
+# decision records, CONTRIBUTING.md, the Dockerfile and the compose file. The
+# decision records are in scope because they ship with the documentation and
+# are written in the same voice as the comments that point at them; the rest
+# of docs/ is not. CONTRIBUTING.md and the two container files carry the same
+# kind of reasons as the code they sit beside. The hook's ``files:`` pattern
+# below says the same thing in regex form, and a test keeps the two in step.
 _DECISIONS_PREFIX = "docs/explanation/decisions/"
 _SOURCE_PREFIXES = ("src/", "scripts/", "tests/", ".github/", _DECISIONS_PREFIX)
-_SOURCE_FILES = frozenset({".dockerignore"})
+_SOURCE_FILES = frozenset(
+    {".dockerignore", "CONTRIBUTING.md", "Dockerfile", "docker-compose.yml"}
+)
 CITATION_HOOK_FILES = (
     r"^(src|scripts|tests|\.github)/|^\.dockerignore$|^docs/explanation/decisions/"
+    r"|^(CONTRIBUTING\.md|Dockerfile|docker-compose\.yml)$"
 )
 CITATION_HOOK_EXCLUDE = r"^tests/citation_samples\.py$"
 _SOURCE_SUFFIXES = frozenset({".py", ".html", ".css", ".js", ".yml", ".yaml", ".md"})
@@ -2559,8 +2564,8 @@ def _shipped_source_files() -> list[str]:
     Returns:
         Repo-relative path names under src/, scripts/, tests/, .github/ and
         the decision records with a source, YAML or Markdown suffix, plus
-        .dockerignore; vendored assets and the citation samples module
-        excluded.
+        .dockerignore, CONTRIBUTING.md, the Dockerfile and the compose file;
+        vendored assets and the citation samples module excluded.
 
     """
     return [
@@ -2725,11 +2730,16 @@ def test_the_citation_hook_covers_shipped_sources_tests_and_ci() -> None:
         "tests/test_deployment_config.py",
         ".github/workflows/ci.yml",
         ".dockerignore",
+        "CONTRIBUTING.md",
+        "Dockerfile",
+        "docker-compose.yml",
     ):
         assert files.match(name), name
     assert files.match("docs/index.md") is None
     assert files.match("docs/explanation/decisions/README.md")
     assert files.match("src.dockerignore") is None
+    assert files.match("README.md") is None
+    assert files.match("docs/CONTRIBUTING.md") is None
 
 
 def test_the_citation_hook_excludes_only_the_samples_module() -> None:
@@ -2761,7 +2771,7 @@ _ADR_INDEX = "README.md"
 # passed over: a pointer that is not the record shape, or names no file, is
 # reported.  The directory itself, the index and the placeholder that
 # CONTRIBUTING.md shows the form with are the only other paths allowed.
-_POINTER_LIKE = re.compile(r"docs/explanation/decisions?/[^\s`'\"()\[\]<>]*")
+_POINTER_LIKE = re.compile(r"docs/explanation/decisions?/[^\s`'\"()\[\]<>|]*")
 _POINTER_TRAILING = ".,;:"
 _NOT_A_POINTER = frozenset(
     {

@@ -2,12 +2,12 @@
 The planning-citation pattern and the sample identifiers its tests need.
 
 The citation guard and the matching commit hook reject any line under src/,
-scripts/, tests/, the workflows, .dockerignore or the decision records under
-docs/explanation/decisions/ that points at the planning records. The guard's
-own pattern, and the identifiers that prove it bites, cannot be written down
-anywhere the hook reads without the hook failing on them, so they live here:
-this is the one file the hook skips, and a test pins that it stays the only
-one.
+scripts/, tests/, the workflows, .dockerignore, the decision records under
+docs/explanation/decisions/, CONTRIBUTING.md, the Dockerfile or the compose
+file that points at the planning records. The guard's own pattern, and the
+identifiers that prove it bites, cannot be written down anywhere the hook reads
+without the hook failing on them, so they live here: this is the one file the
+hook skips, and a test pins that it stays the only one.
 """
 
 from __future__ import annotations
