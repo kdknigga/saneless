@@ -5,7 +5,8 @@ Each check copies the repository, confirms the named test passes on the clean
 copy, applies one hand-written mutant and confirms the test now fails (or, for
 the real-libsane guard, is skipped).  The mutants target the parent's cancel
 grace in ``scan_child.py``, the child's discard of a page read during a cancel
-in ``scan_session.py``, and the skip guard of the real-child cancel test.
+in ``scan_session.py``, and the skip guard of the real-child cancel test,
+which must skip for missing options and fail for a failed option read.
 """
 
 from __future__ import annotations
@@ -115,9 +116,35 @@ def test_the_real_cancel_test_skips_when_libsane_lacks_the_read_delay_options(
         [
             Edit(
                 _SCAN_CHILD_LIBSANE,
-                "offered = {option[0] for option in reply.options or ()}",
-                "offered = {option[0] for option in reply.options or ()}"
+                "offered = {option[0] for option in reply.options}",
+                "offered = {option[0] for option in reply.options}"
                 " - _READ_DELAY_OPTION_NAMES",
+            )
+        ],
+    )
+
+
+@pytest.mark.sane_hardware
+def test_the_real_cancel_test_fails_when_the_capability_read_fails(
+    tmp_path: Path,
+) -> None:
+    """
+    The real-child cancel test fails, not skips, when its option read fails.
+
+    The mutant asks for the options of a device the test backend does not
+    have, so the read fails to open it.  A failed read says nothing about
+    which options libsane offers, so it must not pass for a backend that
+    lacks the read-delay options.
+    """
+    check_mutant(
+        tmp_path,
+        f"{_SCAN_CHILD_LIBSANE}"
+        "::test_a_cancel_mid_read_ends_the_real_child_within_the_grace",
+        [
+            Edit(
+                _SCAN_CHILD_LIBSANE,
+                'listing.ListingRequest(capabilities="test:0")',
+                'listing.ListingRequest(capabilities="test:99")',
             )
         ],
     )

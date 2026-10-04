@@ -168,7 +168,13 @@ def test_a_cancel_mid_read_ends_the_real_child_within_the_grace(
     reply = listing.run_listing_child(
         listing.ListingRequest(capabilities="test:0"), configured_host=""
     )
-    offered = {option[0] for option in reply.options or ()}
+    # A capability read that failed is a failure, never a reason to skip.
+    assert reply.options is not None, (
+        reply.init_error,
+        reply.open_error,
+        reply.options_error,
+    )
+    offered = {option[0] for option in reply.options}
     if not offered >= _READ_DELAY_OPTION_NAMES:
         pytest.skip("this libsane test backend has no read-delay options")
 
