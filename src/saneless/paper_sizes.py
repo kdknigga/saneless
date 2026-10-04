@@ -33,7 +33,8 @@ def crop_to_paper_size(
     Crop an image to the given paper size at the specified DPI.
 
     The crop is **top-left aligned**, which assumes the sheet's top-left corner
-    is the image's: true on a flatbed, or in a feeder window the device has
+    is the image's: true for a sheet placed in the corner of a flatbed, where
+    the scanner backend applies it, or in a feeder window the device has
     already centred on the paper.  A feeder that guides the sheet into the
     middle of a wider window would lose the right edge of every page to it.
 
