@@ -190,9 +190,11 @@ followed by a colon and a line number; the planning directory or the
 assistant-instructions file by name; or a phase named only by a word such as this,
 earlier or next. A test in `tests/test_deployment_config.py` runs the same pattern
 over the same files in CI. Anything the pattern misses, such as a line number written
-out in words, is left to review. The hook skips one file, `tests/citation_samples.py`,
-which holds the pattern and the sample identifiers the guard's own tests need; a test
-pins that it stays the only exclusion.
+out in words, is left to review. It also refuses ordinary prose of those shapes, such
+as the steps of a scan or an upload called phases with a number or an order word;
+reword it, for example as the second pass or the following step. The hook skips one
+file, `tests/citation_samples.py`, which holds the pattern and the sample identifiers
+the guard's own tests need; a test pins that it stays the only exclusion.
 
 The `test` job deselects the `browser` marker because the `browser` job runs those
 Playwright tests, with Chromium and Firefox installed (`uv run playwright install
