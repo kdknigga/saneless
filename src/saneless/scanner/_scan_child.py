@@ -100,11 +100,14 @@ from saneless.scanner.scan_protocol import (
     StageFrame,
     decode_command,
     encode_frame,
+    max_page_pixels,
 )
 from saneless.vocabulary import (
+    PAGE_TOO_LARGE_NEXT_STEP,
     PYTHON_SANE_INSTALL_NEXT_STEP,
     PaperSize,
     ScanStage,
+    page_too_large_error,
     python_sane_missing_message,
 )
 
@@ -581,8 +584,18 @@ class _ChildOutlet:
         Returns:
             True once saneless spooled it; False to stop the pass.
 
+        Raises:
+            ScanError: The page has more pixels than saneless can keep, so
+                it is not sent.
+
         """
         self._runtime.arm_alarm(0)
+        limit = max_page_pixels()
+        if image.width * image.height > limit:
+            raise ScanError(
+                page_too_large_error(number, image.width, image.height, limit),
+                next_step=PAGE_TOO_LARGE_NEXT_STEP,
+            )
         nbytes, strips = _pixels(image)
         header = PageHeader(
             number=number,

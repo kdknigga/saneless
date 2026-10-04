@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import sys
 from dataclasses import dataclass, fields
 from enum import StrEnum
 from types import MappingProxyType
@@ -72,6 +73,7 @@ __all__ = [
     "decode_command",
     "encode_command",
     "encode_frame",
+    "max_page_pixels",
     "read_frame",
     "receive_page",
 ]
@@ -336,6 +338,22 @@ _KINDS: Final[Mapping[type, str]] = MappingProxyType(
         LogLine: "log",
     }
 )
+
+
+def max_page_pixels() -> int:
+    """
+    Return the most pixels a page may have: twice Pillow's bomb limit.
+
+    Read at call time, from the limit the process has set.  Above it, the
+    spooled page could not be opened again, so the child refuses such a page
+    as a scan error and saneless refuses its header.
+
+    Returns:
+        The limit, in pixels.
+
+    """
+    limit = Image.MAX_IMAGE_PIXELS
+    return sys.maxsize if limit is None else 2 * limit
 
 
 def encode_command(command: ScanCommand | ControlOp) -> bytes:

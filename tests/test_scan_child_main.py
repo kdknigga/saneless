@@ -49,8 +49,10 @@ from saneless.scanner.scan_protocol import (
     receive_page,
 )
 from saneless.vocabulary import (
+    PAGE_TOO_LARGE_NEXT_STEP,
     PYTHON_SANE_INSTALL_NEXT_STEP,
     ScanStage,
+    page_too_large_error,
     python_sane_missing_message,
 )
 from tests.fake_sane import FakeSaneDev, FakeSaneError, FakeSaneModule, ReadBlockMode
@@ -980,6 +982,40 @@ def test_a_scan_error_too_long_for_a_frame_is_sent_cut_short(
     assert message.startswith(failure.message)
     assert failure.next_step
     assert next_step.startswith(failure.next_step)
+    assert child.frame() == Bye()
+    assert child.join() == 0
+
+
+def test_a_page_too_large_to_keep_is_a_scan_error_not_a_reply(
+    fake: FakeSaneModule,
+    child: _ChildHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A page over the pixel limit is refused here, as a scan error naming it.
+
+    saneless would refuse its header as a reply it cannot read; the child
+    knows why, so it says so, and stays ready for the next scan.
+    """
+    limit_pixels = 10_000
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", limit_pixels)
+    _ready(child)
+    assert fake.init_call_count == 1
+
+    child.send(_scan())
+    frames, pages = _spool_pass(child)
+    child.send(ControlOp.EXIT)
+
+    assert pages == []
+    assert frames[-1] == ChildFailure(
+        type_name="ScanError",
+        message=page_too_large_error(1, 200, 300, 2 * limit_pixels),
+        next_step=PAGE_TOO_LARGE_NEXT_STEP,
+        stage="read",
+        page=1,
+        fatal=False,
+    )
+    assert fake.device.close_calls == 1
     assert child.frame() == Bye()
     assert child.join() == 0
 

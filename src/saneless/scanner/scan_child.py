@@ -37,13 +37,10 @@ import os
 import select
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol, Self
-
-from PIL import Image
 
 from saneless.exceptions import (
     ConfigError,
@@ -69,6 +66,7 @@ from saneless.scanner.scan_protocol import (
     ScanCommand,
     StageFrame,
     encode_command,
+    max_page_pixels,
     read_frame,
     receive_page,
 )
@@ -328,12 +326,6 @@ _OUTCOMES: Final = (
     ChildGoneError,
     ProtocolError,
 )
-
-
-def _max_pixels() -> int:
-    """Return the most pixels a page may announce: twice Pillow's bomb limit."""
-    limit = Image.MAX_IMAGE_PIXELS
-    return sys.maxsize if limit is None else 2 * limit
 
 
 def _emit(line: LogLine) -> None:
@@ -755,7 +747,7 @@ class ScanChildSession:
         while True:
             self._in_sync = False
             frame = read_frame(
-                child.reply_fd, self._wait_readable, max_pixels=_max_pixels()
+                child.reply_fd, self._wait_readable, max_pixels=max_page_pixels()
             )
             self._in_sync = not isinstance(frame, PageHeader)
             if isinstance(frame, LogLine):
@@ -943,7 +935,7 @@ class ScanChildSession:
         """Read one frame from a stopping child, keeping only its log records."""
         self._in_sync = False
         frame = read_frame(
-            child.reply_fd, self._wait_readable, max_pixels=_max_pixels()
+            child.reply_fd, self._wait_readable, max_pixels=max_page_pixels()
         )
         if isinstance(frame, PageHeader):
             remaining = frame.nbytes

@@ -132,6 +132,7 @@ from saneless.vocabulary import (
     page_counts,
     page_timeout_error,
     page_title,
+    page_too_large_error,
     pages_phrase,
     pass_answer_label,
     pass_cap_warning,
@@ -3640,6 +3641,13 @@ class TestScanChildSentences:
         """A crash names the signal and the stage."""
         assert scan_child_crashed_error(ScanStage.READ, 2, "SIGSEGV") == (
             "The scanning process died from SIGSEGV while reading page 2"
+        )
+
+    def test_page_too_large_error(self) -> None:
+        """A page over the pixel limit names its size and the limit."""
+        assert page_too_large_error(2, 19843, 28066, 400_000_000) == (
+            "Page 2 is 19843 x 28066 pixels, over the 400000000 pixels saneless "
+            "can keep for one page"
         )
 
     def test_scan_child_ended_error(self) -> None:

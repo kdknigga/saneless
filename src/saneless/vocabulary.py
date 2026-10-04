@@ -61,6 +61,7 @@ __all__ = [
     "NO_SCRIPT_HEADING",
     "NO_SCRIPT_LINE",
     "NO_SCRIPT_PAGE_TITLE",
+    "PAGE_TOO_LARGE_NEXT_STEP",
     "PAPERLESS_TITLE_LIMIT",
     "PARTIAL_SUFFIX",
     "PASS_WAIT_STATES",
@@ -157,6 +158,7 @@ __all__ = [
     "page_counts",
     "page_timeout_error",
     "page_title",
+    "page_too_large_error",
     "pages_phrase",
     "pass_answer_label",
     "pass_cap_note",
@@ -2799,6 +2801,31 @@ def scan_page_description(
             f"at {dpi} dpi"
         )
     return f"a {kind} page of {pixels_per_line} x {lines} pixels at {dpi} dpi"
+
+
+PAGE_TOO_LARGE_NEXT_STEP: Final = "Scan at a lower resolution or a smaller paper size."
+"""The next step for a page too large to keep."""
+
+
+def page_too_large_error(number: int, width: int, height: int, limit: int) -> str:
+    """
+    Return the error for a page with more pixels than saneless can keep.
+
+    Args:
+        number: The page's number in its pass, counting from 1.
+        width: Its width, in pixels.
+        height: Its height, in pixels.
+        limit: The most pixels a page may have.
+
+    Returns:
+        E.g. ``"Page 1 is 19843 x 28066 pixels, over the 400000000 pixels
+        saneless can keep for one page"``.
+
+    """
+    return (
+        f"Page {number} is {width} x {height} pixels, over the {limit} pixels "
+        "saneless can keep for one page"
+    )
 
 
 def page_timeout_error(
