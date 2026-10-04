@@ -43,6 +43,7 @@ from saneless.job import Job
 from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
     _BUSY_SEPARATOR,
+    _SCAN_STAGE_PHRASES,
     ACTIVE_STATES,
     BACKS_SUFFIX,
     BUSY_STATES,
@@ -61,6 +62,7 @@ from saneless.vocabulary import (
     PAPERLESS_TITLE_LIMIT,
     PARTIAL_SUFFIX,
     PASS_WAIT_STATES,
+    PYTHON_SANE_INSTALL_NEXT_STEP,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     RESTART_UPLOADING_REASON,
@@ -93,6 +95,7 @@ from saneless.vocabulary import (
     ProfileStorage,
     RequestRejection,
     ScanOutcome,
+    ScanStage,
     SubmitResult,
     WorkerHealth,
     ambiguous_source_error,
@@ -135,6 +138,7 @@ from saneless.vocabulary import (
     pass_heading,
     pass_wait_state,
     progress_label,
+    python_sane_missing_message,
     rejection_message,
     rejection_status_code,
     removed_pages,
@@ -142,7 +146,13 @@ from saneless.vocabulary import (
     render_check_step,
     restart_category,
     restart_error,
+    sane_init_failure_message,
     scan_button_label,
+    scan_child_crashed_error,
+    scan_child_no_answer_error,
+    scan_child_not_started_error,
+    scan_child_stopped_error,
+    scan_child_unexpected_error,
     scan_hold_reason,
     scan_page_description,
     sixteen_bit_error,
@@ -852,13 +862,15 @@ class TestFinishWarnings:
         )
 
     def test_page_timeout_error_when_the_read_did_not_return(self) -> None:
-        """A read the cancel did not end is named as still outstanding."""
+        """A read the cancel did not end says saneless stopped the scanner."""
         page = scan_page_description(2480, 3508, colour=False, dpi=300)
-        assert page_timeout_error("Page 1", 120.0, page, returned=False) == (
+        message = page_timeout_error("Page 1", 120.0, page, returned=False)
+        assert message == (
             "Page 1 timed out after 120s, the limit for a grey page of "
-            "2480 x 3508 pixels at 300 dpi; the scanner did not respond to the "
-            "cancel, so saneless is still waiting for that read to return"
+            "2480 x 3508 pixels at 300 dpi; the scanner did not answer the "
+            "cancel either, so saneless stopped it"
         )
+        assert "still waiting" not in message
 
     def test_page_timeout_error_without_a_page(self) -> None:
         """With no page described, only the limit is named."""
@@ -866,8 +878,8 @@ class TestFinishWarnings:
             "Page 2 timed out after 120s"
         )
         assert page_timeout_error("Page 2", 120.0, None, returned=False) == (
-            "Page 2 timed out after 120s; the scanner did not respond to the "
-            "cancel, so saneless is still waiting for that read to return"
+            "Page 2 timed out after 120s; the scanner did not answer the "
+            "cancel either, so saneless stopped it"
         )
 
     def test_blank_timeout_finish_warning(self) -> None:
@@ -3559,3 +3571,117 @@ class TestRenderCheckStep:
         bad = cast("CheckSurface", "KIOSK")
         with pytest.raises(AssertionError):
             render_check_step("Nothing to retry.", bad)
+
+
+class TestScanChildSentences:
+    """The sentences for a scan child that was stopped, died or went astray."""
+
+    def test_every_scan_stage_has_a_phrase(self) -> None:
+        """Each stage has its phrase, so a new stage cannot go unnamed."""
+        assert set(_SCAN_STAGE_PHRASES) == set(ScanStage)
+
+    def test_scan_stage_values(self) -> None:
+        """The stage values are the lower-case words the protocol carries."""
+        assert [stage.value for stage in ScanStage] == [
+            "startup",
+            "open",
+            "configure",
+            "start",
+            "read",
+            "cancel",
+            "close",
+            "restart",
+            "exit",
+        ]
+
+    @pytest.mark.parametrize(
+        ("stage", "page", "phrase"),
+        [
+            (ScanStage.STARTUP, None, "while the scanner library was starting"),
+            (ScanStage.STARTUP, 4, "while the scanner library was starting"),
+            (ScanStage.OPEN, None, "while opening the scanner"),
+            (ScanStage.CONFIGURE, 2, "while setting up the scan"),
+            (ScanStage.START, 5, "while starting page 5"),
+            (ScanStage.START, None, "while starting a page"),
+            (ScanStage.READ, 3, "while reading page 3"),
+            (ScanStage.READ, None, "while reading a page"),
+            (ScanStage.CANCEL, 6, "while cancelling page 6"),
+            (ScanStage.CANCEL, None, "while cancelling the scan"),
+            (ScanStage.CLOSE, None, "while closing the scanner"),
+            (ScanStage.RESTART, None, "while restarting the scanner library"),
+            (ScanStage.EXIT, 7, "while finishing the scan"),
+        ],
+    )
+    def test_scan_child_stopped_error_names_the_stage(
+        self, stage: ScanStage, page: int | None, phrase: str
+    ) -> None:
+        """A stopped child names the stage, and the page only where it has one."""
+        assert scan_child_stopped_error(stage, page) == (
+            f"The scanner stopped answering {phrase}; saneless stopped it"
+        )
+
+    def test_scan_child_stopped_error_examples(self) -> None:
+        """The stopped-child sentences read as written."""
+        assert scan_child_stopped_error(ScanStage.READ, 3) == (
+            "The scanner stopped answering while reading page 3; saneless stopped it"
+        )
+        assert scan_child_stopped_error(ScanStage.CLOSE, None) == (
+            "The scanner stopped answering while closing the scanner; "
+            "saneless stopped it"
+        )
+        assert scan_child_stopped_error(ScanStage.EXIT, 7) == (
+            "The scanner stopped answering while finishing the scan; "
+            "saneless stopped it"
+        )
+
+    def test_scan_child_crashed_error(self) -> None:
+        """A crash names the signal and the stage."""
+        assert scan_child_crashed_error(ScanStage.READ, 2, "SIGSEGV") == (
+            "The scanning process died from SIGSEGV while reading page 2"
+        )
+
+    def test_scan_child_unexpected_error(self) -> None:
+        """An unexpected exception type is named with the stage."""
+        assert scan_child_unexpected_error("TypeError", ScanStage.CONFIGURE, None) == (
+            "The scanning process failed unexpectedly (TypeError) while setting "
+            "up the scan"
+        )
+
+    def test_scan_child_no_answer_error(self) -> None:
+        """A reply saneless could not read is named as such."""
+        assert scan_child_no_answer_error(ScanStage.OPEN, None) == (
+            "The scanning process sent a reply saneless could not read while "
+            "opening the scanner; saneless stopped it"
+        )
+
+    def test_scan_child_not_started_error(self) -> None:
+        """A child that never started says so."""
+        assert scan_child_not_started_error() == (
+            "The scanning process could not be started"
+        )
+
+
+class TestSaneStartFailureTexts:
+    """The SANE start-failure texts every reporting path shares."""
+
+    def test_sane_init_failure_message(self) -> None:
+        """A SANE initialisation failure keeps its reason."""
+        assert sane_init_failure_message("Error during device I/O") == (
+            "Could not initialise SANE: Error during device I/O"
+        )
+
+    def test_python_sane_missing_message(self) -> None:
+        """The install hint keeps the import's reason in brackets."""
+        assert python_sane_missing_message("No module named 'sane'") == (
+            "python-sane cannot be imported (No module named 'sane'). Install the "
+            "SANE development package (libsane-dev on Debian/Ubuntu, "
+            "sane-backends-devel on Fedora/RHEL) and reinstall saneless; see "
+            "Install on Bare Metal in the documentation"
+        )
+
+    def test_python_sane_install_next_step(self) -> None:
+        """The install next step is the one the install hint has always had."""
+        assert PYTHON_SANE_INSTALL_NEXT_STEP == (
+            "Install the SANE development package and reinstall saneless, "
+            "as the error says, then run the command again."
+        )

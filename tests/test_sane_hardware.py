@@ -458,7 +458,7 @@ class TestRealSaneCancelSequence:
             assert "timed out" in message
             # The real device answers the cancel, so the unresponsive-cancel
             # wording must be absent -- and the backend must not be wedged.
-            assert "did not respond" not in message
+            assert "did not answer the cancel" not in message
             assert sane_backend_mod._WEDGE.stuck is False
         finally:
             # Not in a suppression: "close() succeeds after a cancelled read"
