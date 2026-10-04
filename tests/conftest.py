@@ -21,7 +21,7 @@ import time
 import weakref
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import MagicMock
 
 import httpx2
@@ -1045,6 +1045,40 @@ class ThreadChild:
                 os.close(fd)
 
 
+class SeamChild(Protocol):
+    """What the seam's teardown needs of a child it started."""
+
+    reaped: bool
+
+    def kill_and_reap(self) -> int:
+        """End the child as a kill would, and fail if it does not end."""
+        ...
+
+    def close(self) -> None:
+        """Close saneless's ends of both pipes."""
+        ...
+
+
+def end_seam_children(children: Sequence[SeamChild]) -> None:
+    """
+    End every child the seam started, and fail if one was never reaped.
+
+    Args:
+        children: The children, in the order they started.
+
+    Raises:
+        AssertionError: A child was never reaped by the code under test.
+
+    """
+    unreaped = [child for child in children if not child.reaped]
+    for child in children:
+        child.kill_and_reap()
+        child.close()
+    if unreaped:
+        msg = f"{len(unreaped)} scan child(ren) never reaped by the code under test"
+        raise AssertionError(msg)
+
+
 class ScanChildSeam:
     """
     What the in-process scan-child seam was asked for, in order.
@@ -1129,13 +1163,7 @@ def scan_child_seam(
         sane_backend_mod, "_launch_scan_child", launch_in_process, raising=False
     )
     yield seam
-    unreaped = [child for child in seam.children if not child.reaped]
-    for child in seam.children:
-        child.kill_and_reap()
-        child.close()
-    if unreaped:
-        msg = f"{len(unreaped)} scan child(ren) never reaped by the code under test"
-        raise AssertionError(msg)
+    end_seam_children(seam.children)
 
 
 @pytest.fixture

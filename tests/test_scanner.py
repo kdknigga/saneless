@@ -76,6 +76,7 @@ from saneless.vocabulary import (
 )
 from tests.conftest import (
     StubScannerBackend,
+    end_seam_children,
     images_of,
     scan_batch,
     spooling,
@@ -572,6 +573,69 @@ class TestSaneBackendConstruction:
         second = SaneBackend()
         assert first is not second
         assert fake_sane_module.init_call_count == 0
+
+
+class _StubSeamChild:
+    """A seam child that may refuse to end when it is killed."""
+
+    def __init__(self, *, reaped: bool, ends: bool) -> None:
+        """
+        Make the child.
+
+        Args:
+            reaped: Whether the code under test reaped it.
+            ends: Whether it ends when it is killed.
+
+        """
+        self.reaped = reaped
+        self.closed = False
+        self._ends = ends
+
+    def kill_and_reap(self) -> int:
+        """
+        Close the pipes, as a kill does, and fail if the child does not end.
+
+        Returns:
+            The status the child is reaped with.
+
+        Raises:
+            AssertionError: The child does not end.
+
+        """
+        self.close()
+        if not self._ends:
+            msg = "the in-process scan child did not end when it was killed"
+            raise AssertionError(msg)
+        self.reaped = True
+        return 0
+
+    def close(self) -> None:
+        """Note that both pipes were closed."""
+        self.closed = True
+
+
+def test_the_seam_teardown_ends_every_child_and_names_every_failure() -> None:
+    """
+    One child that will not end leaves no other child running.
+
+    Every child's pipes are closed even when an earlier one will not end, so
+    none runs on into later tests, and the failure names both the children
+    never reaped and those that would not end.
+    """
+    children = [
+        _StubSeamChild(reaped=False, ends=False),
+        _StubSeamChild(reaped=False, ends=True),
+        _StubSeamChild(reaped=True, ends=True),
+    ]
+
+    with pytest.raises(AssertionError) as failed:
+        end_seam_children(children)
+
+    assert [child.closed for child in children] == [True, True, True]
+    assert str(failed.value) == (
+        "2 scan child(ren) never reaped by the code under test; "
+        "1 scan child(ren) did not end when killed"
+    )
 
 
 def _child_ended(child: ThreadChild) -> bool:
