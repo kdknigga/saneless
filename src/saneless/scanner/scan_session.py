@@ -1453,6 +1453,54 @@ def _opened(device_id: str, outlet: PageOutlet) -> Generator[SaneDevice]:
             raise report_failure
 
 
+class _SheetCallError(Exception):
+    """
+    A SANE call starting or reading one sheet failed.
+
+    It keeps the SANE error apart from a failure of the outlet, which is
+    raised as it was and never reported as a scanner error.
+
+    Attributes:
+        error: What the SANE call raised.
+
+    """
+
+    def __init__(self, error: Exception) -> None:
+        """Keep the SANE error."""
+        super().__init__(str(error))
+        self.error = error
+
+
+def _start_sheet(dev: SaneDevice) -> None:
+    """
+    Start one sheet.
+
+    Raises:
+        _SheetCallError: ``start`` failed.
+
+    """
+    try:
+        dev.start()
+    except Exception as exc:
+        raise _SheetCallError(exc) from exc
+
+
+def _snap_sheet(dev: SaneDevice) -> object:
+    """
+    Read the sheet ``start`` began, with no cancel from ``snap`` on failure.
+
+    The backend's reader may still run when the read fails.
+
+    Raises:
+        _SheetCallError: ``snap`` failed.
+
+    """
+    try:
+        return dev.snap(no_cancel=True)
+    except Exception as exc:
+        raise _SheetCallError(exc) from exc
+
+
 def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image:
     """
     Start and read one sheet, as python-sane's feeder iterator would.
@@ -1464,18 +1512,19 @@ def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image
     cancelled before anything waits on it.
 
     Raises:
+        _SheetCallError: ``start`` or ``snap`` failed, with no cancel asked.
         PassStopped: If a cancel was requested while the sheet was read; a
             cancelled ``snap()`` can return a truncated image, so it is
             discarded.
 
     """
     before = _native_thread_ids()
+    outlet.stage(ScanStage.START, number)
+    outlet.reading(dev)
     try:
-        outlet.stage(ScanStage.START, number)
-        outlet.reading(dev)
         if outlet.cancel_requested():
             raise PassStopped
-        dev.start()
+        _start_sheet(dev)
         if outlet.cancel_requested():
             # python-sane raises _sane.error, RuntimeError or AttributeError
             # with no shared base; a failed cancel leaves the read to the
@@ -1484,16 +1533,15 @@ def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image
                 dev.cancel()
             raise PassStopped
         outlet.stage(ScanStage.READ, number)
-        # No cancel from snap() on failure: the backend's reader may still run.
-        image = dev.snap(no_cancel=True)
+        image = _snap_sheet(dev)
     except Exception as exc:
         outlet.reading(None)
         # An asynchronous cancel can kill a backend reader holding a C-library
         # lock, which then hangs every later SANE call, so nothing cancels this
         # handle until the reader this read started has ended.
         _await_backend_threads(before)
-        if outlet.cancel_requested():
-            raise PassStopped from exc
+        if isinstance(exc, _SheetCallError) and outlet.cancel_requested():
+            raise PassStopped from exc.error
         raise
     outlet.reading(None)
     if outlet.cancel_requested():
@@ -1544,9 +1592,8 @@ def _feed(
         number = tally.fed + 1
         try:
             image = _read_sheet(dev, outlet, number)
-        except PassStopped:
-            raise
-        except Exception as exc:
+        except _SheetCallError as failed:
+            exc = failed.error
             if str(exc) == _END_OF_FEED:
                 break
             scan_error_msg = f"Scanner error on page {number}: {describe(exc)}"
@@ -1598,9 +1645,8 @@ def _snap_one(
         raise PassStopped
     try:
         image = _read_sheet(dev, outlet, 1)
-    except PassStopped:
-        raise
-    except Exception as exc:
+    except _SheetCallError as failed:
+        exc = failed.error
         if str(exc) == _END_OF_FEED:
             raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
         snap_msg = f"Scanner error on {neutralise_controls(device_id)}: {describe(exc)}"

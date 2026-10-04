@@ -566,6 +566,36 @@ def test_the_device_closes_when_the_close_cannot_be_reported(
     assert dev.close_calls == 1
 
 
+class _ReadUnreported(RecordingOutlet):
+    """An outlet that cannot report the read stage."""
+
+    def stage(self, stage: ScanStage, page: int | None) -> None:
+        """Record the stage, then fail to report the read."""
+        super().stage(stage, page)
+        if stage is ScanStage.READ:
+            raise _ReportGoneError
+
+
+@pytest.mark.parametrize("settings", [_feeder(), _flatbed()], ids=["feeder", "flatbed"])
+def test_an_outlet_failure_mid_sheet_is_raised_as_it_was(
+    monkeypatch: pytest.MonkeyPatch, settings: ScanSettings
+) -> None:
+    """
+    An outlet that fails part way through a sheet is not a scanner error.
+
+    Its own error comes out unchanged, never wrapped as "Scanner error on
+    page 1", and the device is still closed.
+    """
+    dev = FakeSaneDev(pages=1)
+    _install(monkeypatch, dev)
+
+    with pytest.raises(_ReportGoneError):
+        run_pass(_DEVICE, settings, _ReadUnreported())
+
+    assert dev.calls.count("snap") == 0
+    assert dev.close_calls == 1
+
+
 def test_the_reading_handle_is_registered_around_each_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
