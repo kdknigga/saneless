@@ -14,6 +14,6 @@ These records hold choices a contributor could undo by mistake: each one looked 
 - [0010. Web handlers read one typed services object](0010-typed-services-accessor.md)
 - [0011. The health strip is filled lazily and its polling is bounded](0011-lazy-bounded-health-strip.md)
 - [0012. The web server publishes no API schema](0012-no-openapi.md)
-- [0013. Status glyphs use text-presentation characters only](0013-text-presentation-glyphs.md)
+- [0013. Health-strip glyphs use text-presentation characters only](0013-text-presentation-glyphs.md)
 - [0014. The owner token is a guard, not a login](0014-owner-token-not-a-login.md)
 - [0015. Every dependency update waits seven days](0015-dependabot-cooldown.md)
