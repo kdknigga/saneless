@@ -2769,26 +2769,24 @@ _ADR_FILE = re.compile(r"[0-9]{4}-[a-z0-9-]+\.md")
 _ADR_INDEX = "README.md"
 # Anything that starts like a pointer, so a mistyped one is checked rather than
 # passed over: a pointer that is not the record shape, or names no file, is
-# reported.  The directory itself, the index and the placeholder that
-# CONTRIBUTING.md shows the form with are the only other paths allowed.
-_POINTER_LIKE = re.compile(r"docs/explanation/decisions?/[^\s`'\"()\[\]<>|]*")
+# reported.  A fragment after "#" is not part of the path checked.  The
+# directory itself and the index are the only other paths allowed, and the
+# placeholder is allowed only in CONTRIBUTING.md, which shows the form with it.
+_POINTER_LIKE = re.compile(r"docs/explanation/decisions?/[^\s`'\"()\[\]<>|#]*")
 _POINTER_TRAILING = ".,;:"
-_NOT_A_POINTER = frozenset(
-    {
-        _DECISIONS_PREFIX,
-        _DECISIONS_PREFIX + _ADR_INDEX,
-        _DECISIONS_PREFIX + "NNNN-slug.md",
-    }
-)
+_NOT_A_POINTER = frozenset({_DECISIONS_PREFIX, _DECISIONS_PREFIX + _ADR_INDEX})
+_PLACEHOLDER_POINTER = _DECISIONS_PREFIX + "NNNN-slug.md"
+_PLACEHOLDER_HOME = "CONTRIBUTING.md"
 
 
-def _bad_pointers(line: str, root: Path) -> list[str]:
+def _bad_pointers(line: str, root: Path, allowed: frozenset[str]) -> list[str]:
     """
     Return every pointer-like path in ``line`` that names no decision record.
 
     Args:
         line: One line of a checked file.
         root: The directory the cited paths are relative to.
+        allowed: The paths that are not pointers in this file.
 
     Returns:
         Each offending path, with trailing sentence punctuation removed.
@@ -2797,7 +2795,7 @@ def _bad_pointers(line: str, root: Path) -> list[str]:
     found: list[str] = []
     for raw in _POINTER_LIKE.findall(line):
         pointer = raw.rstrip(_POINTER_TRAILING)
-        if pointer in _NOT_A_POINTER:
+        if pointer in allowed:
             continue
         if not ADR_POINTER.fullmatch(pointer) or not (root / pointer).is_file():
             found.append(pointer)
@@ -2832,10 +2830,13 @@ def _dangling_adr_pointers(names: list[str], root: Path) -> list[str]:
         except OSError as exc:
             offenders.append(f"{name}: unreadable, so it was not checked: {exc}")
             continue
+        allowed = _NOT_A_POINTER
+        if name == _PLACEHOLDER_HOME:
+            allowed |= {_PLACEHOLDER_POINTER}
         offenders.extend(
             f"{name}:{number}: {pointer}"
             for number, line in enumerate(text.splitlines(), start=1)
-            for pointer in _bad_pointers(line, root)
+            for pointer in _bad_pointers(line, root, allowed)
         )
     return offenders
 
@@ -2951,10 +2952,10 @@ def test_the_adr_pointer_check_reports_a_malformed_pointer(
     assert _dangling_adr_pointers(["a.py"], tmp_path) == ["a.py" + ":1: " + pointer]
 
 
-def test_the_adr_pointer_check_allows_the_directory_index_and_placeholder(
+def test_the_adr_pointer_check_allows_the_directory_and_index(
     tmp_path: Path,
 ) -> None:
-    """The decisions directory, its index and the documented placeholder pass."""
+    """The decisions directory and its index pass in any file."""
     decisions = tmp_path / _DECISIONS_PREFIX
     decisions.mkdir(parents=True)
     (decisions / _ADR_INDEX).write_text("# Decisions\n", encoding="utf-8")
@@ -2964,6 +2965,36 @@ def test_the_adr_pointer_check_allows_the_directory_index_and_placeholder(
     )
 
     assert _dangling_adr_pointers(["a.md"], tmp_path) == []
+
+
+def test_the_adr_pointer_check_allows_the_placeholder_only_in_contributing(
+    tmp_path: Path,
+) -> None:
+    """The documented placeholder passes in CONTRIBUTING.md and nowhere else."""
+    line = f"See {_PLACEHOLDER_POINTER}.\n"
+    (tmp_path / _PLACEHOLDER_HOME).write_text(line, encoding="utf-8")
+    (tmp_path / "a.py").write_text(f"# {line}", encoding="utf-8")
+
+    offenders = _dangling_adr_pointers([_PLACEHOLDER_HOME, "a.py"], tmp_path)
+
+    assert offenders == ["a.py" + ":1: " + _PLACEHOLDER_POINTER]
+
+
+def test_the_adr_pointer_check_ignores_a_fragment(tmp_path: Path) -> None:
+    """A real record cited with an anchor passes; a missing one still fails."""
+    decisions = tmp_path / _DECISIONS_PREFIX
+    decisions.mkdir(parents=True)
+    (decisions / "0001-real.md").write_text("# Real\n", encoding="utf-8")
+    real = _DECISIONS_PREFIX + "0001-real.md"
+    missing = _DECISIONS_PREFIX + "0999-nope.md"
+    (tmp_path / "a.py").write_text(
+        f"# See {real}#consequences.\n# See {missing}#context.\n",
+        encoding="utf-8",
+    )
+
+    offenders = _dangling_adr_pointers(["a.py"], tmp_path)
+
+    assert offenders == ["a.py" + ":2: " + missing]
 
 
 def test_the_adr_pointer_check_reports_a_file_it_cannot_read(tmp_path: Path) -> None:
