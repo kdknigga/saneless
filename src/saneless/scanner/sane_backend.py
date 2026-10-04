@@ -1677,6 +1677,9 @@ def _acquire_with_timeout(
             done.set()
             _release_wedge(dev, done, _READER)
 
+    # ``read`` holds ``work``, and through it the feeder iterator, until the
+    # call returns; ``_acquire_pages`` drops its own reference after a wedge on
+    # the strength of that, so the reader must never release it early.
     reader = threading.Thread(
         target=read, name=f"{_READER_THREAD_PREFIX}{page_label}", daemon=True
     )
