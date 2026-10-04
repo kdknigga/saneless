@@ -2708,9 +2708,9 @@ def _choose_feeder_source(available_sources: list[str], requested: str) -> str:
 
     A feeder that scans both sides (``SourceKind.FEEDER_DUPLEX``) is never
     used. Each pass through it returns 2N pages, the two passes' counts agree,
-    ``_interleave_duplex`` pairs a front+back sequence with a reversed
-    back+front one, and the job reports ``DONE`` with 4N pages in scrambled
-    order. So "any feeder" is deliberately not good enough: when the operator
+    ``saneless.duplex.interleave_duplex`` pairs a front+back sequence with a
+    reversed back+front one, and the job reports ``DONE`` with 4N pages in
+    scrambled order. So "any feeder" is deliberately not good enough: when the operator
     named a both-sides source and a single-sided one exists, the single-sided
     one is used with a WARNING naming both; when every feeder scans both sides,
     manual duplex is refused before any page, because a WARNING beside a green
