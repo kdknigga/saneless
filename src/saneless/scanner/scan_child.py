@@ -390,6 +390,7 @@ class ScanChildSession:
         self._child: ChildProcess | None = None
         self._poller: select.poll | None = None
         self._killed = 0
+        self._kill_sent = False
         self._stage = ScanStage.STARTUP
         self._page: int | None = None
         self._deadline = 0.0
@@ -508,6 +509,10 @@ class ScanChildSession:
 
         """
         if self._child is None:
+            return
+        if self._kill_sent:
+            # saneless killed it already; an interrupt stopped the reap.
+            self._end_child()
             return
         self._enter(ScanStage.EXIT)
         status = self._stop_child(ControlOp.EXIT, STAGE_DEADLINE_SECONDS)
@@ -982,15 +987,20 @@ class ScanChildSession:
 
         The child is forgotten only once it is reaped: an interrupt during the
         kill or the reap leaves it in place, so the session's next end of the
-        child, or its close, kills and reaps it again.
+        child, or its close, kills and reaps it again.  The kill is counted
+        as it is sent, so a child an interrupted kill left to be reaped later
+        is still counted, once.
         """
         child = self._child
         if child is None:
             return
         if child.poll() is None:
+            if not self._kill_sent:
+                self._kill_sent = True
+                self._killed += 1
             child.kill_and_reap()
-            self._killed += 1
         self._child = None
+        self._kill_sent = False
         self._poller = None
         try:
             child.close()
