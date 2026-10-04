@@ -38,15 +38,19 @@ from saneless.scanner.scan_protocol import (
     ChildFailure,
     ControlOp,
     LogLine,
+    PageHeader,
     PassDone,
     Ready,
     ScanCommand,
+    StageFrame,
     encode_command,
     read_frame,
+    receive_page,
 )
 from saneless.spool import SpooledPageSink
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from saneless.scanner.scan_protocol import Frame
@@ -316,6 +320,118 @@ def test_a_scan_child_whose_read_failed_survives_a_closed_reply_pipe(
 
     assert isinstance(frame, ChildFailure), frame
     assert not frame.fatal, frame
+    assert returncode != -signal.SIGPIPE, "the scan child was killed by SIGPIPE"
+    assert returncode == _scan_child._PARENT_GONE_STATUS
+
+
+def _slow_failing_read_config(tmp_path: Path) -> Path:
+    """
+    Write a SANE configuration whose reads take a second and then fail.
+
+    Returns:
+        The configuration directory, for ``SANE_CONFIG_DIR``.
+
+    """
+    config = _failing_read_config(tmp_path, "SANE_STATUS_NO_DOCS")
+    with (config / "test.conf").open("a", encoding="ascii") as conf:
+        conf.write("read-delay true\nread-delay-duration 1000000\n")
+    return config
+
+
+def _plain_config(tmp_path: Path) -> Path:
+    """
+    Write a SANE configuration for the test backend as it comes.
+
+    Returns:
+        The configuration directory, for ``SANE_CONFIG_DIR``.
+
+    """
+    config = tmp_path / "sane.d"
+    config.mkdir()
+    (config / "dll.conf").write_text("test\n", encoding="ascii")
+    return config
+
+
+def _close_during_the_read(proc: subprocess.Popen[bytes], reply_fd: int) -> None:
+    """Close saneless's end of the reply pipe once the first read is under way."""
+    assert proc.stdout is not None
+    while _frame(reply_fd) != StageFrame(stage="read", page=1):
+        pass
+    proc.stdout.close()
+
+
+def _close_after_the_first_page(proc: subprocess.Popen[bytes], reply_fd: int) -> None:
+    """Close saneless's end of the reply pipe after page 1, then answer it."""
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    frame = _frame(reply_fd)
+    while not isinstance(frame, PageHeader):
+        frame = _frame(reply_fd)
+    receive_page(reply_fd, frame, lambda: _wait_readable(reply_fd))
+    proc.stdout.close()
+    proc.stdin.write(encode_command(ControlOp.SPOOLED))
+    proc.stdin.flush()
+
+
+@pytest.mark.sane_hardware
+@pytest.mark.parametrize(
+    ("source", "configure", "close"),
+    [
+        ("Flatbed", _slow_failing_read_config, _close_during_the_read),
+        ("Automatic Document Feeder", _plain_config, _close_after_the_first_page),
+    ],
+    ids=["failed-read", "after-a-page"],
+)
+def test_a_scan_child_survives_its_reply_pipe_closing_mid_pass(
+    source: str,
+    configure: Callable[[Path], Path],
+    close: Callable[[subprocess.Popen[bytes], int], None],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A reply pipe closed during a pass ends the child cleanly, not by SIGPIPE.
+
+    libsane puts SIGPIPE back to its default action inside a pass, after a
+    read that fails and after one that succeeds, and the pass writes again
+    before it ends: the next sheet's stages, and the cancel and close of its
+    cleanup.  Each such write to a saneless that has gone must fail, so the
+    child cancels and closes the device and ends with the status for a closed
+    reply channel.  Its stdin stays open, so the end of commands cannot be
+    what ends it.
+
+    Args:
+        source: The source the pass reads.
+        configure: Writes the SANE configuration the pass runs under.
+        close: Closes saneless's end of the reply pipe at its point in the
+            pass.
+        tmp_path: Holds the SANE configuration.
+        monkeypatch: Points SANE at the configuration.
+
+    """
+    monkeypatch.setenv("SANE_CONFIG_DIR", str(configure(tmp_path)))
+    command = ScanCommand(
+        device="test:0",
+        settings=dataclasses.asdict(
+            ScanSettings(source=source, resolution=50, mode="Gray")
+        ),
+        log_level=logging.INFO,
+    )
+    proc = child_launch.start_child(scan_child._CHILD_FILE, "")
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    try:
+        reply_fd = proc.stdout.fileno()
+        assert _frame(reply_fd) == Ready()
+        proc.stdin.write(encode_command(command))
+        proc.stdin.flush()
+        close(proc, reply_fd)
+        returncode = proc.wait(_CHILD_TIMEOUT_SECONDS)
+    finally:
+        child_launch.kill_and_reap(proc)
+        proc.stdin.close()
+        proc.stdout.close()
+
     assert returncode != -signal.SIGPIPE, "the scan child was killed by SIGPIPE"
     assert returncode == _scan_child._PARENT_GONE_STATUS
 
