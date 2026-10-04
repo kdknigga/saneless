@@ -123,8 +123,9 @@ def _one_run(backend: SaneBackend, mode: str, passes: int, spool_root: Path) -> 
                     f"expected {_SHEETS_PER_PASS}"
                 )
                 raise BenchmarkError(msg)
-            size = batch.pages[0].size
-            if size != _PAGE_PIXELS:
+            odd = [page.size for page in batch.pages if page.size != _PAGE_PIXELS]
+            if odd:
+                size = odd[0]
                 msg = (
                     f"{mode} pass {index + 1} scanned {size[0]} x {size[1]} pixel "
                     f"pages, expected {_PAGE_PIXELS[0]} x {_PAGE_PIXELS[1]}: is "
