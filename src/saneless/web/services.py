@@ -89,6 +89,7 @@ def services(request: Request) -> Services:
         The ``Services`` object ``create_app`` stored.
 
     Raises:
+        AttributeError: If the app stores no services at all.
         TypeError: If the app holds anything other than a ``Services``.
 
     """
