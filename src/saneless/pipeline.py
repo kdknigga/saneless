@@ -95,10 +95,7 @@ __all__ = [
 ]
 
 
-# The value of the one event whose name ends in "PASS", named rather than
-# written inline: ruff's S105 reads a string literal assigned to a name ending
-# in "pass" as a hardcoded password.  A scan pass is not a password, and the
-# convention that every member's value is its name stays unbroken this way.
+# Every ``PipelineEvent`` member's value is its name: ``_wait_event`` relies on it.
 _NEXT_WAIT_EVENT_VALUE: Final = "AWAITING_NEXT_PASS"
 
 
@@ -120,22 +117,9 @@ class PipelineEvent(StrEnum):
         """
         Return the job state this event implies.
 
-        The projection is total: every event has a ``JobState`` twin.
-        ``SCANNING_REVERSE`` projects to ``JobState.SCANNING_REVERSE``, so the
-        second pass of a manual-duplex scan is persisted as its own busy state
-        and the job leaves ``AWAITING_FLIP`` the moment pass B starts -- which
-        is what takes the flip prompt, and its Continue and Abort controls, off
-        the screen while the backs feed.
-
-        The three multi-page waits -- ``AWAITING_NEXT_PASS``,
-        ``AWAITING_BLANK_DECISION`` and ``AWAITING_RETRY`` -- each project to the
-        job state of the same name, so a job says which question it is waiting
-        on, and the next ``SCANNING`` event is what takes that prompt off the
-        screen when the operator asks for another pass.
-
-        Note that the returned state is not an instruction to write it:
-        ``DONE`` is terminal and the worker writes it only after the
-        pipeline has returned.  Callers decide which states they apply.
+        Every event projects to the ``JobState`` of the same name.  The state
+        is not an instruction to write it: ``DONE`` is terminal, and the worker
+        writes it only after the pipeline has returned.
 
         Returns:
             The matching JobState.
@@ -172,73 +156,34 @@ def _wait_event(wait: PassWait) -> PipelineEvent:
     """
     Return the event a multi-page run emits when it opens ``wait``.
 
-    Derived from ``vocabulary.pass_wait_state``, the one mapping from a
-    question to the job state that names it, rather than kept as a second
-    ``match`` to be updated in step with it.  The event is that state's twin:
-    every event's value is its name, and ``PipelineEvent.job_state`` projects
-    each event onto the state of the same name, so the event with the state's
-    value is the one whose projection is that state.  A new ``PassWait``
-    member is still caught at edit time, by ``pass_wait_state``'s own
-    ``match``.
-
-    Args:
-        wait: The question the run is about to ask.
-
-    Returns:
-        The waiting event whose job state names that question.
-
+    Derived from ``vocabulary.pass_wait_state`` through the event of the same
+    value, so there is no second mapping to keep in step.
     """
     return PipelineEvent(pass_wait_state(wait).value)
 
 
 logger = logging.getLogger(__name__)
 
-# The per-pass prefix each acquisition pass's file names carry, inside the
-# workspace's spool directory: ``a-0001.png`` for a simplex job or
-# a duplex job's fronts, ``b-0001.png`` for its backs.  The labels are
-# for telling two passes apart in one directory; document order comes from the
-# record list and never from these names.
-#
-# Named constants rather than literals at the call sites, for a lint reason
-# worth recording so nobody "tidies" them back: ruff's S106 reads any keyword
-# argument whose name contains "pass" as a possible hardcoded password, and
-# ``pass_label=`` does, so a string literal there fails the lint and this
-# project adds no suppressions. The constants are spelled ``_SPOOL_LABEL_*``
-# and not ``_PASS_*_LABEL`` for the sibling rule S105, which reads the same
-# substring in a variable's own name. Naming them also gives anything that
-# asserts on the convention one place to import it from.
+# The spool file-name prefix of each acquisition pass: ``a-0001.png`` for a
+# simplex job or a duplex job's fronts, ``b-0001.png`` for its backs.  Document
+# order comes from the record list and never from these names.
 _SPOOL_LABEL_A: Final = "a"
 _SPOOL_LABEL_B: Final = "b"
 
 # The most pages a multi-page document may hold before the run stops offering
-# another pass.  The same number as the per-pass cap, and defined by it, because
-# the two are one judgement about paper -- how big a stack anyone scans as one
-# document -- so if one moves the other must move with it.  The cap is checked
-# only between passes, never inside one, so a document can reach
-# ``MAX_DOCUMENT_PAGES - 1 + MAX_PAGES_PER_PASS`` pages: a pass that starts one
-# page short of the cap is allowed to finish.
+# another pass.  Defined by the per-pass cap because both are one judgement
+# about how big a stack is, so they move together.  It is checked only between
+# passes, so a document can reach ``MAX_DOCUMENT_PAGES - 1 + MAX_PAGES_PER_PASS``.
 MAX_DOCUMENT_PAGES: Final = MAX_PAGES_PER_PASS
 
-# Which half of a manual-duplex run a ``pass_count_callback`` call is reporting.
-# Shared constants rather than a literal spelled once here and once in the
-# worker, so the two halves of the channel can never drift apart, and so a test
-# asserting on the ordering imports the label instead of retyping it.
-#
-# Public (no leading underscore) because ``worker.py`` compares against them,
-# and named ``SCAN_LABEL_*`` rather than the obvious ``PASS_FRONT`` for exactly
-# the lint reason recorded above ``_SPOOL_LABEL_A``: ruff's S105 reads any
-# variable whose own name contains "pass" as a possible hardcoded password, and
-# this project adds no suppressions.  Verified: ``PASS_FRONT: Final = "front"``
-# raises S105 under this configuration.
+# Which half of a manual-duplex run a ``pass_count_callback`` call reports; the
+# worker compares against these.
 SCAN_LABEL_FRONT: Final = "front"
 SCAN_LABEL_BACK: Final = "back"
 
-# The next step for a prompt that broke: a flip or multi-page prompt whose
-# coordinator answered abort with an ``abort_cause``.  Only the CLI's terminal
-# prompts set one, and the fault is the terminal's, so the scanner category's
-# advice would send the operator to a scanner that did nothing wrong.  What was
-# kept is not claimed here: the run guard's note says that, and it is true even
-# when keeping the pages failed.
+# The next step when a flip or multi-page prompt broke (its coordinator aborted
+# with an ``abort_cause``).  The fault is the terminal's, so the scanner
+# category's advice would mislead.  What was kept is the run guard's note to say.
 _BROKEN_PROMPT_NEXT_STEP: Final = "Run the scan again from a working terminal."
 
 
@@ -247,14 +192,9 @@ class _FlipContext:
     """
     What ``_PipelineRun._scan_manual_duplex`` needs to wait for a flip.
 
-    One record, built before the run starts, so a manual-duplex request that
-    cannot run is refused before the device is touched.
-
-    It carries the coordinator as non-Optional.
-    ``PipelineRequest.flip_coordinator`` is ``FlipCoordinator | None`` because a
-    simplex run legitimately has none, so the narrowing to "there is one"
-    happens exactly once, where this record is built, and the callee never
-    needs an ``assert`` (which ``S101`` bans in ``src/``) to prove it.
+    Built before the run starts, so a manual-duplex request that cannot run is
+    refused before the device is touched.  Its coordinator is non-Optional:
+    ``PipelineRequest.flip_coordinator`` is narrowed once, here.
 
     Attributes:
         coordinator: The seam that answers the flip wait.
@@ -272,14 +212,9 @@ class _MultiPageContext:
     """
     What ``_PipelineRun._scan_multi_page`` needs to ask between passes.
 
-    One record, built before the run starts, so a multi-page request that
-    cannot run is refused before the device is touched.
-
-    It carries the coordinator as non-Optional.
-    ``PipelineRequest.pass_coordinator`` is ``PassCoordinator | None`` because
-    a single-pass run legitimately has none, so the narrowing to "there is
-    one" happens exactly once, where this record is built, and the callee
-    never needs an ``assert`` (which ``S101`` bans in ``src/``) to prove it.
+    Built before the run starts, so a multi-page request that cannot run is
+    refused before the device is touched.  Its coordinator is non-Optional:
+    ``PipelineRequest.pass_coordinator`` is narrowed once, here.
 
     Attributes:
         coordinator: The seam that answers every multi-page prompt.
@@ -299,13 +234,10 @@ class DeviceMemory:
 
     With ``scanner.device`` empty each run scans on whichever device SANE lists
     first, so a scanner that appears on the LAN between two jobs takes the
-    second one silently.  Comparing against this record is what lets that
-    change be logged.
+    second one silently; comparing against this record lets that be logged.
 
-    One instance lives per worker and rides on every ``PipelineRequest`` it
-    builds; the CLI runs one scan per process and passes none.  It is not
-    module state, which would carry one test's device into the next and one
-    worker's into another's.
+    One instance lives per worker; the CLI passes none.  It is not module
+    state, which would carry one worker's device into another's.
 
     Attributes:
         last_id: The device id the previous auto-detection chose, or None
@@ -320,16 +252,11 @@ class Settled:
     """
     Whether a run's outcome is fixed: a flag with no lock in it.
 
-    It is set by the run and read by the CLI's signal handler, and both run on
-    the main thread; nothing ever waits on it.  So it takes no lock, and that
-    is the point.  A ``threading.Event`` takes one in ``set`` and
-    ``clear``, and a signal whose handler raises in the instant after the
-    lock is taken leaves that lock held for good: the next ``set`` -- the
-    very retry that lets a run settle despite the signal -- then blocks
-    forever, with both signals already ignored.  Here ``set`` is a single
-    attribute store, so a signal lands either before it, when the flag is
-    still clear and the retry simply sets it, or after it, when the flag is
-    set and the handler defers.
+    It is set by the run and read by the CLI's signal handler, both on the
+    main thread, so it must take no lock.  A ``threading.Event`` locks in
+    ``set``, and a handler that raises just after that lock is taken leaves it
+    held, so the retrying ``set`` blocks forever.  Here ``set`` is a single
+    attribute store, which a signal lands either wholly before or after.
     """
 
     def __init__(self) -> None:
@@ -374,48 +301,27 @@ class PipelineRequest:
     correspondent: int | None = None
     status_callback: Callable[[PipelineEvent], None] | None = None
     thumbnail_callback: Callable[[str], None] | None = None
-    # How many pages a manual-duplex pass produced, announced while the run is
-    # still going.  Its own channel, mirroring
-    # ``thumbnail_callback``, because the three alternatives are all worse:
-    # ``status_callback`` is ``Callable[[PipelineEvent], None]`` and carries no
-    # payload, so ``SCANNING_REVERSE`` cannot carry ``len(front_pages)``;
-    # widening it would touch every call site and hand the CLI an argument it
-    # does not want; and a ``PipelineEvent`` member carrying the number is
-    # rejected outright, because members of that enum are states, not payloads.
-    # ``ScanResult`` is no help either -- it is returned once, at the end, and
-    # the count is wanted while pass B is still feeding.
+    # How many pages a manual-duplex pass produced, announced while pass B is
+    # still feeding.
     pass_count_callback: Callable[[str, int], None] | None = None
-    # One field, one atomic answer.  This replaced a flip event and an abort
-    # event, where an Abort set both so the waiter woke and then had to inspect
-    # the second to learn why -- the two-step that once left an Abort pressed
-    # during pass B doing nothing at all.
     flip_coordinator: FlipCoordinator | None = None
-    # Whether this run builds one document from several flatbed passes.  Its
-    # own field, not a profile setting, because it is a choice about this
-    # scan -- one sheet or a stack of them -- made when the scan is started.
+    # Whether this run builds one document from several flatbed passes: a
+    # choice about this scan, not a profile setting.
     multi_page: bool = False
-    # Where a multi-page run's answers come from: the web routes or a terminal
-    # prompt.  Its own field beside ``flip_coordinator`` rather than a widening
-    # of it, so neither kind of wait can be answered with the other's answers.
+    # Kept apart from ``flip_coordinator``, so neither kind of wait can be
+    # answered with the other's answers.
     pass_coordinator: PassCoordinator | None = None
-    # The worker's record of the device its last auto-detection chose, so a
-    # change between jobs is logged.  Defaulted so the CLI -- one scan per
-    # process, nothing to compare with -- passes none.
+    # The worker's record of the device its last auto-detection chose; the CLI
+    # passes none.
     device_memory: DeviceMemory | None = None
     # Set while a failed run's pages are being preserved, and cleared once
     # that is done, so a stopping server can wait for the pages to land in
     # failed/ rather than exit half way through copying them.  The worker
     # passes one; the CLI, which has no stop join to extend, passes none.
     preserving: threading.Event | None = None
-    # Set once the run's outcome is fixed -- the document delivered, or the
-    # run failed, was cancelled or was interrupted -- and never cleared by the
-    # run: whoever passed it owns it.  From that moment an interruption can
-    # only undo what the run did, by abandoning the pages half way into
-    # failed/ or by turning a delivered document into a failure, so the CLI's
-    # signal handler defers a SIGTERM or SIGHUP while it is set.  The worker,
-    # whose stop never raises into the run, passes none.  A ``Settled``, not a
-    # ``threading.Event``, because a signal can land inside the call that
-    # sets it.
+    # Set once the run's outcome is fixed and never cleared by the run.  From
+    # then an interruption could only undo the outcome, so the CLI's signal
+    # handler defers a SIGTERM or SIGHUP while it is set; the worker passes none.
     settled: Settled | None = None
     # Where the run learns which tag and correspondent ids paperless-ngx still
     # has, before it touches the scanner.  The web worker passes one that reads
@@ -531,32 +437,16 @@ def _observe(request: PipelineRequest, what: str, call: Callable[[], None]) -> N
     """
     Call one observer, and never let its failure change how the run ends.
 
-    Every status, thumbnail and pass-count callback goes through here.  An
-    observer is somebody watching the run -- the web worker writing progress
-    to the job store, the CLI printing a line -- and none of what it does is
-    part of the scan: the same facts arrive again in ``ScanResult`` at the
-    end.  Letting its failure propagate would end a run whose sheets have
-    already been fed over a progress write, and file a job-store fault as a
-    scanner one.  So the failure is logged at WARNING with its traceback and
-    the run carries on.
-
-    Only ``Exception`` is caught.  ``KeyboardInterrupt`` and
-    ``ScanInterrupted`` pass through: they end the run on purpose.
-
-    Args:
-        request: The request, whose title the log line names.
-        what: Which observer call this is, for the log line.
-        call: The observer, bound to its arguments.
-
+    An observer (a progress write, a printed line) is not part of the scan, so
+    its failure is logged at WARNING and the run carries on.  Only ``Exception``
+    is caught: ``KeyboardInterrupt`` and ``ScanInterrupted`` end the run on
+    purpose.
     """
     try:
         call()
     except Exception:
-        # The title is request input, bounded only in length and never in
-        # character set, so it can contain newlines -- it goes into a log line
-        # with %r, which is the discipline web/errors.py's module docstring
-        # states, applied here because this module logs the same class of
-        # value.  %r supplies its own quoting; the format string adds none.
+        # The title is request input that can contain newlines, so it is
+        # logged with %r, which supplies its own quoting.
         logger.warning(
             "Observer failed at %s for %r; the scan continues",
             what,
@@ -569,10 +459,7 @@ def _note_pass_count(request: PipelineRequest, label: str, count: int) -> None:
     """
     Announce one manual-duplex pass's page count to the request's observer.
 
-    An absent observer is the normal case, and the CLI supplies none.  The
-    count is a transient number the status area shows for the length of pass
-    B, so an observer that fails here is logged by ``_observe`` and the scan
-    continues.
+    An absent observer is the normal case; the CLI supplies none.
 
     Args:
         request: The pipeline request, whose callback is fired if it has one.
@@ -592,20 +479,10 @@ def _note_pass_count(request: PipelineRequest, label: str, count: int) -> None:
 
 def _check_disk_space(tmp_dir: Path, min_free_mb: int) -> None:
     """
-    Raise DiskSpaceError if there is too little free space in tmp_dir.
+    Raise ``DiskSpaceError`` if ``tmp_dir`` has less than ``min_free_mb`` free.
 
-    This only measures: ``_open_workspace`` creates the directory first.
-
-    Args:
-        tmp_dir: The existing temporary directory used for scanning.
-        min_free_mb: Minimum free space required in megabytes.
-
-    Raises:
-        DiskSpaceError: If free space is below the required threshold.  A
-            full disk, not a scanner fault, so it is not a ``ScanError``.
-        OSError: If the directory cannot be measured; the caller translates
-            it.
-
+    A full disk is not a scanner fault, so it is not a ``ScanError``.  An
+    ``OSError`` from measuring propagates for the caller to translate.
     """
     usage = shutil.disk_usage(tmp_dir)
     free_mb = usage.free // BYTES_PER_MB
@@ -624,23 +501,14 @@ def _open_workspace(
     """
     Create this run's job workspace under ``tmp_dir``, checking for room.
 
-    The workspace is a ``JobWorkspace``: named ``job-<id>-...`` after the job
-    and locked for as long as the run holds it, so a sweep of ``tmp_dir``
-    can tell a live run's workspace from one a killed process left behind.
-    It is removed when the ``with`` block ends, however it ends, unless the
-    run called its ``keep`` because pages in it could not be kept elsewhere.
+    The workspace is locked while the run holds it, so a sweep of ``tmp_dir``
+    can tell it from one a killed process left behind, and it is removed when
+    the ``with`` block ends unless the run called its ``keep``.
 
-    ``tmp_dir`` is created 0700 when missing and refused when it is not
-    private (see ``saneless.private_dirs``); both failures are a
-    ``ConfigError`` naming ``output.tmp_dir``.  The other two steps can raise a
-    raw ``OSError`` -- a permission refused, or ``tmp_dir`` removed since
-    start-up.  That is the setup problem ``validate_settings_dirs`` reports at
-    start-up, so it is a ``ConfigError`` here too, not an UNKNOWN error the CLI
-    would call a saneless bug.  A full disk is the exception: an ``ENOSPC`` or
-    ``EDQUOT`` from any of the three steps, including creating ``tmp_dir``,
-    is a ``DiskSpaceError``, because nothing in the settings is wrong.
-    Only the workspace's creation is guarded: an ``OSError`` from the scan run
-    inside it keeps its own type.
+    Preparing it maps an ``OSError`` to a ``ConfigError`` naming
+    ``output.tmp_dir``, the setup problem start-up validation reports, except
+    ``ENOSPC`` or ``EDQUOT``, which is a ``DiskSpaceError``.  An ``OSError``
+    from the scan run inside the workspace keeps its own type.
 
     Args:
         tmp_dir: The configured directory for temporary files.
@@ -662,11 +530,9 @@ def _open_workspace(
     """
     with contextlib.ExitStack() as stack:
         try:
-            # Re-checked before every scan, not only at startup: a
-            # temp-directory sweep can remove tmp_dir while the server runs,
-            # and another local user can then create the name.  A refusal is a
-            # ConfigError, which is not an OSError, so it passes the handler
-            # below unwrapped.
+            # Re-checked before every scan: a temp-directory sweep can remove
+            # tmp_dir while the server runs, and another local user can then
+            # create the name.
             ensure_private_dir(tmp_dir, key="output.tmp_dir")
             _check_disk_space(tmp_dir, min_free_mb)
             workspace = JobWorkspace(
@@ -677,9 +543,8 @@ def _open_workspace(
             )
             stack.enter_context(workspace)
         except ConfigError as exc:
-            # Creating a missing tmp_dir is the private-directory helper's,
-            # and it reports every OSError as a ConfigError.  A full disk is
-            # still a full disk.
+            # The private-directory helper reports every OSError as a
+            # ConfigError; a full disk is still a full disk.
             if is_out_of_space(exc):
                 raise _workspace_out_of_space(tmp_dir, exc) from exc
             raise
@@ -699,17 +564,10 @@ def _open_workspace(
 
 def _workspace_out_of_space(tmp_dir: Path, exc: Exception) -> DiskSpaceError:
     """
-    Build the failure for a workspace the disk had no room for.
+    Build the ``DiskSpaceError`` for a workspace the disk had no room for.
 
-    Args:
-        tmp_dir: The configured directory for temporary files.
-        exc: What preparing the workspace raised: the ``OSError`` itself, or
-            the ``ConfigError`` raised from it.
-
-    Returns:
-        The ``DiskSpaceError`` to raise, naming ``tmp_dir`` and the
-        ``OSError``'s own reason.
-
+    ``exc`` is the ``OSError`` itself or the ``ConfigError`` raised from it; the
+    message names ``tmp_dir`` and the ``OSError``'s own reason.
     """
     cause = exc.__cause__ if isinstance(exc, ConfigError) else None
     reason = describe(cause if isinstance(cause, OSError) else exc)
@@ -719,25 +577,11 @@ def _workspace_out_of_space(tmp_dir: Path, exc: Exception) -> DiskSpaceError:
 
 def _require_pages(batch: ScanBatch) -> None:
     """
-    Raise ScanError if a scanner pass came back with no pages at all.
+    Raise ``ScanError`` if a scanner pass came back with no pages at all.
 
-    This is the pipeline's own contract check against any ``ScannerBackend``.
-    Without it an empty batch was misreported as "all pages
-    blank" with empty-page detection on, and leaked img2pdf's bare
-    ``ValueError`` with detection off or on an empty manual-duplex half.
-
-    It never pre-empts the backend's truthful feeder message: the SANE
-    backend raises its own, more specific ``FeederEmptyError`` for an empty
-    feeder, or an all-unreadable ``ScanError``, before it ever returns a
-    batch. What it guarantees is that ``_drop_blank_pages`` and
-    ``assemble_pdf`` never see an empty list.
-
-    Args:
-        batch: The batch one ``scan_pages`` call returned.
-
-    Raises:
-        ScanError: If the batch carries no pages.
-
+    The pipeline's own contract check against any ``ScannerBackend``, so
+    ``_drop_blank_pages`` and ``assemble_pdf`` never see an empty list.  The
+    SANE backend raises its more specific ``FeederEmptyError`` first.
     """
     if not batch.pages:
         msg = "No pages were scanned"
@@ -786,13 +630,10 @@ def _unlink_pages(records: Sequence[PageRecord]) -> None:
     """
     Delete the page files of a pass that was thrown away.
 
-    A thrown-away pass must leave no file behind: the guard, on a failure, and
-    the startup sweep, after a crash, both move every page file they find into
-    ``failed/``, so a leftover page would come back as a pass the operator
-    threw away.  A file already gone, or one that cannot be removed, does not
-    stop the rest from going; one that cannot be removed is logged with its
-    cause, so a page that later turns up in ``failed/`` can be traced back to
-    the pass it was thrown away with.
+    A thrown-away pass must leave no file behind: the guard and the startup
+    sweep move every page file they find into ``failed/``, so a leftover page
+    would come back as a pass the operator threw away.  A file that cannot be
+    removed is logged and does not stop the rest.
 
     Args:
         records: The pass's page records, whose files are removed.
@@ -814,18 +655,9 @@ class _SpoolLedger:
     """
     What each acquisition pass has spooled so far, for the preservation guard.
 
-    Mutable, and deliberately so. The run's guard reads it when a pass fails
-    part way, and a frozen record could only be built after the pass
-    returned, which is precisely the case where there is nothing to preserve.
-    The pass list stays behind methods, so a later step that has to discard a
-    pass can be given one here rather than reach into the list.
-
-    Each pass registers itself **before** it starts, so a fault part-way
-    through it still finds the sink that has been collecting its pages.
-
-    There is no resolution here: each spooled page's record carries the dpi
-    the device read back for it, so a pass interrupted before it returned a
-    batch is still preserved at the device's resolution, not the profile's.
+    Mutable because the guard reads it when a pass fails part way.  Each pass
+    registers itself **before** it starts, so a fault part-way through it still
+    finds the sink that has been collecting its pages.
 
     Attributes:
         passes: One ``(title suffix, sink)`` pair per acquisition pass, in
@@ -870,11 +702,9 @@ class _SpoolLedger:
         """
         Stop tracking a thrown-away pass, then delete its page files.
 
-        In that order, as ``_discard_last_pass`` does: a signal raises on the
-        main thread wherever it is, and landing in between it can then leave
-        at worst orphan files, never an entry the guard would try to keep
-        from pages that are already gone.  The files go through
-        ``_unlink_pages``, which says why none may be left behind.
+        In that order: a signal landing in between leaves at worst orphan
+        files, never an entry the guard would try to keep from pages that are
+        already gone.
 
         Args:
             sink: The sink the discarded pass spooled into.
@@ -887,9 +717,7 @@ class _SpoolLedger:
         """
         Return the passes that actually put pages on the spool.
 
-        An empty pass is dropped rather than preserved as a zero-page PDF:
-        ``assemble_pdf`` cannot build one, and a pass B that fed nothing is
-        exactly the case that is answered by keeping the fronts alone.
+        An empty pass is dropped: ``assemble_pdf`` cannot build a zero-page PDF.
 
         Returns:
             One ``(title suffix, records)`` pair per non-empty pass, in pass
@@ -916,10 +744,8 @@ def _drop_blank_pages(
     """
     Drop blank pages when the profile enables empty-page detection.
 
-    Records in, records out. The judgement is made from the ink coverage and
-    paper white each record already carries, measured once when the page was
-    spooled, against the profile's ``empty_page_coverage_threshold``; nothing
-    here re-opens a page file, and nothing here deletes or copies one.
+    Judged from the coverage each record already carries; nothing here opens,
+    deletes or copies a page file.
 
     Args:
         pages: The scanned page records, in document order.
@@ -930,11 +756,7 @@ def _drop_blank_pages(
         when detection is on, every record and no positions when it is off.
 
     Raises:
-        AllPagesBlankError: If every page of a non-empty batch was detected as
-            blank.  Its own type, not a ``ScanError``: the scanner did nothing
-            wrong, and the advice is to tune detection.  The input is never
-            empty: ``_require_pages`` has already refused an empty batch with
-            ``No pages were scanned``.
+        AllPagesBlankError: If every page was detected as blank.
 
     """
     if not profile.enable_empty_page_detection:
@@ -964,24 +786,9 @@ def _consume_dir_warning(destination: Path) -> str:
     """
     Describe what a consume-directory delivery cost the document.
 
-    A fallback is recorded in the FALLBACK state *with* a warning, because the
-    two halves carry different information: the state says
-    the document took the other route, and the warning says what that route
-    did not do.  ``docs/explanation/consume-directory-fallback.md`` documents
-    the same consequence -- paperless-ngx applies its own matching rules to a
-    file it finds in the consume directory, so the title, tags and
-    correspondent chosen for this scan are not applied to it.
-
-    Nothing was lost and no rescan is needed, so the register is deliberately
-    a warning rather than an error: the web UI renders it amber beside
-    "Saved to folder", not red beside "Failed".
-
-    Args:
-        destination: Where the PDF was written.
-
-    Returns:
-        The warning text recorded on the job and rendered in the status area.
-
+    The FALLBACK state says the document took the other route; this warning
+    says what that route did not do.  A warning, not an error: nothing was lost
+    and no rescan is needed.
     """
     return (
         f"Saved to the paperless-ngx consume directory at {destination} instead of "
@@ -1021,9 +828,6 @@ class _AcceptedPass:
 class _MultiPageDocument:
     """
     A multi-page document as it grows, pass by pass: the loop's mutable state.
-
-    Its own record rather than locals of the loop, so the pass loop's steps can
-    be separate methods and each stay within ruff's complexity limits.
 
     Attributes:
         records: Every accepted page, kept and skipped, in scan order.  The
@@ -1120,23 +924,8 @@ def _rejected_pages_warning(count: int) -> str | None:
     """
     Describe sheets the scanner could not read, and log them, if there were any.
 
-    Worded so it cannot be mistaken for blank-page removal. The pipeline's blank
-    count is empty-page detection, which the web UI shows users as pages
-    removed for being blank; a sheet that failed its integrity checks is a
-    different event with a different remedy, and the two must not be conflated.
-
-    This is the only channel the count has. ``pages_scanned`` is the length of
-    the pages that arrived, which already excludes a skipped sheet, so a
-    ten-sheet stack with one unreadable page reports nine and nobody learns a
-    page was lost. It logs as it builds, as the duplex-mismatch delivery
-    likewise logs the warning it gives.
-
-    Args:
-        count: How many sheets the backend skipped.
-
-    Returns:
-        The warning text, or None when nothing was rejected.
-
+    Worded so it cannot be mistaken for blank-page removal.  It is the count's
+    only channel: ``pages_scanned`` already excludes a skipped sheet.
     """
     if count <= 0:
         return None
@@ -1152,19 +941,9 @@ def _substitution_warning(requested: str | None) -> str | None:
     """
     Say that a flatbed request was scanned through the feeder, and log it.
 
-    The backend records the requested source only when the scanner's Auto
-    source stood in for it on the feeder path, so a substitution that stayed
-    on the glass reaches here as None and the job stays a plain success. The
-    name comes from the profile and was matched against the device's list, so
-    it is neutralised before it reaches a log line, the web UI or a terminal.
-
-    Args:
-        requested: The source the profile asked for, or None when nothing was
-            substituted on the feeder path.
-
-    Returns:
-        The warning text, or None when there was no such substitution.
-
+    ``requested`` is None when nothing was substituted.  The name was matched
+    against the device's list, so it is neutralised before it reaches a log
+    line, the web UI or a terminal.
     """
     if requested is None:
         return None
@@ -1177,17 +956,8 @@ def _pass_cap_warning(cap: PassCapReached | None, pages_kept: int) -> str | None
     """
     Say that a pass stopped at its per-pass cap, and log it, if one did.
 
-    The pages before the cap were kept and are delivered; the sheet past it
-    was fed and thrown away, so the warning names it for the operator to
-    resume from.
-
-    Args:
-        cap: The cap the pass reached, or None when it ended on its own.
-        pages_kept: How many pages the finished document holds.
-
-    Returns:
-        The warning text, or None when no cap was reached.
-
+    The warning names the sheet past the cap, which was fed and thrown away,
+    for the operator to resume from.
     """
     if cap is None:
         return None
@@ -1201,11 +971,6 @@ def _pass_cap_warning(cap: PassCapReached | None, pages_kept: int) -> str | None
 def _join_warnings(*parts: str | None) -> str | None:
     """
     Combine into the single field that carries them everything a run has to say.
-
-    ``ScanResult`` has one warning field and a run can have more than one thing
-    to report: a consume-directory fallback and an unreadable sheet are
-    independent events that can both happen. Letting either overwrite the other
-    would silently drop something the operator needed to know.
 
     Args:
         parts: The candidate warnings, any of which may be None.
@@ -1222,26 +987,16 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
     """
     Build the flip context for a manual-duplex run, refusing one with no coordinator.
 
-    Called only by ``run_pipeline``, only for a ``duplex = "manual"`` profile, and
-    before any scanner contact -- see the comment at the call site for why that
-    placement matters.
-
-    Args:
-        request: The pipeline request, which must carry a flip coordinator.
-        settings: Application settings, for
-            ``output.operator_wait_timeout_seconds``.
-
-    Returns:
-        The coordinator, narrowed to non-Optional, with the configured timeout.
+    Called before any scanner contact, so a request that cannot run never
+    touches the device.
 
     Raises:
         ConfigError: If the request carries no flip coordinator.
 
     """
     if request.flip_coordinator is None:
-        # Refusing is the only safe answer: with no coordinator, pass B would
-        # start the instant pass A ends and re-feed an empty tray.
-        # Starting anyway would turn a bad request into lost pages.
+        # With no coordinator, pass B would start the instant pass A ends and
+        # re-feed an empty tray.
         msg = (
             f"Profile '{request.profile_name}' is manual duplex, which needs a "
             "flip coordinator to tell saneless when the stack has been turned "
@@ -1261,11 +1016,8 @@ def _multi_page_context(
     """
     Build the context a multi-page run asks its questions with, or refuse it.
 
-    Called only by ``run_pipeline``, before any scanner contact, for the same
-    reason ``_flip_context`` is: a request that cannot run must never touch
-    the device.  The web form and the CLI refuse both combinations first;
-    this is the last line, so a request that reached the pipeline some other
-    way is refused just the same.
+    Called before any scanner contact, as ``_flip_context`` is.  The web form
+    and the CLI refuse both combinations first; this is the last line.
 
     Args:
         request: The pipeline request.
@@ -1322,11 +1074,8 @@ _RETRY_ANSWERS: Final = frozenset(
 )
 
 
-# The answers the prompt about a pass's blank pages offers: throw the whole
-# pass away and scan it again, or take it without the pages that look blank,
-# or with them.  Only those three: the question is about this pass alone, and
-# Finish and Abort are left to the next-pass prompt that follows a Skip or a
-# Keep.
+# The answers the prompt about a pass's blank pages offers.  The question is
+# about this pass alone, so Finish and Abort are left to the next-pass prompt.
 _BLANK_ANSWERS: Final = frozenset(
     {PassAnswer.RESCAN, PassAnswer.SKIP_BLANKS, PassAnswer.KEEP_BLANKS}
 )
@@ -1336,27 +1085,10 @@ def _returns_to_prompt(exc: Exception) -> bool:
     """
     Say whether a failed pass of a multi-page document is worth asking about.
 
-    True for ``ErrorCategory.SCANNER`` and ``ErrorCategory.FEEDER`` only, and
-    never for a ``SpoolError``.  A device fault or an empty feeder is one the
-    operator can put right -- clear a jam, close a cover, load the next sheet
-    -- and then try the pass again.  A full disk is a ``DiskSpaceError``,
-    filed as ``ErrorCategory.DISK_SPACE``, and a ``SpoolError`` is a spool
-    that could not be written or measured, raised as a ``ScanError``; either
-    way the same pass would fail the same way at once.  The other categories
-    -- configuration, disk space, assembly, upload, and anything
-    unclassified, a bug among them -- are not the scanner's, so trying the
-    pass again cannot help.
-
-    The caller also requires a page to be kept: with none there is nothing a
-    return to the prompt would protect, and the failure ends the job as a
-    single-pass failure does.
-
-    Args:
-        exc: What the pass raised.
-
-    Returns:
-        True if the run should go back to the operator instead of failing.
-
+    True only for ``ErrorCategory.SCANNER`` and ``ErrorCategory.FEEDER``,
+    faults the operator can put right before trying again.  Never for a
+    ``SpoolError``: it is filed as a scanner fault, but the same pass would
+    fail the same way at once.
     """
     category = classify_error(exc)
     returnable = category in {ErrorCategory.SCANNER, ErrorCategory.FEEDER}
@@ -1365,19 +1097,10 @@ def _returns_to_prompt(exc: Exception) -> bool:
 
 def _unoffered_answer(answer: PassAnswer, number: int) -> ScanError:
     """
-    Build the failure for a coordinator that answered off the prompt's menu.
+    Build the ``ScanError`` for a coordinator that answered off the prompt's menu.
 
-    A ``ScanError`` rather than obedience: the offered set is how a stale or
-    forged answer is refused, so an answer outside it is a broken coordinator,
-    and nobody chose it.  The guard keeps the accepted pages.
-
-    Args:
-        answer: What the coordinator answered.
-        number: The prompt it answered.
-
-    Returns:
-        The error to raise, naming the answer and the prompt.
-
+    The offered set is how a stale or forged answer is refused, so an answer
+    outside it is a broken coordinator, not the operator's choice.
     """
     msg = (
         f"The multi-page coordinator answered {answer.value} to prompt "
@@ -1395,9 +1118,7 @@ def _resolve_device(
     Resolve the scanner device ID from settings or auto-detection.
 
     An auto-detected device that differs from the one ``memory`` recorded is
-    logged at WARNING, naming both: the scan still runs, on the new device,
-    because refusing would stop a household scanning over a warning.  The
-    ids are logged with ``%r`` since discovery supplies them.
+    logged at WARNING, naming both, and the scan still runs on the new device.
 
     Args:
         scanner: Scanner backend instance.
@@ -1410,9 +1131,7 @@ def _resolve_device(
 
     Raises:
         NoScannerFoundError: If no device is configured and auto-detection
-            finds none.  An empty ``scanner.device`` is a valid setting that
-            asks for discovery, so finding nothing is a scanner condition, not
-            a configuration error.
+            finds none: a scanner condition, not a configuration error.
 
     """
     device_id = settings.scanner.device
