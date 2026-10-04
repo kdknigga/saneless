@@ -1646,7 +1646,7 @@ class _PipelineRun:
             raise ScanError(msg)
         back_pages = back_batch.pages
         logger.info("Pass B: scanned %d back page(s)", len(back_pages))
-        # The worker ignores this one: the run is a moment from its ScanResult,
+        # The worker ignores this one: the run is moments away from its ScanResult,
         # and replacing the front count would change the number on screen.
         _note_pass_count(self.request, SCAN_LABEL_BACK, len(back_pages))
 
