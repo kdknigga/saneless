@@ -1327,6 +1327,9 @@ class PageOutlet(Protocol):
         """
         Note the handle a start or read is in progress on, or None after it.
 
+        Once a call with None returns, no cancel of the handle by another
+        thread is still running, and none will start.
+
         Args:
             dev: The handle, or None once the call has returned.
 
@@ -1515,14 +1518,38 @@ def _snap_sheet(dev: SaneDevice) -> object:
         raise _SheetCallError(exc) from exc
 
 
+def _release_or_stop(dev: SaneDevice, outlet: PageOutlet) -> None:
+    """
+    Release the handle, and cancel the read ``start`` began if a cancel came.
+
+    Releasing waits for a cancel another thread is making on the handle and
+    keeps any later one off it, so this thread is then the only one to cancel
+    it, and a stage reported afterwards is never written while another thread
+    is inside a SANE call.
+
+    Raises:
+        PassStopped: A cancel has arrived; the read is cancelled.
+
+    """
+    outlet.reading(None)
+    if outlet.cancel_requested():
+        # python-sane raises _sane.error, RuntimeError or AttributeError with
+        # no shared base; a failed cancel leaves the read to the close that
+        # follows.
+        with contextlib.suppress(Exception):
+            dev.cancel()
+        raise PassStopped
+
+
 def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image:
     """
     Start and read one sheet, as python-sane's feeder iterator would.
 
-    A cancel can arrive before the handle is registered, or while ``start``
-    runs, when cancelling the handle does not stop the read ``start`` begins.
-    So the cancel is looked at again once the handle is registered, when no
-    sheet is started, and once ``start`` returns, when the read it began is
+    The handle is registered for a cancel only while ``start`` or ``snap``
+    runs.  A cancel can arrive while it is not, or while ``start`` runs, when
+    cancelling the handle does not stop the read ``start`` begins.  So the
+    cancel is looked at again each time the handle is registered or released:
+    before ``start`` no sheet is started, and after it the read it began is
     cancelled before anything waits on it.
 
     Raises:
@@ -1539,14 +1566,11 @@ def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image
         if outlet.cancel_requested():
             raise PassStopped
         _start_sheet(dev)
-        if outlet.cancel_requested():
-            # python-sane raises _sane.error, RuntimeError or AttributeError
-            # with no shared base; a failed cancel leaves the read to the
-            # close that follows.
-            with contextlib.suppress(Exception):
-                dev.cancel()
-            raise PassStopped
+        _release_or_stop(dev, outlet)
         outlet.stage(ScanStage.READ, number)
+        outlet.reading(dev)
+        if outlet.cancel_requested():
+            _release_or_stop(dev, outlet)
         image = _snap_sheet(dev)
     except Exception as exc:
         outlet.reading(None)

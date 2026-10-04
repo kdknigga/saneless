@@ -261,7 +261,10 @@ class _ReplyChannel:
     it writes from the thread that made it, the one that runs ``main`` and
     makes every SANE call; only that thread may set a signal's action.  No
     other thread writes: the control thread sends nothing, and the log
-    forwarder drops a record logged on any other thread.
+    forwarder drops a record logged on any other thread.  The control
+    thread's cancel can reset SIGPIPE too, but the main thread writes only
+    while no handle is registered for a cancel, so none runs between an
+    ignore and its write.
 
     Attributes:
         forward_logs: Whether saneless's log records are sent as frames.
@@ -518,7 +521,9 @@ class _Control:
         Note the handle a start or read is in progress on, or None after it.
 
         Under the same lock the cancel takes, so a cancel never reaches a
-        handle whose call has already returned.
+        handle whose call has already returned, and None waits for a cancel
+        already under way: the main thread may then cancel the handle or
+        write a reply, with no SANE call running on the control thread.
         """
         with self._handle_lock:
             self._handle = dev
