@@ -527,12 +527,14 @@ def _assemble_app(
         checks=checks_cache,
         refresher=refresher,
         templates=_build_templates(),
-        # The two routes that send a token-bearing request to paperless-ngx on
-        # every call get a rate floor.
+        # Both routes that send a token-bearing request to paperless-ngx on
+        # every call are floored: POST /api/cache/invalidate by one refetch
+        # floor per resource,
         invalidate_floors={
             "tags": MinimumInterval(),
             "correspondents": MinimumInterval(),
         },
+        # and GET /api/paperless/test by one shared, briefly reused answer.
         paperless_test_result=SingleFlightResult(
             ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=PAPERLESS_TEST_WAIT_SECONDS
         ),
