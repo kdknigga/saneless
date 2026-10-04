@@ -5,7 +5,8 @@ Every SANE call of a scan job runs in this file, in a child process saneless
 starts for the job, so a hang inside libsane costs only this process: saneless
 owns every deadline and kills and reaps a child that overruns one.  The child
 serves every pass of the job, holds no device between passes, and restarts
-SANE when asked.  See docs/explanation/decisions/ for the decision.
+SANE when asked.  See
+docs/explanation/decisions/0016-scan-sessions-in-a-child-process.md.
 
 saneless sends commands on stdin, one ASCII JSON line each, and the child
 answers with length-prefixed frames; ``scan_protocol`` holds both formats.

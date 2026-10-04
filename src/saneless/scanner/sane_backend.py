@@ -222,7 +222,8 @@ class SaneBackend(ScannerBackend):
     This process makes no python-sane call: a scan runs in a scan child, one
     per scan session, and listing, open checks and capability reads each run
     in a short-lived listing child.  A scan's child is reaped before the call
-    that started it returns or raises.
+    that started it returns or raises.  See
+    docs/explanation/decisions/0016-scan-sessions-in-a-child-process.md.
     """
 
     def __init__(self, host: str = "") -> None:

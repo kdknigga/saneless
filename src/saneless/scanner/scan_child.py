@@ -3,8 +3,8 @@ Drive a scan session that runs in a child process saneless can always stop.
 
 saneless makes no libsane call in its own process: every SANE call of a scan
 session runs in one child, and that child is reaped before the session ends
-and before any pass that had to stop it raises.  The decision and its
-alternatives are recorded under docs/explanation/decisions/.
+and before any pass that had to stop it raises.  See
+docs/explanation/decisions/0016-scan-sessions-in-a-child-process.md.
 
 The child is started the way every SANE child is (``child_launch``), so the
 device id travels in the ``scan`` command on its stdin, never in argv.  This

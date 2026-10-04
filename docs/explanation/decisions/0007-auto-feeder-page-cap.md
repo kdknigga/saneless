@@ -10,7 +10,7 @@ A feeder pass ends when the scanner reports that its feed is empty. A source sen
 
 ## Decision
 
-Every feeder pass is bounded by a page count per pass, not per job. A source named as a feeder is capped at 500 pages, sized to any plausible hopper. A source sent through the feeder that does not classify as a feeder is capped at 50 pages, which bounds a rescanned platen to minutes while still covering any plausible stack fed through Auto. Both are module constants, not settings. The free-space check on each page, not the cap, is what protects the disk.
+Every feeder pass is bounded by a page count per pass, not per job. A source named as a feeder is capped at 500 pages, sized to any plausible hopper. A source sent through the feeder that does not classify as a feeder is capped at 50 pages, which bounds a rescanned platen to minutes while still covering any plausible stack fed through Auto. Both are module constants, not settings, and the scan child applies them to each pass it runs. The free-space check on each page, not the cap, is what protects the disk.
 
 The invariant: no feeder pass can ask the scanner for pages forever.
 

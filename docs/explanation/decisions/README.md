@@ -17,3 +17,4 @@ These records hold choices a contributor could undo by mistake: each one looked 
 - [0013. Health-strip glyphs use text-presentation characters only](0013-text-presentation-glyphs.md)
 - [0014. The owner token is a guard, not a login](0014-owner-token-not-a-login.md)
 - [0015. Every dependency update waits seven days](0015-dependabot-cooldown.md)
+- [0016. Scan sessions run in a child process](0016-scan-sessions-in-a-child-process.md)
