@@ -512,6 +512,81 @@ def test_a_child_that_answers_the_cancel_is_not_killed(
     _assert_reaped(files.pid())
 
 
+class _ReapInterruptedOnce:
+    """A child whose first kill is interrupted between the kill and the reap."""
+
+    def __init__(self, child: ChildProcess) -> None:
+        """Wrap a started child."""
+        self._child = child
+        self._interrupted = False
+
+    @property
+    def pid(self) -> int:
+        """The child's process id."""
+        return self._child.pid
+
+    @property
+    def command_fd(self) -> int:
+        """The write end of the child's command channel."""
+        return self._child.command_fd
+
+    @property
+    def reply_fd(self) -> int:
+        """The read end of the child's reply channel."""
+        return self._child.reply_fd
+
+    def poll(self) -> int | None:
+        """Reap the child if it has exited."""
+        return self._child.poll()
+
+    def wait(self, timeout: float) -> int | None:
+        """Wait for the child to exit."""
+        return self._child.wait(timeout)
+
+    def kill_and_reap(self) -> int:
+        """
+        Kill the child; the first time, raise a Ctrl-C before it is reaped.
+
+        Raises:
+            KeyboardInterrupt: The first time, once the child is killed.
+
+        """
+        if not self._interrupted:
+            self._interrupted = True
+            os.killpg(self._child.pid, signal.SIGKILL)
+            raise KeyboardInterrupt
+        return self._child.kill_and_reap()
+
+    def close(self) -> None:
+        """Close both channels."""
+        self._child.close()
+
+
+def test_a_child_whose_kill_was_interrupted_is_still_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A Ctrl-C between the kill and the reap does not leave the child unreaped.
+
+    The session keeps the child until it is reaped, so ending it again on
+    the way out reaps it, and only then is the live Event cleared.
+    """
+    _shorten_deadlines(monkeypatch)
+    files = _stand_in(monkeypatch, tmp_path, SCAN_TEST_HANG_AT="open")
+    live = threading.Event()
+
+    def start() -> ChildProcess:
+        return _ReapInterruptedOnce(scan_child_mod.start_scan_child(""))
+
+    session = ScanChildSession(start, live=live)
+
+    with pytest.raises(KeyboardInterrupt):
+        session.scan_pass(_DEVICE, _SETTINGS, _RecordingSink(tmp_path))
+
+    _assert_reaped(files.pid())
+    assert not live.is_set()
+
+
 def test_a_crash_names_the_signal_stage_and_page(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

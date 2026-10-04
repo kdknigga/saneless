@@ -927,18 +927,24 @@ class ScanChildSession:
         self._in_sync = True
 
     def _end_child(self) -> None:
-        """Kill the child if it still runs, reap it and close its channels."""
+        """
+        Kill the child if it still runs, reap it and close its channels.
+
+        The child is forgotten only once it is reaped: an interrupt during the
+        kill or the reap leaves it in place, so the session's next end of the
+        child, or its close, kills and reaps it again.
+        """
         child = self._child
         if child is None:
             return
+        if child.poll() is None:
+            child.kill_and_reap()
+            self._killed += 1
         self._child = None
         self._poller = None
         try:
-            if child.poll() is None:
-                child.kill_and_reap()
-                self._killed += 1
-        finally:
             child.close()
+        finally:
             if self._live is not None:
                 self._live.clear()
 
