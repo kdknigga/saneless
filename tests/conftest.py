@@ -1063,20 +1063,35 @@ def end_seam_children(children: Sequence[SeamChild]) -> None:
     """
     End every child the seam started, and fail if one was never reaped.
 
+    Every child is killed even when an earlier one will not end, so none is
+    left running into later tests, and one failure names them all.
+
     Args:
         children: The children, in the order they started.
 
     Raises:
-        AssertionError: A child was never reaped by the code under test.
+        AssertionError: A child was never reaped by the code under test, or
+            did not end when it was killed.
 
     """
-    unreaped = [child for child in children if not child.reaped]
+    unreaped = sum(not child.reaped for child in children)
+    not_ended = 0
     for child in children:
-        child.kill_and_reap()
-        child.close()
+        try:
+            child.kill_and_reap()
+        except AssertionError:
+            not_ended += 1
+        finally:
+            child.close()
+    problems: list[str] = []
     if unreaped:
-        msg = f"{len(unreaped)} scan child(ren) never reaped by the code under test"
-        raise AssertionError(msg)
+        problems.append(
+            f"{unreaped} scan child(ren) never reaped by the code under test"
+        )
+    if not_ended:
+        problems.append(f"{not_ended} scan child(ren) did not end when killed")
+    if problems:
+        raise AssertionError("; ".join(problems))
 
 
 class ScanChildSeam:
