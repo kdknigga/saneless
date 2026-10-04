@@ -83,6 +83,7 @@ from saneless.paperless import (
 )
 from saneless.pipeline import PipelineEvent, PipelineRequest, ScanResult
 from saneless.scanner import sane_backend
+from saneless.scanner import scan_session as scan_session_mod
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -2113,7 +2114,7 @@ class TestDevicesCommand:
         # The device stores a name that is not one of its options on itself,
         # as python-sane does, so this shadows get_options for this device.
         monkeypatch.setattr(device, "get_options", with_unnamed)
-        monkeypatch.setattr(sane_backend, "sane", FakeSaneModule(device=device))
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=device))
         runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
         expected = [str(opt[1]) for opt in named]
 
@@ -2676,7 +2677,7 @@ _LIBSANE_MISSING = (
 
 def _block_sane_import(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``import sane`` raise ModuleNotFoundError, as with python-sane absent."""
-    monkeypatch.setattr(sane_backend, "sane", None)
+    monkeypatch.setattr(scan_session_mod, "sane", None)
     monkeypatch.setitem(sys.modules, "sane", None)
 
 
@@ -7224,7 +7225,7 @@ class TestEntryPointsCloseTheBackend:
         that never started SANE at all.
         """
         fake_sane = FakeSaneModule()
-        monkeypatch.setattr(sane_backend, "sane", fake_sane)
+        monkeypatch.setattr(scan_session_mod, "sane", fake_sane)
         runner, _ = _patch_cli(monkeypatch, scanner_cls=sane_backend.SaneBackend)
         initialised_when_built: list[bool] = []
 

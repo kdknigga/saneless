@@ -75,7 +75,7 @@ from saneless.paperless import (
     PaperlessClient,
 )
 from saneless.scanner import listing, saned_probe
-from saneless.scanner import sane_backend as sane_backend_mod
+from saneless.scanner import scan_session as scan_session_mod
 from saneless.scanner.base import DeviceInfo, DeviceSurvey
 from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import SaneBackend
@@ -7882,7 +7882,7 @@ class TestIsolatedListingWiring:
         ) -> tuple[CheckContext, _OpenCountingSaneModule, FakeSaneDev]:
             handle = FakeSaneDev()
             fake = _OpenCountingSaneModule(handle)
-            monkeypatch.setattr(sane_backend_mod, "sane", fake)
+            monkeypatch.setattr(scan_session_mod, "sane", fake)
             context = CheckContext(
                 settings=_with_device(_settings(tmp_path), device),
                 scanner=SaneBackend(),

@@ -30,7 +30,7 @@ import saneless.duplex as duplex_module
 import saneless.flip as flip_module
 import saneless.pipeline as pipeline_module
 import saneless.preservation as preservation_module
-import saneless.scanner.sane_backend as sane_backend_mod
+import saneless.scanner.scan_session as scan_session_mod
 from saneless.config import ProfileConfig
 from saneless.duplex import interleave_duplex
 from saneless.exceptions import (
@@ -2642,7 +2642,7 @@ def _manual_duplex_over_the_fake(
     dev = FakeSaneDev()
     dev.report_sources(["Flatbed", "Automatic Document Feeder"])
     dev.load_feeder([_sheet(colour) for colour in fronts])
-    monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+    monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
 
     def _reload_the_stack(event: PipelineEvent) -> None:
         """Put the flipped stack back when the pipeline asks for it."""
@@ -2721,7 +2721,7 @@ class TestManualDuplexOverTheSharedFake:
         fronts = [_make_content_image(c) for c in ["red", "green", "blue"]]
         backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
         dev.load_feeder(fronts)
-        monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
 
         def _reload_the_stack(event: PipelineEvent) -> None:
             """Put the flipped stack back when the pipeline asks for it."""
@@ -2854,7 +2854,7 @@ class TestManualDuplexOverTheSharedFake:
 
         dev = FakeSaneDev()
         dev.report_sources(["Flatbed", "Auto"])
-        monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
 
         events: list[PipelineEvent] = []
         request = PipelineRequest(
@@ -3312,7 +3312,7 @@ class TestFullDiskIsNotTheScanner:
         dev = FakeSaneDev()
         dev.report_sources(["Flatbed", "Automatic Document Feeder"])
         dev.load_feeder([_make_content_image(c) for c in ["red", "green", "blue"]])
-        monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
 
         real_disk_usage = shutil.disk_usage
         spool_measurements: list[Path] = []

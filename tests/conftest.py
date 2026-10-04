@@ -43,6 +43,7 @@ from saneless.paperless import ApiDelivery, PaperlessClient, PaperlessTiming, Ta
 from saneless.scanner import _listing_child
 from saneless.scanner import listing as listing_mod
 from saneless.scanner import sane_backend as sane_backend_mod
+from saneless.scanner import scan_session as scan_session_mod
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
 from saneless.scanner.listing import ListingReply
 from saneless.sigpipe import block_sigpipe
@@ -95,7 +96,7 @@ _XDG_BASES = (
 _REAL_LAUNCH_LISTING = sane_backend_mod.__dict__.get("_launch_listing")
 
 _NO_REAL_LIBSANE = (
-    "the default suite must not start real libsane: patch sane_backend.sane "
+    "the default suite must not start real libsane: patch scan_session.sane "
     "with a FakeSaneModule, or request real_listing_launcher with a stand-in "
     "child"
 )
@@ -734,7 +735,7 @@ def sane_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     by construction.
 
     ``monkeypatch`` is requested, and not used, purely for its ordering.  It is
-    the fixture every module patches ``sane_backend.sane`` through, and a
+    the fixture every module patches ``scan_session.sane`` through, and a
     fixture that requests it is torn down before its ``undo`` runs -- so the
     final reset still finds the fake in place rather than the real library that
     the undo restores.
@@ -778,7 +779,7 @@ def listing_seam(
     Run every scanner listing in this process, over the patched fake module.
 
     The backend lists scanners in a child process, and a child cannot see
-    ``monkeypatch.setattr(sane_backend, "sane", FakeSaneModule())``: it
+    ``monkeypatch.setattr(scan_session, "sane", FakeSaneModule())``: it
     imports the real python-sane and asks the real libsane.  Every test that
     drives a real ``SaneBackend`` over the fake -- directly, or through the
     app, the worker, the CLI or the health checks -- would otherwise start
@@ -788,7 +789,7 @@ def listing_seam(
     for the reason ``sane_process_state`` gives: a module that forgot would
     list through real libsane without anyone noticing.  The replacement runs
     the child's own ``respond()`` over whatever is patched into
-    ``sane_backend.sane``, and decodes the result with the launcher's own
+    ``scan_session.sane``, and decodes the result with the launcher's own
     decoder, so the child's logic and the reply schema are still what a test
     exercises.  With nothing patched it fails the test instead of listing.
 
@@ -817,7 +818,7 @@ def listing_seam(
     ) -> ListingReply:
         seam.calls.append((listing_request, configured_host))
         seam.aborts.append(abort)
-        module = sane_backend_mod.sane
+        module = scan_session_mod.sane
         if module is None:
             raise AssertionError(_NO_REAL_LIBSANE)
         reply = _listing_child.respond(

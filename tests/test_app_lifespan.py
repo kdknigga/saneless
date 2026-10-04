@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
 
 import saneless.scanner.sane_backend as sane_backend_mod
+import saneless.scanner.scan_session as scan_session_mod
 from saneless import worker as worker_module
 from saneless.config import (
     OutputConfig,
@@ -1719,7 +1720,7 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     fake = FakeSaneModule(
         devices=[("test:device:001", "TestVendor", "TestModel", "scanner")]
     )
-    monkeypatch.setattr(sane_backend_mod, "sane", fake)
+    monkeypatch.setattr(scan_session_mod, "sane", fake)
     # This process may have initialised SANE in an earlier test; the guard is
     # process-level by design, so the proof starts by re-arming it.
     sane_backend_mod.shutdown()

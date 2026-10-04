@@ -25,7 +25,10 @@ import saneless
 import saneless.cli as cli_module
 import saneless.scanner as scanner_pkg
 import saneless.scanner.base as scanner_base
+import saneless.scanner.options as options_mod
+import saneless.scanner.page_budget as page_budget_mod
 import saneless.scanner.sane_backend as sane_backend_mod
+import saneless.scanner.scan_session as scan_session_mod
 import saneless.web.app as app_module
 import saneless.web.server as server_module
 from saneless import checks
@@ -53,7 +56,8 @@ from saneless.scanner.base import (
 )
 from saneless.scanner.listing import ListingReply, ListingRequest
 from saneless.scanner.net_hosts import effective_sane_net_hosts
-from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
+from saneless.scanner.sane_backend import SaneBackend
+from saneless.scanner.scan_session import GeometryUnit
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import scan_page_description
@@ -82,6 +86,10 @@ if TYPE_CHECKING:
 
 # The backend module's own logger, for the tests that read what it reported.
 _BACKEND_LOGGER = "saneless.scanner.sane_backend"
+_SESSION_LOGGER = "saneless.scanner.scan_session"
+# The backend logs from two modules: its own, for SANE's lifecycle and the
+# per-page wait, and the device session's, for what is done with the device.
+_SCANNER_LOGGERS = frozenset({_BACKEND_LOGGER, _SESSION_LOGGER})
 
 
 @contextlib.contextmanager
@@ -453,7 +461,7 @@ def _join_sane_cancel_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
 # resolution the device chose and whether the scan area was set on the
 # device.  A test driving acquisition directly has none of those, and is not
 # about geometry: a "full" paper size never crops.
-_UNCROPPED = sane_backend_mod._PageFraming(
+_UNCROPPED = scan_session_mod._PageFraming(
     paper_size="full", resolution=300, geometry_set=True
 )
 
@@ -492,7 +500,7 @@ def second_pass_sink(tmp_path: Path) -> SpooledPageSink:
 @pytest.fixture
 def fake_sane_module(monkeypatch: pytest.MonkeyPatch) -> FakeSaneModule:
     """
-    Patch the one shared fake into sane_backend's module-level ``sane`` name.
+    Patch the one shared fake into scan_session's module-level ``sane`` name.
 
     ``_ensure_sane()`` returns whatever is patched into that name before it
     would import python-sane, which is the seam that makes the whole approach
@@ -510,7 +518,7 @@ def fake_sane_module(monkeypatch: pytest.MonkeyPatch) -> FakeSaneModule:
         device=device,
         devices=[(_TEST_DEVICE, "TestVendor", "TestModel", "scanner")],
     )
-    monkeypatch.setattr(sane_backend_mod, "sane", module)
+    monkeypatch.setattr(scan_session_mod, "sane", module)
     return module
 
 
@@ -715,7 +723,7 @@ def _backend_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     """
-    Collect the backend module's WARNING messages.
+    Collect the scanner backend's WARNING messages, from either module.
 
     Args:
         caplog: The capturing fixture, already set to WARNING for the module.
@@ -727,7 +735,7 @@ def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         record.getMessage()
         for record in caplog.records
-        if record.name == _BACKEND_LOGGER and record.levelno == logging.WARNING
+        if record.name in _SCANNER_LOGGERS and record.levelno == logging.WARNING
     ]
 
 
@@ -863,7 +871,7 @@ class TestSaneInitGuard:
     ) -> None:
         """A failed init records nothing, the environment included."""
         failing = FakeSaneModule(init_error=FakeSaneError("no SANE here"))
-        monkeypatch.setattr(sane_backend_mod, "sane", failing)
+        monkeypatch.setattr(scan_session_mod, "sane", failing)
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
 
         with pytest.raises(ScanError, match="Could not initialise SANE"):
@@ -936,13 +944,13 @@ class TestSaneInitGuard:
     ) -> None:
         """A failed init raises and leaves the guard unset, so a retry runs."""
         failing = FakeSaneModule(init_error=FakeSaneError("no SANE here"))
-        monkeypatch.setattr(sane_backend_mod, "sane", failing)
+        monkeypatch.setattr(scan_session_mod, "sane", failing)
         with pytest.raises(ScanError, match="Could not initialise SANE: no SANE here"):
             SaneBackend()
         assert failing.init_call_count == 1
 
         working = FakeSaneModule()
-        monkeypatch.setattr(sane_backend_mod, "sane", working)
+        monkeypatch.setattr(scan_session_mod, "sane", working)
         SaneBackend()
         assert working.init_call_count == 1
 
@@ -1247,7 +1255,7 @@ class TestTheMainProcessNeverLists:
         """An id the listing lacks is opened, cancelled and closed once."""
         device = FakeSaneDev()
         monkeypatch.setattr(
-            sane_backend_mod, "sane", FakeSaneModule(device=device, devices=[])
+            scan_session_mod, "sane", FakeSaneModule(device=device, devices=[])
         )
 
         survey = SaneBackend().list_and_open(_NET_DEVICE)
@@ -1261,7 +1269,7 @@ class TestTheMainProcessNeverLists:
     ) -> None:
         """The open's failure comes back as its class name, and no text."""
         monkeypatch.setattr(
-            sane_backend_mod,
+            scan_session_mod,
             "sane",
             FakeSaneModule(devices=[], open_error=FakeSaneError("Invalid argument")),
         )
@@ -1278,7 +1286,7 @@ class TestTheMainProcessNeverLists:
     ) -> None:
         """A listing that raised leaves no devices and its class name."""
         monkeypatch.setattr(
-            sane_backend_mod,
+            scan_session_mod,
             "sane",
             FakeSaneModule(get_devices_error=RuntimeError("boom")),
         )
@@ -1296,7 +1304,7 @@ class TestTheMainProcessNeverLists:
         """An id the listing already has is not opened at all."""
         device = FakeSaneDev()
         monkeypatch.setattr(
-            sane_backend_mod,
+            scan_session_mod,
             "sane",
             FakeSaneModule(
                 device=device, devices=[(_NET_DEVICE, "Vendor", "Model", "scanner")]
@@ -1418,7 +1426,7 @@ class TestTheMainProcessNeverLists:
         a control character in it is escaped before it reaches any sink.
         """
         monkeypatch.setattr(
-            sane_backend_mod,
+            scan_session_mod,
             "sane",
             FakeSaneModule(get_devices_error=FakeSaneError(message)),
         )
@@ -1462,7 +1470,7 @@ class TestTheMainProcessNeverLists:
     ) -> None:
         """The error carries the failure's class name, never the id or its text."""
         monkeypatch.setattr(
-            sane_backend_mod,
+            scan_session_mod,
             "sane",
             FakeSaneModule(
                 devices=[], open_error=FakeSaneError(f"cannot reach {_NET_DEVICE}")
@@ -1513,7 +1521,7 @@ class TestTheMainProcessNeverLists:
 
     def test_the_seam_refuses_to_start_real_libsane(self) -> None:
         """With no fake patched in, a listing fails the test instead of running."""
-        assert sane_backend_mod.sane is None
+        assert scan_session_mod.sane is None
 
         with pytest.raises(AssertionError, match="must not start real libsane"):
             sane_backend_mod._launch_listing(ListingRequest(), configured_host="")
@@ -1972,7 +1980,7 @@ def _backend_with(dev: FakeSaneDev, monkeypatch: pytest.MonkeyPatch) -> SaneBack
         A backend whose ``open()`` returns ``dev``.
 
     """
-    monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+    monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
     return SaneBackend()
 
 
@@ -2716,7 +2724,7 @@ class TestResolveSourceForManualDuplex:
         """The device's own first feeder is chosen, not a guessed name."""
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
 
-        choice = sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
+        choice = scan_session_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
 
         assert choice.effective == "Automatic Document Feeder"
         assert choice.has_option is True
@@ -2725,7 +2733,7 @@ class TestResolveSourceForManualDuplex:
         """An operator who picked one of two feeders gets that one."""
         raw = _options_reporting(["Flatbed", "ADF Front", "Automatic Document Feeder"])
 
-        choice = sane_backend_mod._resolve_source(
+        choice = scan_session_mod._resolve_source(
             raw, "Automatic Document Feeder", resolve_feeder=True
         )
 
@@ -2744,8 +2752,8 @@ class TestResolveSourceForManualDuplex:
         """
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            choice = sane_backend_mod._resolve_source(
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
+            choice = scan_session_mod._resolve_source(
                 raw, "ADF Duplex", resolve_feeder=True
             )
 
@@ -2753,8 +2761,7 @@ class TestResolveSourceForManualDuplex:
         warnings = [
             record.getMessage()
             for record in caplog.records
-            if record.name == "saneless.scanner.sane_backend"
-            and record.levelno == logging.WARNING
+            if record.name == _SESSION_LOGGER and record.levelno == logging.WARNING
         ]
         assert any(
             "'ADF Duplex'" in message and "'Automatic Document Feeder'" in message
@@ -2767,7 +2774,7 @@ class TestResolveSourceForManualDuplex:
         """The first *single-sided* feeder is chosen, not the first feeder."""
         raw = _options_reporting(["Flatbed", "ADF Duplex", "Automatic Document Feeder"])
 
-        choice = sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
+        choice = scan_session_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
 
         assert choice.effective == "Automatic Document Feeder"
 
@@ -2782,7 +2789,7 @@ class TestResolveSourceForManualDuplex:
         raw = _options_reporting(["Flatbed", "ADF Duplex"])
 
         with pytest.raises(ScanError, match="scans both sides") as excinfo:
-            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+            scan_session_mod._resolve_source(raw, "ADF", resolve_feeder=True)
 
         message = str(excinfo.value)
         assert 'duplex = "hardware"' in message
@@ -2792,7 +2799,7 @@ class TestResolveSourceForManualDuplex:
         """``source = "ADF"`` on a device that says "Automatic Document Feeder"."""
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder"])
 
-        choice = sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+        choice = scan_session_mod._resolve_source(raw, "ADF", resolve_feeder=True)
 
         assert choice.effective == "Automatic Document Feeder"
 
@@ -2801,7 +2808,7 @@ class TestResolveSourceForManualDuplex:
         raw = _options_reporting(["Flatbed"])
 
         with pytest.raises(ScanError, match="feeder") as excinfo:
-            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+            scan_session_mod._resolve_source(raw, "ADF", resolve_feeder=True)
 
         assert "['Flatbed']" in str(excinfo.value)
 
@@ -2815,7 +2822,7 @@ class TestResolveSourceForManualDuplex:
         raw = _options_reporting(["Flatbed", "Auto"])
 
         with pytest.raises(ScanError, match="feeder") as excinfo:
-            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+            scan_session_mod._resolve_source(raw, "ADF", resolve_feeder=True)
 
         assert "['Flatbed', 'Auto']" in str(excinfo.value)
 
@@ -2829,7 +2836,7 @@ class TestResolveSourceForManualDuplex:
         """
         raw = build_option_table(omit=("source",))
 
-        choice = sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+        choice = scan_session_mod._resolve_source(raw, "ADF", resolve_feeder=True)
 
         assert (choice.effective, choice.has_option) == ("ADF", False)
 
@@ -2837,7 +2844,7 @@ class TestResolveSourceForManualDuplex:
         """A ``source = "Manual Duplex"`` profile runs on a device with no source option."""
         raw = build_option_table(omit=("source",))
 
-        choice = sane_backend_mod._resolve_source(
+        choice = scan_session_mod._resolve_source(
             raw, "Manual Duplex", resolve_feeder=True
         )
 
@@ -2848,7 +2855,7 @@ class TestResolveSourceForManualDuplex:
         raw = build_option_table(omit=("source",))
 
         with pytest.raises(ScanError, match="exposes no source option") as excinfo:
-            sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
+            scan_session_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
 
         assert "'Flatbed'" in str(excinfo.value)
 
@@ -2861,7 +2868,7 @@ class TestResolveSourceForManualDuplex:
         """
         raw = [_option(1, "source", _STRING_OPTION, None)]
 
-        choice = sane_backend_mod._resolve_source(raw, " ADF ", resolve_feeder=True)
+        choice = scan_session_mod._resolve_source(raw, " ADF ", resolve_feeder=True)
 
         assert (choice.effective, choice.has_option) == ("ADF", True)
         assert choice.substituted_from is None
@@ -2887,7 +2894,7 @@ class TestResolveSourceForManualDuplex:
         raw = [_option(1, "source", _STRING_OPTION, None)]
 
         with pytest.raises(ScanError) as excinfo:
-            sane_backend_mod._resolve_source(raw, requested, resolve_feeder=True)
+            scan_session_mod._resolve_source(raw, requested, resolve_feeder=True)
 
         message = str(excinfo.value)
         assert "could not be read" in message
@@ -2905,7 +2912,7 @@ class TestResolveSourceForManualDuplex:
         raw = _options_reporting(["Flatbed", "Auto"])
 
         with pytest.raises(ScanError) as excinfo:
-            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=False)
+            scan_session_mod._resolve_source(raw, "ADF", resolve_feeder=False)
 
         message = str(excinfo.value)
         assert all(name in message for name in ("'ADF'", "'Flatbed'", "'Auto'"))
@@ -2915,7 +2922,7 @@ class TestResolveSourceForManualDuplex:
         raw = _options_reporting(["Flatbed"])
 
         with pytest.raises(ScanError) as excinfo:
-            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=False)
+            scan_session_mod._resolve_source(raw, "ADF", resolve_feeder=False)
 
         message = str(excinfo.value)
         assert "'ADF'" in message
@@ -2925,7 +2932,7 @@ class TestResolveSourceForManualDuplex:
         """Only manual duplex looks for a feeder; a simplex flatbed stays put."""
         raw = _options_reporting(["Flatbed", "Automatic Document Feeder"])
 
-        choice = sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=False)
+        choice = scan_session_mod._resolve_source(raw, "Flatbed", resolve_feeder=False)
 
         assert (choice.effective, choice.has_option) == ("Flatbed", True)
         assert choice.substituted_from is None
@@ -3380,7 +3387,7 @@ class TestSaneBackendCancelSequence:
             .parameters["budget"]
             .default
         )
-        assert budget.timeout == sane_backend_mod._PAGE_TIMEOUT_FLOOR_SECONDS
+        assert budget.timeout == page_budget_mod._PAGE_TIMEOUT_FLOOR_SECONDS
         assert budget.grace == sane_backend_mod._CANCEL_GRACE_SECONDS
         fake_device.block_read(ReadBlockMode.PARTIAL)
 
@@ -3657,7 +3664,7 @@ class TestSaneBackendCancelSequence:
                 sane_backend_mod._acquire_with_timeout(
                     dev,
                     fake_device.snap,
-                    sane_backend_mod._page_label(0),
+                    page_budget_mod._page_label(0),
                     sane_backend_mod._PageBudget(timeout=5.0, grace=grace),
                 )
             elapsed = time.monotonic() - began
@@ -3716,7 +3723,7 @@ class TestSaneBackendCancelSequence:
                 sane_backend_mod._acquire_with_timeout(
                     dev,
                     fake_device.snap,
-                    sane_backend_mod._page_label(0),
+                    page_budget_mod._page_label(0),
                     sane_backend_mod._PageBudget(timeout=1e300),
                 )
 
@@ -3768,7 +3775,7 @@ class TestSaneBackendCancelSequence:
                 sane_backend_mod._acquire_with_timeout(
                     dev,
                     fake_device.snap,
-                    sane_backend_mod._page_label(0),
+                    page_budget_mod._page_label(0),
                     sane_backend_mod._PageBudget(timeout=0.05),
                 )
 
@@ -4121,7 +4128,7 @@ class TestReinitialise:
     ) -> None:
         """A handle that never opened is never counted, so never blocks a job."""
         module = FakeSaneModule(open_error=FakeSaneError("Invalid argument"))
-        monkeypatch.setattr(sane_backend_mod, "sane", module)
+        monkeypatch.setattr(scan_session_mod, "sane", module)
         backend = SaneBackend()
 
         with contextlib.ExitStack() as stack, pytest.raises(ScanError):
@@ -4676,7 +4683,7 @@ class TestGeometryPresenceCheck:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         assert [m for m in _warning_messages(caplog) if "br-y" in m]
@@ -4701,7 +4708,7 @@ class TestGeometryPresenceCheck:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         assert [m for m in _warning_messages(caplog) if "can't be set by software" in m]
@@ -4769,7 +4776,7 @@ class TestGeometryUnit:
         fails here at runtime, as well as failing ``assert_never`` under both
         type checkers.
         """
-        scale = sane_backend_mod._units_per_mm(unit, 300, fallback="will crop")
+        scale = scan_session_mod._units_per_mm(unit, 300, fallback="will crop")
 
         if unit in _CONVERTIBLE_UNITS:
             assert scale is not None
@@ -4845,7 +4852,7 @@ class TestGeometryUnit:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         assert [m for m in _warning_messages(caplog) if unit.name in m]
@@ -4870,7 +4877,7 @@ class TestGeometryUnit:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         assert [m for m in _warning_messages(caplog) if "99" in m]
@@ -4891,7 +4898,7 @@ class TestNonPositiveGeometryScale:
     def test_a_sub_one_dpi_read_back_yields_a_zero_scale(self) -> None:
         """A read-back resolution below 1 dpi yields a scale factor of 0.0."""
         assert (
-            sane_backend_mod._units_per_mm(
+            scan_session_mod._units_per_mm(
                 GeometryUnit.UNIT_PIXEL, 0, fallback="will crop"
             )
             == 0.0
@@ -4901,13 +4908,13 @@ class TestNonPositiveGeometryScale:
         """A zero scale makes ``_set_geometry`` decline, so the crop runs."""
         dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
 
-        assert sane_backend_mod._set_geometry(dev, "a4", dev.get_options(), 0) is False
+        assert scan_session_mod._set_geometry(dev, "a4", dev.get_options(), 0) is False
 
     def test_no_zero_size_box_reaches_the_device(self) -> None:
         """No corner is assigned when the scale is zero."""
         dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
 
-        sane_backend_mod._set_geometry(dev, "a4", dev.get_options(), 0)
+        scan_session_mod._set_geometry(dev, "a4", dev.get_options(), 0)
 
         assert "br_x" not in dev.assignments
         assert "br_y" not in dev.assignments
@@ -4937,7 +4944,7 @@ class TestClampedScanArea:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         # The warning has to name what was asked for AND what was got, or the
@@ -4966,7 +4973,7 @@ class TestClampedScanArea:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         # br really was honoured -- only tl moved, which is what makes the far
@@ -4990,7 +4997,7 @@ class TestClampedScanArea:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         assert not [m for m in _warning_messages(caplog) if "clamped" in m.lower()]
@@ -5018,7 +5025,7 @@ class TestClampedScanArea:
             source="Flatbed", resolution=300, mode="Color", paper_size="letter"
         )
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         # The round trip really is inexact -- this is what makes the tolerance
@@ -5236,7 +5243,7 @@ class TestFeederPaperSize:
             auto_source_mode=auto_source_mode,
         )
 
-        with caplog.at_level(logging.INFO, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.INFO, logger=_SESSION_LOGGER):
             pages = backend.scan_pages("test:0", settings, page_sink).pages
 
         assert _paper_assignments(dev) == []
@@ -5313,14 +5320,14 @@ class TestFeederPaperSize:
         settings = ScanSettings(
             source="ADF", resolution=300, mode="Color", paper_size="a5"
         )
-        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+        caplog.set_level(logging.WARNING, logger=_SESSION_LOGGER)
 
         backend.scan_pages("test:0", settings, page_sink)
 
         messages = [
             record.getMessage()
             for record in caplog.records
-            if record.name == _BACKEND_LOGGER and "UNIT_DPI" in record.getMessage()
+            if record.name == _SESSION_LOGGER and "UNIT_DPI" in record.getMessage()
         ]
         assert messages
         assert all("will scan the full window" in message for message in messages)
@@ -5562,13 +5569,13 @@ def _backend_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
         caplog: The pytest log-capture fixture.
 
     Returns:
-        One string per WARNING record from the backend's logger.
+        One string per WARNING record from either of the backend's loggers.
 
     """
     return [
         record.getMessage()
         for record in caplog.records
-        if record.name == _BACKEND_LOGGER and record.levelno == logging.WARNING
+        if record.name in _SCANNER_LOGGERS and record.levelno == logging.WARNING
     ]
 
 
@@ -5693,7 +5700,7 @@ class TestAdfMode:
         """
         dev = FakeSaneDev(pages=1)
         dev.report_sources(["Flatbed", _ADF_SOURCE])
-        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+        caplog.set_level(logging.WARNING, logger=_SESSION_LOGGER)
 
         batch = self._scan(
             dev, monkeypatch, page_sink, source=_ADF_SOURCE, duplex="hardware"
@@ -5712,7 +5719,7 @@ class TestAdfMode:
         """A both-sides source name selects duplex by itself."""
         dev = FakeSaneDev(pages=2)
         dev.report_sources(["Flatbed", _ADF_SOURCE, "ADF Duplex"])
-        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+        caplog.set_level(logging.WARNING, logger=_SESSION_LOGGER)
 
         self._scan(dev, monkeypatch, page_sink, source="ADF Duplex", duplex="hardware")
 
@@ -5891,7 +5898,7 @@ class TestResolutionConstraintShapes:
         range of strings, so this guard against a malformed device is asserted
         at the function that does the hardening.
         """
-        found = sane_backend_mod._constraint(
+        found = options_mod._constraint(
             [_option(2, "resolution", _FIXED_OPTION, ("low", "high", "step"))],
             "resolution",
         )
@@ -5902,7 +5909,7 @@ class TestResolutionConstraintShapes:
 
     def test_a_short_option_tuple_is_skipped_without_raising(self) -> None:
         """An option too short to carry a constraint is ignored, never fatal."""
-        found = sane_backend_mod._constraint([(1, "resolution")], "resolution")
+        found = options_mod._constraint([(1, "resolution")], "resolution")
 
         assert found.present is False
 
@@ -6246,7 +6253,7 @@ _A4_1200_LINES = 14031
 
 def _parameters(
     frame_format: str, pixels_per_line: int, lines: int, bytes_per_line: int
-) -> sane_backend_mod._ScanParameters:
+) -> page_budget_mod._ScanParameters:
     """
     Build the parameters a device reports for an 8-bit frame.
 
@@ -6260,7 +6267,7 @@ def _parameters(
         The parameters.
 
     """
-    return sane_backend_mod._ScanParameters(
+    return page_budget_mod._ScanParameters(
         frame_format=frame_format,
         last_frame=True,
         pixels_per_line=pixels_per_line,
@@ -6329,12 +6336,12 @@ class TestPageBudget:
     )
     def test_the_budget_scales_with_the_negotiated_page(
         self,
-        parameters: sane_backend_mod._ScanParameters,
+        parameters: page_budget_mod._ScanParameters,
         resolution: int,
         expected: object,
     ) -> None:
         """Twice the page's share of a minute per A4 colour page at 600 dpi."""
-        assert sane_backend_mod._page_budget_seconds(parameters, resolution) == expected
+        assert page_budget_mod._page_budget_seconds(parameters, resolution) == expected
 
     def test_a_page_of_unknown_length_is_budgeted_as_legal_length(self) -> None:
         """
@@ -6346,11 +6353,11 @@ class TestPageBudget:
         unknown = _parameters("color", _A4_1200_WIDTH, -1, _A4_1200_WIDTH * 3)
         legal = _parameters("color", _A4_1200_WIDTH, 16800, _A4_1200_WIDTH * 3)
 
-        budget = sane_backend_mod._page_budget_seconds(unknown, 1200)
+        budget = page_budget_mod._page_budget_seconds(unknown, 1200)
 
         assert budget > 480
         assert budget == pytest.approx(
-            sane_backend_mod._page_budget_seconds(legal, 1200), rel=0.001
+            page_budget_mod._page_budget_seconds(legal, 1200), rel=0.001
         )
 
     @pytest.mark.parametrize(
@@ -6369,7 +6376,7 @@ class TestPageBudget:
         ],
     )
     def test_a_nonsense_frame_is_capped_at_an_hour(
-        self, parameters: sane_backend_mod._ScanParameters, resolution: int
+        self, parameters: page_budget_mod._ScanParameters, resolution: int
     ) -> None:
         """
         The device's numbers cannot make one page's limit unbounded.
@@ -6377,15 +6384,15 @@ class TestPageBudget:
         Uncapped, the first budget is months and the second is too large for
         ``threading.Event.wait`` to accept at all.
         """
-        budget = sane_backend_mod._page_budget_seconds(parameters, resolution)
+        budget = page_budget_mod._page_budget_seconds(parameters, resolution)
 
         assert budget == 3600.0
-        assert budget == sane_backend_mod._PAGE_TIMEOUT_CEILING_SECONDS
+        assert budget == page_budget_mod._PAGE_TIMEOUT_CEILING_SECONDS
         assert budget < threading.TIMEOUT_MAX
 
     def test_the_floor_is_two_minutes_with_no_setting(self) -> None:
         """The floor is two minutes, and a default budget uses it."""
-        assert sane_backend_mod._PAGE_TIMEOUT_FLOOR_SECONDS == 120.0
+        assert page_budget_mod._PAGE_TIMEOUT_FLOOR_SECONDS == 120.0
         assert sane_backend_mod._PageBudget().timeout == 120.0
         assert sane_backend_mod._PageBudget().page is None
 
@@ -6407,7 +6414,7 @@ class TestPageBudget:
         real = sane_backend_mod._acquire_with_timeout
 
         def spy(
-            dev: sane_backend_mod.SaneDevice,
+            dev: scan_session_mod.SaneDevice,
             work: Callable[[], object],
             page_label: str,
             budget: sane_backend_mod._PageBudget,
@@ -6474,7 +6481,7 @@ class TestPageBudget:
         once; the read still returns after the cancel, as a cooperative
         scanner's does, so only the limit is named, not a stuck read.
         """
-        monkeypatch.setattr(sane_backend_mod, "_PAGE_TIMEOUT_FLOOR_SECONDS", 0.05)
+        monkeypatch.setattr(page_budget_mod, "_PAGE_TIMEOUT_FLOOR_SECONDS", 0.05)
         dev = FakeSaneDev(pages=1)
         dev.set_parameters(
             frame_format="gray", pixels_per_line=236, lines=295, bytes_per_line=236
@@ -6510,7 +6517,7 @@ class TestSourceOptionPresence:
 
     def test_a_device_with_no_source_option_is_left_alone(self) -> None:
         """No source option means nothing to assign and nothing to validate."""
-        choice = sane_backend_mod._resolve_source([], "Flatbed")
+        choice = scan_session_mod._resolve_source([], "Flatbed")
 
         assert choice.has_option is False
         assert choice.effective == "Flatbed"
@@ -6532,7 +6539,7 @@ class TestSourceOptionPresence:
         device, and not assigning at all would scan from whatever source the
         device happened to be left on.
         """
-        choice = sane_backend_mod._resolve_source(
+        choice = scan_session_mod._resolve_source(
             [_option(1, "source", _STRING_OPTION, constraint)], " ADF "
         )
 
@@ -6563,14 +6570,14 @@ class TestAutoSourceFallbackIsAudible:
     def test_a_feeder_request_is_refused_rather_than_substituted(self) -> None:
         """'ADF Duplex' on a Flatbed-and-Auto device refuses, naming the sources."""
         with pytest.raises(ScanError) as excinfo:
-            sane_backend_mod._resolve_source(self._flatbed_and_auto(), "ADF Duplex")
+            scan_session_mod._resolve_source(self._flatbed_and_auto(), "ADF Duplex")
 
         message = str(excinfo.value)
         assert all(name in message for name in ("'ADF Duplex'", "'Flatbed'", "'Auto'"))
 
     def test_a_flatbed_request_is_still_substituted(self) -> None:
         """A flatbed request becomes the device's Auto, and the record says so."""
-        choice = sane_backend_mod._resolve_source(self._auto_and_adf(), "Flatbed")
+        choice = scan_session_mod._resolve_source(self._auto_and_adf(), "Flatbed")
 
         assert choice.effective == "Auto"
         assert choice.has_option is True
@@ -6589,7 +6596,7 @@ class TestAutoSourceFallbackIsAudible:
         raw = [_option(1, "source", _STRING_OPTION, ["Flatbed Scanner", "Auto", "ADF"])]
 
         with pytest.raises(ScanError) as excinfo:
-            sane_backend_mod._resolve_source(raw, "Flatbed")
+            scan_session_mod._resolve_source(raw, "Flatbed")
 
         message = str(excinfo.value)
         assert all(name in message for name in ("'Flatbed'", "'Flatbed Scanner'"))
@@ -6598,7 +6605,7 @@ class TestAutoSourceFallbackIsAudible:
         """Auto is recognised by the classifier, so a lowercase 'auto' is used."""
         raw = [_option(1, "source", _STRING_OPTION, ["auto", "ADF"])]
 
-        choice = sane_backend_mod._resolve_source(raw, "Flatbed")
+        choice = scan_session_mod._resolve_source(raw, "Flatbed")
 
         assert choice.effective == "auto"
         assert choice.substituted_from == "Flatbed"
@@ -6620,13 +6627,13 @@ class TestAutoSourceFallbackIsAudible:
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        with caplog.at_level(logging.INFO, logger=_BACKEND_LOGGER):
+        with caplog.at_level(logging.INFO, logger=_SESSION_LOGGER):
             backend.scan_pages(_TEST_DEVICE, settings, page_sink)
 
         assert [
             record
             for record in caplog.records
-            if record.name == _BACKEND_LOGGER
+            if record.name == _SESSION_LOGGER
             and record.levelno == logging.INFO
             and "'Flatbed'" in record.getMessage()
             and "'Auto'" in record.getMessage()
@@ -6741,7 +6748,7 @@ class TestSourceMatching:
         """The resolved name is the device's entry, not the request."""
         raw = _options_reporting(["Auto", "Flatbed", "ADF"])
 
-        choice = sane_backend_mod._resolve_source(raw, " adf")
+        choice = scan_session_mod._resolve_source(raw, " adf")
 
         assert choice.effective == "ADF"
         assert choice.substituted_from is None
@@ -6788,7 +6795,7 @@ class TestSourceMatching:
         """'adf' against 'ADF' and 'adf' is not ambiguous: it is listed exactly."""
         raw = _options_reporting(["Auto", "ADF", "adf"])
 
-        choice = sane_backend_mod._resolve_source(raw, "adf")
+        choice = scan_session_mod._resolve_source(raw, "adf")
 
         assert choice.effective == "adf"
 
@@ -6828,13 +6835,13 @@ class TestSourceMatching:
             source="Flatbed", resolution=300, mode="Color", auto_source_mode="flatbed"
         )
 
-        with caplog.at_level(logging.INFO, logger=_BACKEND_LOGGER):
+        with caplog.at_level(logging.INFO, logger=_SESSION_LOGGER):
             dev, batch = self._scan(["Auto", "ADF"], settings, monkeypatch, page_sink)
 
         assert dev.source == "Auto"
         assert len(batch.pages) == 1
         assert batch.substituted_source is None
-        backend_records = [r for r in caplog.records if r.name == _BACKEND_LOGGER]
+        backend_records = [r for r in caplog.records if r.name in _SCANNER_LOGGERS]
         assert [
             r
             for r in backend_records
@@ -6864,7 +6871,7 @@ class TestSourceMatching:
             source="Flatbed", resolution=300, mode="Color", auto_source_mode="adf"
         )
 
-        with caplog.at_level(logging.INFO, logger=_BACKEND_LOGGER):
+        with caplog.at_level(logging.INFO, logger=_SESSION_LOGGER):
             dev, batch = self._scan(["Auto", "ADF"], settings, monkeypatch, page_sink)
 
         assert dev.source == "Auto"
@@ -6979,7 +6986,7 @@ class TestResolutionReadBack:
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=5000, mode="Color")
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             backend.scan_pages("test:0", settings, page_sink)
 
         assert [m for m in self._warnings(caplog) if "5000" in m and "1200" in m]
@@ -6995,7 +7002,7 @@ class TestResolutionReadBack:
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=5000, mode="Color")
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             backend.scan_pages("test:0", settings, page_sink)
 
         warnings = self._warnings(caplog)
@@ -7014,7 +7021,7 @@ class TestResolutionReadBack:
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             backend.scan_pages("test:0", settings, page_sink)
 
         assert not [m for m in self._warnings(caplog) if "resolution" in m.lower()]
@@ -7406,7 +7413,7 @@ class TestSaneBoundary:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A missing python-sane is a one-line ConfigError with the install hint."""
-        monkeypatch.setattr(sane_backend_mod, "sane", None)
+        monkeypatch.setattr(scan_session_mod, "sane", None)
         monkeypatch.setitem(sys.modules, "sane", None)
 
         with pytest.raises(ConfigError) as exc_info:
@@ -7469,19 +7476,19 @@ class TestSaneBoundary:
     ) -> None:
         """With sane already bound, require_sane() returns and replaces nothing."""
         module = FakeSaneModule()
-        monkeypatch.setattr(sane_backend_mod, "sane", module)
+        monkeypatch.setattr(scan_session_mod, "sane", module)
 
         assert sane_backend_mod.require_sane() is None
-        assert sane_backend_mod.sane is module
+        assert scan_session_mod.sane is module
 
     def test_ensure_sane_returns_the_patched_module(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A module patched into ``sane`` is what every SANE call goes through."""
         module = FakeSaneModule()
-        monkeypatch.setattr(sane_backend_mod, "sane", module)
+        monkeypatch.setattr(scan_session_mod, "sane", module)
 
-        assert sane_backend_mod._ensure_sane() is module
+        assert scan_session_mod._ensure_sane() is module
 
     def test_ensure_sane_imports_on_every_call_without_binding(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7495,15 +7502,15 @@ class TestSaneBoundary:
         """
         first = FakeSaneModule()
         second = FakeSaneModule()
-        monkeypatch.setattr(sane_backend_mod, "sane", None)
+        monkeypatch.setattr(scan_session_mod, "sane", None)
         monkeypatch.setitem(sys.modules, "sane", first)
 
-        assert sane_backend_mod._ensure_sane() is first
-        assert sane_backend_mod.sane is None
+        assert scan_session_mod._ensure_sane() is first
+        assert scan_session_mod.sane is None
 
         monkeypatch.setitem(sys.modules, "sane", second)
 
-        assert sane_backend_mod._ensure_sane() is second
+        assert scan_session_mod._ensure_sane() is second
 
     def test_scanner_package_does_not_offer_the_backend(self) -> None:
         """
@@ -7530,12 +7537,16 @@ class TestSaneBoundary:
         monkeypatch.delitem(sys.modules, "sane", raising=False)
         monkeypatch.delitem(sys.modules, "_sane", raising=False)
         monkeypatch.delitem(sys.modules, sane_backend_mod.__name__)
+        monkeypatch.delitem(sys.modules, scan_session_mod.__name__)
         monkeypatch.setattr(scanner_pkg, "sane_backend", sane_backend_mod)
+        monkeypatch.setattr(scanner_pkg, "scan_session", scan_session_mod)
 
         fresh = importlib.import_module(sane_backend_mod.__name__)
+        fresh_session = sys.modules[scan_session_mod.__name__]
 
         assert fresh is not sane_backend_mod
-        assert fresh.sane is None
+        assert fresh_session is not scan_session_mod
+        assert fresh_session.sane is None
         assert "sane" not in sys.modules
 
     # -- init / open / get_devices / close ----------------------------------
@@ -7546,7 +7557,7 @@ class TestSaneBoundary:
         """A failing sane.init() is a ScanError chained to the SANE error."""
         original = FakeSaneError("Access to resource has been denied")
         monkeypatch.setattr(
-            sane_backend_mod, "sane", FakeSaneModule(init_error=original)
+            scan_session_mod, "sane", FakeSaneModule(init_error=original)
         )
 
         with pytest.raises(
@@ -7563,7 +7574,7 @@ class TestSaneBoundary:
         """sane.open() failing names the device and chains the original."""
         original = FakeSaneError("Invalid argument")
         monkeypatch.setattr(
-            sane_backend_mod, "sane", FakeSaneModule(open_error=original)
+            scan_session_mod, "sane", FakeSaneModule(open_error=original)
         )
         backend = SaneBackend()
 
@@ -7582,7 +7593,7 @@ class TestSaneBoundary:
         """The same translation applies on the scan path."""
         original = FakeSaneError("Invalid argument")
         monkeypatch.setattr(
-            sane_backend_mod, "sane", FakeSaneModule(open_error=original)
+            scan_session_mod, "sane", FakeSaneModule(open_error=original)
         )
         backend = SaneBackend()
 
@@ -7600,7 +7611,7 @@ class TestSaneBoundary:
     ) -> None:
         """An empty SANE message falls back to the exception's class name."""
         monkeypatch.setattr(
-            sane_backend_mod,
+            scan_session_mod,
             "sane",
             FakeSaneModule(open_error=FakeSaneError("")),
         )
@@ -7623,7 +7634,7 @@ class TestSaneBoundary:
         """
         original = FakeSaneError("Out of memory")
         monkeypatch.setattr(
-            sane_backend_mod, "sane", FakeSaneModule(get_devices_error=original)
+            scan_session_mod, "sane", FakeSaneModule(get_devices_error=original)
         )
         backend = SaneBackend()
 
@@ -7719,8 +7730,7 @@ class TestSaneBoundary:
         backend_warnings = [
             r
             for r in caplog.records
-            if r.name == "saneless.scanner.sane_backend"
-            and r.levelno >= logging.WARNING
+            if r.name in _SCANNER_LOGGERS and r.levelno >= logging.WARNING
         ]
         assert backend_warnings == []
         for record in caplog.records:
@@ -7943,7 +7953,7 @@ class TestDeviceIdsInScanErrorsAreNeutralised:
     ) -> None:
         """The open failure names the device with its controls escaped."""
         monkeypatch.setattr(
-            sane_backend_mod,
+            scan_session_mod,
             "sane",
             FakeSaneModule(open_error=FakeSaneError("Invalid argument")),
         )
