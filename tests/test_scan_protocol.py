@@ -341,6 +341,48 @@ _OFF_SCHEMA_FRAMES = [
         ),
         id="configured-float-for-int",
     ),
+    pytest.param(
+        _json(
+            {
+                "kind": "configured",
+                "resolution": 300,
+                "frame_format": "gray",
+                "last_frame": True,
+                "pixels_per_line": 10,
+                "lines": 10**400,
+                "depth": 8,
+                "bytes_per_line": 10**400,
+                "use_adf": False,
+            }
+        ),
+        id="configured-huge-ints",
+    ),
+    pytest.param(_page(number=2**31), id="page-number-past-sane-ints"),
+    pytest.param(_page(dpi=10**6), id="page-dpi-past-any-scanner"),
+    pytest.param(
+        _json(
+            {
+                "kind": "pass_done",
+                "resolution": 10**400,
+                "rejected": 0,
+                "substituted_source": None,
+                "cap": None,
+            }
+        ),
+        id="pass-done-huge-resolution",
+    ),
+    pytest.param(
+        _json(
+            {
+                "kind": "pass_done",
+                "resolution": 300,
+                "rejected": 0,
+                "substituted_source": None,
+                "cap": [2**31, 51, True],
+            }
+        ),
+        id="pass-done-huge-cap",
+    ),
 ]
 
 

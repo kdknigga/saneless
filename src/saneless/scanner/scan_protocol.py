@@ -16,8 +16,9 @@ them stay raw and be read in place with ``os.readv``.
 
 Nothing the child writes can run in saneless: the messages are JSON, never
 pickle, and every one is checked against its schema (exact keys, ints that
-are not bools, allowlisted modes, stages and log levels, a pixel count and a
-byte count that agree) before anything is allocated for a page.  A message
+are not bools and lie within SANE's 32-bit range, allowlisted modes, stages
+and log levels, a pixel count and a byte count that agree) before anything
+is allocated for a page.  A message
 off the schema is a ``ProtocolError``, which the caller treats as no answer.
 
 saneless receives each page into one buffer of exactly the announced size,
@@ -119,6 +120,13 @@ STAGES: Final = frozenset(
 # The standard logging levels, DEBUG to CRITICAL: the only ones a child's log
 # message may carry.
 LOG_LEVELS: Final = frozenset({10, 20, 30, 40, 50})
+
+# The largest int a message may carry: SANE's own ints are 32-bit, and with
+# every field at most this, nothing saneless works out from them overflows.
+_SANE_INT_MAX: Final = 2**31 - 1
+
+# The highest resolution a message may carry, in dpi: well above any scanner's.
+_MAX_RESOLUTION: Final = 100_000
 
 _LOGGER_ROOT: Final = "saneless"
 _OFF_SCHEMA: Final = "The scan child sent a message saneless does not understand"
@@ -537,17 +545,26 @@ def _fields(payload: dict[str, object], keys: frozenset[str]) -> dict[str, objec
     return payload
 
 
-def _int(value: object, minimum: int) -> int:
+def _int(value: object, minimum: int, maximum: int = _SANE_INT_MAX) -> int:
     """
-    Validate an int, not a bool, of at least ``minimum``.
+    Validate an int, not a bool, from ``minimum`` to ``maximum``.
 
     Raises:
         ProtocolError: ``value`` is anything else.
 
     """
-    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not minimum <= value <= maximum
+    ):
         raise ProtocolError(_OFF_SCHEMA)
     return value
+
+
+def _resolution(value: object) -> int:
+    """Validate a resolution in dpi, from 1 to ``_MAX_RESOLUTION``."""
+    return _int(value, 1, _MAX_RESOLUTION)
 
 
 def _optional_page(value: object) -> int | None:
@@ -629,7 +646,7 @@ def _decode_configured(payload: dict[str, object], _max_pixels: int) -> Configur
     """Validate a ``configured`` message; ``lines`` may be -1, for unknown."""
     _fields(payload, frozenset(field.name for field in fields(Configured)))
     return Configured(
-        resolution=_int(payload["resolution"], 1),
+        resolution=_resolution(payload["resolution"]),
         frame_format=_str(payload["frame_format"]),
         last_frame=_bool(payload["last_frame"]),
         pixels_per_line=_int(payload["pixels_per_line"], 0),
@@ -664,7 +681,7 @@ def _decode_page(payload: dict[str, object], max_pixels: int) -> PageHeader:
         mode=mode,
         width=width,
         height=height,
-        dpi=_int(payload["dpi"], 1),
+        dpi=_resolution(payload["dpi"]),
         nbytes=nbytes,
     )
 
@@ -688,7 +705,7 @@ def _decode_pass_done(payload: dict[str, object], _max_pixels: int) -> PassDone:
     """Validate a ``pass_done`` message."""
     _fields(payload, frozenset(field.name for field in fields(PassDone)))
     return PassDone(
-        resolution=_int(payload["resolution"], 1),
+        resolution=_resolution(payload["resolution"]),
         rejected=_int(payload["rejected"], 0),
         substituted_source=_optional_str(payload["substituted_source"]),
         cap=_cap(payload["cap"]),
