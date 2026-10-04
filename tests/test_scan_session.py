@@ -183,6 +183,7 @@ def test_a_feeder_pass_reports_stages_and_pages_in_order(
         (ScanStage.START, 3),
         (ScanStage.READ, 3),
         (ScanStage.START, 4),
+        (ScanStage.CANCEL, None),
         (ScanStage.CLOSE, None),
     ]
     assert outlet.configured_calls == [(300, True)]
@@ -618,6 +619,7 @@ def test_the_reading_handle_is_registered_around_each_read(
         "start 2",
         "reading",
         "reading done",
+        "cancel",
         "close",
     ]
     registered = [handle for handle in outlet.handles if handle is not None]

@@ -168,6 +168,9 @@ _CONTROL_THREAD_NAME: Final = "saneless-scan-control"
 _STDERR_FD: Final = 2
 """The descriptor the child inherits as saneless's stderr."""
 
+_CLEANUP_STAGES: Final = frozenset({ScanStage.CANCEL, ScanStage.CLOSE})
+"""The stages that end every pass; nothing in them raises."""
+
 _PAGE_STAGES: Final = frozenset({ScanStage.START, ScanStage.READ})
 """
 The stages saneless times against the page budget.
@@ -498,8 +501,8 @@ class _ChildOutlet:
 
     Attributes:
         error_stage: The stage a failure of the pass comes from: the last
-            stage entered before the device is closed, since closing never
-            raises.
+            stage entered before the device is cancelled and closed, since
+            neither raises.
         error_page: The page that stage concerns, if any.
         bad_command: Whether a page was answered with something other than
             ``spooled``, ``stop`` or ``cancel``.
@@ -536,7 +539,7 @@ class _ChildOutlet:
         """
         seconds = _READ_ALARM_SECONDS if stage in _PAGE_STAGES else _STAGE_ALARM_SECONDS
         self._runtime.arm_alarm(seconds)
-        if stage is not ScanStage.CLOSE:
+        if stage not in _CLEANUP_STAGES:
             self.error_stage = stage
             self.error_page = page
         self._reply.send(StageFrame(stage=stage.value, page=page))

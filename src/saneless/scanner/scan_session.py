@@ -1407,6 +1407,21 @@ def restart_library() -> object:
     return start_library()
 
 
+def _report_quietly(outlet: PageOutlet, stage: ScanStage) -> Exception | None:
+    """
+    Report a cleanup stage, keeping a failure to report it for later.
+
+    Returns:
+        What the outlet raised, or None.
+
+    """
+    try:
+        outlet.stage(stage, None)
+    except Exception as exc:
+        return exc
+    return None
+
+
 @contextlib.contextmanager
 def _opened(device_id: str, outlet: PageOutlet) -> Generator[SaneDevice]:
     """
@@ -1430,16 +1445,15 @@ def _opened(device_id: str, outlet: PageOutlet) -> Generator[SaneDevice]:
         yield dev
         failed = False
     finally:
-        # The outlet may fail to report the stage (saneless has gone, or a
-        # page was cut short); the device is cancelled and closed regardless,
-        # and that failure is raised only when the pass raised nothing else.
-        report_failure: Exception | None = None
-        try:
-            outlet.stage(ScanStage.CLOSE, None)
-        except Exception as exc:
-            report_failure = exc
+        # The outlet may fail to report a stage (saneless has gone, or a page
+        # was cut short); the device is cancelled and closed regardless, and
+        # that failure is raised only when the pass raised nothing else.
+        report_failure = _report_quietly(outlet, ScanStage.CANCEL)
         with contextlib.suppress(Exception):
             dev.cancel()
+        close_failure = _report_quietly(outlet, ScanStage.CLOSE)
+        if report_failure is None:
+            report_failure = close_failure
         try:
             dev.close()
         except Exception:

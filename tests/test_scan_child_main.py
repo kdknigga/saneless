@@ -409,7 +409,13 @@ def _feeder_pass_shape(pages: int) -> list[str]:
     shape = ["stage open", "stage configure", "configured"]
     for number in range(1, pages + 1):
         shape += [f"stage start {number}", f"stage read {number}", f"page {number}"]
-    return [*shape, f"stage start {pages + 1}", "stage close", "pass_done"]
+    return [
+        *shape,
+        f"stage start {pages + 1}",
+        "stage cancel",
+        "stage close",
+        "pass_done",
+    ]
 
 
 def test_a_feeder_pass_streams_every_page_and_exits_on_request(
@@ -473,7 +479,7 @@ def test_a_stop_answer_ends_the_pass_and_the_child(
 
     child.send(ControlOp.STOP)
 
-    assert _shape(child.frames_until(Bye)) == ["stage close", "bye"]
+    assert _shape(child.frames_until(Bye)) == ["stage cancel", "stage close", "bye"]
     assert child.join() == 0
     assert fake.device.calls.count("start") == 1
     assert fake.device.close_calls == 1
@@ -506,7 +512,7 @@ def test_a_cancel_mid_read_cancels_the_handle_from_the_control_thread(
 
     child.send(ControlOp.CANCEL)
 
-    assert _shape(child.frames_until(Bye)) == ["stage close", "bye"]
+    assert _shape(child.frames_until(Bye)) == ["stage cancel", "stage close", "bye"]
     assert child.join() == 0
     assert cancelled_on[0] == _CONTROL_THREAD
     assert fake.device.close_calls == 1
@@ -696,6 +702,7 @@ def test_the_alarm_is_armed_before_every_libsane_stage(
         _READ,  # read 2
         0,  # waiting for page 2's answer
         _READ,  # start 3: the end of the feed
+        _STAGE,  # cancel
         _STAGE,  # close
         0,  # pass done
         _STAGE,  # restart
