@@ -279,8 +279,10 @@ site.
 - `S101` bans `assert` in `src/`. Narrow an optional where the value is built, so the
   callee receives a record whose field is never `None`, or raise an explicit error.
 - `S608` matches `select ... from` anywhere in the literal text of an interpolated
-  string. A query assembled from fragments keeps each verb and nested `SELECT` in a
-  named constant of its own, and every value is a bound parameter.
+  string. SQL verbs are written plainly, never split into a constant to hide them from
+  the rule. Where every interpolated fragment is a module constant and every value is
+  a bound parameter, the module gets an `S608` entry under `per-file-ignores` that
+  says so, as `src/saneless/job.py` does.
 - `S603` accepts a subprocess argv only when it is written out as a literal at the
   call. Variable parts reach the child through its environment, not through the argv.
 - The `PTH` rules ask for the `pathlib` equivalent of an `os` or `open()` call; use it
