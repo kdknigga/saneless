@@ -66,6 +66,7 @@ _CHILD_PATH = Path(saneless.__file__).parent / "scanner" / "_scan_child.py"
 _DEVICE = "test:0"
 _REPLY_TIMEOUT_SECONDS = 10.0
 _JOIN_TIMEOUT_SECONDS = 10.0
+_REST_SLICE_SECONDS = 0.05
 _MAX_PIXELS = 1 << 30
 _CONTROL_THREAD = "saneless-scan-control"
 _STAGE = scan_child_main._STAGE_ALARM_SECONDS
@@ -277,6 +278,36 @@ class _ChildHarness:
         self._thread.join(_JOIN_TIMEOUT_SECONDS)
         assert not self._thread.is_alive(), "main did not return"
         return self._status[0]
+
+    def rest(self) -> bytes:
+        """
+        Read every byte the child writes until ``main`` has returned.
+
+        Returns:
+            The bytes, however they split into frames.
+
+        Raises:
+            AssertionError: Nothing arrived for a while and ``main`` had not
+                returned.
+
+        """
+        received = bytearray()
+        idle = 0
+        while True:
+            done = not self._thread.is_alive()
+            readable, _, _ = select.select(
+                [self._reply_read], [], [], 0 if done else _REST_SLICE_SECONDS
+            )
+            if readable:
+                received += os.read(self._reply_read, 1 << 20)
+                idle = 0
+            elif done:
+                return bytes(received)
+            else:
+                idle += 1
+                if idle * _REST_SLICE_SECONDS > _REPLY_TIMEOUT_SECONDS:
+                    msg = "main did not return"
+                    raise AssertionError(msg)
 
 
 @pytest.fixture
@@ -894,3 +925,101 @@ def test_settings_off_the_schema_end_the_child_before_any_open(
     assert child.join() == scan_child_main._BAD_COMMAND_STATUS
     assert fake.device.close_calls == 0
     assert fake.device.calls == []
+
+
+# The most pixel bytes one write may carry: a page goes out in strips of whole
+# rows of about this size, each written as soon as it is made.
+_STRIP_CEILING = 1 << 18
+
+# Longer than any frame header these tests receive, and shorter than a strip.
+_FRAME_CEILING = 1 << 10
+
+# The pages the strip tests send: taller than one strip, and of a height no
+# strip divides, so the last strip is short.
+_TALL_PAGES = {
+    "L": Image.linear_gradient("L").resize((1000, 700)),
+    "RGB": Image.merge(
+        "RGB",
+        [
+            Image.linear_gradient("L").resize((1000, 301)),
+            Image.linear_gradient("L").rotate(90).resize((1000, 301)),
+            Image.new("L", (1000, 301), 77),
+        ],
+    ),
+}
+
+
+@pytest.mark.parametrize("mode", sorted(_TALL_PAGES))
+def test_a_page_crosses_in_strips_that_rebuild_the_same_image(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: FakeSaneModule,
+    child: _ChildHarness,
+    mode: str,
+) -> None:
+    """
+    No write carries a whole page, and saneless still gets the page exactly.
+
+    The child makes and writes the pixels a strip at a time, so it encodes the
+    next strip while saneless reads the last; the strips add up to the bytes
+    ``tobytes()`` gives for the whole page, in order.
+    """
+    writes: list[int] = []
+    write = scan_child_main._ReplyChannel._write
+
+    def recording(reply: scan_child_main._ReplyChannel, data: bytes) -> None:
+        writes.append(len(data))
+        write(reply, data)
+
+    monkeypatch.setattr(scan_child_main._ReplyChannel, "_write", recording)
+    source = _TALL_PAGES[mode]
+    fake.device.load_feeder([source])
+    _ready(child)
+
+    child.send(_scan())
+    frames, pages = _spool_pass(child)
+    child.send(ControlOp.EXIT)
+
+    assert _shape(frames) == _feeder_pass_shape(1)
+    assert [(page.mode, page.size) for page in pages] == [(mode, source.size)]
+    assert pages[0].tobytes() == source.tobytes()
+    assert max(writes) <= _STRIP_CEILING
+    pixel_writes = [size for size in writes if size > _FRAME_CEILING]
+    assert sum(pixel_writes) == len(source.tobytes())
+    assert len(pixel_writes) > 1
+    assert child.join() == 0
+
+
+def test_a_page_cut_short_ends_the_channel_after_its_last_strip(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeSaneModule, child: _ChildHarness
+) -> None:
+    """
+    A strip that cannot be made leaves the page short, and nothing follows it.
+
+    The header and the strips already written cannot be taken back, so any
+    later frame would be read as pixels: the child sends nothing more, not
+    even the error, and ``main`` returns as for a channel that will not take
+    a write.  saneless then sees the channel close mid-page.
+    """
+    source = _TALL_PAGES["L"]
+    expected = source.tobytes()
+    made: list[int] = []
+    tobytes = Image.Image.tobytes
+
+    def failing(image: Image.Image, *args: str) -> bytes:
+        made.append(image.height)
+        if len(made) > 1:
+            raise MemoryError
+        return tobytes(image, *args)
+
+    monkeypatch.setattr(Image.Image, "tobytes", failing)
+    fake.device.load_feeder([source])
+    _ready(child)
+    child.send(_scan())
+    frames = [child.frame() for _ in range(6)]
+
+    rest = child.rest()
+
+    assert _shape(frames) == _feeder_pass_shape(1)[:6]
+    assert len(made) == 2
+    assert rest == expected[: made[0] * source.width]
+    assert child.join() == scan_child_main._PARENT_GONE_STATUS
