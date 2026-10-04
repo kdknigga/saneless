@@ -1478,8 +1478,6 @@ def _enumeration_from(
 
 def _check_scanner(context: CheckContext) -> CheckResult:
     """
-    Report whether a scanner is there to scan with.
-
     Report whether a scanner is there to scan with, without the scanner gate.
 
     The same three steps as ``_scanner_result``, which differs only in where
@@ -1505,14 +1503,9 @@ def _paperless_next_step(
     """
     Return what to do about one connection outcome.
 
-    The sentences are fixed user copy, and they pair with the messages
-    ``connection_status_message`` already owns -- this module authors the
-    remedy, never the diagnosis, so the two surfaces cannot disagree about
-    what happened even if they disagreed about what to do.
-
-    A redirect's next step never names where it pointed: that is upstream
-    text, and this row is shown on the LAN-visible status strip.  It says to
-    use ``https://`` only when the redirect changed nothing but the scheme.
+    This module authors the remedy; ``connection_status_message`` owns the
+    diagnosis.  A redirect's next step never names where it pointed, because
+    the row is LAN-visible.
 
     Args:
         status: The connection-test outcome.
@@ -1572,32 +1565,11 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     """
     Report whether scans can be filed, without spending thirty seconds on it.
 
-    The token is examined first and the probe is skipped entirely when it is a
-    placeholder: an unset token cannot succeed, so a request would only
-    tell paperless-ngx about it.  ``is_placeholder_token`` is the one predicate
-    ``doctor``, this check, the scan route and ``saneless scan`` share, so all
-    four agree on whether the appliance can upload.
-
-    An empty ``paperless.url`` is examined next and skips the probe too.  It
-    loads, so ``serve`` can start and show this row, but a request to it
-    fails inside httpx2 before anything is sent.  The probe would call that
-    MISCONFIGURED, which is true but names both settings; an address that
-    was never set gets its own, plainer row here.
-
-    A redirect's row names no address, because the strip is visible to
-    anyone on the LAN: only whether it was a plain switch to ``https://``
-    reaches the next step.  The sanitised target goes in ``terminal_detail``
-    instead, which ``saneless doctor`` prints and the strip never renders.
-
-    A ``None`` client means one could not be constructed, and
-    ``context.paperless_refusal`` says why.  ``PaperlessClient.__init__``
-    refuses a URL httpx2 will not parse or that carries a user name or
-    password, a token an HTTP header cannot carry, and a TLS trust store it
-    cannot read.  The first three are the configuration row that names
-    ``paperless.url`` and ``paperless.token``; the trust store is a row of its
-    own that names ``SSL_CERT_FILE`` and ``SSL_CERT_DIR``, because the settings
-    are not what is wrong.  A caller that does not say why keeps the "not
-    found at that URL" row.
+    A placeholder token or an empty ``paperless.url`` is reported without a
+    request, because neither can succeed; ``is_placeholder_token`` is the
+    predicate every surface shares.  A redirect's sanitised target goes only
+    in ``terminal_detail``.  A trust store that could not be read gets its own
+    row, because the settings are not what is wrong.
 
     Args:
         context: The injected dependencies and configuration.
@@ -1671,17 +1643,10 @@ def _check_profiles(context: CheckContext) -> CheckResult:
     """
     Report whether there are scan profiles and whether they will survive a restart.
 
-    Exactly one result comes out, and the precedence is fixed: no profiles at
-    all (red) beats a read-only config location (amber) beats no config file at
-    all (amber) beats a generated profile with no name (amber) beats the count.
-    The two amber rows are deliberately different sentences, because "saneless
-    has no file to save to" and "saneless has one and cannot write it" are
-    different facts and only the second is worth investigating.
-
-    The storage outcome is recorded by the worker rather than recomputed here.
-    A fresh ``os.access`` probe cannot substitute for it: the failure that
-    matters is a single-file bind mount, where the directory is writable and
-    only the rename fails.
+    No profiles is red; a read-only config location, no config file and an
+    unnamed generated profile are amber, in that order.  The storage outcome is
+    the worker's record, because ``os.access`` says yes on a single-file bind
+    mount where only the rename fails.
 
     Args:
         context: The injected dependencies and configuration.
@@ -1706,9 +1671,6 @@ def _check_profiles(context: CheckContext) -> CheckResult:
             return CheckResult(
                 key=CheckKey.PROFILES,
                 state=CheckState.WARN,
-                # One literal, deliberately over the 88-column guide (E501 is
-                # off in this project): the sentence is pinned word for word,
-                # and a grep for it has to find it on one line.
                 message="Generated in memory — the config location is read-only, so they are lost on restart.",
                 next_step=(
                     "Make the saneless config directory writable, "
@@ -1719,13 +1681,10 @@ def _check_profiles(context: CheckContext) -> CheckResult:
             return CheckResult(
                 key=CheckKey.PROFILES,
                 state=CheckState.WARN,
-                # One literal for the same reason as the sibling row above.
                 message="Generated in memory — no configuration file is in use, so they are lost on restart.",
                 next_step="Create a saneless config file so the profiles are saved.",
             )
         case ProfileStorage.PERSISTED:
-            # Saved to the config file and will survive a restart, so the only
-            # question left is whether they have names.
             pass
         case _:
             assert_never(context.profile_storage)
@@ -1751,14 +1710,9 @@ def _check_fallback(context: CheckContext) -> CheckResult:
     """
     Report whether a scan has somewhere to go when paperless-ngx is down.
 
-    An unset fallback folder is amber and never red.  The
-    appliance scans and files perfectly without one; what it cannot do is
-    survive paperless-ngx being down, and a red row for a deployment that works
-    is a row people learn to ignore.
-
-    The configured path is not in either sentence.  It is a host filesystem
-    path on a LAN-visible page, omitted for the same reason the log file's
-    path is.
+    An unset fallback folder is amber, because the appliance works without
+    one.  The configured path is never shown, because the page is
+    LAN-visible.
 
     Args:
         context: The injected dependencies and configuration.
@@ -1795,10 +1749,8 @@ def _check_fallback(context: CheckContext) -> CheckResult:
     )
 
 
-# The two settings the Data folder row judges, in the order it judges them.
-# The row names whichever is wrong by its key: a key is in the saneless config
-# file the reader will open, and a path would put a host filesystem path on a
-# LAN-visible page.
+# The Data folder row names a faulty setting by its key, never by its path,
+# because the page is LAN-visible.
 _DATA_DIR_KEY: Final = "output.data_dir"
 _TMP_DIR_KEY: Final = "output.tmp_dir"
 
@@ -1823,15 +1775,9 @@ def _folder_fault(path: Path) -> _FolderFault | None:
     """
     Judge a folder setting the way saneless will use it.
 
-    A folder that exists has to be a folder and take a write.  One that does
-    not exist yet is created when it is first needed, so it is judged by its
-    nearest existing ancestor, which is where creating it would fail: that has
-    to be a folder and take a write too.  Anything named by the setting -- a
-    file, or a dangling link -- counts as existing, because creating a folder
-    there would fail.
-
-    Args:
-        path: The configured folder.
+    A missing folder is created when first needed, so it is judged by its
+    nearest existing ancestor.  A file or a dangling link at the path counts
+    as existing, because creating a folder there would fail.
 
     Returns:
         None when saneless can use or create the folder, else what is wrong.
@@ -1858,9 +1804,8 @@ def _privacy_fault(path: Path) -> _FolderFault:
     """
     Say why ``check_private_dir`` refused a working folder, without its path.
 
-    The verdict is ``check_private_dir``'s, so the row refuses exactly what
-    start-up refuses.  Its message names the path, which the status strip must
-    not show, so the kind of problem is read back here for the row's words.
+    The verdict is ``check_private_dir``'s, so the row refuses what start-up
+    refuses, but its message names the path, so the problem is re-read here.
 
     Args:
         path: The working folder that was refused.
@@ -1896,17 +1841,8 @@ def _working_folder_fault(path: Path) -> _FolderFault | None:
     """
     Judge the working folder the way start-up does: private first, then usable.
 
-    An existing working folder must be a real folder this user owns that
-    nobody else can write to, because scans in progress are kept there.  A
-    missing one is created 0700 when it is first needed, so only where it
-    would be created is judged.
-
-    Args:
-        path: The configured working folder.
-
-    Returns:
-        None when saneless can use or create the folder, else what is wrong.
-
+    Scans in progress are kept there, so an existing one must be private; a
+    missing one is created 0700.
     """
     if os.path.lexists(path):
         try:
@@ -1975,27 +1911,9 @@ def _check_data_dir(context: CheckContext) -> CheckResult:
     """
     Report whether the data and working folders will work, as start-up asks.
 
-    Unlike the fallback folder these are not optional: the job store and the
-    preserved scans live in ``output.data_dir``, and every scan is built in
-    ``output.tmp_dir``.  Both are judged here, so the row asks the question
-    start-up asks and a fault in either is red:
-
-    - a folder that exists has to be a folder that takes a write;
-    - one that does not exist yet is fine when it can be created, judged by
-      its nearest existing ancestor, the way saneless will create it;
-    - an existing working folder must also be private, as
-      ``check_private_dir`` decides: not a symbolic link, owned by this user,
-      and not writable by anyone else.
-
-    The data folder is judged first, and the first setting that fails decides
-    the row, which names it by its key and never by its path.
-
-    Args:
-        context: The injected dependencies and configuration.
-
-    Returns:
-        Exactly one result for ``CheckKey.DATA_DIR``.
-
+    Unlike the fallback folder these are not optional, so a fault in either is
+    red.  The data folder is judged first, and the first faulty setting
+    decides the row.
     """
     output = context.settings.output
     data_fault = _folder_fault(output.data_dir)
@@ -2017,9 +1935,8 @@ def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
     """
     Run the one check a key names.
 
-    A total ``match`` rather than a dict of functions: a seventh ``CheckKey``
-    member stops this function type-checking until somebody decides what it
-    does, which a dict lookup with a fallback would not.
+    A total ``match`` rather than a dict, so a new ``CheckKey`` member stops
+    this type-checking until it has a check.
 
     Args:
         key: The check to run.
@@ -2056,27 +1973,11 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     """
     Run the scanner check, holding the worker's gate only around the listing.
 
-    This is the only check that takes the gate, because the device listing is
-    the only thing any check does inside libsane.  The preflight -- name
-    resolution and the saned handshake -- runs with the gate free, and a
-    preflight that settles the row never touches it.  The listing, and the
-    open of an unlisted configured device, run in the backend's listing child
-    inside one non-blocking hold, released in a ``finally`` only after the
-    child is reaped; the verdict runs after the release.  A gate already held
-    is reported as the neutral busy row, not waited on.
-
-    Holding the gate across resolution could park a scan whose job row already
-    reads ``SCANNING`` behind a broken resolver, waiting on it would queue the
-    probe behind a scan that runs for minutes, and releasing it while the child
-    is still inside libsane would let a scan in beside it.
-    ``test_a_gated_run_returns_what_an_ungated_run_returns`` holds this path to
-    the rows ``_check_scanner`` gives ``saneless doctor``.
-
+    The gate is tried without blocking, held only while the listing child
+    runs and released after it is reaped; a held gate gives the busy row.
+    Holding it across name resolution could park a scan behind a broken
+    resolver, and waiting on it would queue the probe behind a long scan.
     See docs/explanation/decisions/0003-scanner-gate-is-a-lock.md.
-
-    Args:
-        context: The injected dependencies and configuration.
-        scanner_gate: The worker's gate, tried without blocking.
 
     Returns:
         The scanner row, or the neutral busy row when the gate was not free.
@@ -2107,54 +2008,19 @@ def run_checks(
     Run every check once, in member order, and never raise.
 
     This is the function both surfaces call, and the tuple it returns is the
-    whole of what either of them may show.  It iterates ``CheckKey``, so
-    a check that exists for ``saneless doctor`` and not for the status strip is
-    not something either surface is able to express.
+    whole of what either of them may show.
 
-    ``skip_scanner`` is honoured here rather than inside the scanner check, and
-    it returns the paused row without entering the backend at all.  That is
-    correctness, not politeness: nothing in ``sane_backend.py`` mutually
-    excludes two SANE calls, so a status probe landing on the device mid-scan
-    is a second caller into the same C library while a read is outstanding,
-    which SANE does not allow.  It is honoured
-    *first*, before the gate is looked at: a caller that already knows a scan
-    is running has no reason to touch the gate at all.
+    ``skip_scanner`` is honoured first, before the gate, and never enters the
+    backend: SANE does not allow a second call into the library while a scan's
+    read is outstanding.  The gate is passed in, not held by the caller around
+    the whole run, so a scan start never waits on the Paperless check's HTTP
+    budget.
 
-    The gate is a parameter rather than something the caller holds around this
-    call, and that is deliberate.  Only ``_check_scanner`` enters
-    libsane.  ``_check_paperless`` carries a multi-second HTTP budget, and
-    ``_check_fallback`` and ``_check_data_dir`` each create and delete a real
-    file.  A caller that wrapped every check made the lock that exists to keep two
-    callers out of libsane into the lock a scan start waits on: ``ScanWorker``
-    would sit in ``with self._scanner_gate:`` with the job row already written
-    ``SCANNING`` while a health probe waited on a Paperless timeout.  Passing
-    the gate in lets the registry hold it for the one check that needs it.
-
-    The attempt on the gate is non-blocking and a failure produces the paused
-    row, which is the one move ``ScanWorker.scanner_gate`` documents as
-    permitted for a caller.  A blocking acquire would be wrong here for the
-    reason that docstring gives: the probe would queue behind a scan that can
-    run for minutes and then enter SANE with the freshness its own caller
-    assumed long gone.
-
-    A check that raises is caught and rendered as a red row with a
-    developer-constant message.  A registry that could raise would take the
-    whole strip down and with it the checks that passed, and the
-    exception text is exactly the thing that must not reach a LAN-visible page.
-    That handler covers the gated scanner branch too, and the gate is released
-    on the way out of it.
-
-    A caller that is stopping sets ``context.abort``.  The run then ends
-    before the next check, and a saned pre-probe or a scanner listing in
-    flight ends as aborted, which also ends the run there, so a stop never
-    waits out the Paperless check's budget after the scanner check was
-    stopped.  The Paperless probe itself is one HTTP request that cannot be
-    interrupted: a stop that lands during it waits for it, up to
-    ``saned_probe.PROBE_CONNECT_SECONDS`` plus
-    ``saned_probe.PROBE_READ_SECONDS``.  What is returned then is
-    only the rows of the checks that finished, which is the one case where
-    there is not one row per member: it exists only for a stopping caller,
-    and that caller stores none of it.
+    A check that raises becomes a red row with a developer-constant message,
+    because its exception text must not reach a LAN-visible page.  A set
+    ``context.abort`` ends the run before the next check, or as soon as an
+    in-flight probe or listing aborts; an in-flight Paperless request is not
+    interruptible.
 
     Args:
         context: The injected dependencies and configuration.
