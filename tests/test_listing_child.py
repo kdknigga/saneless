@@ -16,6 +16,7 @@ loading it pulls in no python-sane.
 from __future__ import annotations
 
 import ast
+import importlib
 import io
 import json
 import os
@@ -33,6 +34,7 @@ from tests.fake_sane import FakeSaneDev, FakeSaneModule
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from types import ModuleType
 
 _CHILD_PATH = Path(saneless.__file__).parent / "scanner" / "_listing_child.py"
 
@@ -54,15 +56,18 @@ _ALLOWED_IMPORTS = frozenset(
         "typing",
         "collections.abc",
         "saneless.scanner._child_stdio",
+        "saneless.thread_unwinder",
     }
 )
 
-# The saneless modules loading the child may pull in: the reply-pipe helper
-# and the two packages above it, whose ``__init__`` files import nothing.
+# The saneless modules loading the child may pull in: the reply-pipe helper,
+# the thread-unwinder loader, and the two packages above them, whose
+# ``__init__`` files import nothing.
 _SANELESS_MODULES_LOADED = [
     "saneless",
     "saneless.scanner",
     "saneless.scanner._child_stdio",
+    "saneless.thread_unwinder",
 ]
 
 
@@ -142,6 +147,241 @@ def test_respond_truth_table(
     fake = make_module()
 
     assert _listing_child.respond(request_line, fake) == expected
+
+
+# SANE option tuples: (index, name, title, desc, type, unit, size, cap,
+# constraint).  Only the name and the constraint cross to the parent.
+_OPTION_ZERO = (0, "", "Number of options", "", 1, 0, 4, 4, None)
+_GROUP_HEADING = (1, None, "Scan Mode", "", 5, 0, 0, 0, None)
+_MODE_OPTION = (2, "mode", "Scan mode", "", 3, 0, 6, 5, ["Gray", "Color"])
+_DEPTH_OPTION = (3, "depth", "Bit depth", "", 1, 0, 4, 5, [1, 8, 16])
+_RESOLUTION_OPTION = (4, "resolution", "Resolution", "", 2, 4, 4, 5, (1.0, 1200.0, 0.5))
+_PREVIEW_OPTION = (5, "preview", "Preview", "", 0, 0, 4, 5, None)
+
+
+class _OptionsDevice:
+    """A device handle that reports a fixed option table, and counts its closing."""
+
+    def __init__(
+        self,
+        options: list[tuple[object, ...]],
+        *,
+        options_error: Exception | None = None,
+        closing_error: Exception | None = None,
+    ) -> None:
+        """
+        Create the handle.
+
+        Args:
+            options: What ``get_options()`` returns.  Unlike ``FakeSaneDev``,
+                a name may be ``None``, as a group heading's is.
+            options_error: Raised by ``get_options()`` instead, when given.
+            closing_error: Raised by ``cancel()`` and ``close()``, when given,
+                after each has counted its call.
+
+        """
+        self.options = options
+        self.options_error = options_error
+        self.closing_error = closing_error
+        self.cancel_calls = 0
+        self.close_calls = 0
+
+    def get_options(self) -> list[tuple[object, ...]]:
+        """
+        Return the option table.
+
+        Returns:
+            The table the handle was made with.
+
+        Raises:
+            Exception: The configured ``options_error``.
+
+        """
+        if self.options_error is not None:
+            raise self.options_error
+        return list(self.options)
+
+    def cancel(self) -> None:
+        """
+        Count the call.
+
+        Raises:
+            Exception: The configured ``closing_error``.
+
+        """
+        self.cancel_calls += 1
+        if self.closing_error is not None:
+            raise self.closing_error
+
+    def close(self) -> None:
+        """
+        Count the call.
+
+        Raises:
+            Exception: The configured ``closing_error``.
+
+        """
+        self.close_calls += 1
+        if self.closing_error is not None:
+            raise self.closing_error
+
+
+class _OptionsModule:
+    """A ``sane`` stand-in whose ``open()`` returns one ``_OptionsDevice``."""
+
+    def __init__(
+        self, device: _OptionsDevice, *, open_error: Exception | None = None
+    ) -> None:
+        """
+        Create the module.
+
+        Args:
+            device: What every ``open()`` returns.
+            open_error: Raised by ``open()`` instead, when given.
+
+        """
+        self.device = device
+        self.open_error = open_error
+        self.opened: list[str] = []
+        self.get_devices_calls = 0
+
+    def get_devices(self) -> list[tuple[str, str, str, str]]:
+        """
+        Count the call and list one device.
+
+        Returns:
+            The one test device.
+
+        """
+        self.get_devices_calls += 1
+        return [_TEST_DEVICE]
+
+    def open(self, device_id: str) -> _OptionsDevice:
+        """
+        Record the id and open the device.
+
+        Returns:
+            The module's one device.
+
+        Raises:
+            Exception: The configured ``open_error``.
+
+        """
+        self.opened.append(device_id)
+        if self.open_error is not None:
+            raise self.open_error
+        return self.device
+
+
+def _capabilities_request(device_id: str = "test:0") -> dict[str, object]:
+    """
+    Build a capabilities request as the launcher sends it.
+
+    Returns:
+        The decoded request.
+
+    """
+    return {"open": None, "capabilities": device_id, "alarm": 0}
+
+
+@pytest.mark.parametrize(
+    ("option", "entry"),
+    [
+        pytest.param(
+            _MODE_OPTION, ["mode", "list", ["Gray", "Color"]], id="string-list"
+        ),
+        pytest.param(_DEPTH_OPTION, ["depth", "list", [1, 8, 16]], id="word-list"),
+        pytest.param(
+            _RESOLUTION_OPTION, ["resolution", "range", [1.0, 1200.0, 0.5]], id="range"
+        ),
+        pytest.param(_PREVIEW_OPTION, ["preview", "none", []], id="unconstrained"),
+        pytest.param(_OPTION_ZERO, ["", "none", []], id="option-zero"),
+        pytest.param(_GROUP_HEADING, [None, "none", []], id="group-heading"),
+    ],
+)
+def test_a_capabilities_request_reports_each_option(
+    option: tuple[object, ...], entry: list[object]
+) -> None:
+    """
+    Each option crosses as its name, its constraint's kind, and its values.
+
+    The device is opened by the requested id, cancelled and closed once, and
+    nothing is listed: a capabilities request is not a listing.  The JSON
+    round trip is the one the reply line makes.
+    """
+    device = _OptionsDevice([option])
+    module = _OptionsModule(device)
+
+    reply = _listing_child.respond(_capabilities_request(), module)
+
+    assert json.loads(json.dumps(reply)) == {"devices": [], "options": [entry]}
+    assert module.opened == ["test:0"]
+    assert module.get_devices_calls == 0
+    assert (device.cancel_calls, device.close_calls) == (1, 1)
+
+
+def test_a_capabilities_request_keeps_the_device_order() -> None:
+    """A whole table comes back entry for entry, in the device's order."""
+    table = [_OPTION_ZERO, _GROUP_HEADING, _MODE_OPTION, _RESOLUTION_OPTION]
+    module = _OptionsModule(_OptionsDevice(table))
+
+    reply = _listing_child.respond(_capabilities_request(), module)
+
+    assert reply["options"] == [
+        ["", "none", []],
+        [None, "none", []],
+        ["mode", "list", ["Gray", "Color"]],
+        ["resolution", "range", [1.0, 1200.0, 0.5]],
+    ]
+
+
+def test_a_capabilities_request_that_cannot_open_reports_open_error() -> None:
+    """An open that raises is reported, and no device is touched."""
+    device = _OptionsDevice([_MODE_OPTION])
+    module = _OptionsModule(device, open_error=_DeviceIOError(_IO_ERROR_MESSAGE))
+
+    reply = _listing_child.respond(_capabilities_request(_NET_DEVICE_ID), module)
+
+    assert reply == {
+        "devices": [],
+        "open_error": {"type": "_DeviceIOError", "message": _IO_ERROR_MESSAGE},
+    }
+    assert module.opened == [_NET_DEVICE_ID]
+    assert (device.cancel_calls, device.close_calls) == (0, 0)
+
+
+def test_a_capabilities_request_that_cannot_read_options_reports_options_error() -> (
+    None
+):
+    """A ``get_options()`` that raises is reported, and the device still closed."""
+    device = _OptionsDevice([], options_error=RuntimeError("no options"))
+    module = _OptionsModule(device)
+
+    reply = _listing_child.respond(_capabilities_request(), module)
+
+    assert reply == {
+        "devices": [],
+        "options_error": {"type": "RuntimeError", "message": "no options"},
+    }
+    assert (device.cancel_calls, device.close_calls) == (1, 1)
+
+
+def test_a_capabilities_request_swallows_a_failed_cancel_and_close() -> None:
+    """
+    The options already read are the answer, whatever closing does.
+
+    Both closing steps are still attempted when the first one raises.
+    """
+    device = _OptionsDevice([_MODE_OPTION], closing_error=RuntimeError("stuck"))
+    module = _OptionsModule(device)
+
+    reply = _listing_child.respond(_capabilities_request(), module)
+
+    assert reply == {
+        "devices": [],
+        "options": [["mode", "list", ["Gray", "Color"]]],
+    }
+    assert (device.cancel_calls, device.close_calls) == (1, 1)
 
 
 def test_respond_lists_once_and_never_initialises() -> None:
@@ -297,29 +537,115 @@ def test_main_arms_the_alarm_before_initialising_and_writes_one_line(
     assert json.loads(output) == {"devices": [list(_TEST_DEVICE)]}
 
 
-def test_main_reports_a_failed_init_as_both_listing_and_open_errors(
+_START_ERROR = {"type": "RuntimeError", "message": "SANE could not start"}
+
+
+@pytest.mark.parametrize(
+    ("request_line", "expected"),
+    [
+        pytest.param(
+            {"open": None, "alarm": 35},
+            {"devices": [], "list_error": _START_ERROR, "init_error": _START_ERROR},
+            id="listing",
+        ),
+        pytest.param(
+            {"open": _NET_DEVICE_ID, "alarm": 35},
+            {
+                "devices": [],
+                "list_error": _START_ERROR,
+                "opened": False,
+                "open_error": _START_ERROR,
+                "init_error": _START_ERROR,
+            },
+            id="listing-and-open",
+        ),
+        pytest.param(
+            {"open": None, "capabilities": "test:0", "alarm": 35},
+            {"devices": [], "init_error": _START_ERROR},
+            id="capabilities",
+        ),
+    ],
+)
+def test_main_reports_a_sane_that_will_not_start_as_init_error(
     monkeypatch: pytest.MonkeyPatch,
+    request_line: dict[str, object],
+    expected: dict[str, object],
 ) -> None:
-    """A SANE that cannot start fails the listing and the requested open alike."""
+    """
+    A SANE that cannot start is named as such, beside today's failure keys.
+
+    The parent can then tell a library that would not start from a listing
+    or an open that failed, and a listing request still fails its listing and
+    its open alike.
+    """
     events: list[str] = []
     fake = _OrderedFakeSane(events, init_error=RuntimeError("SANE could not start"))
 
     status, output = _run_main(
-        monkeypatch,
-        json.dumps({"open": _NET_DEVICE_ID, "alarm": 35}) + "\n",
-        fake,
-        events,
+        monkeypatch, json.dumps(request_line) + "\n", fake, events
     )
 
-    error = {"type": "RuntimeError", "message": "SANE could not start"}
     assert status == 0
-    assert json.loads(output) == {
-        "devices": [],
-        "list_error": error,
-        "opened": False,
-        "open_error": error,
-    }
+    assert json.loads(output) == expected
     assert fake.get_devices_call_count == 0
+
+
+def test_main_reports_a_missing_python_sane_as_init_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An interpreter without python-sane is a library that would not start.
+
+    A ``None`` in ``sys.modules`` makes the import raise as a missing module
+    does.  The alarm is replaced, as ``_run_main`` replaces it.
+    """
+    monkeypatch.setitem(sys.modules, "sane", None)
+    monkeypatch.setattr(_listing_child.signal, "alarm", lambda _seconds: 0)
+    reply_channel = io.StringIO()
+
+    status = _listing_child.main(
+        io.StringIO('{"open": null, "alarm": 35}\n'), reply_channel
+    )
+
+    reply = json.loads(reply_channel.getvalue())
+    assert status == 0
+    assert reply["init_error"]["type"] == "ModuleNotFoundError"
+    assert reply == {
+        "devices": [],
+        "list_error": reply["init_error"],
+        "init_error": reply["init_error"],
+    }
+
+
+def test_main_loads_the_unwinder_before_python_sane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The C library's thread unwinder is loaded before python-sane is imported.
+
+    A backend thread that is the first to end would otherwise be the one to
+    load it, and an asynchronous cancel there can leave the dynamic loader's
+    lock held.  The alarm still comes first, so the unwinder's own work is
+    under the deadline too.
+    """
+    events: list[str] = []
+    fake = _OrderedFakeSane(events, devices=[_TEST_DEVICE])
+    real_import = importlib.import_module
+
+    def record_unwinder() -> None:
+        events.append("unwinder")
+
+    def record_import(name: str, package: str | None = None) -> ModuleType:
+        events.append(f"import {name}")
+        return real_import(name, package)
+
+    monkeypatch.setattr(_listing_child, "load_thread_unwinder", record_unwinder)
+    monkeypatch.setattr(_listing_child.importlib, "import_module", record_import)
+
+    status, _ = _run_main(monkeypatch, '{"open": null, "alarm": 35}\n', fake, events)
+
+    assert status == 0
+    assert events == ["alarm 35", "unwinder", "import sane", "init"]
 
 
 def test_main_round_trips_a_lone_surrogate_through_stdout(
@@ -348,6 +674,14 @@ def test_main_round_trips_a_lone_surrogate_through_stdout(
         pytest.param('{"open": null, "alarm": true}\n', id="boolean-alarm"),
         pytest.param('{"open": null}\n', id="alarm-missing"),
         pytest.param("[]\n", id="not-an-object"),
+        pytest.param(
+            '{"open": null, "capabilities": 5, "alarm": 35}\n',
+            id="capabilities-not-a-string",
+        ),
+        pytest.param(
+            '{"open": null, "capabilities": "", "alarm": 35}\n',
+            id="capabilities-empty",
+        ),
         pytest.param("", id="empty-stdin"),
     ],
 )
