@@ -6,7 +6,7 @@ backend.  It takes one acquired page at a time, brings it to a mode it can
 store (or refuses it), checks there is room for it, writes it as a PNG under
 the job's workspace, measures it, and returns a ``PageRecord``.  Nothing here
 accumulates page images, so peak memory does not grow with page count.
-See docs/explanation/decisions/0006-per-page-pdf-and-qpdf-merge.md.
+See docs/explanation/decisions/0005-page-sink-contract.md.
 
 The spooled PNG *is* the PDF's page content, embedded losslessly by
 ``assemble_pdf`` with no second encode.  It is written at Pillow's default
