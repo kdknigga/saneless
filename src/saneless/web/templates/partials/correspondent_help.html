@@ -1,17 +1,5 @@
-{# The ONLY copy of the help line under the Correspondent select.  index.html
-   includes it in place, directly after the select, whose aria-describedby
-   names it.  Every response that re-renders the correspondent options -- the
-   options, the refresh, the profile change and the lazy list load -- carries
-   it again with oob = true, so the line always describes the list the select
-   now holds.
-
-   A select cannot hold a sentence, so this line is where the list says it
-   could not be loaded: the amber status-fallback line with the warning sign,
-   read by the select's aria-describedby.  It also holds the list's hidden
-   retry (see partials/list_retry.html), which adds nothing to what is read,
-   so the select asks again for as long as this line says it could not be
-   loaded.  While the list is still loading it says so; otherwise it is the
-   plain help sentence.  The copy comes from
-   vocabulary by name; this file composes no prose of its own beyond the help
-   sentence. #}
+{# The only copy of the Correspondent help line.  Every response that
+   re-renders the options carries it again out of band, so it always describes
+   the list the select now holds; a select cannot hold a sentence, so this is
+   where the list says it could not be loaded. #}
 <small id="correspondent-help"{% if oob %} hx-swap-oob="true"{% endif %}{% if correspondents_unavailable %} class="status-fallback"{% endif %}>{% if correspondents_unavailable %}&#9888; {{ CORRESPONDENTS_UNAVAILABLE }}{% with retry_resource = "correspondents", retry_seconds = correspondents_retry_seconds %}{% include "partials/list_retry.html" %}{% endwith %}{% elif correspondents_loading %}{{ CORRESPONDENTS_LOADING }}{% else %}Who sent this document? Optional.{% endif %}</small>

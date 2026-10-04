@@ -1,20 +1,10 @@
-{# The options alone, never the select: the refresh swaps them innerHTML, and
-   the select that holds them is the profile-change swap's own target.
-   selected_correspondent is the choice to show: the profile's default on a
-   page load or profile change, and the current choice on a refresh.
-   extra_option is that choice when the list does not name it, labelled stale
-   or unlisted by the context, and selected so an untouched submit carries
-   it.  With no choice nothing is marked, and the browser selects the first
-   option, which is the one that means none.  Names and labels stay
-   autoescaped; nothing here is marked safe. #}
+{# Options only: the refresh swaps them innerHTML into the select.
+   extra_option is the current choice when the list does not name it,
+   selected so an untouched submit carries it.  With no choice the browser
+   selects the first option, which means none. #}
 <option value="">No correspondent</option>
 {% if extra_option %}<option value="{{ extra_option.id }}" selected>{{ extra_option.label }}</option>{% endif %}
 {% for c in correspondents %}<option value="{{ c.id }}"{% if c.id == selected_correspondent %} selected{% endif %}>{{ c.name }}</option>{% endfor %}
-{# The help line under the select rides along out of band, so it follows the
-   options it describes: it says the list could not be loaded, or goes back to
-   the plain help sentence once it could.  Not when this file is included
-   inside the select (help_elsewhere): whoever renders the select renders the
-   line, and an element inside a select would not survive the parser.  Nor
-   for a hidden control, whose page has no help line to replace.  oob is
-   scoped to the include, so nothing else in this file reads it. #}
+{# Never when included inside the select (help_elsewhere): an element inside
+   a select does not survive the parser. #}
 {% if show_correspondent and not help_elsewhere %}{% with oob = true %}{% include "partials/correspondent_help.html" %}{% endwith %}{% endif %}

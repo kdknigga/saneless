@@ -1,19 +1,7 @@
-{# Why this disclosure is deliberately short.
-
-   ASVS 4.0.3 V7.4 forbids exception text, request input and the log path from ever
-   reaching this surface, so the HTTP status code, the id of the row a
-   refused submit wrote and, on a 421, the Host that was refused are the only
-   technical facts the slot is permitted to carry.  That Host arrives
-   neutralised and bounded, and is autoescaped here.  Saying that out loud is
-   better than a uniform affordance that sometimes lies about having detail.
-
-   The twelve slot messages are unchanged.  Each is already "the problem, then
-   what to do next" in one sentence pair, so the rule that every failure gives
-   a message plus a next step is met by the string itself; splitting a
-   locked, doc-pinned copy table would be churn with no reader benefit.
-
-   No alert role here: #status-message is itself the alert region, and a second
-   one inside it would announce the failure twice. #}
+{# Only the status code, a refused submit's job id and a 421's neutralised
+   Host may reach this slot: never exception text, request input or the log
+   path.  No alert role: #status-message is itself the alert region, and a
+   second one would announce the failure twice. #}
 <p class="status-error">&#10007; {{ message }}</p>
 <details class="tech-details">
   <summary>Technical details</summary>
@@ -26,11 +14,8 @@
   {%- endif %}
 </details>
 {% if refresh_history %}<div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>{% endif %}
-{# A refused Scan press hands focus back to the Scan button.  The press
-   disabled it for the request, which dropped focus to the page body, so the
-   button is re-rendered out-of-band, enabled and with autofocus: the press
-   came from an enabled button, and the next status rendering re-renders its
-   true state.  Focus never moves into this slot; the slot speaks the error
-   from where it is.  render_error decides when this applies, and never on a
-   blocked appliance, so scan_blocked = false below is the truth. #}
+{# A refused Scan press disabled the button and dropped focus to the body,
+   so the button comes back out of band, enabled and autofocused.
+   render_error never sets refocus_scan on a blocked appliance, so
+   scan_blocked = false is true here. #}
 {% if refocus_scan %}{% with oob = true, autofocus_scan = true, job = none, scan_blocked = false %}{% include "partials/scan_button.html" %}{% endwith %}{% endif %}

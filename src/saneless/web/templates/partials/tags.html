@@ -1,74 +1,23 @@
-{# The whole swap target, wrapper and all.  The swap moved from innerHTML on a
-   multi-select to outerHTML on this div, so the element that carries the id
-   and the class has to be rendered here: an outerHTML swap replaces the
-   target, and a partial that rendered only the rows would put them where the
-   wrapper was and lose both on the first refresh.
+{# This div is the whole outerHTML swap target, so the wrapper with its id and
+   class is rendered here: a partial of rows alone would lose both on the
+   first refresh.
 
-   Four row kinds, in this order, and every ticked id lands in exactly one:
-   1. Stale: ticked, but missing from a tag list that was read just now -- a
-      profile default deleted in paperless-ngx.  It stays ticked, labelled
-      with the note that says it will be skipped, so the untouched submit
-      still carries it and the finished job names the drop; unticking it is
-      how the operator clears both.
-   2. Unlisted: ticked while the tag list could not be read at all, or
-      missing from the last good copy served while it could not be read.  The
-      row is the bare id, with no note, because "no longer in paperless-ngx"
-      cannot be claimed without a current list; it stays ticked for the same
-      reason as a stale one.
-   3. Pinned: ticked and in the list, but excluded by the filter.  Pinned
-      above the list so a tick can never leave the DOM and therefore can
-      never be dropped from the next submit.
-   4. The filtered list.  A tag that is both ticked and matched is rendered
-      by this loop alone, so it appears once rather than twice.
-   The empty-state lines render only when there is no row of any kind, and
-   never when the list could not be loaded: then the amber unavailable line
-   comes first instead, and the ticked ids still follow as unlisted rows,
-   because "paperless-ngx has no tags" and "paperless-ngx could not be asked"
-   are different facts.  The unavailable line brings the list's hidden retry
-   with it (see partials/list_retry.html), so the list asks again for as long
-   as it is rendered unavailable.
+   Every ticked id lands in exactly one row: stale (ticked, missing from a list
+   read just now), unlisted (ticked while the list could not be read, so no
+   "no longer in paperless-ngx" note), pinned (ticked but filtered out, kept so
+   a tick never leaves the DOM and the next submit), then the filtered list.
+   The empty-state lines never render when the list is unavailable: "no tags"
+   and "could not ask" are different facts.
 
-   Every box turns autocomplete off: a browser that restores form state on
-   reload would otherwise re-tick or untick boxes over what the server
-   rendered, and the page's ticks are a profile's defaults.
+   autocomplete is off so a browser's form restore cannot change the ticks the
+   server rendered.  Each box's id comes from its tag id, so htmx can give
+   focus back after a swap the person did not cause.  The filter text is never
+   rendered back, and nothing here is marked safe.
 
-   Every box carries an id made from its tag id, unique because every id
-   lands in exactly one row.  htmx gives focus back after a swap only to an
-   element with the same id, and a list that fills in by itself once
-   paperless-ngx answers is swapped with no action of the person's: without
-   the id, someone on a row then would lose focus to the page.
-
-   The filter text itself appears nowhere in this file.  It is a filter, not a
-   label, and nothing the client typed is rendered back (ASVS 4.0.3 V5.3).  The tag
-   names are upstream text and the notes come from the context; both stay
-   autoescaped, and nothing here is marked safe.
-
-   The label is the tap target, not the box: app.css gives every row the full
-   width and a finger-sized height.
-
-   The wrapper carries one request of its own, the profile-change refresh,
-   and names its own hx-target and hx-swap so it never inherits the scan
-   form's status-area target.  The include is mandatory on a GET, and it
-   carries the profile alone: the response ticks that profile's defaults and
-   nothing else, replacing the earlier ticks on purpose, because the new
-   profile's defaults are what an untouched form now means.  The filter box,
-   the refresh button and the filter form each carry their own requests,
-   which do keep the ticks.
-
-   The profile-change response alone also carries the list's profile marker
-   out-of-band (see partials/profile_marker.html), so the marker names the new
-   profile in the same swap that ticks its defaults.  It comes first so the
-   wrapper stays the last element of the response.
-
-   The lazy list load (partials/metadata_response.html) sends the whole list
-   out-of-band, because its own swap target is the loader, so it sets
-   list_oob.  The name is not oob: the marker include above reads oob, and
-   the wrapper's flag must not decide the marker's.
-
-   The page itself asks paperless-ngx for nothing, so it renders the list
-   loading (tags_loading): the same wrapper with the same attributes, so a
-   profile change made before the lazy list load lands still refreshes it,
-   holding only the loading line.  The lazy list load replaces it whole. #}
+   The wrapper's own request, the profile-change refresh, includes only the
+   profile, so it replaces the ticks with that profile's defaults on purpose.
+   The marker comes first so the wrapper stays the response's last element.
+   list_oob is not named oob because the marker include reads oob. #}
 {% if follows_profile %}{% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = follows_profile, oob = true %}{% include "partials/profile_marker.html" %}{% endwith %}{% endif %}
 <div id="tags-list" class="tag-list"{% if list_oob %} hx-swap-oob="true"{% endif %}
      hx-get="/api/profiles/tags"

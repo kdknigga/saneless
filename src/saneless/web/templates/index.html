@@ -1,25 +1,11 @@
 {% extends "base.html" %}
-{# The tab's title follows the status area's state by the rule every status
-   response carries, so a reload and a poll never disagree about it. #}
 {% block title %}{{ page_title }}{% endblock %}
 {% block content %}
 
-{# --- Section 0: System status --- #}
-{# First in the block, for three reasons in this order:
-   1. The strip exists so a household member can tell AT A GLANCE whether
-      the appliance is healthy, and at a glance means first.
-   2. It is outside <form hx-post="/api/scan">, so the form's inherited
-      hx-disabled-elt cannot reach it.  No attribute is added to the
-      form element; the inheritance fix below stays exactly as written.
-   3. The error slot's invariant -- #status-message is the immediate sibling above
-      the status block -- is preserved untouched.
-   #checks-strip is silent: it is not a live region, and its rows stay reachable
-   by navigation.  A health list that spoke on its own would talk over the scan,
-   so the status area is the only thing on the page that speaks without a
-   user action: #status-live below is never swapped, and the #status-message
-   slot stays the one assertive region.  The profile description is a polite
-   region too, but it changes only when the operator picks a profile.  #checks-body is still
-   the swap target, and #checks-strip the container that survives every swap. #}
+{# Outside the scan form, so the form's inherited hx-disabled-elt cannot reach
+   it.  #checks-strip is deliberately not a live region: a health list that
+   spoke on its own would talk over the scan.  #checks-body is the swap target;
+   #checks-strip is the container that survives every swap. #}
 <article id="checks-card">
     <h2>System status</h2>
     <div id="checks-strip">
@@ -27,27 +13,13 @@
     </div>
 </article>
 
-{# --- Section 1: Scan Form --- #}
 <article>
     <h2>Scan</h2>
     <noscript><p class="status-fallback">&#9888; {{ no_script_line }}</p></noscript>
-    {# The line above is what a browser with JavaScript off reads first, ahead of
-       every control: Scan cannot work there, and saneless scan on the server
-       can.  It is the amber fallback line, because nothing has failed yet.
-
-       hx-disabled-elt replaces the deleted app script's beforeRequest handler:
-       the button is disabled for the round-trip, so there is no double submit.
-       hx-disinherit is mandatory: hx-disabled-elt is an inherited attribute, so
-       without it the tags/correspondent selects and refresh buttons inside this
-       form would each inherit it and disable the Scan button for the length of
-       their own round-trip -- greying it out every time a list refreshes.
-
-       method and action are for a browser with JavaScript off, which submits
-       the form by itself.  Without them it would GET the page with every field,
-       the title included, in the URL, where history and access logs keep it.
-       As a POST the fields stay in the body, and the server refuses that post
-       with a page saying why nothing started.  They are not htmx attributes and
-       nothing inherits them, so the inheritance fix is unchanged. #}
+    {# hx-disinherit is mandatory: hx-disabled-elt is inherited, so without it
+       every select and refresh button in this form would disable Scan for its
+       own round-trip.  method and action make a JavaScript-off submit a POST,
+       which keeps the title out of the URL. #}
     <form hx-post="/api/scan"
           method="post" action="/api/scan"
           hx-target="#status-area"
@@ -55,35 +27,12 @@
           hx-disabled-elt="#scan-btn"
           hx-disinherit="hx-disabled-elt">
 
-        {# Three things a reader will question, answered here.
-
-           1. The swap is innerHTML and never outerHTML. The help slot below
-              carries the id that aria-describedby points at, the polite live
-              region, and the adjacency to this control that gives it Pico's
-              muted help-text styling. Replacing the element breaks all three;
-              replacing only its text breaks none.
-           2. The option value stays the profile name. That is the wire
-              contract POST /api/scan already takes, so only the text a
-              household member reads is new. The human name falls back to the
-              name itself, because a config whose profiles predate the label
-              key carries none until auto-profiles --force is run.
-           3. This select issues its own GET, but it declares no
-              hx-disabled-elt of its own, and the form's existing
-              hx-disinherit="hx-disabled-elt" already covers the one the form
-              declares, so NO attribute is added to the form element above.
-              The inheritance fix stays exactly as written.
-
-           The slot doubles as this control's one line of help text;
-           there is deliberately no second one.
-
-           Turning autocomplete off matters more here than on any other
-           control.  The description, the Multiple pages field, the tag ticks
-           and the correspondent are all rendered for the profile this page
-           opens on, and the ones below it opt out of form-state restore.  A
-           browser that brought this select back to another profile on reload
-           or on Back would do so without firing change, so none of them would
-           follow it, and an untouched submit would name one profile with
-           another's metadata. #}
+        {# The description swap is innerHTML, never outerHTML: the slot's id (the
+           aria-describedby target), its live region and its adjacency to the
+           select must survive.  The option value is the profile name, the wire
+           contract POST /api/scan takes.  autocomplete is off because a browser
+           that restores another profile on reload or Back fires no change, so
+           the description, ticks and correspondent would stay on the old one. #}
         <label for="profile-select">Profile</label>
         <select name="profile" id="profile-select"
                 autocomplete="off"
@@ -98,72 +47,27 @@
         </select>
         <small id="profile-description" aria-live="polite">{{ selected_description }}</small>
 
-        {# Multiple pages sits directly under the profile, because the profile
-           decides whether it can be ticked.  The partial's wrapper names its
-           own hx-target and hx-swap, so it does not inherit this form's
-           status-area target, and no attribute is added to the form element:
-           the inheritance fix above stays exactly as written. #}
+        {# The partial names its own hx-target and hx-swap, so it does not inherit
+           this form's status-area target. #}
         {% include "partials/multi_page_field.html" %}
 
-        {# Every control below gets one line of help in plain words, each one an
-           adjacent <small> its control points at with aria-describedby: that
-           adjacency is both Pico's own help-text pattern and what makes a
-           screen reader announce the sentence with the control.
-           The placeholder and the help line deliberately say different things,
-           so neither is a restatement of the other.  Profile is not given one
-           here: its live description already is its help line, and a second
-           would be a second line under one control. #}
+        {# Each control's help is an adjacent <small> the control names in
+           aria-describedby, so a screen reader reads it with the control. #}
         <label for="title-input">Title</label>
         <input type="text" name="title" id="title-input" maxlength="{{ title_max_length }}"
                aria-describedby="title-help"
                placeholder="Document title (auto-generated if empty)">
         <small id="title-help">What this document should be called in paperless-ngx.</small>
 
-        {# The multi-select is gone: a checkbox list is one control
-           a thumb can actually hit, and the list is now a group of controls
-           rather than one, so it is a fieldset with a legend and no longer a
-           label pointing at a single element.  The wrapper the refresh targets
-           is rendered by the partial, because the swap is outerHTML and an
-           outerHTML swap replaces the element it is aimed at.  The refresh
-           carries the current filter and the current ticks with it for the same
-           reason the filter does: what the server re-renders has to include
-           what is already chosen, or refreshing would silently untick it.
-
-           The filter box names a different form than the one it sits inside.
-           An input with a form attribute is owned by the form it names, so the
-           filter text is never submitted with a scan and pressing Enter in it
-           filters the list instead of starting one.  The
-           debounce is htmx's own: an input that changed the value, delayed, so
-           a household member typing three letters makes one request and not
-           three.  input rather than keyup, because a paste, a dictation or an
-           autocorrection changes the value with no key at all; search as well,
-           because that is what the box's own clear button and Escape fire.  The
-           maxlength is the route's own bound on the filter, so the box never
-           sends a filter the route would refuse.  The include is mandatory on a
-           GET -- htmx does not gather the enclosing form for one -- and it is
-           what carries the current ticks to the server so the swap can
-           re-render them ticked.
-
-           The refresh button sits beside the legend and never inside it, and
-           the filter has a label of its own.  Everything inside a legend is
-           part of the name the group is announced by, so a button there made
-           the tags "Tags Refresh tags".  The label is visually hidden and says
-           what the placeholder says, so the spoken name and the visible hint
-           agree.  The stylesheet keeps the button on the legend's line.  The
-           button has an id so focus can be put back on it after a swap: its
-           own swap targets the list and never the button, so focus stays.
-
-           The whole block is behind a config key: one appliance, one
-           form shape, not a per-browser toggle a household member could switch
-           by accident.  The controls are ABSENT from the rendered page when it
-           is off, never present and hidden with a stylesheet -- what is not in
-           the markup cannot be re-shown in devtools, cannot be read by a screen
-           reader and cannot be tabbed into.  Turning the block off changes the
-           form and never the scan.  Shown, the list opens with the profile's
-           default tags ticked and follows every profile change, so an
-           untouched submit means the defaults and a cleared one means none;
-           hidden, the same defaults apply, exactly as a blank title already
-           falls back to the profile's title through resolve_job_title. #}
+        {# The filter input belongs to tag-filter-form through its form attribute,
+           so its text never rides with a scan and Enter filters instead of
+           scanning.  input plus search, not keyup: a paste or dictation changes
+           the value with no key, and the clear button fires search.  The
+           hx-include is needed on a GET, where htmx gathers no form, and carries
+           the current ticks so a filter or refresh never unticks anything.  The
+           refresh button sits beside the legend, never inside it: everything in
+           a legend is part of the group's name.  With the config key off the
+           block is absent from the markup, not hidden by CSS. #}
         {% if show_tags %}
         <fieldset aria-describedby="tags-help">
             <legend>Tags</legend>
@@ -187,29 +91,17 @@
             <small id="tag-filter-help">Type to narrow the list. Ticked tags stay ticked.</small>
 
             {% include "partials/tags.html" %}
-            {# Both markers on this page say the lists have not answered yet,
-               never the opening profile: until the lazy list load lands they
-               hold no ticks and no choice, and a Scan a status poll released
-               early must file the profile's defaults, not nothing.  The load's
-               first answer names the profile.  See the marker partial. #}
+            {# The markers name no profile until the lazy list load answers: until
+               then the lists hold no ticks, and a Scan released early must file
+               the profile's defaults, not nothing. #}
             {% with marker_id = "tags-profile", marker_name = "tags_profile", marker_profile = lists_loading_marker %}{% include "partials/profile_marker.html" %}{% endwith %}
         </fieldset>
         <small id="tags-help">Labels to file this under in paperless-ngx. Optional.</small>
         {% endif %}
 
-        {# The same rules as the Tags block above, for the same reasons:
-           absent rather than hidden; shown, it opens on the profile's default
-           correspondent and follows every profile change; hidden, that
-           default still applies.  The refresh carries the current choice with
-           it, as the tag refresh carries the ticks, so refreshing the list
-           never changes what is chosen.  The select is rendered by its
-           partial because it is the profile-change swap's own target.
-
-           The refresh button sits beside the label, inside a heading row, and
-           never inside the label: everything in a label is part of the name its
-           control is announced by, so a button there made the select
-           "Correspondent Refresh correspondents".  The row keeps the button on
-           the label's line, and the id lets focus be put back on it. #}
+        {# The refresh button sits beside the label, never inside it: everything
+           in a label is part of the select's name.  The refresh includes the
+           current choice, so refreshing never changes it. #}
         {% if show_correspondent %}
         <div class="field-heading">
             <label for="correspondent-select">Correspondent</label>
@@ -230,89 +122,31 @@
         {% endif %}
 
         {% include "partials/scan_button.html" %}
-        {# Why the button above is greyed out, as visible text in the reading
-           order directly after it.  Not a title tooltip, and not
-           aria-disabled, which appears on no element.  A
-           disabled button cannot be focused, so aria-describedby on it is
-           never announced on focus and a tooltip is unreachable by keyboard
-           and unreliable on touch; keeping the button focusable by swapping
-           the real disabled attribute for the ARIA one is forbidden, because
-           it would break the rule that the server alone decides the real
-           disabled state, and hx-disabled-elt with it.
-           It renders only when blocked, so it is never an out-of-band swap
-           target and never has to exist as an empty placeholder: the verdict
-           comes from Settings, which cannot change while the process runs.
-           The sentence is a developer constant from vocabulary.py; this
-           template composes no prose.  No attribute is added to the form
-           element above, so the inheritance fix stays exactly as written.
-           #}
+        {# Visible text directly after the button: a disabled button cannot be
+           focused, so aria-describedby or a tooltip on it is never announced.
+           Do not swap disabled for aria-disabled to keep it focusable; the
+           server alone decides the real disabled state. #}
         {% if scan_blocked %}<small id="scan-blocked-reason" class="status-error">{{ scan_blocked_reason }}</small>{% endif %}
-        {# Why the button is held while the lists load, by the same rule as the
-           blocked reason above: visible text in the reading order directly
-           after the button, because a disabled button can carry no tooltip.
-           Muted rather than red, since a short wait is not an error.  Unlike
-           the blocked reason it does not outlast the page: the lazy list load
-           empties it out of band, byte-empty so the stylesheet's :empty rule
-           hides it, once both lists have arrived or could not be loaded.  A
-           status poll can release the button before that, and the stylesheet
-           hides the line whenever the button after which it sits is enabled,
-           so it never describes a wait that is over.  A
-           blocked appliance renders only its own reason, which still holds
-           the button after the lists arrive.  The sentence comes from
-           vocabulary.py through the route; this template composes no prose,
-           and adds no attribute to the form element. #}
+        {# The lazy list load empties this out of band, byte-empty so the :empty
+           rule in app.css hides it.  app.css also hides it once the Scan button
+           before it is enabled, because a status poll can release Scan first. #}
         {% if lists_loading and not scan_blocked %}<small id="scan-hold-reason">{{ scan_hold_reason }}</small>{% endif %}
     </form>
 
-    {# The lazy list load's trigger: once the page has rendered, it asks
-       /api/metadata for both lists, naming the profile the select shows, and
-       the answer removes it and brings the lists, the profile markers, a
-       released Scan button and the emptied hold line out of band.  A list
-       that could not be loaded brings its own retry inside it.  The loader
-       renders only while a shown list is loading, which is every page with a
-       list on it.
-
-       Outside the scan form, like the filter form below, so it inherits
-       nothing from the form and the form's attribute list stays exactly as
-       written.  It asks again every 20 s until an answer lands: a first
-       request lost to htmx's own timeout, which leaves the element in place,
-       must not hold Scan for good.
-
-       It also asks again whenever Profile changes, and each request replaces
-       the one in flight (hx-sync this:replace aborts it).  Otherwise an
-       answer for the profile chosen before would land after the
-       profile-change swaps and put that profile's ticks, choice and markers
-       back under the new one: the form would show one profile's defaults
-       under another's name, and the markers would make the scan discard what
-       the person then adjusted. #}
+    {# Outside the scan form, so it inherits nothing from it.  every 20s
+       retries a first request lost to htmx's timeout, which leaves the element
+       in place and would otherwise hold Scan for good.  hx-sync this:replace
+       aborts the answer for the previous profile, which would otherwise land
+       after the profile-change swaps and restore that profile's ticks. #}
     {% if lists_loading %}
     <div id="metadata-loader" class="htmx-hidden" hx-get="/api/metadata" hx-include="#profile-select" hx-trigger="load, change from:#profile-select, every 20s" hx-sync="this:replace" hx-swap="outerHTML"></div>
     {% endif %}
 
-    {# How a list that could not be loaded fills in once it can.  Its hidden
-       retry (partials/list_retry.html) only asks whether the list can be
-       loaded now, and on yes fires the list's recovery event, heard here.
-       Each element then asks for its list again, carrying what the form
-       shows at that moment: the filter and the ticks, or the choice.  So
-       the answer keeps every tick and choice made while the retry was in
-       flight, and never names a profile.  A tick or choice made while this
-       request is itself in flight is not kept, as with the filter and the
-       refresh.  That flight is normally a cache read of the list the retry
-       has just fetched, and lands at once.  With the cache disabled
-       (paperless_cache_ttl_seconds = 0) nothing is read from the cache, so
-       this request fetches the list from paperless-ngx again and can be in
-       flight as long as any list fetch.
-
-       Each is synced with its list (hx-sync abort on the list's id), whose
-       only request of its own is the profile-change refresh.  A recovery
-       request asked while that refresh is in flight is dropped, and one in
-       flight when Profile changes is abandoned.  Otherwise the answer could
-       land first, take the refresh's swap target from under it, and leave
-       the list showing the profile chosen before under the new profile's
-       marker.  The refresh renders the list afresh, with a retry of its own
-       if it still could not be loaded, so a dropped recovery loses nothing.
-
-       Outside the scan form, like the loader, so they inherit nothing. #}
+    {# Fired by a list's hidden retry once the list can be loaded; each asks
+       again carrying the form's current filter, ticks or choice.  hx-sync abort
+       on the list's id drops a recovery while the profile-change refresh is in
+       flight: landing first, it would take that refresh's swap target and leave
+       the old profile's list under the new marker. #}
     {% if show_tags %}
     <div id="tags-recover" class="htmx-hidden" hx-get="/api/tags" hx-include="#tag-filter, #tags-list" hx-trigger="tags-recovered from:body" hx-target="#tags-list" hx-swap="outerHTML" hx-sync="#tags-list:abort"></div>
     {% endif %}
@@ -320,24 +154,9 @@
     <div id="correspondents-recover" class="htmx-hidden" hx-get="/api/correspondents" hx-include="#correspondent-select" hx-trigger="correspondents-recovered from:body" hx-target="#correspondent-select" hx-swap="innerHTML" hx-sync="#correspondent-select:abort"></div>
     {% endif %}
 
-    {# The filter box belongs to this form, not to the scan form.  An input with
-       a form attribute is owned by the form it names, so the filter text is
-       never submitted with a scan and pressing Enter in it filters the list
-       instead of starting one.  This form is empty and has no submit button;
-       htmx handles its submit event and sends the same request the debounced
-       input sends.
-
-       This is also the decisive advantage over the alternative: dropping
-       the filter field on the way out of the scan form with hx-params on the
-       form element.  That would mean adding an attribute to the scan form,
-       and htmx attributes are inherited, so every attribute added there has
-       to be added to the hx-disinherit list as well or every control inside
-       the form picks it up.  Nothing is added to the scan form element at
-       all, so the fix above stays exactly as written.
-
-       It goes with the fieldset above when the Tags block is off: a form whose
-       only member is an input that is no longer rendered has nothing left to
-       own. #}
+    {# The filter input's own form, so its text never rides with a scan.  Adding
+       hx-params to the scan form instead would be inherited by every control in
+       it unless hx-disinherit listed it too. #}
     {% if show_tags %}
     <form id="tag-filter-form" class="htmx-hidden"
           hx-get="/api/tags" hx-target="#tags-list" hx-swap="outerHTML"
@@ -345,23 +164,15 @@
     {% endif %}
 </article>
 
-{# --- Section 2: Request errors, then status --- #}
-{# #status-live is the polite region that speaks without a user action (the
-   profile description, the other polite region, changes only when a profile
-   is picked), and it is on the page before anything inside it changes: a
-   screen reader announces changes to a region it already knows about, not a
-   region that arrives with the change.  So it is
-   never a swap target and no response carries it; every status response swaps
-   #status-area inside it, and because an unchanged poll is answered 204, each
-   visible change is heard once.  role="status" already implies polite and
-   atomic, so neither is restated, and it carries no class: it is not styled.
-   #status-message stays its immediate previous sibling. #}
+{# #status-live is never a swap target: a screen reader announces changes to
+   a region already on the page, not one that arrives with the change.  Every
+   status response swaps #status-area inside it, and #status-message stays its
+   immediate previous sibling. #}
 <div id="status-message" role="alert"></div>
 <div id="status-live" role="status">
 {% include "partials/status.html" %}
 </div>
 
-{# --- Section 3: Job History --- #}
 <article>
     <h2>Job History</h2>
     <div class="history-table-wrap">
