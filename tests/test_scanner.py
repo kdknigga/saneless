@@ -11,12 +11,12 @@ import inspect
 import logging
 import operator
 import os
-import signal
 import subprocess
 import sys
 import threading
 import time
 import types
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, cast
 
@@ -58,13 +58,14 @@ from saneless.scanner.base import (
     classify_source,
 )
 from saneless.scanner.listing import ListingReply, ListingRequest
-from saneless.scanner.net_hosts import effective_sane_net_hosts
 from saneless.scanner.sane_backend import SaneBackend
+from saneless.scanner.scan_child import ScanChildSession
 from saneless.scanner.scan_session import GeometryUnit
 from saneless.spool import SpooledPageSink
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     PYTHON_SANE_INSTALL_NEXT_STEP,
+    ScanStage,
     python_sane_missing_message,
     scan_page_description,
 )
@@ -84,12 +85,14 @@ from tests.fake_sane import (
     ReadBlockMode,
     build_option_table,
 )
+from tests.test_scan_session import RecordingOutlet
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterator
-    from types import FrameType, ModuleType
+    from collections.abc import Callable
+    from types import ModuleType
 
-    from tests.conftest import ListingSeam
+    from saneless.scanner.scan_child import ChildProcess
+    from tests.conftest import ListingSeam, ScanChildSeam
 
 # The backend module's own logger, for the tests that read what it reported.
 _BACKEND_LOGGER = "saneless.scanner.sane_backend"
@@ -97,34 +100,6 @@ _SESSION_LOGGER = "saneless.scanner.scan_session"
 # The backend logs from two modules: its own, for SANE's lifecycle and the
 # per-page wait, and the device session's, for what is done with the device.
 _SCANNER_LOGGERS = frozenset({_BACKEND_LOGGER, _SESSION_LOGGER})
-
-
-@contextlib.contextmanager
-def _signal_raises_scan_interrupted(signum: int) -> Generator[None]:
-    """
-    Make ``signum`` raise ``ScanInterrupted`` for the block, then restore it.
-
-    The stand-in for the handler a one-shot command installs for SIGTERM and
-    SIGHUP.  The previous handler is put back in a ``finally``, because a
-    raising SIGTERM handler left behind would outlive this test.
-
-    Args:
-        signum: The signal to handle.
-
-    Yields:
-        Nothing; the handler is installed for the block.
-
-    """
-
-    def handler(received: int, _frame: FrameType | None) -> None:
-        msg = f"Interrupted by signal {received}"
-        raise ScanInterrupted(msg, signum=received)
-
-    previous = signal.signal(signum, handler)
-    try:
-        yield
-    finally:
-        signal.signal(signum, previous)
 
 
 # The EXIF orientation tag, set on a page so a test can tell whether any EXIF
@@ -397,36 +372,6 @@ def _page_sink_for(tmp_path: Path, label: str = _SPOOL_LABEL_A) -> SpooledPageSi
     return SpooledPageSink(directory, label, _NO_FREE_SPACE_RESERVE)
 
 
-# The prefix every acquisition thread the backend starts is named with, and the
-# bound a test waits for one under.
-#
-# Joining by name is how a test observes a daemon reader finishing without
-# polling and without a sleep: ``Thread.join(timeout)`` returns the instant the
-# thread ends.  The bound exists only so a genuinely stuck reader fails the
-# assertion that follows rather than hanging the run; five seconds is well
-# inside pytest-timeout's sixty.
-_READER_THREAD_PREFIX = "sane-read-"
-_READER_JOIN_SECONDS = 5.0
-
-# The bound an interrupt delivered mid-read must land inside.  The read's page
-# budget is thirty seconds, far above it, so a wait that held the interrupt
-# back until the page timed out would miss the bound by seconds.
-_INTERRUPT_BOUND_SECONDS = 5.0
-
-
-def _join_sane_reader_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
-    """
-    Wait for every acquisition thread the backend started to finish.
-
-    Args:
-        timeout: The bound each join waits under.
-
-    """
-    for thread in threading.enumerate():
-        if thread.name.startswith(_READER_THREAD_PREFIX):
-            thread.join(timeout)
-
-
 def _wedged() -> bool:
     """
     Report whether the backend has a wedge recorded.
@@ -440,37 +385,6 @@ def _wedged() -> bool:
 
     """
     return sane_backend_mod._WEDGE.stuck
-
-
-# The name the backend gives the thread that cancels a timed-out read.
-_CANCEL_THREAD_NAME = "sane-cancel"
-
-
-def _join_sane_cancel_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
-    """
-    Wait for every cancel thread the backend started to finish.
-
-    Joined like the readers, and for the same reason: it is how a test sees a
-    slow cancel come back without polling or a sleep.
-
-    Args:
-        timeout: The bound each join waits under.
-
-    """
-    for thread in threading.enumerate():
-        if thread.name == _CANCEL_THREAD_NAME:
-            thread.join(timeout)
-
-
-# The framing for a direct acquisition call: pages handed on uncropped, at
-# 300 dpi.  ``_acquire_pages`` takes the crop and the read-back dpi as one
-# record because ``scan_pages`` builds both from the paper size, the
-# resolution the device chose and whether the scan area was set on the
-# device.  A test driving acquisition directly has none of those, and is not
-# about geometry: a "full" paper size never crops.
-_UNCROPPED = scan_session_mod._PageFraming(
-    paper_size="full", resolution=300, geometry_set=True
-)
 
 
 @pytest.fixture
@@ -546,8 +460,8 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
     """
     The suite-wide reset really re-arms the init guard, in both its branches.
 
-    The guard is process state, so a module that builds a
-    ``SaneBackend`` over a fake and leaves ``_INIT.done`` set silently
+    The guard is process state, so a test that initialises SANE through
+    it over a fake and leaves ``_INIT.done`` set silently
     suppresses ``sane.init()`` for every later test in the same process -- and
     the later test that then makes real SANE calls fails with an empty device
     list rather than with anything that names the cause.  ``conftest``'s
@@ -559,7 +473,7 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
         self, fake_sane_module: FakeSaneModule
     ) -> None:
         """A constructed backend leaves nothing behind once the reset runs."""
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         assert sane_backend_mod._INIT.done is True
 
         reset_sane_process_state()
@@ -568,7 +482,7 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
         assert fake_sane_module.exit_call_count == 1
         # The proof that the guard is genuinely re-armed and not merely
         # reported as such: the next construction initialises again.
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         assert fake_sane_module.init_call_count == 2
 
     def test_the_reset_rearms_the_guard_even_when_a_wedge_was_left_behind(
@@ -584,7 +498,7 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
         by hand instead -- and ``exit_call_count`` staying 0 is the assertion
         that it did *not* reach for the unsafe call on the way.
         """
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         record = sane_backend_mod._WEDGE
         record.stuck = True
         record.done = threading.Event()
@@ -601,83 +515,22 @@ class TestTheSuiteResetsTheProcessGlobalSaneState:
         assert fake_sane_module.exit_call_count == 0
 
 
-class TestSaneBackendInit:
-    """Constructing a SaneBackend initialises SANE and sets its host list."""
+class TestSaneBackendConstruction:
+    """Building a SaneBackend loads nothing and starts nothing."""
 
-    def test_sane_backend_init_calls_sane_init(
-        self, fake_sane_module: FakeSaneModule
-    ) -> None:
-        """SaneBackend constructor calls sane.init()."""
-        assert fake_sane_module.init_call_count == 0
-        SaneBackend()
-        assert fake_sane_module.init_call_count == 1
-
-    def test_sane_backend_sets_sane_net_hosts(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """SaneBackend(host='192.168.1.50') sets SANE_NET_HOSTS env var."""
-        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend(host="192.168.1.50")
-        assert os.environ["SANE_NET_HOSTS"] == "192.168.1.50"
-
-    def test_sane_backend_does_not_override_existing_env(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """SaneBackend does not override externally-set SANE_NET_HOSTS."""
-        monkeypatch.setenv("SANE_NET_HOSTS", "external-host")
-        SaneBackend(host="config-host")
-        assert os.environ["SANE_NET_HOSTS"] == "external-host"
-
-    def test_sane_backend_no_host_no_env_change(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """SaneBackend() with no host does not set SANE_NET_HOSTS."""
-        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend()
-        assert "SANE_NET_HOSTS" not in os.environ
-
-    def test_sane_backend_multi_host_colon_delimiter(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """SaneBackend with colon-delimited hosts sets multi-host value."""
-        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend(host="192.168.1.50:192.168.1.51")
-        assert os.environ["SANE_NET_HOSTS"] == "192.168.1.50:192.168.1.51"
-
-    def test_sane_backend_treats_an_exported_empty_variable_as_unset(
+    def test_construction_starts_no_sane_and_no_child(
         self,
         fake_sane_module: FakeSaneModule,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+        scan_child_seam: ScanChildSeam,
+        listing_seam: ListingSeam,
     ) -> None:
-        """
-        An exported but empty SANE_NET_HOSTS names no host, so the config wins.
-
-        libsane skips empty entries, so leaving the empty value in place would
-        give SANE no host at all while the operator configured one.
-        """
-        monkeypatch.setenv("SANE_NET_HOSTS", "")
-        caplog.set_level(logging.INFO, logger=_BACKEND_LOGGER)
+        """No sane_init here or in a child, and no child of either kind."""
         SaneBackend(host="scanbox.lan")
 
-        assert os.environ["SANE_NET_HOSTS"] == "scanbox.lan"
-        assert not any("set externally" in m for m in _backend_messages(caplog))
-
-    def test_sane_backend_logs_an_exported_value_as_external(
-        self,
-        fake_sane_module: FakeSaneModule,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A non-empty exported value is kept and named once at INFO."""
-        monkeypatch.setenv("SANE_NET_HOSTS", "external-host")
-        caplog.set_level(logging.INFO, logger=_BACKEND_LOGGER)
-        SaneBackend(host="config-host")
-
-        assert os.environ["SANE_NET_HOSTS"] == "external-host"
-        external = [m for m in _backend_messages(caplog) if "set externally" in m]
-        assert len(external) == 1
-        assert "external-host" in external[0]
+        assert fake_sane_module.init_call_count == 0
+        assert fake_sane_module.child_init_call_count == 0
+        assert scan_child_seam.launches == []
+        assert listing_seam.calls == []
 
     @pytest.mark.parametrize(
         "environment",
@@ -687,27 +540,203 @@ class TestSaneBackendInit:
             pytest.param("ext-host", id="exported"),
         ],
     )
-    def test_sane_backend_writes_what_the_shared_helper_derives(
+    def test_construction_leaves_sane_net_hosts_alone(
         self,
         fake_sane_module: FakeSaneModule,
         monkeypatch: pytest.MonkeyPatch,
         environment: str | None,
     ) -> None:
         """
-        The backend and the helper agree on the host list in every state.
+        The process's own SANE_NET_HOSTS is never written.
 
-        The scanner check probes the helper's answer, so any disagreement
-        would have it probe a host SANE never dials.
+        Each child derives its own from the configured host, so nothing in
+        this process's environment has to change.
         """
+        _ = fake_sane_module
         if environment is None:
             monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
         else:
             monkeypatch.setenv("SANE_NET_HOSTS", environment)
-        expected = effective_sane_net_hosts("cfg-host")
 
-        SaneBackend(host="cfg-host")
+        SaneBackend(host="192.168.1.50:192.168.1.51")
 
-        assert os.environ.get("SANE_NET_HOSTS") == expected
+        assert os.environ.get("SANE_NET_HOSTS") == environment
+
+    def test_the_configured_host_goes_to_every_scan_child(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """Each child is started with the ``scanner.host`` setting."""
+        _ = fake_sane_module
+        backend = SaneBackend(host="192.168.1.50:192.168.1.51")
+
+        backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+        backend.scan_pages("test:0", _flatbed_settings(), second_pass_sink)
+
+        assert scan_child_seam.launches == ["192.168.1.50:192.168.1.51"] * 2
+
+
+def _child_ended(child: ChildProcess) -> bool:
+    """
+    Tell whether an in-process scan child has exited and been reaped.
+
+    Args:
+        child: A child the seam started.
+
+    Returns:
+        Whether its main has returned.
+
+    """
+    return child.poll() is not None
+
+
+class TestScanSession:
+    """A scan session keeps one scan child for every pass inside it."""
+
+    def test_two_scans_in_one_session_start_one_child(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """Both passes run in the one child, which is reaped as the block ends."""
+        backend = SaneBackend()
+        settings = _flatbed_settings()
+
+        with backend.scan_session():
+            first = backend.scan_pages("test:0", settings, page_sink)
+            second = backend.scan_pages("test:0", settings, second_pass_sink)
+            assert len(scan_child_seam.children) == 1
+            assert not _child_ended(scan_child_seam.children[0])
+
+        assert len(first.pages) == len(second.pages) == 1
+        assert len(scan_child_seam.children) == 1
+        assert _child_ended(scan_child_seam.children[0])
+        assert fake_sane_module.child_calls == ["init"]
+
+    def test_a_scan_outside_a_session_starts_and_reaps_its_own_child(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """Each call gets a child, reaped before the call returns."""
+        _ = fake_sane_module
+        backend = SaneBackend()
+
+        backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+        assert len(scan_child_seam.children) == 1
+        assert _child_ended(scan_child_seam.children[0])
+
+        backend.scan_pages("test:0", _flatbed_settings(), second_pass_sink)
+        assert len(scan_child_seam.children) == 2
+        assert _child_ended(scan_child_seam.children[1])
+
+    def test_a_failed_scan_outside_a_session_reaps_its_child_before_raising(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """The child is gone by the time the scan's error reaches the caller."""
+        dev = FakeSaneDev(start_error=FakeSaneError("Scanner cover is open"))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError):
+            backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+
+        assert len(scan_child_seam.children) == 1
+        assert _child_ended(scan_child_seam.children[0])
+
+    def test_a_nested_session_is_refused(
+        self, fake_sane_module: FakeSaneModule, scan_child_seam: ScanChildSeam
+    ) -> None:
+        """One backend runs one session at a time; a second is a bug."""
+        _ = fake_sane_module
+        backend = SaneBackend()
+
+        with backend.scan_session(), pytest.raises(RuntimeError, match="already"):
+            backend.scan_session().__enter__()
+
+        assert scan_child_seam.launches == []
+
+    def test_live_is_set_while_the_sessions_child_exists(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """The session's ``live`` Event marks the child from start to reap."""
+        _ = fake_sane_module
+        backend = SaneBackend()
+        live = threading.Event()
+
+        with backend.scan_session(live=live):
+            assert not live.is_set()
+            backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+            assert live.is_set()
+
+        assert not live.is_set()
+
+    def test_an_abort_set_before_the_scan_starts_no_child(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """A session whose abort is already set refuses to start a child."""
+        _ = fake_sane_module
+        backend = SaneBackend()
+        abort = threading.Event()
+        abort.set()
+
+        with (
+            backend.scan_session(abort=abort),
+            pytest.raises(ScanInterrupted),
+        ):
+            backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+
+        assert scan_child_seam.launches == []
+
+    def test_close_ends_a_live_session_child(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """A session left open has its child ended by ``close``."""
+        _ = fake_sane_module
+        backend = SaneBackend()
+        session = backend.scan_session()
+        session.__enter__()
+        backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+        assert not _child_ended(scan_child_seam.children[0])
+
+        backend.close()
+
+        assert _child_ended(scan_child_seam.children[0])
+        session.__exit__(None, None, None)
+
+    def test_close_with_no_session_does_nothing(
+        self, fake_sane_module: FakeSaneModule, scan_child_seam: ScanChildSeam
+    ) -> None:
+        """Closing a backend that never scanned starts and ends nothing."""
+        _ = fake_sane_module
+        SaneBackend().close()
+
+        assert scan_child_seam.launches == []
+        assert fake_sane_module.exit_call_count == 0
+
+    def test_the_base_session_does_nothing(self) -> None:
+        """A backend with nothing to keep between passes has an empty session."""
+        backend = StubScannerBackend()
+
+        with backend.scan_session(abort=threading.Event()) as entered:
+            assert entered is None
 
 
 def _backend_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -748,22 +777,19 @@ def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 class TestSaneInitGuard:
     """
-    SANE is initialised once per process, behind a guard.
+    The in-process init guard initialises SANE once per process.
 
-    ``sane_init`` is a process-global call: the second one is at best wasted
-    and at worst -- on a ``net`` backend, whose host list is read only at the
-    first -- an operator's configuration silently doing nothing.  The guard is
-    a guard rather than a singleton on purpose: three CLI commands and the web
-    server each build their own ``SaneBackend``, and every one of them has to
-    keep working.
+    ``SaneBackend`` no longer initialises SANE in this process: its scans and
+    listings run in children.  These pin the guard itself, through
+    ``_ensure_initialised``, for as long as it exists.
     """
 
     def test_init_once_for_two_backends_in_one_process(
         self, fake_sane_module: FakeSaneModule
     ) -> None:
         """Two SaneBackend constructions call sane.init() once between them."""
-        SaneBackend()
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
+        sane_backend_mod._ensure_initialised("")
         assert fake_sane_module.init_call_count == 1
 
     def test_init_once_warns_when_a_later_host_differs(
@@ -774,9 +800,9 @@ class TestSaneInitGuard:
     ) -> None:
         """A second, different host is named alongside the one in effect."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend(host="scanner-a.local")
+        sane_backend_mod._ensure_initialised("scanner-a.local")
         caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
-        SaneBackend(host="scanner-b.local")
+        sane_backend_mod._ensure_initialised("scanner-b.local")
 
         warnings = _guard_warnings(caplog)
         assert len(warnings) == 1
@@ -795,9 +821,9 @@ class TestSaneInitGuard:
     ) -> None:
         """Repeating the configured host logs no warning."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend(host="scanner-a.local")
+        sane_backend_mod._ensure_initialised("scanner-a.local")
         caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
-        SaneBackend(host="scanner-a.local")
+        sane_backend_mod._ensure_initialised("scanner-a.local")
 
         assert _guard_warnings(caplog) == []
         assert fake_sane_module.init_call_count == 1
@@ -810,9 +836,9 @@ class TestSaneInitGuard:
     ) -> None:
         """No host asks for nothing, so nothing was ignored and nothing warns."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend(host="scanner-a.local")
+        sane_backend_mod._ensure_initialised("scanner-a.local")
         caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
 
         assert _guard_warnings(caplog) == []
         assert fake_sane_module.init_call_count == 1
@@ -821,9 +847,9 @@ class TestSaneInitGuard:
         self, fake_sane_module: FakeSaneModule
     ) -> None:
         """A shutdown re-arms the guard, so the next construction initialises."""
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         sane_backend_mod.shutdown()
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         assert fake_sane_module.init_call_count == 2
 
     def test_a_re_init_after_shutdown_writes_its_own_host(
@@ -839,12 +865,12 @@ class TestSaneInitGuard:
         exported, keep it, and log it as set externally.
         """
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend(host="scanner-a")
+        sane_backend_mod._ensure_initialised("scanner-a")
         sane_backend_mod.shutdown()
         assert "SANE_NET_HOSTS" not in os.environ
 
         caplog.set_level(logging.INFO, logger=_BACKEND_LOGGER)
-        SaneBackend(host="scanner-b")
+        sane_backend_mod._ensure_initialised("scanner-b")
 
         assert os.environ["SANE_NET_HOSTS"] == "scanner-b"
         assert not any("set externally" in m for m in _backend_messages(caplog))
@@ -854,7 +880,7 @@ class TestSaneInitGuard:
     ) -> None:
         """The previous state is put back exactly, empty rather than absent."""
         monkeypatch.setenv("SANE_NET_HOSTS", "")
-        SaneBackend(host="scanner-a")
+        sane_backend_mod._ensure_initialised("scanner-a")
         assert os.environ["SANE_NET_HOSTS"] == "scanner-a"
 
         sane_backend_mod.shutdown()
@@ -866,7 +892,7 @@ class TestSaneInitGuard:
     ) -> None:
         """Only saneless's own value is restored; a later change is not undone."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        SaneBackend(host="scanner-a")
+        sane_backend_mod._ensure_initialised("scanner-a")
         monkeypatch.setenv("SANE_NET_HOSTS", "operator-host")
 
         sane_backend_mod.shutdown()
@@ -882,7 +908,7 @@ class TestSaneInitGuard:
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
 
         with pytest.raises(ScanError, match="Could not initialise SANE"):
-            SaneBackend(host="scanner-a")
+            sane_backend_mod._ensure_initialised("scanner-a")
 
         assert "SANE_NET_HOSTS" not in os.environ
 
@@ -899,9 +925,9 @@ class TestSaneInitGuard:
         never used, so naming it would send the operator to the wrong place.
         """
         monkeypatch.setenv("SANE_NET_HOSTS", "ext-host")
-        SaneBackend(host="scanner-a")
+        sane_backend_mod._ensure_initialised("scanner-a")
         caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
-        SaneBackend(host="scanner-b")
+        sane_backend_mod._ensure_initialised("scanner-b")
 
         warnings = _guard_warnings(caplog)
         assert len(warnings) == 1
@@ -926,7 +952,7 @@ class TestSaneInitGuard:
         def build() -> None:
             ready.wait(5)
             try:
-                SaneBackend()
+                sane_backend_mod._ensure_initialised("")
             except Exception as exc:
                 # Carried back to the test thread: an exception raised here
                 # would be reported as an unhandled thread exception with no
@@ -953,28 +979,22 @@ class TestSaneInitGuard:
         failing = FakeSaneModule(init_error=FakeSaneError("no SANE here"))
         monkeypatch.setattr(scan_session_mod, "sane", failing)
         with pytest.raises(ScanError, match="Could not initialise SANE: no SANE here"):
-            SaneBackend()
+            sane_backend_mod._ensure_initialised("")
         assert failing.init_call_count == 1
 
         working = FakeSaneModule()
         monkeypatch.setattr(scan_session_mod, "sane", working)
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         assert working.init_call_count == 1
 
     def test_backend_stays_freely_constructible(
         self, fake_sane_module: FakeSaneModule
     ) -> None:
-        """
-        The guard guards init, not construction: no singleton, no factory.
-
-        Every one-shot CLI command builds its own backend and the web server
-        builds another; a guard that returned a shared instance would change
-        what ``SaneBackend()`` means for all of them.
-        """
+        """Every entry point builds its own backend, and none starts SANE here."""
         first = SaneBackend()
         second = SaneBackend()
         assert first is not second
-        assert fake_sane_module.init_call_count == 1
+        assert fake_sane_module.init_call_count == 0
 
 
 def _failing_exit() -> None:
@@ -1012,9 +1032,8 @@ class TestSaneShutdown:
     """
     SANE is shut down at an entry point, once, and never over an error.
 
-    ``shutdown()`` is the other half of the init guard: the entry point that
-    owns the process calls it when the process is ending, and nothing else
-    calls it at all.  ``atexit`` is not used and must not be, because it runs
+    ``shutdown()`` is the other half of the in-process init guard, which
+    ``SaneBackend`` no longer uses; ``close()`` now ends a stray scan child.  ``atexit`` is not used and must not be, because it runs
     while a daemon reader thread may still be inside ``sane_read``.
     """
 
@@ -1022,7 +1041,7 @@ class TestSaneShutdown:
         self, fake_sane_module: FakeSaneModule
     ) -> None:
         """Repeated shutdowns, one per backend, call sane_exit once."""
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         sane_backend_mod.shutdown()
         sane_backend_mod.shutdown()
         assert fake_sane_module.exit_call_count == 1
@@ -1047,7 +1066,7 @@ class TestSaneShutdown:
         callback or a lifespan shutdown, where a raise would replace whatever
         error the operator is actually being shown.
         """
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
 
         monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
         with caplog.at_level(logging.WARNING, logger=sane_backend_mod.__name__):
@@ -1059,7 +1078,7 @@ class TestSaneShutdown:
         self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A failed exit still re-arms the guard, so SANE can initialise again."""
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         working_exit = fake_sane_module.exit
 
         monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
@@ -1068,16 +1087,8 @@ class TestSaneShutdown:
         # Only the exit is restored: a blanket undo would take the whole fake
         # module with it and send the next construction at the real one.
         monkeypatch.setattr(fake_sane_module, "exit", working_exit)
-        SaneBackend()
+        sane_backend_mod._ensure_initialised("")
         assert fake_sane_module.init_call_count == 2
-
-    def test_close_delegates_to_shutdown(
-        self, fake_sane_module: FakeSaneModule
-    ) -> None:
-        """An entry point closes the backend it holds; SANE goes down with it."""
-        backend = SaneBackend()
-        backend.close()
-        assert fake_sane_module.exit_call_count == 1
 
     def test_close_overrides_the_base_no_op(self) -> None:
         """
@@ -1094,14 +1105,30 @@ class TestSaneShutdown:
         fake_sane_module: FakeSaneModule,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
+        page_sink: SpooledPageSink,
     ) -> None:
-        """Closing never raises, so it cannot replace the operator's error."""
+        """A session child that ends badly is logged, never raised, by close."""
+        _ = fake_sane_module
         backend = SaneBackend()
-        monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
-        with caplog.at_level(logging.WARNING, logger=sane_backend_mod.__name__):
-            backend.close()
+        session = backend.scan_session()
+        session.__enter__()
+        backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+        stopped = ScanError("The scanning process was stopped")
 
-        _assert_shutdown_failure_logged(caplog)
+        def failing_close(self: ScanChildSession) -> None:
+            self._end_child()
+            raise stopped
+
+        real_close = ScanChildSession.close
+        monkeypatch.setattr(ScanChildSession, "close", failing_close)
+        with caplog.at_level(logging.WARNING, logger=_BACKEND_LOGGER):
+            backend.close()
+        monkeypatch.setattr(ScanChildSession, "close", real_close)
+
+        assert [
+            r.getMessage() for r in caplog.records if r.name == _BACKEND_LOGGER
+        ] == ["The scan session did not end cleanly: The scanning process was stopped"]
+        session.__exit__(None, None, None)
 
     @pytest.mark.parametrize(
         "module",
@@ -1698,9 +1725,9 @@ class TestSaneBackendScanPages:
         # method: start() is where a flatbed scan first touches the hardware,
         # and the fake raises from there with the library's own error type.
         # The library's error leaves the backend as a ScanError naming the
-        # device, with the original kept as its cause.
-        original = FakeSaneError("scan failed")
-        dev = FakeSaneDev(start_error=original)
+        # device; the pass keeps the original as its cause
+        # (TestSaneBoundary.test_the_pass_chains_the_sane_error).
+        dev = FakeSaneDev(start_error=FakeSaneError("scan failed"))
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
@@ -1708,7 +1735,6 @@ class TestSaneBackendScanPages:
             backend.scan_pages("test:0", settings, page_sink)
 
         assert str(exc_info.value) == "Scanner error on test:0: scan failed"
-        assert exc_info.value.__cause__ is original
         assert dev.cancel_calls
         assert dev.close_calls
 
@@ -2183,15 +2209,15 @@ class TestAdfPageErrorsAreTruthful:
         assert not isinstance(exc_info.value, FeederEmptyError)
 
     def test_first_page_fault_keeps_the_original_as_cause(
-        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The translated ScanError chains the exception SANE actually raised."""
+        """The pass's ScanError chains the exception SANE actually raised."""
         original = FakeSaneError("Document feeder jammed")
         dev = FakeSaneDev(pages=5, start_error=original)
-        backend = _backend_with(dev, monkeypatch)
+        monkeypatch.setattr(scan_session_mod, "sane", FakeSaneModule(device=dev))
 
         with pytest.raises(ScanError) as exc_info:
-            backend.scan_pages("test:0", _feeder_settings(), page_sink)
+            scan_session_mod.run_pass("test:0", _feeder_settings(), RecordingOutlet())
 
         assert exc_info.value.__cause__ is original
 
@@ -2290,7 +2316,7 @@ class TestAdfPageCap:
         tmp_path: Path,
     ) -> None:
         """A feeder that never reports end-of-feed keeps 500 pages and names 501."""
-        cap = sane_backend_mod._MAX_ADF_PAGES
+        cap = scan_session_mod._MAX_ADF_PAGES
         # Far more sheets than the cap, so the fake never reports end-of-feed
         # and the loop has to be stopped by the cap rather than by the device.
         dev = FakeSaneDev(pages=cap * 100)
@@ -2319,7 +2345,7 @@ class TestAdfPageCap:
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """Exactly _MAX_ADF_PAGES sheets complete normally and spool in full."""
-        cap = sane_backend_mod._MAX_ADF_PAGES
+        cap = scan_session_mod._MAX_ADF_PAGES
         dev = FakeSaneDev(pages=cap)
         backend = _backend_with(dev, monkeypatch)
 
@@ -2381,7 +2407,7 @@ class TestAdfPageCap:
         The cap counts sheets fed, not pages kept, so the sheet not kept is
         still the 501st whatever was skipped before it.
         """
-        cap = sane_backend_mod._MAX_ADF_PAGES
+        cap = scan_session_mod._MAX_ADF_PAGES
         # Far below _MIN_PAGE_BYTES: a 10x10 RGB page is 300 bytes.
         unreadable = Image.new("RGB", (10, 10), "white")
         readable = _make_content_image()
@@ -2401,7 +2427,7 @@ class TestAdfPageCap:
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """Every sheet unreadable, then the cap: the unreadable error, no batch."""
-        cap = sane_backend_mod._MAX_ADF_PAGES
+        cap = scan_session_mod._MAX_ADF_PAGES
         dev = FakeSaneDev()
         dev.load_feeder([Image.new("RGB", (10, 10), "white")] * (cap * 2))
         backend = _backend_with(dev, monkeypatch)
@@ -2429,7 +2455,7 @@ class TestAdfPageCap:
 
     def test_the_auto_cap_is_fifty(self) -> None:
         """The bound for a source that is not a named feeder is 50 pages."""
-        assert sane_backend_mod._MAX_AUTO_FEEDER_PAGES == 50
+        assert scan_session_mod._MAX_AUTO_FEEDER_PAGES == 50
 
 
 class TestSaneBackendPageValidation:
@@ -3175,936 +3201,6 @@ class TestResolveSourceForManualDuplex:
         assert "source" not in mock_dev.assignments
 
 
-class TestSaneBackendPerPageTimeout:
-    """A page that takes too long raises ScanError; pages in time are spooled."""
-
-    def test_page_timeout_raises_scan_error(
-        self,
-        fake_sane_module: FakeSaneModule,
-        page_sink: SpooledPageSink,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """
-        A page that takes too long raises ScanError naming the timeout, once.
-
-        The read is held on the shared fake's gate rather than slowed by a
-        sleep, so the per-page timeout fires at once and nothing waits it out.
-        The backend raises and leaves the logging to whoever handles the error
-        -- the worker or the CLI -- so the backend itself must not also log the
-        timeout at ERROR, or every timeout reads as two failures.
-        """
-        caplog.set_level(logging.DEBUG, logger=_BACKEND_LOGGER)
-        mock_dev = fake_sane_module.device
-        mock_dev.block_read(ReadBlockMode.PARTIAL)
-
-        backend = SaneBackend()
-
-        try:
-            with pytest.raises(ScanError, match="timed out after"):
-                backend._scan_adf_pages(
-                    mock_dev,
-                    page_sink,
-                    _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=0.05),
-                )
-        finally:
-            mock_dev.release_read()
-            _join_sane_reader_threads()
-
-        timeout_errors = [
-            record
-            for record in caplog.records
-            if record.name == _BACKEND_LOGGER
-            and record.levelno >= logging.ERROR
-            and "timed out after" in record.getMessage()
-        ]
-        assert timeout_errors == []
-
-    def test_pages_within_timeout_succeed(
-        self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
-    ) -> None:
-        """Pages acquired within timeout are spooled and reported in order."""
-        mock_dev = fake_sane_module.device
-        assert isinstance(mock_dev, FakeSaneDev)
-
-        backend = SaneBackend()
-        records = backend._scan_adf_pages(
-            mock_dev, page_sink, _UNCROPPED, sane_backend_mod._PageBudget(timeout=5.0)
-        ).records
-        assert len(records) == 3
-        assert [record.sequence for record in records] == [1, 2, 3]
-
-
-class TestSaneBackendCancelSequence:
-    """
-    A timed-out read is cancelled and waited for, and closed only once it returns.
-
-    Every test here arms the shared fake's Event-gated read, so nothing waits
-    out a sleep: the block is ended by setting an ``Event``, and the only
-    bounded waits are the backend's own timeout and grace.
-
-    The ordering these tests assert is not a refinement.  ``sane_close`` runs
-    holding the GIL while ``sane_read`` has released it, so a close racing a
-    blocked read is the one sequence python-sane cannot survive -- which is
-    why "was close called while the read was still blocked" is asserted
-    directly rather than inferred from a call count.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _clear_wedge(self, fake_device: FakeSaneDev) -> Iterator[None]:
-        """
-        Release any blocked read and clear the wedge after each test here.
-
-        The record is module state by design -- the *next* ``scan_pages`` on
-        a fresh backend object has to refuse -- so a test that
-        wedges it deliberately has to un-wedge it, or the refusal leaks into
-        every test that runs afterwards.
-
-        The gate is opened first, and the readers joined, so the release goes
-        through the production path: the reader closes its own handle and
-        clears the record itself, exactly as it would in service.  Without
-        that, a test arming ``NEVER`` leaves a daemon parked until the fake's
-        30 s ceiling, and the *next* test's join waits the difference out.
-
-        Whatever is left afterwards is cleared outright.  A reader still
-        blocked at that point identifies its own acquisition by the ``done``
-        event it was given, so a late wake-up matches nothing and does
-        nothing.
-
-        Args:
-            fake_device: The one handle every test in this class drives.
-
-        Yields:
-            None, before the release and the clear.
-
-        """
-        yield
-        fake_device.release_read()
-        _join_sane_reader_threads()
-        _join_sane_cancel_threads()
-        record = sane_backend_mod._WEDGE
-        record.stuck = False
-        record.done = None
-        record.device = None
-        record.device_id = ""
-        record.page_label = ""
-        record.settling = False
-        record.outstanding = set()
-
-    @staticmethod
-    def _wedge(
-        backend: SaneBackend, device: FakeSaneDev, sink: SpooledPageSink
-    ) -> None:
-        """
-        Leave the backend wedged by a read that does not answer the cancel.
-
-        Args:
-            backend: The backend to wedge.
-            device: The shared fake, armed here rather than by the caller so
-                that every wedge in this class is built the same way.
-            sink: Where the (never arriving) page would have gone.
-
-        """
-        device.block_read(ReadBlockMode.NEVER)
-        with (
-            pytest.raises(ScanError, match="timed out"),
-            backend._open_device(_TEST_DEVICE) as dev,
-        ):
-            backend._scan_adf_pages(
-                dev,
-                sink,
-                _UNCROPPED,
-                sane_backend_mod._PageBudget(timeout=0.05, grace=0.05),
-            )
-
-    def test_close_not_called_while_blocked(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """
-        The cancel goes out first and the close waits for the read to return.
-
-        Asserted inside the device context and then again outside it, because
-        the two say different things: inside, that nothing closed the handle
-        while the read was still in SANE; outside, that the handle really was
-        released once the read came back.  A single count at the end could not
-        tell "closed after" from "closed during".
-        """
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-
-        with sane_backend._open_device(_TEST_DEVICE) as dev:
-            with pytest.raises(ScanError, match="timed out"):
-                sane_backend._scan_adf_pages(
-                    dev,
-                    page_sink,
-                    _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=0.05),
-                )
-            assert fake_device.cancel_calls == 1
-            assert fake_device.close_while_blocked is False
-            assert fake_device.close_calls == 0
-
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_blocked is False
-
-    def test_did_not_respond_to_cancel(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """
-        A scanner that never answers the cancel is reported, not closed.
-
-        The grace is injected through the page budget, as the timeout is, so
-        the test does not wait out the module's real ten seconds.
-        """
-        fake_device.block_read(ReadBlockMode.NEVER)
-
-        with (
-            caplog.at_level(logging.CRITICAL),
-            pytest.raises(ScanError) as raised,
-            sane_backend._open_device(_TEST_DEVICE) as dev,
-        ):
-            sane_backend._scan_adf_pages(
-                dev,
-                page_sink,
-                _UNCROPPED,
-                sane_backend_mod._PageBudget(timeout=0.05, grace=0.05),
-            )
-
-        message = str(raised.value)
-        assert "timed out" in message
-        assert "did not answer the cancel" in message
-        assert fake_device.close_calls == 0
-        assert fake_device.close_while_blocked is False
-        assert [
-            record.getMessage()
-            for record in caplog.records
-            if record.levelno == logging.CRITICAL
-        ]
-
-    def test_post_cancel_page_discarded(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        tmp_path: Path,
-    ) -> None:
-        """
-        The truncated page a cancelled read returns never reaches the sink.
-
-        This is the case a "use it if it arrived after all" shortcut gets
-        wrong.  Measured on real libsane, a cancelled ``snap()`` returns a
-        truncated image rather than raising, and that image clears
-        ``_validate_page_image``: spooling it would put one more page in the
-        PDF than the error message claims.
-        """
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-
-        with (
-            pytest.raises(ScanError, match="timed out"),
-            sane_backend._open_device(_TEST_DEVICE) as dev,
-        ):
-            sane_backend._scan_adf_pages(
-                dev, page_sink, _UNCROPPED, sane_backend_mod._PageBudget(timeout=0.05)
-            )
-
-        assert page_sink.records == ()
-        # Asserted on the directory as well as on the sink, because "the sink
-        # was never called" and "no page file exists" are different claims and
-        # a partial PDF is built from the second one.
-        assert list((tmp_path / f"spool-{_SPOOL_LABEL_A}").iterdir()) == []
-
-    def test_a_wedged_backend_refuses_the_next_call_with_no_sane_traffic(
-        self,
-        sane_backend: SaneBackend,
-        fake_sane_module: FakeSaneModule,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        second_pass_sink: SpooledPageSink,
-    ) -> None:
-        """
-        A wedged backend refuses to scan or list in this process, touching nothing.
-
-        A capability read is not refused: it runs in a listing child, whose
-        SANE is its own, so nothing it does can reach the stuck read.
-
-        "No SANE call" is asserted as the device's own call log being
-        byte-for-byte what it was, because the refusal has to happen before
-        ``sane.open()``: opening is the very operation the SANE standard forbids
-        while a read is outstanding.
-
-        ``get_devices`` refuses too.  ``_resolve_device`` calls it before
-        ``scan_pages`` whenever ``scanner.device`` is empty, and on the ``net``
-        backend ``sane_get_devices`` is an RPC on the same control wire the
-        stuck read is on.
-        """
-        self._wedge(sane_backend, fake_device, page_sink)
-        calls_before = list(fake_device.calls)
-        enumerations_before = fake_sane_module.get_devices_call_count
-        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
-
-        with pytest.raises(ScanError, match="Restart saneless"):
-            sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
-        with pytest.raises(ScanError, match="Restart saneless") as refusal:
-            sane_backend.get_devices()
-
-        assert fake_device.calls == calls_before
-        assert fake_sane_module.get_devices_call_count == enumerations_before
-        assert fake_device.close_calls == 0
-        assert fake_device.cancel_calls == 1
-        # The refusal names the wedged device even though the caller had none
-        # to name: enumeration is the call that finds out which devices exist.
-        assert _TEST_DEVICE in str(refusal.value)
-
-    def test_a_wedged_backend_refuses_list_and_open_without_a_child(
-        self,
-        sane_backend: SaneBackend,
-        fake_sane_module: FakeSaneModule,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        listing_seam: ListingSeam,
-    ) -> None:
-        """
-        The Scanner check's list-then-open refuses too, and starts nothing.
-
-        A child could not touch this process's stuck handle, so the refusal is
-        not about safety here.  It keeps one rule for every SANE entry point,
-        and an appliance whose read is stuck cannot scan anyway.
-        """
-        self._wedge(sane_backend, fake_device, page_sink)
-        calls_before = list(fake_device.calls)
-        listings_before = list(listing_seam.calls)
-        enumerations_before = fake_sane_module.get_devices_call_count
-
-        with pytest.raises(ScanError, match="Restart saneless"):
-            sane_backend.list_and_open(_NET_DEVICE)
-
-        assert listing_seam.calls == listings_before
-        assert fake_sane_module.get_devices_call_count == enumerations_before
-        assert fake_device.calls == calls_before
-
-    def test_shutdown_leaves_sane_up_while_a_read_is_outstanding(
-        self,
-        sane_backend: SaneBackend,
-        fake_sane_module: FakeSaneModule,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """
-        A wedged backend is not shut down, and the refusal is logged.
-
-        ``sane_exit`` closes every open handle and runs holding the GIL, so it
-        is the close-while-reading hazard applied to every handle at once.  An
-        un-exited SANE in a process that is ending anyway costs nothing next to
-        that, so this path skips rather than risks it.
-        """
-        self._wedge(sane_backend, fake_device, page_sink)
-        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
-
-        sane_backend.close()
-
-        assert fake_sane_module.exit_call_count == 0
-        assert fake_sane_module.exit_while_blocked is False
-        assert any("has not returned" in message for message in _guard_warnings(caplog))
-
-    def test_the_wedge_clears_when_the_late_read_finally_returns(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        second_pass_sink: SpooledPageSink,
-    ) -> None:
-        """
-        A transient hang recovers without a restart, and the reader closes.
-
-        The handle is closed by the reader thread itself, because it is the
-        only thread that knows the read is over -- the thread that gave up on
-        it has long since raised.  Joining that thread is a bounded wait on a
-        real event, not a sleep: it ends the instant the reader returns.
-        """
-        self._wedge(sane_backend, fake_device, page_sink)
-
-        fake_device.release_read()
-        _join_sane_reader_threads()
-
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_blocked is False
-
-        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
-        batch = sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
-        assert batch.pages
-
-    def test_flatbed_timeout_matches_the_adf_message_shape(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """
-        One flatbed sheet is bounded exactly as one fed sheet is.
-
-        The defaults are asserted alongside the behaviour because the claim is
-        not merely "the flatbed times out" but "with the same constant, and no
-        new config key".  A second timeout that happened to be equal would
-        satisfy the first half and quietly drift apart later.  The grace is
-        pinned for the same reason, and because it is the parameter that makes
-        the unresponsive-cancel path testable at all.
-        """
-        budget = (
-            inspect.signature(sane_backend_mod._snap_flatbed)
-            .parameters["budget"]
-            .default
-        )
-        assert budget.timeout == page_budget_mod._PAGE_TIMEOUT_FLOOR_SECONDS
-        assert budget.grace == sane_backend_mod._CANCEL_GRACE_SECONDS
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-
-        with sane_backend._open_device(_TEST_DEVICE) as dev:
-            with pytest.raises(ScanError, match="timed out"):
-                sane_backend_mod._snap_flatbed(
-                    dev,
-                    _TEST_DEVICE,
-                    page_sink,
-                    _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=0.05),
-                )
-            # Inside the device context, so the count is the acquisition's own
-            # cancel and not the context manager's routine one on the way out.
-            assert fake_device.cancel_calls == 1
-            assert fake_device.close_while_blocked is False
-            assert fake_device.close_calls == 0
-
-        assert page_sink.records == ()
-
-    def test_flatbed_did_not_respond_to_cancel(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """
-        A platen scanner that never answers the cancel is reported, not closed.
-
-        The flatbed counterpart of ``test_did_not_respond_to_cancel``: one sheet
-        is one sheet, whichever way it was presented, including when the scanner
-        ignores the cancel.  The grace is injected through the page budget, so
-        the test does not wait out the module's real ten seconds.
-        """
-        fake_device.block_read(ReadBlockMode.NEVER)
-        began = time.monotonic()
-
-        with (
-            caplog.at_level(logging.CRITICAL),
-            pytest.raises(ScanError) as raised,
-            sane_backend._open_device(_TEST_DEVICE) as dev,
-        ):
-            sane_backend_mod._snap_flatbed(
-                dev,
-                _TEST_DEVICE,
-                page_sink,
-                _UNCROPPED,
-                sane_backend_mod._PageBudget(timeout=0.05, grace=0.05),
-            )
-
-        # The injected grace was really used, not the module's ten seconds --
-        # which is the whole difference this parameter makes.
-        assert time.monotonic() - began < 1.0
-        message = str(raised.value)
-        assert "timed out" in message
-        assert "did not answer the cancel" in message
-        assert fake_device.close_calls == 0
-        assert fake_device.close_while_blocked is False
-        assert page_sink.records == ()
-        assert [
-            record.getMessage()
-            for record in caplog.records
-            if record.levelno == logging.CRITICAL
-        ]
-
-    def test_flatbed_unreadable_sheet_is_fatal_not_skipped(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """
-        The shared page validation is fatal on the platen.
-
-        A fed sheet that fails the same two checks is skipped and counted,
-        because there is a next sheet to carry on to.  A flatbed exposes one
-        sheet at a time, so there is nothing to carry on to and the scan ends
-        -- which is why the call log must show exactly one attempt.
-        """
-        fake_device.load_feeder([Image.new("RGB", (10, 10), "white")])
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
-
-        with pytest.raises(ScanError, match="unreadable"):
-            sane_backend.scan_pages(_TEST_DEVICE, settings, page_sink)
-
-        assert fake_device.calls == ["start", "snap"]
-        assert page_sink.records == ()
-
-    @pytest.mark.parametrize(
-        ("signum", "expected"),
-        [
-            pytest.param(signal.SIGINT, KeyboardInterrupt, id="ctrl-c"),
-            pytest.param(signal.SIGTERM, ScanInterrupted, id="sigterm"),
-        ],
-    )
-    def test_keyboard_interrupt_mid_read(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        signum: signal.Signals,
-        expected: type[BaseException],
-    ) -> None:
-        """
-        Ctrl-C or SIGTERM during a read cancels and settles the device, then re-raises.
-
-        The exception comes back out unchanged, so the CLI keeps its exit 130 and
-        a one-shot command keeps the pages already scanned.  The interrupt lands
-        well inside the thirty-second page budget: a wait that held it back until
-        the page timed out would prove the timeout path instead.
-
-        ``read_started`` is set from inside the blocked read, so the signal is
-        sent only once the waiting thread is in the block that handles it.  It
-        goes to the main thread with ``pthread_kill``, which is where that wait
-        runs; ``raise_signal`` would deliver it to the interrupter's own thread.
-        """
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-        main_thread = threading.main_thread().ident
-        assert main_thread is not None
-
-        def interrupt_once_the_read_blocks() -> None:
-            if fake_device.read_started.wait(_READER_JOIN_SECONDS):
-                signal.pthread_kill(main_thread, signum)
-
-        interrupter = threading.Thread(
-            target=interrupt_once_the_read_blocks, name="interrupter", daemon=True
-        )
-        handling = (
-            _signal_raises_scan_interrupted(signum)
-            if expected is ScanInterrupted
-            else contextlib.nullcontext()
-        )
-
-        with handling, sane_backend._open_device(_TEST_DEVICE) as dev:
-            began = time.monotonic()
-            interrupter.start()
-            with pytest.raises(expected):
-                sane_backend._scan_adf_pages(
-                    dev,
-                    page_sink,
-                    _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=30.0),
-                )
-            elapsed = time.monotonic() - began
-            interrupter.join(_READER_JOIN_SECONDS)
-
-            assert elapsed < _INTERRUPT_BOUND_SECONDS
-
-            assert fake_device.cancel_calls == 1
-            assert fake_device.close_while_blocked is False
-            assert fake_device.close_calls == 0
-
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_blocked is False
-        assert page_sink.records == ()
-
-    def test_a_timed_out_feeder_page_sends_one_cancel_in_all(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """
-        After a feeder page times out, the only cancel is the one the timeout sent.
-
-        Neither the feeder iterator's finaliser nor the device context's routine
-        cancel before close sends another.  On the ``net`` backend each cancel is
-        a request to a host that may have stopped answering, and those two would
-        run on the worker thread with no bound.  Counted after the context has
-        exited and after a collection, so an iterator released late by a
-        reference cycle would still be counted if it cancelled an open handle.
-        """
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-
-        # The device context is the outer one, so the timeout is caught, and
-        # its traceback let go of, while the handle is still open.
-        with (
-            sane_backend._open_device(_TEST_DEVICE) as dev,
-            pytest.raises(ScanError, match="timed out"),
-        ):
-            sane_backend._scan_adf_pages(
-                dev, page_sink, _UNCROPPED, sane_backend_mod._PageBudget(timeout=0.05)
-            )
-        gc.collect()
-
-        assert fake_device.cancel_calls == 1
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_blocked is False
-
-    def test_a_timed_out_flatbed_page_sends_one_cancel_in_all(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """
-        After a flatbed page times out, the device context sends no second cancel.
-
-        The flatbed has no iterator, so the one extra cancel it could send is
-        the routine one before close.
-        """
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-
-        with (
-            sane_backend._open_device(_TEST_DEVICE) as dev,
-            pytest.raises(ScanError, match="timed out"),
-        ):
-            sane_backend_mod._snap_flatbed(
-                dev,
-                _TEST_DEVICE,
-                page_sink,
-                _UNCROPPED,
-                sane_backend_mod._PageBudget(timeout=0.05),
-            )
-        gc.collect()
-
-        assert fake_device.cancel_calls == 1
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_blocked is False
-
-    @pytest.mark.parametrize(
-        "interruption",
-        [
-            pytest.param(KeyboardInterrupt(), id="ctrl-c"),
-            pytest.param(
-                ScanInterrupted("Interrupted by SIGTERM", signum=signal.SIGTERM),
-                id="sigterm",
-            ),
-        ],
-    )
-    def test_an_interrupt_before_the_reader_starts_wedges_nothing(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        monkeypatch: pytest.MonkeyPatch,
-        interruption: BaseException,
-    ) -> None:
-        """
-        Ctrl-C landing before the reader thread exists neither cancels nor wedges.
-
-        Parametrised over a signal's ``ScanInterrupted`` too, which takes the same
-        settle path.  With no reader, a cancel would hit a handle holding no read
-        and the grace would be waited out on an event nothing sets; the wedge then
-        recorded could never clear, because only a reader's ``finally`` releases
-        it, and every later scan would refuse.
-
-        Only the *reader* thread is interrupted, so the cancel thread would start
-        normally if the handler reached for it; ``cancel_calls`` is therefore a
-        real assertion.  The elapsed bound pins "did not wait out the grace".
-        """
-        reader_prefix = sane_backend_mod._READER_THREAD_PREFIX
-
-        class _InterruptTheReaderBeforeItStarts(threading.Thread):
-            """A Thread whose reader never gets as far as running."""
-
-            def start(self) -> None:
-                """Raise instead of starting, but only for the reader."""
-                if self.name.startswith(reader_prefix):
-                    raise interruption
-                super().start()
-
-        monkeypatch.setattr(
-            sane_backend_mod.threading, "Thread", _InterruptTheReaderBeforeItStarts
-        )
-        grace = 5.0
-
-        # The assertions are inside the device context because _open_device's
-        # own finally issues a routine cancel() on the clean path, which would
-        # make cancel_calls 1 for a reason that has nothing to do with this.
-        with sane_backend._open_device(_TEST_DEVICE) as dev:
-            began = time.monotonic()
-            with pytest.raises(type(interruption)):
-                sane_backend_mod._acquire_with_timeout(
-                    dev,
-                    fake_device.snap,
-                    page_budget_mod._page_label(0),
-                    sane_backend_mod._PageBudget(timeout=5.0, grace=grace),
-                )
-            elapsed = time.monotonic() - began
-
-            assert fake_device.cancel_calls == 0
-            assert sane_backend_mod._WEDGE.stuck is False
-
-        assert elapsed < grace
-
-    def test_a_read_that_settles_in_the_grace_leaves_no_wedge(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """
-        The wedge written before the cancel is cleared once the read returns.
-
-        The record goes in before the cancel fires, so a read that comes back
-        inside the grace has to take it out again.  Left behind, it would
-        refuse every later scan for a device that answered, and the device
-        context would leave a perfectly good handle open.
-        """
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-
-        with sane_backend._open_device(_TEST_DEVICE) as dev:
-            with pytest.raises(ScanError, match="timed out") as raised:
-                sane_backend._scan_adf_pages(
-                    dev,
-                    page_sink,
-                    _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=0.05),
-                )
-            record = sane_backend_mod._WEDGE
-            assert record.stuck is False
-            assert record.settling is False
-            assert record.outstanding == set()
-            assert fake_device.close_calls == 0
-
-        assert "did not answer the cancel" not in str(raised.value)
-
-    def test_any_error_from_the_wait_still_settles_a_started_read(
-        self, sane_backend: SaneBackend, fake_device: FakeSaneDev
-    ) -> None:
-        """
-        An exception that is not an interrupt still cancels and waits out a read.
-
-        A wait too long for ``threading.Event.wait`` raises ``OverflowError``
-        once the reader is running. Left unsettled, the device context would
-        cancel and close the handle while the read was still inside it.
-        """
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-
-        with sane_backend._open_device(_TEST_DEVICE) as dev:
-            with pytest.raises(OverflowError):
-                sane_backend_mod._acquire_with_timeout(
-                    dev,
-                    fake_device.snap,
-                    page_budget_mod._page_label(0),
-                    sane_backend_mod._PageBudget(timeout=1e300),
-                )
-
-            assert fake_device.cancel_calls == 1
-            assert fake_device.read_is_blocked() is False
-            assert sane_backend_mod._WEDGE.stuck is False
-
-        assert fake_device.close_while_blocked is False
-
-    def test_an_interrupt_while_the_cancel_is_prepared_leaves_the_wedge(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-    ) -> None:
-        """
-        Ctrl-C landing as the cancel thread is built finds the wedge recorded.
-
-        The record has to come before any other work of the cancel tail. An
-        interrupt landing before it would leave no wedge, and the device
-        context would then cancel and close the handle while the read was
-        still inside it. With the record standing, the handle is left alone
-        until the read returns, and the reader closes it then.
-        """
-
-        class _InterruptTheCancelAsItIsBuilt(threading.Thread):
-            """A Thread whose construction is interrupted for the canceller."""
-
-            def __init__(
-                self,
-                *,
-                target: Callable[..., object],
-                name: str,
-                daemon: bool,
-                args: tuple[object, ...] = (),
-            ) -> None:
-                """Raise for the cancel thread, construct any other."""
-                if name == _CANCEL_THREAD_NAME:
-                    raise KeyboardInterrupt
-                super().__init__(target=target, name=name, daemon=daemon, args=args)
-
-        fake_device.block_read(ReadBlockMode.NEVER)
-        monkeypatch.setattr(
-            sane_backend_mod.threading, "Thread", _InterruptTheCancelAsItIsBuilt
-        )
-
-        with sane_backend._open_device(_TEST_DEVICE) as dev:
-            with pytest.raises(KeyboardInterrupt):
-                sane_backend_mod._acquire_with_timeout(
-                    dev,
-                    fake_device.snap,
-                    page_budget_mod._page_label(0),
-                    sane_backend_mod._PageBudget(timeout=0.05),
-                )
-
-            assert _wedged()
-
-        assert fake_device.close_while_blocked is False
-        assert fake_device.close_calls == 0
-
-        fake_device.release_read()
-        _join_sane_reader_threads()
-
-        assert not _wedged()
-        assert fake_device.close_calls == 1
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_cancelling is False
-
-    def test_a_slow_cancel_reply_holds_the_worker_no_longer_than_the_grace(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        second_pass_sink: SpooledPageSink,
-    ) -> None:
-        """
-        A cancel still in flight at the end of the grace leaves the handle wedged.
-
-        On ``net`` a cancel is a request to the host, and a host slow to reply
-        holds the thread that sent it.  Here the read comes back at once but
-        the cancel does not: the worker gives it the grace and no more, sends
-        no second cancel, and closes nothing, because closing a handle while
-        SANE is still inside a cancel on it is as unsafe as closing it under a
-        read.  The cancel thread closes the handle itself when the reply
-        finally arrives, and the wedge clears.
-
-        The margin on the elapsed time is generous on purpose: what it pins is
-        "about the grace", not a scheduling latency.
-        """
-        release = threading.Event()
-        fake_device.block_read(ReadBlockMode.PARTIAL)
-        fake_device.block_cancel(release)
-        grace = 1.0
-        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
-
-        try:
-            began = time.monotonic()
-            with (
-                pytest.raises(ScanError, match="timed out") as raised,
-                sane_backend._open_device(_TEST_DEVICE) as dev,
-            ):
-                sane_backend._scan_adf_pages(
-                    dev,
-                    page_sink,
-                    _UNCROPPED,
-                    sane_backend_mod._PageBudget(timeout=0.05, grace=grace),
-                )
-            elapsed = time.monotonic() - began
-
-            assert elapsed < grace + 1.0
-            assert "did not answer the cancel" in str(raised.value)
-            assert fake_device.cancel_calls == 1
-            assert fake_device.cancels_in_flight_max == 1
-            # No close at all, so none under the cancel either.
-            assert fake_device.close_calls == 0
-            assert _wedged() is True
-            with pytest.raises(ScanError, match="Restart saneless"):
-                sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
-        finally:
-            release.set()
-        _join_sane_cancel_threads()
-
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_cancelling is False
-        assert fake_device.close_while_blocked is False
-        assert fake_device.cancels_in_flight_max == 1
-        assert _wedged() is False
-
-    @pytest.mark.parametrize(
-        ("signum", "expected"),
-        [
-            pytest.param(signal.SIGINT, KeyboardInterrupt, id="ctrl-c"),
-            pytest.param(signal.SIGTERM, ScanInterrupted, id="sigterm"),
-        ],
-    )
-    def test_a_second_interrupt_during_the_grace_still_records_the_wedge(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-        signum: signal.Signals,
-        expected: type[BaseException],
-    ) -> None:
-        """
-        Ctrl-C pressed twice leaves the stuck read recorded, not closed under.
-
-        The first interrupt lands during the read and starts the cancel; the
-        second lands while the worker waits out the grace for a read that ignores
-        the cancel.  The wedge is written before the cancel fires, so the second
-        interrupt cannot skip it: the device context leaves the handle alone, the
-        next scan is refused, and the reader closes the handle when it returns.
-
-        Both signals go to the main thread with ``pthread_kill``, where the wait
-        they interrupt runs.  Each waits on the fake's event for the moment it is
-        meant to hit, so there is no sleep.
-        """
-        fake_device.block_read(ReadBlockMode.NEVER)
-        main_thread = threading.main_thread().ident
-        assert main_thread is not None
-        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
-
-        def interrupt_twice() -> None:
-            if not fake_device.read_started.wait(_READER_JOIN_SECONDS):
-                return
-            signal.pthread_kill(main_thread, signum)
-            if fake_device.cancel_started.wait(_READER_JOIN_SECONDS):
-                signal.pthread_kill(main_thread, signum)
-
-        interrupter = threading.Thread(
-            target=interrupt_twice, name="interrupter", daemon=True
-        )
-        handling = (
-            _signal_raises_scan_interrupted(signum)
-            if expected is ScanInterrupted
-            else contextlib.nullcontext()
-        )
-
-        # Started before the scan: it does nothing until the read has begun.
-        interrupter.start()
-        with (
-            handling,
-            pytest.raises(expected),
-            sane_backend._open_device(_TEST_DEVICE) as dev,
-        ):
-            sane_backend._scan_adf_pages(
-                dev,
-                page_sink,
-                _UNCROPPED,
-                sane_backend_mod._PageBudget(timeout=20.0, grace=20.0),
-            )
-        interrupter.join(_READER_JOIN_SECONDS)
-
-        assert _wedged() is True
-        assert fake_device.cancel_calls == 1
-        # No close at all, so none under the read either.
-        assert fake_device.close_calls == 0
-        with pytest.raises(ScanError, match="Restart saneless"):
-            sane_backend.scan_pages(_TEST_DEVICE, settings, page_sink)
-
-        fake_device.release_read()
-        _join_sane_reader_threads()
-
-        assert fake_device.close_calls == 1
-        assert fake_device.close_while_blocked is False
-        assert _wedged() is False
-
-
 class TestBeginSettle:
     """Recording a wedge before a cancel leaves a read that has returned alone."""
 
@@ -4135,150 +3231,113 @@ class TestBeginSettle:
 
 class TestReinitialise:
     """
-    The per-job SANE restart, and the two states in which it must not run.
+    SANE is restarted in the session's scan child, never in this process.
 
-    After a saned restart, an open in this process keeps failing with an I/O
-    error until SANE is restarted, so each scan job starts by restarting it.
-    ``sane_exit`` closes every open handle with a close request that waits for
-    a reply, and on a host that has silently vanished that wait can last
-    longer than 40 seconds.  So the restart is refused, with no SANE
-    call at all, while a read is stuck or any handle is open.  "No SANE call"
-    is asserted on the fake's own counters, because a refusal that came after
-    ``sane_exit`` would already be too late.
+    After a saned restart an open keeps failing with an I/O error until SANE
+    is restarted, so a job restarts it before each later pass.  The library
+    lives in the job's child now, so the restart is a command to that child;
+    with no session there is no child to restart, and the next scan starts a
+    fresh one, whose SANE starts fresh.
     """
 
-    @pytest.fixture(autouse=True)
-    def _release_reads(self, fake_device: FakeSaneDev) -> Iterator[None]:
-        """
-        Let any blocked read return after each test, and clear the wedge.
-
-        The release goes through the production path first, so the reader
-        closes its own handle and clears the record.  Whatever is left is then
-        cleared by hand, as ``TestSaneBackendCancelSequence`` does.
-
-        Args:
-            fake_device: The one handle every test here drives.
-
-        Yields:
-            None, before the release and the clear.
-
-        """
-        yield
-        fake_device.release_read()
-        _join_sane_reader_threads()
-        record = sane_backend_mod._WEDGE
-        record.stuck = False
-        record.done = None
-        record.device = None
-        record.device_id = ""
-        record.page_label = ""
-
-    @staticmethod
-    def _sane_calls(module: FakeSaneModule) -> tuple[int, int, int]:
-        """
-        Snapshot the process-level SANE calls the fake has counted.
-
-        Args:
-            module: The patched fake.
-
-        Returns:
-            The exit, init and device-listing call counts, in that order.
-
-        """
-        return (
-            module.exit_call_count,
-            module.init_call_count,
-            module.get_devices_call_count,
-        )
-
-    def test_reinitialise_exits_then_initialises_once(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    def test_reinitialise_restarts_the_library_in_the_session_child(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
     ) -> None:
-        """One restart is one ``sane_exit`` and one ``sane_init``, host kept."""
-        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        backend = SaneBackend(host="scanbox.lan")
-        assert fake_sane_module.init_call_count == 1
+        """Between two passes the one child runs sane_exit, then sane_init."""
+        backend = SaneBackend()
+        settings = _flatbed_settings()
+
+        with backend.scan_session():
+            backend.scan_pages("test:0", settings, page_sink)
+            assert fake_sane_module.child_calls == ["init"]
+            backend.reinitialise()
+            assert fake_sane_module.child_calls == ["init", "exit", "init"]
+            backend.scan_pages("test:0", settings, second_pass_sink)
+
+        assert len(scan_child_seam.children) == 1
+        assert fake_sane_module.init_call_count == 0
         assert fake_sane_module.exit_call_count == 0
 
-        backend.reinitialise()
-
-        assert fake_sane_module.exit_call_count == 1
-        assert fake_sane_module.init_call_count == 2
-        assert sane_backend_mod._INIT.done is True
-        assert sane_backend_mod._INIT.host == "scanbox.lan"
-        assert os.environ["SANE_NET_HOSTS"] == "scanbox.lan"
-
-    def test_reinitialise_calls_exit_before_init(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    def test_reinitialise_outside_a_session_does_nothing(
+        self, fake_sane_module: FakeSaneModule, scan_child_seam: ScanChildSeam
     ) -> None:
-        """The old SANE is shut down before the new one starts, never after."""
+        """With no session there is no child, and none is started to restart."""
+        SaneBackend().reinitialise()
+
+        assert scan_child_seam.launches == []
+        assert fake_sane_module.child_calls == []
+        assert fake_sane_module.init_call_count == 0
+        assert fake_sane_module.exit_call_count == 0
+
+    def test_reinitialise_before_the_first_scan_starts_no_child(
+        self, fake_sane_module: FakeSaneModule, scan_child_seam: ScanChildSeam
+    ) -> None:
+        """A session whose child has not started yet has nothing to restart."""
         backend = SaneBackend()
-        order: list[str] = []
-        real_exit = fake_sane_module.exit
+
+        with backend.scan_session():
+            backend.reinitialise()
+
+        assert scan_child_seam.launches == []
+        assert fake_sane_module.child_calls == []
+
+    def test_a_failed_restart_is_reported_and_the_next_pass_starts_afresh(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """
+        A SANE that will not start again fails the restart, and only the restart.
+
+        The child that failed is gone, so the next pass in the same session
+        starts a fresh child, whose SANE start succeeds.
+        """
+        backend = SaneBackend()
+        settings = _flatbed_settings()
         real_init = fake_sane_module.init
+        starts = 0
 
-        def recording_exit() -> None:
-            """Record the shutdown, then make it."""
-            order.append("exit")
-            real_exit()
-
-        def recording_init() -> tuple[int, int, int, int]:
-            """
-            Record the start, then make it.
-
-            Returns:
-                The version the fake reports.
-
-            """
-            order.append("init")
+        def second_start_fails() -> tuple[int, int, int, int]:
+            nonlocal starts
+            starts += 1
+            if starts == 2:
+                reason = "no backend could start"
+                raise FakeSaneError(reason)
             return real_init()
 
-        monkeypatch.setattr(fake_sane_module, "exit", recording_exit)
-        monkeypatch.setattr(fake_sane_module, "init", recording_init)
+        monkeypatch.setattr(fake_sane_module, "init", second_start_fails)
 
-        backend.reinitialise()
+        with backend.scan_session():
+            backend.scan_pages("test:0", settings, page_sink)
+            with pytest.raises(ScanError) as failure:
+                backend.reinitialise()
+            batch = backend.scan_pages("test:0", settings, second_pass_sink)
 
-        assert order[-2:] == ["exit", "init"]
+        assert str(failure.value) == (
+            "Could not initialise SANE: no backend could start"
+        )
+        assert len(batch.pages) == 1
+        assert len(scan_child_seam.children) == 2
 
-    def test_reinitialise_is_refused_while_a_read_is_stuck(
-        self,
-        sane_backend: SaneBackend,
-        fake_sane_module: FakeSaneModule,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """A stuck read refuses the restart before any SANE call is made."""
-        TestSaneBackendCancelSequence._wedge(sane_backend, fake_device, page_sink)
-        calls_before = self._sane_calls(fake_sane_module)
-        device_calls_before = list(fake_device.calls)
+    def test_the_base_reinitialise_does_nothing(self) -> None:
+        """A backend holding no library has nothing to restart."""
+        assert StubScannerBackend().reinitialise() is None
 
-        with pytest.raises(ScanError, match="Restart saneless"):
-            sane_backend.reinitialise()
 
-        assert self._sane_calls(fake_sane_module) == calls_before
-        assert fake_device.calls == device_calls_before
-        assert fake_sane_module.exit_while_blocked is False
+class TestOpenHandleRecord:
+    """
+    The in-process open-handle record counts each handle once.
 
-    def test_reinitialise_is_refused_while_a_handle_is_open(
-        self,
-        sane_backend: SaneBackend,
-        fake_sane_module: FakeSaneModule,
-        fake_device: FakeSaneDev,
-    ) -> None:
-        """An open handle refuses the restart; closing it allows it again."""
-        with sane_backend._open_device(_TEST_DEVICE):
-            calls_before = self._sane_calls(fake_sane_module)
-            device_calls_before = list(fake_device.calls)
-
-            with pytest.raises(ScanError, match="still open"):
-                sane_backend.reinitialise()
-
-            assert self._sane_calls(fake_sane_module) == calls_before
-            assert fake_device.calls == device_calls_before
-
-        exits_before = fake_sane_module.exit_call_count
-        sane_backend.reinitialise()
-        assert fake_sane_module.exit_call_count == exits_before + 1
+    ``SaneBackend`` no longer opens a device in this process; these pin the
+    record its in-process device block still keeps.
+    """
 
     def test_the_handle_count_follows_opens_and_closes_for_reinitialise(
         self, sane_backend: SaneBackend
@@ -4300,7 +3359,7 @@ class TestReinitialise:
     def test_a_failed_open_is_not_counted_for_reinitialise(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A handle that never opened is never counted, so never blocks a job."""
+        """A handle that never opened is never counted."""
         module = FakeSaneModule(open_error=FakeSaneError("Invalid argument"))
         monkeypatch.setattr(scan_session_mod, "sane", module)
         backend = SaneBackend()
@@ -4310,35 +3369,8 @@ class TestReinitialise:
 
         assert sane_backend_mod._handles_open() == 0
 
-    def test_a_stuck_handle_stays_counted_until_released_for_reinitialise(
-        self,
-        sane_backend: SaneBackend,
-        fake_device: FakeSaneDev,
-        page_sink: SpooledPageSink,
-    ) -> None:
-        """
-        A handle left open by a stuck read is counted until the reader closes it.
-
-        The device block exits without closing the handle, so the count must
-        not drop there.  It drops when the late read returns and the reader
-        closes the handle itself.
-        """
-        TestSaneBackendCancelSequence._wedge(sane_backend, fake_device, page_sink)
-        assert sane_backend_mod._handles_open() == 1
-
-        fake_device.release_read()
-        _join_sane_reader_threads()
-
-        assert fake_device.close_calls == 1
-        assert sane_backend_mod._handles_open() == 0
-
     def test_closing_one_handle_twice_leaves_another_counted(self) -> None:
-        """
-        A second close of the same handle does not count a different one closed.
-
-        A bare count would drop to zero here and let SANE restart with the
-        other handle still open, which ``sane_exit`` would then try to close.
-        """
+        """A second close of the same handle does not count a different one closed."""
         first = FakeSaneDev()
         second = FakeSaneDev()
         sane_backend_mod._handle_opened(first)
@@ -4350,167 +3382,6 @@ class TestReinitialise:
         assert sane_backend_mod._handles_open() == 1
         sane_backend_mod._handle_closed(second)
         assert sane_backend_mod._handles_open() == 0
-
-    def test_reinitialise_logs_one_info_line(
-        self,
-        fake_sane_module: FakeSaneModule,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A job adds one INFO line; the shutdown and start lines are DEBUG."""
-        _ = fake_sane_module
-        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
-        backend = SaneBackend(host="scanbox.lan")
-        caplog.set_level(logging.DEBUG, logger=_BACKEND_LOGGER)
-        caplog.clear()
-
-        backend.reinitialise()
-
-        records = [r for r in caplog.records if r.name == _BACKEND_LOGGER]
-        loud = [r.getMessage() for r in records if r.levelno >= logging.INFO]
-        assert loud == ["SANE re-initialised before this scan"]
-        quiet = [r.getMessage() for r in records if r.levelno == logging.DEBUG]
-        assert "SANE shut down" in quiet
-        assert any(m.startswith("SANE initialized") for m in quiet)
-        assert any(m.startswith("SANE net host discovery") for m in quiet)
-
-    def test_the_base_reinitialise_does_nothing(self) -> None:
-        """A backend holding no process-global library has nothing to restart."""
-        assert StubScannerBackend().reinitialise() is None
-
-    def test_a_failed_start_during_reinitialise_is_reported_and_retried(
-        self,
-        sane_backend: SaneBackend,
-        fake_sane_module: FakeSaneModule,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """
-        A SANE that will not start again fails the job and is tried next time.
-
-        The guard stays unset, so the next job's restart calls ``sane_init``
-        rather than assuming a SANE that is not there.
-        """
-
-        def failing_init() -> tuple[int, int, int, int]:
-            """
-            Count the call and fail, as a SANE that cannot start does.
-
-            Raises:
-                FakeSaneError: Always.
-
-            """
-            fake_sane_module.init_call_count += 1
-            reason = "no backend could start"
-            raise FakeSaneError(reason)
-
-        real_init = fake_sane_module.init
-        monkeypatch.setattr(fake_sane_module, "init", failing_init)
-
-        with pytest.raises(ScanError) as failure:
-            sane_backend.reinitialise()
-
-        assert str(failure.value).startswith("Could not initialise SANE: ")
-        assert sane_backend_mod._INIT.done is False
-
-        monkeypatch.setattr(fake_sane_module, "init", real_init)
-        inits_before = fake_sane_module.init_call_count
-        sane_backend.reinitialise()
-        assert fake_sane_module.init_call_count == inits_before + 1
-        # The version, not ``done``: a type checker still holds ``done`` at the
-        # False asserted above.  Only a successful init records a version.
-        assert sane_backend_mod._INIT.version == (16777248, 1, 0, 32)
-
-
-# The child process the exit proof runs, and the bound it is given.
-#
-# It blocks in ``os.read`` on a pipe nobody writes to.  That is the honest
-# stand-in for ``sane_read``: a real blocking syscall that releases the GIL,
-# which a wait on a ``threading.Event`` would only pretend to be -- and the
-# whole claim under test is about what the interpreter does at exit with a
-# thread parked in exactly such a call.
-#
-# Twenty seconds is not a duration the proof expects to use: a passing run
-# exits in well under a second.  It is the bound that turns the failure this
-# test exists to catch -- a process that never exits -- into a reported
-# failure instead of a hung session.  A ``TimeoutExpired`` is therefore left
-# to raise rather than caught.
-_CHILD_EXIT_SECONDS = 20.0
-_STUCK_READ_CHILD = '''\
-"""Block a daemon reader in a real syscall, then leave."""
-
-import os
-
-from saneless.exceptions import ScanError
-from saneless.scanner.sane_backend import _acquire_with_timeout, _PageBudget
-
-
-class StuckScanner:
-    """A device whose read never returns and whose cancel changes nothing."""
-
-    def __init__(self) -> None:
-        self.cancels = 0
-        self.closes = 0
-
-    def cancel(self) -> None:
-        self.cancels += 1
-
-    def close(self) -> None:
-        self.closes += 1
-
-
-read_fd, _write_fd = os.pipe()
-device = StuckScanner()
-returned = True
-
-
-def never_returns() -> object:
-    """Block forever in a GIL-releasing syscall, as sane_read does."""
-    return os.read(read_fd, 1)
-
-
-try:
-    _acquire_with_timeout(
-        device, never_returns, "Page 1", _PageBudget(timeout=0.2, grace=0.2)
-    )
-except ScanError as exc:
-    returned = "did not answer the cancel" not in str(exc)
-
-print(f"returned={returned} cancels={device.cancels} closes={device.closes}")
-'''
-
-
-class TestStuckReadDoesNotBlockProcessExit:
-    """
-    A process with a permanently stuck SANE read still exits on its own.
-
-    No in-process test can show that the interpreter would exit, so a real
-    child is started, wedged in a real blocking read, and required to exit.
-    """
-
-    def test_process_exits(self, tmp_path: Path) -> None:
-        """
-        A child with a permanently stuck reader still exits, and exits 0.
-
-        The printed line carries the whole cancel sequence in one assertion:
-        the read did not return, exactly one cancel was fired, and no close
-        was issued on a handle a read is still inside.
-
-        Args:
-            tmp_path: Where the child script is written.
-
-        """
-        child = tmp_path / "stuck_read.py"
-        child.write_text(_STUCK_READ_CHILD, encoding="utf-8")
-        result = subprocess.run(
-            [sys.executable, str(child)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_CHILD_EXIT_SECONDS,
-        )
-
-        assert result.returncode == 0, result.stderr
-        assert "returned=False cancels=1 closes=0" in result.stdout
 
 
 class TestSaneBackendADFCleanup:
@@ -6573,30 +5444,26 @@ class TestPageBudget:
     @staticmethod
     def _spy_on_budgets(
         monkeypatch: pytest.MonkeyPatch,
-    ) -> list[sane_backend_mod._PageBudget]:
+    ) -> list[tuple[str, tuple[float, str] | None]]:
         """
-        Record the budget every acquisition is given, then acquire as usual.
+        Record the budget the session times each page stage with.
 
         Args:
-            monkeypatch: Fixture used to wrap the acquisition.
+            monkeypatch: Fixture used to wrap the session's stage clock.
 
         Returns:
-            The list the budgets are appended to, in acquisition order.
+            One ``(stage, budget)`` pair per start or read stage, in order.
 
         """
-        budgets: list[sane_backend_mod._PageBudget] = []
-        real = sane_backend_mod._acquire_with_timeout
+        budgets: list[tuple[str, tuple[float, str] | None]] = []
+        real = ScanChildSession._start_stage_clock
 
-        def spy(
-            dev: scan_session_mod.SaneDevice,
-            work: Callable[[], object],
-            page_label: str,
-            budget: sane_backend_mod._PageBudget,
-        ) -> Image.Image:
-            budgets.append(budget)
-            return real(dev, work, page_label, budget)
+        def spy(session: ScanChildSession) -> None:
+            if session._stage in {ScanStage.START, ScanStage.READ}:
+                budgets.append((session._stage.value, session._page_budget))
+            real(session)
 
-        monkeypatch.setattr(sane_backend_mod, "_acquire_with_timeout", spy)
+        monkeypatch.setattr(ScanChildSession, "_start_stage_clock", spy)
         return budgets
 
     @pytest.mark.parametrize(
@@ -6628,10 +5495,12 @@ class TestPageBudget:
         )
 
         assert len(batch.pages) == 1
-        assert budgets
-        for budget in budgets:
-            assert budget.timeout == pytest.approx(480, rel=0.01)
-            assert budget.page == scan_page_description(
+        assert [stage for stage, _ in budgets][:2] == ["start", "read"]
+        for _, budget in budgets:
+            assert budget is not None
+            timeout, page = budget
+            assert timeout == pytest.approx(480, rel=0.01)
+            assert page == scan_page_description(
                 _A4_1200_WIDTH, _A4_1200_LINES, colour=True, dpi=1200
             )
 
@@ -6670,7 +5539,6 @@ class TestPageBudget:
                 )
         finally:
             dev.release_read()
-            _join_sane_reader_threads()
 
         message = str(raised.value)
         assert message.startswith("Page 1 timed out after 0s, the limit for ")
@@ -7421,6 +6289,41 @@ class _RecordingSink(PageSink):
         return record
 
 
+class _WeakSink(PageSink):
+    """
+    A sink that counts, at each ``add``, the pages it was given still alive.
+
+    It keeps only ``weakref``s, so the count is what the caller retains.
+    """
+
+    def __init__(self, delegate: SpooledPageSink) -> None:
+        """
+        Wrap a real sink.
+
+        Args:
+            delegate: The sink that actually writes each page.
+
+        """
+        self._delegate = delegate
+        self._given: list[weakref.ref[Image.Image]] = []
+        self.live_at_each_add: list[int] = []
+
+    def add(self, image: Image.Image, *, dpi: int) -> PageRecord:
+        """
+        Count the live pages, this one included, then pass it on.
+
+        Returns:
+            The delegate's record, unchanged.
+
+        """
+        self._given.append(weakref.ref(image))
+        gc.collect()
+        self.live_at_each_add.append(
+            sum(1 for page in self._given if page() is not None)
+        )
+        return self._delegate.add(image, dpi=dpi)
+
+
 def _feeder_of(pages: int, monkeypatch: pytest.MonkeyPatch) -> FakeSaneDev:
     """
     Build a fresh feeder of ``pages`` sheets and wire it into the backend.
@@ -7475,6 +6378,24 @@ class TestPeakPageMemory:
         # same peak.  This is the assertion that fails if anything downstream
         # starts accumulating.
         assert long_run.high_water_live_pages == short_run.high_water_live_pages
+
+    def test_the_parent_holds_one_decoded_page_at_a_time(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Each page this process decodes is released before the next arrives.
+
+        The child's own images are the fake's to count; the ones this process
+        holds are the images the sink is handed, each counted live with a
+        ``weakref`` at every ``add``.
+        """
+        _feeder_of(12, monkeypatch)
+        sink = _WeakSink(_page_sink_for(tmp_path))
+
+        batch = SaneBackend().scan_pages("test:0", _feeder_settings(), sink)
+
+        assert len(batch.pages) == 12
+        assert sink.live_at_each_add == [1] * 12
 
     def test_live_page_images_falls_as_pages_are_released(self) -> None:
         """The counter tracks releases, so a steady reading means retention."""
@@ -7568,6 +6489,205 @@ class _AssignmentFailure(NamedTuple):
     expected: str
 
 
+class _PassFault(NamedTuple):
+    """
+    One SANE failure a pass meets, and what it has to become.
+
+    Attributes:
+        arm: Builds a fresh fake module with the fault armed, and returns
+            it with the exception SANE raises.
+        settings: The settings that reach the failing call.
+        expected: The saneless error class the pass raises.
+        message: Its exact message.
+
+    """
+
+    arm: Callable[[], tuple[FakeSaneModule, BaseException]]
+    settings: ScanSettings
+    expected: type[ScanError]
+    message: str
+
+
+def _with_device(
+    arm: Callable[[FakeSaneDev], BaseException],
+) -> Callable[[], tuple[FakeSaneModule, BaseException]]:
+    """
+    Return a builder for a fresh fake whose device has one fault armed.
+
+    Args:
+        arm: Arms the fault on the device, returning the exception it raises.
+
+    Returns:
+        The builder.
+
+    """
+
+    def build() -> tuple[FakeSaneModule, BaseException]:
+        dev = FakeSaneDev()
+        return FakeSaneModule(device=dev), arm(dev)
+
+    return build
+
+
+def _open_fails() -> tuple[FakeSaneModule, BaseException]:
+    """
+    Build a fresh fake whose ``open()`` fails.
+
+    Returns:
+        The module and the exception its ``open()`` raises.
+
+    """
+    error = FakeSaneError("Invalid argument")
+    return FakeSaneModule(open_error=error), error
+
+
+def _armed(method: str, error: BaseException) -> Callable[[FakeSaneDev], BaseException]:
+    """
+    Return an arming that makes one device call fail.
+
+    Returns:
+        The arming function.
+
+    """
+
+    def arm(dev: FakeSaneDev) -> BaseException:
+        dev.fail_call(method, error)
+        return error
+
+    return arm
+
+
+def _start_fails(
+    error: BaseException,
+) -> Callable[[], tuple[FakeSaneModule, BaseException]]:
+    """
+    Return a builder for a fresh fake whose first ``start()`` fails.
+
+    Returns:
+        The builder.
+
+    """
+
+    def build() -> tuple[FakeSaneModule, BaseException]:
+        return FakeSaneModule(device=FakeSaneDev(start_error=error)), error
+
+    return build
+
+
+def _assignment_fails(
+    option: str, error: BaseException
+) -> Callable[[FakeSaneDev], BaseException]:
+    """
+    Return an arming that makes one option assignment fail.
+
+    Returns:
+        The arming function.
+
+    """
+
+    def arm(dev: FakeSaneDev) -> BaseException:
+        dev.fail_assignment(option, error)
+        return error
+
+    return arm
+
+
+def _read_back_fails(
+    option: str, error: BaseException
+) -> Callable[[FakeSaneDev], BaseException]:
+    """
+    Return an arming that makes one option read-back fail.
+
+    Returns:
+        The arming function.
+
+    """
+
+    def arm(dev: FakeSaneDev) -> BaseException:
+        dev.fail_read(option, error)
+        return error
+
+    return arm
+
+
+_PASS_FAULTS = [
+    pytest.param(
+        _PassFault(
+            arm=_open_fails,
+            settings=_flatbed_settings(),
+            expected=ScanError,
+            message="Could not open scanner test:0: Invalid argument",
+        ),
+        id="open",
+    ),
+    pytest.param(
+        _PassFault(
+            arm=_with_device(
+                _assignment_fails("mode", AttributeError("Inactive option: mode"))
+            ),
+            settings=_flatbed_settings(),
+            expected=ScanError,
+            message="Could not set mode to 'Color' on test:0: Inactive option: mode",
+        ),
+        id="assignment",
+    ),
+    pytest.param(
+        _PassFault(
+            arm=_with_device(
+                _read_back_fails(
+                    "resolution", AttributeError("Inactive option: resolution")
+                )
+            ),
+            settings=_flatbed_settings(),
+            expected=ScanError,
+            message=(
+                "Could not read back resolution from test:0: "
+                "Inactive option: resolution"
+            ),
+        ),
+        id="read-back",
+    ),
+    pytest.param(
+        _PassFault(
+            arm=_with_device(
+                _armed("get_options", FakeSaneError("Error during device I/O"))
+            ),
+            settings=_flatbed_settings(),
+            expected=ScanError,
+            message="Could not read options from test:0: Error during device I/O",
+        ),
+        id="get-options",
+    ),
+    pytest.param(
+        _PassFault(
+            arm=_start_fails(FakeSaneError("Scanner cover is open")),
+            settings=_flatbed_settings(),
+            expected=ScanError,
+            message="Scanner error on test:0: Scanner cover is open",
+        ),
+        id="flatbed-start",
+    ),
+    pytest.param(
+        _PassFault(
+            arm=_with_device(_armed("snap", RuntimeError("Scanner returned no data"))),
+            settings=_flatbed_settings(),
+            expected=ScanError,
+            message="Scanner error on test:0: Scanner returned no data",
+        ),
+        id="flatbed-snap",
+    ),
+    pytest.param(
+        _PassFault(
+            arm=_start_fails(FakeSaneError(_OUT_OF_DOCUMENTS)),
+            settings=_flatbed_settings(),
+            expected=FeederEmptyError,
+            message="No paper detected in feeder",
+        ),
+        id="out-of-documents",
+    ),
+]
+
+
 class TestSaneBoundary:
     """
     Every python-sane failure leaves the backend as a saneless type.
@@ -7634,24 +6754,29 @@ class TestSaneBoundary:
 
         assert sane_backend_mod.require_sane() is None
 
-    def test_an_unloadable_libsane_is_reported_when_the_backend_is_built(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_an_unloadable_libsane_is_reported_by_the_first_scan(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """A plain ImportError (libsane.so missing) is today's install hint."""
-        original = ImportError(_LIBSANE_MISSING)
+        """
+        A plain ImportError (libsane.so missing) is today's install hint.
+
+        The backend is built without loading python-sane, so the scan child
+        is where the library first fails to load, and it reports that.
+        """
 
         def _fail() -> NoReturn:
-            raise original
+            raise ImportError(_LIBSANE_MISSING)
 
         monkeypatch.setattr(sane_backend_mod, "_ensure_sane", _fail)
         monkeypatch.setattr(scan_session_mod, "_ensure_sane", _fail)
+        backend = SaneBackend()
 
         with pytest.raises(ConfigError) as exc_info:
-            SaneBackend()
+            backend.scan_pages("test:0", _flatbed_settings(), page_sink)
 
+        assert type(exc_info.value) is ConfigError
         assert str(exc_info.value) == python_sane_missing_message(_LIBSANE_MISSING)
         assert exc_info.value.next_step == PYTHON_SANE_INSTALL_NEXT_STEP
-        assert exc_info.value.__cause__ is original
 
     def test_require_sane_next_step_says_install_not_reconfigure(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7757,21 +6882,29 @@ class TestSaneBoundary:
     # -- init / open / get_devices / close ----------------------------------
 
     def test_init_failure_raises_scan_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """A failing sane.init() is a ScanError chained to the SANE error."""
+        """
+        A failing sane.init() in the scan child is the same ScanError here.
+
+        The child's start keeps the SANE error as the cause
+        (``test_start_library_reports_an_init_failure``); only its text
+        crosses the pipe.
+        """
         original = FakeSaneError("Access to resource has been denied")
         monkeypatch.setattr(
             scan_session_mod, "sane", FakeSaneModule(init_error=original)
         )
+        backend = SaneBackend()
 
-        with pytest.raises(
-            ScanError,
-            match=r"^Could not initialise SANE: Access to resource has been denied$",
-        ) as exc_info:
-            SaneBackend()
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings(), page_sink)
 
-        assert exc_info.value.__cause__ is original
+        assert type(exc_info.value) is ScanError
+        assert str(exc_info.value) == (
+            "Could not initialise SANE: Access to resource has been denied"
+        )
+        assert exc_info.value.next_step is None
 
     def test_open_failure_in_get_capabilities_raises_scan_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7800,9 +6933,10 @@ class TestSaneBoundary:
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """The same translation applies on the scan path."""
-        original = FakeSaneError("Invalid argument")
         monkeypatch.setattr(
-            scan_session_mod, "sane", FakeSaneModule(open_error=original)
+            scan_session_mod,
+            "sane",
+            FakeSaneModule(open_error=FakeSaneError("Invalid argument")),
         )
         backend = SaneBackend()
 
@@ -7813,7 +6947,6 @@ class TestSaneBoundary:
             str(exc_info.value)
             == "Could not open scanner epson2:libusb:001:004: Invalid argument"
         )
-        assert exc_info.value.__cause__ is original
 
     def test_open_failure_with_empty_message_names_the_type(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7868,7 +7001,7 @@ class TestSaneBoundary:
         )
 
         with (
-            caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"),
+            caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER),
             pytest.raises(ScanError, match="NonExistentSource"),
         ):
             backend.scan_pages("test:0", settings, page_sink)
@@ -7877,7 +7010,7 @@ class TestSaneBoundary:
         records = [
             r
             for r in caplog.records
-            if r.name == "saneless.scanner.sane_backend"
+            if r.name == _SESSION_LOGGER
             and r.levelno == logging.WARNING
             and "test:0" in r.getMessage()
         ]
@@ -7895,14 +7028,14 @@ class TestSaneBoundary:
         dev.fail_call("close", FakeSaneError("close failed"))
         backend = _backend_with(dev, monkeypatch)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+        with caplog.at_level(logging.WARNING, logger=_SESSION_LOGGER):
             batch = backend.scan_pages("test:0", _flatbed_settings(), page_sink)
 
         assert len(batch.pages) == 1
         records = [
             r
             for r in caplog.records
-            if r.name == "saneless.scanner.sane_backend"
+            if r.name == _SESSION_LOGGER
             and "Could not close scanner test:0" in r.getMessage()
         ]
         assert len(records) == 1
@@ -8023,7 +7156,6 @@ class TestSaneBoundary:
             backend.scan_pages("test:0", case.settings, page_sink)
 
         assert str(exc_info.value) == case.expected
-        assert exc_info.value.__cause__ is case.error
         assert dev.cancel_calls
         assert dev.close_calls
 
@@ -8031,9 +7163,8 @@ class TestSaneBoundary:
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """Reading the resolution back after setting it is wrapped too."""
-        original = AttributeError("Inactive option: resolution")
         dev = FakeSaneDev()
-        dev.fail_read("resolution", original)
+        dev.fail_read("resolution", AttributeError("Inactive option: resolution"))
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(ScanError) as exc_info:
@@ -8042,7 +7173,6 @@ class TestSaneBoundary:
         assert str(exc_info.value) == (
             "Could not read back resolution from test:0: Inactive option: resolution"
         )
-        assert exc_info.value.__cause__ is original
 
     # -- get_options ---------------------------------------------------------
 
@@ -8050,9 +7180,8 @@ class TestSaneBoundary:
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """get_options() failing on the scan path names the device."""
-        original = FakeSaneError("Error during device I/O")
         dev = FakeSaneDev()
-        dev.fail_call("get_options", original)
+        dev.fail_call("get_options", FakeSaneError("Error during device I/O"))
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(ScanError) as exc_info:
@@ -8061,7 +7190,6 @@ class TestSaneBoundary:
         assert str(exc_info.value) == (
             "Could not read options from test:0: Error during device I/O"
         )
-        assert exc_info.value.__cause__ is original
         assert dev.close_calls
 
     def test_get_options_failure_in_get_capabilities_raises_scan_error(
@@ -8090,47 +7218,83 @@ class TestSaneBoundary:
     def test_flatbed_start_failure_raises_scan_error(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """A flatbed start() failure names the device and chains the original."""
-        original = FakeSaneError("Scanner cover is open")
-        dev = FakeSaneDev(start_error=original)
+        """A flatbed start() failure names the device."""
+        dev = FakeSaneDev(start_error=FakeSaneError("Scanner cover is open"))
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(ScanError) as exc_info:
             backend.scan_pages("test:0", _flatbed_settings(), page_sink)
 
         assert str(exc_info.value) == "Scanner error on test:0: Scanner cover is open"
-        assert exc_info.value.__cause__ is original
         assert not isinstance(exc_info.value, FeederEmptyError)
 
     def test_flatbed_snap_failure_raises_scan_error(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
-        """snap()'s RuntimeError for an empty read is a ScanError with cause."""
-        original = RuntimeError("Scanner returned no data")
+        """snap()'s RuntimeError for an empty read is a ScanError."""
         dev = FakeSaneDev()
-        dev.fail_call("snap", original)
+        dev.fail_call("snap", RuntimeError("Scanner returned no data"))
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(ScanError) as exc_info:
             backend.scan_pages("test:0", _flatbed_settings(), page_sink)
 
         assert "Scanner returned no data" in str(exc_info.value)
-        assert exc_info.value.__cause__ is original
         assert dev.close_calls
 
     def test_flatbed_out_of_documents_is_feeder_empty(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
     ) -> None:
         """The one end-of-feed message maps to FeederEmptyError."""
-        original = FakeSaneError(_OUT_OF_DOCUMENTS)
-        dev = FakeSaneDev(start_error=original)
+        dev = FakeSaneDev(start_error=FakeSaneError(_OUT_OF_DOCUMENTS))
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(FeederEmptyError) as exc_info:
             backend.scan_pages("test:0", _flatbed_settings(), page_sink)
 
         assert str(exc_info.value) == "No paper detected in feeder"
-        assert exc_info.value.__cause__ is original
+
+    @pytest.mark.parametrize("fault", _PASS_FAULTS)
+    def test_the_pass_chains_the_sane_error(
+        self, fault: _PassFault, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pass the child runs raises a saneless error chained to SANE's."""
+        module, original = fault.arm()
+        monkeypatch.setattr(scan_session_mod, "sane", module)
+
+        with pytest.raises(fault.expected) as raised:
+            scan_session_mod.run_pass("test:0", fault.settings, RecordingOutlet())
+
+        assert type(raised.value) is fault.expected
+        assert str(raised.value) == fault.message
+        assert raised.value.__cause__ is original
+
+    @pytest.mark.parametrize("fault", _PASS_FAULTS)
+    def test_the_backend_raises_what_the_pass_raised(
+        self,
+        fault: _PassFault,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        Across the pipe the same class, message and next step arrive.
+
+        The pass is run here first on one fresh fake, then the backend scans
+        through its child on another, armed alike.
+        """
+        module, _ = fault.arm()
+        monkeypatch.setattr(scan_session_mod, "sane", module)
+        with pytest.raises(fault.expected) as in_pass:
+            scan_session_mod.run_pass("test:0", fault.settings, RecordingOutlet())
+
+        module, _ = fault.arm()
+        monkeypatch.setattr(scan_session_mod, "sane", module)
+        with pytest.raises(fault.expected) as through_backend:
+            SaneBackend().scan_pages("test:0", fault.settings, page_sink)
+
+        assert type(through_backend.value) is type(in_pass.value)
+        assert str(through_backend.value) == str(in_pass.value)
+        assert through_backend.value.next_step == in_pass.value.next_step
 
     def test_adf_empty_message_fault_names_the_type(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
@@ -8243,15 +7407,20 @@ class TestDeviceIdsInScanErrorsAreNeutralised:
             f"Could not open scanner {_SHOWN_DEVICE}: "
         )
 
-    def test_wedged_refusal(
+    def test_a_recorded_wedge_refuses_nothing(
         self,
         fake_sane_module: FakeSaneModule,
         fake_device: FakeSaneDev,
         page_sink: SpooledPageSink,
     ) -> None:
-        """The wedge refusal names both devices with their controls escaped."""
-        backend = SaneBackend()
+        """
+        No SaneBackend call consults the in-process wedge record.
+
+        Every SANE call runs in a child whose library is its own, so a read
+        this process once lost cannot stop a scan, a listing or a check.
+        """
         _ = fake_sane_module
+        backend = SaneBackend()
         record = sane_backend_mod._WEDGE
         record.stuck = True
         record.done = threading.Event()
@@ -8259,11 +7428,13 @@ class TestDeviceIdsInScanErrorsAreNeutralised:
         record.device_id = _HOSTILE_DEVICE
         record.page_label = "Page 1"
 
-        with pytest.raises(ScanError) as exc_info:
-            backend.scan_pages(_HOSTILE_DEVICE, _flatbed_settings(), page_sink)
+        batch = backend.scan_pages("test:0", _flatbed_settings(), page_sink)
+        devices = backend.get_devices()
+        survey = backend.list_and_open("test:0")
 
-        self._assert_defused(exc_info.value)
-        assert str(exc_info.value).count(_SHOWN_DEVICE) == 2
+        assert len(batch.pages) == 1
+        assert [device.name for device in devices] == [_TEST_DEVICE]
+        assert survey.list_error is None
 
 
 def test_require_sane_loads_nothing() -> None:

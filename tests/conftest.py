@@ -939,6 +939,9 @@ class _SelfClosingCommands(io.FileIO):
     the write end, so the read end is closed by the end of input it reads.
     """
 
+    # Whether the child's control thread has started reading.
+    read_started = False
+
     def readline(self, size: int | None = -1, /) -> bytes:
         """
         Read one line, and close the pipe at its end.
@@ -947,6 +950,7 @@ class _SelfClosingCommands(io.FileIO):
             The line, or ``b""`` at the end of input.
 
         """
+        self.read_started = True
         line = super().readline(size)
         if not line:
             self.close()
@@ -998,6 +1002,10 @@ class _ThreadChild:
             self._status.append(_scan_child.main(commands, reply_write, runtime))
         finally:
             os.close(reply_write)
+            # A child that failed to start never started its control thread,
+            # so nothing else will read the command pipe to its end.
+            if not commands.read_started:
+                commands.close()
 
     @property
     def pid(self) -> int:
