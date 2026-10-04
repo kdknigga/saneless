@@ -93,9 +93,8 @@ def is_owner(presented: str | None, recorded: str | None) -> bool:
     """
     Report whether a presented token speaks for the job that recorded one.
 
-    A NULL recorded token means the job is unowned and anyone may answer it.
-    Nothing creates one now, but a row written before owner tokens has one,
-    and a strict rule would strand its flip prompt until the timeout.
+    A NULL recorded token means the job is unowned and anyone may answer it,
+    so an unowned row's flip prompt is never stranded until the timeout.
 
     ``secrets.compare_digest`` keeps the comparison constant-time.  It
     refuses a non-ASCII ``str``, so both sides are encoded first.

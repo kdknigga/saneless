@@ -222,8 +222,8 @@ def render_error(
     catch-all 500 is sent outside the ``SecurityHeaders`` middleware.
 
     The strip fetching itself gets no ``HX-Retarget``: htmx 2.0.10 applies that
-    header before choosing what to swap, so a retargeted failure left the strip
-    polling.  ``base.html``'s ``{"code":"[45]..","swap":true,"error":true}``
+    header before choosing what to swap, so a retargeted failure would leave the
+    strip polling.  ``base.html``'s ``{"code":"[45]..","swap":true,"error":true}``
     rule is what makes the exempt error body swap at all.
 
     A refused Scan press carries the Scan button out-of-band, enabled and with
