@@ -984,6 +984,63 @@ def test_sigpipe_is_ignored_again_before_every_reply(
     assert events.count("ignore sigpipe") == len(sends)
 
 
+def test_no_reply_is_written_while_a_handle_is_registered(
+    fake: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The child writes to saneless only while no handle is open to a cancel.
+
+    The control thread's cancel can reset SIGPIPE too, so a reply written
+    while a handle is registered could meet the default action between its
+    ignore and its write.  Over a pass that spools two pages, one that finds
+    the feeder empty, and one cancelled mid-read, every byte is written
+    outside each span from registering a handle to releasing it.
+    """
+    events: list[str] = []
+    real_write = scan_child_main._ReplyChannel._write
+    real_reading = scan_child_main._Control.reading
+
+    def recording_write(reply: scan_child_main._ReplyChannel, data: bytes) -> None:
+        events.append(f"write {_header_shape(data) or 'pixels'}")
+        real_write(reply, data)
+
+    def recording_reading(
+        control: scan_child_main._Control, dev: scan_session_mod.SaneDevice | None
+    ) -> None:
+        real_reading(control, dev)
+        events.append("release" if dev is None else "register")
+
+    monkeypatch.setattr(scan_child_main._ReplyChannel, "_write", recording_write)
+    monkeypatch.setattr(scan_child_main._Control, "reading", recording_reading)
+    fake.device.load_feeder([_content_image(0), _content_image(1)])
+    with _ChildHarness() as child:
+        _ready(child)
+        child.send(_scan())
+        _spool_pass(child)
+        child.send(_scan())
+        _spool_pass(child)
+        fake.device.load_feeder([_content_image(2)])
+        fake.device.block_read(ReadBlockMode.PARTIAL)
+        child.send(_scan())
+        while child.frame() != StageFrame(stage="read", page=1):
+            pass
+        assert fake.device.read_started.wait(_REPLY_TIMEOUT_SECONDS)
+        child.send(ControlOp.CANCEL)
+        child.frames_until(Bye)
+        assert child.join() == 0
+
+    registered = False
+    written_while_registered: list[tuple[int, str]] = []
+    for index, event in enumerate(events):
+        if event in {"register", "release"}:
+            registered = event == "register"
+        elif registered:
+            written_while_registered.append((index, event))
+    assert events.count("register") >= 6, events
+    assert "write pixels" in events
+    assert not written_while_registered, events
+
+
 def test_every_reply_channel_is_given_its_sigpipe_hook() -> None:
     """
     A reply channel cannot be made without saying how SIGPIPE is ignored.
