@@ -1446,6 +1446,12 @@ def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image
     """
     Start and read one sheet, as python-sane's feeder iterator would.
 
+    A cancel can arrive before the handle is registered, or while ``start``
+    runs, when cancelling the handle does not stop the read ``start`` begins.
+    So the cancel is looked at again once the handle is registered, when no
+    sheet is started, and once ``start`` returns, when the read it began is
+    cancelled before anything waits on it.
+
     Raises:
         PassStopped: If a cancel was requested while the sheet was read; a
             cancelled ``snap()`` can return a truncated image, so it is
@@ -1456,7 +1462,16 @@ def _read_sheet(dev: SaneDevice, outlet: PageOutlet, number: int) -> Image.Image
     try:
         outlet.stage(ScanStage.START, number)
         outlet.reading(dev)
+        if outlet.cancel_requested():
+            raise PassStopped
         dev.start()
+        if outlet.cancel_requested():
+            # python-sane raises _sane.error, RuntimeError or AttributeError
+            # with no shared base; a failed cancel leaves the read to the
+            # close that follows.
+            with contextlib.suppress(Exception):
+                dev.cancel()
+            raise PassStopped
         outlet.stage(ScanStage.READ, number)
         # No cancel from snap() on failure: the backend's reader may still run.
         image = dev.snap(no_cancel=True)

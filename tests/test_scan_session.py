@@ -326,6 +326,72 @@ def test_a_page_read_during_a_cancel_is_discarded(
     assert dev.close_calls == 1
 
 
+class _CancelOnRegister(RecordingOutlet):
+    """An outlet whose cancel arrives just as the handle is registered."""
+
+    def reading(self, dev: SaneDevice | None) -> None:
+        """Record the handle, and request the cancel as it is registered."""
+        super().reading(dev)
+        if dev is not None:
+            self.cancel = True
+
+
+def test_a_cancel_before_the_handle_is_registered_starts_no_sheet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cancel that came before the handle was registered starts nothing.
+
+    Cancelling the handle could not reach it then, so the sheet would
+    otherwise be started and read in full before the cancel was seen.
+    """
+    dev = FakeSaneDev(pages=3)
+    _install(monkeypatch, dev)
+
+    with pytest.raises(PassStopped):
+        run_pass(_DEVICE, _feeder(), _CancelOnRegister())
+
+    assert dev.calls.count("start") == 0
+    assert dev.calls.count("snap") == 0
+    assert dev.close_calls == 1
+
+
+def test_a_cancel_during_start_cancels_the_read_it_began(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cancel that lands while ``start`` runs cancels the read, which is not taken.
+
+    A ``sane_cancel`` made before or during ``sane_start`` does not stop the
+    read that start begins, so the read is cancelled once start returns.
+    """
+    dev = FakeSaneDev(pages=3)
+    _install(monkeypatch, dev)
+    outlet = RecordingOutlet()
+    events: list[str] = []
+    real_start, real_cancel = FakeSaneDev.start, FakeSaneDev.cancel
+
+    def start_then_cancel(self: FakeSaneDev) -> None:
+        real_start(self)
+        events.append("start")
+        outlet.cancel = True
+
+    def record_cancel(self: FakeSaneDev) -> None:
+        events.append("cancel")
+        real_cancel(self)
+
+    monkeypatch.setattr(FakeSaneDev, "start", start_then_cancel)
+    monkeypatch.setattr(FakeSaneDev, "cancel", record_cancel)
+
+    with pytest.raises(PassStopped):
+        run_pass(_DEVICE, _feeder(), outlet)
+
+    assert dev.calls.count("snap") == 0
+    assert events[:2] == ["start", "cancel"]
+    assert outlet.pages == []
+    assert dev.close_calls == 1
+
+
 @pytest.mark.parametrize("failing", ["start", "snap"])
 def test_a_failed_read_waits_for_the_reader_before_cancelling(
     monkeypatch: pytest.MonkeyPatch, failing: str
