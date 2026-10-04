@@ -3203,19 +3203,8 @@ def _no_answer(prompt: PassPrompt, deadline: datetime | None) -> str:
     """
     Return the opening of a timeout note: when an unanswered question gives up.
 
-    The deadline, once the page knows it, replaces the duration inside the one
-    note rather than adding a second one, so nothing is said twice.  Until
-    then -- and always in the terminal, which reads only the headline -- the
-    note names the duration.
-
-    Args:
-        prompt: The open question.
-        deadline: When the question gives up, if known.  Must be aware.
-
-    Returns:
-        E.g. ``"No answer within 10 minutes"`` or
-        ``"No answer by 2026-09-30 14:23 CDT"``.
-
+    A known deadline replaces the duration in the note rather than adding a
+    second one; until then, and always in the terminal, the duration is named.
     """
     if deadline is None:
         return f"No answer within {duration_phrase(prompt.timeout_seconds)}"
@@ -3301,19 +3290,7 @@ def _next_pass_copy(prompt: PassPrompt, deadline: datetime | None) -> PassPrompt
 
 
 def _blank_list(prompt: PassPrompt) -> str:
-    """
-    Return the positions of a pass's blank pages as a headline subject.
-
-    Positions are comma-separated, the style of the removed-as-blank note.
-
-    Args:
-        prompt: The open blank-page question.
-
-    Returns:
-        E.g. ``"Pages 2, 4, 6 of the 6 just scanned look blank."``, or
-        ``"Page 3 of the 4 just scanned looks blank."`` for one blank page.
-
-    """
+    """Return the headline naming a pass's blank pages, comma-separated."""
     listed = ", ".join(str(position) for position in prompt.blank_positions)
     if len(prompt.blank_positions) == 1:
         return f"Page {listed} of the {prompt.pass_pages} just scanned looks blank."
@@ -3601,10 +3578,9 @@ def job_state_for(outcome: ScanOutcome) -> JobState:
     "Complete" is the silent success this vocabulary exists to remove.
 
     This is a ``match`` with ``assert_never`` and not a
-    ``dict[ScanOutcome, JobState]`` on purpose.  A dict missing a member draws
-    no diagnostic from either ``ty`` or ``pyrefly``; the same enum in a match
-    is caught by both, at edit time, before a third outcome can fall silently
-    through an ``else``.
+    ``dict[ScanOutcome, JobState]`` on purpose: a dict missing a member draws
+    no diagnostic from ``ty`` or ``pyrefly``, and a match missing one is caught
+    by both.
 
     Args:
         outcome: The outcome the pipeline resolved to.
@@ -3636,25 +3612,11 @@ def _unconfirmed_advice(category: _UnconfirmedCategory) -> ErrorAdvice:
     """
     Return the advice for an upload that may already be in paperless-ngx.
 
-    The two messages differ, because "received" is the stronger statement,
-    but the next step is one: it never says to start the scan again, since a
-    blind rescan could store the document twice.
-
-    The next step does not promise a copy in ``failed/``.  Usually there is
-    one, and the error beside this advice names it; but a job that was
-    uploading when saneless restarted keeps one only if the startup sweep
-    found its PDF, and a copy that could not be written is reported as such.
-    So the import is conditional on the error naming a copy.
-
-    Args:
-        category: One of the two unconfirmed categories.
-
-    Returns:
-        The message for the category and the shared next step, paired.
-
-    Raises:
-        AssertionError: If the value is not one of the two.
-
+    The messages differ, because "received" is the stronger statement, but the
+    shared next step never says to start the scan again.  It does not promise
+    a copy in ``failed/``: a job uploading when saneless restarted keeps one
+    only if the startup sweep found its PDF, so the import is conditional on
+    the error naming a copy.
     """
     match category:
         case ErrorCategory.UNCONFIRMED_SEND:
@@ -3707,7 +3669,7 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
     versions saneless supports, which are facts about saneless rather than
     about the job.
 
-    The two unconfirmed categories share a next step that never says to
+    The unconfirmed categories share a next step that never says to
     start the scan again: the document may already be in paperless-ngx, so a
     blind rescan could store it twice.  ``_unconfirmed_advice`` words the
     pair, as ``_pass_wait_state_label`` does for the multi-page waits.
@@ -3862,8 +3824,8 @@ def error_next_step(category: ErrorCategory) -> str:
         category: The error category to advise on.
 
     Returns:
-        One imperative sentence -- two for ASSEMBLY and UNKNOWN -- that names
-        what to do next without naming the web page or the command line.
+        One or two imperative sentences that name what to do next without
+        naming the web page or the command line.
 
     Raises:
         AssertionError: If the value is not an ErrorCategory member.
@@ -4014,26 +3976,10 @@ def _reload_page_message(
     """
     Return the message for a rejection whose remedy is "reload the page".
 
-    These are one group, not unrelated arms: each names a different thing the
-    browser got wrong and every one ends in the same sentence, because
-    reloading is the only thing a reader can usefully do about any of them.
-    Grouping them keeps ``rejection_message`` readable as ``RequestRejection``
-    grows.
-
-    The parameter is typed as the members this arm can pass, so the
-    ``assert_never`` below still fails the type gate if the group ever grows,
-    and ``rejection_message``'s own ``assert_never`` still fails it if
-    ``RequestRejection`` grows.
-
-    Args:
-        rejection: One of the reload-remedy rejections.
-
-    Returns:
-        The approved sentence for that rejection.
-
-    Raises:
-        AssertionError: If the value is outside the reload-remedy group.
-
+    Each names a different thing the browser got wrong and ends in the same
+    sentence, because reloading is all a reader can usefully do.  The parameter
+    is typed as the group's members, so ``assert_never`` fails the type gate
+    if the group grows.
     """
     match rejection:
         case RequestRejection.INVALID_REQUEST:
@@ -4063,25 +4009,10 @@ def _config_file_message(
     """
     Return the message for a rejection whose remedy is an edit to the config file.
 
-    These are one group: each names the one setting to change and ends
-    in the same instruction, because saneless reads its config file only at
-    start-up.  Each names the setting and never a value -- not the token, not
-    the paperless-ngx URL (which says where paperless-ngx runs), and not the
-    refused Host, which is shown beside the sentence, neutralised and bounded
-    (ASVS 4.0.3 V7.4).
-
-    The parameter is typed as the members this arm can pass, so the
-    ``assert_never`` below still fails the type gate if the group ever grows.
-
-    Args:
-        rejection: One of the config-file rejections.
-
-    Returns:
-        The approved sentence for that rejection.
-
-    Raises:
-        AssertionError: If the value is outside the config-file group.
-
+    Each names the setting to change and ends with a restart, because saneless
+    reads its config file only at start-up.  None names a value: not the token,
+    not the paperless-ngx URL, and not the refused Host, which is shown beside
+    the sentence, neutralised and bounded (ASVS 4.0.3 V7.4).
     """
     match rejection:
         case RequestRejection.TOKEN_UNSET:
@@ -4245,20 +4176,18 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
     """
     Return the CLI exit code for an error category.
 
-    Three outcomes are resolved by exception type before a caller classifies at
+    These outcomes are resolved by exception type before a caller classifies at
     all, and so never reach this function:
 
     * A cancel is not a category.  ``ScanCancelledError`` and
       ``KeyboardInterrupt`` map to ``ExitCode.CANCELLED``.
     * Nor is an interruption.  ``ScanInterrupted`` maps through
       ``exit_code_for_signal`` to 128 plus the signal number.
-    * ``StorageError`` classifies as ``UNKNOWN``, but it is a setup problem, so
-      the CLI guard maps it to ``ExitCode.CONFIG`` (exit 2) by type.  The
-      mapping is by type rather than by making ``classify_error`` return
-      ``CONFIG`` because ``ErrorCategory`` is persisted on job records, and a
-      store that cannot open is not a job's configuration failure.  An
-      ``ErrorCategory.STORAGE`` member was rejected for the same reason: it
-      would be a new persisted value no job could ever carry.
+    * ``StorageError`` classifies as ``UNKNOWN``, and the CLI guard maps it to
+      ``ExitCode.CONFIG`` by type.  A job-store failure exits as a setup error
+      and is never persisted as an error category: every category is a value
+      some job record can carry.
+      See docs/explanation/decisions/0008-no-storage-error-category.md.
 
     ``UNKNOWN`` therefore reaches ``UNEXPECTED`` only for exceptions that are
     not saneless types -- and for a bare ``SanelessError``, which is itself a
@@ -4268,9 +4197,9 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
     was degraded on the way; ``exit_code_for_outcome`` gives those their codes.
 
     ``PAPERLESS_VERSION`` shares ``PAPERLESS`` with ``UPLOAD``: a refused API
-    version stores nothing, so a script that retries on 3 duplicates
-    nothing.  The two unconfirmed categories share ``UNCONFIRMED`` (9), which
-    a script must never retry on.
+    version stores nothing, so a script that retries on ``PAPERLESS``
+    duplicates nothing.  The unconfirmed categories share ``UNCONFIRMED``,
+    which a script must never retry on.
 
     Args:
         category: The error category to map.
@@ -4315,7 +4244,7 @@ def exit_code_for_outcome(outcome: ScanOutcome, warning: str | None) -> ExitCode
     report only one code.
 
     This is a ``match`` with ``assert_never`` for the same reason
-    ``job_state_for`` is: a third ``ScanOutcome`` member then fails both type
+    ``job_state_for`` is: a new ``ScanOutcome`` member then fails both type
     checkers here until it is given a code.
 
     Args:
@@ -4344,7 +4273,7 @@ def exit_code_for_signal(signum: int | None) -> ExitCode:
     Return the CLI exit code for a command a signal interrupted.
 
     SIGHUP and SIGTERM exit 128 plus the signal number, the shell's
-    convention: 129 and 143.  They are the only signals a one-shot command
+    convention.  They are the only signals a one-shot command
     installs a handler for.  Ctrl-C's SIGINT never reaches here: it is a
     ``KeyboardInterrupt``, a cancel, and exits ``CANCELLED``.
 
@@ -4373,17 +4302,16 @@ def classify_error(exc: Exception) -> ErrorCategory:
 
     The checks are ordered, not matched: ``FeederEmptyError`` subclasses
     ``ScanError``, so the narrower class has to be tested first.  For the same
-    reason the three narrower paperless classes are tested before
+    reason the narrower paperless classes are tested before
     ``PaperlessError``: an upload that may have arrived, an accepted upload
     that was never confirmed filed (a poll timeout among them, since
     ``PaperlessTimeoutError`` subclasses ``PaperlessUnconfirmedError``), and a
     refused API version each need advice of their own, and the
-    ``PaperlessError`` arm would otherwise file all three as ``UPLOAD``.
+    ``PaperlessError`` arm would otherwise file them all as ``UPLOAD``.
     ``DiskSpaceError`` is a sibling of every other class here, so its place
-    in the order does not matter.  This is an
-    ``isinstance`` chain rather than a ``match`` because it dispatches on
-    exception type instead of on an enum, so ``assert_never`` does not apply
-    and the trailing ``UNKNOWN`` is the correct total fallback.
+    in the order does not matter.  It dispatches on exception type, not on an
+    enum, so ``assert_never`` does not apply and the trailing ``UNKNOWN`` is
+    the total fallback.
 
     ``ScanCancelledError`` is deliberately left ``UNKNOWN``: a cancel is not a
     failure category, and callers test for it before they classify.
