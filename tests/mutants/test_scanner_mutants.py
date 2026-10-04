@@ -45,7 +45,9 @@ def test_the_abort_test_fails_when_the_cancel_waits_out_the_page(
 
     The mutant still cancels the child and still kills it if it will not
     exit, but only once a whole page's budget has passed: the same outcome,
-    minutes late, while the server waits to stop.
+    minutes late, while the server waits to stop.  It also drops the cut
+    that holds any wait on a stopping child to the grace once the abort is
+    set, which would otherwise save the mutated stop.
     """
     check_mutant(
         tmp_path,
@@ -64,7 +66,18 @@ def test_the_abort_test_fails_when_the_cancel_waits_out_the_page(
                 "                ControlOp.CANCEL,\n"
                 "                STAGE_DEADLINE_SECONDS if budget is None else budget[0],\n"
                 "            )\n",
-            )
+            ),
+            Edit(
+                _SCAN_CHILD,
+                "                if self._watch_abort:\n"
+                "                    raise _AbortedError\n"
+                "                self._deadline = min(\n"
+                "                    self._deadline, time.monotonic() + "
+                "CANCEL_GRACE_SECONDS\n"
+                "                )\n",
+                "                if self._watch_abort:\n"
+                "                    raise _AbortedError\n",
+            ),
         ],
     )
 
