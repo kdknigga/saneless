@@ -59,7 +59,6 @@ from saneless.scanner import scan_child
 from saneless.scanner.base import ScanSettings
 from saneless.scanner.scan_child import ScanChildSession
 from saneless.spool import SpooledPageSink
-from saneless.spool import SpooledPageSink
 
 sink = SpooledPageSink(os.environ["SANELESS_TEST_SPOOL"], _SPOOL_LABEL_A, 0)
 settings = ScanSettings(source="Flatbed", resolution=50, mode="Gray")
