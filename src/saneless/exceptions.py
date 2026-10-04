@@ -147,11 +147,10 @@ class SpoolError(ScanError):
     disk is not this: a shortfall, or a write that runs out of space or
     quota, is a ``DiskSpaceError``.
 
-    A ``ScanError`` subclass, so ``classify_error`` still files it as
-    ``ErrorCategory.SCANNER`` and every exit code and message stays what it
-    was.  It exists so a caller that must treat a failing disk differently
-    from a device fault can test for it exactly: a jammed feeder is worth
-    trying again, a disk that cannot be written is not.
+    A ``ScanError`` subclass, so ``classify_error`` files it as
+    ``ErrorCategory.SCANNER``.  It exists so a caller can tell a failing disk
+    from a device fault: a jammed feeder is worth trying again, a disk that
+    cannot be written is not.
     """
 
 
@@ -297,9 +296,9 @@ class PaperlessTrustStoreError(PaperlessError):
     The trust anchors are read while the paperless-ngx client is built, so
     this is raised before any request is sent: the address, the token and
     paperless-ngx itself are untested, and nothing suggests any of them is
-    wrong.  It stays a ``PaperlessError``, so ``classify_error`` files it as
-    ``ErrorCategory.UPLOAD`` and ``serve`` exits 3 for it as before, and it
-    carries a ``next_step`` naming the two variables.
+    wrong.  It is a ``PaperlessError``, so ``classify_error`` files it as
+    ``ErrorCategory.UPLOAD``, and it carries a ``next_step`` naming the two
+    variables.
     """
 
 
@@ -310,7 +309,7 @@ class StorageError(SanelessError):
     The job database cannot be used: the file cannot be opened or read as
     SQLite, or its jobs table is a shape this build does not recognise.  Every
     message names the job database path.  The CLI reports it as a setup
-    problem with exit 2, not as an unexpected error.
+    problem, ``ExitCode.CONFIG``, not as an unexpected error.
     """
 
 

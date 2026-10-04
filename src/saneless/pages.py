@@ -3,15 +3,10 @@ Page processing utilities: blank-page detection and thumbnail generation.
 
 Measures how much of a page is ink -- the share of the page, inside a thin
 trimmed margin, that is clearly darker than the paper it is printed on -- and
-judges a page blank from that measurement and a per-profile threshold.  Also
-provides the pipeline's blank-page filter, which judges each page from the
-measurement its ``PageRecord`` carries rather than from the page itself, and
-generates base64-encoded JPEG thumbnails of scanned pages.
-
-``measure_ink`` and the thumbnail take an image; the filter takes records,
-because the measurement it needs was made once already, at spool time, while
-the page was in memory -- reading it off the record is what stops the page
-being decoded a second time.
+judges a page blank from that measurement and a per-profile threshold.  The
+blank-page filter takes records, not images: the measurement was made once at
+spool time, so no page is decoded a second time.  Also generates
+base64-encoded JPEG thumbnails of scanned pages.
 """
 
 from __future__ import annotations
@@ -71,7 +66,7 @@ INK_DELTA: Final = 40
 # only copy.
 PAPER_WHITE_FLOOR: Final = 128
 
-# The image modes ``measure_ink`` reads; anything else is normalised first.
+# The image modes ``measure_ink`` reads; the spool normalises anything else.
 _MEASURABLE_MODES = frozenset({"1", "L", "RGB"})
 
 
@@ -116,15 +111,7 @@ def _darkest_channel(image: Image.Image) -> Image.Image:
 
     For a colour page that is the minimum of red, green and blue, which sees a
     yellow highlighter or a light-blue pen that a luminance conversion would
-    render nearly as light as the paper.  A greyscale page is already its own
-    darkest channel, and a one-bit page is widened to greyscale.
-
-    Args:
-        image: The page, in mode ``1``, ``L`` or ``RGB``.
-
-    Returns:
-        An ``L`` image the size of the page.
-
+    render nearly as light as the paper.
     """
     if image.mode == "RGB":
         red, green, blue = image.split()
@@ -167,9 +154,7 @@ def measure_ink(image: Image.Image) -> InkMeasurement:
     not.
 
     No threshold is applied here, because the threshold belongs to the
-    profile; ``is_blank`` turns the measurement into a verdict.  The work is
-    one channel reduction, one crop and one histogram, all at C speed, with no
-    per-pixel Python loop.
+    profile; ``is_blank`` turns the measurement into a verdict.
 
     Args:
         image: The page, in mode ``1``, ``L`` or ``RGB``.
@@ -252,26 +237,17 @@ def filter_blank_pages(
     its record carries, measured once when it was spooled; nothing here opens
     a page file.
 
-    Records in, records out.  The pages are files on the spool by the time
-    this runs, so what gets filtered is the list, never the directory: a
-    removed page is simply not referenced by the result, and nothing here
-    unlinks it or copies it anywhere.  It goes when the job's workspace does.
-    The surviving records keep their relative order, and their ``sequence``
-    values keep the gaps the removals left.  A sequence is the page's place
-    among the pages spooled in its pass, so it matches the fed sheet only on
-    a one-sided pass with no rejected sheet before it: a rejected sheet is
-    not counted, a two-sided device spools two pages a sheet, and manual
-    duplex's pass B runs from the last sheet back.
+    Records in, records out: a removed page is simply not referenced by the
+    result, and its file goes when the job's workspace does.  The survivors
+    keep their order and their ``sequence`` values.
 
-    What was removed is reported by **position** instead: the page's 1-based
-    place in ``pages``, which is the scanned document in order -- for manual
-    duplex, the interleaved one.  That is the number the operator reads on
-    every surface and rescans by, and it is the number each log line gives.
+    What was removed is reported by **position**, the page's 1-based place in
+    ``pages`` (for manual duplex, the interleaved document), because that is
+    the number the operator reads and rescans by.  ``sequence`` is per pass
+    and does not match it.
 
-    One INFO line is logged per page, whether kept or removed, naming its
-    position, its spooled file, its coverage at full precision, its paper
-    white, the threshold and the verdict, so a page that went missing can be
-    traced from the log alone.
+    One INFO line is logged per page, kept or removed, so a page that went
+    missing can be traced from the log alone.
 
     Args:
         pages: The page records to filter, in document order.
@@ -320,13 +296,8 @@ def generate_thumbnail(
     Generate a base64-encoded JPEG thumbnail of a scanned page.
 
     Fits the image inside a ``max_edge`` square (preserving aspect
-    ratio), then encodes as JPEG and returns the base64 string.
-
-    The full-size duplicate this used to start with is gone, because it
-    copied a 26 MB page so that a 300 px thumbnail could be made from the
-    copy. Pillow's ``contain`` operation produces the same small result
-    directly, in 29 ms measured, with no full-size intermediate and no
-    mutation of the caller's image.
+    ratio), then encodes as JPEG and returns the base64 string.  The caller's
+    image is never copied at full size or mutated.
 
     Args:
         image: PIL Image of the scanned page.
