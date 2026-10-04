@@ -1,9 +1,11 @@
 """
-The scanner tests fail, or skip, under the conditions they exist to catch.
+The scan-child tests fail, or skip, under the conditions they exist to catch.
 
 Each check copies the repository, confirms the named test passes on the clean
 copy, applies one hand-written mutant and confirms the test now fails (or, for
-the real-libsane guard, is skipped).
+the real-libsane guard, is skipped).  The mutants target the parent's cancel
+grace in ``scan_child.py``, the child's discard of a page read during a cancel
+in ``scan_session.py``, and the skip guard of the real-child cancel test.
 """
 
 from __future__ import annotations
@@ -19,68 +21,75 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.mutant
 
-_SANE_BACKEND = "src/saneless/scanner/sane_backend.py"
+_SCAN_CHILD = "src/saneless/scanner/scan_child.py"
+_SCAN_SESSION = "src/saneless/scanner/scan_session.py"
+_SCAN_CHILD_LIBSANE = "tests/test_scan_child_libsane.py"
 
-_DEFERRED_INTERRUPT_SECONDS = 180
+_PAGE_BUDGET_WAIT_SECONDS = 180
 """
-How long the interrupt check may take.
+How long the cancel-grace check may take.
 
-Its mutated run sits out the interrupted test's whole thirty-second page
-budget, on top of the clean run and the copy.
+Its mutated run waits on a child that ignores the cancel for the page budget,
+two minutes at least, until the test's own sixty-second timeout ends it, on
+top of the clean run and the copy.
 """
 
 
-@pytest.mark.timeout(_DEFERRED_INTERRUPT_SECONDS)
-def test_the_mid_read_interrupt_test_fails_when_the_interrupt_waits_out_the_page(
+@pytest.mark.timeout(_PAGE_BUDGET_WAIT_SECONDS)
+def test_the_abort_test_fails_when_the_cancel_waits_out_the_page(
     tmp_path: Path,
 ) -> None:
     """
-    The mid-read interrupt test fails when the interrupt waits out the page budget.
+    The mid-read abort test fails when the stop waits the page budget, not the grace.
 
-    The mutant leaves the interrupt to be raised, and the device to be settled,
-    but only once the read has had its whole page timeout: the same outcome,
-    arriving thirty seconds late.
+    The mutant still cancels the child and still kills it if it will not
+    exit, but only once a whole page's budget has passed: the same outcome,
+    minutes late, while the server waits to stop.
     """
     check_mutant(
         tmp_path,
-        "tests/test_scanner.py::TestSaneBackendCancelSequence"
-        "::test_keyboard_interrupt_mid_read[ctrl-c]",
+        "tests/test_scan_child.py::test_an_abort_mid_read_returns_within_the_grace"
+        "[ignores-cancel]",
         [
             Edit(
-                _SANE_BACKEND,
-                "        if started or reader.is_alive():\n"
-                "            _settle_or_wedge(dev, done, budget.grace, page_label)\n"
-                "        raise\n",
-                "        if started or reader.is_alive():\n"
-                "            done.wait(budget.timeout)\n"
-                "            _settle_or_wedge(dev, done, budget.grace, page_label)\n"
-                "        raise\n",
+                _SCAN_CHILD,
+                '            logger.info("The scan was stopped because saneless is '
+                'stopping")\n'
+                "            self._stop_child(ControlOp.CANCEL, CANCEL_GRACE_SECONDS)\n",
+                '            logger.info("The scan was stopped because saneless is '
+                'stopping")\n'
+                "            budget = self._page_budget\n"
+                "            self._stop_child(\n"
+                "                ControlOp.CANCEL,\n"
+                "                STAGE_DEADLINE_SECONDS if budget is None else budget[0],\n"
+                "            )\n",
             )
         ],
     )
 
 
-def test_the_settle_test_fails_when_a_finished_read_is_not_rechecked(
+def test_the_discard_test_fails_when_a_cancelled_page_is_kept(
     tmp_path: Path,
 ) -> None:
     """
-    The finished-read settle test fails when the settle skips its done re-check.
+    The discard test fails when a page read during a cancel is handed on.
 
-    Without the re-check a read that returned in the instant before the
-    timeout is recorded as wedged, and its handle refused until restart.
+    A cancelled ``snap()`` can return a truncated image, so the check after
+    the read is what keeps that image from being spooled as a page.  The
+    mutant removes it.
     """
     check_mutant(
         tmp_path,
-        "tests/test_scanner.py::TestBeginSettle"
-        "::test_an_already_finished_read_is_not_marked_wedged",
+        "tests/test_scan_session.py::test_a_page_read_during_a_cancel_is_discarded",
         [
             Edit(
-                _SANE_BACKEND,
-                "    with _WEDGE_LOCK:\n"
-                "        if done.is_set():\n"
-                "            return False\n"
-                "        _WEDGE.stuck = True\n",
-                "    with _WEDGE_LOCK:\n        _WEDGE.stuck = True\n",
+                _SCAN_SESSION,
+                "    outlet.reading(None)\n"
+                "    if outlet.cancel_requested():\n"
+                "        _await_backend_threads(before)\n"
+                "        raise PassStopped\n"
+                "    return _as_image(image)\n",
+                "    outlet.reading(None)\n    return _as_image(image)\n",
             )
         ],
     )
@@ -91,23 +100,23 @@ def test_the_real_cancel_test_skips_when_libsane_lacks_the_read_delay_options(
     tmp_path: Path,
 ) -> None:
     """
-    The real-libsane cancel test skips when the device lacks the read-delay options.
+    The real-child cancel test skips when the device lacks the read-delay options.
 
-    The mutant stands in for a libsane build whose ``test`` backend has no
-    read-delay or read-limit options: it hides those four names from the
-    device's option list.  python-sane stores an unknown option name as a plain
-    attribute without complaint, so without the guard the test would run
-    against a read that is never slow.
+    The test asks a listing child for the device's option list before it
+    scans.  The mutant stands in for a libsane build whose ``test`` backend
+    has no read-delay or read-limit options: it hides those names from that
+    list.  Without the guard the test would scan a page that is never slow,
+    and its cancel would land after the read had already finished.
     """
     check_mutant_skips(
         tmp_path,
-        "tests/test_sane_hardware.py::TestRealSaneCancelSequence"
-        "::test_a_cancel_unblocks_a_slow_read_and_the_handle_still_closes",
+        f"{_SCAN_CHILD_LIBSANE}"
+        "::test_a_cancel_mid_read_ends_the_real_child_within_the_grace",
         [
             Edit(
-                "tests/test_sane_hardware.py",
-                "offered = {option[1] for option in device.get_options()}",
-                "offered = {option[1] for option in device.get_options()}"
+                _SCAN_CHILD_LIBSANE,
+                "offered = {option[0] for option in reply.options or ()}",
+                "offered = {option[0] for option in reply.options or ()}"
                 " - _READ_DELAY_OPTION_NAMES",
             )
         ],
