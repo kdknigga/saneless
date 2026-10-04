@@ -17,7 +17,7 @@ The invariant: no step of assembly holds more than one page's image data at a ti
 ## Consequences
 
 - Measured flat at 131 MB for both 12 and 48 pages, with byte-identical image streams, the same page boxes and the same total wall clock.
-- The merge holds the GIL for roughly 12 ms per page, so a 500-page job stalls its thread for about 6 s during assembly. That thread is the worker's, already busy for the whole scan, so the visible effect is one briefly frozen status poll.
+- The merge holds the GIL for roughly 12 ms per page, so a 500-page job stalls every Python thread for about 6 s during assembly: web requests, status polls and the health endpoint wait, not only the worker's thread.
 - The shape is not a tuning knob: it is what keeps the memory bound true end to end.
 
 **Alternatives rejected:** one `convert` call over every page; one `convert` call with `outputstream=`, which still finalises the whole document in memory.
