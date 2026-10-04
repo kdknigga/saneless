@@ -2,41 +2,20 @@
 # See https://pre-commit.com/hooks.html for more hooks
 # Git shims installed by `prek install`; worktrees share them via core.hooksPath.
 default_install_hook_types: [pre-commit, pre-merge-commit, pre-push]
-# The vendored htmx and Pico files under static/vendor/ are pinned by SHA-384
-# `integrity` attributes in base.html, so their bytes must stay exactly as the npm
-# registry shipped them. The byte-rewriting hooks below (end-of-file-fixer,
-# mixed-line-ending, trailing-whitespace) would append a newline or rewrite line
-# endings, the hash would stop matching, and browsers would refuse to load the
-# assets. No hook sees the directory; tests/test_vendor_assets.py is the backstop.
+# The vendored htmx and Pico files are pinned by SHA-384 `integrity` attributes
+# in base.html, so a byte-rewriting hook would make browsers refuse them.
+# tests/test_vendor_assets.py is the backstop.
 exclude: ^src/saneless/web/static/vendor/
-# Hooks with no `stages:` of their own run at commit time only, never at merge or
-# push, where a file-modifying hook would abort the operation.
-#
-# It does NOT override a hook whose own manifest declares `stages:` -- a
-# manifest-declared value wins over default_stages. pre-commit-hooks v6.0.0 declares
-# [pre-commit, pre-push, manual] on check-added-large-files,
-# check-executables-have-shebangs, end-of-file-fixer and trailing-whitespace, so each
-# of those carries an explicit `stages: [pre-commit]` below to pin it back. The same
-# manifest declares it on check-shebang-scripts-are-executable and destroyed-symlinks,
-# which this config does not use yet. Read the upstream manifest before adding a hook:
-# if it declares `stages:`, the pin here is what keeps it off merge and push.
+# Hooks with no `stages:` run at commit time only; a file-modifying hook at
+# merge or push would abort the operation. A manifest-declared `stages:` wins
+# over this, so read the upstream manifest before adding a hook: pre-commit-hooks
+# v6.0.0 declares [pre-commit, pre-push, manual] on several, and each one used
+# here carries an explicit `stages: [pre-commit]` to pin it back.
 default_stages: [pre-commit]
 
-# Every hook below whose `language` is python gets its interpreter from here.
-# Without this pin prek builds each hook environment with whatever interpreter
-# it happens to find, which is not the project's: measured on this machine,
-# hook environments existed at 3.12.4, 3.13.9 AND 3.14.2 simultaneously.
-#
-# That is not a cosmetic inconsistency. `check-ast` and `debug-statements`
-# parse this project's source with their OWN interpreter, so a hook built on
-# anything below 3.14 rejects syntax that is valid here. PEP 758's bracketless
-# `except ValueError, TypeError:` -- which `ruff format` PRODUCES at
-# target-version = "py314" -- fails to parse on both 3.12 and 3.13 with
-# "SyntaxError: multiple exception types must be parenthesized". The suite
-# would then reject code ruff had just written, and the only ways out are a
-# suppression or hand-mangling the source, both of which this project forbids.
-#
-# pinned by tests/test_deployment_config.py
+# check-ast and debug-statements parse this source with their own interpreter,
+# and anything below 3.14 rejects the bracketless `except A, B:` that
+# `ruff format` writes at py314. Pinned by tests/test_deployment_config.py.
 default_language_version:
   python: python3.14
 repos:
@@ -47,12 +26,7 @@ repos:
         stages: [pre-commit]
       - id: check-executables-have-shebangs
         stages: [pre-commit]
-      # Read-only checks: they report and never rewrite, so nothing here can
-      # abort a merge or a push by modifying a file. They run at all three
-      # stages deliberately -- check-merge-conflict is worth most at
-      # pre-merge-commit, the stage named after the operation it guards, and
-      # detect-private-key and detect-aws-credentials at pre-push, the last
-      # point before content leaves the machine.
+      # Read-only checks, so they can run at all three stages.
       - id: check-ast
         stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-json
@@ -83,11 +57,6 @@ repos:
       - id: mixed-line-ending
         args: ["--fix=lf"]
       - id: pretty-format-json
-      # No sort-simple-yaml: upstream declares `files: '^$'`, a pattern that
-      # matches nothing, so the hook can only ever run against a `files:` this
-      # config supplies itself. There is no YAML here whose keys we want sorted
-      # -- ordering is meaningful in this file and in the workflows -- so it is
-      # absent rather than configured.
       - id: trailing-whitespace
         stages: [pre-commit]
 
@@ -96,19 +65,10 @@ repos:
     hooks:
       - id: check-json5
 
-  # The commit-stage lint fixer and formatter. They are local rather than
-  # fetched from a hook repository so that ruff comes from uv.lock, hash-checked
-  # and at the exact version the project resolves, the same binary the
-  # merge- and push-stage checks below run. A remote ruff hook would carry a
-  # second, separately pinned copy, and keeping that copy in step with the lock
-  # needs a syncing hook, which rewrites a frozen commit SHA back to its tag and
-  # so undoes the pin every remote repo above carries.
-  #
-  # They sit in their own block because they work the other way round from
-  # the whole-tree checkers in the next one: these are handed the changed
-  # files and filter them by type, so a commit touching no Python skips them.
-  # `require_serial` keeps prek from splitting the file list across parallel
-  # ruff processes that would race to rewrite the same files.
+  # Local, so ruff comes hash-checked from uv.lock, the same binary the merge-
+  # and push-stage checks run; a remote ruff hook would need a syncing hook that
+  # undoes the frozen SHA pins. These are handed the changed files, and
+  # `require_serial` stops parallel ruff processes racing on the same files.
   - repo: local
     hooks:
       - id: ruff-check
@@ -127,15 +87,9 @@ repos:
 
   - repo: local
     hooks:
-      # Commit time checks src/ only, so a TDD RED commit (a test naming a symbol
-      # that does not exist yet) can land. tests/ is checked in full when the
-      # branch is merged with --no-ff or pushed, by the two "(full)" hooks below.
-      #
-      # No `types:` on any hook in this section, deliberately. Each one pairs
-      # `always_run: true` with `pass_filenames: false`, so it runs whatever
-      # changed and is handed no filenames -- a `types:` filter would have
-      # nothing to act on, and would only suggest a scoping that is not there.
-      # The paths these checkers cover are the ones written into `entry`.
+      # Commit time checks src/ only, so a TDD RED commit can land; the "(full)"
+      # hooks check tests/ at merge and push. These hooks take no filenames, so
+      # the paths they cover are the ones in `entry`.
       - id: ty-checker
         name: ty type checker (src)
         entry: uv run ty check src
@@ -143,14 +97,9 @@ repos:
         pass_filenames: false
         always_run: true
 
-      # Paths are explicit rather than relying on `project-includes`: pyrefly's
-      # `use-ignore-files` is on by default and is only bypassed when files are
-      # named on the command line.  Without them, a checkout inside a gitignored
-      # directory (a `.claude/worktrees/` git worktree) has every source file
-      # filtered out and the hook fails with "No Python files matched".  The
-      # full hook below names `scripts` for the same reason: a directory that
-      # is not named is not checked at all, so the release scripts would pass
-      # the gate unexamined.
+      # Paths are named because pyrefly's `use-ignore-files` filters out every
+      # file in a gitignored worktree unless files are named on the command
+      # line; a directory not named, such as `scripts`, is not checked.
       - id: pyrefly-checker
         name: pyrefly type checker (src)
         entry: uv run pyrefly check src
@@ -158,14 +107,9 @@ repos:
         pass_filenames: false
         always_run: true
 
-      # The workflow audit, at commit stage with the other cheap checks: it
-      # reads five files, finishes in well under a second, and never rewrites
-      # anything, so it cannot abort an operation by modifying the tree. Any
-      # finding exits non-zero, which is the whole contract -- findings get
-      # fixed, not silenced with an inline audit-ignore comment. The entry is
-      # bare on purpose: no severity or confidence floor and no persona flag,
-      # because the default `regular` persona is the contract. CI runs this
-      # hook through prek, so this entry is the only spelling of the audit.
+      # Any finding fails; findings get fixed, not silenced. The entry is bare
+      # on purpose, with no severity floor or persona flag, and CI runs it only
+      # through this hook.
       - id: zizmor
         name: zizmor (workflow audit)
         entry: uv run zizmor .
@@ -189,12 +133,8 @@ repos:
         always_run: true
         stages: [pre-merge-commit, pre-push]
 
-      # Lint and format are checked, not applied, at merge and push. The
-      # commit-stage ruff fixer and formatter in the block above rewrite files,
-      # so they cannot run at either stage -- which would leave the two cheapest
-      # checks in the gate deferred to a CI round trip while the two slowest
-      # (the type checkers) ran locally. `--no-fix` and `--check` report
-      # instead of rewriting, so they can.
+      # Checked, not applied: `--no-fix` and `--check` report without rewriting,
+      # so they can run at merge and push.
       - id: ruff-check-full
         name: ruff (no fix)
         entry: uv run ruff check --no-fix .
@@ -211,13 +151,8 @@ repos:
         always_run: true
         stages: [pre-merge-commit, pre-push]
 
-      # The doc-truth harness -- the naming guard and the deployment claims it
-      # asserts -- gets its own gate here, at merge and push. Until this hook
-      # existed there was no pytest hook anywhere in this file, so the guard's
-      # only enforcement points were CI and whatever a developer chose to run
-      # locally; this adds the third. Scoped to the one file the guard lives in
-      # rather than the whole suite: about two seconds instead of twenty-seven,
-      # and the rest of the suite is already CI's job.
+      # The deployment-config tests only: about two seconds, where the whole
+      # suite is CI's job.
       - id: doc-truth-guard
         name: doc-truth harness (naming guard, deployment claims)
         entry: uv run pytest tests/test_deployment_config.py -q
@@ -226,33 +161,12 @@ repos:
         always_run: true
         stages: [pre-merge-commit, pre-push]
 
-  # Comments and docstrings state their reasons in words. They never point at
-  # the planning records (decision, finding and requirement IDs, phase and plan
-  # numbers, the planning file names), because those records do not ship and a
-  # reader cannot look the reference up. For the same reason they never cite a
-  # source file by line number, the assistant instructions file, or a phase
-  # without its number: line numbers drift, and the other two do not ship
-  # either. That holds for the package under src/, the release scripts under
-  # scripts/ that the workflows send a reader into, the tests, the workflows
-  # under .github/, .dockerignore and the decision records under
-  # docs/explanation/decisions/, which ship and are written in the same voice
-  # as the comments that point at them. The rest of docs/ is not in scope.
-  # pygrep fails the hook on any matching line in those files.
-  #
-  # This block is separate from the local block above because it works the
-  # other way round: those hooks run whole-tree checkers with no filenames,
-  # while this one is handed the files and filters them by path and type, so it
-  # only ever reads Python, templates, CSS, JavaScript, YAML, Markdown and
-  # .dockerignore.
-  # The top-level exclude keeps the vendored assets out. The one file this hook
-  # excludes is tests/citation_samples.py: it holds the pattern and the sample
-  # identifiers the guard's own tests need, which cannot be written anywhere
-  # this hook reads. There is no baseline. Read-only, so it runs at all three
-  # stages. tests/test_deployment_config.py imports the same pattern, scans the
-  # same files in CI, and asserts that the pattern, the scope and the single
-  # exclusion stay as written here. The test picks files by suffix where this
-  # hook picks them by type, so a Python script with no .py suffix would be
-  # checked here and not there.
+  # Shipped comments, tests, workflows and decision records state their reasons
+  # in words and never cite the planning records, a source line number or the
+  # assistant instructions file, none of which a reader can look up.
+  # tests/citation_samples.py holds the pattern's own samples, so it is the one
+  # exclusion. tests/test_deployment_config.py pins the pattern, scope and
+  # exclusion; it picks files by suffix where this hook picks them by type.
   - repo: local
     hooks:
       - id: no-planning-citations
@@ -264,15 +178,10 @@ repos:
         exclude: ^tests/citation_samples\.py$
         stages: [pre-commit, pre-merge-commit, pre-push]
 
-      # tests/ruff.toml bans time.sleep in tests, but a thread can pause just as
-      # well on an Event nobody sets, and a browser test can pause on the page's
-      # wait_for_timeout; the ban sees neither. A fixed pause, threaded or in
-      # the browser, belongs in conftest's named helpers (quiet_window and
-      # browser_quiet_window), where it can be found by name, so the one-line
-      # idiom for either inline pause fails here. conftest holds those helpers,
-      # so it is the one file excluded. It is a net for the common spellings,
-      # not a proof: a named Event that is never set still gets through, and
-      # review has to catch it.
+      # A fixed pause in a test belongs in conftest's named helpers
+      # (quiet_window and browser_quiet_window), so the inline idioms fail here.
+      # A net for the common spellings, not a proof: a named Event never set
+      # still gets through.
       - id: no-inline-fixed-waits
         name: no inline fixed pauses in tests
         language: pygrep
