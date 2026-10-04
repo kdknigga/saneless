@@ -28,7 +28,7 @@ from saneless.exceptions import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
     from pathlib import Path
 
@@ -64,6 +64,7 @@ __all__ = [
     "PAPERLESS_TITLE_LIMIT",
     "PARTIAL_SUFFIX",
     "PASS_WAIT_STATES",
+    "PYTHON_SANE_INSTALL_NEXT_STEP",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
     "RESTART_UPLOADING_REASON",
@@ -113,6 +114,7 @@ __all__ = [
     "RemovedPagesNoted",
     "RequestRejection",
     "ScanOutcome",
+    "ScanStage",
     "SubmitResult",
     "WorkerHealth",
     "abort_question",
@@ -164,6 +166,7 @@ __all__ = [
     "pass_prompt_copy",
     "pass_wait_state",
     "progress_label",
+    "python_sane_missing_message",
     "rejection_message",
     "rejection_status_code",
     "removed_pages",
@@ -173,7 +176,13 @@ __all__ = [
     "restart_error",
     "root_owned_config_note",
     "root_per_user_config_note",
+    "sane_init_failure_message",
     "scan_button_label",
+    "scan_child_crashed_error",
+    "scan_child_no_answer_error",
+    "scan_child_not_started_error",
+    "scan_child_stopped_error",
+    "scan_child_unexpected_error",
     "scan_hold_reason",
     "scan_page_description",
     "sentence_case",
@@ -199,8 +208,8 @@ its dimensions in ``saneless.paper_sizes.PAPER_SIZES_MM``.
 """
 
 
-# The values of the members whose names end in "PASS".  Every StrEnum here has
-# value == name, and these are named constants under CONTRIBUTING.md's
+# The values of the members whose names end in "PASS".  Every StrEnum here but
+# ScanStage, whose values are the scan process's own words, has value == name, and these are named constants under CONTRIBUTING.md's
 # hard-coded-credential lint note.
 _NEXT_WAIT_STATE_VALUE = "AWAITING_NEXT_PASS"
 _NEXT_WAIT_VALUE = "NEXT_PASS"
@@ -2800,7 +2809,8 @@ def page_timeout_error(
     The limit grows with the page, so the sentence names the limit and the
     page it was worked out for: a timeout on a large page then reads as a
     page that needed longer, not only as a dropped link. When the cancel did
-    not end the read either, the sentence says saneless is still waiting.
+    not end the read either, the sentence says saneless stopped the scanner's
+    process.
 
     Args:
         page_label: The page, e.g. ``"Page 3"``.
@@ -2818,10 +2828,195 @@ def page_timeout_error(
         message += f", the limit for {page}"
     if not returned:
         message += (
-            "; the scanner did not respond to the cancel, so saneless is "
-            "still waiting for that read to return"
+            "; the scanner did not answer the cancel either, so saneless stopped it"
         )
     return message
+
+
+class ScanStage(StrEnum):
+    """
+    The stage a scan's own process was at when it failed or stopped answering.
+
+    Unlike the other enums here, the values are the lower-case words the scan
+    process reports its progress with, so a stage read from it maps straight
+    to a member.
+    """
+
+    STARTUP = "startup"
+    OPEN = "open"
+    CONFIGURE = "configure"
+    START = "start"
+    READ = "read"
+    CANCEL = "cancel"
+    CLOSE = "close"
+    RESTART = "restart"
+    EXIT = "exit"
+
+
+# Each stage's phrase: the one used when no page is known, and the one with the
+# page number filled in, or ``None`` for a stage that never names a page.
+_SCAN_STAGE_PHRASES: Final[Mapping[ScanStage, tuple[str, str | None]]] = {
+    ScanStage.STARTUP: ("while the scanner library was starting", None),
+    ScanStage.OPEN: ("while opening the scanner", None),
+    ScanStage.CONFIGURE: ("while setting up the scan", None),
+    ScanStage.START: ("while starting a page", "while starting page {page}"),
+    ScanStage.READ: ("while reading a page", "while reading page {page}"),
+    ScanStage.CANCEL: ("while cancelling the scan", "while cancelling page {page}"),
+    ScanStage.CLOSE: ("while closing the scanner", None),
+    ScanStage.RESTART: ("while restarting the scanner library", None),
+    ScanStage.EXIT: ("while finishing the scan", None),
+}
+
+
+def _scan_stage_phrase(stage: ScanStage, page: int | None) -> str:
+    """
+    Name a stage, and the page where the stage has one.
+
+    Args:
+        stage: The stage the scan process was at.
+        page: The page it was working on, or ``None`` when there is none.
+
+    Returns:
+        E.g. ``"while reading page 3"`` or ``"while closing the scanner"``.
+
+    """
+    without_page, with_page = _SCAN_STAGE_PHRASES[stage]
+    if with_page is None or page is None:
+        return without_page
+    return with_page.format(page=page)
+
+
+def scan_child_stopped_error(stage: ScanStage, page: int | None) -> str:
+    """
+    Return the error for a scan process saneless stopped because it went quiet.
+
+    Args:
+        stage: The stage the scan process was at.
+        page: The page it was working on, or ``None`` when there is none.
+
+    Returns:
+        E.g. ``"The scanner stopped answering while reading page 3; saneless
+        stopped it"``.
+
+    """
+    phrase = _scan_stage_phrase(stage, page)
+    return f"The scanner stopped answering {phrase}; saneless stopped it"
+
+
+def scan_child_crashed_error(
+    stage: ScanStage, page: int | None, signal_name: str
+) -> str:
+    """
+    Return the error for a scan process that a signal killed.
+
+    Args:
+        stage: The stage the scan process was at.
+        page: The page it was working on, or ``None`` when there is none.
+        signal_name: The signal's name, e.g. ``"SIGSEGV"``.
+
+    Returns:
+        E.g. ``"The scanning process died from SIGSEGV while reading page 2"``.
+
+    """
+    phrase = _scan_stage_phrase(stage, page)
+    return f"The scanning process died from {signal_name} {phrase}"
+
+
+def scan_child_unexpected_error(
+    type_name: str, stage: ScanStage, page: int | None
+) -> str:
+    """
+    Return the error for a scan process that failed in a way nobody expected.
+
+    Only the exception's type is named, never its message, so no text the scan
+    process produced reaches the operator through this sentence.
+
+    Args:
+        type_name: The exception type's name, e.g. ``"TypeError"``.
+        stage: The stage the scan process was at.
+        page: The page it was working on, or ``None`` when there is none.
+
+    Returns:
+        E.g. ``"The scanning process failed unexpectedly (TypeError) while
+        setting up the scan"``.
+
+    """
+    phrase = _scan_stage_phrase(stage, page)
+    return f"The scanning process failed unexpectedly ({type_name}) {phrase}"
+
+
+def scan_child_no_answer_error(stage: ScanStage, page: int | None) -> str:
+    """
+    Return the error for a scan process whose reply saneless could not read.
+
+    Args:
+        stage: The stage the scan process was at.
+        page: The page it was working on, or ``None`` when there is none.
+
+    Returns:
+        E.g. ``"The scanning process sent a reply saneless could not read while
+        opening the scanner; saneless stopped it"``.
+
+    """
+    phrase = _scan_stage_phrase(stage, page)
+    return (
+        f"The scanning process sent a reply saneless could not read {phrase}; "
+        "saneless stopped it"
+    )
+
+
+def scan_child_not_started_error() -> str:
+    """
+    Return the error for a scan process that could not be started.
+
+    Returns:
+        The error sentence.
+
+    """
+    return "The scanning process could not be started"
+
+
+PYTHON_SANE_INSTALL_NEXT_STEP: Final = (
+    "Install the SANE development package and reinstall saneless, "
+    "as the error says, then run the command again."
+)
+"""The next step for a python-sane that cannot be imported."""
+
+
+def python_sane_missing_message(reason: str) -> str:
+    """
+    Return the error for a python-sane that cannot be imported.
+
+    A missing package and a missing ``libsane.so`` fail differently, so the
+    reason the import gave is kept to tell them apart.
+
+    Args:
+        reason: Why the import failed, e.g. ``"No module named 'sane'"``.
+
+    Returns:
+        The error sentence, with the install hint.
+
+    """
+    return (
+        f"python-sane cannot be imported ({reason}). Install the SANE "
+        "development package (libsane-dev on Debian/Ubuntu, "
+        "sane-backends-devel on Fedora/RHEL) and reinstall saneless; see "
+        "Install on Bare Metal in the documentation"
+    )
+
+
+def sane_init_failure_message(reason: str) -> str:
+    """
+    Return the error for a SANE library that would not initialise.
+
+    Args:
+        reason: Why initialisation failed, e.g. ``"Error during device I/O"``.
+
+    Returns:
+        The error sentence.
+
+    """
+    return f"Could not initialise SANE: {reason}"
 
 
 def ambiguous_source_error(requested: str, matches: Sequence[str]) -> str:

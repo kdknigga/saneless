@@ -3198,7 +3198,7 @@ class TestSaneBackendCancelSequence:
 
         message = str(raised.value)
         assert "timed out" in message
-        assert "did not respond" in message
+        assert "did not answer the cancel" in message
         assert fake_device.close_calls == 0
         assert fake_device.close_while_blocked is False
         assert [
@@ -3437,7 +3437,7 @@ class TestSaneBackendCancelSequence:
         assert time.monotonic() - began < 1.0
         message = str(raised.value)
         assert "timed out" in message
-        assert "did not respond" in message
+        assert "did not answer the cancel" in message
         assert fake_device.close_calls == 0
         assert fake_device.close_while_blocked is False
         assert page_sink.records == ()
@@ -3697,7 +3697,7 @@ class TestSaneBackendCancelSequence:
             assert record.outstanding == set()
             assert fake_device.close_calls == 0
 
-        assert "did not respond" not in str(raised.value)
+        assert "did not answer the cancel" not in str(raised.value)
 
     def test_any_error_from_the_wait_still_settles_a_started_read(
         self, sane_backend: SaneBackend, fake_device: FakeSaneDev
@@ -3827,7 +3827,7 @@ class TestSaneBackendCancelSequence:
             elapsed = time.monotonic() - began
 
             assert elapsed < grace + 1.0
-            assert "did not respond" in str(raised.value)
+            assert "did not answer the cancel" in str(raised.value)
             assert fake_device.cancel_calls == 1
             assert fake_device.cancels_in_flight_max == 1
             # No close at all, so none under the cancel either.
@@ -4292,7 +4292,7 @@ try:
         device, never_returns, "Page 1", _PageBudget(timeout=0.2, grace=0.2)
     )
 except ScanError as exc:
-    returned = "did not respond" not in str(exc)
+    returned = "did not answer the cancel" not in str(exc)
 
 print(f"returned={returned} cancels={device.cancels} closes={device.closes}")
 '''
@@ -6495,7 +6495,7 @@ class TestPageBudget:
         assert message.startswith("Page 1 timed out after 0s, the limit for ")
         assert scan_page_description(236, 295, colour=False, dpi=300) in message
         assert "at 300 dpi" in message
-        assert "did not respond" not in message
+        assert "did not answer the cancel" not in message
 
 
 class TestSourceOptionPresence:
