@@ -610,6 +610,25 @@ class TestScanSession:
         assert _child_ended(scan_child_seam.children[0])
         assert fake_sane_module.child_calls == ["init"]
 
+    def test_a_seam_child_that_exited_is_reaped_with_its_own_status(
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        scan_child_seam: ScanChildSeam,
+    ) -> None:
+        """
+        Killing an in-process child that already exited gives its own status.
+
+        A real child that exited before the kill is reaped with the status it
+        exited with, not as one a signal killed.
+        """
+        _ = fake_sane_module
+        SaneBackend().scan_pages("test:0", _flatbed_settings(), page_sink)
+        child = scan_child_seam.children[0]
+
+        assert child.poll() == 0
+        assert child.kill_and_reap() == 0
+
     def test_a_scan_outside_a_session_starts_and_reaps_its_own_child(
         self,
         fake_sane_module: FakeSaneModule,

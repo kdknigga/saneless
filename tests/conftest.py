@@ -1004,19 +1004,22 @@ class _ThreadChild:
         End the child as a kill would, and fail the test if it does not end.
 
         Returns:
-            ``-SIGKILL``, the status a killed child is reaped with.
+            ``-SIGKILL``, the status a killed child is reaped with, or the
+            status ``main`` had already returned, as a child that exited
+            before the kill is reaped with its own.
 
         Raises:
             AssertionError: ``main`` was still running after its channels
                 were closed.
 
         """
+        exited = self.poll()
         self.close()
         self._thread.join(_SEAM_CHILD_JOIN_SECONDS)
         if self._thread.is_alive():
             msg = "the in-process scan child did not end when it was killed"
             raise AssertionError(msg)
-        return -signal.SIGKILL
+        return -signal.SIGKILL if exited is None else exited
 
     def close(self) -> None:
         """Close saneless's ends of both pipes; idempotent."""
