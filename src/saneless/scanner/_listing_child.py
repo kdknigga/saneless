@@ -2,24 +2,15 @@
 List the scanners in a fresh interpreter, and report back over one JSON line.
 
 Every device listing saneless makes runs this file in a short-lived child
-process, so a crash or a hang inside libsane while it lists scanners cannot
-take saneless down, and the parent can kill a child that runs too long.
+process, so a crash or a hang inside libsane cannot take saneless down and the
+parent can kill a child that runs too long.  A fresh interpreter runs its own
+``sane_init``, so it never holds the stale net-backend control connection a
+fork of saneless would inherit.
+See docs/explanation/decisions/0002-listing-in-a-child-process.md.
 
-Why the listing happens here and not in saneless's own process: libsane's net
-backend keeps one control connection per scanner host open between listings.
-Once that connection is lost, for example because the host's saned restarted,
-the next ``sane_get_devices`` fails its request, ignores the failed status and
-reads a reply that was never filled in (sane-backends ``backend/net.c``,
-``sane_get_devices``), which crashes the process.  A child started from a fresh
-interpreter runs its own ``sane_init``, so it never holds a stale control
-connection, and it resolves the ``SANE_NET_HOSTS`` names afresh every time.  A
-fork of saneless would inherit the very connection this avoids, which is why
-the parent starts this file as a new program instead.
-
-The file is run by path with ``python -I``, and it imports nothing from
-``saneless``: importing the package runs its ``__init__``, which loads the
-configuration layer and costs about 130 ms, several times what a local listing
-takes.  It imports only the standard library, and python-sane late and by name.
+It imports only the standard library, and python-sane late and by name: never
+``saneless``, whose ``__init__`` costs about 130 ms, several times a local
+listing.
 
 The request is one JSON line on stdin::
 
@@ -27,9 +18,7 @@ The request is one JSON line on stdin::
 
 The child arms ``signal.alarm`` with ``alarm`` before it imports python-sane, so
 a child whose parent died cannot sit inside libsane for ever: the default action
-for ``SIGALRM`` ends the process even inside a blocking C call.  The device id
-arrives on stdin and never in argv, because any local user can read a process's
-argv, and a network device id names a host on the LAN.
+for ``SIGALRM`` ends the process even inside a blocking C call.
 
 The reply is one JSON line on the pipe the parent reads as stdout, holding
 only these keys:
@@ -44,31 +33,22 @@ only these keys:
   listing first;
 - ``open_error``, only when ``opened`` is false: ``{"type", "message"}``.
 
-The reply is written with ``json.dumps``' default ASCII escaping, so every
-string, a lone surrogate from a name python-sane could not decode included,
-reaches the parent unchanged.  JSON rather than pickle: nothing the child
-writes can execute when the parent reads it.
+The reply uses ``json.dumps``' default ASCII escaping, so a lone surrogate
+from a name python-sane could not decode reaches the parent unchanged.  JSON
+rather than pickle: nothing the child writes can execute when the parent reads
+it.
 
-That pipe is kept private to the reply.  Before anything else runs, the child
-duplicates it to a descriptor of its own and points fd 1 at stderr, so
-nothing python-sane or a backend prints can reach the reply.  C code shares fd 1
-with Python, and when fd 1 is a pipe C stdio holds its output until the
-process exits, well after the reply was written: left on the reply's pipe, a
-single ``printf`` in any backend would turn a good reply into no answer.  A
-child whose stderr is closed first opens fd 2 on ``/dev/null``, so that output
-is discarded and the reply still reaches the parent.
+That pipe is kept private to the reply: before anything else runs, the child
+moves it to a descriptor of its own and points fd 1 at stderr.  C stdio on a
+pipe holds its output until exit, so a single ``printf`` in any backend left
+on the reply's pipe would turn a good reply into no answer.
 
-Every python-sane call is wrapped in ``except Exception``, never
-``BaseException``, and its failure travels back as data.  So the child ends
-without a reply only when a signal ends it or when it cannot read its request,
-which exits with status 2.  It has no logger: the parent decides what to log.
-
-Once the reply is written the child ends with ``os._exit``, skipping the
-interpreter's and the libraries' teardown.  The parent reads the exit status
-before the reply, so a destructor or an exit hook that crashed or hung after
-the reply was on the pipe would otherwise report a listing that worked as a
-crash or a timeout.  Output a backend left in C stdio's buffer is dropped
-with it; libsane's own debug output goes to stderr unbuffered.
+Every python-sane failure travels back as data, so the child ends without a
+reply only when a signal ends it or it cannot read its request.  It has no
+logger: the parent decides what to log.  Once the reply is written the child
+ends with ``os._exit``, because the parent reads the exit status first and a
+crash or hang in teardown would otherwise turn a good listing into a failed
+one.
 """
 
 from __future__ import annotations
@@ -167,10 +147,6 @@ def _open_and_close(sane_module: SaneModule, device_id: str) -> dict[str, object
 
     A failure to cancel or close is swallowed: the open has already shown that
     the device can be reached, which is the one fact the caller wants.
-
-    Args:
-        sane_module: The python-sane module, or a stand-in for it.
-        device_id: The SANE name of the device to open.
 
     Returns:
         ``{"opened": True}``, or ``{"opened": False, "open_error": ...}`` when
@@ -298,19 +274,13 @@ def _private_reply_channel() -> TextIO:
     """
     Take the parent's stdout pipe for the reply, and point fd 1 at stderr.
 
-    The child inherits saneless's stderr, which is closed when saneless was
-    started with it closed.  Then fd 2 is first opened on ``/dev/null``: left
-    free, it would be the lowest free descriptor, so the reply's own copy
-    would land on it and fd 1 would be pointed straight back at the reply's
-    pipe.  What the scanner library prints is then discarded.  That fd 2 is
-    left inheritable, as fd 1 is, so a helper program a backend starts gets
-    it too, rather than a free fd 2 that the helper's own first ``open``
-    would take.
+    A closed stderr is first opened on ``/dev/null``: a free fd 2 would be the
+    lowest free descriptor, so the reply's copy would land on it and fd 1 would
+    point straight back at the reply's pipe.  That fd 2 stays inheritable, so
+    a helper program a backend starts does not take it with its first ``open``.
 
     Returns:
-        A text stream on a new descriptor for the parent's pipe.  From here
-        on, fd 1 is stderr, so nothing written to it, by Python or by C code,
-        reaches the parent's pipe.
+        A text stream on a new descriptor for the parent's pipe.
 
     """
     try:
@@ -345,9 +315,8 @@ def _flush_standard_streams() -> None:
 if __name__ == "__main__":
     with _private_reply_channel() as channel:
         status = main(sys.stdin, channel)
-    # The reply is on the pipe, so end here, without the interpreter's and the
-    # libraries' teardown: a crash or a hang in a destructor or an exit hook
-    # would otherwise turn a listing that worked into a failed one.  The
-    # kernel closes the sockets and USB handles, and a saned sees EOF.
+    # The reply is on the pipe, so skip teardown, whose crash or hang would
+    # turn a good listing into a failed one.  The kernel closes the sockets and
+    # USB handles, and a saned sees EOF.
     _flush_standard_streams()
     os._exit(status)

@@ -1,48 +1,23 @@
 """
 List scanners in a short-lived child process that can be killed.
 
-Why a child at all: libsane's net backend keeps one control connection per
-scanner host open between listings.  Once the saned on that host restarts or
-dies, the next ``sane_get_devices`` sends its request on the lost connection,
-ignores the failed status and reads a reply that was never filled in
-(sane-backends ``backend/net.c``), and the whole process dies from SIGSEGV,
-SIGABRT or SIGBUS.  A listing can also hang for minutes inside a blocking C
-call on a host that has silently gone away.  Neither can be contained in the
-process that made the call.  In a child, a crash is a failed listing and a
-hang is a process to kill.
+libsane can kill the whole process while listing after a saned restart, and a
+listing can hang for minutes inside a blocking C call, so every listing runs
+in a child that has a deadline and is killed and reaped before the listing
+returns.  See docs/explanation/decisions/0002-listing-in-a-child-process.md.
 
-How the child is started, measured against the local ``test`` backend from a
-parent that had already initialised SANE and had a second thread running:
+The argv is the literal ``/bin/sh -c 'exec "$P" -I "$C"'``, with the two paths
+passed in the environment, because ruff's S603 accepts only a literal argv.
+``exec`` replaces the shell, so the child's PID is the interpreter's own and
+killing it leaves no grandchild.  ``-I`` ignores every ``PYTHON*`` variable,
+so python-sane must be importable from the interpreter's own site-packages,
+and the device id travels on stdin, never in argv, which any local user can
+read.
 
-- ``fork`` inherits the parent's libsane, stale control connection included,
-  and after a saned restart every forked child crashed.  It is not an option.
-- The standard library's "spawn" start method for Python worker processes
-  costs about 340 ms per listing, because it re-imports the parent's
-  ``__main__``, and it leaves a resource tracker running.
-- Its "forkserver" start method leaves two resident helper processes.
-- A clean exec of the interpreter on the child script, by path, costs about
-  14 ms and leaves nothing behind.  That is what this module does.
-
-Every argv element is a literal: ``/bin/sh -c 'exec "$P" -I "$C"'``, with the
-interpreter and the child script passed in the environment, quoted so they
-are never re-split.  ruff's S603 accepts only a literal argv, and ``exec``
-replaces the shell, so the child's PID is the interpreter's own and killing
-and waiting on it leaves no grandchild.  ``-I`` runs the interpreter in
-isolated mode: every ``PYTHON*`` variable is ignored and the script's
-directory is not put on ``sys.path``.  So python-sane must be importable from
-the interpreter's own site-packages: one reachable only through
-``PYTHONPATH`` imports in saneless but not in the child, whose listing then
-fails with ``ModuleNotFoundError``, and the Scanner check reports that no
-scanner was found rather than that scanner support is missing.  The device id
-travels on stdin, never in argv, which any local user can read.
-
-The child's stderr is inherited, so libsane's ``SANE_DEBUG_*`` output keeps
-reaching the log it always reached.  The child points its own fd 1 at stderr
-and keeps the stdout pipe for the reply alone, so what Python code or a direct
-``write`` to fd 1 prints reaches the log too.  A backend's C stdio output
-reaches it only when stderr is a terminal: on a pipe or a socket, as under
-Docker or systemd, C stdio holds it in a buffer, and the child's exit, which
-skips teardown, drops that buffer.
+The child inherits stderr and points its own fd 1 at it, keeping the stdout
+pipe for the reply alone.  A backend's C stdio output reaches the log only
+when stderr is a terminal: on a pipe or a socket it sits in a buffer that the
+child's exit, which skips teardown, drops.
 
 This is a leaf.  It imports neither python-sane nor the health checks: the
 child does the SANE work, and the checks import the scanner layer, not the
@@ -87,15 +62,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# How long one listing child may run before it is killed.  The slowest
-# listing measured locally took about 1.7 s, with a full distribution backend
-# list, so this is about 18 times that.  The margin is for what a real
-# deployment adds and a test bench does not: a saned doing name lookups
-# before it answers, a scanner host enumerating real USB hardware, eSCL
-# discovery on a real network.  It is about a quarter of the ~127 s a
-# silently unreachable host costs a listing, because Linux retries a SYN six
-# times by default inside a blocking C call nothing can interrupt.  Not a
-# setting.  Read at call time, so tests can shorten it.
+# How long one listing child may run before it is killed: about 18 times the
+# slowest local listing (1.7 s), and about a quarter of the ~127 s Linux's SYN
+# retries cost a listing of a silently unreachable host.  Read at call time,
+# so tests can shorten it.
 LISTING_DEADLINE_SECONDS: Final = 30.0
 
 # The child arms ``alarm(ceil(deadline) + margin)`` before it touches SANE.
@@ -105,10 +75,9 @@ LISTING_DEADLINE_SECONDS: Final = 30.0
 _ALARM_MARGIN_SECONDS: Final = 5
 
 # The longest the launcher waits on a child before it looks at the caller's
-# abort Event again.  So a stopping saneless ends an in-flight listing within
-# about this long, rather than waiting out the deadline: the thread that is
-# stopping only sets the Event, and the thread that started the child kills
-# and reaps it, so no other thread ever signals a PID it does not own.
+# abort Event again.  The stopping thread only sets the Event; the thread that
+# started the child kills and reaps it, so no thread signals a PID it does not
+# own.
 _ABORT_POLL_SECONDS: Final = 0.1
 
 # The largest reply accepted.  A real reply is a few hundred bytes per device;
@@ -119,9 +88,7 @@ _MAX_REPLY_BYTES: Final = 1_048_576
 # launcher at a stand-in.
 _CHILD_FILE: Final = Path(__file__).with_name("_listing_child.py")
 
-# The two variables the child's literal argv expands.  The argv itself is
-# written out at the ``Popen`` call: ruff's S603 accepts a literal there and
-# flags the same tuple held in a constant.
+# The two variables the child's literal argv expands.
 _PYTHON_VARIABLE: Final = "SANELESS_LISTING_PYTHON"
 _CHILD_VARIABLE: Final = "SANELESS_LISTING_CHILD"
 
@@ -279,12 +246,6 @@ def _device(value: object) -> tuple[str, str, str, str]:
     """
     Validate one device entry: a list of exactly four strings.
 
-    Args:
-        value: The decoded entry.
-
-    Returns:
-        The entry as a ``(name, vendor, model, type)`` tuple.
-
     Raises:
         ListingNoAnswerError: The entry is any other shape.
 
@@ -300,12 +261,6 @@ def _device(value: object) -> tuple[str, str, str, str]:
 def _child_error(value: object) -> ChildError:
     """
     Validate one reported error: an object with exactly two strings.
-
-    Args:
-        value: The decoded error object.
-
-    Returns:
-        The reported error.
 
     Raises:
         ListingNoAnswerError: The object is any other shape.
@@ -360,28 +315,16 @@ def run_listing_child(
     """
     Run one listing in a fresh child process, under a hard deadline.
 
-    The child is dead and reaped before this returns or raises, whatever
-    happens: on the deadline it is killed and waited for, and so is a child
-    still running when the wait is interrupted by a Ctrl-C or a server stop.
-    A caller that holds the scanner gate around this call therefore releases
-    it with nothing still inside libsane.
+    The child is dead and reaped before this returns or raises, on the
+    deadline, on ``abort`` and on a Ctrl-C or server stop alike, so a caller
+    holding the scanner gate releases it with nothing still inside libsane.
+    Only this thread kills the child; the thread that sets ``abort`` never
+    touches it, so no thread signals a PID that may already be another's.
 
-    A caller that may have to stop part way passes ``abort``.  The wait is
-    made in short slices, and between two of them the launcher looks at the
-    Event: once it is set, the child is killed and reaped here, on the thread
-    that started it, and the listing ends as aborted.  The thread that sets
-    the Event never touches the child, so no thread signals a process it did
-    not start, whose PID may already belong to another by then.
-
-    The child starts in a session of its own, so a signal sent to saneless's
-    whole process group, such as a terminal's Ctrl-C on ``saneless serve``,
-    does not reach it.  In the shared group, a listing running on the worker
-    thread, where no interruption is raised, would die from that signal and
-    be reported as a crash of the scanner library.  A Ctrl-C or a stop that
-    does reach this call interrupts the wait, and the child is killed and
-    reaped as above.  A parent that dies outright, or that exits while this
-    wait is still running on a thread it gave up waiting for, leaves the
-    child to its own alarm, which ends it a few seconds after the deadline.
+    The child runs in a session of its own, so a Ctrl-C sent to saneless's
+    process group does not kill a listing on the worker thread and get
+    reported as a library crash.  A parent that dies outright leaves the child
+    to its own alarm, which ends it a few seconds after the deadline.
 
     A crash is reported and not retried: a fresh child cannot hit the stale
     connection defect, so a crash here is a new defect that a retry would
@@ -465,21 +408,8 @@ def _wait_for_child(
     Send the child its request and wait for it to finish, in short slices.
 
     The request goes with the first slice only: ``communicate`` keeps writing
-    what is left of it, and keeps what it has read, across a retry after a
-    timeout, and refuses input sent again.  After each slice that ends with
-    the child still running, the abort is looked at first and then the
-    deadline.  The child is killed and reaped before anything is raised, so
-    a caller holding the scanner gate releases it with nothing still inside
-    libsane.
-
-    Args:
-        proc: The child process, just started.
-        line: The request line.
-        deadline: Seconds the whole wait may take.
-        abort: The caller's abort Event, or ``None``.
-
-    Returns:
-        Everything the child wrote to stdout.
+    the rest of it across a retry after a timeout, and refuses input sent
+    again.  The child is killed and reaped before anything is raised.
 
     Raises:
         ListingAbortedError: ``abort`` was set while the child ran.
@@ -517,13 +447,6 @@ def _not_started(exc: OSError) -> ListingNoAnswerError:
 
     Only the error number's name is logged: the exception's text can name
     the interpreter's path.
-
-    Args:
-        exc: Why starting the child failed.
-
-    Returns:
-        The error for the caller to raise.
-
     """
     name = "unknown error"
     if exc.errno is not None:
