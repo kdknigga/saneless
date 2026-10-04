@@ -1253,9 +1253,10 @@ class ScanWorker:
         """
         List the configured profile names, in configuration order.
 
-        Request threads (the index dropdown) and the worker share one lock for
-        every profile read; the routes are ``def`` handlers on the threadpool,
-        so that concurrency is real.
+        Request threads (the index dropdown) read under the profiles lock; the
+        routes are ``def`` handlers on the threadpool, so that concurrency is
+        real.  Readers that skip the lock rely on the mapping being replaced
+        wholesale.
 
         Returns:
             A new list, so the caller can keep or change it freely.
